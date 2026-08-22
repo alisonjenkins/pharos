@@ -923,6 +923,135 @@ async fn a_quarantine_fetch_cannot_escape_its_directory() {
     }
 }
 
+/// "N files are damaged" must turn into WHICH files — the whole point of
+/// exposing `IntegrityMemo::damaged`. Route-level (not a helper-level test on
+/// `IntegrityMemo` itself), because B198 taught that a helper test misses a
+/// broken route: `hls_cache`'s own tests already prove the memo tracks
+/// damage correctly, and stay green whether or not this endpoint is even
+/// registered or wired to the right state.
+///
+/// Covers both halves the task called out: an entry whose id still resolves
+/// in the media store (must carry its real path), and one that does not (a
+/// deleted/never-registered row — must still appear, with `Path: null`,
+/// never silently dropped).
+#[actix_web::test]
+async fn an_admin_can_list_damaged_files_including_one_with_no_resolvable_path() {
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+    use pharos_server::integrity_memo::{IntegrityMemo, INTEGRITY_SCAN_VERSION};
+    use pharos_transcode::integrity::IntegrityReport;
+
+    let (state, token, _uid) = seed(true).await;
+
+    // A media row that DOES resolve.
+    MediaStore::put(
+        &state.stores,
+        MediaItem {
+            id: 7643804359852398774,
+            path: "/media/Movies/Thor.mkv".into(),
+            title: "Thor: Ragnarok".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(7_800_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let memo = IntegrityMemo::load("/nonexistent/integrity.json", INTEGRITY_SCAN_VERSION);
+    memo.record(
+        7643804359852398774,
+        Some((100, 500)),
+        IntegrityReport {
+            demux_errors: 1,
+            first_fault_ms: Some(5_582_400),
+            first_fault: Some(
+                "0x00 at pos 5091920906 invalid as first byte of an EBML number".into(),
+            ),
+            scanned_ms: 5_582_400,
+            declared_ms: Some(7_800_000),
+            complete: true,
+            ..Default::default()
+        },
+    );
+    // A verdict for a row that no longer exists in the media store — a
+    // deleted/re-scanned-away item. Must still appear, `Path: null`.
+    memo.record(
+        999,
+        Some((1, 1)),
+        IntegrityReport {
+            read_errors: 3,
+            scanned_ms: 1_000,
+            complete: false,
+            ..Default::default()
+        },
+    );
+
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into())
+            .with_integrity_memo(std::sync::Arc::new(memo)),
+    );
+    let app = test::init_service(build_app(state)).await;
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/integrity/damaged")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v.as_array().expect("array response");
+    assert_eq!(arr.len(), 2, "both damaged entries must be listed: {v}");
+
+    let thor = arr
+        .iter()
+        .find(|e| e["MediaId"] == "7643804359852398774")
+        .unwrap_or_else(|| {
+            panic!(
+                "Thor entry missing (stringified id must survive JS number \
+             precision): {v}"
+            )
+        });
+    assert_eq!(thor["Path"], "/media/Movies/Thor.mkv");
+    assert_eq!(thor["Verdict"], "damaged");
+    assert_eq!(
+        thor["FirstFault"],
+        "0x00 at pos 5091920906 invalid as first byte of an EBML number"
+    );
+    assert_eq!(thor["FirstFaultMs"], 5_582_400);
+    assert_eq!(thor["ScannedMs"], 5_582_400);
+    assert_eq!(thor["DeclaredMs"], 7_800_000);
+
+    let gone = arr
+        .iter()
+        .find(|e| e["MediaId"] == "999")
+        .unwrap_or_else(|| panic!("deleted-row entry must still appear: {v}"));
+    assert!(
+        gone["Path"].is_null(),
+        "a media id that no longer resolves must report Path: null, not be dropped: {v}"
+    );
+    assert_eq!(gone["Verdict"], "unreadable");
+}
+
+#[actix_web::test]
+async fn a_non_admin_cannot_list_damaged_files() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/integrity/damaged")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
 /// The quarantine holds whatever was serving when something went wrong, so
 /// reading it is admin-only like the purge that created it.
 #[actix_web::test]

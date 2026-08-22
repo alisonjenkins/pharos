@@ -1655,13 +1655,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // invisible until a viewer hits it — which is how a zeroed region inside
     // an episode was first diagnosed from a Google TV crash report.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
-    pharos_server::integrity_backfill::spawn(
-        state.stores.clone(),
-        state.is_bg_leader.clone(),
-        state.bg_io.clone(),
-        libav_pool.clone(),
-        integrity_memo_for(&cfg),
-    );
+    {
+        let integrity_memo = integrity_memo_for(&cfg);
+        pharos_server::integrity_backfill::spawn(
+            state.stores.clone(),
+            state.is_bg_leader.clone(),
+            state.bg_io.clone(),
+            libav_pool.clone(),
+            integrity_memo.clone(),
+        );
+        // GET /admin/integrity/damaged reads this — the only way "N files
+        // are damaged" turns into which ones without a debug pod on the
+        // cache PVC.
+        state = state.with_integrity_memo(integrity_memo);
+    }
     // T81 — resolve real cast portraits from TMDB when a key is configured.
     // Gated on the key: with none, this library's people rows keep their
     // legacy (unreachable) thumb paths and the /Persons image route 404s to a
