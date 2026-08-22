@@ -806,6 +806,10 @@ enum SchedMsg {
         /// callers that need to name this job while it is still running.
         assigned: Option<JobSlot>,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
+        /// B201 — carried to the `JobSpec` the worker receives, alongside
+        /// `decode_offload`. `None` for every ordinary submission; see
+        /// [`TranscodeScheduler::submit_tracked_with_filler`].
+        filler: Option<crate::options::FillerSpec>,
     },
     /// Somebody a client is blocked on turned out to be speculative work.
     Promote { job_id: JobId },
@@ -935,6 +939,10 @@ struct JobCtx {
     /// exported to Tempo, carries the placement facts as a result: a wedged
     /// segment can be read without joining three log lines by job id.
     span: tracing::Span,
+    /// B201 — carried straight into every `JobSpec` this job dispatches as
+    /// (retries included; see `place`/the dispatch sites). `None` for every
+    /// ordinary job.
+    filler: Option<crate::options::FillerSpec>,
 }
 
 struct SchedState {
@@ -1425,6 +1433,29 @@ impl TranscodeScheduler {
         hint: JobHint,
         assigned: Option<JobSlot>,
     ) -> Result<JobDone, SchedError> {
+        self.submit_tracked_with_filler(input, opts, sink, class, hint, assigned, None)
+            .await
+    }
+
+    /// [`Self::submit_tracked`], additionally naming a B201 filler for the
+    /// worker to synthesize instead of decoding `input`.
+    ///
+    /// A separate method rather than one more parameter on `submit_tracked`
+    /// itself: that method has ~90 call sites across this crate's tests, and
+    /// every one of them is an ordinary (non-filler) submission — the
+    /// zero-cost default belongs at the call site count, not spelled out at
+    /// each of them.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_tracked_with_filler(
+        &self,
+        input: PathBuf,
+        opts: TranscodeOptions,
+        sink: SinkRequest,
+        class: JobClass,
+        hint: JobHint,
+        assigned: Option<JobSlot>,
+        filler: Option<crate::options::FillerSpec>,
+    ) -> Result<JobDone, SchedError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(SchedMsg::Submit {
@@ -1435,6 +1466,7 @@ impl TranscodeScheduler {
                 hint,
                 assigned,
                 reply,
+                filler,
             })
             .await
             .map_err(|_| SchedError::Io("scheduler stopped".into()))?;
@@ -1563,6 +1595,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             hint,
             assigned,
             reply,
+            filler,
         } => {
             if matches!(sink, SinkRequest::LiveStream) {
                 // Wired in the fd-passing step; not yet schedulable. Counted
@@ -1638,6 +1671,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 playhead_at_submit: state.playheads.get(&hint.stream).map(|(h, _)| *h),
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
+                filler,
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -1712,6 +1746,9 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 device,
                 decode_offload,
                 sink: OutputSink::Stdout,
+                // The live progressive path has no retry ladder to exhaust —
+                // B201 filler is an HLS-segment concept.
+                filler: None,
             };
             let spawner = state.spawner.clone();
             tokio::spawn(async move {
@@ -2974,6 +3011,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 device: dev,
                 decode_offload,
                 sink: to_output_sink(&ctx.sink),
+                filler: ctx.filler,
             };
             let dispatched_at = Instant::now();
             // The long-wait warning belongs INSIDE the span: the queue
@@ -3316,6 +3354,7 @@ fn try_place_no_queue(
                 device: dev,
                 decode_offload,
                 sink: to_output_sink(&ctx.sink),
+                filler: ctx.filler,
             };
             let dispatched_at = Instant::now();
             // The long-wait warning belongs INSIDE the span: the queue
@@ -3492,6 +3531,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         }
     }
 

@@ -138,6 +138,7 @@ fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
         DeviceId::Cpu,
         out.to_str().unwrap(),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     let res = Command::new("ffmpeg")
         .args(&args)

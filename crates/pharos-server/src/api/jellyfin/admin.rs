@@ -41,6 +41,9 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/admin/cache/quarantine/{name}",
             web::get().to(fetch_quarantined),
         )
+        // Container-integrity sweep results — "which files are damaged",
+        // not just a count.
+        .route("/admin/integrity/damaged", web::get().to(damaged_files))
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(scheduled_tasks))
         .route(
@@ -770,6 +773,88 @@ async fn fetch_quarantined(
     Ok(HttpResponse::Ok()
         .content_type("application/octet-stream")
         .body(bytes))
+}
+
+/// `GET /admin/integrity/damaged` — every file the whole-file container
+/// integrity sweep (`integrity_backfill`) has verdicted damaged, with WHICH
+/// file, not just a count.
+///
+/// The sweep already logs a summary line and increments a metric per pass —
+/// "N files damaged" — but naming the count without naming the files is
+/// exactly the shape this project's own §"Expose the cause" discipline
+/// exists to forbid: an operator who wants to know WHICH episode is rotting
+/// had no route to ask, only a debug pod against the cache PVC (the same
+/// gap T120/T123 closed for segment quarantine). `IntegrityMemo::damaged`
+/// already holds the answer; this is the one place it was never read.
+///
+/// A memo entry whose id no longer resolves in the media store (the file was
+/// removed/re-scanned away since the verdict was recorded) still appears,
+/// with `path: null` — a deleted row must not hide a damaged verdict; the
+/// operator still needs to know SOMETHING was wrong even if it is gone now.
+// Plain snake_case field names, matching every other admin DTO in this file
+// (the `CiQuery`-normalises-to-snake_case lesson from B198 is about REQUEST
+// query keys — this route takes none — but the convention is kept for the
+// same reason: one casing rule for the whole surface, not a special case per
+// endpoint).
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DamagedFileDto {
+    /// Stringified: a `u64` media id can exceed `Number.MAX_SAFE_INTEGER`
+    /// and jellyfin-web's own DTOs already carry ids as strings for exactly
+    /// this reason (see `wire_id`/`item_id` throughout `items.rs`).
+    media_id: String,
+    /// `None` when the id no longer resolves in the media store — see this
+    /// function's doc comment. Never used to drop the entry.
+    path: Option<String>,
+    verdict: &'static str,
+    first_fault: Option<String>,
+    first_fault_ms: Option<u64>,
+    demux_errors: u64,
+    corrupt_packets: u64,
+    read_errors: u64,
+    scanned_ms: u64,
+    declared_ms: Option<u64>,
+    // No `recorded_at`: `integrity_memo::Entry` carries `mtime`/`size` (the
+    // FILE's own stat, used to invalidate the verdict) and the report, but no
+    // timestamp of when the scan itself ran — there is nothing to surface.
+}
+
+async fn damaged_files(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(memo) = state.integrity_memo.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "no integrity memo on this build/platform (needs unix + the ffmpeg-lib backend)",
+        ));
+    };
+    let mut out = Vec::new();
+    for (id, entry) in memo.damaged() {
+        // `NotFound` (row gone) is exactly the case this route exists to
+        // still surface — see the doc comment above. Any OTHER error
+        // (store unreachable) is the server's problem and 500s the whole
+        // request rather than silently dropping entries one by one.
+        let path = match pharos_core::MediaStore::get(&state.stores, id).await {
+            Ok(item) => Some(item.path.to_string_lossy().into_owned()),
+            Err(pharos_core::DomainError::NotFound(_)) => None,
+            Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+        };
+        let r = &entry.report;
+        out.push(DamagedFileDto {
+            media_id: id.to_string(),
+            path,
+            verdict: r.label(),
+            first_fault: r.first_fault.clone(),
+            first_fault_ms: r.first_fault_ms,
+            demux_errors: r.demux_errors,
+            corrupt_packets: r.corrupt_packets,
+            read_errors: r.read_errors,
+            scanned_ms: r.scanned_ms,
+            declared_ms: r.declared_ms,
+        });
+    }
+    Ok(web::Json(out))
 }
 
 /// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard

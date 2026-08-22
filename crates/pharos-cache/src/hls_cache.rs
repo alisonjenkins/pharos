@@ -36,8 +36,8 @@ use tracing::Instrument;
 
 use pharos_transcode::scheduler::{JobClass, JobHint, PlayheadSeed, StreamKey};
 use pharos_transcode::{
-    progress_sidecar_path, FfmpegTranscoder, SegmentAudio, SegmentContainer, SegmentOpts,
-    SegmentVideo, TranscodeOptions, VideoCodec,
+    progress_sidecar_path, AudioCodec, FfmpegTranscoder, FillerSpec, SegmentAudio,
+    SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions, VideoCodec,
 };
 use tokio::io::AsyncReadExt;
 
@@ -235,6 +235,14 @@ enum SegmentOutcome {
     Ok,
     /// Carried less video than its duration implies — see `short_of_frames`.
     Short,
+    /// B201/V154 — the retry ladder was exhausted (max decode preroll, still
+    /// short of or with zero video frames) on a window whose source bytes are
+    /// gone, so the cache synthesized and served a black-video (+ silent
+    /// audio, when muxed) filler for the whole window instead of a 500.
+    /// Counted apart from `Ok`: a filler is a degradation, not a healthy
+    /// production, and folding it into `Ok` would hide exactly the damaged
+    /// spans the integrity sweep (B185) exists to name.
+    Filler,
     /// Below the minimum plausible size for a segment.
     Empty,
     /// The transcode itself failed.
@@ -295,6 +303,7 @@ impl SegmentOutcome {
         match self {
             Self::Ok => "ok",
             Self::Short => "short",
+            Self::Filler => "filler",
             Self::Empty => "empty",
             Self::Failed => "failed",
             Self::Shed => "shed",
@@ -767,6 +776,11 @@ struct SegmentProvenance<'a> {
     queue_wait_ms: Option<u64>,
     produced_frames: Option<u64>,
     expected_frames: Option<u64>,
+    /// B201 — `true` when these bytes are a synthesized filler (black video
+    /// plus silence) rather than a real transcode, so a segment found on
+    /// disk days later is identifiable without re-deriving it from the
+    /// frame counts above.
+    filler: bool,
 }
 
 /// Record WHO produced a segment, next to the segment itself.
@@ -791,6 +805,7 @@ async fn write_provenance(segment: &Path, prov: SegmentProvenance<'_>) {
         "queue_wait_ms": prov.queue_wait_ms,
         "produced_frames": prov.produced_frames,
         "expected_frames": prov.expected_frames,
+        "filler": prov.filler,
         "written_unix": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -899,6 +914,49 @@ fn short_of_frames(
         }
     }
     None
+}
+
+/// The SOURCE container's own advertised frame size, for a B201 filler.
+///
+/// Deliberately reads this off `source` itself rather than threading a probed
+/// width/height through `TranscodeOptions`/`SegmentOpts` — nothing in the
+/// segment pipeline carries resolution at all today (every rendition here
+/// keeps the source's native size; there is no downscale ladder), so a filler
+/// needing an explicit `lavfi` size is the first caller to need it. A stream
+/// header probe is cheap next to the transcode that just failed twice, and it
+/// answers correctly even inside a damaged file: the ~7.5 MiB hole that
+/// destroyed B201's video frames left the container's own stream metadata
+/// (read at open, not at the damaged offset) untouched — the file "decodes
+/// cleanly on both sides of the hole" per the bug report, which is exactly
+/// what this reads.
+///
+/// `None` on any probe failure (binary missing, non-zero exit, unparsable
+/// output) — deliberately not a fallback size. A guessed resolution risks a
+/// filler that does not match its sibling segments' own frame size, and the
+/// caller's response to `None` is to keep the historical error path rather
+/// than serve a wrongly-shaped segment.
+async fn probe_source_dimensions(source: &Path) -> Option<(u32, u32)> {
+    let out = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+        ])
+        .arg(source)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = text.trim().split_once('x')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 /// How a segment's frame count compares with what its window implied.
@@ -2693,6 +2751,18 @@ impl HlsSegmentCache {
         // account for the frames rather than discarding the only evidence of
         // what was actually encoded.
         let mut reported: Option<(u64, f64)> = None;
+        // B201 — whether the bytes that end up cached are a real encode or a
+        // synthesized filler. Read by the success path below to pick the
+        // right `SegmentOutcome` and provenance marker instead of reporting a
+        // filler as an ordinary hit.
+        let mut is_filler = false;
+        // Hoisted out of the loop: the filler attempt below is a THIRD
+        // `write_segment` call, made after the loop ends, and reuses whatever
+        // class/hint the last real attempt resolved to rather than
+        // re-deriving it (promotion state cannot have changed between the
+        // loop's last iteration and here — nothing awaits in between).
+        let mut submit_class = class;
+        let mut submit_hint = hint;
         for attempt in 0..2 {
             if attempt == 1 {
                 attempt_opts.decode_preroll_seconds =
@@ -2716,7 +2786,7 @@ impl HlsSegmentCache {
             // they answer a different question, and a client-blocking encode
             // filed under `class="background"` is invisible to the interactive
             // p95 that phase 1's own validation reads.
-            let submit_class = if promoted.load(std::sync::atomic::Ordering::Acquire) {
+            submit_class = if promoted.load(std::sync::atomic::Ordering::Acquire) {
                 JobClass::Interactive
             } else {
                 class
@@ -2726,7 +2796,7 @@ impl HlsSegmentCache {
             // driver's stream — see `JobHint::on_behalf_of_a_joiner`. When the
             // class did not move, this driver IS the requester and the hint is
             // its own.
-            let submit_hint = if submit_class == class {
+            submit_hint = if submit_class == class {
                 hint
             } else {
                 hint.on_behalf_of_a_joiner()
@@ -2811,12 +2881,103 @@ impl HlsSegmentCache {
             }
         }
         if let Some(why) = shortfall {
-            record_segment_outcome(SegmentOutcome::Short, class);
-            return Err(HlsCacheError::Transcode(format!(
-                "transcode produced an incomplete segment even with a \
-                 {}s decode preroll: {why}",
-                pharos_transcode::DECODE_PREROLL_RETRY_SECONDS
-            )));
+            // B201/V154 — the retry ladder (max decode preroll) is exhausted
+            // and this window still cannot yield the frames it was asked
+            // for. Every case that reaches this arm warrants a filler:
+            // `short_of_frames` already returned `None` above — taking this
+            // production through the ordinary caching path with its real,
+            // honestly short bytes — for the one case that must NOT (a
+            // FINAL window's tail deficit, T113/B189). What is left is a
+            // mid-file hole (any window) or literally zero video frames
+            // (any window, final included) — both mean the frames are not
+            // in the source, and no further retry conjures them.
+            match probe_source_dimensions(source).await {
+                Some((width, height)) => {
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        seek_secs = opts.window.start_seconds(),
+                        seg_secs = opts.window.duration_seconds(),
+                        reason = %why,
+                        codec = codec_tag(opts.video, opts.audio_codec(), opts.container),
+                        source = %source.display(),
+                        "hls segment retry ladder exhausted; synthesizing a \
+                         filler for this window instead of failing it \
+                         (B201/V154)"
+                    );
+                    let mut filler_opts = attempt_opts.clone();
+                    filler_opts.filler = Some(FillerSpec {
+                        width,
+                        height,
+                        // Silence substitutes for the COPY a real segment of
+                        // a muxed rendition would make from the title's
+                        // continuous audio encode — never a video-only
+                        // rendition's absent audio.
+                        audio_codec: if attempt_opts.muxed_audio_source.is_some() {
+                            opts.audio_codec().map(AudioCodec::from)
+                        } else {
+                            None
+                        },
+                    });
+                    match self
+                        .write_segment(
+                            source,
+                            &filler_opts,
+                            &tmp,
+                            submit_class,
+                            submit_hint,
+                            &job_slot,
+                        )
+                        .instrument(tracing::info_span!("write_segment", filler = true))
+                        .await
+                    {
+                        Ok(t) => {
+                            timing = t;
+                            reported = read_progress(&tmp).await;
+                            is_filler = true;
+                        }
+                        Err(HlsCacheError::SchedulerBusy) => {
+                            let _ = tokio::fs::remove_file(&tmp).await;
+                            let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                            record_segment_failure(SegmentOutcome::Shed, "scheduler_busy", class);
+                            return Err(HlsCacheError::SchedulerBusy);
+                        }
+                        Err(e) => {
+                            let _ = tokio::fs::remove_file(&tmp).await;
+                            let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                            tracing::error!(
+                                media.id = media_id,
+                                seg = seg_index,
+                                reason = failure_reason(&e),
+                                error = %e,
+                                source = %source.display(),
+                                "hls filler segment transcode failed"
+                            );
+                            record_segment_failure(
+                                SegmentOutcome::Failed,
+                                failure_reason(&e),
+                                class,
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+                None => {
+                    // Can't even learn the source's own advertised frame
+                    // size — this file is more damaged than this fix
+                    // targets (see `probe_source_dimensions`). Fall back to
+                    // the historical bounded error rather than guess a
+                    // resolution that might not match this rendition's
+                    // sibling segments.
+                    record_segment_outcome(SegmentOutcome::Short, class);
+                    return Err(HlsCacheError::Transcode(format!(
+                        "transcode produced an incomplete segment even with a \
+                         {}s decode preroll: {why} (no filler: could not read \
+                         the source's own frame size)",
+                        pharos_transcode::DECODE_PREROLL_RETRY_SECONDS
+                    )));
+                }
+            }
         }
         // Never CACHE an empty/truncated transcode. A worker can exit "success"
         // yet emit near-zero bytes (e.g. a hw encoder fed an option it rejects
@@ -2858,7 +3019,14 @@ impl HlsSegmentCache {
             .await
             .map_err(|e| counted("publish_read_back", e.into()))?;
         let transcode_ms = started.elapsed().as_millis();
-        record_segment_outcome(SegmentOutcome::Ok, class);
+        record_segment_outcome(
+            if is_filler {
+                SegmentOutcome::Filler
+            } else {
+                SegmentOutcome::Ok
+            },
+            class,
+        );
         // Same label set as the hit arm so `sum by (result)` stays meaningful
         // and a hit-rate query does not have to special-case one side.
         // `hit_path` is "none" on a miss rather than absent: a label that
@@ -2990,6 +3158,7 @@ impl HlsSegmentCache {
                 queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
                 produced_frames,
                 expected_frames,
+                filler: is_filler,
             },
         )
         .await;
@@ -3138,7 +3307,7 @@ impl HlsSegmentCache {
         if let Some(sched) = &self.scheduler {
             use pharos_transcode::scheduler::SinkRequest;
             let done = sched
-                .submit_tracked(
+                .submit_tracked_with_filler(
                     source.to_path_buf(),
                     opts.clone(),
                     SinkRequest::FileDirect {
@@ -3150,6 +3319,13 @@ impl HlsSegmentCache {
                     // a NEW job, and promoting the one it replaced would leave
                     // the client waiting on the tier it was rescued from.
                     Some(job_slot.clone()),
+                    // B201 — read off `opts` HERE, in-process, before it
+                    // crosses to the scheduler: `TranscodeOptions::filler` is
+                    // `#[serde(skip)]` precisely so it never reaches the
+                    // worker via `opts` itself (see that field's doc
+                    // comment) — this is the hand-off onto the sibling
+                    // `JobSpec::filler` field that actually does.
+                    opts.filler,
                 )
                 .await
                 .map_err(|e| match e {
@@ -6017,6 +6193,270 @@ mod tests {
         assert_eq!(joined.len(), 256);
     }
 
+    /// A tiny REAL video file — mimics B201's source ("decodes cleanly on
+    /// both sides of the hole"). The filler tests below never decode it
+    /// (their scheduler is a fake worker that ignores the argv entirely),
+    /// but `probe_source_dimensions` genuinely opens it with real `ffprobe`
+    /// to read the filler's frame size off actual container metadata, the
+    /// same call production makes.
+    async fn real_tiny_source(dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("tiny.mp4");
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:size=64x48:rate=24:duration=1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&path)
+            .status()
+            .await
+            .expect("ffmpeg must be on PATH inside the devShell (see CLAUDE.md)");
+        assert!(status.success(), "failed to build the tiny fixture source");
+        path
+    }
+
+    /// A scheduler whose worker fails EVERY real attempt — `frame=0` when
+    /// `zero_frames`, else a genuine but short duration — and only succeeds
+    /// once `job.filler` is set, i.e. once B201's synthesis kicks in. Checks
+    /// `job.filler` (the wire-carried `JobSpec` field), not
+    /// `job.opts.filler` — that one is `#[serde(skip)]` and, on a REAL
+    /// worker process, would always read `None`; a fake worker that read it
+    /// instead would pass even if the production hand-off in
+    /// `HlsSegmentCache::write_segment` were silently dropped.
+    /// Models the retry ladder being fully exhausted before the filler
+    /// attempt is ever made.
+    ///
+    /// `real_attempts` counts only the non-filler attempts, so a test can
+    /// assert the ladder was actually exhausted (both real attempts ran) and
+    /// not just that SOME attempt eventually returned bytes.
+    fn always_short_until_filler(
+        zero_frames: bool,
+        real_attempts: Arc<std::sync::atomic::AtomicU64>,
+    ) -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Spawner {
+            zero_frames: bool,
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl WorkerSpawner for Spawner {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let zero_frames = self.zero_frames;
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    Ok(Box::new(FillerTestWorker {
+                        id,
+                        zero_frames,
+                        real_attempts,
+                    }) as Box<dyn Worker>)
+                })
+            }
+        }
+        struct FillerTestWorker {
+            id: WorkerId,
+            zero_frames: bool,
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Worker for FillerTestWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let zero_frames = self.zero_frames;
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    let progress = if job.filler.is_some() {
+                        // The filler attempt: cropped to the window's real
+                        // duration by `-t`, so a real encode would report
+                        // exactly this — matched here for the frame-deficit
+                        // accounting downstream of production to read as
+                        // complete rather than short-and-refused.
+                        "frame=144\nout_time_us=6006000\n".to_string()
+                    } else {
+                        real_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if zero_frames {
+                            "frame=0\nout_time_us=100000\n".to_string()
+                        } else {
+                            "frame=10\nout_time_us=500000\n".to_string()
+                        }
+                    };
+                    let _ =
+                        tokio::fs::write(pharos_transcode::progress_sidecar_path(path), progress)
+                            .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Spawner {
+                zero_frames,
+                real_attempts,
+            }),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        )
+    }
+
+    /// B201/V154 — a window whose real attempts both come back short (not
+    /// zero) of video, on a NON-final segment, is served as a filler rather
+    /// than a 500 once the retry ladder is exhausted.
+    ///
+    /// Disarm evidence (recorded here rather than left to re-derive): with
+    /// the filler arm removed — i.e. `produce_segment`'s
+    /// `if let Some(why) = shortfall` block reverted to just
+    /// `record_segment_outcome(Short, class); return Err(...)` — this test
+    /// goes RED as `driver.await.unwrap()` returning
+    /// `Err(Transcode("transcode produced an incomplete segment..."))`
+    /// instead of `Ok`, i.e. exactly the B201 500 loop.
+    #[test]
+    fn a_window_inside_a_damaged_span_serves_filler_rather_than_500() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = always_short_until_filler(false, real_attempts.clone());
+        let cache = cache.with_scheduler(sched);
+        // Video, non-final: `SegmentWindow::for_segment(0, None, Some(600.0))`
+        // over a 600 s title puts segment 0 nowhere near the tail.
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let bytes = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(cache.segment_bytes(42, 0, &source, &opts, JobClass::Interactive))
+        })
+        .expect("a window inside a damaged span must still serve 200, not 500");
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "precondition: the retry ladder (both real attempts) must have run \
+             and both come back short before the filler is even considered"
+        );
+
+        let filler_count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == "pharos_segment_produced_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == "filler")
+            })
+            .map(|(.., v)| v);
+        assert!(
+            matches!(
+                filler_count,
+                Some(DebugValue::Counter(n)) if n >= 1
+            ),
+            "pharos_segment_produced_total{{outcome=\"filler\"}} must fire; got {filler_count:?}"
+        );
+    }
+
+    /// B201/V154 — the "no video frames at all" case reaches filler too, and
+    /// it does so even on the title's FINAL window: `short_of_frames` fires
+    /// its zero-frame check unconditionally, before the tail exemption
+    /// (T113/B189) is even consulted, so a final window that produced
+    /// NOTHING must not be mistaken for a legitimately short tail.
+    #[tokio::test]
+    async fn a_window_with_zero_video_frames_serves_filler_even_at_the_final_segment() {
+        let dir = TempDir::new().unwrap();
+        let source = real_tiny_source(&dir).await;
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = always_short_until_filler(true, real_attempts.clone());
+        let cache = cache.with_scheduler(sched);
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            // A 3 s title has exactly one segment: index 0 is both first and
+            // FINAL.
+            window: pharos_core::SegmentWindow::for_segment(0, None, Some(3.0)),
+            ..slow_opts()
+        };
+        assert!(
+            opts.window.is_final(),
+            "precondition: must be the final window"
+        );
+
+        let bytes = cache
+            .segment_bytes(43, 0, &source, &opts, JobClass::Interactive)
+            .await
+            .expect("zero video frames at the final segment must still serve a filler, not 500");
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both real attempts must have run and both reported zero frames"
+        );
+    }
+
+    /// Regression pin for T113/B189: a FINAL window with a genuine (nonzero)
+    /// short tail is the source's honest shape, not damage, and must keep
+    /// being served with its own real bytes — never routed through the
+    /// filler path at all.
+    #[tokio::test]
+    async fn a_final_windows_short_tail_is_not_replaced_by_a_filler() {
+        let dir = TempDir::new().unwrap();
+        let source = real_tiny_source(&dir).await;
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        // A worker that always reports a short (but nonzero) duration — the
+        // Ant-Man shape (T113): video ends before the container's clamp.
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = always_short_until_filler(false, real_attempts.clone());
+        let cache = cache.with_scheduler(sched);
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            window: pharos_core::SegmentWindow::for_segment(0, None, Some(3.0)),
+            ..slow_opts()
+        };
+        assert!(
+            opts.window.is_final(),
+            "precondition: must be the final window"
+        );
+
+        let bytes = cache
+            .segment_bytes(44, 0, &source, &opts, JobClass::Interactive)
+            .await
+            .expect("a final short tail must be served, not 500");
+        assert_eq!(bytes.len(), 256);
+        // The exemption fires on ATTEMPT 0 — `short_of_frames` returns `None`
+        // for a nonzero-frame final window regardless of preroll — so the
+        // second (longer-preroll) real attempt, and the filler path, must
+        // never run at all.
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a genuine final short tail must be accepted on the FIRST attempt, \
+             never retried and never routed through the filler path"
+        );
+    }
+
     /// ...and the promoted re-submission must not drag the DRIVER'S viewer's
     /// playhead forward with it.
     ///
@@ -7683,6 +8123,7 @@ mod tests {
         let all = [
             SegmentOutcome::Ok,
             SegmentOutcome::Short,
+            SegmentOutcome::Filler,
             SegmentOutcome::Empty,
             SegmentOutcome::Failed,
             SegmentOutcome::Shed,
@@ -7694,6 +8135,7 @@ mod tests {
             match o {
                 SegmentOutcome::Ok
                 | SegmentOutcome::Short
+                | SegmentOutcome::Filler
                 | SegmentOutcome::Empty
                 | SegmentOutcome::Failed
                 | SegmentOutcome::Shed
@@ -7708,6 +8150,7 @@ mod tests {
             vec![
                 "ok",
                 "short",
+                "filler",
                 "empty",
                 "failed",
                 "shed",

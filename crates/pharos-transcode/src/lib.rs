@@ -38,7 +38,9 @@ pub use backend::SpawnBackend;
 pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, WaveformPoint};
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
-pub use options::{AudioCodec, Container, MuxedAudio, SourceCodec, TranscodeOptions, VideoCodec};
+pub use options::{
+    AudioCodec, Container, FillerSpec, MuxedAudio, SourceCodec, TranscodeOptions, VideoCodec,
+};
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
 };
@@ -121,6 +123,11 @@ impl FfmpegTranscoder {
             hwaccel_to_device(self.hwaccel),
             "pipe:1",
             crate::DecodeOffload::Allowed,
+            // This legacy inline path never reaches the scheduler/worker
+            // boundary `TranscodeOptions::filler` is skipped across, so
+            // reading it straight off `opts` here is the one place that is
+            // still correct — see that field's doc comment.
+            opts.filler,
         );
         let mut cmd = Command::new(&self.ffmpeg_bin);
         cmd.args(&args)
@@ -386,6 +393,7 @@ fn build_args(input: &str, opts: &TranscodeOptions) -> Vec<String> {
         crate::protocol::DeviceId::Cpu,
         "pipe:1",
         crate::DecodeOffload::Allowed,
+        None,
     )
 }
 
@@ -438,6 +446,29 @@ pub const DECODE_PREROLL_RETRY_SECONDS: f64 = 45.0;
 /// 90000 is the MPEG 90 kHz clock the mpegts segments already use, and it
 /// divides no frame rate exactly — timestamps round to under 3 µs.
 pub const FMP4_TRACK_TIMESCALE: u32 = 90_000;
+
+/// B201 — frame rate for a filler window's `lavfi` `color` source when
+/// `TranscodeOptions::source_frame_rate` is unknown. 24000/1001 (23.976 fps)
+/// is the most common film/TV cadence in this library; an unknown rate is
+/// rare (it comes off `SegmentWindow::rate()`, itself sourced from the
+/// probed container) and any reasonable constant frame rate here still
+/// produces a segment of the requested WALL-CLOCK duration — `-t` crops it —
+/// so this only ever affects how many (identical, black) frames that
+/// duration is divided into.
+const FILLER_FALLBACK_RATE: &str = "24000/1001";
+
+/// Sample rate for a filler window's `anullsrc` silence. 48 kHz is the
+/// standard rate every target codec here (AAC/Opus) accepts natively, so it
+/// needs no resampling and never mismatches a real segment's own rate — nothing
+/// downstream keys audio timing off the SOURCE rate the way video keys off
+/// `source_frame_rate`.
+const FILLER_AUDIO_SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Channel layout for a filler window's `anullsrc` silence. Stereo, matching
+/// the downmix every AAC/Opus segment encode already forces (see the `-ac 2`
+/// note beside the real `match opts.audio` block below) — a filler must not
+/// carry MORE channels than the real encode it substitutes for.
+const FILLER_AUDIO_CHANNEL_LAYOUT: &str = "stereo";
 
 /// Where ffmpeg is told to write its machine-readable progress report for a
 /// file output — `frame=` and `out_time_us=`, which say how much the encoder
@@ -583,28 +614,63 @@ impl std::fmt::Display for DecodeAccel {
 /// `FileDirect` sink) on a concrete `device`. Exposed so the
 /// out-of-process worker reuses the exact same negotiated argument logic
 /// as the in-process transcoder.
+#[allow(clippy::too_many_arguments)]
 pub fn ffmpeg_transcode_args(
     input: &str,
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
     offload: DecodeOffload,
+    filler: Option<options::FillerSpec>,
 ) -> Vec<String> {
-    build_args_for_device(input, opts, device, output, offload)
+    build_args_for_device(input, opts, device, output, offload, filler)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_args_for_device(
     input: &str,
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
     output: &str,
     offload: DecodeOffload,
+    // B201 — same shape as `offload`: decided by the process holding the
+    // retry history (the segment cache), travels beside the device on
+    // `protocol::JobSpec::filler` rather than inside `opts`
+    // (`TranscodeOptions::filler` exists purely for the caller's own
+    // convenience before that hand-off — see its doc comment for why it must
+    // never be read here instead of this parameter).
+    filler: Option<options::FillerSpec>,
 ) -> Vec<String> {
     use crate::protocol::DeviceId;
     let preroll_seconds = opts
         .decode_preroll_seconds
         .unwrap_or(DECODE_PREROLL_SECONDS);
     let hwaccel = device.hwaccel();
+    // B201 — a filler window is fully synthetic: nothing here is decoded, so
+    // every source-shaped fact (burn, the muxed-audio copy input, the
+    // per-track audio index) makes no sense against black lavfi frames.
+    // Strip them from a CLONE before the encoder-selection logic below runs
+    // unmodified — that logic is what has to match the failed real attempt
+    // bit-for-bit, or the shared init breaks (V153/#114). The clone is local
+    // to this function; the caller's `TranscodeOptions` (and therefore
+    // `RenditionKey`) never sees it.
+    let opts_owned;
+    let opts: &TranscodeOptions = if let Some(f) = filler {
+        let mut o = opts.clone();
+        o.burn_subtitle_stream_index = None;
+        o.muxed_audio_source = None;
+        o.audio_source_stream_index = None;
+        // `to_transcode_options` always lowers a real HLS segment's `audio`
+        // to `None` (the codec lives in `muxed_audio_source`/copy instead —
+        // see that field's comment) — but a filler segment has no copy
+        // source, so its audio is an actual `anullsrc` ENCODE and needs the
+        // codec named here for the `match opts.audio` block below to fire.
+        o.audio = f.audio_codec;
+        opts_owned = o;
+        &opts_owned
+    } else {
+        opts
+    };
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -620,22 +686,29 @@ fn build_args_for_device(
     // A real decode: `-c:v copy` decodes nothing and an audio-only job has no
     // video decoder. Shares its definition with `DecodeAccel::of`, which is
     // the ONE place the GPU-decode question is answered.
-    let decoding_video = !matches!(
-        DecodeAccel::of(opts, device, offload),
-        DecodeAccel::NoVideoDecode
-    );
+    //
+    // A filler window decodes NOTHING — there is no real input to seed a
+    // decoder from — so it is never GPU-decode-eligible regardless of what
+    // `DecodeAccel::of` would answer for a real segment of this rendition.
+    let decoding_video = filler.is_none()
+        && !matches!(
+            DecodeAccel::of(opts, device, offload),
+            DecodeAccel::NoVideoDecode
+        );
     // Decode on the GPU as well as encode there — see [`DecodeAccel`], so what
     // the scheduler reports and what ffmpeg is actually told cannot drift.
-    if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device, offload) {
-        a.push("-hwaccel".into());
-        a.push(name.into());
-        // Decode on the SAME GPU that will encode. Without this a multi-GPU
-        // box decodes on device 0 and encodes on device N, adding a
-        // cross-device copy of every frame.
-        if name == "cuda" {
-            if let Some(idx) = device.index() {
-                a.push("-hwaccel_device".into());
-                a.push(idx.to_string());
+    if filler.is_none() {
+        if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device, offload) {
+            a.push("-hwaccel".into());
+            a.push(name.into());
+            // Decode on the SAME GPU that will encode. Without this a multi-GPU
+            // box decodes on device 0 and encodes on device N, adding a
+            // cross-device copy of every frame.
+            if name == "cuda" {
+                if let Some(idx) = device.index() {
+                    a.push("-hwaccel_device".into());
+                    a.push(idx.to_string());
+                }
             }
         }
     }
@@ -664,8 +737,9 @@ fn build_args_for_device(
     // decode of 1080p 10-bit HEVC still runs well above realtime, and the
     // scheduler's permit budget (cores / threads-per-encode) only holds if
     // each job's total footprint actually stays near that many cores.
-    // Copy/remux does no decode → skip; audio-only decode is trivial.
-    if opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy)) {
+    // Copy/remux does no decode → skip; audio-only decode is trivial. A
+    // filler decodes nothing either (see `decoding_video` above).
+    if filler.is_none() && opts.video.is_some() && !matches!(opts.video, Some(VideoCodec::Copy)) {
         a.push("-threads".into());
         a.push(sw_encode_threads().to_string());
     }
@@ -700,12 +774,55 @@ fn build_args_for_device(
         Some(s) => (s, 0.0),
         None => (0.0, 0.0),
     };
-    if input_seek > 0.0 {
-        a.push("-ss".into());
-        a.push(format!("{input_seek:.6}"));
+    match filler {
+        Some(f) => {
+            // B201 — no seek, no real input: `-t` below (unchanged) crops
+            // these infinite lavfi sources to exactly the window's duration,
+            // and `-output_ts_offset` (unchanged, computed from `start`
+            // above) still anchors the result to this window's true position
+            // on the shared timeline — a filler tiles into its playlist slot
+            // exactly like a real segment would.
+            a.push("-f".into());
+            a.push("lavfi".into());
+            a.push("-i".into());
+            // Matches this rendition's OWN frame size and rate — never
+            // guessed: `f.width`/`f.height` were read off the source
+            // container's own stream metadata (still intact; only the
+            // FRAME DATA in this window's span is the damaged part), and the
+            // rate is the same `source_frame_rate` a real segment of this
+            // rendition pins its encoder to below.
+            let rate = opts
+                .source_frame_rate
+                .map(|r| {
+                    let (num, den) = r.as_ratio();
+                    format!("{num}/{den}")
+                })
+                .unwrap_or_else(|| FILLER_FALLBACK_RATE.to_string());
+            a.push(format!(
+                "color=c=black:size={}x{}:rate={rate}",
+                f.width, f.height
+            ));
+            if f.audio_codec.is_some() {
+                // Silence, not a copy of the continuous encode: the design
+                // deliberately trades the partial real audio this window
+                // might have had for one uniform mechanism (B201).
+                a.push("-f".into());
+                a.push("lavfi".into());
+                a.push("-i".into());
+                a.push(format!(
+                    "anullsrc=r={FILLER_AUDIO_SAMPLE_RATE_HZ}:cl={FILLER_AUDIO_CHANNEL_LAYOUT}"
+                ));
+            }
+        }
+        None => {
+            if input_seek > 0.0 {
+                a.push("-ss".into());
+                a.push(format!("{input_seek:.6}"));
+            }
+            a.push("-i".into());
+            a.push(input.to_string());
+        }
     }
-    a.push("-i".into());
-    a.push(input.to_string());
     // The title's one continuous audio encode, as a SECOND input to copy the
     // slice from. Seeked to the same point as the source: ffmpeg re-bases each
     // input's timestamps by that input's own seek position, so two inputs
@@ -1200,6 +1317,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         }
     }
 
@@ -1227,6 +1345,7 @@ mod tests {
             },
             "/out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         assert!(
             !hw.iter().any(|x| x == "-enc_time_base"),
@@ -1245,6 +1364,7 @@ mod tests {
             crate::protocol::DeviceId::Cpu,
             "/out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let e = sw
             .iter()
@@ -1285,6 +1405,7 @@ mod tests {
             },
             "/out.m4s",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let sw = build_args_for_device(
             "/m/foo.mkv",
@@ -1292,6 +1413,7 @@ mod tests {
             crate::protocol::DeviceId::Cpu,
             "/out.m4s",
             crate::DecodeOffload::Allowed,
+            None,
         );
         pinned(&hw, "hardware");
         pinned(&sw, "software");
@@ -1318,8 +1440,227 @@ mod tests {
             },
             "/out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         assert!(!hw.iter().any(|x| x == "-r"), "{hw:?}");
+    }
+
+    fn filler_opts() -> TranscodeOptions {
+        let mut o = opts();
+        o.container = Container::Fmp4;
+        o.video = Some(VideoCodec::H264);
+        o.source_frame_rate = pharos_core::FrameRate::from_mille(23_976);
+        o.start_position_ticks = 55_800_000_000; // 5580.0 s
+        o.duration_ticks = Some(60_060_000); // 6.006 s
+        o
+    }
+
+    /// The value right after `flag`'s LAST occurrence — `-c:v`, `-pix_fmt`,
+    /// `-b:v`, `-t`, `-output_ts_offset` and `-video_track_timescale` each
+    /// appear exactly once in a real or filler argv, so "last" is "the one".
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .rposition(|x| x == flag)
+            .map(|i| args[i + 1].as_str())
+    }
+
+    /// B201 — the filler's two `-f lavfi` inputs carry the rendition's OWN
+    /// size and rate, never a guess: `color` gets `FillerSpec::width`/
+    /// `height` and `opts.source_frame_rate` (the same value a real segment
+    /// of this rendition pins `-r`/`-enc_time_base` to below); `anullsrc`
+    /// appears only when the rendition muxes audio.
+    #[test]
+    fn filler_argv_uses_two_lavfi_inputs_sized_from_the_fillerspec_and_the_source_rate() {
+        // Filler is a JOB-LEVEL fact, not read off `opts` by the argv
+        // builder (`TranscodeOptions::filler` is `#[serde(skip)]` — see its
+        // doc comment) — so it is passed explicitly here, exactly as
+        // `spawn_job_args` passes `JobSpec::filler`, not folded into `opts`
+        // the way `build_args`'s two-arg test wrapper would silently drop.
+        let mut o = filler_opts();
+        let spec = FillerSpec {
+            width: 128,
+            height: 72,
+            audio_codec: Some(AudioCodec::Aac),
+        };
+        o.filler = Some(spec);
+        let a = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Cpu,
+            "pipe:1",
+            crate::DecodeOffload::Allowed,
+            Some(spec),
+        );
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("-f lavfi -i color=c=black:size=128x72:rate=24000/1001"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-f lavfi -i anullsrc=r=48000:cl=stereo"),
+            "{joined}"
+        );
+        assert_eq!(
+            a.iter().filter(|x| x.as_str() == "lavfi").count(),
+            2,
+            "one lavfi input for video, one for audio: {joined}"
+        );
+
+        // Video-only rendition (no muxed audio to substitute silence for):
+        // no anullsrc input at all.
+        let video_only_spec = FillerSpec {
+            width: 128,
+            height: 72,
+            audio_codec: None,
+        };
+        let vo = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Cpu,
+            "pipe:1",
+            crate::DecodeOffload::Allowed,
+            Some(video_only_spec),
+        )
+        .join(" ");
+        assert!(vo.contains("-f lavfi -i color=c=black"), "{vo}");
+        assert!(!vo.contains("anullsrc"), "{vo}");
+    }
+
+    /// B201 — a filler decodes NOTHING and burns NOTHING: even when the
+    /// FAILED real attempt's own options carry a burn index and a
+    /// muxed-audio copy source (the ordinary shape for the rendition this
+    /// window belongs to), the filler argv must not seek, hwaccel, map, or
+    /// otherwise reference any of it — a broken filler-input branch that
+    /// fell through to the real-segment code would reproduce exactly the
+    /// B201 500 (the real input cannot be decoded), invisibly to every cache
+    /// test, which drives a fake worker that never looks at the argv at all.
+    #[test]
+    fn filler_argv_carries_no_seek_hwaccel_map_or_burn_remnants() {
+        let mut o = filler_opts();
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_intent = true;
+        o.audio_source_stream_index = Some(3);
+        o.muxed_audio_source = Some(MuxedAudio {
+            path: std::path::PathBuf::from("/cache/audio/continuous.m4s"),
+            start_seconds: 5000.0,
+        });
+        o.filler = Some(FillerSpec {
+            width: 128,
+            height: 72,
+            audio_codec: Some(AudioCodec::Aac),
+        });
+
+        let a = build_args_for_device(
+            "/m/foo.mkv",
+            &o,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Nvenc,
+                index: 0,
+            },
+            "/out.m4s",
+            crate::DecodeOffload::Allowed,
+            o.filler,
+        );
+        let joined = a.join(" ");
+        assert!(
+            !joined.contains("-ss"),
+            "no seek against a synthetic source: {joined}"
+        );
+        assert!(
+            !joined.contains("-hwaccel"),
+            "nothing here is decoded: {joined}"
+        );
+        assert!(
+            !joined.contains("/m/foo.mkv"),
+            "the real input path must not appear: {joined}"
+        );
+        assert!(
+            !joined.contains("/cache/audio/continuous.m4s"),
+            "the muxed-audio copy source must not appear: {joined}"
+        );
+        assert!(
+            !a.iter().any(|x| x == "-map"),
+            "default selection resolves the two lavfi inputs unambiguously: {joined}"
+        );
+        assert!(!joined.contains("subtitles="), "no burn filter: {joined}");
+        assert!(
+            !joined.contains("overlay"),
+            "no image-subtitle burn graph: {joined}"
+        );
+        assert_eq!(
+            a.iter().filter(|x| x.as_str() == "-i").count(),
+            2,
+            "exactly the two lavfi inputs, nothing else: {joined}"
+        );
+    }
+
+    /// V153 — a filler must come off the SAME encoder-selection path as a
+    /// real segment of the same rendition/device, or its bitstream is
+    /// incompatible with the shared init the real segments already
+    /// published (#114). Pinned on both CPU (libx264) and NVENC, since the
+    /// two take different branches through the encoder-selection match.
+    #[test]
+    fn filler_and_a_real_segment_of_the_same_rendition_share_an_identical_encoder_tail() {
+        let tail_flags = [
+            "-c:v",
+            "-pix_fmt",
+            "-b:v",
+            "-t",
+            "-output_ts_offset",
+            "-video_track_timescale",
+        ];
+        for device in [
+            crate::protocol::DeviceId::Cpu,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Nvenc,
+                index: 0,
+            },
+        ] {
+            let real_opts = filler_opts();
+            let mut filler_opts = real_opts.clone();
+            filler_opts.filler = Some(FillerSpec {
+                width: 128,
+                height: 72,
+                audio_codec: None,
+            });
+
+            let real = build_args_for_device(
+                "/m/foo.mkv",
+                &real_opts,
+                device,
+                "/real.m4s",
+                crate::DecodeOffload::Allowed,
+                None,
+            );
+            let filler = build_args_for_device(
+                "/m/foo.mkv",
+                &filler_opts,
+                device,
+                "/filler.m4s",
+                crate::DecodeOffload::Allowed,
+                filler_opts.filler,
+            );
+
+            for flag in tail_flags {
+                assert_eq!(
+                    flag_value(&filler, flag),
+                    flag_value(&real, flag),
+                    "{flag} must match between filler and real on {device:?}\nreal:   {real:?}\nfiller: {filler:?}"
+                );
+            }
+            // The frame-grid pin (`-r` hw / `-enc_time_base` sw) is part of
+            // the same shared-timeline contract and must agree too.
+            assert_eq!(
+                real.iter().any(|x| x == "-r"),
+                filler.iter().any(|x| x == "-r"),
+                "on {device:?}: real {real:?} filler {filler:?}"
+            );
+            assert_eq!(
+                real.iter().any(|x| x == "-enc_time_base"),
+                filler.iter().any(|x| x == "-enc_time_base"),
+                "on {device:?}: real {real:?} filler {filler:?}"
+            );
+        }
     }
 
     #[test]
@@ -1391,6 +1732,7 @@ mod tests {
             crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0),
             "pipe:1",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let joined = a.join(" ");
         assert!(joined.contains("h264_nvenc"), "{joined}");
@@ -1449,6 +1791,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -1510,6 +1853,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -1548,6 +1892,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let nvenc = build_args_for_device(
             "/m/x.mkv",
@@ -1555,6 +1900,7 @@ mod tests {
             DeviceId::hw(HwAccel::Nvenc, 0),
             "out.m4s",
             crate::DecodeOffload::Allowed,
+            None,
         )
         .join(" ");
         assert!(
@@ -1577,6 +1923,7 @@ mod tests {
             DeviceId::Cpu,
             "out.m4s",
             crate::DecodeOffload::Allowed,
+            None,
         )
         .join(" ");
         assert!(
@@ -1650,6 +1997,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -1679,6 +2027,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
@@ -1943,6 +2292,7 @@ mod tests {
             DeviceId::hw(HwAccel::Vaapi, 1),
             "out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let joined = a.join(" ");
         assert!(
@@ -2072,7 +2422,8 @@ mod tests {
         o.container = Container::Mpegts;
         let dev = DeviceId::hw(HwAccel::Nvenc, 1);
 
-        let denied = build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Denied);
+        let denied =
+            build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Denied, None);
         assert!(
             !denied.iter().any(|x| x == "-hwaccel"),
             "a source this card was never proved able to decode must not be \
@@ -2090,7 +2441,8 @@ mod tests {
         // And the same options with the offload allowed DO reach the decoder,
         // so the assertion above is about the gate rather than about this
         // device never emitting `-hwaccel` at all.
-        let allowed = build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Allowed);
+        let allowed =
+            build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Allowed, None);
         assert!(allowed.iter().any(|x| x == "-hwaccel"), "{allowed:?}");
 
         // The reported verdict and the argv are one decision, not two.
@@ -2117,6 +2469,7 @@ mod tests {
             DeviceId::hw(HwAccel::Nvenc, 1),
             "out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let i = a.iter().position(|x| x == "-i").expect("input");
         let h = a.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
@@ -2137,6 +2490,7 @@ mod tests {
             DeviceId::hw(HwAccel::Vaapi, 0),
             "out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         let vh = v.iter().position(|x| x == "-hwaccel").expect("-hwaccel");
         assert_eq!(v[vh + 1], "vaapi", "{v:?}");
@@ -2157,6 +2511,7 @@ mod tests {
             DeviceId::Cpu,
             "out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
     }
@@ -2173,6 +2528,7 @@ mod tests {
             DeviceId::hw(HwAccel::Nvenc, 0),
             "out.ts",
             crate::DecodeOffload::Allowed,
+            None,
         );
         assert!(!a.iter().any(|x| x == "-hwaccel"), "{a:?}");
     }
@@ -2243,6 +2599,7 @@ mod tests {
                 device,
                 "out.ts",
                 crate::DecodeOffload::Allowed,
+                None,
             );
             match got {
                 DecodeAccel::Gpu { name } => {

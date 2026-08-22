@@ -113,6 +113,7 @@ fn transcode_segment(
         burn_fonts_dir: None,
         decode_preroll_seconds: None,
         muxed_audio_source: None,
+        filler: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
@@ -120,6 +121,7 @@ fn transcode_segment(
         DeviceId::Cpu,
         out.to_str().unwrap(),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     eprintln!("argv: ffmpeg {}", args.join(" "));
     let status = Command::new("ffmpeg")
@@ -197,6 +199,7 @@ fn transcode_segment_from_sidecar(
         burn_fonts_dir: None,
         decode_preroll_seconds: None,
         muxed_audio_source: None,
+        filler: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
@@ -204,6 +207,7 @@ fn transcode_segment_from_sidecar(
         DeviceId::Cpu,
         out.to_str().unwrap(),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     eprintln!("argv: ffmpeg {}", args.join(" "));
     let status = Command::new("ffmpeg")
