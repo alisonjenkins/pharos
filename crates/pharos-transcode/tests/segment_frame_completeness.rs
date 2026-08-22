@@ -122,6 +122,7 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
         DeviceId::Cpu,
         out.to_str().unwrap(),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     let res = Command::new("ffmpeg")
         .args(&args)

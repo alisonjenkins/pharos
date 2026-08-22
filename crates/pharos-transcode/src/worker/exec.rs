@@ -160,8 +160,14 @@ pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), Work
             let out_str = path
                 .to_str()
                 .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 output path: {path:?}")))?;
-            let args =
-                ffmpeg_transcode_args(input, &spec.opts, spec.device, out_str, spec.decode_offload);
+            let args = ffmpeg_transcode_args(
+                input,
+                &spec.opts,
+                spec.device,
+                out_str,
+                spec.decode_offload,
+                spec.filler,
+            );
             Ok((args, SpawnTarget::File(path.clone())))
         }
         OutputSink::Stdout => {
@@ -171,6 +177,7 @@ pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), Work
                 spec.device,
                 "pipe:1",
                 spec.decode_offload,
+                spec.filler,
             );
             Ok((args, SpawnTarget::Stdout))
         }

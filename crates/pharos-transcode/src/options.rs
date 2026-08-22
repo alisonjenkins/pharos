@@ -395,6 +395,60 @@ pub struct TranscodeOptions {
     /// the difference.
     #[serde(default)]
     pub muxed_audio_source: Option<MuxedAudio>,
+    /// B201 — when set, this segment is a FILLER: black video (+ silence for
+    /// a muxed audio rendition) generated from an ffmpeg `lavfi` source
+    /// instead of decoded from the real input, because the retry ladder
+    /// (max decode preroll) still came back short of — or with zero — video
+    /// frames. The frames are not in the source; no further retry conjures
+    /// them (V154).
+    ///
+    /// `#[serde(skip)]`, exactly like [`Self::source_video_codec`] and for
+    /// the same reason: `RenditionKey` digests these options through serde,
+    /// and this field is set on only SOME segments of a rendition — the ones
+    /// that happened to land in a damaged span. A NON-skip field, even one
+    /// unconditionally neutralised in `RenditionKey::new`, still changes the
+    /// JSON text every OTHER rendition in the system serializes to (a bare
+    /// `,"filler":null` lands in every canon that never had it), which
+    /// shifts every hash-derived device placement at once — measured live
+    /// while building this fix: two placement tests broke from that field
+    /// alone existing, non-skip, with a value that never varied. `skip`
+    /// avoids the byte ever appearing, so an untouched rendition's canon —
+    /// and therefore its pinned device — is provably unchanged.
+    ///
+    /// This is why the WIRE delivery to the worker (a separate process, so
+    /// this in-process field alone cannot reach it) does NOT go through this
+    /// field at all: see [`crate::protocol::JobSpec::filler`], which travels
+    /// beside `decode_offload` — a fact ABOUT the job, not part of the
+    /// rendition's own identity — for exactly the reason that field does.
+    /// This field exists purely for the CALLER convenience of attaching a
+    /// filler decision to a `TranscodeOptions` value before the scheduler
+    /// pulls it back out into that sibling field (see
+    /// `HlsSegmentCache::write_segment`); nothing downstream reads it after
+    /// that point.
+    #[serde(skip)]
+    pub filler: Option<FillerSpec>,
+}
+
+/// What the spawn arg builder needs to synthesize a filler segment: the
+/// rendition's own frame size (so the black video matches every sibling
+/// segment's dimensions — nothing here is guessed) and, when the rendition
+/// muxes audio, which codec to encode `anullsrc` silence with.
+///
+/// Carries no bitrate of its own: `TranscodeOptions::audio_bitrate_bps` is
+/// already the right value for a muxed rendition regardless of whether this
+/// particular segment encodes or copies audio, so filler reuses it rather
+/// than duplicating it here.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FillerSpec {
+    pub width: u32,
+    pub height: u32,
+    /// `Some` only for a rendition whose segments mux audio
+    /// (`muxed_audio_source.is_some()` on the real attempt) — the silence
+    /// substitutes for the COPY that attempt would have made from the
+    /// title's continuous audio encode. `None` for a video-only (demuxed
+    /// audio) rendition, which gets no audio input at all, same as a real
+    /// segment of that rendition.
+    pub audio_codec: Option<AudioCodec>,
 }
 
 impl TranscodeOptions {
@@ -445,6 +499,13 @@ impl RenditionKey {
         o.duration_ticks = None;
         o.decode_preroll_seconds = None;
         o.burn_subtitle_stream_index = None;
+        // B201 — `filler` is `#[serde(skip)]` (see its own doc comment for
+        // why: unlike this field, ANY non-skip presence — even neutralised
+        // to a constant here — would still shift every OTHER rendition's
+        // hash), so it is already absent from `canon` below and needs no
+        // clearing here. Noted for the same reason `burn_subtitle_stream_index`
+        // above IS cleared explicitly: the next per-segment field added to
+        // this struct should ask which of the two techniques it needs.
         // PER-SEGMENT, like the position fields above: `maybe_gate_burn` clears
         // this for any segment whose window carries no subtitle event, so two
         // segments of ONE rendition disagree on it. Left in the canon it split
@@ -508,6 +569,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -533,6 +595,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }
@@ -579,6 +642,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         }
     }
 
@@ -696,6 +760,7 @@ mod tests {
             burn_fonts_dir: None,
             decode_preroll_seconds: None,
             muxed_audio_source: None,
+            filler: None,
         };
         let mut named = base.clone();
         named.source_video_codec = Some(SourceCodec::Av1);

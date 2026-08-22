@@ -312,6 +312,11 @@ impl ResolvedSegment {
                 ResolvedAudio::Silent => None,
                 ResolvedAudio::Muxed(_, m) => Some(m.clone()),
             },
+            // The real (non-filler) attempt this produces. `produce_segment`
+            // sets this on its OWN clone of the result if the retry ladder is
+            // exhausted (B201) — never here, so a freshly-resolved segment is
+            // never accidentally born a filler.
+            filler: None,
         }
     }
 }
@@ -418,6 +423,7 @@ mod tests {
                 crate::protocol::DeviceId::Cpu,
                 "/out.ts",
                 crate::DecodeOffload::Allowed,
+                None,
             )
         };
 

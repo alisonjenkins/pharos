@@ -102,6 +102,7 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
         burn_fonts_dir: None,
         decode_preroll_seconds: None,
         muxed_audio_source: None,
+        filler: None,
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         src.to_str().expect("utf8 tmpdir"),
@@ -109,6 +110,7 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
         pharos_transcode::protocol::DeviceId::Cpu,
         seg.to_str().expect("utf8 tmpdir"),
         pharos_transcode::DecodeOffload::Allowed,
+        None,
     );
     let out = Command::new(ffmpeg())
         .args(["-v", "error"])
