@@ -2,5 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "automergeStrategy": "rebase",
+  "packageRules": [
+    {
+      "description": "Auto-merge patch and minor updates once CI is green (branch protection on main requires all 4 checks); major bumps still open a PR for manual review.",
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true
+    }
   ]
 }
