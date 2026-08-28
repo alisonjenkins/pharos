@@ -1017,7 +1017,13 @@ async fn build_media_segments(
         let Some(seg_type) = classify_chapter_title(&c.title) else {
             continue;
         };
-        seen_types.insert(seg_type);
+        // A second chapter of the same Type is a boundary marker ("Intro
+        // end"), not a real second span — ripper tools title the chapter
+        // AFTER the intro to describe the transition, and it matches the
+        // same substring. Keep only the first (B201/V154).
+        if !seen_types.insert(seg_type) {
+            continue;
+        }
         let start_ticks = c.start_ms.saturating_mul(10_000);
         // The chapter's `end_ms` is the *next* chapter's start —
         // ffprobe carries it explicitly so we trust it.
@@ -1103,6 +1109,51 @@ mod media_segments_tests {
         );
         assert_eq!(classify_chapter_title("Chapter 4"), None);
         assert_eq!(classify_chapter_title("The Beach"), None);
+    }
+
+    #[actix_web::test]
+    async fn build_media_segments_keeps_only_first_chapter_per_type() {
+        // B201: "Intro start" / "Intro end" is a boundary-marker pair, not
+        // two real intro spans. The second chapter must not surface as its
+        // own segment covering the rest of the episode (V154).
+        use crate::state::{AppState, Stores};
+        use pharos_core::{MediaChapter, MediaItem, MediaKind, MediaProbe, MediaStore};
+
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        stores
+            .put(MediaItem {
+                id: 42,
+                path: "/sabrina-s01e02.mkv".into(),
+                title: "Chapter Two".into(),
+                kind: MediaKind::Episode,
+                probe: MediaProbe {
+                    chapters: vec![
+                        MediaChapter {
+                            start_ms: 0,
+                            end_ms: 102_853,
+                            title: "Intro start".into(),
+                        },
+                        MediaChapter {
+                            start_ms: 102_853,
+                            end_ms: 3_429_760,
+                            title: "Intro end".into(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = AppState::new(stores, "t".into());
+
+        let segs = build_media_segments(&state, "42").await;
+        let intros: Vec<_> = segs.iter().filter(|s| s.kind == "Intro").collect();
+        assert_eq!(
+            intros.len(),
+            1,
+            "a same-Type second chapter must be dropped as a boundary marker, not unioned in: {segs:?}"
+        );
     }
 
     #[test]
