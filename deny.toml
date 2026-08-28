@@ -58,6 +58,21 @@ ignore = [
     # boko moves to quick-xml 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0258 — unbounded empty DATA frames in `h2` < 0.4.16.
+    # Patched only on the 0.4 line (upstream advisory: "patched >= 0.4.16");
+    # there is no fixed 0.3.x release. pharos's hyper/tonic path already
+    # resolves the fixed h2 0.4.19. The remaining h2 0.3.27 came from
+    # actix-web's `http2` feature, which was a DEFAULT we never asked for and
+    # never used: pharos's `HttpServer` only ever `.bind()`s plaintext
+    # HTTP/1.1, so h2c was live on the production listener with nothing
+    # exercising it. Retired the dependency instead of ignoring it —
+    # actix-web now opts out of `http2` (workspace Cargo.toml). The only
+    # remaining h2 0.3.27 in the lockfile comes from `awc`/`actix-test`
+    # (test-only dev-dependencies, hard-required regardless of features),
+    # confirmed absent from the no-dev graph: `cargo tree -i h2@0.3.27 -e
+    # no-dev` prints nothing. Re-evaluate if actix-web ever ships a release
+    # off h2 0.3, or if `http2` becomes needed in production.
+    "RUSTSEC-2026-0258",
 ]
 
 [licenses]
