@@ -27,4 +27,13 @@ ignore = [
     # invalidate it, is in deny.toml; V123 says it has to be written down.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # RUSTSEC-2026-0258 — unbounded empty DATA frames in `h2` < 0.4.16, fixed
+    # only on the 0.4 line. actix-web's `http2` default (never used — pharos
+    # `.bind()`s plaintext HTTP/1.1 only) pulled the vulnerable h2 0.3.27 into
+    # the shipped binary; retired by disabling that feature rather than
+    # ignoring it (workspace Cargo.toml). The remaining h2 0.3.27 in the
+    # lockfile comes only from `awc`/`actix-test` dev-dependencies — confirmed
+    # via `cargo tree -i h2@0.3.27 -e no-dev` printing nothing. Full rationale
+    # in deny.toml.
+    "RUSTSEC-2026-0258",
 ]
