@@ -56,7 +56,7 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sevenz-rust2 = { version = "0.21", default-features = false, features = ["compress", "util"] }
+sevenz-rust2 = { version = "0.22", default-features = false, features = ["compress", "util"] }
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.10" }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
