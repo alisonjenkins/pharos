@@ -2011,7 +2011,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "http 0.2.12",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "slab",
  "tokio",
  "tokio-util",
@@ -2030,7 +2030,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "http 1.4.1",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "slab",
  "tokio",
  "tokio-util",
@@ -2422,9 +2422,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -2693,7 +2693,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "getrandom 0.4.3",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "itoa",
  "log",
  "md-5 0.11.0",
@@ -2805,7 +2805,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4f0c8427b39666bf970460908b213ec09b3b350f20c0c2eabcbba51704a08e6"
 dependencies = [
  "base64",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "metrics",
  "metrics-util",
  "quanta",
@@ -2822,7 +2822,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "metrics",
  "num_cpus",
  "ordered-float",
@@ -4060,7 +4060,7 @@ checksum = "815cc8a37159a463064825246cadb07961e25cd9885908606f6d08a98d8f8874"
 dependencies = [
  "bytes",
  "hashbrown 0.17.1",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "munge",
  "ptr_meta",
  "rancor",
@@ -4635,7 +4635,7 @@ dependencies = [
  "futures-util",
  "hashbrown 0.15.5",
  "hashlink",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "log",
  "memchr",
  "once_cell",
@@ -5157,7 +5157,7 @@ version = "0.22.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
 dependencies = [
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "serde",
  "serde_spanned",
  "toml_datetime",
@@ -6054,7 +6054,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "hyper",
  "hyper-util",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "itertools",
  "libc",
  "log",
@@ -6236,7 +6236,7 @@ dependencies = [
  "crossbeam-utils",
  "displaydoc",
  "flate2",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "memchr",
  "thiserror 2.0.18",
  "zopfli",
@@ -6250,7 +6250,7 @@ checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
 dependencies = [
  "crc32fast",
  "flate2",
- "indexmap 2.14.0",
+ "indexmap 2.14.1",
  "memchr",
  "typed-path",
 ]
