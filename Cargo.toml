@@ -42,7 +42,7 @@ actix-web = { version = "4", default-features = false, features = [
     "compat",
     "ws",
 ] }
-actix-ws = "0.3"
+actix-ws = "0.4"
 anyhow = "1"
 argon2 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
