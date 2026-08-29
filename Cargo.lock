@@ -3323,7 +3323,7 @@ name = "pharos-discovery"
 version = "0.0.0"
 dependencies = [
  "pharos-core",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3426,7 +3426,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "sonic-rs",
  "tempfile",
  "thiserror 1.0.69",

@@ -8,7 +8,7 @@ publish.workspace = true
 
 [dependencies]
 pharos-core = { path = "../pharos-core" }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
 tracing.workspace = true
