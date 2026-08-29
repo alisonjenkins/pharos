@@ -406,7 +406,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -417,7 +417,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1298,9 +1298,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-cli-config"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c000f584ddf608e2b272b3074bf11512a474eeeb2eb85a1915f276ce5c4a8615"
+checksum = "322d10f47effebd85ee0662a2cb083ff920d40dd6295a4afd8cfa4f9bc2e05c6"
 dependencies = [
  "wasm-bindgen",
 ]
@@ -1354,9 +1354,9 @@ checksum = "96007ed6cbad951dfed82d83c581aabd95bc591f351f5666d454ddbe7845b324"
 
 [[package]]
 name = "dioxus-devtools"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2349cedbdf1b429df1f1bea61fdee0ad3dae7b2548eedfbeca82710122a57da0"
+checksum = "434cebb282b3f820a341582ebfd37dab907d5a25c3eeafd87802468afcd2a959"
 dependencies = [
  "dioxus-cli-config",
  "dioxus-core",
@@ -1372,9 +1372,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-devtools-types"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ab9b0f7565d1916b70915f59b89ea8054ef0a9d67a364a32bbee68ef5f3818d"
+checksum = "dfd6f3475e38c93be245a664a9ce11679a8f2b99832620705cf7837f42aa39ce"
 dependencies = [
  "dioxus-core",
  "serde",
@@ -1383,9 +1383,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-document"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37e3a5bec7ffc999ff23446a487eb5cd86111d1574a23533dd3f8b3c69a53a22"
+checksum = "2f6fadd5c6d886b48b762820abae1a08142a2159f8a1136c0466b4b4ed9f547e"
 dependencies = [
  "dioxus-core",
  "dioxus-core-macro",
@@ -1402,9 +1402,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-history"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a15232302d1933015fcf2d6fe9e286ad36f6e9c205a546089a0f326023bb0d2"
+checksum = "2404b77d4441e694a5e93afb5c9a729efb26a3f6920f769cfe6cfedf5c7ac210"
 dependencies = [
  "dioxus-core",
  "tracing",
@@ -1464,9 +1464,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-interpreter-js"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11999d6eb5bb179a9512dad30e5de408aab66f2cb65de9098c9fbe02927e2978"
+checksum = "faa22cc3431e7efdbae28069542a1763c977d5edbe4d4fbfb0b7667b9c9966e9"
 dependencies = [
  "js-sys",
  "lazy-js-bundle",
@@ -1545,9 +1545,9 @@ dependencies = [
 
 [[package]]
 name = "dioxus-web"
-version = "0.7.9"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc0a0be76b404e8242a597db0fb239d05f8dee4e7856bc1fc7144f7e244822fd"
+checksum = "481093233d789c5ffbdde66e7970e803b01a199a7ab0c0f8ef84c65d30b7384f"
 dependencies = [
  "dioxus-cli-config",
  "dioxus-core",
@@ -1671,7 +1671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2474,7 +2474,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2968,7 +2968,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3760,7 +3760,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4158,7 +4158,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4544,7 +4544,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4941,7 +4941,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
