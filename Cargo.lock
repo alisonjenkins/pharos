@@ -6336,7 +6336,7 @@ dependencies = [
  "socket2 0.5.10",
  "socket2 0.6.5",
  "sqlx",
- "sqlx-core 0.8.6",
+ "sqlx-core 0.9.0",
  "sqlx-macros 0.9.0",
  "sqlx-macros-core 0.9.0",
  "sqlx-postgres 0.8.6",
