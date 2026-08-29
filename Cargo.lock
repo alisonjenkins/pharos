@@ -2721,6 +2721,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
 
 [[package]]
+name = "lzma-rust2"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6effa5c575f68109664a511f378c0e170888e33a426694ee0910a673762bd47"
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4362,7 +4368,7 @@ checksum = "20acd38118edb830eb5a0bfacaf83c687b9995f48d6983cdac3cb18ce1d571cc"
 dependencies = [
  "crc32fast",
  "js-sys",
- "lzma-rust2",
+ "lzma-rust2 0.18.1",
  "wasm-bindgen",
 ]
 
@@ -6063,7 +6069,7 @@ dependencies = [
  "itertools",
  "libc",
  "log",
- "lzma-rust2",
+ "lzma-rust2 0.20.0",
  "memchr",
  "metrics-util",
  "mio",
