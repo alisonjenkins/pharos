@@ -18,7 +18,7 @@ publish = false
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
@@ -80,7 +80,7 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
