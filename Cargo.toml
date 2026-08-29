@@ -119,7 +119,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
-toml = "0.8"
+toml = "0.9"
 tracing = "0.1"
 tracing-actix-web = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
