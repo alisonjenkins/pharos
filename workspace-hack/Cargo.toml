@@ -67,7 +67,7 @@ socket2-d8f496e17d97b5cb = { package = "socket2", version = "0.5", default-featu
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
-sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
+sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
@@ -119,7 +119,7 @@ sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki
 sqlx-macros = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
 sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
 sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
-sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
+sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
 syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
