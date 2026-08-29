@@ -28,7 +28,7 @@ digest = { version = "0.10", features = ["mac", "std"] }
 dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
-foldhash = { version = "0.1" }
+foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -88,7 +88,7 @@ derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "
 digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
-foldhash = { version = "0.1" }
+foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
