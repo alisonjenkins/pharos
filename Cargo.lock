@@ -1671,7 +1671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2283,7 +2283,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -2474,7 +2474,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2717,6 +2717,12 @@ name = "lzma-rust2"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "243cb2271683c2855cad62142cbf38199db439b1b1e1ccdd5a011342894dd7cc"
+
+[[package]]
+name = "lzma-rust2"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6effa5c575f68109664a511f378c0e170888e33a426694ee0910a673762bd47"
 
 [[package]]
 name = "markup5ever"
@@ -3720,7 +3726,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3758,9 +3764,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4158,7 +4164,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4360,7 +4366,7 @@ checksum = "20acd38118edb830eb5a0bfacaf83c687b9995f48d6983cdac3cb18ce1d571cc"
 dependencies = [
  "crc32fast",
  "js-sys",
- "lzma-rust2",
+ "lzma-rust2 0.18.1",
  "wasm-bindgen",
 ]
 
@@ -4941,7 +4947,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5769,7 +5775,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6059,7 +6065,7 @@ dependencies = [
  "itertools",
  "libc",
  "log",
- "lzma-rust2",
+ "lzma-rust2 0.20.0",
  "memchr",
  "metrics-util",
  "mio",
