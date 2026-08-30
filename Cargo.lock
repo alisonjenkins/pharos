@@ -6339,7 +6339,7 @@ dependencies = [
  "sqlx-core 0.9.0",
  "sqlx-macros 0.9.0",
  "sqlx-macros-core 0.9.0",
- "sqlx-postgres 0.8.6",
+ "sqlx-postgres 0.9.0",
  "sqlx-sqlite 0.9.0",
  "stable_deref_trait",
  "syn 2.0.119",
