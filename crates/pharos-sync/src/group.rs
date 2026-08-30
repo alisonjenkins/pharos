@@ -141,6 +141,22 @@ pub const MEMBER_TTL_MS: u64 = 150_000;
 /// it is never quietly thinned. Sized far beyond any observed blackout.
 pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 
+/// How long a member's socket must have been gone before its reconnect
+/// forces a real `Seek` rather than trusting the ordinary catch-up `Play`
+/// alone to reposition it.
+///
+/// Live 2026-08-30 (Men in Black): a WAN member's socket dropped and came
+/// back repeatedly over 90 minutes (`pharos_syncplay_socket_gone_seconds`).
+/// Every single reconnect already ran the existing catch-up path and sent a
+/// correctly-extrapolated `Play{position_ms}` — and she still drifted
+/// minutes behind. A `Play` is what an idle-paused player expects to resume
+/// FROM; jellyfin-web's own comments elsewhere note it does not reliably
+/// reposition a player that thinks it never stopped. Only a `Seek` is
+/// documented (via `schedulePause`) to force a hard `currentTime` set. 30s is
+/// comfortably past ordinary command/ack chatter, so it fires only on a
+/// stall long enough that passive drift correction has already failed.
+pub const FORCE_RESEEK_AFTER_OUTAGE_MS: u64 = 30_000;
+
 /// How often the actor sweeps for TTL-expired members.
 const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
 
@@ -637,14 +653,18 @@ impl SocketGoneCause {
 /// Record how long a member's socket was gone, once it comes back. Called from
 /// every reconnect path (`AddMember` re-add, `ResyncMember`) — the histogram
 /// only answers "how long do reconnects really take" if it is exhaustive.
-fn record_socket_return(rec: &mut MemberRec) {
-    if let Some((since, cause)) = rec.socket_gone_since.take() {
-        metrics::histogram!(
-            "pharos_syncplay_socket_gone_seconds",
-            "cause" => cause.label(),
-        )
-        .record(since.elapsed().as_secs_f64());
-    }
+/// Returns the outage duration so a long one can also trigger a forced reseek
+/// (see [`FORCE_RESEEK_AFTER_OUTAGE_MS`]) — `None` when the member's socket
+/// was never marked gone (an ordinary re-add, not a reconnect).
+fn record_socket_return(rec: &mut MemberRec) -> Option<f64> {
+    let (since, cause) = rec.socket_gone_since.take()?;
+    let outage_secs = since.elapsed().as_secs_f64();
+    metrics::histogram!(
+        "pharos_syncplay_socket_gone_seconds",
+        "cause" => cause.label(),
+    )
+    .record(outage_secs);
+    Some(outage_secs)
 }
 
 /// One entry in the group's play queue.
@@ -1302,6 +1322,63 @@ impl GroupState {
                 );
             }
         }
+    }
+
+    /// Force ONE returning member to reseat its playhead via a real `Seek`,
+    /// instead of trusting `send_catch_up`'s passive `Play{position_ms}` to
+    /// reposition a client that has been stalled long enough
+    /// ([`FORCE_RESEEK_AFTER_OUTAGE_MS`]) that drift correction has already
+    /// failed once this reconnect cycle.
+    ///
+    /// Deliberately does NOT go through `enter_waiting`/`resolve_waiting`: that
+    /// machinery's resume (`start_playing`) broadcasts `Play` to the WHOLE
+    /// group, which would re-hitch alison and jana's already-fine playback for
+    /// the sake of correcting jana alone. Nobody else needs to wait on this
+    /// member's ack — the rest of the group already committed to the current
+    /// timeline — so this sends `Seek` then `Play` directly to just this one
+    /// sink and touches no shared group state. Idle when a group-wide gate is
+    /// already open (own `state.waiting`), a live buffering freeze, or the
+    /// group isn't Playing: this is a courtesy correction for the common
+    /// steady-Playing case, not a reason to contend with whatever the shared
+    /// gate machinery is already reasoning about.
+    fn force_reseek_one(&self, member_id: MemberId, outage_secs: f64) {
+        if self.waiting.is_some() || self.group_paused_due_to_buffering {
+            return;
+        }
+        let PlaybackState::Playing {
+            position_ms,
+            anchor_server_ms,
+        } = self.playback
+        else {
+            return;
+        };
+        let server_ms = self.server_ms_now();
+        let elapsed = server_ms.saturating_sub(anchor_server_ms);
+        let at_server_ms = server_ms + MIN_LEAD_MS;
+        let sent_position_ms =
+            clamp_to_runtime(position_ms + elapsed, self.current_item_runtime_ms());
+        metrics::counter!("pharos_syncplay_forced_reseek_total").increment(1);
+        tracing::info!(
+            group = %self.id,
+            member = %member_id,
+            outage_secs,
+            position_ms = sent_position_ms,
+            "syncplay: forcing a real seek for a member returning from a long socket outage"
+        );
+        self.send_one(
+            member_id,
+            ServerMsg::Seek {
+                at_server_ms,
+                position_ms: sent_position_ms,
+            },
+        );
+        self.send_one(
+            member_id,
+            ServerMsg::Play {
+                at_server_ms,
+                position_ms: sent_position_ms,
+            },
+        );
     }
 
     /// Broadcast the current queue to every member (Jellyfin `PlayQueue`).
@@ -2571,7 +2648,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 rec.last_seen = tokio::time::Instant::now();
                 // The socket is back — the member is a gate follower again.
                 rec.connected = true;
-                record_socket_return(rec);
+                let outage_secs = record_socket_return(rec);
                 let summaries = state.member_summaries();
                 let leader = state.leader.unwrap_or(member_id);
                 let _ = reply.send(Joined {
@@ -2588,6 +2665,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     },
                 );
                 state.send_catch_up(member_id);
+                if let Some(secs) =
+                    outage_secs.filter(|s| *s * 1000.0 >= FORCE_RESEEK_AFTER_OUTAGE_MS as f64)
+                {
+                    state.force_reseek_one(member_id, secs);
+                }
                 return;
             }
             let was_empty = state.members.is_empty();
@@ -2665,10 +2747,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // gate) is untouched. Ignored if the member isn't in the roster.
             if state.members.contains_key(&member_id) {
                 // The socket is back — the member is a gate follower again.
-                if let Some(rec) = state.members.get_mut(&member_id) {
+                let outage_secs = state.members.get_mut(&member_id).and_then(|rec| {
                     rec.connected = true;
-                    record_socket_return(rec);
-                }
+                    record_socket_return(rec)
+                });
                 // A reconnect (page reload / deploy rollover) hands a FRESH
                 // jellyfin-web Manager whose `groupInfo` is null and whose
                 // SyncPlay is not enabled. Lead the catch-up with `Joined`
@@ -2688,6 +2770,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     },
                 );
                 state.send_catch_up(member_id);
+                if let Some(secs) =
+                    outage_secs.filter(|s| *s * 1000.0 >= FORCE_RESEEK_AFTER_OUTAGE_MS as f64)
+                {
+                    state.force_reseek_one(member_id, secs);
+                }
             } else {
                 // B168 — the socket came back holding an attachment to THIS
                 // group, but the roster no longer has this member: it was
@@ -4138,6 +4225,95 @@ mod tests {
         assert!(
             (secs - 120.0).abs() < 1.0,
             "must record the real gap (120s), got {secs}"
+        );
+    }
+
+    /// 2026-08-30 (Men in Black) — a member whose socket was gone long enough
+    /// that the ordinary catch-up `Play` had already failed to reposition it
+    /// once must get a real `Seek` on reconnect, not another `Play`.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_socket_outage_forces_a_seek_on_reconnect() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        tokio::time::advance(Duration::from_millis(FORCE_RESEEK_AFTER_OUTAGE_MS + 5_000)).await;
+
+        let mut rx2b = join(&h, &sinks, m2, "second").await;
+        let _ = snapshot_of(&h).await;
+        drop(rx2);
+
+        let mut saw_seek_then_play = false;
+        let mut saw_seek = false;
+        while let Ok(msg) = rx2b.try_recv() {
+            match msg {
+                ServerMsg::Seek { .. } => saw_seek = true,
+                ServerMsg::Play { .. } if saw_seek => saw_seek_then_play = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_seek_then_play,
+            "a member returning from a >{FORCE_RESEEK_AFTER_OUTAGE_MS}ms outage must get a Seek \
+             followed by a Play — the ordinary catch-up Play alone already failed to reseat it once"
+        );
+    }
+
+    /// The forced reseek is a correction for a GENUINE stall, not chatter on
+    /// every ordinary reconnect — a page reload or a brief WiFi blip must not
+    /// pay for a Seek nobody needed.
+    #[tokio::test(start_paused = true)]
+    async fn a_brief_socket_blip_does_not_force_a_reseek() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::MemberSocketLost { member_id: m2 })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let mut rx2b = join(&h, &sinks, m2, "second").await;
+        let _ = snapshot_of(&h).await;
+        drop(rx2);
+
+        let mut saw_seek = false;
+        let mut saw_play = false;
+        while let Ok(msg) = rx2b.try_recv() {
+            match msg {
+                ServerMsg::Seek { .. } => saw_seek = true,
+                ServerMsg::Play { .. } => saw_play = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_play,
+            "the ordinary catch-up must still resume the member"
+        );
+        assert!(
+            !saw_seek,
+            "a brief blip well under the threshold must not force an extra Seek"
         );
     }
 
