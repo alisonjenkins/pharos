@@ -157,6 +157,11 @@ pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 /// stall long enough that passive drift correction has already failed.
 pub const FORCE_RESEEK_AFTER_OUTAGE_MS: u64 = 30_000;
 
+/// [`FORCE_RESEEK_AFTER_OUTAGE_MS`] in seconds, matching the unit
+/// `record_socket_return` measures in — converted once so callers compare
+/// like units directly instead of scaling the measured value at each site.
+const FORCE_RESEEK_AFTER_OUTAGE_SECS: f64 = FORCE_RESEEK_AFTER_OUTAGE_MS as f64 / 1000.0;
+
 /// How often the actor sweeps for TTL-expired members.
 const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
 
@@ -1330,17 +1335,30 @@ impl GroupState {
     /// ([`FORCE_RESEEK_AFTER_OUTAGE_MS`]) that drift correction has already
     /// failed once this reconnect cycle.
     ///
+    /// Sends `Seek` ALONE, not `Seek` then `Play` — a reconnect is exactly
+    /// when a client's clock offset is coldest, and jellyfin-web's
+    /// pre-time-sync command queue keeps only the LAST queued command (the
+    /// `Pause` case above survives it for the same reason: it is the only
+    /// message in flight). Two back-to-back sends here would risk the queue
+    /// collapsing to just the trailing `Play`, silently dropping the `Seek`
+    /// and reintroducing the exact drift this exists to fix. A real `Seek`
+    /// is a player transition, so V139 (`jellyfin-web posts Ready only on a
+    /// transition`) guarantees this member reports back; `MemberReady`'s
+    /// existing "no gate open, group already Playing" branch already heals a
+    /// late Ready with a freshly-computed `send_playback_state` — reused
+    /// as-is rather than duplicated here.
+    ///
     /// Deliberately does NOT go through `enter_waiting`/`resolve_waiting`: that
     /// machinery's resume (`start_playing`) broadcasts `Play` to the WHOLE
     /// group, which would re-hitch alison and jana's already-fine playback for
     /// the sake of correcting jana alone. Nobody else needs to wait on this
     /// member's ack — the rest of the group already committed to the current
-    /// timeline — so this sends `Seek` then `Play` directly to just this one
-    /// sink and touches no shared group state. Idle when a group-wide gate is
-    /// already open (own `state.waiting`), a live buffering freeze, or the
-    /// group isn't Playing: this is a courtesy correction for the common
-    /// steady-Playing case, not a reason to contend with whatever the shared
-    /// gate machinery is already reasoning about.
+    /// timeline — so this sends directly to just this one sink and touches no
+    /// shared group state. Idle when a group-wide gate is already open (own
+    /// `state.waiting`), a live buffering freeze, or the group isn't Playing:
+    /// this is a courtesy correction for the common steady-Playing case, not a
+    /// reason to contend with whatever the shared gate machinery is already
+    /// reasoning about.
     fn force_reseek_one(&self, member_id: MemberId, outage_secs: f64) {
         if self.waiting.is_some() || self.group_paused_due_to_buffering {
             return;
@@ -1368,13 +1386,6 @@ impl GroupState {
         self.send_one(
             member_id,
             ServerMsg::Seek {
-                at_server_ms,
-                position_ms: sent_position_ms,
-            },
-        );
-        self.send_one(
-            member_id,
-            ServerMsg::Play {
                 at_server_ms,
                 position_ms: sent_position_ms,
             },
@@ -2665,9 +2676,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     },
                 );
                 state.send_catch_up(member_id);
-                if let Some(secs) =
-                    outage_secs.filter(|s| *s * 1000.0 >= FORCE_RESEEK_AFTER_OUTAGE_MS as f64)
-                {
+                if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
                     state.force_reseek_one(member_id, secs);
                 }
                 return;
@@ -2770,9 +2779,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     },
                 );
                 state.send_catch_up(member_id);
-                if let Some(secs) =
-                    outage_secs.filter(|s| *s * 1000.0 >= FORCE_RESEEK_AFTER_OUTAGE_MS as f64)
-                {
+                if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
                     state.force_reseek_one(member_id, secs);
                 }
             } else {
@@ -4230,7 +4237,11 @@ mod tests {
 
     /// 2026-08-30 (Men in Black) — a member whose socket was gone long enough
     /// that the ordinary catch-up `Play` had already failed to reposition it
-    /// once must get a real `Seek` on reconnect, not another `Play`.
+    /// once must ALSO get a real `Seek` on reconnect. Sent alone (never
+    /// immediately after another message to the same sink): jellyfin-web's
+    /// pre-time-sync command queue keeps only the LAST queued command, so a
+    /// `Seek` immediately followed by a `Play` risks the queue collapsing to
+    /// just the `Play` and silently dropping the correction.
     #[tokio::test(start_paused = true)]
     async fn a_long_socket_outage_forces_a_seek_on_reconnect() {
         let (h, sinks, mut rx1, m1) = fresh().await;
@@ -4255,19 +4266,25 @@ mod tests {
         let _ = snapshot_of(&h).await;
         drop(rx2);
 
-        let mut saw_seek_then_play = false;
         let mut saw_seek = false;
+        let mut messages_after_seek = 0u32;
         while let Ok(msg) = rx2b.try_recv() {
-            match msg {
-                ServerMsg::Seek { .. } => saw_seek = true,
-                ServerMsg::Play { .. } if saw_seek => saw_seek_then_play = true,
-                _ => {}
+            if saw_seek {
+                messages_after_seek += 1;
+            }
+            if matches!(msg, ServerMsg::Seek { .. }) {
+                saw_seek = true;
             }
         }
         assert!(
-            saw_seek_then_play,
-            "a member returning from a >{FORCE_RESEEK_AFTER_OUTAGE_MS}ms outage must get a Seek \
-             followed by a Play — the ordinary catch-up Play alone already failed to reseat it once"
+            saw_seek,
+            "a member returning from a >{FORCE_RESEEK_AFTER_OUTAGE_MS}ms outage must get a real \
+             Seek — the ordinary catch-up Play alone already failed to reseat it once"
+        );
+        assert_eq!(
+            messages_after_seek, 0,
+            "the Seek must be the LAST message sent on reconnect: a trailing Play risks the \
+             client's pre-time-sync queue collapsing to just the Play and dropping the Seek"
         );
     }
 
