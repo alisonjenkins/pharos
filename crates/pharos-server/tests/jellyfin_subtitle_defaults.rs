@@ -183,3 +183,68 @@ async fn none_when_no_subtitle_tracks() {
     let (state, token) = seed(vec![]).await;
     assert_eq!(fetch_default(state, token).await, None);
 }
+
+// 2026-08-29 — this ladder picked the container's default PGS track and
+// handed its index straight to `DefaultSubtitleStreamIndex`, oblivious to
+// `resolve_selected_subtitle`'s separate rule that an unforced image default
+// is too expensive to auto-burn. jellyfin-web pre-selected the advertised
+// default and nothing rendered: the burn path had silently declined it.
+// `Some(4)` here (not `Some(3)`, the container's actual default) is the fix.
+
+#[actix_web::test]
+async fn declines_an_unforced_image_default_and_falls_back_to_a_renderable_track() {
+    let tracks = vec![
+        SubtitleTrack {
+            stream_index: 3,
+            language: Some("eng".into()),
+            codec: Some("hdmv_pgs_subtitle".into()),
+            title: Some("Signs & Songs".into()),
+            is_default: true,
+            is_forced: false,
+            is_hearing_impaired: false,
+        },
+        SubtitleTrack {
+            stream_index: 4,
+            language: Some("eng".into()),
+            codec: Some("subrip".into()),
+            title: None,
+            is_default: false,
+            is_forced: false,
+            is_hearing_impaired: false,
+        },
+    ];
+    let (state, token) = seed(tracks).await;
+    assert_eq!(fetch_default(state, token).await, Some(4));
+}
+
+#[actix_web::test]
+async fn declines_an_unforced_image_default_with_no_renderable_alternative() {
+    let tracks = vec![SubtitleTrack {
+        stream_index: 3,
+        language: Some("eng".into()),
+        codec: Some("hdmv_pgs_subtitle".into()),
+        title: Some("Signs & Songs".into()),
+        is_default: true,
+        is_forced: false,
+        is_hearing_impaired: false,
+    }];
+    let (state, token) = seed(tracks).await;
+    assert_eq!(fetch_default(state, token).await, None);
+}
+
+#[actix_web::test]
+async fn a_forced_image_default_still_selects_and_burns() {
+    // B44's Avatar case: a forced track is dialogue the viewer cannot follow
+    // without, not a convenience — the cost-decline must not touch it.
+    let tracks = vec![SubtitleTrack {
+        stream_index: 3,
+        language: Some("nav".into()),
+        codec: Some("hdmv_pgs_subtitle".into()),
+        title: None,
+        is_default: true,
+        is_forced: true,
+        is_hearing_impaired: false,
+    }];
+    let (state, token) = seed(tracks).await;
+    assert_eq!(fetch_default(state, token).await, Some(3));
+}
