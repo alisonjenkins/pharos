@@ -2056,6 +2056,13 @@ async fn vp9_audio_file(
     // so that race has one outcome. The shape is recorded BEFORE the rewrite,
     // because how often a deferred init reached this point is the signal.
     if name == "init.mp4" {
+        crate::session_start::note_segment_serve(
+            &state.segment_refetches,
+            q.play_session_id.as_deref(),
+            media_id,
+            crate::session_start::INIT_SEG_VP9_AUDIO,
+            "vp9-audio-init",
+        );
         fmp4::record_audio_init_shape(&bytes, media_id, file.session_start_seg);
         // Only the SESSION's own `-output_ts_offset` comes off. A from-0
         // session's offset is 0, so its init is returned untouched — the empty
@@ -2154,6 +2161,13 @@ async fn vp9_init(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        crate::session_start::INIT_SEG_VP9,
+        "vp9-init",
+    );
     let mut opts = vp9_segment_opts(
         &state,
         &req,
@@ -2340,6 +2354,13 @@ async fn h264cmaf_init(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_item(&state, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
+    crate::session_start::note_segment_serve(
+        &state.segment_refetches,
+        q.play_session_id.as_deref(),
+        id_num,
+        crate::session_start::INIT_SEG_H264CMAF,
+        "h264cmaf-init",
+    );
     let mut opts = fmp4_segment_opts(
         &state,
         &req,

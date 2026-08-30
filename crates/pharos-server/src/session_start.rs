@@ -151,6 +151,17 @@ const REFETCH_THRESHOLD: u32 = 5;
 /// warning, which is far cheaper than an LRU on the segment hot path.
 const MAX_TRACKED_REFETCHES: usize = 16_384;
 
+/// An init segment has no real segment index, but a client stuck re-requesting
+/// it is exactly [`SegmentRefetches`]'s failure shape — the 2026-08-29 SyncPlay
+/// wedge (a Code Geass episode change) was one browser tab re-fetching
+/// `h264cmaf/init.mp4` 291 times in 27s, never advancing to a media segment,
+/// while every existing refetch call site only watched numbered segments. One
+/// sentinel per rendition, chosen far outside any real segment count, so a
+/// storm on one init is never conflated with another under the same session.
+pub const INIT_SEG_H264CMAF: u32 = u32::MAX;
+pub const INIT_SEG_VP9: u32 = u32::MAX - 1;
+pub const INIT_SEG_VP9_AUDIO: u32 = u32::MAX - 2;
+
 /// Counts repeat serves of one segment to one play session (T126).
 ///
 /// The gap this fills: on 2026-08-16 a viewer stared at a frozen frame for
@@ -275,6 +286,42 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(r.note(None, 7), None);
         }
+    }
+
+    /// The init sentinels must never collide with each other or with a real
+    /// segment index — a collision would conflate a video-init storm with an
+    /// audio-init storm (or with ordinary segment 0 traffic) under the same
+    /// session, hiding exactly the distinction this exists to draw.
+    #[test]
+    fn init_sentinels_are_distinct_from_each_other_and_real_segments() {
+        let sentinels = [INIT_SEG_H264CMAF, INIT_SEG_VP9, INIT_SEG_VP9_AUDIO];
+        for (i, a) in sentinels.iter().enumerate() {
+            for b in &sentinels[i + 1..] {
+                assert_ne!(a, b, "init sentinels must be pairwise distinct");
+            }
+            assert!(
+                *a > 1_000_000,
+                "sentinel must sit far outside any real segment count"
+            );
+        }
+    }
+
+    /// A client stuck re-requesting an init segment is the T126 failure shape
+    /// exactly, so it must be reported the same way (2026-08-29 SyncPlay wedge:
+    /// one browser tab re-fetched `h264cmaf/init.mp4` 291 times in 27s and this
+    /// mechanism had no call site watching it).
+    #[test]
+    fn a_repeatedly_refetched_init_segment_is_reported() {
+        let r = SegmentRefetches::new();
+        let psid = Some("stuck-tab");
+        for _ in 1..REFETCH_THRESHOLD {
+            assert_eq!(r.note(psid, INIT_SEG_H264CMAF), None);
+        }
+        assert_eq!(
+            r.note(psid, INIT_SEG_H264CMAF),
+            Some(REFETCH_THRESHOLD),
+            "an init-segment storm must cross the same threshold a media-segment storm does"
+        );
     }
     use super::*;
     use metrics_util::debugging::DebuggingRecorder;
