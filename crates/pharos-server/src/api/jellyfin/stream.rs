@@ -100,7 +100,7 @@ impl<B> Drop for MeteredBody<B> {
             "route" => self.route.label(),
         )
         .increment(1);
-        if self.sent > 0 || elapsed >= BODY_INCOMPLETE_WARN_AFTER {
+        if elapsed >= BODY_INCOMPLETE_WARN_AFTER {
             tracing::warn!(
                 media.id = self.media_id,
                 route = self.route.label(),
@@ -138,7 +138,12 @@ impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for M
                 this.clock.store(now, Ordering::Relaxed);
                 this.sent += chunk.len() as u64;
             }
-            Poll::Ready(None) => {
+            // `MessageBody`/`Stream` do not guarantee fused behaviour — a
+            // caller MAY poll again after `None` or `Err`. Guard on `settled`
+            // so a re-poll can't re-fire these: it already recorded a
+            // definite outcome once, and metrics::counter!.increment(1) has
+            // no "only if new" form.
+            Poll::Ready(None) if !this.settled => {
                 this.settled = true;
                 metrics::counter!(
                     "pharos_stream_body_finished_total",
@@ -146,7 +151,7 @@ impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for M
                 )
                 .increment(1);
             }
-            Poll::Ready(Some(Err(_))) => {
+            Poll::Ready(Some(Err(_))) if !this.settled => {
                 this.settled = true;
                 tracing::warn!(
                     media.id = this.media_id,
@@ -161,7 +166,9 @@ impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for M
                 )
                 .increment(1);
             }
-            Poll::Pending => {}
+            // Pending, an already-`settled` re-poll of `None`/`Err`, or (via
+            // the `Ok` arm above) plain data — nothing further to record.
+            _ => {}
         }
         polled
     }
@@ -1541,6 +1548,52 @@ mod tests {
         );
     }
 
+    /// `MessageBody`/`Stream` do not guarantee fused behaviour — a caller MAY
+    /// poll again after `None`. That re-poll must not re-increment the
+    /// finished counter: `settled` already recorded the outcome once.
+    #[tokio::test]
+    async fn repolling_after_a_natural_end_does_not_double_count() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let body = MeteredBody {
+            inner: actix_web::web::Bytes::from_static(b"payload"),
+            clock: Arc::new(AtomicI64::new(0)),
+            media_id: 42,
+            route: StreamBodyRoute::DirectPlay,
+            total: Some(7),
+            sent: 0,
+            started: Instant::now(),
+            settled: false,
+        };
+        {
+            let mut body = std::pin::pin!(body);
+            let _ = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            let second = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(second.is_none());
+            // A THIRD poll, past the natural end already observed above.
+            let third = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(third.is_none(), "Bytes keeps returning None once exhausted");
+        }
+
+        let count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                (ck.key().name() == "pharos_stream_body_finished_total").then_some(v)
+            })
+            .expect("finished counter must exist");
+        assert!(
+            matches!(count, DebugValue::Counter(1)),
+            "a re-poll past the natural end must not re-increment the finished \
+             counter — got {count:?}"
+        );
+    }
+
     #[tokio::test]
     async fn byte_offset_from_ticks_uses_bitrate_when_available() {
         // 1 Mbps source = 125_000 bytes/s.
@@ -1675,6 +1728,24 @@ mod tests {
         );
         assert_eq!(DirectPlayClient::Browser.label(), "browser");
         assert_eq!(DirectPlayClient::Native.label(), "native");
+    }
+
+    // Same contract as `DirectPlayDelivery`/`DirectPlayClient` above:
+    // `StreamBodyRoute::label()` feeds `route` on `pharos_stream_body_*_total`.
+    #[::core::prelude::v1::test]
+    fn stream_body_route_labels_are_distinct_and_stable() {
+        let all = [
+            StreamBodyRoute::DirectPlay,
+            StreamBodyRoute::Resume,
+            StreamBodyRoute::ProgressiveWebm,
+            StreamBodyRoute::AudioRemux,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), all.len(), "route labels must be distinct");
+        assert_eq!(StreamBodyRoute::DirectPlay.label(), "direct_play");
+        assert_eq!(StreamBodyRoute::Resume.label(), "resume");
+        assert_eq!(StreamBodyRoute::ProgressiveWebm.label(), "progressive_webm");
+        assert_eq!(StreamBodyRoute::AudioRemux.label(), "audio_remux");
     }
 
     // The classifier is the input to the capping decision, so it has to agree
