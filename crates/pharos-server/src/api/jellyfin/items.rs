@@ -2016,73 +2016,95 @@ fn resolve_selected_subtitle<'a>(
         // the person paying it — and where, as the selection log has noted
         // since B104, a client that omits the field rather than sending -1
         // cannot turn the resulting burn off again.
-        None => {
-            let default = probe.subtitle_tracks.iter().find(|t| t.is_default)?;
-            let burns = |t: &pharos_core::SubtitleTrack| {
-                decide_subtitle_delivery(t.codec.as_deref(), client_profiles)
-                    == SubtitleDelivery::Burn
-            };
-            // Narrowed twice, on purpose.
-            //
-            // By CODEC: an unrenderable ASS default is still burned (B104 —
-            // converting it to WebVTT drops positioning and fonts, which the
-            // Android app rendered as black bars), because a text overlay
-            // costs a fraction of a bitmap one. PGS/VOBSUB is the measured
-            // expensive case and is what this rule is about.
-            //
-            // By FORCED: a forced track is not a convenience, it is dialogue
-            // the viewer cannot follow without — B44's Avatar case, where the
-            // Na'vi sections played unsubtitled until the default+forced PGS
-            // was baked in. Its cost is the price of an intelligible film, and
-            // it is bounded: forced tracks cover a fraction of the runtime.
-            // What this declines is the UNFORCED image default — a full-frame
-            // burn for the whole film that nobody asked for.
-            let image_default = default
-                .codec
-                .as_deref()
-                .is_some_and(|c| is_image_subtitle_codec(&c.to_ascii_lowercase()));
-            if !(image_default && !default.is_forced && burns(default)) {
-                metrics::counter!(
-                    "pharos_subtitle_autoselect_total",
-                    "outcome" => "default",
-                )
-                .increment(1);
-                return Some(default);
-            }
-            // The default would cost a full-frame re-encode nobody asked for.
-            // Prefer any track this client can render itself: the viewer still
-            // gets subtitles, at no encoding cost at all.
-            if let Some(cheap) = probe.subtitle_tracks.iter().find(|t| !burns(t)) {
-                metrics::counter!(
-                    "pharos_subtitle_autoselect_total",
-                    "outcome" => "swapped_to_external",
-                )
-                .increment(1);
-                tracing::info!(
-                    subtitle.declined = default.stream_index,
-                    subtitle.declined_codec = ?default.codec,
-                    subtitle.chosen = cheap.stream_index,
-                    subtitle.chosen_codec = ?cheap.codec,
-                    "the default subtitle could only be delivered by burning it \
-                     in; auto-selected an externally-renderable track instead"
-                );
-                return Some(cheap);
-            }
-            metrics::counter!(
-                "pharos_subtitle_autoselect_total",
-                "outcome" => "declined_burn",
-            )
-            .increment(1);
-            tracing::info!(
-                subtitle.index = default.stream_index,
-                subtitle.codec = ?default.codec,
-                "declining to auto-select an image subtitle nobody requested: \
-                 its only delivery is a full-frame burn, measured above \
-                 realtime, and the client cannot turn it off"
-            );
-            None
-        }
+        None => probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.is_default)
+            .and_then(|default| accept_or_decline_uninvited_burn(default, probe, client_profiles)),
     }
+}
+
+/// Veto an AUTO-PICKED (never explicitly requested) subtitle candidate that
+/// would silently commit the session to an above-realtime full-frame burn
+/// (T110) — substituting a cheap externally-renderable track when one exists,
+/// declining outright otherwise. Applies regardless of which ladder produced
+/// the candidate: `resolve_selected_subtitle`'s container-default lookup and
+/// `stream_select::default_subtitle_stream_index`'s mode/language-aware ladder
+/// (P12) both hand it a track nobody asked for, and the cost is the same
+/// either way. The two ladders disagreeing about the ANSWER is fine — the P12
+/// ladder can legitimately prefer a language-matched track the container
+/// never flagged default — but disagreeing about whether THAT answer is
+/// affordable is what let `DefaultSubtitleStreamIndex` point at a track the
+/// burn path had separately and silently declined to ever deliver, live
+/// 2026-08-29 (Code Geass: the container-default PGS track was a sparse
+/// signs/songs-only track; jellyfin-web pre-selected it as "English" and
+/// nothing rendered during dialogue).
+///
+/// Narrowed twice, on purpose.
+///
+/// By CODEC: an unrenderable ASS default is still burned (B104 — converting it
+/// to WebVTT drops positioning and fonts, which the Android app rendered as
+/// black bars), because a text overlay costs a fraction of a bitmap one.
+/// PGS/VOBSUB is the measured expensive case and is what this rule is about.
+///
+/// By FORCED: a forced track is not a convenience, it is dialogue the viewer
+/// cannot follow without — B44's Avatar case, where the Na'vi sections played
+/// unsubtitled until the default+forced PGS was baked in. Its cost is the
+/// price of an intelligible film, and it is bounded: forced tracks cover a
+/// fraction of the runtime. What this declines is the UNFORCED image
+/// candidate — a full-frame burn for the whole film that nobody asked for.
+fn accept_or_decline_uninvited_burn<'a>(
+    candidate: &'a pharos_core::SubtitleTrack,
+    probe: &'a pharos_core::MediaProbe,
+    client_profiles: &[SubtitleProfileDto],
+) -> Option<&'a pharos_core::SubtitleTrack> {
+    let burns = |t: &pharos_core::SubtitleTrack| {
+        decide_subtitle_delivery(t.codec.as_deref(), client_profiles) == SubtitleDelivery::Burn
+    };
+    let image_candidate = candidate
+        .codec
+        .as_deref()
+        .is_some_and(|c| is_image_subtitle_codec(&c.to_ascii_lowercase()));
+    if !(image_candidate && !candidate.is_forced && burns(candidate)) {
+        metrics::counter!(
+            "pharos_subtitle_autoselect_total",
+            "outcome" => "default",
+        )
+        .increment(1);
+        return Some(candidate);
+    }
+    // The candidate would cost a full-frame re-encode nobody asked for.
+    // Prefer any track this client can render itself: the viewer still gets
+    // subtitles, at no encoding cost at all.
+    if let Some(cheap) = probe.subtitle_tracks.iter().find(|t| !burns(t)) {
+        metrics::counter!(
+            "pharos_subtitle_autoselect_total",
+            "outcome" => "swapped_to_external",
+        )
+        .increment(1);
+        tracing::info!(
+            subtitle.declined = candidate.stream_index,
+            subtitle.declined_codec = ?candidate.codec,
+            subtitle.chosen = cheap.stream_index,
+            subtitle.chosen_codec = ?cheap.codec,
+            "the auto-picked subtitle could only be delivered by burning it in; \
+             auto-selected an externally-renderable track instead"
+        );
+        return Some(cheap);
+    }
+    metrics::counter!(
+        "pharos_subtitle_autoselect_total",
+        "outcome" => "declined_burn",
+    )
+    .increment(1);
+    tracing::info!(
+        subtitle.index = candidate.stream_index,
+        subtitle.codec = ?candidate.codec,
+        "declining to auto-select an image subtitle nobody requested: \
+         its only delivery is a full-frame burn, measured above \
+         realtime, and the client cannot turn it off"
+    );
+    None
 }
 
 /// A DirectPlay/DirectStream decision must downgrade to Transcode when the
@@ -3090,12 +3112,26 @@ async fn playback_info(
         // only external/default/forced, so B44's forced track and B104's
         // default ASS still select — and still burn — while an incidental
         // track no longer switches itself on.
+        // The ladder above is a faithful port of upstream's mode/language
+        // selection (stream_select.rs) and knows nothing of burn cost — it
+        // picked the container-default PGS "Signs & Songs" track for Code
+        // Geass live 2026-08-29 while the burn path separately declined to
+        // ever deliver it, so jellyfin-web pre-selected a subtitle that
+        // rendered nothing during dialogue. Route its answer through the same
+        // veto `resolve_selected_subtitle` applies to the container default,
+        // so `DefaultSubtitleStreamIndex` never points at a track this
+        // session will not actually burn.
         None => super::stream_select::default_subtitle_stream_index(
             &super::stream_select::subtitle_facts(&streams),
             &track_prefs.subtitle_languages,
             track_prefs.subtitle_mode,
             chosen_audio_language.as_deref(),
-        ),
+        )
+        .and_then(|idx| probe.subtitle_tracks.iter().find(|t| t.stream_index == idx))
+        .and_then(|candidate| {
+            accept_or_decline_uninvited_burn(candidate, probe, &profile.subtitle_profiles)
+        })
+        .map(|t| t.stream_index),
     };
 
     // TranscodingSubProtocol only makes sense alongside a real TranscodingUrl.
