@@ -13,6 +13,7 @@ use crate::{
 };
 use actix_files::NamedFile;
 use actix_web::{
+    body::MessageBody,
     error,
     http::{
         header::{self, HeaderValue},
@@ -26,6 +27,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 use pharos_core::time::{Ticks, TICKS_PER_SECOND};
@@ -37,9 +39,80 @@ use pharos_core::time::{Ticks, TICKS_PER_SECOND};
 /// window after the request line (all a once-per-request stamp bought). B72: the
 /// regulator was blind to every non-webm delivery path, so background sweeps ran
 /// at full `BG_IO_MAX` during direct playback and starved live reads.
+/// Bounded, stable label naming which streaming surface a body came from —
+/// the counterpart to [`DirectPlayDelivery`] for body-COMPLETION
+/// observability, since a delivery decision and whether its body actually
+/// finished are two different questions. 2026-08-31 (House, skip-intro): the
+/// DirectPlay decision logged a fast, correct 206 in ~2ms, and then the
+/// client went silent for 82s with no signal ANYWHERE — not an abort (the
+/// handler had already returned by then, so `RedMetrics`'s `AbortGuard` never
+/// saw it), not an error, nothing — that the body itself never finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamBodyRoute {
+    DirectPlay,
+    Resume,
+    ProgressiveWebm,
+    AudioRemux,
+}
+
+impl StreamBodyRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirectPlay => "direct_play",
+            Self::Resume => "resume",
+            Self::ProgressiveWebm => "progressive_webm",
+            Self::AudioRemux => "audio_remux",
+        }
+    }
+}
+
+/// Below this, a body that never reached its end is not worth a WARN — a
+/// player cancelling one in-flight range because it issued a fresh seek is
+/// routine, and every seek supersedes exactly one of these. Mirrors
+/// `RedMetrics::ABORT_WARN_AFTER`, which draws the same line for the request
+/// future this body-level guard cannot see (the handler has already returned
+/// by the time this body starts streaming).
+const BODY_INCOMPLETE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct MeteredBody<B> {
     inner: B,
     clock: Arc<AtomicI64>,
+    media_id: u64,
+    route: StreamBodyRoute,
+    total: Option<u64>,
+    sent: u64,
+    started: Instant,
+    /// Set once `poll_next` sees a natural end (`None`) or an error — both are
+    /// a DEFINITE outcome the body itself already reported. Only a body
+    /// dropped WITHOUT ever reaching one of those is the invisible case this
+    /// type exists to name.
+    settled: bool,
+}
+
+impl<B> Drop for MeteredBody<B> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        metrics::counter!(
+            "pharos_stream_body_incomplete_total",
+            "route" => self.route.label(),
+        )
+        .increment(1);
+        if self.sent > 0 || elapsed >= BODY_INCOMPLETE_WARN_AFTER {
+            tracing::warn!(
+                media.id = self.media_id,
+                route = self.route.label(),
+                sent_bytes = self.sent,
+                total_bytes = ?self.total,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "a stream body was dropped before it finished — the client either \
+                 disconnected or stalled reading it, and the request itself already \
+                 returned its response headers so nothing else would have caught this"
+            );
+        }
+    }
 }
 
 impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for MeteredBody<B> {
@@ -55,26 +128,70 @@ impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for M
     ) -> Poll<Option<Result<actix_web::web::Bytes, Self::Error>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.inner).poll_next(cx);
-        if let Poll::Ready(Some(Ok(_))) = &polled {
-            // Bytes just went out — mark playback live NOW. Cheap relaxed store.
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            this.clock.store(now, Ordering::Relaxed);
+        match &polled {
+            Poll::Ready(Some(Ok(chunk))) => {
+                // Bytes just went out — mark playback live NOW. Cheap relaxed store.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                this.clock.store(now, Ordering::Relaxed);
+                this.sent += chunk.len() as u64;
+            }
+            Poll::Ready(None) => {
+                this.settled = true;
+                metrics::counter!(
+                    "pharos_stream_body_finished_total",
+                    "route" => this.route.label(),
+                )
+                .increment(1);
+            }
+            Poll::Ready(Some(Err(_))) => {
+                this.settled = true;
+                tracing::warn!(
+                    media.id = this.media_id,
+                    route = this.route.label(),
+                    sent_bytes = this.sent,
+                    total_bytes = ?this.total,
+                    "a stream body errored mid-transfer"
+                );
+                metrics::counter!(
+                    "pharos_stream_body_error_total",
+                    "route" => this.route.label(),
+                )
+                .increment(1);
+            }
+            Poll::Pending => {}
         }
         polled
     }
 }
 
 /// Route a delivery response's body through [`MeteredBody`] so the playback
-/// clock keeps ticking for the stream's whole lifetime (V35). Every direct-play
+/// clock keeps ticking for the stream's whole lifetime (V35), AND so a body
+/// that never reaches a natural end or an error — dropped mid-transfer,
+/// invisible to every other signal pharos has — gets one. Every direct-play
 /// / resume / progressive / audio delivery return value passes through here.
-fn meter_body(resp: HttpResponse, clock: Arc<AtomicI64>) -> HttpResponse {
+fn meter_body(
+    resp: HttpResponse,
+    clock: Arc<AtomicI64>,
+    media_id: u64,
+    route: StreamBodyRoute,
+) -> HttpResponse {
     resp.map_body(|_, body| {
+        let total = match body.size() {
+            actix_web::body::BodySize::Sized(n) => Some(n),
+            _ => None,
+        };
         actix_web::body::BoxBody::new(MeteredBody {
             inner: body,
             clock: clock.clone(),
+            media_id,
+            route,
+            total,
+            sent: 0,
+            started: Instant::now(),
+            settled: false,
         })
     })
 }
@@ -313,6 +430,8 @@ async fn audio_remux(
             .content_type(content_type)
             .body(actix_web::body::BodyStream::new(stream)),
         clock,
+        item.id,
+        StreamBodyRoute::AudioRemux,
     ))
 }
 
@@ -578,6 +697,8 @@ async fn stream_transcoded_webm(
                         .content_type("video/webm")
                         .streaming(stream),
                     clock,
+                    item.id,
+                    StreamBodyRoute::ProgressiveWebm,
                 ));
             }
             Err(e) => {
@@ -595,6 +716,8 @@ async fn stream_transcoded_webm(
             .content_type("video/webm")
             .streaming(stream.into_stream()),
         clock,
+        item.id,
+        StreamBodyRoute::ProgressiveWebm,
     ))
 }
 
@@ -904,7 +1027,12 @@ async fn deliver_stream(
             resp.headers_mut().insert(header::SET_COOKIE, hv);
         }
     }
-    Ok(meter_body(resp, clock))
+    Ok(meter_body(
+        resp,
+        clock,
+        item.id,
+        StreamBodyRoute::DirectPlay,
+    ))
 }
 
 fn parse_start_time_ticks(qs: &str) -> u64 {
@@ -1049,7 +1177,7 @@ async fn serve_content_range(
         });
         resp_builder.body(actix_web::body::SizedStream::new(remaining, stream))
     };
-    Ok(meter_body(resp, clock))
+    Ok(meter_body(resp, clock, item.id, StreamBodyRoute::Resume))
 }
 
 /// Turn a failure to OPEN a known item's file into the 404 the client sees,
@@ -1290,6 +1418,12 @@ mod tests {
         let body = MeteredBody {
             inner: actix_web::web::Bytes::from_static(b"payload"),
             clock: clock.clone(),
+            media_id: 1,
+            route: StreamBodyRoute::DirectPlay,
+            total: Some(7),
+            sent: 0,
+            started: Instant::now(),
+            settled: false,
         };
         assert_eq!(
             clock.load(Ordering::Relaxed),
@@ -1302,6 +1436,108 @@ mod tests {
         assert!(
             clock.load(Ordering::Relaxed) > 0,
             "clock must stamp once bytes flow (V35)"
+        );
+    }
+
+    /// 2026-08-31 (House, skip-intro): a body dropped mid-transfer — the
+    /// client disconnected or stalled reading it — produced no signal
+    /// anywhere. `RedMetrics`'s abort guard only watches the handler's
+    /// future, which had already returned by the time this body starts
+    /// streaming, so a stall here was genuinely invisible before this.
+    #[tokio::test]
+    async fn a_body_dropped_before_it_finishes_is_counted_incomplete() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let body = MeteredBody {
+            inner: actix_web::web::Bytes::from_static(b"payload"),
+            clock: Arc::new(AtomicI64::new(0)),
+            media_id: 42,
+            route: StreamBodyRoute::DirectPlay,
+            total: Some(7),
+            sent: 0,
+            started: Instant::now(),
+            settled: false,
+        };
+        {
+            // One successful poll (the whole 7-byte payload) — then dropped
+            // WITHOUT the follow-up poll that would have returned `None`.
+            // Exactly what a client that reads the first chunk and then
+            // disconnects looks like from the server's side.
+            let mut body = std::pin::pin!(body);
+            let chunk = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(chunk.is_some(), "expected the one chunk to flow first");
+        }
+
+        let incomplete = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, _)| ck.key().name() == "pharos_stream_body_incomplete_total");
+        assert!(
+            incomplete,
+            "a body dropped before a natural end or an error must be counted incomplete"
+        );
+        let finished = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, _)| ck.key().name() == "pharos_stream_body_finished_total");
+        assert!(
+            !finished,
+            "a body that never reached None must not ALSO count as finished"
+        );
+    }
+
+    /// The success side of the same signal: a body that runs to its natural
+    /// end must be counted finished, not incomplete — otherwise every
+    /// ordinary completed stream would falsely look like a stall.
+    #[tokio::test]
+    async fn a_body_that_finishes_naturally_is_not_counted_incomplete() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let body = MeteredBody {
+            inner: actix_web::web::Bytes::from_static(b"payload"),
+            clock: Arc::new(AtomicI64::new(0)),
+            media_id: 42,
+            route: StreamBodyRoute::DirectPlay,
+            total: Some(7),
+            sent: 0,
+            started: Instant::now(),
+            settled: false,
+        };
+        {
+            let mut body = std::pin::pin!(body);
+            let first = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(first.is_some(), "expected the one chunk to flow first");
+            let second = futures_util::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(second.is_none(), "Bytes must end after its one chunk");
+        }
+
+        let finished = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, _)| ck.key().name() == "pharos_stream_body_finished_total");
+        assert!(
+            finished,
+            "a body that reaches None must be counted finished"
+        );
+        let incomplete = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, _)| ck.key().name() == "pharos_stream_body_incomplete_total");
+        assert!(
+            !incomplete,
+            "a body that finished normally must not ALSO count as incomplete"
         );
     }
 
