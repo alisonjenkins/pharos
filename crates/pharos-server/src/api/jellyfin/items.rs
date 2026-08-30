@@ -2064,11 +2064,16 @@ fn accept_or_decline_uninvited_burn<'a>(
     let image_candidate = candidate
         .codec
         .as_deref()
-        .is_some_and(|c| is_image_subtitle_codec(&c.to_ascii_lowercase()));
+        .is_some_and(is_image_subtitle_codec);
     if !(image_candidate && !candidate.is_forced && burns(candidate)) {
+        // "accepted", not "default": the P12 ladder can hand this a
+        // language/mode-preferred candidate the container never flagged
+        // default (Smart mode, an English-preferred track over a
+        // non-preferred one), and this rule doesn't care which ladder
+        // produced it — only whether the pick is affordable as-is.
         metrics::counter!(
             "pharos_subtitle_autoselect_total",
-            "outcome" => "default",
+            "outcome" => "accepted",
         )
         .increment(1);
         return Some(candidate);
