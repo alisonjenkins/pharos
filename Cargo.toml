@@ -49,7 +49,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 getrandom = "0.2"
 metrics = "0.23"
-metrics-exporter-prometheus = { version = "0.15", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Test-only: lets a test assert on the metrics a code path actually emitted,
 # so an instrumentation contract can be verified by disarming it and watching
 # the test go red rather than by reading the code.
