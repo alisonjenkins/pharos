@@ -47,7 +47,7 @@ anyhow = "1"
 argon2 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
-getrandom = "0.2"
+getrandom = "0.4"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 # Test-only: lets a test assert on the metrics a code path actually emitted,
