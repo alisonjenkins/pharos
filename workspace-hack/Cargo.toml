@@ -63,7 +63,7 @@ simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 socket2-3b31131e45eafb45 = { package = "socket2", version = "0.6", default-features = false, features = ["all"] }
-socket2-d8f496e17d97b5cb = { package = "socket2", version = "0.5", default-features = false, features = ["all"] }
+socket2-d8f496e17d97b5cb = { package = "socket2", version = "0.6", default-features = false, features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate", "offline"] }
