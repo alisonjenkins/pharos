@@ -2892,6 +2892,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
+dependencies = [
+ "portable-atomic",
+ "rapidhash",
+]
+
+[[package]]
 name = "metrics-exporter-prometheus"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2899,7 +2909,7 @@ checksum = "b4f0c8427b39666bf970460908b213ec09b3b350f20c0c2eabcbba51704a08e6"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.1",
- "metrics",
+ "metrics 0.23.1",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
@@ -2916,7 +2926,7 @@ dependencies = [
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "indexmap 2.14.1",
- "metrics",
+ "metrics 0.23.1",
  "num_cpus",
  "ordered-float",
  "quanta",
@@ -3287,7 +3297,7 @@ name = "pharos-cache"
 version = "0.0.0"
 dependencies = [
  "dashmap",
- "metrics",
+ "metrics 0.24.6",
  "metrics-util",
  "pharos-core",
  "pharos-transcode",
@@ -3360,7 +3370,7 @@ dependencies = [
  "futures-util",
  "libc",
  "lopdf",
- "metrics",
+ "metrics 0.24.6",
  "metrics-util",
  "notify",
  "pharos-core",
@@ -3399,7 +3409,7 @@ dependencies = [
  "getrandom 0.2.17",
  "httpdate",
  "libc",
- "metrics",
+ "metrics 0.24.6",
  "metrics-exporter-prometheus",
  "metrics-util",
  "mime_guess",
@@ -3463,7 +3473,7 @@ dependencies = [
  "actix-ws",
  "dashmap",
  "futures-util",
- "metrics",
+ "metrics 0.24.6",
  "metrics-util",
  "pharos-core",
  "serde",
@@ -3486,7 +3496,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "libc",
- "metrics",
+ "metrics 0.24.6",
  "metrics-util",
  "pharos-core",
  "rusty-chromaprint",
@@ -4005,6 +4015,15 @@ name = "rangemap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
+
+[[package]]
+name = "rapidhash"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "raw-cpuid"
