@@ -50,7 +50,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 # wasm32 has no default getrandom backend; dioxus 0.7's dep graph pulls
 # getrandom 0.2 transitively, so force its `js` feature for the web build.
-getrandom = { version = "0.2", features = ["js"], optional = true }
+getrandom = { version = "0.4", features = ["js"], optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
