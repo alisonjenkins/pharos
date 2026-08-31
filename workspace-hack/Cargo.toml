@@ -42,7 +42,7 @@ itertools = { version = "0.15" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.20", default-features = false, features = ["encoder", "optimization", "std"] }
 memchr = { version = "2" }
-metrics-util = { version = "0.17" }
+metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
