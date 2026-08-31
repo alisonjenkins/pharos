@@ -35,7 +35,7 @@ futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.4", default-features = false, features = ["js", "std"] }
 hashbrown = { version = "0.14", default-features = false, features = ["ahash", "raw"] }
 indexmap = { version = "2" }
 itertools = { version = "0.15" }
@@ -95,7 +95,7 @@ futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.4", default-features = false, features = ["js", "std"] }
 indexmap = { version = "2" }
 itertools = { version = "0.15" }
 log = { version = "0.4", default-features = false, features = ["std"] }
