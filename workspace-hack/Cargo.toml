@@ -121,7 +121,7 @@ sqlx-macros-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring
 sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate", "offline"] }
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn = { version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }
