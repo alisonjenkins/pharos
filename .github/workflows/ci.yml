@@ -169,7 +169,7 @@ jobs:
         run: nix develop --command bash -c 'just compat-playwright-full'
       - name: Upload Playwright report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report-${{ github.sha }}
           path: compat-playwright/playwright-report
