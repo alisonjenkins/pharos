@@ -33,7 +33,7 @@ jobs:
         run: nix develop --command just compat-syncplay
       - name: Upload Playwright report + traces on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: syncplay-report-${{ github.sha }}
           if-no-files-found: warn
