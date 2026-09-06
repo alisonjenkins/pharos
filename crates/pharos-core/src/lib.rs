@@ -1472,6 +1472,15 @@ pub struct Library {
     pub wire_id: String,
 }
 
+/// Outcome of [`LibraryStore::backfill_library_ids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LibraryBackfill {
+    /// Items that now belong to some library.
+    pub assigned: u64,
+    /// Rows whose `library_id` this run changed.
+    pub changed: u64,
+}
+
 /// LIB-C1 — typed libraries as first-class rows. Split from
 /// [`MediaStore`] so in-memory test stores that only round-trip items
 /// don't have to implement library reconciliation. Reconciled from
@@ -1510,8 +1519,11 @@ pub trait LibraryStore: Send + Sync {
     /// every item whose path is strictly under the library's `root_path`
     /// (so `/media/movies` never claims `/media/movies-4k`). Idempotent —
     /// re-running re-points each item at the library covering its path.
-    /// Returns the number of items assigned to some library.
-    fn backfill_library_ids(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+    /// Returns how many items belong to some library and how many rows this
+    /// run actually rewrote; a repeat over an unchanged library rewrites none.
+    fn backfill_library_ids(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<LibraryBackfill>> + Send;
 
     /// Item ids belonging to the library whose `wire_id` matches — the
     /// exact `/Items?ParentId=<library id>` pivot. Empty Vec when no

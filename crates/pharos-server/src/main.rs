@@ -53,7 +53,8 @@ async fn reconcile_libraries(
     let libraries = stores.libraries().await?;
     tracing::info!(
         libraries = libraries.len(),
-        items_assigned = assigned,
+        items_assigned = assigned.assigned,
+        items_restamped = assigned.changed,
         "reconciled typed libraries"
     );
     Ok(libraries)

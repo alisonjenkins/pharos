@@ -2829,21 +2829,25 @@ impl LibraryStore for PostgresStore {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn backfill_library_ids(&self) -> DomainResult<u64> {
-        // SHORTEST ROOT FIRST, so the most specific library wins — see the
-        // sqlite impl for why (B174): `libraries()` orders by NAME, and a
-        // whole-share "media" root sorted last and overwrote every typed
-        // library nested inside it.
-        let mut libs = self.libraries().await?;
-        libs.sort_by_key(|l| l.root_path.len());
-        for lib in &libs {
-            let like = crate::root_like_pattern(&lib.root_path);
-            sqlx::query("UPDATE media_items SET library_id = $1 WHERE path LIKE $2 ESCAPE '\\'")
-                .bind(lib.id as i32)
-                .bind(like)
+    async fn backfill_library_ids(&self) -> DomainResult<pharos_core::LibraryBackfill> {
+        // Shortest root first, and a nested root's rows are excluded from
+        // the containing root's step, so each row is written by exactly the
+        // library that keeps it and a repeat run writes nothing (B174, B221).
+        let libs = self.libraries().await?;
+        let mut changed: u64 = 0;
+        for step in crate::backfill_plan(&libs) {
+            let sql = crate::backfill_sql(&step, |n| format!("${n}"), "IS DISTINCT FROM");
+            let mut q = sqlx::query(&sql)
+                .bind(step.library_id as i32)
+                .bind(&step.like);
+            for nested in &step.nested_likes {
+                q = q.bind(nested);
+            }
+            changed += q
                 .execute(&self.pool)
                 .await
-                .map_err(|e| DomainError::Backend(e.to_string()))?;
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .rows_affected();
         }
         let (count,) = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM media_items WHERE library_id IS NOT NULL",
@@ -2851,7 +2855,10 @@ impl LibraryStore for PostgresStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
-        Ok(count.max(0) as u64)
+        Ok(pharos_core::LibraryBackfill {
+            assigned: count.max(0) as u64,
+            changed,
+        })
     }
 
     #[tracing::instrument(skip(self))]

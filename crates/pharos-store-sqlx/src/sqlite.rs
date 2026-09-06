@@ -2916,32 +2916,23 @@ impl LibraryStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn backfill_library_ids(&self) -> DomainResult<u64> {
-        // Path-boundary-safe: for each library, stamp every media_items row
-        // strictly under its root (root + '/'). root_like_pattern escapes
-        // wildcards + appends "/%", so /media/movies never claims
-        // /media/movies-4k.
-        //
-        // SHORTEST ROOT FIRST, so the most specific library wins (B174). Roots
-        // DO nest: a whole-share `mixed` root beside typed libraries for its
-        // subfolders is the obvious way to configure this, and it is what the
-        // deployment does. `libraries()` orders by NAME, and under that order
-        // "media" sorted last and overwrote every typed library it contained —
-        // 14,229 items in one mixed library while Movies, Music and TV Shows
-        // sat at zero, with no error anywhere. Ordering by root LENGTH makes
-        // the containing root apply first and the nested one overwrite it,
-        // which is the only assignment that can be correct when roots nest.
-        let mut libs = self.libraries().await?;
-        libs.sort_by_key(|l| l.root_path.len());
-        let mut total: i64 = 0;
-        for lib in &libs {
-            let like = crate::root_like_pattern(&lib.root_path);
-            sqlx::query("UPDATE media_items SET library_id = ? WHERE path LIKE ? ESCAPE '\\'")
-                .bind(lib.id)
-                .bind(like)
+    async fn backfill_library_ids(&self) -> DomainResult<pharos_core::LibraryBackfill> {
+        // Shortest root first, and a nested root's rows are excluded from
+        // the containing root's step, so each row is written by exactly the
+        // library that keeps it and a repeat run writes nothing (B174, B221).
+        let libs = self.libraries().await?;
+        let mut changed: u64 = 0;
+        for step in crate::backfill_plan(&libs) {
+            let sql = crate::backfill_sql(&step, |n| format!("?{n}"), "IS NOT");
+            let mut q = sqlx::query(&sql).bind(step.library_id).bind(&step.like);
+            for nested in &step.nested_likes {
+                q = q.bind(nested);
+            }
+            changed += q
                 .execute(&self.pool)
                 .await
-                .map_err(|e| DomainError::Backend(e.to_string()))?;
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .rows_affected();
         }
         let (count,) = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM media_items WHERE library_id IS NOT NULL",
@@ -2949,8 +2940,10 @@ impl LibraryStore for SqliteStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
-        total += count;
-        Ok(total.max(0) as u64)
+        Ok(pharos_core::LibraryBackfill {
+            assigned: count.max(0) as u64,
+            changed,
+        })
     }
 
     #[tracing::instrument(skip(self))]

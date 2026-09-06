@@ -326,7 +326,7 @@ async fn parent_library() {
         .await
         .unwrap();
     let assigned = s.backfill_library_ids().await.unwrap();
-    assert!(assigned > 0);
+    assert!(assigned.assigned > 0);
 
     let q = MediaQuery {
         parent: Some(ParentFilter::Library {
