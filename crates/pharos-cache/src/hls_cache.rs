@@ -85,6 +85,10 @@ pub enum AudioWaitGiveUp {
     NeverStarted,
     Stalled,
     BudgetExhausted,
+    /// The session's ffmpeg has already exited without success. Nothing more
+    /// will be written, so waiting out the no-progress grace only delays the
+    /// 404 (B217).
+    SessionFailed,
 }
 
 impl AudioWaitGiveUp {
@@ -96,6 +100,7 @@ impl AudioWaitGiveUp {
             Self::NeverStarted => "never_started",
             Self::Stalled => "stalled",
             Self::BudgetExhausted => "budget_exhausted",
+            Self::SessionFailed => "session_failed",
         }
     }
 }
@@ -106,6 +111,7 @@ impl std::fmt::Display for AudioWaitGiveUp {
             Self::NeverStarted => "session never produced a segment",
             Self::Stalled => "session stopped advancing",
             Self::BudgetExhausted => "overall wait budget exhausted",
+            Self::SessionFailed => "session process exited without producing",
         })
     }
 }
@@ -1179,6 +1185,11 @@ struct CacheState {
     /// `(source, audio-relative index)`. A property of the file, so probed once
     /// and reused. See `source_audio_start`.
     source_audio_starts: HashMap<(PathBuf, u32), f64>,
+    /// Rendition directories whose most recent audio session exited without
+    /// success, and when. A reader waiting on that directory gives up at once
+    /// instead of spending the 12 s no-progress grace on a process that is
+    /// already gone (B217). Cleared when a new session is spawned there.
+    audio_session_failures: HashMap<PathBuf, std::time::Instant>,
 }
 
 /// One file of the demuxed audio rendition, with the session that produced it.
@@ -3462,6 +3473,8 @@ impl HlsSegmentCache {
         }
         tokio::fs::create_dir_all(Self::audio_session_dir(&dir, start_seg)).await?;
         tokio::fs::write(&running, b"").await?;
+        // A fresh session supersedes any failure recorded for this rendition.
+        self.state.lock().await.audio_session_failures.remove(&dir);
 
         let audio_start = self.source_audio_start(source, audio_index).await;
         let args = Self::audio_hls_args(
@@ -3483,6 +3496,8 @@ impl HlsSegmentCache {
         let bin = self.transcoder.binary().to_path_buf();
         let running_marker = running.clone();
         let media = media_id;
+        let failures = self.state.clone();
+        let failed_dir = dir.clone();
         // Detached: run the encode to completion, then drop the `.running`
         // marker (the from-0 session leaves `audio.m3u8` as the done-marker).
         tokio::spawn(async move {
@@ -3491,22 +3506,35 @@ impl HlsSegmentCache {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            match cmd.spawn() {
+            let failed = match cmd.spawn() {
                 Ok(mut child) => {
                     let status = child.wait().await;
-                    if let Ok(s) = status {
-                        if !s.success() {
+                    match status {
+                        Ok(s) if !s.success() => {
                             tracing::warn!(
                                 media.id = media,
                                 ?s,
                                 "audio HLS session exited non-zero"
                             );
+                            true
                         }
+                        Ok(_) => false,
+                        Err(_) => true,
                     }
                 }
                 Err(e) => {
                     tracing::warn!(media.id = media, error = %e, "failed to spawn audio HLS session");
+                    true
                 }
+            };
+            if failed {
+                // Told to the readers, not just the log: a wait on this
+                // rendition now ends at its next poll (B217).
+                failures
+                    .lock()
+                    .await
+                    .audio_session_failures
+                    .insert(failed_dir, std::time::Instant::now());
             }
             let _ = tokio::fs::remove_file(&running_marker).await;
         });
@@ -4241,6 +4269,13 @@ impl HlsSegmentCache {
         let mut give_up = AudioWaitGiveUp::BudgetExhausted;
         for i in 0..max_polls {
             polls = i;
+            // The session that would write this file has already died: no
+            // grace can help. Checked before the progress read so a session
+            // that produced something and then died is not waited on either.
+            if self.audio_session_failed_recently(dir).await {
+                give_up = AudioWaitGiveUp::SessionFailed;
+                break;
+            }
             // Resolve across the rendition's sessions each poll: the file may
             // not exist yet, and which session ends up owning it is only known
             // once one has written it.
@@ -4300,6 +4335,32 @@ impl HlsSegmentCache {
             waited_ms,
             last_progress,
         })
+    }
+
+    /// Whether the most recent audio session for `dir` exited without success
+    /// within the last [`Self::AUDIO_FAILURE_MEMORY`]. Bounded in time so a
+    /// failure recorded while a rendition was unreadable (a stale NFS handle,
+    /// 2026-09-04) does not outlive the condition and refuse a later, healthy
+    /// session that the spawn path did not happen to clear.
+    async fn audio_session_failed_recently(&self, dir: &Path) -> bool {
+        self.state
+            .lock()
+            .await
+            .audio_session_failures
+            .get(dir)
+            .is_some_and(|at| at.elapsed() < Self::AUDIO_FAILURE_MEMORY)
+    }
+
+    /// How long a recorded audio-session failure short-circuits reads.
+    const AUDIO_FAILURE_MEMORY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[cfg(test)]
+    async fn note_audio_session_failed(&self, dir: &Path) {
+        self.state
+            .lock()
+            .await
+            .audio_session_failures
+            .insert(dir.to_path_buf(), std::time::Instant::now());
     }
 
     async fn touch(&self, key: SegmentIdentity) {
@@ -8678,6 +8739,37 @@ mod tests {
         assert_eq!(got.bytes, b"y");
     }
 
+    /// B217 — on 2026-09-04 the audio session died on open (stale NFS handle)
+    /// at 20:16:06 and seven readers each waited the full 12 s no-progress
+    /// grace before their 404. The process's exit is known the moment it
+    /// happens; the wait must end there.
+    #[tokio::test]
+    async fn a_dead_audio_session_fails_the_read_at_once() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        cache.note_audio_session_failed(&dir).await;
+        let started = std::time::Instant::now();
+        let res = cache.audio_hls_file_budget(&dir, "a3.m4s", 200, 6, 6).await;
+        assert!(
+            matches!(
+                res,
+                Err(HlsCacheError::AudioNotReady {
+                    reason: AudioWaitGiveUp::SessionFailed,
+                    waited_ms: 0,
+                    ..
+                })
+            ),
+            "a known-dead session must give up with SessionFailed and no wait; got {:?}",
+            res.as_ref().err()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "a known-dead session must not be waited on"
+        );
+    }
+
     #[tokio::test]
     async fn audio_hls_file_gives_up_when_session_never_starts() {
         // Empty dir, nothing ever produced → NotFound after the no-progress
@@ -8826,9 +8918,18 @@ mod tests {
             AudioWaitGiveUp::NeverStarted,
             AudioWaitGiveUp::Stalled,
             AudioWaitGiveUp::BudgetExhausted,
+            AudioWaitGiveUp::SessionFailed,
         ];
         let labels: Vec<&str> = all.iter().map(|r| r.label()).collect();
-        assert_eq!(labels, vec!["never_started", "stalled", "budget_exhausted"]);
+        assert_eq!(
+            labels,
+            vec![
+                "never_started",
+                "stalled",
+                "budget_exhausted",
+                "session_failed"
+            ]
+        );
         let mut uniq = labels.clone();
         uniq.sort_unstable();
         uniq.dedup();
