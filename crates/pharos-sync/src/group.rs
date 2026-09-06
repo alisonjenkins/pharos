@@ -144,6 +144,16 @@ pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 /// How often the actor sweeps for TTL-expired members.
 const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
 
+/// B210 — the most a resume after a buffering freeze is delayed so the member
+/// that recovered can catch up to the frozen position. A recovering member is
+/// already playing from where it stalled: jellyfin-web only reports Buffering
+/// after 3 s of `waiting`, and a stream reload adds a few seconds more, so a
+/// few seconds behind is the normal case. Anything far beyond that is a client
+/// whose position cannot be trusted, and holding the whole room for it would
+/// be the wedge this file keeps fixing — beyond the cap the room resumes on
+/// the ordinary lead and the member is left to its own drift correction.
+pub const MAX_RESUME_CATCH_UP_MS: u64 = 5_000;
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1491,15 +1501,43 @@ impl GroupState {
     /// else settle `Paused` (a freeze that engaged around a paused group / a
     /// user paused during the freeze). Clears the freeze bookkeeping either way.
     /// Caller must ensure the freeze should lift (no buffering members, no open
-    /// readiness gate).
-    fn resume_after_buffering(&mut self) {
+    /// readiness gate). `outcome` says why it lifts — the last holder recovered
+    /// or left (`Recovered`), or the deadline forced it (`AntiWedge`).
+    ///
+    /// `recovered_at_ms` is the position the recovering member reported it is
+    /// already PLAYING from, when known. It stalled there and jellyfin-web
+    /// only reported the stall 3 s later, so it is behind the frozen room;
+    /// jellyfin-web never seeks a player that is behind a Play, and sync
+    /// correction is off by default, so resuming the room at once left that
+    /// member permanently behind. Real Jellyfin delays everyone else's Unpause
+    /// by the lag instead (`WaitingGroupState`, "is recovering, group will
+    /// resume in {Delay}") — the room pauses a moment longer and the member
+    /// meets it at the frozen position (B210).
+    fn resume_after_buffering(&mut self, outcome: FreezeOutcome, recovered_at_ms: Option<u64>) {
         let position_ms = self.current_position_ms();
         let resume_playing = self.buffering_resume_playing;
         // Report BEFORE delegating: `start_playing` clears the freeze too, and
         // whichever call lands first owns the attribution.
-        self.clear_buffering_freeze(FreezeOutcome::Recovered);
+        self.clear_buffering_freeze(outcome);
         if resume_playing {
-            self.start_playing(position_ms, "Ready");
+            let behind_ms = recovered_at_ms
+                .map(|r| position_ms.saturating_sub(r))
+                .unwrap_or(0);
+            let catch_up_ms = behind_ms.min(MAX_RESUME_CATCH_UP_MS);
+            if behind_ms > 0 {
+                tracing::info!(
+                    group = %self.id,
+                    frozen_position_ms = position_ms,
+                    recovered_at_ms = recovered_at_ms.unwrap_or(0),
+                    behind_ms,
+                    catch_up_ms,
+                    capped = behind_ms > catch_up_ms,
+                    "syncplay: resume delayed so the recovering member catches the room up"
+                );
+                metrics::histogram!("pharos_syncplay_resume_catch_up_seconds")
+                    .record(catch_up_ms as f64 / 1000.0);
+            }
+            self.start_playing_after(position_ms, "Ready", catch_up_ms);
         } else {
             self.playback = PlaybackState::Paused { position_ms };
             self.broadcast(ServerMsg::StateUpdate {
@@ -1541,8 +1579,16 @@ impl GroupState {
     /// `Play` + `StateUpdate`. `reason` must be one of jellyfin-web's OSD
     /// strings ('Unpause' / 'Ready' — matched case-sensitively).
     fn start_playing(&mut self, position_ms: u64, reason: &str) {
+        self.start_playing_after(position_ms, reason, 0);
+    }
+
+    /// `start_playing` with the schedule pushed out by `extra_lead_ms` beyond
+    /// the ordinary transport lead — the room waits that much longer before
+    /// unpausing, which is how a member already playing from behind catches
+    /// it up (B210). A member already at the position simply unpauses later.
+    fn start_playing_after(&mut self, position_ms: u64, reason: &str, extra_lead_ms: u64) {
         let server_ms = self.server_ms_now();
-        let at_server_ms = server_ms + self.lead_time_ms();
+        let at_server_ms = server_ms + self.lead_time_ms().max(extra_lead_ms);
         // C — anchor at the SCHEDULED start instant (`at_server_ms`), NOT `now`.
         // Clients play `position_ms` AT `at_server_ms` (Jellyfin's `When`), so
         // anchoring at `now` made the server model run `lead_time` ahead of every
@@ -2288,7 +2334,10 @@ impl GroupHandle {
                         if state.waiting.is_none() {
                             // Resume per the captured intent (Playing normally;
                             // Paused if the freeze engaged around a user pause).
-                            state.resume_after_buffering();
+                            // Forced by the deadline: `anti_wedge`, not
+                            // `recovered` — every 30 s freeze on 2026-08-28 and
+                            // 2026-09-06 was counted as recovered (B209).
+                            state.resume_after_buffering(FreezeOutcome::AntiWedge, None);
                         } else {
                             // A gate owns the resume; disarm the freeze so this
                             // arm doesn't spin.
@@ -2535,7 +2584,7 @@ fn release_gate_holds_for(state: &mut GroupState, member_id: MemberId) {
         && !state.members.values().any(|m| m.buffering)
     {
         tracing::info!(group = %state.id, "syncplay: buffering holder gone — lifting freeze");
-        state.resume_after_buffering();
+        state.resume_after_buffering(FreezeOutcome::Recovered, None);
     }
 }
 
@@ -3004,7 +3053,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 && !state.members.values().any(|m| m.buffering)
                 && state.waiting.is_none()
             {
-                state.resume_after_buffering();
+                state.resume_after_buffering(FreezeOutcome::Recovered, None);
             }
         }
         GroupMsg::Unpause { sender } => {
@@ -3232,7 +3281,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         }
         GroupMsg::MemberReady {
             member_id,
-            position_ms: _,
+            position_ms,
             playlist_item_id,
             is_playing,
         } => {
@@ -3282,8 +3331,13 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // IsBuffering() clears); without it every network hiccup
                 // paused the group until a human pressed play. Resume per the
                 // captured intent — a freeze that engaged around a user pause
-                // settles Paused rather than force-playing.
-                state.resume_after_buffering();
+                // settles Paused rather than force-playing. A member that is
+                // already playing again reports where from, so the room can
+                // wait for it (B210); a paused one is wherever it is told.
+                state.resume_after_buffering(
+                    FreezeOutcome::Recovered,
+                    is_playing.then_some(position_ms),
+                );
             } else if matches!(state.playback, PlaybackState::Playing { .. }) {
                 // No waiting gate: the group already resolved (often because
                 // the ready-timeout fired before THIS member's player finished
@@ -3343,7 +3397,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     && !state.members.values().any(|m| m.buffering)
                     && state.waiting.is_none()
                 {
-                    state.resume_after_buffering();
+                    state.resume_after_buffering(FreezeOutcome::Recovered, None);
                 }
             }
         }
@@ -6429,6 +6483,11 @@ mod tests {
     /// anti-wedge deadline force-clears the freeze and resumes.
     #[tokio::test(start_paused = true)]
     async fn buffering_freeze_times_out_via_anti_wedge() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
         let (h, sinks, mut rx1, m1) = fresh().await;
         let (m2, mut _rx2) = add_member(&h, &sinks, "second").await;
         h.tx.send(GroupMsg::LeaderPlay {
@@ -6469,6 +6528,112 @@ mod tests {
             "buffering freeze must time out and resume the group"
         );
         assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+
+        // The lift was forced by the deadline, so it is an `anti_wedge`, never
+        // a `recovered`: live on 2026-08-28 and 2026-09-06 every 30 s freeze
+        // was counted as recovered (`held_ms=30001`), hiding the defect.
+        let outcomes: Vec<(String, DebugValue)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_syncplay_buffering_freeze_total")
+            .map(|(ck, _, _, v)| {
+                let outcome = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "outcome")
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default();
+                (outcome, v)
+            })
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .any(|(o, v)| o == "anti_wedge" && matches!(v, DebugValue::Counter(1))),
+            "a deadline-forced lift must count as anti_wedge; got {outcomes:?}"
+        );
+        assert!(
+            !outcomes.iter().any(|(o, _)| o == "recovered"),
+            "a deadline-forced lift must not be counted as recovered; got {outcomes:?}"
+        );
+    }
+
+    /// A member that recovers from its own stall is already PLAYING again by
+    /// the time it posts Ready, from the position it stalled at — behind the
+    /// frozen room by the stall, the reload and jellyfin-web's 3 s buffering
+    /// threshold. Resuming the room at its frozen position immediately left
+    /// that member permanently behind: jellyfin-web only seeks a player that
+    /// is AHEAD of a Play, and sync correction is off by default. Real
+    /// Jellyfin delays everyone else's Unpause by that lag so the recovering
+    /// client catches up; do the same.
+    #[tokio::test]
+    async fn a_recovering_member_behind_the_room_delays_the_resume() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 9_000,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let (pause_at, frozen) = match recv_matching(&mut rx1, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Pause { .. })
+        })
+        .await
+        {
+            Some(ServerMsg::Pause {
+                at_server_ms,
+                position_ms,
+            }) => (at_server_ms, position_ms),
+            other => panic!("expected the freeze Pause, got {other:?}"),
+        };
+
+        // m2 recovers, playing again from 2 s behind the frozen position.
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: frozen - 2_000,
+            playlist_item_id: None,
+            is_playing: true,
+        })
+        .await
+        .unwrap();
+        let (play_at, play_pos) = match recv_matching(&mut rx1, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await
+        {
+            Some(ServerMsg::Play {
+                at_server_ms,
+                position_ms,
+            }) => (at_server_ms, position_ms),
+            other => panic!("expected the resume Play, got {other:?}"),
+        };
+        assert!(
+            (frozen.saturating_sub(50)..=frozen + 50).contains(&play_pos),
+            "the room resumes at its frozen position {frozen}, got {play_pos}"
+        );
+        // The freeze Pause was itself scheduled MIN_LEAD_MS after the freeze
+        // instant, so a resume issued ~immediately and pushed 2 s out lands
+        // ~1.8 s after the Pause's When. Without the catch-up it lands at the
+        // plain lead: ~0 ms after it.
+        let delay = play_at.saturating_sub(pause_at) + MIN_LEAD_MS;
+        assert!(
+            (1_900..=2_600).contains(&delay),
+            "the resume must be scheduled ~2 s out so the recovering member (2 s behind, \
+             already playing) reaches the frozen position as the room unpauses; got {delay} ms"
+        );
     }
 
     /// B57 — a duplicate AddMember for a member already in the roster (New/Join
