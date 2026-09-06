@@ -995,6 +995,7 @@ async fn local_artwork_path(
             tracing::warn!(
                 media.id = id,
                 role = token,
+                path = %path.display(),
                 "recorded local artwork missing on disk"
             );
             None
