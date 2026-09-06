@@ -222,6 +222,28 @@ pub enum ServerMsg {
     GroupLeft,
 }
 
+impl ServerMsg {
+    /// The variant name, for logs and metric labels. Bounded and stable.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ServerMsg::Welcome { .. } => "welcome",
+            ServerMsg::Joined { .. } => "joined",
+            ServerMsg::Pong { .. } => "pong",
+            ServerMsg::Play { .. } => "play",
+            ServerMsg::Pause { .. } => "pause",
+            ServerMsg::Seek { .. } => "seek",
+            ServerMsg::LeaderChange { .. } => "leader_change",
+            ServerMsg::MemberJoined { .. } => "member_joined",
+            ServerMsg::MemberLeft { .. } => "member_left",
+            ServerMsg::StateUpdate { .. } => "state_update",
+            ServerMsg::PlayQueue { .. } => "play_queue",
+            ServerMsg::Error { .. } => "error",
+            ServerMsg::NotInGroup => "not_in_group",
+            ServerMsg::GroupLeft => "group_left",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
