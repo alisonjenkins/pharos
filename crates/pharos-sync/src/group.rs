@@ -3498,7 +3498,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             );
         }
         GroupMsg::SetPlaylistItem {
-            sender: _,
+            sender,
             playlist_item_id,
         } => {
             if let Some(idx) = state
@@ -3513,6 +3513,21 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, GateReason::PlaylistItem, 0);
+            } else {
+                // A jump to an entry the queue does not hold (a client behind
+                // a queue change, or a stale id after a takeover) is a silent
+                // 204 to the caller — say which id missed and what the queue
+                // currently holds, or the "clicked an episode, nothing
+                // happened" report has no server-side trace at all.
+                tracing::warn!(
+                    group = %state.id,
+                    sender = %sender,
+                    requested = %playlist_item_id,
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    queue_len = state.queue.items.len(),
+                    "syncplay: SetPlaylistItem for an entry not in the queue — ignored"
+                );
+                metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "set_playlist_item", "reason" => "unknown_entry").increment(1);
             }
         }
         GroupMsg::NextItem {
@@ -8163,6 +8178,58 @@ mod tests {
         assert!(
             saw_catch_up,
             "stale buffering must trigger a queue catch-up"
+        );
+    }
+
+    /// A jump to an entry the queue does not hold was a silent no-op: the
+    /// caller got 204 and the server wrote nothing. The ignore must be
+    /// counted so "clicked an episode, nothing happened" is a query.
+    #[tokio::test]
+    async fn set_playlist_item_for_an_unknown_entry_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, _sinks, mut rx1, m1) = fresh().await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: m1,
+            item_ids: vec!["1".into()],
+            item_runtimes_ms: Vec::new(),
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::SetPlaylistItem {
+            sender: m1,
+            playlist_item_id: "not-in-this-queue".into(),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert!(
+            rx1.try_recv().is_err(),
+            "an unknown entry must not broadcast a queue or open a gate"
+        );
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, v)| {
+                ck.key().name() == "pharos_syncplay_command_ignored_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "unknown_entry")
+                    && matches!(v, DebugValue::Counter(1))
+            });
+        assert!(
+            counted,
+            "the ignored jump must emit pharos_syncplay_command_ignored_total{{reason=\"unknown_entry\"}}"
         );
     }
 
