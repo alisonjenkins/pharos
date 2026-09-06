@@ -30,7 +30,7 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -834,6 +834,15 @@ enum SchedMsg {
     Snapshot {
         reply: oneshot::Sender<SchedSnapshot>,
     },
+    /// Which device a shared-init fMP4 rendition is pinned to, resolved by
+    /// the same pure function `candidates_for` applies at dispatch. `None`
+    /// for a rendition that is not pinned (not shared-init fMP4) or that no
+    /// device supports.
+    PinnedDevice {
+        input: PathBuf,
+        opts: TranscodeOptions,
+        reply: oneshot::Sender<Option<DeviceId>>,
+    },
 }
 
 /// Retry context the actor keeps for an in-flight or queued job. Holds
@@ -1516,6 +1525,23 @@ impl TranscodeScheduler {
         self.tx.send(SchedMsg::Snapshot { reply }).await.ok()?;
         rx.await.ok()
     }
+
+    /// The device a shared-init fMP4 rendition of `input` under `opts` will be
+    /// placed on — the pin `candidates_for` enforces — so a caller sizing
+    /// speculative work can size it for the device that will actually run it.
+    /// `None` when the rendition is not pinned, or the scheduler is gone.
+    pub async fn pinned_device(&self, input: &Path, opts: &TranscodeOptions) -> Option<DeviceId> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedMsg::PinnedDevice {
+                input: input.to_path_buf(),
+                opts: opts.clone(),
+                reply,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
 }
 
 /// Wraps a live byte stream so it owns the device permit for its
@@ -1923,6 +1949,15 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
             // A permit just freed (the detached task dropped it before
             // sending JobFinished) — let queued jobs claim it.
             drain_pending(state, self_tx);
+        }
+        SchedMsg::PinnedDevice { input, opts, reply } => {
+            let dev = if crate::device::shared_init_fmp4(&opts) {
+                let key = crate::options::RenditionKey::new(&input, &opts);
+                state.devices.rendition_device(&opts, key.value())
+            } else {
+                None
+            };
+            let _ = reply.send(dev);
         }
         SchedMsg::Snapshot { reply } => {
             let devices = state
@@ -3766,6 +3801,40 @@ mod tests {
             devices.len(),
             1,
             "a shared-init rendition must not mix encoders; got {devices:?}"
+        );
+    }
+
+    /// B219 — the pin is readable BEFORE any job is submitted, and it is the
+    /// same device every segment then lands on, so a caller can size its
+    /// speculative work for the encoder that will actually run it.
+    #[tokio::test]
+    async fn the_pinned_device_is_readable_ahead_of_dispatch_and_matches_it() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, |_, _| WorkerRunResult::Done {
+            out_bytes: 1,
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        let input = PathBuf::from("/m/show.mkv");
+        let pinned = s
+            .pinned_device(&input, &cmaf())
+            .await
+            .expect("a shared-init fMP4 rendition always pins");
+        let mut o = cmaf();
+        o.duration_ticks = Some(6 * 10_000_000);
+        let done = s
+            .submit(
+                input.clone(),
+                o,
+                file_sink(),
+                JobClass::Interactive,
+                JobHint::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.device, pinned, "the pin read ahead is the pin applied");
+        assert_eq!(
+            s.pinned_device(&input, &h264()).await,
+            None,
+            "an mpegts rendition is not shared-init and is not pinned"
         );
     }
 
