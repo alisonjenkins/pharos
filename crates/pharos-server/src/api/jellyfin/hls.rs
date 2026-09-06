@@ -1213,7 +1213,7 @@ async fn serve_segment(
                 PlayheadSeed::Observes,
             )
             .await
-            .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")))?;
+            .map_err(segment_cache_error)?;
         return Ok(HttpResponse::Ok()
             .content_type(opts.container.content_type())
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
@@ -1276,6 +1276,24 @@ async fn serve_segment(
             "public, max-age=31536000, immutable",
         ))
         .streaming(stream.into_stream()))
+}
+
+/// The HTTP answer for a segment the cache could not produce.
+///
+/// A source that could not be OPENED is the same 404 DirectPlay gives for the
+/// same condition (`stream::source_unreadable`): the catalogue knows the item,
+/// the storage does not have it right now. Everything else is the 500 it
+/// always was. Splitting them matters during a storage incident — on
+/// 2026-09-04 every one of a viewer's init retries was a 500 that read as an
+/// encoder fault (B218).
+fn segment_cache_error(e: pharos_cache::hls_cache::HlsCacheError) -> actix_web::Error {
+    match e {
+        pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { reason, detail } => {
+            tracing::warn!(reason, error = %detail, "hls: media source unreadable");
+            error::ErrorNotFound("media source unreadable")
+        }
+        other => error::ErrorInternalServerError(format!("segment cache: {other}")),
+    }
 }
 
 /// P18 — stable weak-ETag string for a segment. Encodes every dimension that
@@ -3419,7 +3437,7 @@ async fn vp9_segment_raw(
                 PlayheadSeed::Observes,
             )
             .await
-            .map_err(|e| error::ErrorInternalServerError(format!("segment cache: {e}")));
+            .map_err(segment_cache_error);
     }
     // Same as the h264 live fallback: no cache means no continuous audio
     // encode, so a muxed rung cannot be served here. (VP9 rungs are
