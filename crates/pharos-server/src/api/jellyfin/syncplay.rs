@@ -78,6 +78,10 @@ enum CommandOutcome {
     DroppedNoSocket,
     /// The request carried no `deviceId` at all.
     NoDevice,
+    /// The session's group handle pointed at an actor that has terminated
+    /// (the group emptied while this socket was between reconnects). The
+    /// handle is detached and the client told `NotInGroup`.
+    ActorDown,
 }
 
 impl CommandOutcome {
@@ -88,6 +92,7 @@ impl CommandOutcome {
             Self::NotInGroup => "not_in_group",
             Self::DroppedNoSocket => "dropped_no_socket",
             Self::NoDevice => "no_device",
+            Self::ActorDown => "actor_down",
         }
     }
 }
@@ -113,6 +118,7 @@ fn record_command(command: &str, outcome: CommandOutcome) {
 /// view reconciles via catch-up the instant its `/socket` reconnects (B24).
 /// Returns whether a group was found and the command sent.
 async fn recover_and_apply(
+    hub: &SessionHub,
     registry: &GroupRegistry,
     stores: &crate::state::Stores,
     member_id: MemberId,
@@ -137,6 +143,10 @@ async fn recover_and_apply(
         command = label, device_id = %device_id, %member_id, group = %gid,
         "syncplay: command applied from persisted membership (no live socket — deploy reconnect gap)"
     );
+    // Re-attach the session too, when it has one: until the socket's own
+    // B24 re-attach lands, every message this group delivers to the socket
+    // would be translated with no group id and a zero epoch (When = 1970).
+    hub.attach_group(device_id, h.clone());
     let _ = h.tx.send(make(member_id)).await;
     record_command(label, CommandOutcome::Recovered);
     true
@@ -177,14 +187,31 @@ async fn dispatch(
     match resolve_with_retry(hub, dev).await {
         Some(sess) => match sess.group {
             Some(h) => {
+                if h.tx.send(make(sess.member_id)).await.is_err() {
+                    // The actor is gone (the group emptied while this socket
+                    // was between reconnects) but the hub still pointed at
+                    // it: every command was a 204 that applied nothing. Drop
+                    // the dead handle and make the exit visible client-side.
+                    tracing::warn!(
+                        command = label, device_id = %dev, group = %h.group_id,
+                        "syncplay: group actor is gone — detaching session and telling client NotInGroup"
+                    );
+                    hub.detach_group(dev);
+                    let _ = sess
+                        .sink
+                        .send(pharos_sync::messages::ServerMsg::NotInGroup)
+                        .await;
+                    record_command(label, CommandOutcome::ActorDown);
+                    return no_content();
+                }
                 tracing::info!(command = label, device_id = %dev, group = %h.group_id, "syncplay: command dispatched");
-                let _ = h.tx.send(make(sess.member_id)).await;
                 record_command(label, CommandOutcome::Dispatched);
             }
             // A live socket but no attached group here: its B24 re-attach may
             // not have run yet, so try persisted recovery before giving up.
             None => {
-                if !recover_and_apply(registry, stores, sess.member_id, dev, label, make).await {
+                if !recover_and_apply(hub, registry, stores, sess.member_id, dev, label, make).await
+                {
                     tracing::warn!(
                         command = label, device_id = %dev,
                         "syncplay: session is in no group — telling client NotInGroup"
@@ -204,7 +231,7 @@ async fn dispatch(
         // persisted membership instead of dropping (was: silent WARN + drop).
         None => {
             let member_id = pharos_sync::hub::member_id_for_device(dev);
-            if !recover_and_apply(registry, stores, member_id, dev, label, make).await {
+            if !recover_and_apply(hub, registry, stores, member_id, dev, label, make).await {
                 tracing::warn!(
                     command = label, device_id = %dev,
                     "syncplay: no /socket registered and no persisted group — command dropped"
@@ -1001,6 +1028,7 @@ mod tests {
             CommandOutcome::NotInGroup,
             CommandOutcome::DroppedNoSocket,
             CommandOutcome::NoDevice,
+            CommandOutcome::ActorDown,
         ];
         let labels: HashSet<&str> = all.iter().map(|o| o.label()).collect();
         assert_eq!(
@@ -1015,6 +1043,61 @@ mod tests {
         assert_eq!(CommandOutcome::NotInGroup.label(), "not_in_group");
         assert_eq!(CommandOutcome::DroppedNoSocket.label(), "dropped_no_socket");
         assert_eq!(CommandOutcome::NoDevice.label(), "no_device");
+        assert_eq!(CommandOutcome::ActorDown.label(), "actor_down");
+    }
+
+    /// A session whose hub entry points at a group actor that has since
+    /// terminated (the group emptied while this socket was between
+    /// reconnects) used to get a 204 for every command while nothing was
+    /// applied and nothing was logged — the client stayed in SyncPlay mode
+    /// with dead controls. The dead handle must be detached and the client
+    /// told NotInGroup, counted as `actor_down`.
+    #[actix_web::test]
+    async fn dispatch_to_a_dead_group_actor_detaches_and_tells_not_in_group() {
+        use crate::state::Stores;
+        use pharos_sync::delivery::{LocalDelivery, MemberSinks};
+        use pharos_sync::SessionHub;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let registry = GroupRegistry::spawn(Arc::new(LocalDelivery::new(MemberSinks::new())));
+        let hub = SessionHub::new();
+        let dev = "user:dev-dead-group";
+        let (sink_tx, mut sink_rx) = mpsc::channel(4);
+        hub.register(dev.to_string(), "alison".into(), sink_tx);
+        // A handle whose actor is gone: the receiver is dropped immediately.
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        hub.attach_group(
+            dev,
+            GroupHandle {
+                group_id: GroupId::new(),
+                tx,
+                epoch_unix_ms: 0,
+            },
+        );
+
+        let resp = dispatch(
+            &hub,
+            &registry,
+            &stores,
+            Some(dev.to_string()),
+            "pause",
+            |mid| GroupMsg::PauseShared { sender: mid },
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NO_CONTENT);
+        assert!(
+            matches!(
+                sink_rx.try_recv(),
+                Ok(pharos_sync::messages::ServerMsg::NotInGroup)
+            ),
+            "the client must be told it is in no group"
+        );
+        assert!(
+            hub.resolve(dev).unwrap().group.is_none(),
+            "the dead handle must be detached so the next command recovers or exits cleanly"
+        );
     }
 
     /// The recovery guard: a device that no persisted snapshot claims must NOT
@@ -1029,6 +1112,7 @@ mod tests {
         let stores = Stores::connect("sqlite::memory:").await.unwrap();
         let registry = GroupRegistry::spawn(Arc::new(LocalDelivery::new(MemberSinks::new())));
         let applied = recover_and_apply(
+            &SessionHub::new(),
             &registry,
             &stores,
             MemberId::new(),
