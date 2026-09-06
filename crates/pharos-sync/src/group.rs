@@ -233,6 +233,13 @@ pub enum GroupMsg {
         /// satisfy the new item's readiness gate (B37) — real Jellyfin
         /// validates this id against the current item.
         playlist_item_id: Option<String>,
+        /// Whether the member's player is PLAYING as it reports ready
+        /// (jellyfin-web's `ReadyRequestDto.IsPlaying`). A member playing
+        /// while the group is paused has dropped the group's Pause and must
+        /// be pulled back; a paused member reporting into a paused group is
+        /// settled and must be left alone (the command loop `ready_while_group
+        /// _paused_sends_nothing` guards).
+        is_playing: bool,
     },
     /// Jellyfin HTTP `/SyncPlay/SetNewQueue` — replace the playlist and start
     /// (leader only). `item_ids` are library item ids; the server assigns a
@@ -385,6 +392,10 @@ pub enum RemoteCommand {
         position_ms: u64,
         #[serde(default)]
         playlist_item_id: Option<String>,
+        /// `default` (false = "not playing") keeps an older peer's envelope
+        /// decodable; a missing flag reads as settled, never as out of sync.
+        #[serde(default)]
+        is_playing: bool,
     },
     MemberPing {
         member_id: MemberId,
@@ -499,10 +510,12 @@ impl RemoteCommand {
                 member_id,
                 position_ms,
                 playlist_item_id,
+                is_playing,
             } => GroupMsg::MemberReady {
                 member_id,
                 position_ms,
                 playlist_item_id,
+                is_playing,
             },
             RemoteCommand::MemberPing { member_id } => GroupMsg::MemberPing { member_id },
             RemoteCommand::SetNewQueue {
@@ -3210,6 +3223,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             member_id,
             position_ms: _,
             playlist_item_id,
+            is_playing,
         } => {
             // B37 — the poisoned-gate bug: jellyfin-web posts Ready on EVERY
             // player transition, including the OLD episode's teardown right
@@ -3269,6 +3283,22 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // Only while Playing — a paused member is already settled, and
                 // healing it with another Pause would re-trigger its Ready
                 // (command loop).
+                state.send_playback_state(member_id);
+            } else if is_playing && matches!(state.playback, PlaybackState::Paused { .. }) {
+                // The mirror case: the member's player is PLAYING while the
+                // group is paused, so it dropped the group's Pause (its player
+                // was not active when the Pause arrived — the same race the
+                // branch above heals with a Play). Pull it back. Real Jellyfin
+                // does this from PausedGroupState on a Ready that reports
+                // playing. No loop: a paused member reports `is_playing =
+                // false`, which stays silent above.
+                tracing::info!(
+                    group = %state.id,
+                    member = %member_id,
+                    "syncplay: member reports playing into a paused group — re-sending Pause"
+                );
+                metrics::counter!("pharos_syncplay_ready_heal_total", "group_state" => "paused")
+                    .increment(1);
                 state.send_playback_state(member_id);
             }
         }
@@ -4604,6 +4634,7 @@ mod tests {
             member_id: m2,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -5418,6 +5449,7 @@ mod tests {
             member_id: m2,
             position_ms: 1_500,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -5542,6 +5574,7 @@ mod tests {
             member_id: m1,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -5669,6 +5702,7 @@ mod tests {
             member_id: m1,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -5712,6 +5746,7 @@ mod tests {
             member_id: m1,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -5762,6 +5797,7 @@ mod tests {
             member_id: m2,
             position_ms: 1_500,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -6517,6 +6553,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 30_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -6848,6 +6885,7 @@ mod tests {
             member_id: m2,
             position_ms: 1_000,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7067,6 +7105,7 @@ mod tests {
             member_id: m2,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7217,6 +7256,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 60_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7286,6 +7326,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 60_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7365,6 +7406,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 60_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7431,6 +7473,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 60_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7494,6 +7537,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 60_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7546,6 +7590,7 @@ mod tests {
             member_id: leader,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7578,6 +7623,7 @@ mod tests {
             member_id: leader,
             position_ms: 30_000,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7696,6 +7742,7 @@ mod tests {
             member_id: m2,
             position_ms: 5_000,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7703,6 +7750,51 @@ mod tests {
         assert!(
             m2_rx.try_recv().is_err(),
             "no heal commands while the group is paused"
+        );
+    }
+
+    /// The mirror of the Playing heal. A member whose Ready says its player
+    /// is PLAYING while the group is paused has dropped the group's Pause
+    /// (its player was not active when the Pause arrived — the same "no
+    /// active player" race the Playing branch heals with a Play). Pull it
+    /// back with the group's Pause. No loop: a paused member reports
+    /// `is_playing = false`, which the test above pins to silence.
+    #[tokio::test]
+    async fn ready_reporting_playing_into_a_paused_group_is_paused() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::MemberReady {
+            member_id: m2,
+            position_ms: 7_000,
+            playlist_item_id: None,
+            is_playing: true,
+        })
+        .await
+        .unwrap();
+        let pause = recv_matching(&mut m2_rx, Duration::from_millis(200), |m| {
+            matches!(m, ServerMsg::Pause { .. })
+        })
+        .await;
+        assert!(
+            matches!(pause, Some(ServerMsg::Pause { position_ms, .. }) if position_ms < 6_000),
+            "a member playing into a paused group must be sent the group's Pause; got {pause:?}"
+        );
+        assert!(
+            leader_rx.try_recv().is_err(),
+            "the heal is addressed to the out-of-sync member only"
         );
     }
 
@@ -7813,6 +7905,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 0,
                 playlist_item_id: Some(plis[0].clone()),
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -7833,6 +7926,7 @@ mod tests {
             member_id: leader,
             position_ms: 0,
             playlist_item_id: Some(plis[0].clone()),
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7841,6 +7935,7 @@ mod tests {
             member_id: m2,
             position_ms: 0,
             playlist_item_id: Some(plis[1].clone()),
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7870,6 +7965,7 @@ mod tests {
             member_id: leader,
             position_ms: 0,
             playlist_item_id: Some(plis[1].clone()),
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7915,6 +8011,7 @@ mod tests {
             member_id: leader,
             position_ms: 0,
             playlist_item_id: Some(plis[0].clone()),
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -7946,6 +8043,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 0,
                 playlist_item_id: Some(plis[0].clone()),
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -8197,6 +8295,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 0,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -8216,6 +8315,7 @@ mod tests {
                 member_id: mid,
                 position_ms: 90_000,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();

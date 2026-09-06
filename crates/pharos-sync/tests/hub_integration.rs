@@ -125,6 +125,7 @@ async fn two_sessions_start_in_lockstep_after_both_ready() {
             member_id: a.member_id,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -134,6 +135,7 @@ async fn two_sessions_start_in_lockstep_after_both_ready() {
             member_id: b.member_id,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -183,6 +185,7 @@ async fn silent_member_does_not_wedge_the_group() {
             member_id: a.member_id,
             position_ms: 0,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -229,6 +232,7 @@ async fn late_joiner_does_not_advance_the_queue() {
                 member_id: m,
                 position_ms: 0,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -312,6 +316,7 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
                 member_id: m,
                 position_ms: 0,
                 playlist_item_id: None,
+                is_playing: false,
             })
             .await
             .unwrap();
@@ -359,6 +364,7 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
             member_id: a.member_id,
             position_ms: 30_000,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();
@@ -368,6 +374,7 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
             member_id: b.member_id,
             position_ms: 30_000,
             playlist_item_id: None,
+            is_playing: false,
         })
         .await
         .unwrap();

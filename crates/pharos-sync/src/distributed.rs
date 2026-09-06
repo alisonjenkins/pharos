@@ -113,10 +113,12 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             member_id,
             position_ms,
             playlist_item_id,
+            is_playing,
         } => RemoteCommand::MemberReady {
             member_id,
             position_ms,
             playlist_item_id,
+            is_playing,
         },
         GroupMsg::MemberPing { member_id } => RemoteCommand::MemberPing { member_id },
         GroupMsg::SetNewQueue {

@@ -363,6 +363,10 @@ struct ReadyBody {
     /// change (B37).
     #[serde(default)]
     playlist_item_id: Option<String>,
+    /// `ReadyRequestDto.IsPlaying` — whether the reporting player is playing.
+    /// Read by the actor to pull a member playing into a paused group back.
+    #[serde(default)]
+    is_playing: bool,
 }
 
 /// `/SyncPlay/NextItem` + `/PreviousItem` body — the entry the CLIENT
@@ -706,6 +710,7 @@ async fn ready(
     let body = body.into_inner();
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
     let pli = body.playlist_item_id;
+    let is_playing = body.is_playing;
     dispatch(
         &hub,
         &registry,
@@ -716,6 +721,7 @@ async fn ready(
             member_id: mid,
             position_ms: pos,
             playlist_item_id: pli,
+            is_playing,
         },
     )
     .await
