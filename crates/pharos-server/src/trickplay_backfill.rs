@@ -557,6 +557,80 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
             tokio::time::sleep(COOLDOWN).await;
         }
     }
+    // Warm the chapter thumbnails of the item somebody is WATCHING (the
+    // priority seed only). A chapter list fires one image request per chapter
+    // at once, and each was a cold ffmpeg seek into the source over NFS through
+    // the same worker pool playback uses: on the Android TV app 64 of 133
+    // chapter-image requests in the week to 2026-09-06 were abandoned by the
+    // client before the frame arrived (B220). Seed-only, gate-paced and capped:
+    // warming every chapter of every title library-wide is tens of thousands
+    // of seeks for lists nobody opens, whereas the seed's list is the one
+    // about to be opened. Idempotent — a warm chapter costs one `stat`.
+    if bypass_gate {
+        if let Some(ic) = ctx.images.as_ref() {
+            let targets = chapter_warm_targets(item);
+            if !targets.is_empty() {
+                // Deliberately gated even for the seed: these are many small
+                // reads of the file being played, and a permit paces them
+                // behind live segments instead of racing them.
+                let _permit = acquire_gate(false, &ctx.bg_io).await;
+                let mut warmed = 0u32;
+                let mut failed = 0u32;
+                for (idx, start_ms) in targets {
+                    match ic.chapter(item.id, &item.path, idx, start_ms).await {
+                        Ok(_) => warmed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            tracing::debug!(
+                                media.id = item.id, chapter = idx, error = %e,
+                                "chapter thumbnail warm failed"
+                            );
+                            if failed >= CHAPTER_WARM_MAX_FAILURES {
+                                break;
+                            }
+                        }
+                    }
+                }
+                tracing::info!(
+                    media.id = item.id,
+                    warmed,
+                    failed,
+                    "chapter thumbnails warmed"
+                );
+                metrics::counter!("pharos_chapter_warm_total", "outcome" => "warmed")
+                    .increment(u64::from(warmed));
+                metrics::counter!("pharos_chapter_warm_total", "outcome" => "failed")
+                    .increment(u64::from(failed));
+            }
+        }
+    }
+}
+
+/// The most chapters warmed for one item. A film carries a few dozen; a
+/// disc rip with hundreds of tiny chapters is not worth hundreds of seeks.
+const CHAPTER_WARM_MAX: usize = 48;
+
+/// Stop after this many consecutive-or-not failures: a source that cannot
+/// seek fails every chapter the same way.
+const CHAPTER_WARM_MAX_FAILURES: u32 = 3;
+
+/// The `(index, start_ms)` of the chapters worth warming for `item`: video
+/// only, in list order (the order the client requests them), capped at
+/// [`CHAPTER_WARM_MAX`], and never a chapter that starts at or past the end of
+/// the media (a seek there yields no frame — a 404 the client already handles).
+fn chapter_warm_targets(item: &MediaItem) -> Vec<(u32, u64)> {
+    if !is_video(item) {
+        return Vec::new();
+    }
+    let end = item.probe.duration_ms;
+    item.probe
+        .chapters
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| end.map_or(true, |d| c.start_ms < d))
+        .map(|(i, c)| (i as u32, c.start_ms))
+        .take(CHAPTER_WARM_MAX)
+        .collect()
 }
 
 #[cfg(test)]
@@ -564,6 +638,35 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
 mod tests {
     use super::*;
     use pharos_core::SeriesInfo;
+
+    /// B220 — only video items with chapters are warmed, in list order, capped,
+    /// and never a chapter that starts past the end of the media.
+    #[test]
+    fn chapter_warm_targets_are_video_only_ordered_capped_and_inside_the_media() {
+        use pharos_core::{MediaChapter, MediaKind};
+        let ch = |start_ms: u64| MediaChapter {
+            start_ms,
+            end_ms: start_ms + 1,
+            title: String::new(),
+        };
+        let mut film = ep(1, "film", 1, 1);
+        film.kind = MediaKind::Movie;
+        film.probe.duration_ms = Some(100_000);
+        film.probe.chapters = vec![ch(0), ch(40_000), ch(100_000), ch(120_000)];
+        assert_eq!(chapter_warm_targets(&film), vec![(0, 0), (1, 40_000)]);
+
+        let mut audio = film.clone();
+        audio.kind = MediaKind::Audio;
+        assert!(
+            chapter_warm_targets(&audio).is_empty(),
+            "audio has no frames to seek to"
+        );
+
+        let mut many = film.clone();
+        many.probe.duration_ms = None;
+        many.probe.chapters = (0..200u64).map(|i| ch(i * 100)).collect();
+        assert_eq!(chapter_warm_targets(&many).len(), CHAPTER_WARM_MAX);
+    }
 
     /// B213 — a file libav cannot read fails identically on every pass; the
     /// memo stops the sweep re-decoding it until the file itself changes.
