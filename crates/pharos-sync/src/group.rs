@@ -1584,12 +1584,28 @@ impl GroupState {
         }
     }
 
-    /// Freeze playback into `Paused` at the current live position and return
-    /// it (Idle stays Idle at 0). The value every outbound `Pause` must carry —
-    /// jellyfin-web's `schedulePause` seeks to the command's PositionTicks, so
-    /// a missing position seeks the client to 0:00.
-    fn freeze_paused_position(&mut self) -> u64 {
-        let position_ms = self.current_position_ms();
+    /// The position the model reaches at `server_ms` (clamped to the item's
+    /// runtime). For a paused or idle group this is the stored position.
+    fn position_at_ms(&self, server_ms: u64) -> u64 {
+        let raw = match self.playback {
+            PlaybackState::Idle => 0,
+            PlaybackState::Paused { position_ms } => position_ms,
+            PlaybackState::Playing {
+                position_ms,
+                anchor_server_ms,
+            } => position_ms + server_ms.saturating_sub(anchor_server_ms),
+        };
+        clamp_to_runtime(raw, self.current_item_runtime_ms())
+    }
+
+    /// Freeze playback into `Paused` at the position clients reach at
+    /// `at_server_ms` — the Pause's own `When` — and return it (Idle stays Idle
+    /// at 0). The value every outbound `Pause` must carry: jellyfin-web's
+    /// `schedulePause` pauses AT `When` and then seeks to the command's
+    /// PositionTicks, so a position taken at issue time rewinds every client by
+    /// the lead, and a missing one seeks them to 0:00.
+    fn freeze_paused_position(&mut self, at_server_ms: u64) -> u64 {
+        let position_ms = self.position_at_ms(at_server_ms);
         if !matches!(self.playback, PlaybackState::Idle) {
             self.playback = PlaybackState::Paused { position_ms };
         }
@@ -2923,7 +2939,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.clear_buffering_freeze(FreezeOutcome::Superseded);
             // Freeze position at the moment we paused so late joiners
             // get the correct still-frame.
-            let position_ms = state.freeze_paused_position();
+            let position_ms = state.freeze_paused_position(at_server_ms);
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
                 position_ms,
@@ -3024,7 +3040,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // hits the late-joiner catch-up and is told to *Play* —
                 // desynced from everyone else who is paused. (V19 buffer
                 // isolation.)
-                let position_ms = state.freeze_paused_position();
+                let position_ms = state.freeze_paused_position(at_server_ms);
                 state.broadcast(ServerMsg::Pause {
                     at_server_ms,
                     position_ms,
@@ -3262,7 +3278,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // clear its bookkeeping so a member's later Ready / the anti-wedge
             // timer can't force-resume the group out from under this pause.
             state.clear_buffering_freeze(FreezeOutcome::Superseded);
-            let position_ms = state.freeze_paused_position();
+            let position_ms = state.freeze_paused_position(at_server_ms);
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
                 position_ms,
@@ -7244,9 +7260,12 @@ mod tests {
             }
         }
         let pos = pause_pos.expect("pause must broadcast a position");
+        // Issued 80 ms into a 200 ms pre-roll, scheduled 200 ms later: clients
+        // have played ~80 ms by the Pause's When. The bug this guards reported
+        // ~10280 (anchored at issue time, so the model ran a full lead ahead).
         assert!(
-            pos <= 10_050,
-            "pre-roll pause must report the start position (~10000), not lead-advanced; got {pos}"
+            (10_000..10_150).contains(&pos),
+            "pre-roll pause must report where clients are at its When (~10080), not lead-advanced; got {pos}"
         );
     }
 
@@ -7696,6 +7715,57 @@ mod tests {
             ),
             other => panic!("expected Pause, got {other:?}"),
         }
+    }
+
+    /// jellyfin-web executes a Pause AT `When`: it pauses, then seeks to the
+    /// command's PositionTicks. So the position a Pause carries must be the
+    /// one clients reach at `at_server_ms`, not the one the model held when
+    /// the command was issued — freezing at issue time rewound every pause by
+    /// the whole lead (200 ms with no RTT samples, up to 2.2 s), and every
+    /// late joiner got that rewound frame too. Exact arithmetic: both instants
+    /// come from the server clock, so the expected value is deterministic.
+    #[tokio::test]
+    async fn pause_position_is_where_clients_are_at_the_scheduled_instant() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, _m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        let play_at = match recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await
+        {
+            Some(ServerMsg::Play { at_server_ms, .. }) => at_server_ms,
+            other => panic!("expected Play, got {other:?}"),
+        };
+        // Past the pre-roll: clients are genuinely playing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.tx.send(GroupMsg::PauseShared { sender: leader })
+            .await
+            .unwrap();
+        let (pause_at, pause_pos) =
+            match recv_matching(&mut leader_rx, Duration::from_millis(500), |m| {
+                matches!(m, ServerMsg::Pause { .. })
+            })
+            .await
+            {
+                Some(ServerMsg::Pause {
+                    at_server_ms,
+                    position_ms,
+                }) => (at_server_ms, position_ms),
+                other => panic!("expected Pause, got {other:?}"),
+            };
+        assert_eq!(
+            pause_pos,
+            10_000 + (pause_at - play_at),
+            "Pause must carry the position clients reach at its own When, \
+             not the position {} ms earlier (the lead)",
+            MIN_LEAD_MS
+        );
     }
 
     #[tokio::test]
