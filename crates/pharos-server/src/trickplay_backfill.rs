@@ -59,6 +59,9 @@ const GRID_PRIMARY_WIDTH: u32 = 480;
 #[derive(Clone)]
 struct GenCtx {
     stores: Stores,
+    /// Items whose generation FAILED, by file signature, so the sweep does not
+    /// re-decode a file libav cannot read on every pass (see [`FailureMemo`]).
+    failed: Arc<std::sync::Mutex<FailureMemo>>,
     /// Background-work leadership (T85). The SWEEP waits on this; the priority
     /// worker deliberately does not — see [`spawn`].
     bg_leader: Arc<std::sync::atomic::AtomicBool>,
@@ -117,6 +120,7 @@ pub fn spawn(
         );
         let ctx = GenCtx {
             stores,
+            failed: Arc::new(std::sync::Mutex::new(FailureMemo::default())),
             bg_leader,
             cache,
             subtitles,
@@ -330,6 +334,51 @@ fn is_video(item: &MediaItem) -> bool {
     matches!(item.kind, MediaKind::Movie | MediaKind::Episode)
 }
 
+/// A file's identity for the failure memo: its mtime and size. A file that
+/// changes on disk is a different file and earns a fresh attempt.
+type FileSig = (i64, u64);
+
+/// Which items' trickplay generation failed, and on which version of the file.
+///
+/// Without this, a source libav cannot decode ("send packet: Invalid data
+/// found when processing input" — the zeroed/truncated population the probe
+/// memo already knows about) was re-attempted on EVERY sweep pass: five such
+/// files, 34 whole-file decode attempts each in the two days to 2026-09-06,
+/// every attempt a background-I/O permit and a multi-GB NFS read spent on an
+/// answer that cannot change while the file does not (B213). In memory only: a
+/// restart costs one attempt per file, which is the right price for never
+/// pinning a permanent verdict on a transient fault.
+#[derive(Default)]
+struct FailureMemo {
+    by_item: std::collections::HashMap<u64, FileSig>,
+}
+
+impl FailureMemo {
+    /// `true` when `id` failed before on exactly this version of the file.
+    fn is_failed(&self, id: u64, sig: Option<FileSig>) -> bool {
+        match (self.by_item.get(&id), sig) {
+            (Some(prev), Some(now)) => *prev == now,
+            _ => false,
+        }
+    }
+
+    fn record(&mut self, id: u64, sig: Option<FileSig>) {
+        if let Some(sig) = sig {
+            self.by_item.insert(id, sig);
+        }
+    }
+}
+
+async fn file_sig(path: &std::path::Path) -> Option<FileSig> {
+    let m = tokio::fs::metadata(path).await.ok()?;
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)?;
+    Some((mtime, m.len()))
+}
+
 /// Whether a background sweep can do any work on this item at all.
 ///
 /// Two ways to be out of scope, and they fail differently. A non-video has
@@ -381,7 +430,21 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
         .iter()
         .filter_map(|&width| build_layout(&item.probe, width, ctx.interval_ms))
         .collect();
-    if !layouts.is_empty() {
+    let sig = file_sig(&item.path).await;
+    let failed_before = ctx
+        .failed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_failed(item.id, sig);
+    if failed_before {
+        metrics::counter!("pharos_trickplay_skipped_total", "reason" => "failed_before")
+            .increment(1);
+        tracing::debug!(
+            media.id = item.id,
+            "trickplay generation skipped: failed before on this version of the file"
+        );
+    }
+    if !layouts.is_empty() && !failed_before {
         // Throttle to the adaptive gate: hold a background-I/O permit across the
         // whole batch (master decode + derives) so bulk generation runs at
         // bounded concurrency (yielding NFS + CPU headroom to live streams) yet
@@ -410,7 +473,16 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
             }
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(error = %e, media.id = item.id, "trickplay generation failed");
+                tracing::warn!(
+                    error = %e,
+                    media.id = item.id,
+                    path = %item.path.display(),
+                    "trickplay generation failed; not retried until the file changes"
+                );
+                ctx.failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record(item.id, sig);
             }
         }
     }
@@ -492,6 +564,30 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
 mod tests {
     use super::*;
     use pharos_core::SeriesInfo;
+
+    /// B213 — a file libav cannot read fails identically on every pass; the
+    /// memo stops the sweep re-decoding it until the file itself changes.
+    #[test]
+    fn a_failed_item_is_not_retried_until_its_file_changes() {
+        let mut memo = FailureMemo::default();
+        let sig = Some((1_700_000_000, 4_096));
+        assert!(!memo.is_failed(7, sig), "never attempted");
+        memo.record(7, sig);
+        assert!(memo.is_failed(7, sig), "same file, same failure");
+        assert!(
+            !memo.is_failed(7, Some((1_700_000_999, 4_096))),
+            "a rewritten file is a new file"
+        );
+        assert!(
+            !memo.is_failed(7, None),
+            "an unstat-able file is not judged"
+        );
+        memo.record(8, None);
+        assert!(
+            !memo.is_failed(8, sig),
+            "a failure with no signature is not kept"
+        );
+    }
 
     /// T85 — the sweep must not run on a replica that is not the background
     /// leader.
@@ -689,6 +785,7 @@ mod tests {
             // A test exercising the worker directly is the leader by definition.
             bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             stores,
+            failed: Arc::new(std::sync::Mutex::new(FailureMemo::default())),
             cache: TrickplayCache::new(dir.path(), 1),
             subtitles: None,
             images: None,
