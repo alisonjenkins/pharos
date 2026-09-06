@@ -337,10 +337,27 @@ pub(crate) async fn pre_extract_subtitles(
 
     let args = build_batch_extract_args(input, &batch);
     let started = std::time::Instant::now();
-    let status = Command::new("ffmpeg").args(&args).output().await;
-    if let Err(e) = &status {
-        tracing::warn!(error = %e, media.id = item.id, "subtitle batch ffmpeg spawn failed");
-        return;
+    let output = match Command::new("ffmpeg").args(&args).output().await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = item.id, "subtitle batch ffmpeg spawn failed");
+            return;
+        }
+    };
+    // ffmpeg's own verdict on the SOURCE, said once. Thirty per-track "no
+    // output" lines carried no cause at all: on 2026-09-04 the cause was a
+    // stale NFS handle on the open, and the exit status and stderr that named
+    // it were discarded (B212).
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr_tail(&stderr, 3);
+        tracing::warn!(
+            media.id = item.id,
+            path = %item.path.display(),
+            exit = %output.status,
+            stderr_tail = %tail,
+            "subtitle batch ffmpeg exited non-zero"
+        );
     }
 
     // Harvest whatever got written, REGARDLESS of overall exit status: ffmpeg
@@ -349,6 +366,7 @@ pub(crate) async fn pre_extract_subtitles(
     // loop, so a permanently-bad stream can't turn every warm pass back into N
     // whole-file demuxes).
     let mut ok = 0u32;
+    let mut empty = 0u32;
     for (p, b) in pending.iter().zip(batch.iter()) {
         match tokio::fs::read(&b.out).await {
             Ok(bytes) if !bytes.is_empty() => {
@@ -358,7 +376,19 @@ pub(crate) async fn pre_extract_subtitles(
                 ok += 1;
             }
             _ => {
-                tracing::warn!(
+                empty += 1;
+                if memo_empty_track(output.status.success()) {
+                    // ffmpeg read the whole source and wrote nothing for this
+                    // track: it has no cues. Remember that, or the track stays
+                    // "pending" and every warm pass re-demuxes the whole file
+                    // to learn it again — 60 such lines for one item in two
+                    // days (B212). A failed run is NOT memoised: it says
+                    // nothing about the track.
+                    cache
+                        .store(&item.path, mtime, p.stream_index, p.kind, Vec::new())
+                        .await;
+                }
+                tracing::debug!(
                     media.id = item.id,
                     idx = p.stream_index,
                     "subtitle track produced no output in batch demux"
@@ -370,9 +400,28 @@ pub(crate) async fn pre_extract_subtitles(
         media.id = item.id,
         tracks = pending.len(),
         extracted = ok,
+        empty,
+        ffmpeg_ok = output.status.success(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "subtitle batch extracted (one source open)"
     );
+}
+
+/// Whether a track that produced no output should be remembered as EMPTY.
+/// Only when ffmpeg finished cleanly: then the source was read end to end and
+/// the track genuinely has nothing. A non-zero exit (a source that would not
+/// open, a demux that died halfway) says nothing about the track, and memoising
+/// it would hide a subtitle until the file's mtime changed.
+fn memo_empty_track(ffmpeg_succeeded: bool) -> bool {
+    ffmpeg_succeeded
+}
+
+/// The last `n` non-empty lines of an ffmpeg stderr, joined — the part that
+/// names the fault.
+fn stderr_tail(stderr: &str, n: usize) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join(" | ")
 }
 
 /// A text subtitle track selected for batch extraction.
