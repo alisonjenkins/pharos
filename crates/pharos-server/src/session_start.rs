@@ -146,6 +146,21 @@ pub fn note_session_start(
 /// in this range is a player that cannot use what it is being given.
 const REFETCH_THRESHOLD: u32 = 5;
 
+/// An init segment is re-fetched on every seek (hls.js reloads it with the
+/// first fragment after a flush), so its healthy count is not "once": in the
+/// week to 2026-09-06, 2508 of 2540 sessions fetched it twice and the
+/// scrubbing tail reached 35, while the 2026-08-29 wedge fetched it 291 times
+/// in 27 s. Set between those, on the wedge's side of the tail.
+const INIT_REFETCH_THRESHOLD: u32 = 60;
+
+fn refetch_threshold(seg: u32) -> u32 {
+    if matches!(seg, INIT_SEG_H264CMAF | INIT_SEG_VP9 | INIT_SEG_VP9_AUDIO) {
+        INIT_REFETCH_THRESHOLD
+    } else {
+        REFETCH_THRESHOLD
+    }
+}
+
 /// Above this many tracked (session, segment) pairs, forget them all. Same
 /// trade as [`MAX_TRACKED_SESSIONS`]: a cleared entry costs at most one delayed
 /// warning, which is far cheaper than an LRU on the segment hot path.
@@ -197,7 +212,7 @@ impl SegmentRefetches {
         }
         let n = counts.entry((psid.to_string(), seg)).or_insert(0);
         *n += 1;
-        (*n == REFETCH_THRESHOLD).then_some(*n)
+        (*n == refetch_threshold(seg)).then_some(*n)
     }
 }
 
@@ -314,13 +329,34 @@ mod tests {
     fn a_repeatedly_refetched_init_segment_is_reported() {
         let r = SegmentRefetches::new();
         let psid = Some("stuck-tab");
-        for _ in 1..REFETCH_THRESHOLD {
+        for _ in 1..INIT_REFETCH_THRESHOLD {
             assert_eq!(r.note(psid, INIT_SEG_H264CMAF), None);
         }
         assert_eq!(
             r.note(psid, INIT_SEG_H264CMAF),
-            Some(REFETCH_THRESHOLD),
-            "an init-segment storm must cross the same threshold a media-segment storm does"
+            Some(INIT_REFETCH_THRESHOLD),
+            "an init-segment storm must be reported once it passes the threshold"
+        );
+    }
+
+    /// A viewer scrubbing through an episode re-fetches the init segment on
+    /// every seek — 35 times in the worst healthy session of the week to
+    /// 2026-09-06 — and that is not the wedge this detector exists for.
+    #[test]
+    fn a_scrubbing_session_does_not_trip_the_init_alarm() {
+        let r = SegmentRefetches::new();
+        let psid = Some("scrubbing-tab");
+        for _ in 0..35 {
+            assert_eq!(
+                r.note(psid, INIT_SEG_H264CMAF),
+                None,
+                "an init re-fetch per seek is ordinary, not a stuck player"
+            );
+        }
+        assert_eq!(
+            r.note(psid, 7),
+            None,
+            "a media segment keeps the tighter threshold"
         );
     }
     use super::*;
