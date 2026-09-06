@@ -92,7 +92,7 @@ impl Delivery for BusDelivery {
             self.local.deliver(member_id, msg);
             return;
         }
-        let msg_kind = msg_kind(&msg);
+        let msg_kind = ServerMsg::kind(&msg);
         let env = BusMsg::Deliver { member_id, msg };
         if let Ok(payload) = serde_json::to_string(&env) {
             // Send failure means the egress task is gone (process shutting
@@ -119,26 +119,6 @@ struct Outbound {
 /// delivery desyncs one member, a lost command drops a whole group action.
 pub fn record_publish_failure(kind: &'static str) {
     metrics::counter!("pharos_syncplay_bus_publish_failed_total", "kind" => kind).increment(1);
-}
-
-/// The variant name of a `ServerMsg`, for the drop log. Bounded and stable.
-fn msg_kind(msg: &ServerMsg) -> &'static str {
-    match msg {
-        ServerMsg::Welcome { .. } => "welcome",
-        ServerMsg::Joined { .. } => "joined",
-        ServerMsg::Pong { .. } => "pong",
-        ServerMsg::Play { .. } => "play",
-        ServerMsg::Pause { .. } => "pause",
-        ServerMsg::Seek { .. } => "seek",
-        ServerMsg::LeaderChange { .. } => "leader_change",
-        ServerMsg::MemberJoined { .. } => "member_joined",
-        ServerMsg::MemberLeft { .. } => "member_left",
-        ServerMsg::StateUpdate { .. } => "state_update",
-        ServerMsg::PlayQueue { .. } => "play_queue",
-        ServerMsg::Error { .. } => "error",
-        ServerMsg::NotInGroup => "not_in_group",
-        ServerMsg::GroupLeft => "group_left",
-    }
 }
 
 /// Spawn the per-replica ingress: subscribe to `bus` and deliver every
