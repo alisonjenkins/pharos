@@ -1194,7 +1194,8 @@ async fn serve_segment(
             &opts,
             wanted_burn,
             q.play_session_id.as_deref(),
-        );
+        )
+        .await;
         let stream = q
             .play_session_id
             .as_deref()
@@ -2295,7 +2296,8 @@ async fn vp9_segment(
         &opts,
         wanted_burn,
         q.play_session_id.as_deref(),
-    );
+    )
+    .await;
     let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
     // A/V-sync diagnostic (T-avsync): log each track's tfdt + content duration
     // so real playback reveals a per-segment gap/overlap or an audio-vs-video
@@ -2476,7 +2478,8 @@ async fn h264cmaf_segment(
         &opts,
         wanted_burn,
         q.play_session_id.as_deref(),
-    );
+    )
+    .await;
     let raw = vp9_segment_raw(&state, &item, seg, &opts, q.play_session_id.as_deref()).await?;
     fmp4::record_track_timescale(&raw, item.id, seg);
     let processed = fmp4::process_segment(&raw)
@@ -2533,6 +2536,30 @@ fn segment_prefetch_ahead(hw_budget: Option<u32>) -> u32 {
             permits.saturating_sub(2).clamp(1, 4)
         }
     }
+}
+
+/// The hardware session budget the prefetch depth may scale on, or `None` for
+/// the CPU depth.
+///
+/// The pin wins when there is one: a rendition pinned to the CPU prefetches
+/// at the CPU depth however capable the GPU is, because every one of those
+/// speculative segments will run on the CPU beside the client's own — measured
+/// 2026-09-06 as a CPU-pinned CMAF rendition warming 6 ahead on 4 permits,
+/// `peer_jobs 5` on the segment the viewer was waiting for (B219). A rendition
+/// pinned to hardware, or an unpinned one whose codec hardware-encodes, scales
+/// on the budget as before.
+fn prefetch_hw_budget(
+    pinned: Option<pharos_transcode::protocol::DeviceId>,
+    hw_capable: bool,
+    hw_session_budget: usize,
+) -> Option<u32> {
+    use pharos_transcode::protocol::DeviceId;
+    let on_hardware = match pinned {
+        Some(DeviceId::Cpu) => false,
+        Some(DeviceId::Hw { .. }) => true,
+        None => hw_capable,
+    };
+    (on_hardware && hw_session_budget > 0).then_some(hw_session_budget as u32)
 }
 
 /// Validate a source's `frame_rate_mille` into a usable [`pharos_core::FrameRate`].
@@ -3059,7 +3086,7 @@ fn spawn_one_prefetch(
     })
 }
 
-fn spawn_segment_prefetch(
+async fn spawn_segment_prefetch(
     state: &web::Data<AppState>,
     item: &pharos_core::MediaItem,
     base_seg: u32,
@@ -3070,6 +3097,23 @@ fn spawn_segment_prefetch(
     if state.hls.is_none() {
         return;
     }
+    // Where THIS rendition will actually encode. A shared-init fMP4 rendition
+    // is pinned to one device by the scheduler, and the pin lands on the CPU
+    // for its share of the weighted spread (007) even when a GPU could encode
+    // the codec — so the codec-capability test below is not enough on its own
+    // (B219). An audio-carrying opts cannot be lowered without its slice, but
+    // the fMP4 surfaces are audio-free, which is exactly the pinned case.
+    let pinned = match (
+        &state.transcode_scheduler,
+        opts.clone().resolve_with(|_| Err(())),
+    ) {
+        (Some(sched), Ok(resolved)) => {
+            sched
+                .pinned_device(&item.path, &resolved.to_transcode_options())
+                .await
+        }
+        _ => None,
+    };
     let total_segs = item
         .probe
         .duration_ms
@@ -3078,16 +3122,13 @@ fn spawn_segment_prefetch(
     // the target codec is one it hardware-encodes (h264/h265 on NVENC; VP9/AV1
     // stay software). Only then does the prefetch scale on the GPU session
     // budget — a software-codec stream keeps the conservative CPU-thread depth.
-    let hw_budget = opts.video.and_then(|seg_video| {
-        let codec = VideoCodec::from(seg_video);
-        let budget = state.hw_encode_session_budget;
-        (budget > 0
-            && state
-                .encode_capabilities
-                .best_for(codec)
-                .is_some_and(|c| c.accel.is_hardware()))
-        .then_some(budget as u32)
+    let hw_capable = opts.video.is_some_and(|seg_video| {
+        state
+            .encode_capabilities
+            .best_for(VideoCodec::from(seg_video))
+            .is_some_and(|c| c.accel.is_hardware())
     });
+    let hw_budget = prefetch_hw_budget(pinned, hw_capable, state.hw_encode_session_budget);
     let ahead = segment_prefetch_ahead(hw_budget);
     // Near shallow prefetch: the next few segments, all of them (fast).
     let near = prefetch_target_segments(base_seg, total_segs, ahead);
@@ -3717,6 +3758,24 @@ mod tests {
         assert!(
             (1..=4).contains(&n),
             "sw prefetch-ahead {n} out of sane range"
+        );
+    }
+
+    /// B219 — a CPU-pinned rendition prefetches at the CPU depth whatever the
+    /// GPU could do; a hardware pin or an unpinned hardware-capable codec
+    /// scales on the session budget.
+    #[::core::prelude::v1::test]
+    fn a_cpu_pinned_rendition_prefetches_at_the_cpu_depth() {
+        use pharos_transcode::protocol::DeviceId;
+        let gpu = DeviceId::hw(pharos_transcode::HwAccel::Nvenc, 0);
+        assert_eq!(prefetch_hw_budget(Some(DeviceId::Cpu), true, 8), None);
+        assert_eq!(prefetch_hw_budget(Some(gpu), true, 8), Some(8));
+        assert_eq!(prefetch_hw_budget(None, true, 8), Some(8));
+        assert_eq!(prefetch_hw_budget(None, false, 8), None);
+        assert_eq!(
+            prefetch_hw_budget(Some(gpu), true, 0),
+            None,
+            "no budget, no hardware depth"
         );
     }
 
