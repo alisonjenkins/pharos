@@ -2072,17 +2072,22 @@ impl GroupState {
         self.queue.repeat_mode = ps.repeat_mode;
         self.queue.shuffle_mode = ps.shuffle_mode;
         self.queue.updated_unix_ms = ps.queue_updated_unix_ms;
-        self.waiting = ps.waiting.map(|w| WaitingGate {
-            pending: w.pending.into_iter().collect(),
-            reason: GateReason::from_label(&w.reason),
-            opened_at: tokio::time::Instant::now(),
-            resume_playing: w.resume_playing,
-            position_ms: w.position_ms,
-            // Not persisted: the spurious-Ready window is ~lead-sized (≤2.2s)
-            // and a takeover mid-gate re-arms the deadline anyway.
-            not_before_server_ms: 0,
-            deadline: tokio::time::Instant::now()
-                + std::time::Duration::from_millis(READY_TIMEOUT_MS),
+        self.waiting = ps.waiting.map(|w| {
+            let reason = GateReason::from_label(&w.reason);
+            WaitingGate {
+                pending: w.pending.into_iter().collect(),
+                reason,
+                opened_at: tokio::time::Instant::now(),
+                resume_playing: w.resume_playing,
+                position_ms: w.position_ms,
+                // Not persisted: the spurious-Ready window is ~lead-sized (≤2.2s)
+                // and a takeover mid-gate re-arms the deadline anyway.
+                not_before_server_ms: 0,
+                // Re-armed in full on the new owner, on the bound the gate's own
+                // reason sets — a restored seek gate is still a seek gate.
+                deadline: tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(reason.timeout_ms()),
+            }
         });
         self.group_name = ps.group_name;
     }
@@ -5468,6 +5473,83 @@ mod tests {
             GroupPlayState::Waiting,
             "the gate must have given up by {SEEK_GATE_TIMEOUT_MS}ms; on the \
              30s new-item timeout this is still open and the room is frozen"
+        );
+    }
+
+    /// A seek gate restored from a snapshot (a pod takeover mid-seek) kept its
+    /// reason but was re-armed on the 30 s new-item timeout regardless — six
+    /// times the bound B182 set for a seek. The restored gate must honour its
+    /// own reason's timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_seek_gate_keeps_the_seek_timeout() {
+        let member = MemberId::new();
+        let ps = PersistState {
+            members: vec![PersistMember {
+                id: member,
+                name: "one".into(),
+                ignore_wait: false,
+            }],
+            leader: Some(member),
+            group_paused_due_to_buffering: false,
+            buffering_resume_playing: false,
+            playback: PersistPlayback::Paused {
+                position_ms: 60_000,
+            },
+            queue_items: vec![PersistQueueItem {
+                item_id: "1".into(),
+                playlist_item_id: "pli-1".into(),
+                runtime_ms: None,
+            }],
+            playing_index: 0,
+            repeat_mode: String::new(),
+            shuffle_mode: String::new(),
+            queue_updated_unix_ms: 1,
+            waiting: Some(PersistWaiting {
+                pending: vec![member],
+                resume_playing: true,
+                position_ms: 60_000,
+                reason: GateReason::Seek.label().to_string(),
+            }),
+            group_name: "g".into(),
+        };
+        let json = serde_json::to_string(&ps).unwrap();
+        let sinks = MemberSinks::new();
+        let delivery = Arc::new(LocalDelivery::new(sinks.clone()));
+        let (tx, mut rx) = mpsc::channel(64);
+        sinks.insert(member, 1, tx);
+        let h = GroupHandle::spawn_persistent(
+            GroupId::new(),
+            1_000,
+            delivery,
+            Arc::new(CapturePersistence::default()),
+            Some(&json),
+        );
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the gate must be restored open"
+        );
+
+        tokio::time::advance(Duration::from_millis(SEEK_GATE_TIMEOUT_MS + 500)).await;
+        let _ = snapshot_of(&h).await;
+        assert_ne!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "a restored seek gate must give up by {SEEK_GATE_TIMEOUT_MS}ms, not {READY_TIMEOUT_MS}ms"
+        );
+        let play = recv_matching(&mut rx, Duration::from_millis(100), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "the resolved gate resumes at the seek target"
         );
     }
 
