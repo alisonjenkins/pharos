@@ -312,6 +312,18 @@ impl SegmentOutcome {
 /// encode" (a transcode bug). Those need opposite responses, and telling them
 /// apart used to mean reading the error string out of a log line that the
 /// failure path never wrote.
+/// Whether a segment took so long that its viewer is stalling: more than three
+/// times the playback it covers. The budget is floored at one second because a
+/// TAIL segment can cover a few dozen milliseconds, and against that any encode
+/// at all — a 1.4 s encode of a 0.1 s tail was warned as "far below realtime"
+/// on 2026-09-05 — reads as a stall that no viewer experiences: the player has
+/// the whole preceding segment in hand and the file is over.
+fn far_below_realtime(transcode_ms: f64, seg_secs: f64) -> bool {
+    const BUDGET_FLOOR_MS: f64 = 1_000.0;
+    let budget_ms = (seg_secs * 1000.0).max(BUDGET_FLOOR_MS);
+    transcode_ms > 3.0 * budget_ms
+}
+
 fn failure_reason(err: &HlsCacheError) -> &'static str {
     match err {
         HlsCacheError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => "source_missing",
@@ -3074,8 +3086,7 @@ impl HlsSegmentCache {
         // to attribute the stall — the 170-225 s outliers observed live
         // (2026-07-14, Avatar burn path) were only findable by correlating
         // INFO lines after the fact.
-        let realtime_budget_ms = seg_secs * 1000.0;
-        if (transcode_ms as f64) > 3.0 * realtime_budget_ms {
+        if far_below_realtime(transcode_ms as f64, seg_secs) {
             tracing::warn!(
                 media.id = media_id,
                 seg = seg_index,
@@ -7404,6 +7415,21 @@ mod tests {
     /// The `result` label is a dashboard contract: three distinct, stable
     /// values. `tail_deficit` exists so the tail is neither counted as loss
     /// nor laundered into `complete`.
+    /// A 0.1 s tail segment encoded in 1.4 s is not a stall: the viewer holds
+    /// the previous segment and the item is over. Only a segment that would
+    /// actually outrun its own playback three times over warns.
+    #[test]
+    fn a_tiny_tail_segment_does_not_trip_the_below_realtime_alarm() {
+        assert!(!far_below_realtime(1_394.0, 0.104_479));
+        assert!(!far_below_realtime(2_999.0, 0.5));
+        assert!(
+            far_below_realtime(3_001.0, 0.5),
+            "floor is 1 s: 3 s is the line"
+        );
+        assert!(far_below_realtime(22_112.0, 6.006));
+        assert!(!far_below_realtime(17_000.0, 6.006));
+    }
+
     #[test]
     fn frame_results_have_distinct_labels() {
         const ALL: [FrameResult; 3] = [
