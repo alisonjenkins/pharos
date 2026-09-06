@@ -3059,10 +3059,21 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // desynced from everyone else who is paused. (V19 buffer
                 // isolation.)
                 let position_ms = state.freeze_paused_position(at_server_ms);
-                state.broadcast(ServerMsg::Pause {
-                    at_server_ms,
-                    position_ms,
-                });
+                // To everyone EXCEPT the member that is buffering (real
+                // Jellyfin: `SyncPlayBroadcastType.AllReady`). Its element is
+                // stalled mid-load; pausing it there means it never fires
+                // `playing`, so it never posts the Ready that lifts this
+                // freeze — measured live as 30 s freezes ending only at the
+                // anti-wedge, and as the room's owner pressing play every few
+                // minutes on 2026-09-06 (B208). Left alone it recovers on its
+                // own, Readys, and the resume below brings it back in line.
+                state.broadcast_except(
+                    member_id,
+                    ServerMsg::Pause {
+                        at_server_ms,
+                        position_ms,
+                    },
+                );
             }
         }
         GroupMsg::BufferingEnd { member_id } => {
@@ -4901,7 +4912,10 @@ mod tests {
         while m2_rx.try_recv().is_ok() {}
         while m3_rx.try_recv().is_ok() {}
 
-        // First buffering report → exactly one Pause per member (3 total).
+        // First buffering report → exactly one Pause per NON-buffering member.
+        // The buffering member itself gets nothing: pausing its element
+        // mid-load stops it from ever emitting `playing`, so it could never
+        // post the Ready that lifts the freeze (real Jellyfin: `AllReady`).
         h.tx.send(GroupMsg::BufferingStart {
             member_id: m2,
             position_ms: 0,
@@ -4914,13 +4928,15 @@ mod tests {
             ServerMsg::Pause { .. }
         ));
         assert!(matches!(
-            m2_rx.recv().await.unwrap(),
-            ServerMsg::Pause { .. }
-        ));
-        assert!(matches!(
             m3_rx.recv().await.unwrap(),
             ServerMsg::Pause { .. }
         ));
+        let _ = snapshot_of(&h).await;
+        assert!(
+            m2_rx.try_recv().is_err(),
+            "the buffering member must not be sent the freeze Pause — a paused \
+             element never fires `playing`, so it could never Ready"
+        );
 
         // Second buffering report from a different member while group is
         // already paused → no broadcast, no Pause on any sink.
