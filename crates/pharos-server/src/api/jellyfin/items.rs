@@ -1842,7 +1842,7 @@ struct PlaybackInfoBody {
 
 /// Parse an IP from either a bare address (X-Forwarded-For form) or a
 /// `host:port` / `[v6]:port` socket string (actix peer-addr form).
-fn parse_client_ip(s: &str) -> Option<std::net::IpAddr> {
+pub(crate) fn parse_client_ip(s: &str) -> Option<std::net::IpAddr> {
     let t = s.trim();
     if let Ok(ip) = t.parse::<std::net::IpAddr>() {
         return Some(ip);
@@ -1853,7 +1853,7 @@ fn parse_client_ip(s: &str) -> Option<std::net::IpAddr> {
 /// True when `ip` is a public (WAN) address — i.e. NOT loopback, private
 /// (RFC1918 / ULA), link-local, unspecified, or carrier-grade-NAT / mesh-VPN
 /// shared space (100.64/10, commonly Tailscale — treated as LAN-speed).
-fn ip_is_remote(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn ip_is_remote(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             // 100.64.0.0/10 — CGNAT / shared address space (Tailscale et al.).
@@ -1885,7 +1885,7 @@ fn ip_is_remote(ip: &std::net::IpAddr) -> bool {
 /// ingress's `X-Forwarded-For` (actix `realip_remote_addr`). An unresolvable
 /// address is treated as LOCAL — we never want to spuriously throttle a LAN
 /// viewer we simply couldn't parse.
-fn client_is_remote(req: &actix_web::HttpRequest) -> bool {
+pub(crate) fn client_is_remote(req: &actix_web::HttpRequest) -> bool {
     req.connection_info()
         .realip_remote_addr()
         .and_then(parse_client_ip)
