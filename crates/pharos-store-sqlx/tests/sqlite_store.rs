@@ -796,7 +796,7 @@ async fn libraries_upsert_list_and_backfill_by_path_prefix() {
 
     let assigned = s.backfill_library_ids().await.unwrap();
     // items 1 + 2 assigned; item 3 (movies-4k) untouched by the boundary.
-    assert_eq!(assigned, 2);
+    assert_eq!(assigned.assigned, 2);
 
     let movies_items = s.item_ids_for_library(movies_wire).await.unwrap();
     assert_eq!(movies_items, vec![1], "only the strictly-under item");
@@ -1593,7 +1593,10 @@ async fn a_nested_library_beats_the_root_that_contains_it() {
         .unwrap();
 
     let assigned = s.backfill_library_ids().await.unwrap();
-    assert_eq!(assigned, 3, "every item lands in exactly one library");
+    assert_eq!(
+        assigned.assigned, 3,
+        "every item lands in exactly one library"
+    );
 
     assert_eq!(
         s.item_ids_for_library(books_wire).await.unwrap(),
@@ -1607,5 +1610,55 @@ async fn a_nested_library_beats_the_root_that_contains_it() {
         s.item_ids_for_library(all_wire).await.unwrap(),
         vec![3],
         "the mixed root keeps only what no more specific library claimed"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_backfill_rewrites_nothing_when_roots_nest() {
+    use pharos_core::{LibraryKind, LibraryStore};
+    let s = fresh().await;
+    s.upsert_library(
+        "media",
+        "/media",
+        LibraryKind::Mixed,
+        "cccc2222cccc2222cccc2222cccc2222",
+    )
+    .await
+    .unwrap();
+    s.upsert_library(
+        "Movies",
+        "/media/Movies",
+        LibraryKind::Movies,
+        "eeee4444eeee4444eeee4444eeee4444",
+    )
+    .await
+    .unwrap();
+    s.put(item(
+        1,
+        "/media/Movies/Alien.mkv",
+        "Alien",
+        MediaKind::Movie,
+    ))
+    .await
+    .unwrap();
+    s.put(item(2, "/media/Loose.mkv", "Loose", MediaKind::Movie))
+        .await
+        .unwrap();
+
+    let first = s.backfill_library_ids().await.unwrap();
+    assert_eq!(first.assigned, 2);
+    assert_eq!(
+        first.changed, 2,
+        "each item is written exactly once, by the library that keeps it — \
+         not once by the containing root and again by the nested one"
+    );
+
+    let second = s.backfill_library_ids().await.unwrap();
+    assert_eq!(second.assigned, 2);
+    assert_eq!(
+        second.changed, 0,
+        "a boot-time backfill over an unchanged library must not rewrite \
+         every row: on the deployment that is a 3.6 s full-table UPDATE per \
+         library on every start"
     );
 }

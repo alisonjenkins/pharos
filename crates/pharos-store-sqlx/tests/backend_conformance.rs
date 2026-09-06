@@ -665,8 +665,13 @@ where
         .any(|l| l.wire_id == lib_wire_id && l.name == "Conformance Library"));
     let assigned = LibraryStore::backfill_library_ids(&store).await.unwrap();
     assert!(
-        assigned >= 1,
+        assigned.assigned >= 1,
         "backfill must assign at least the conformance item"
+    );
+    let again = LibraryStore::backfill_library_ids(&store).await.unwrap();
+    assert_eq!(
+        again.changed, 0,
+        "a repeat backfill over an unchanged library rewrites no row"
     );
     let lib_item_ids = LibraryStore::item_ids_for_library(&store, lib_wire_id)
         .await

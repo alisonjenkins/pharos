@@ -865,7 +865,7 @@ impl LibraryStore for AnyStore {
         }
     }
 
-    async fn backfill_library_ids(&self) -> DomainResult<u64> {
+    async fn backfill_library_ids(&self) -> DomainResult<pharos_core::LibraryBackfill> {
         match self {
             AnyStore::Sqlite(s) => s.backfill_library_ids().await,
             AnyStore::Postgres(p) => p.backfill_library_ids().await,

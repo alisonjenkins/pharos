@@ -133,6 +133,64 @@ pub(crate) fn root_like_pattern(root: &str) -> String {
     out
 }
 
+/// One `UPDATE` of the library backfill: the library, its own LIKE pattern
+/// and the patterns of every library nested under it, which keep their own
+/// rows. Shortest root first so a nested root's own step always follows the
+/// step of the root that contains it (B174).
+pub(crate) struct BackfillStep {
+    pub(crate) library_id: i64,
+    pub(crate) like: String,
+    pub(crate) nested_likes: Vec<String>,
+}
+
+pub(crate) fn backfill_plan(libs: &[pharos_core::Library]) -> Vec<BackfillStep> {
+    let mut libs: Vec<&pharos_core::Library> = libs.iter().collect();
+    libs.sort_by_key(|l| l.root_path.len());
+    libs.iter()
+        .map(|lib| {
+            let base = lib.root_path.strip_suffix('/').unwrap_or(&lib.root_path);
+            let inside = format!("{base}/");
+            let nested_likes = libs
+                .iter()
+                .filter(|o| {
+                    o.root_path.len() > lib.root_path.len() && o.root_path.starts_with(&inside)
+                })
+                .map(|o| root_like_pattern(&o.root_path))
+                .collect();
+            BackfillStep {
+                library_id: lib.id,
+                like: root_like_pattern(&lib.root_path),
+                nested_likes,
+            }
+        })
+        .collect()
+}
+
+/// SQL for one [`BackfillStep`]: only rows whose value would change are
+/// written, and rows a nested library owns are left to that library's step.
+/// `placeholder(n)` renders the n-th (1-based) bind; `distinct` is the
+/// dialect's null-safe inequality. Binds, in order: library id, own pattern,
+/// then each nested pattern.
+pub(crate) fn backfill_sql(
+    step: &BackfillStep,
+    placeholder: impl Fn(usize) -> String,
+    distinct: &str,
+) -> String {
+    let mut sql = format!(
+        "UPDATE media_items SET library_id = {id} \
+         WHERE path LIKE {like} ESCAPE '\\' AND library_id {distinct} {id}",
+        id = placeholder(1),
+        like = placeholder(2),
+    );
+    for i in 0..step.nested_likes.len() {
+        sql.push_str(&format!(
+            " AND path NOT LIKE {} ESCAPE '\\'",
+            placeholder(3 + i)
+        ));
+    }
+    sql
+}
+
 /// B98 — mark-and-sweep blast-radius guard. A scan deletes every row under a
 /// root that it didn't observe this pass; if the media mount briefly
 /// under-reports a directory (an NFS export returning a short/empty listing
