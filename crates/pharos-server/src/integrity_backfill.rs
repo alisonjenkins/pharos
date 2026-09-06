@@ -135,7 +135,18 @@ async fn run_sweep(ctx: Ctx) {
 /// retried on every pass, each attempt taking a background-I/O permit away
 /// from live playback (V134).
 fn scannable(it: &MediaItem) -> bool {
-    it.origin().local().is_some()
+    // Only what libav can open. A book is never probed by ffmpeg (004-books
+    // FR-001) and cannot pass an integrity demux; scanning one fails on every
+    // pass, and a failure is deliberately not memoised (see `run_pass`), so
+    // each ebook cost a background-I/O permit and a WARN every pass forever —
+    // 19 002 lines in the week to 2026-09-06.
+    let is_av = matches!(
+        it.kind,
+        pharos_core::MediaKind::Movie
+            | pharos_core::MediaKind::Episode
+            | pharos_core::MediaKind::Audio
+    );
+    is_av && it.origin().local().is_some()
 }
 
 async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
@@ -278,6 +289,25 @@ mod tests {
     /// the scan would fail on it forever: nothing is ever recorded, so nothing
     /// is ever skipped, and every pass spends a background-I/O permit on it.
     /// The sweep must not offer one to the pool at all.
+    /// A book has no A/V stream for libav to demux, so the scan fails on it
+    /// every pass; and because a scan FAILURE is deliberately never memoised,
+    /// every ebook in the library was re-attempted every pass, forever.
+    #[test]
+    fn a_book_is_never_offered_to_the_integrity_scan() {
+        let mut book = local("/books/Essentialism.azw3");
+        book.kind = MediaKind::Book;
+        assert!(
+            !scannable(&book),
+            "a book cannot pass a libav demux; scanning it can only ever fail"
+        );
+        let mut audio = local("/music/track.flac");
+        audio.kind = MediaKind::Audio;
+        assert!(
+            scannable(&audio),
+            "audio is a real stream and stays in scope"
+        );
+    }
+
     #[test]
     fn a_remote_origin_is_never_read_from_disk() {
         assert!(scannable(&local("/tv/Show/s01e01.mkv")));
