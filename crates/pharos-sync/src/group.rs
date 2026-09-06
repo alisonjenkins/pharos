@@ -2296,19 +2296,28 @@ impl GroupHandle {
                     }, if deadline.is_some() => {
                         // Timeout: drop still-pending members from the gate and
                         // start anyway (anti-wedge). They re-sync via their own
-                        // drift correction.
+                        // drift correction. A gate with NOBODY pending is not a
+                        // hang: its last holdout left inside the lead window and
+                        // `release_gate_holds_for` aimed the deadline at the
+                        // schedule instant — that is an ordinary resolve.
+                        let outcome = match state.waiting.as_ref() {
+                            Some(w) if w.pending.is_empty() => GateOutcome::Resolved,
+                            _ => GateOutcome::AntiWedge,
+                        };
                         if let Some(w) = state.waiting.as_ref() {
-                            tracing::warn!(
-                                group = %state.id,
-                                pending = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
-                                reason = "anti-wedge timeout",
-                                gate = w.reason.label(),
-                                waited_ms = w.opened_at.elapsed().as_millis() as u64,
-                                frozen_for_buffering = state.group_paused_due_to_buffering,
-                                "syncplay: readiness gate timed out; starting without stragglers"
-                            );
+                            if outcome == GateOutcome::AntiWedge {
+                                tracing::warn!(
+                                    group = %state.id,
+                                    pending = ?w.pending.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+                                    reason = "anti-wedge timeout",
+                                    gate = w.reason.label(),
+                                    waited_ms = w.opened_at.elapsed().as_millis() as u64,
+                                    frozen_for_buffering = state.group_paused_due_to_buffering,
+                                    "syncplay: readiness gate timed out; starting without stragglers"
+                                );
+                            }
                         }
-                        state.resolve_waiting(GateOutcome::AntiWedge);
+                        state.resolve_waiting(outcome);
                         state.persist();
                     }
                     _ = async {
@@ -2540,13 +2549,34 @@ fn release_gate_holds_for(state: &mut GroupState, member_id: MemberId) {
     if let Some(w) = state.waiting.as_mut() {
         w.pending.remove(&member_id);
     }
+    let now_server_ms = state.server_ms_now();
     let resolve = state.waiting.as_ref().is_some_and(|w| {
-        w.pending.is_empty()
-            && !state.members.is_empty()
-            && state.server_ms_now() >= w.not_before_server_ms
+        w.pending.is_empty() && !state.members.is_empty() && now_server_ms >= w.not_before_server_ms
     });
     if resolve {
         state.resolve_waiting(GateOutcome::Resolved);
+    } else if !state.members.is_empty() {
+        // Empty but premature: nobody is left to ack, and no later ack can
+        // resolve it (an ack from a member that was never pending does not
+        // count). Without this the gate ran to its anti-wedge deadline and
+        // was counted as a hang. Pull the deadline in to the schedule instant
+        // instead; the timer arm resolves an EMPTY gate as `resolved`.
+        if let Some(w) = state.waiting.as_mut() {
+            if w.pending.is_empty() {
+                let remaining_ms = w.not_before_server_ms.saturating_sub(now_server_ms);
+                let at =
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(remaining_ms);
+                if at < w.deadline {
+                    tracing::info!(
+                        group = %state.id,
+                        gate = w.reason.label(),
+                        remaining_ms,
+                        "syncplay: gate emptied inside the lead window — resolving at its schedule time"
+                    );
+                    w.deadline = at;
+                }
+            }
+        }
     }
     // B55 — the same member must not wedge the V19 buffering freeze either. If
     // the group is frozen for buffering and this was the last member still
@@ -5625,6 +5655,65 @@ mod tests {
         assert!(
             got_play,
             "the still-connected member gets the resolved Play"
+        );
+    }
+
+    /// A gate whose LAST holdout drops out INSIDE the scheduled command's lead
+    /// window is empty but premature: B38 forbids resolving before
+    /// `not_before`, and nothing later re-checks. Every later ack sees
+    /// `was_pending = false`, so the gate sat until its anti-wedge deadline
+    /// (5 s for a seek) and was counted as a hang. It must resolve the moment
+    /// the schedule instant passes — as `resolved`, not `anti_wedge`.
+    #[tokio::test]
+    async fn a_gate_emptied_inside_the_lead_window_resolves_at_the_schedule_time() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // Seek → gate on both, not_before = now + lead (200 ms, no RTT samples).
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        // Both sockets blip immediately — inside the lead window.
+        for mid in [m1, m2] {
+            h.tx.send(GroupMsg::MemberSocketLost { member_id: mid })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "premature: the gate must not resolve before the seek's schedule time"
+        );
+
+        // Well before SEEK_GATE_TIMEOUT_MS (5 s) — just past the lead — the
+        // empty gate must have resolved and Play must have gone out.
+        let play = recv_matching(&mut rx1, Duration::from_millis(1_500), |m| {
+            matches!(
+                m,
+                ServerMsg::Play {
+                    position_ms: 60_000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert!(
+            play.is_some(),
+            "an empty gate must resolve at its schedule time, not at the anti-wedge deadline"
         );
     }
 
