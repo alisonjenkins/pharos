@@ -1,8 +1,10 @@
 //! Observability bootstrap. One-shot init (permitted lock per V18). Read path
 //! is lock-free via `OnceLock<PrometheusHandle>` — render() does not contend.
 
+use actix_web::HttpMessage;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::sync::{Once, OnceLock};
+use std::time::Instant;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 /// Root-span builder that records the HTTP response status on every request
@@ -16,6 +18,9 @@ pub struct StatusRootSpanBuilder;
 
 impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
     fn on_request_start(request: &actix_web::dev::ServiceRequest) -> tracing::Span {
+        request
+            .extensions_mut()
+            .insert(RequestStart(Instant::now()));
         tracing_actix_web::root_span!(request)
     }
 
@@ -29,9 +34,14 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
         tracing_actix_web::DefaultRootSpanBuilder::on_request_end(span, outcome);
         if let Ok(resp) = outcome {
             let status = resp.status().as_u16();
+            let elapsed_ms = request_elapsed_ms(resp.request());
             let _e = logged.enter();
             if status >= 400 {
-                tracing::warn!(status, "http request completed with error status");
+                tracing::warn!(
+                    status,
+                    elapsed_ms,
+                    "http request completed with error status"
+                );
             } else if log_all_requests() {
                 // B68 — a strict client (jellyfin-sdk-kotlin: Android/Google TV)
                 // can crash PARSING a 200 response (a missing kotlin-required
@@ -47,6 +57,7 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
                     .unwrap_or("");
                 tracing::info!(
                     status,
+                    elapsed_ms,
                     method = %req.method(),
                     path = %req.path(),
                     ua,
@@ -60,6 +71,17 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
 /// Opt-in flag (env `PHAROS_LOG_ALL_REQUESTS`) to log EVERY request, not just
 /// errors — read once, cached. Off by default (2xx stay silent). Used to debug
 /// a strict client crashing on a 200 response body (B68).
+/// When the request arrived, so the completion line can say how long it
+/// took: the Prometheus histogram gives the route's distribution, but only
+/// the log can tie one slow request to its item, session and client.
+#[derive(Clone, Copy)]
+struct RequestStart(Instant);
+
+fn request_elapsed_ms(req: &actix_web::HttpRequest) -> Option<u64> {
+    let start = req.extensions().get::<RequestStart>().copied()?;
+    Some(u64::try_from(start.0.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
 fn log_all_requests() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -203,9 +225,24 @@ pub fn render() -> String {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The completion line reports the request's own age, or nothing when
+    /// the middleware never stamped the request (a synthetic one in tests).
+    #[actix_web::test]
+    async fn elapsed_is_read_from_the_stamp_the_start_hook_left() {
+        use actix_web::test::TestRequest;
+        let req = TestRequest::default().to_http_request();
+        assert_eq!(super::request_elapsed_ms(&req), None);
+        req.extensions_mut().insert(super::RequestStart(
+            super::Instant::now() - std::time::Duration::from_millis(1500),
+        ));
+        let ms = super::request_elapsed_ms(&req).expect("stamped request reports its age");
+        assert!((1500..2500).contains(&ms), "elapsed_ms={ms}");
+    }
 
     #[test]
     fn init_returns_ok_and_is_idempotent() {
