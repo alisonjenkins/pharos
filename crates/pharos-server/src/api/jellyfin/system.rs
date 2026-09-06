@@ -410,12 +410,29 @@ fn disk_free_used(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
-async fn system_endpoint() -> impl Responder {
+async fn system_endpoint(req: actix_web::HttpRequest) -> impl Responder {
     // `EndpointInfo` — both fields no-default in the SDK; typed per B78/V38.
-    crate::api::jellyfin::wire::json(&EndpointInfoDto {
-        is_local: true,
-        is_in_network: true,
-    })
+    crate::api::jellyfin::wire::json(&endpoint_info(&req))
+}
+
+/// What the client should believe about where it is. jellyfin-web reads
+/// `IsInNetwork` to choose between the user's HOME and INTERNET streaming
+/// quality settings, and Jellyfin answers it from the request's address. This
+/// used to be hard-coded `true`, so a WAN viewer was handed the home profile —
+/// its "Auto" bitrate probe then measured a fast burst, chose ≥25 Mbps, and
+/// jellyfin-web's hls.js dropped to a 6 s buffer on that setting, which is one
+/// segment of headroom on a link that had just shown it needed more (B211).
+/// Same address rule PlaybackInfo already applies for the remote bitrate cap
+/// (B81), so the two surfaces agree on who is remote.
+fn endpoint_info(req: &actix_web::HttpRequest) -> EndpointInfoDto {
+    let ip = req
+        .connection_info()
+        .realip_remote_addr()
+        .and_then(super::items::parse_client_ip);
+    EndpointInfoDto {
+        is_local: ip.is_some_and(|ip| ip.is_loopback()),
+        is_in_network: !super::items::client_is_remote(req),
+    }
 }
 
 /// Jellyfin `EndpointInfo` (`GET /System/Endpoint`).
@@ -1225,6 +1242,49 @@ mod local_address_tests {
             .insert_header(("Host", "media.example.com"))
             .to_http_request();
         assert_eq!(derive_local_address(&req), "http://media.example.com");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod endpoint_tests {
+    use super::*;
+    use actix_web::test::TestRequest;
+
+    /// A viewer arriving through the ingress with a public address is NOT in
+    /// the network; a LAN address is. Hard-coding `true` made jellyfin-web
+    /// apply the home quality profile to WAN viewers (B211).
+    #[test]
+    fn a_public_forwarded_address_is_outside_the_network() {
+        let req = TestRequest::default()
+            .insert_header(("X-Forwarded-For", "75.161.182.180"))
+            .to_http_request();
+        let info = endpoint_info(&req);
+        assert!(!info.is_in_network, "a public address is remote");
+        assert!(!info.is_local);
+
+        let lan = TestRequest::default()
+            .insert_header(("X-Forwarded-For", "192.168.1.23"))
+            .to_http_request();
+        let info = endpoint_info(&lan);
+        assert!(info.is_in_network, "an RFC1918 address is in the network");
+        assert!(!info.is_local, "in-network is not the same as on this host");
+
+        let local = TestRequest::default()
+            .insert_header(("X-Forwarded-For", "127.0.0.1"))
+            .to_http_request();
+        let info = endpoint_info(&local);
+        assert!(info.is_in_network && info.is_local);
+    }
+
+    /// An address we cannot parse is treated as LOCAL, matching PlaybackInfo's
+    /// remote-cap rule: never spuriously downgrade a LAN viewer.
+    #[test]
+    fn an_unparseable_address_is_treated_as_in_network() {
+        let req = TestRequest::default()
+            .insert_header(("X-Forwarded-For", "not-an-address"))
+            .to_http_request();
+        assert!(endpoint_info(&req).is_in_network);
     }
 }
 
