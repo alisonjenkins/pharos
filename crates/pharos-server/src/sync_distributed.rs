@@ -168,7 +168,17 @@ impl BusCommands {
         let (egress, mut rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(payload) = rx.recv().await {
-                let _ = bus.publish(payload).await;
+                // A command that cannot reach the owner is a whole group
+                // action lost (a Pause nobody else sees). Say so.
+                let bytes = payload.len();
+                if let Err(e) = bus.publish(payload).await {
+                    tracing::warn!(
+                        bytes,
+                        error = %e,
+                        "syncplay: command to the owner replica dropped — bus publish failed"
+                    );
+                    pharos_sync::bus_delivery::record_publish_failure("command");
+                }
             }
         });
         Self { egress }
