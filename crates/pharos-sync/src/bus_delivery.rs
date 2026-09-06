@@ -40,7 +40,7 @@ pub enum BusMsg {
 /// channel + the sink table).
 #[derive(Clone)]
 pub struct BusDelivery {
-    egress: mpsc::UnboundedSender<String>,
+    egress: mpsc::UnboundedSender<Outbound>,
     /// The sockets connected to THIS replica. A member found here is delivered
     /// to directly — bypassing the bus, so it is NOT subject to the Postgres
     /// `NOTIFY` 8000-byte payload cap that silently drops a large `PlayQueue`.
@@ -53,14 +53,25 @@ impl BusDelivery {
     /// replica's member-sink table, used to short-circuit same-replica
     /// deliveries to a direct local send.
     pub fn new<B: SyncBus>(bus: Arc<B>, sinks: MemberSinks) -> Self {
-        let (egress, mut rx) = mpsc::unbounded_channel::<String>();
+        let (egress, mut rx) = mpsc::unbounded_channel::<Outbound>();
         tokio::spawn(async move {
-            while let Some(payload) = rx.recv().await {
+            while let Some(out) = rx.recv().await {
                 // A publish failure (e.g. payload over the NOTIFY cap, or a
                 // transient DB blip) drops this one message; the member
                 // reconciles via the next catch-up. Best-effort, same as the
-                // V19 `try_send` drop philosophy — keep draining.
-                let _ = bus.publish(payload).await;
+                // V19 `try_send` drop philosophy — keep draining. But never
+                // silently: the member on the other pod just lost a command.
+                let bytes = out.payload.len();
+                if let Err(e) = bus.publish(out.payload).await {
+                    tracing::warn!(
+                        member = %out.member_id,
+                        msg = out.msg_kind,
+                        bytes,
+                        error = %e,
+                        "syncplay: cross-replica delivery dropped — bus publish failed"
+                    );
+                    record_publish_failure("deliver");
+                }
             }
         });
         Self {
@@ -81,12 +92,52 @@ impl Delivery for BusDelivery {
             self.local.deliver(member_id, msg);
             return;
         }
+        let msg_kind = msg_kind(&msg);
         let env = BusMsg::Deliver { member_id, msg };
         if let Ok(payload) = serde_json::to_string(&env) {
             // Send failure means the egress task is gone (process shutting
             // down) — nothing to do.
-            let _ = self.egress.send(payload);
+            let _ = self.egress.send(Outbound {
+                member_id,
+                msg_kind,
+                payload,
+            });
         }
+    }
+}
+
+/// One serialized envelope queued for the bus, tagged with what it carries
+/// so a failed publish can say what was lost.
+struct Outbound {
+    member_id: MemberId,
+    msg_kind: &'static str,
+    payload: String,
+}
+
+/// Count a bus publish that failed. `kind` is `deliver` (owner → member) or
+/// `command` (non-owner → owner); the two have opposite diagnoses — a lost
+/// delivery desyncs one member, a lost command drops a whole group action.
+pub fn record_publish_failure(kind: &'static str) {
+    metrics::counter!("pharos_syncplay_bus_publish_failed_total", "kind" => kind).increment(1);
+}
+
+/// The variant name of a `ServerMsg`, for the drop log. Bounded and stable.
+fn msg_kind(msg: &ServerMsg) -> &'static str {
+    match msg {
+        ServerMsg::Welcome { .. } => "welcome",
+        ServerMsg::Joined { .. } => "joined",
+        ServerMsg::Pong { .. } => "pong",
+        ServerMsg::Play { .. } => "play",
+        ServerMsg::Pause { .. } => "pause",
+        ServerMsg::Seek { .. } => "seek",
+        ServerMsg::LeaderChange { .. } => "leader_change",
+        ServerMsg::MemberJoined { .. } => "member_joined",
+        ServerMsg::MemberLeft { .. } => "member_left",
+        ServerMsg::StateUpdate { .. } => "state_update",
+        ServerMsg::PlayQueue { .. } => "play_queue",
+        ServerMsg::Error { .. } => "error",
+        ServerMsg::NotInGroup => "not_in_group",
+        ServerMsg::GroupLeft => "group_left",
     }
 }
 
@@ -232,6 +283,63 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "unrelated member received a message"
+        );
+    }
+
+    /// A bus that refuses a payload (Postgres NOTIFY caps at 8000 bytes; a
+    /// whole-season `PlayQueue` to a member on the OTHER pod during a deploy
+    /// is over it) used to drop the message with no trace at all. The drop
+    /// must be counted and name what was lost.
+    #[tokio::test]
+    async fn a_refused_publish_is_counted_not_swallowed() {
+        use crate::bus::BusError;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        struct RefusingBus;
+        impl SyncBus for RefusingBus {
+            async fn publish(&self, payload: String) -> Result<(), BusError> {
+                Err(BusError::Backend(format!(
+                    "payload {} bytes exceeds NOTIFY cap",
+                    payload.len()
+                )))
+            }
+            fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+                tokio::sync::broadcast::channel(1).1
+            }
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // No local sink for the member → the message goes to the bus.
+        let delivery = BusDelivery::new(Arc::new(RefusingBus), MemberSinks::new());
+        delivery.deliver(
+            MemberId::new(),
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 0,
+            },
+        );
+        // The egress task runs on this same current-thread runtime.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(ck, _, _, v)| {
+                ck.key().name() == "pharos_syncplay_bus_publish_failed_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "kind" && l.value() == "deliver")
+                    && matches!(v, DebugValue::Counter(1))
+            });
+        assert!(
+            counted,
+            "a refused publish must emit pharos_syncplay_bus_publish_failed_total{{kind=\"deliver\"}}"
         );
     }
 
