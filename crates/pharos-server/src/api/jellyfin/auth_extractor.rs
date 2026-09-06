@@ -31,12 +31,12 @@ impl FromRequest for AuthUser {
                 .stores
                 .resolve(&token)
                 .await
-                .map_err(|_| ErrorUnauthorized("invalid token"))?;
+                .map_err(|e| auth_failure(e, "invalid token"))?;
             let record = state
                 .stores
                 .get(uid)
                 .await
-                .map_err(|_| ErrorUnauthorized("user revoked"))?;
+                .map_err(|e| auth_failure(e, "user revoked"))?;
             Ok(AuthUser(record.into_user()))
         })
     }
@@ -83,17 +83,40 @@ impl FromRequest for AuthSession {
                 .stores
                 .resolve(&token)
                 .await
-                .map_err(|_| ErrorUnauthorized("invalid token"))?;
+                .map_err(|e| auth_failure(e, "invalid token"))?;
             let record = state
                 .stores
                 .get(uid)
                 .await
-                .map_err(|_| ErrorUnauthorized("user revoked"))?;
+                .map_err(|e| auth_failure(e, "user revoked"))?;
             Ok(AuthSession {
                 user: record.into_user(),
                 device_id,
             })
         })
+    }
+}
+
+/// The HTTP answer for a token-store failure, which is two different things.
+///
+/// A token the store does not know is the caller's problem: `401 <rejected>`.
+/// A store that could not ANSWER — the pool timed out, the database was
+/// unreachable — is ours, and it is transient: `503`, so the client retries
+/// and keeps its session. Collapsing both into `401 invalid token` is what
+/// happened on 2026-09-06 18:50Z when a 25 s pool wait during an API-server
+/// outage answered every member's `/SyncPlay/Pause`, segment and trickplay
+/// request with 401 for sixteen seconds: the pauses were dropped, and the
+/// clients were told their credentials were bad when nothing about them was
+/// (B216).
+fn auth_failure(e: pharos_core::AuthError, rejected: &'static str) -> actix_web::Error {
+    match e {
+        pharos_core::AuthError::Backend(detail) => {
+            tracing::warn!(error = %detail, "auth store unavailable; answering 503, not 401");
+            actix_web::error::ErrorServiceUnavailable(format!(
+                "auth store unavailable, retry: {detail}"
+            ))
+        }
+        _ => ErrorUnauthorized(rejected),
     }
 }
 
@@ -321,6 +344,33 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// B216 — a store that could not answer is not a bad token. During a
+    /// database stall every request was answered 401, which drops a client's
+    /// SyncPlay commands and tells it its session is invalid.
+    #[test]
+    fn a_backend_failure_is_503_and_a_bad_token_is_401() {
+        let backend = auth_failure(
+            pharos_core::AuthError::Backend("pool timed out".into()),
+            "invalid token",
+        );
+        assert_eq!(
+            backend.as_response_error().status_code(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(backend.to_string().contains("pool timed out"), "{backend}");
+        for e in [
+            pharos_core::AuthError::InvalidToken,
+            pharos_core::AuthError::UserNotFound,
+            pharos_core::AuthError::InvalidCredentials,
+        ] {
+            let err = auth_failure(e, "invalid token");
+            assert_eq!(
+                err.as_response_error().status_code(),
+                actix_web::http::StatusCode::UNAUTHORIZED
+            );
+        }
+    }
     use actix_web::test::TestRequest;
 
     fn session(user_id: pharos_core::UserId, device: Option<&str>) -> AuthSession {
