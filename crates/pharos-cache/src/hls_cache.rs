@@ -55,6 +55,16 @@ pub enum HlsCacheError {
     /// into a generic failure makes deliberate load-shedding read as breakage.
     #[error("transcode scheduler had no spare capacity")]
     SchedulerBusy,
+    /// ffmpeg could not OPEN the source at all — a stale NFS handle, a vanished
+    /// file, a permission change. Not a transcode failure: nothing about the
+    /// encode was ever tried, and re-running it cannot help while the storage
+    /// condition stands. Carries the classified reason for the metric and the
+    /// verbatim cause for the log (B218).
+    #[error("media source unreadable ({reason}): {detail}")]
+    SourceUnreadable {
+        reason: &'static str,
+        detail: String,
+    },
     /// An audio-rendition file did not appear before the read wait's budget ran
     /// out. Carries WHICH budget expired and what the session had produced by
     /// then — a bare `NotFound` here is indistinguishable from "the client asked
@@ -338,8 +348,42 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
         HlsCacheError::Transcode(_) => "transcode",
         HlsCacheError::NonUtf8Path => "bad_path",
         HlsCacheError::SchedulerBusy => "scheduler_busy",
+        HlsCacheError::SourceUnreadable { .. } => "source_unreadable",
         HlsCacheError::AudioNotReady { .. } => "audio_not_ready",
     }
+}
+
+/// Classify an ffmpeg failure message as "the SOURCE could not be opened",
+/// naming why, or `None` for anything that is genuinely about the encode.
+///
+/// The strings are ffmpeg's own (`Error opening input: Stale file handle`,
+/// `... No such file or directory`, `... Permission denied`), so the match is
+/// on the OS error text libav passes through, bounded to the four causes a
+/// storage incident produces. On 2026-09-04 a stale NFS handle produced 3 862
+/// `500`s on one item's init segment in an hour — one ffmpeg spawn per client
+/// retry against a path that could not open — all reported as "transcode
+/// failed" and counted as encode failures (B218).
+pub fn source_open_failure(msg: &str) -> Option<&'static str> {
+    // Anchored on ffmpeg's own "could not open the INPUT" text. A bare OS
+    // string is not enough: a missing ffmpeg BINARY also says "No such file
+    // or directory", and that is a server fault, not a storage one.
+    let tail = msg.split("Error opening input").nth(1)?;
+    Some(if tail.contains("Stale file handle") {
+        "stale_handle"
+    } else if tail.contains("No such file or directory") {
+        "missing"
+    } else if tail.contains("Permission denied") {
+        "permission"
+    } else {
+        "io"
+    })
+}
+
+/// Count a request refused because its source cannot be opened. Same series
+/// DirectPlay records (`pharos_source_unreadable_total`), so a storage incident
+/// is one query whichever delivery path the viewer was on.
+fn record_source_unreadable(reason: &'static str) {
+    metrics::counter!("pharos_source_unreadable_total", "reason" => reason).increment(1);
 }
 
 /// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
@@ -1185,6 +1229,14 @@ struct CacheState {
     /// `(source, audio-relative index)`. A property of the file, so probed once
     /// and reused. See `source_audio_start`.
     source_audio_starts: HashMap<(PathBuf, u32), f64>,
+    /// Sources ffmpeg recently failed to OPEN, with the classified reason. A
+    /// request for any segment of such a source is refused without spawning
+    /// ffmpeg again while the memory holds — hls.js retries a failed init or
+    /// fragment about once a second and jellyfin-web restarts the whole
+    /// session on top of that, so without this every client retry during a
+    /// storage incident is a fresh ffmpeg against a path that cannot open
+    /// (B218). Short-lived: the condition, not the file, is what is remembered.
+    unreadable_sources: HashMap<PathBuf, (std::time::Instant, &'static str)>,
     /// Rendition directories whose most recent audio session exited without
     /// success, and when. A reader waiting on that directory gives up at once
     /// instead of spending the 12 s no-progress grace on a process that is
@@ -1369,6 +1421,10 @@ fn shared_copy(err: &HlsCacheError) -> HlsCacheError {
         HlsCacheError::Transcode(m) => HlsCacheError::Transcode(m.clone()),
         HlsCacheError::NonUtf8Path => HlsCacheError::NonUtf8Path,
         HlsCacheError::SchedulerBusy => HlsCacheError::SchedulerBusy,
+        HlsCacheError::SourceUnreadable { reason, detail } => HlsCacheError::SourceUnreadable {
+            reason,
+            detail: detail.clone(),
+        },
         HlsCacheError::AudioNotReady {
             name,
             reason,
@@ -2230,6 +2286,19 @@ impl HlsSegmentCache {
             }
         }
 
+        // A source that could not be opened moments ago cannot be opened now:
+        // refuse without spending an ffmpeg on the client's retry (B218).
+        if let Some(reason) = self.source_unreadable_recently(source).await {
+            record_source_unreadable(reason);
+            return Err(HlsCacheError::SourceUnreadable {
+                reason,
+                detail: format!(
+                    "refused for {}s after the last open failure",
+                    Self::UNREADABLE_SOURCE_MEMORY.as_secs()
+                ),
+            });
+        }
+
         // Coalesce onto an encode already in progress for this exact key, or
         // become the one that starts it, then wait for the ANSWER rather than
         // for exclusion.
@@ -2785,6 +2854,24 @@ impl HlsSegmentCache {
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    // A source that would not open is not an encode failure:
+                    // re-classify it so the log, the outcome counter and the
+                    // HTTP status all say "storage", and remember it so the
+                    // client's retry loop does not spawn ffmpeg again (B218).
+                    let e = match e {
+                        HlsCacheError::Transcode(msg) => match source_open_failure(&msg) {
+                            Some(reason) => {
+                                record_source_unreadable(reason);
+                                self.note_source_unreadable(source, reason).await;
+                                HlsCacheError::SourceUnreadable {
+                                    reason,
+                                    detail: msg,
+                                }
+                            }
+                            None => HlsCacheError::Transcode(msg),
+                        },
+                        other => other,
+                    };
                     // The success path below records twelve fields about a
                     // segment that WORKED and this path recorded none about one
                     // that did not: a failing segment reached the client as a
@@ -4353,6 +4440,35 @@ impl HlsSegmentCache {
 
     /// How long a recorded audio-session failure short-circuits reads.
     const AUDIO_FAILURE_MEMORY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long a source that failed to open is refused without a fresh
+    /// attempt. Short: a storage blip that clears in seconds must not cost a
+    /// viewer more than one retry cycle, and hls.js retries about once a
+    /// second, so 5 s turns a spawn per retry into a spawn per five.
+    const UNREADABLE_SOURCE_MEMORY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    async fn source_unreadable_recently(&self, source: &Path) -> Option<&'static str> {
+        self.state
+            .lock()
+            .await
+            .unreadable_sources
+            .get(source)
+            .filter(|(at, _)| at.elapsed() < Self::UNREADABLE_SOURCE_MEMORY)
+            .map(|(_, reason)| *reason)
+    }
+
+    async fn note_source_unreadable(&self, source: &Path, reason: &'static str) {
+        let mut state = self.state.lock().await;
+        // Bounded: expired entries are dropped whenever one is added, so an
+        // incident touching every file in the library does not leave the map
+        // holding every path forever.
+        state
+            .unreadable_sources
+            .retain(|_, (at, _)| at.elapsed() < Self::UNREADABLE_SOURCE_MEMORY);
+        state
+            .unreadable_sources
+            .insert(source.to_path_buf(), (std::time::Instant::now(), reason));
+    }
 
     #[cfg(test)]
     async fn note_audio_session_failed(&self, dir: &Path) {
@@ -8287,6 +8403,81 @@ mod tests {
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
             .await;
         assert!(matches!(res, Err(HlsCacheError::Transcode(_))));
+    }
+
+    /// B218 — the ffmpeg strings a storage incident produces are classified as
+    /// the source being unreadable, and nothing else is.
+    #[test]
+    fn a_source_that_cannot_be_opened_is_classified_not_called_a_transcode_failure() {
+        assert_eq!(
+            source_open_failure(
+                "transcode: transcode failed: [in#0 @ 0x1] Error opening input: Stale file handle\nError opening input file /media/x.mkv."
+            ),
+            Some("stale_handle")
+        );
+        assert_eq!(
+            source_open_failure("Error opening input: No such file or directory"),
+            Some("missing")
+        );
+        assert_eq!(
+            source_open_failure("Error opening input: Permission denied"),
+            Some("permission")
+        );
+        assert_eq!(
+            source_open_failure("Error opening input: Protocol not found"),
+            Some("io")
+        );
+        assert_eq!(
+            source_open_failure("ffmpeg exited unsuccessfully: exit status: 1"),
+            None,
+            "an encode that ran and failed is still a transcode failure"
+        );
+        assert_eq!(
+            source_open_failure("spawn /no/such/ffmpeg: No such file or directory (os error 2)"),
+            None,
+            "a missing ffmpeg binary is a server fault, not an unreadable source"
+        );
+    }
+
+    /// B218 — once a source has failed to open, the next request inside the
+    /// memory window is refused at once, without an ffmpeg spawn: 3 862 spawns
+    /// against one stale path in an hour on 2026-09-04.
+    #[tokio::test]
+    async fn a_recently_unreadable_source_is_refused_without_spawning() {
+        let td = TempDir::new().unwrap();
+        // An ffmpeg that cannot exist: if the refusal did not short-circuit,
+        // the call would fall through to `Transcode`, not `SourceUnreadable`.
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let opts = SegmentOpts {
+            source_video_codec: None,
+            container: pharos_transcode::SegmentContainer::Mpegts,
+            video: None,
+            audio: AudioDelivery::Separate,
+            video_bitrate_bps: None,
+            window: pharos_core::SegmentWindow::for_segment(0, None, Some(600.0)),
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_intent: false,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+        };
+        let source = Path::new("/media/stale.mkv");
+        cache.note_source_unreadable(source, "stale_handle").await;
+        let res = cache
+            .segment_bytes(8, 0, source, &opts, JobClass::Interactive)
+            .await;
+        assert!(
+            matches!(
+                res,
+                Err(HlsCacheError::SourceUnreadable {
+                    reason: "stale_handle",
+                    ..
+                })
+            ),
+            "refused from memory, not re-attempted; got {:?}",
+            res.as_ref().err()
+        );
     }
 
     #[tokio::test]
