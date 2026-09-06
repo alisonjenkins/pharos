@@ -98,11 +98,31 @@ impl MemberSinks {
     }
 
     /// V19 carried over: a slow/full sink must not block delivery. `try_send`
-    /// drops on a full channel; the member reconciles via the next catch-up.
+    /// drops on a full channel — and nothing re-delivers: the member stays
+    /// out of sync until its socket is declared lost and it reconnects into a
+    /// catch-up. So a drop is counted and named, never silent.
     pub fn send(&self, member_id: MemberId, msg: ServerMsg) {
-        if let Some(e) = self.inner.get(&member_id) {
-            let _ = e.sink.try_send(msg);
-        }
+        use tokio::sync::mpsc::error::TrySendError;
+        let Some(e) = self.inner.get(&member_id) else {
+            return;
+        };
+        let (reason, msg) = match e.sink.try_send(msg) {
+            Ok(()) => return,
+            Err(TrySendError::Full(m)) => ("full", m),
+            Err(TrySendError::Closed(m)) => ("closed", m),
+        };
+        metrics::counter!(
+            "pharos_syncplay_sink_dropped_total",
+            "kind" => msg.kind(),
+            "reason" => reason
+        )
+        .increment(1);
+        tracing::warn!(
+            member = %member_id,
+            kind = msg.kind(),
+            reason,
+            "syncplay: outbound message dropped — the member's socket is not draining; it is out of sync until it reconnects"
+        );
     }
 }
 
@@ -138,6 +158,49 @@ mod tests {
 
     fn ch() -> (mpsc::Sender<ServerMsg>, mpsc::Receiver<ServerMsg>) {
         mpsc::channel(16)
+    }
+
+    /// A full sink drops the message, and a dropped Pause is a member that
+    /// keeps playing while the room is paused. The drop must be visible.
+    #[tokio::test]
+    async fn a_drop_on_a_full_sink_is_counted_by_kind() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let sinks = MemberSinks::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let mid = MemberId::new();
+        sinks.insert(mid, 1, tx);
+        let pause = ServerMsg::Pause {
+            at_server_ms: 1,
+            position_ms: 0,
+        };
+        sinks.send(mid, pause.clone());
+        sinks.send(mid, pause);
+
+        let dropped = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(ck, _, _, _)| {
+                ck.key().name() == "pharos_syncplay_sink_dropped_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "kind" && l.value() == "pause")
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "full")
+            })
+            .map(|(_, _, _, v)| v);
+        assert_eq!(
+            dropped,
+            Some(DebugValue::Counter(1)),
+            "the second Pause overflowed a one-slot sink and must be counted as dropped"
+        );
     }
 
     #[tokio::test]
