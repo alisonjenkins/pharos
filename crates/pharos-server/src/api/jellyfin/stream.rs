@@ -11,7 +11,6 @@ use crate::{
     api::jellyfin::auth_extractor::{auth_cookie_header, AuthUser},
     state::AppState,
 };
-use actix_files::NamedFile;
 use actix_web::{
     body::MessageBody,
     error,
@@ -273,7 +272,7 @@ async fn head_response(
     id_str: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
     let item = load_item(state, id_str).await?;
-    let file = NamedFile::open_async(&item.path)
+    let file = open_named_file(&item.path)
         .await
         .map_err(|e| source_unreadable(&item, &e))?
         .use_etag(true)
@@ -997,7 +996,7 @@ async fn deliver_stream(
         None,
     );
 
-    let file = NamedFile::open_async(&item.path)
+    let file = open_named_file(&item.path)
         .await
         .map_err(|e| source_unreadable(&item, &e))?
         .use_etag(true)
@@ -1199,6 +1198,21 @@ async fn serve_content_range(
 ///
 /// The path stays in the log; the client is told only that the source is
 /// unreadable, since a filesystem layout is not a client's business.
+/// actix-files 0.7 dropped `NamedFile::open_async` (the earlier convenience
+/// that ran the blocking open on a threadpool); `open` is a plain sync
+/// `std::fs::File::open`, and this project cares specifically about opens
+/// that stall (NFS, a stale handle — see B72's `bg_io` gate), so it is never
+/// safe to call directly on the actix runtime thread. `web::block` keeps that
+/// guarantee.
+pub(crate) async fn open_named_file(
+    path: &std::path::Path,
+) -> std::io::Result<actix_files::NamedFile> {
+    let path = path.to_path_buf();
+    web::block(move || actix_files::NamedFile::open(path))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
 fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
     let reason = match e.kind() {
         std::io::ErrorKind::NotFound => "missing",
