@@ -1,8 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Bench for stable path hash — guards SIMD xxh3 regressions.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pharos_scanner::fs::stable_id;
+use std::hint::black_box;
 use std::path::Path;
 
 fn bench_hash(c: &mut Criterion) {

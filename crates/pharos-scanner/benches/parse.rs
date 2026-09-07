@@ -1,8 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Criterion bench for `parse_ffprobe_output` — guards SIMD JSON regressions.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use pharos_scanner::parse_ffprobe_output;
+use std::hint::black_box;
 
 const SMALL: &[u8] = br#"{
     "streams": [{"codec_type":"audio"}],
