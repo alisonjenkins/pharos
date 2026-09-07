@@ -219,11 +219,11 @@ async fn fresh_target_db(pg_url: &str) -> String {
         .await
         .expect("connect postgres maintenance db");
     // DROP/CREATE DATABASE cannot run inside a transaction — execute directly.
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db}")))
         .execute(&mut admin)
         .await
         .expect("drop stale target db");
-    sqlx::query(&format!("CREATE DATABASE {db}"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
         .execute(&mut admin)
         .await
         .expect("create target db");
@@ -294,14 +294,16 @@ async fn migrate_sqlite_to_postgres_round_trip() {
 
     // Independent count verification on both sides.
     for table in counts.keys() {
-        let (sqlite_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(sqlite.pool())
-            .await
-            .unwrap();
-        let (pg_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(postgres.pool())
-            .await
-            .unwrap();
+        let (sqlite_count,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(sqlite.pool())
+                .await
+                .unwrap();
+        let (pg_count,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
         assert_eq!(
             sqlite_count, pg_count,
             "row count mismatch on {table}: sqlite={sqlite_count} postgres={pg_count}"

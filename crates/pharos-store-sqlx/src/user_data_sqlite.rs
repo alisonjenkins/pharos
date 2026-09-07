@@ -108,7 +108,7 @@ impl UserDataStore for SqliteStore {
              FROM user_data
              WHERE user_id = ? AND item_id IN ({placeholders})"
         );
-        let mut q = sqlx::query_as::<_, UserDataRowWithId>(&sql);
+        let mut q = sqlx::query_as::<_, UserDataRowWithId>(sqlx::AssertSqlSafe(sql));
         q = q.bind(id_bytes);
         for id in items {
             q = q.bind(media_id_i64(*id)?);

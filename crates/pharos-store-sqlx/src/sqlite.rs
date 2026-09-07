@@ -111,7 +111,7 @@ impl SqliteStore {
             format!("WHERE {}", built.where_sql)
         };
         let sql = format!("SELECT COUNT(*) FROM media_items {join} {where_clause}");
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
         if let Some(uid) = user {
             query = query.bind(uid.0.as_bytes().to_vec());
         }
@@ -172,7 +172,7 @@ impl SqliteStore {
             cols = media_columns_prefixed("m"),
             hit = Self::search_hit_subquery(),
         );
-        let mut query = sqlx::query_as::<_, MediaRow>(&sql)
+        let mut query = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(match_expr)
             .bind(needle)
             .bind(needle)
@@ -209,7 +209,7 @@ impl SqliteStore {
              WHERE 1 = 1 {kind_clause}",
             hit = Self::search_hit_subquery(),
         );
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql)
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql))
             .bind(match_expr)
             .bind(needle)
             .bind(needle)
@@ -271,7 +271,7 @@ impl SqliteStore {
             user: Option<UserId>,
             params: &[Param],
         ) -> DomainResult<Vec<FacetValue>> {
-            let mut q = sqlx::query_as::<_, (String, String, i64)>(sql);
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             if let Some(uid) = user {
                 q = q.bind(uid.0.as_bytes().to_vec());
             }
@@ -561,7 +561,7 @@ impl MediaStore for SqliteStore {
         let id_i64 =
             i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id = ?");
-        let row = sqlx::query_as::<_, MediaRow>(&sql)
+        let row = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(id_i64)
             .fetch_optional(&self.pool)
             .await
@@ -776,7 +776,7 @@ impl MediaStore for SqliteStore {
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items ORDER BY id");
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -809,7 +809,7 @@ impl MediaStore for SqliteStore {
              FROM media_items {join} {where_clause} ORDER BY {} {limit_clause}",
             built.order_sql,
         );
-        let mut query = sqlx::query_as::<_, QueryRow>(&sql);
+        let mut query = sqlx::query_as::<_, QueryRow>(sqlx::AssertSqlSafe(sql));
         // The user-data join's user id binds FIRST (it appears in the FROM
         // clause, ahead of every WHERE/ORDER/LIMIT placeholder).
         if let Some(uid) = user {
@@ -1085,7 +1085,7 @@ impl MediaStore for SqliteStore {
             "SELECT {MEDIA_COLUMNS} FROM media_items \
              WHERE fingerprint = ? ORDER BY id LIMIT 1"
         );
-        let row = sqlx::query_as::<_, MediaRow>(&sql)
+        let row = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(fp.as_slice())
             .fetch_optional(&self.pool)
             .await
@@ -1231,7 +1231,7 @@ impl MediaStore for SqliteStore {
                AND kind IN ('movie','episode') \
              ORDER BY id ASC LIMIT ?"
         );
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(ttl_cutoff)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -1256,7 +1256,7 @@ impl MediaStore for SqliteStore {
                         AND (match_external_id IS NULL OR match_external_id <> ?))) \
              ORDER BY id ASC LIMIT ?"
         );
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(ttl_cutoff)
             .bind(current_miss_marker)
             .bind(limit)
@@ -2924,7 +2924,9 @@ impl LibraryStore for SqliteStore {
         let mut changed: u64 = 0;
         for step in crate::backfill_plan(&libs) {
             let sql = crate::backfill_sql(&step, |n| format!("?{n}"), "IS NOT");
-            let mut q = sqlx::query(&sql).bind(step.library_id).bind(&step.like);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(step.library_id)
+                .bind(&step.like);
             for nested in &step.nested_likes {
                 q = q.bind(nested);
             }
@@ -3147,7 +3149,8 @@ impl SeriesMetadataStore for SqliteStore {
         let cols = crate::series_meta_row::SERIES_META_COLUMNS;
         let sql =
             format!("SELECT {cols} FROM series_metadata WHERE series_key IN ({placeholders})");
-        let mut q = sqlx::query_as::<_, crate::series_meta_row::SeriesMetaRow>(&sql);
+        let mut q =
+            sqlx::query_as::<_, crate::series_meta_row::SeriesMetaRow>(sqlx::AssertSqlSafe(sql));
         for k in keys {
             q = q.bind(k);
         }
