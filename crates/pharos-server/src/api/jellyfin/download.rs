@@ -22,7 +22,7 @@
 //! `SizedStream` carrying `BodySize::Sized(file_len)`, so the correct length is
 //! structural rather than remembered, and its reader is never polled on a HEAD.
 
-use actix_files::NamedFile;
+use crate::api::jellyfin::stream::open_named_file;
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse, Responder};
 
 use pharos_core::MediaStore;
@@ -136,7 +136,7 @@ async fn download(
         _ => item.path.clone(),
     };
 
-    let file = NamedFile::open_async(&serve_path).await.map_err(|e| {
+    let file = open_named_file(&serve_path).await.map_err(|e| {
         // Carry the offending path AND the underlying io error — "not found"
         // alone cannot distinguish a deleted file from a dead NFS mount, which
         // is exactly the distinction the mergerfs outage turned on.
