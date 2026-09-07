@@ -33,6 +33,7 @@ digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["a
 dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
+flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -141,7 +142,6 @@ typenum = { version = "1", default-features = false, features = ["const-generics
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -157,7 +157,6 @@ libc = { version = "0.2" }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -173,7 +172,6 @@ libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -189,7 +187,6 @@ libc = { version = "0.2" }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-flate2 = { version = "1", features = ["zlib-rs"] }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
