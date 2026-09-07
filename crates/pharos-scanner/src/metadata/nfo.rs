@@ -277,16 +277,16 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
             Ok(Event::Start(e)) => {
                 let name = e.local_name();
                 let tag = name.as_ref().to_ascii_lowercase();
-                match tag.as_slice() {
-                    b"actor" => actor = Some(ActorBuilder::default()),
-                    b"ratings" => in_ratings = true,
-                    b"set" | b"collection" => in_set = true,
-                    b"uniqueid" | b"thumb" | b"fanart" => {
+                match tag.as_str() {
+                    "actor" => actor = Some(ActorBuilder::default()),
+                    "ratings" => in_ratings = true,
+                    "set" | "collection" => in_set = true,
+                    "uniqueid" | "thumb" | "fanart" => {
                         // Capture attributes for the upcoming text/child.
-                        if tag.as_slice() == b"uniqueid" {
-                            uniqueid_type = attr(&e, b"type");
+                        if tag == "uniqueid" {
+                            uniqueid_type = attr(&e, "type");
                         }
-                        if tag.as_slice() == b"thumb" {
+                        if tag == "thumb" {
                             // A <thumb> may carry the URL as text (handled in
                             // Text) or an `aspect` attr we ignore.
                         }
@@ -300,31 +300,29 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 // Kodi uses text, but tolerate an attr-only form).
                 let name = e.local_name();
                 let tag = name.as_ref().to_ascii_lowercase();
-                match tag.as_slice() {
-                    b"thumb" => {
-                        if let Some(url) = attr(&e, b"url") {
+                match tag.as_str() {
+                    "thumb" => {
+                        if let Some(url) = attr(&e, "url") {
                             push_artwork(&mut result, ArtworkRole::Primary, &url);
                         }
                     }
-                    b"fanart" => {
-                        if let Some(url) = attr(&e, b"url") {
+                    "fanart" => {
+                        if let Some(url) = attr(&e, "url") {
                             push_artwork(&mut result, ArtworkRole::Backdrop, &url);
                         }
                     }
-                    b"uniqueid" => {
+                    "uniqueid" => {
                         // No text payload; nothing to record.
-                        let _ = attr(&e, b"type");
+                        let _ = attr(&e, "type");
                     }
                     _ => {}
                 }
             }
             Ok(Event::Text(t)) => {
-                // Accumulate the literal run (charset-decoded). Entities in this
-                // node arrive separately as `GeneralRef`; a `decode` failure on a
-                // bad-encoding node just drops that run (V6 tolerance).
-                if let Ok(decoded) = t.decode() {
-                    cur_text.push_str(&decoded);
-                }
+                // Accumulate the literal run (already charset-decoded by the
+                // reader). Entities in this node arrive separately as
+                // `GeneralRef` — see below.
+                cur_text.push_str(&t);
             }
             Ok(Event::GeneralRef(r)) => {
                 // Re-insert the character an entity/char-ref stands for so the
@@ -332,8 +330,8 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 // `0`). Unknown named entities are dropped (V6 tolerance).
                 if let Ok(Some(c)) = r.resolve_char_ref() {
                     cur_text.push(c);
-                } else if let Ok(name) = r.decode() {
-                    match name.as_ref() {
+                } else {
+                    match r.as_ref() {
                         "amp" => cur_text.push('&'),
                         "lt" => cur_text.push('<'),
                         "gt" => cur_text.push('>'),
@@ -361,17 +359,17 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                         in_set,
                     );
                 }
-                match tag.as_slice() {
-                    b"actor" => {
+                match tag.as_str() {
+                    "actor" => {
                         if let Some(b) = actor.take() {
                             if let Some(p) = b.build() {
                                 result.people.push(p);
                             }
                         }
                     }
-                    b"ratings" => in_ratings = false,
-                    b"set" | b"collection" => in_set = false,
-                    b"uniqueid" => uniqueid_type = None,
+                    "ratings" => in_ratings = false,
+                    "set" | "collection" => in_set = false,
+                    "uniqueid" => uniqueid_type = None,
                     _ => {}
                 }
                 cur_text.clear();
@@ -399,7 +397,7 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
 /// Route a text run keyed by the element it sits inside.
 #[allow(clippy::too_many_arguments)]
 fn apply_text(
-    tag: &[u8],
+    tag: &str,
     text: &str,
     result: &mut MetadataResult,
     original_title: &mut Option<String>,
@@ -412,21 +410,21 @@ fn apply_text(
     // take precedence over the top-level field names.
     if let Some(b) = actor.as_mut() {
         match tag {
-            b"name" => {
+            "name" => {
                 b.name = Some(text.to_string());
                 return;
             }
-            b"role" => {
+            "role" => {
                 b.character = Some(text.to_string());
                 return;
             }
-            b"order" => {
+            "order" => {
                 b.order = text.parse::<u32>().ok();
                 return;
             }
             // LIB-C2 — capture the actor's headshot URL (persisted on the
             // person row's thumb_url). Other actor children are ignored.
-            b"thumb" => {
+            "thumb" => {
                 b.thumb = Some(text.to_string());
                 return;
             }
@@ -436,43 +434,43 @@ fn apply_text(
 
     // LIB-C5 — nested box-set form `<set><name>Name</name></set>`: a
     // `<name>` text run inside a <set> is the collection name. (The flat
-    // `<set>Name</set>` form is handled by the `b"set"` arm below.)
-    if in_set && tag == b"name" {
+    // `<set>Name</set>` form is handled by the `"set"` arm below.)
+    if in_set && tag == "name" {
         push_unique(&mut result.collections, text);
         return;
     }
 
     match tag {
-        b"title" => set_first(&mut result.title, text),
-        b"originaltitle" => set_first(original_title, text),
-        b"plot" => set_first(&mut result.overview, text),
+        "title" => set_first(&mut result.title, text),
+        "originaltitle" => set_first(original_title, text),
+        "plot" => set_first(&mut result.overview, text),
         // Only use outline if no plot was seen.
-        b"outline" => set_first(&mut result.overview, text),
-        b"tagline" => set_first(&mut result.tagline, text),
-        b"year" => set_first_with(&mut result.production_year, || parse_year(text)),
-        b"premiered" | b"aired" | b"releasedate" => {
+        "outline" => set_first(&mut result.overview, text),
+        "tagline" => set_first(&mut result.tagline, text),
+        "year" => set_first_with(&mut result.production_year, || parse_year(text)),
+        "premiered" | "aired" | "releasedate" => {
             set_first_with(&mut result.premiere_date, || parse_date_unix(text));
             // Backfill year from the date if <year> was absent.
             set_first_with(&mut result.production_year, || year_from_date(text));
         }
-        b"rating" => set_first_with(&mut result.community_rating, || parse_rating(text)),
+        "rating" => set_first_with(&mut result.community_rating, || parse_rating(text)),
         // Structured <ratings><rating><value>..</value> — take the first
         // value as community rating if a flat <rating> didn't set one.
-        b"value" if in_ratings => {
+        "value" if in_ratings => {
             set_first_with(&mut result.community_rating, || parse_rating(text))
         }
-        b"criticrating" => set_first_with(&mut result.critic_rating, || parse_rating(text)),
-        b"mpaa" | b"certification" => {
+        "criticrating" => set_first_with(&mut result.critic_rating, || parse_rating(text)),
+        "mpaa" | "certification" => {
             set_first(&mut result.official_rating, &normalise_certification(text))
         }
-        b"genre" => push_unique(&mut result.genres, text),
-        b"studio" => push_unique(&mut result.studios, text),
-        b"tag" => push_unique(&mut result.tags, text),
+        "genre" => push_unique(&mut result.genres, text),
+        "studio" => push_unique(&mut result.studios, text),
+        "tag" => push_unique(&mut result.tags, text),
         // T67 — `<country>` → ProductionLocations, `<trailer>` → RemoteTrailers.
-        b"country" => push_unique(&mut result.production_locations, text),
-        b"trailer" => push_unique(&mut result.trailers, text),
-        b"set" | b"collection" => push_unique(&mut result.collections, text),
-        b"director" => result.people.push(PersonRef {
+        "country" => push_unique(&mut result.production_locations, text),
+        "trailer" => push_unique(&mut result.trailers, text),
+        "set" | "collection" => push_unique(&mut result.collections, text),
+        "director" => result.people.push(PersonRef {
             name: text.to_string(),
             role: None,
             kind: PersonKind::Director,
@@ -481,7 +479,7 @@ fn apply_text(
             thumb: None,
             provider_ids: None,
         }),
-        b"credits" => result.people.push(PersonRef {
+        "credits" => result.people.push(PersonRef {
             name: text.to_string(),
             role: None,
             kind: PersonKind::Writer,
@@ -490,18 +488,18 @@ fn apply_text(
             thumb: None,
             provider_ids: None,
         }),
-        b"uniqueid" => apply_uniqueid(&mut result.provider_ids, uniqueid_type.as_deref(), text),
+        "uniqueid" => apply_uniqueid(&mut result.provider_ids, uniqueid_type.as_deref(), text),
         // Bare <id> — Kodi movies use TMDB by convention; only set tmdb if a
         // typed <uniqueid> hasn't already supplied one.
-        b"id" => set_first(&mut result.provider_ids.tmdb, text),
-        b"imdbid" | b"imdb_id" => set_first(&mut result.provider_ids.imdb, text),
-        b"tmdbid" => set_first(&mut result.provider_ids.tmdb, text),
-        b"tvdbid" => set_first(&mut result.provider_ids.tvdb, text),
-        b"musicbrainztrackid" | b"musicbrainzalbumid" | b"musicbrainzartistid" => {
+        "id" => set_first(&mut result.provider_ids.tmdb, text),
+        "imdbid" | "imdb_id" => set_first(&mut result.provider_ids.imdb, text),
+        "tmdbid" => set_first(&mut result.provider_ids.tmdb, text),
+        "tvdbid" => set_first(&mut result.provider_ids.tvdb, text),
+        "musicbrainztrackid" | "musicbrainzalbumid" | "musicbrainzartistid" => {
             set_first(&mut result.provider_ids.mbid, text)
         }
-        b"thumb" => push_artwork(result, ArtworkRole::Primary, text),
-        b"fanart" => push_artwork(result, ArtworkRole::Backdrop, text),
+        "thumb" => push_artwork(result, ArtworkRole::Primary, text),
+        "fanart" => push_artwork(result, ArtworkRole::Backdrop, text),
         _ => {}
     }
 }
@@ -670,7 +668,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// Read a UTF-8 attribute value off a start/empty tag, lower-casing the
 /// match on the attribute key. `None` if absent or non-UTF-8.
-fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.local_name().as_ref().eq_ignore_ascii_case(key) {
             // quick-xml 0.41 deprecated `unescape_value` in favour of
