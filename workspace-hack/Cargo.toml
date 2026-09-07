@@ -15,30 +15,33 @@ publish = false
 
 ### BEGIN HAKARI SECTION
 [dependencies]
+actix-http = { version = "3", features = ["compress-brotli", "compress-gzip", "compress-zstd", "http2", "ws"] }
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
+ahash = { version = "0.8" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
-base64 = { version = "0.23" }
+base64 = { version = "0.22" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
+crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
+crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
-foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 hashbrown = { version = "0.14", default-features = false, features = ["ahash", "raw"] }
 indexmap = { version = "2" }
-itertools = { version = "0.15" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.20", default-features = false, features = ["encoder", "optimization", "std"] }
 memchr = { version = "2" }
@@ -47,9 +50,9 @@ mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.10" }
+rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
-rand_chacha = { version = "0.10", default-features = false, features = ["std"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
@@ -58,20 +61,19 @@ serde_core = { version = "1", default-features = false, features = ["alloc", "rc
 serde_json = { version = "1", features = ["raw_value"] }
 sevenz-rust2 = { version = "0.22", default-features = false, features = ["compress", "util"] }
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
-sha2 = { version = "0.11" }
+sha2 = { version = "0.10" }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
-socket2-3b31131e45eafb45 = { package = "socket2", version = "0.6", default-features = false, features = ["all"] }
-socket2-d8f496e17d97b5cb = { package = "socket2", version = "0.5", default-features = false, features = ["all"] }
+socket2 = { version = "0.6", default-features = false, features = ["all"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite", "tls-rustls"] }
-sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
-sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate", "offline"] }
-sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "migrate", "offline"] }
+sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
+sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
+sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
@@ -80,15 +82,15 @@ zerocopy = { version = "0.8", default-features = false, features = ["derive", "s
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
-base64 = { version = "0.23" }
+base64 = { version = "0.22" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
+crypto-common = { version = "0.1", default-features = false, features = ["std"] }
 derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
-foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
@@ -97,7 +99,6 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js", "std"] }
 indexmap = { version = "2" }
-itertools = { version = "0.15" }
 log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
@@ -112,16 +113,17 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = { version = "0.11" }
+sha2 = { version = "0.10" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
-sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
-sqlx-macros = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
-sqlx-macros-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
-sqlx-postgres = { version = "0.9", default-features = false, features = ["migrate", "offline"] }
-sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "migrate", "offline"] }
+sqlx-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
+sqlx-macros = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
+sqlx-macros-core = { version = "0.8", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite"] }
+sqlx-postgres = { version = "0.8", default-features = false, features = ["migrate", "offline"] }
+sqlx-sqlite = { version = "0.8", default-features = false, features = ["bundled", "migrate", "offline"] }
 stable_deref_trait = { version = "1" }
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-stream = { version = "0.1", features = ["fs", "net"] }
 tracing = { version = "0.1", features = ["log"] }
