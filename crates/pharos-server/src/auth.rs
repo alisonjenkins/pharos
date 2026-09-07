@@ -3,7 +3,7 @@
 //! domain layer never needs `argon2` as a dependency (V12).
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Argon2,
 };
 use pharos_core::{
@@ -39,14 +39,12 @@ impl<U: UserStore> BuiltinAuth<U> {
     /// Hash a plaintext password with a fresh random salt. Use this to
     /// build a `UserRecord` before calling `UserStore::create`.
     pub fn hash_password(&self, password: &SecretString) -> AuthResult<SecretString> {
-        let mut salt_bytes = [0u8; 16];
-        getrandom::getrandom(&mut salt_bytes)
-            .map_err(|e| AuthError::Backend(format!("salt rng: {e}")))?;
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|e| AuthError::Backend(format!("salt encode: {e}")))?;
+        // password-hash 0.6's `hash_password` generates its own fresh random
+        // salt of the recommended length via the `getrandom` feature — no
+        // reason to hand-roll that ourselves as the pre-0.6 API required.
         let hash = self
             .argon
-            .hash_password(password.expose().as_bytes(), &salt)
+            .hash_password(password.expose().as_bytes())
             .map_err(|e| AuthError::Backend(format!("hash: {e}")))?
             .to_string();
         Ok(SecretString::new(hash))
