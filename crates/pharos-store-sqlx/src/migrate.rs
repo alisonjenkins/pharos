@@ -134,7 +134,7 @@ async fn setval(tx: &mut Transaction<'_, Postgres>, table: &str) -> Result<(), S
         "SELECT setval(pg_get_serial_sequence('{table}', 'id'), \
          COALESCE((SELECT MAX(id) FROM {table}), 1))"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql))
         .execute(&mut **tx)
         .await
         .map_err(StoreError::Sqlx)?;
@@ -150,14 +150,16 @@ async fn verify_counts(
     tables: &[(String, u64)],
 ) -> Result<(), StoreError> {
     for (table, _) in tables {
-        let (sqlite_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-        let (pg_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(dp)
-            .await
-            .map_err(StoreError::Sqlx)?;
+        let (sqlite_count,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(sp)
+                .await
+                .map_err(StoreError::Sqlx)?;
+        let (pg_count,): (i64,) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(dp)
+                .await
+                .map_err(StoreError::Sqlx)?;
         if sqlite_count != pg_count {
             return Err(StoreError::Parse(format!(
                 "migration count mismatch on {table}: sqlite={sqlite_count} postgres={pg_count}"
@@ -240,16 +242,17 @@ async fn copy_id_name_wire(
     tx: &mut Transaction<'_, Postgres>,
     table: &str,
 ) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, String)> =
-        sqlx::query_as(&format!("SELECT id, name, wire_id FROM {table}"))
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
+    let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT id, name, wire_id FROM {table}"
+    )))
+    .fetch_all(sp)
+    .await
+    .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
     for (id, name, wire_id) in rows {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} (id, name, wire_id) OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3)"
-        ))
+        )))
         .bind(id)
         .bind(name)
         .bind(wire_id)
@@ -551,7 +554,7 @@ async fn copy_media_items(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<u64, StoreError> {
     let select_sql = format!("SELECT {MEDIA_MIGRATE_COLUMNS} FROM media_items ORDER BY id");
-    let rows: Vec<MediaItemRow> = sqlx::query_as(&select_sql)
+    let rows: Vec<MediaItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
         .fetch_all(sp)
         .await
         .map_err(StoreError::Sqlx)?;
@@ -563,7 +566,7 @@ async fn copy_media_items(
          $45,$46,$47,$48,$49,$50,$51)"
     );
     for row in rows {
-        sqlx::query(&insert_sql)
+        sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
             .bind(row.id)
             .bind(row.path)
             .bind(row.title)
@@ -793,16 +796,17 @@ async fn copy_item_link(
     table: &str,
     entity_col: &str,
 ) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, i64)> =
-        sqlx::query_as(&format!("SELECT item_id, {entity_col} FROM {table}"))
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
+    let rows: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT item_id, {entity_col} FROM {table}"
+    )))
+    .fetch_all(sp)
+    .await
+    .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
     for (item_id, entity_id) in rows {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} (item_id, {entity_col}) VALUES ($1, $2)"
-        ))
+        )))
         .bind(item_id)
         .bind(entity_id)
         .execute(&mut **tx)

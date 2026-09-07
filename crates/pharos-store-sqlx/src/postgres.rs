@@ -123,7 +123,7 @@ impl PostgresStore {
             format!("WHERE {}", built.where_sql)
         };
         let sql = format!("SELECT COUNT(*) FROM media_items {join} {where_clause}");
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
         if let Some(uid) = user {
             query = query.bind(uid.0.as_bytes().to_vec());
         }
@@ -192,7 +192,7 @@ impl PostgresStore {
             cols = media_columns_prefixed_pg("m"),
             hit = Self::search_hit_subquery_pg(),
         );
-        let mut query = sqlx::query_as::<_, MediaRow>(&sql)
+        let mut query = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(tsquery)
             .bind(needle);
         for k in kinds {
@@ -232,7 +232,9 @@ impl PostgresStore {
              JOIN media_items m ON m.id = hit.rid WHERE TRUE {kind_clause}",
             hit = Self::search_hit_subquery_pg(),
         );
-        let mut query = sqlx::query_as::<_, (i64,)>(&sql).bind(tsquery).bind(needle);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql))
+            .bind(tsquery)
+            .bind(needle);
         for k in kinds {
             query = query.bind(k.as_str());
         }
@@ -285,7 +287,7 @@ impl PostgresStore {
             user: Option<UserId>,
             params: &[Param],
         ) -> DomainResult<Vec<FacetValue>> {
-            let mut q = sqlx::query_as::<_, (String, String, i64)>(sql);
+            let mut q = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
             if let Some(uid) = user {
                 q = q.bind(uid.0.as_bytes().to_vec());
             }
@@ -537,7 +539,7 @@ impl MediaStore for PostgresStore {
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
         let id_i64 = media_id_i64(id)?;
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id = $1");
-        let row = sqlx::query_as::<_, MediaRow>(&sql)
+        let row = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(id_i64)
             .fetch_optional(&self.pool)
             .await
@@ -749,7 +751,7 @@ impl MediaStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items ORDER BY id");
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -781,7 +783,7 @@ impl MediaStore for PostgresStore {
              FROM media_items {join} {where_clause} ORDER BY {} {limit_clause}",
             built.order_sql,
         );
-        let mut query = sqlx::query_as::<_, QueryRow>(&sql);
+        let mut query = sqlx::query_as::<_, QueryRow>(sqlx::AssertSqlSafe(sql));
         if let Some(uid) = user {
             query = query.bind(uid.0.as_bytes().to_vec());
         }
@@ -1059,7 +1061,7 @@ impl MediaStore for PostgresStore {
             "SELECT {MEDIA_COLUMNS} FROM media_items \
              WHERE fingerprint = $1 ORDER BY id LIMIT 1"
         );
-        let row = sqlx::query_as::<_, MediaRow>(&sql)
+        let row = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(fp.as_slice())
             .fetch_optional(&self.pool)
             .await
@@ -1200,7 +1202,7 @@ impl MediaStore for PostgresStore {
                AND kind IN ('movie','episode') \
              ORDER BY id ASC LIMIT $2"
         );
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(ttl_cutoff)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -1225,7 +1227,7 @@ impl MediaStore for PostgresStore {
                         AND (match_external_id IS NULL OR match_external_id <> $2))) \
              ORDER BY id ASC LIMIT $3"
         );
-        let rows = sqlx::query_as::<_, MediaRow>(&sql)
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
             .bind(ttl_cutoff)
             .bind(current_miss_marker)
             .bind(limit)
@@ -2837,7 +2839,7 @@ impl LibraryStore for PostgresStore {
         let mut changed: u64 = 0;
         for step in crate::backfill_plan(&libs) {
             let sql = crate::backfill_sql(&step, |n| format!("${n}"), "IS DISTINCT FROM");
-            let mut q = sqlx::query(&sql)
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(step.library_id as i32)
                 .bind(&step.like);
             for nested in &step.nested_likes {
@@ -3393,11 +3395,12 @@ impl SeriesMetadataStore for PostgresStore {
         let cols = crate::series_meta_row::SERIES_META_COLUMNS;
         let sql = format!("SELECT {cols} FROM series_metadata WHERE series_key = ANY($1)");
         let keys_vec: Vec<String> = keys.to_vec();
-        let rows = sqlx::query_as::<_, crate::series_meta_row::SeriesMetaRow>(&sql)
-            .bind(&keys_vec)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let rows =
+            sqlx::query_as::<_, crate::series_meta_row::SeriesMetaRow>(sqlx::AssertSqlSafe(sql))
+                .bind(&keys_vec)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(rows
             .into_iter()
             .map(|r| {
