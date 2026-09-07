@@ -105,7 +105,7 @@ static INIT: Once = Once::new();
 static RESULT: OnceLock<Result<PrometheusHandle, ObsError>> = OnceLock::new();
 /// Keeps the OTLP tracer provider alive for the process lifetime so the batch
 /// span processor keeps flushing (dropping it would stop export).
-static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::TracerProvider> = OnceLock::new();
+static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
 
 /// Initialize tracing subscriber + Prometheus recorder. Idempotent.
 /// Subsequent calls return the cached result, no recorder reinstall.
@@ -201,12 +201,11 @@ where
         .with_endpoint(endpoint)
         .build()
         .map_err(|e| ObsError::Otlp(e.to_string()))?;
-    let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-        "service.name",
-        "pharos",
-    )]);
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_attribute(opentelemetry::KeyValue::new("service.name", "pharos"))
+        .build();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
     let tracer = provider.tracer("pharos");
