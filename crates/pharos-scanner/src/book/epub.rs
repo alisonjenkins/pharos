@@ -242,9 +242,9 @@ fn rootfile_href(xml: &str) -> Option<String> {
     loop {
         match reader.read_event() {
             Ok(Event::Empty(e)) | Ok(Event::Start(e))
-                if local_name(e.name().as_ref()).eq_ignore_ascii_case(b"rootfile") =>
+                if local_name(e.name().as_ref()).eq_ignore_ascii_case("rootfile") =>
             {
-                if let Some(v) = attr(&e, b"full-path") {
+                if let Some(v) = attr(&e, "full-path") {
                     return Some(v);
                 }
             }
@@ -274,41 +274,37 @@ fn parse_opf(xml: &str) -> Result<EpubMetadata, String> {
     // `GeneralRef` events, so a single element's text arrives in pieces —
     // `&amp;` in a title would otherwise truncate it. Same handling as the NFO
     // reader.
-    let mut current: Option<Vec<u8>> = None;
+    let mut current: Option<String> = None;
     let mut text = String::new();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 let name = local_name(e.name().as_ref()).to_ascii_lowercase();
-                match name.as_slice() {
-                    b"title" | b"creator" | b"publisher" | b"description" | b"date"
-                    | b"identifier" => {
+                match name.as_str() {
+                    "title" | "creator" | "publisher" | "description" | "date" | "identifier" => {
                         current = Some(name);
                         text.clear();
                     }
-                    b"meta" => absorb_meta(&e, &mut out, &mut cover_id),
-                    b"item" => absorb_manifest_item(&e, &mut manifest),
+                    "meta" => absorb_meta(&e, &mut out, &mut cover_id),
+                    "item" => absorb_manifest_item(&e, &mut manifest),
                     _ => current = None,
                 }
             }
             Ok(Event::Empty(e)) => {
                 let name = local_name(e.name().as_ref()).to_ascii_lowercase();
-                match name.as_slice() {
+                match name.as_str() {
                     // EPUB 3 puts the series on a `<meta property="…">` with
                     // text content, but calibre's EPUB 2 form is an empty tag
                     // carrying name/content attributes. Both reach here.
-                    b"meta" => absorb_meta(&e, &mut out, &mut cover_id),
-                    b"item" => absorb_manifest_item(&e, &mut manifest),
+                    "meta" => absorb_meta(&e, &mut out, &mut cover_id),
+                    "item" => absorb_manifest_item(&e, &mut manifest),
                     _ => {}
                 }
             }
-            // A decode failure drops that run rather than the element
-            // (V6 tolerance), same as the NFO reader.
+            // Already charset-decoded by the reader; same as the NFO reader.
             Ok(Event::Text(t)) if current.is_some() => {
-                if let Ok(decoded) = t.decode() {
-                    text.push_str(&decoded);
-                }
+                text.push_str(&t);
             }
             // quick-xml 0.41 delivers entities separately, so `&amp;` in a
             // title reassembles here rather than truncating it.
@@ -348,16 +344,16 @@ fn parse_opf(xml: &str) -> Result<EpubMetadata, String> {
     Ok(out)
 }
 
-fn assign_dc(field: &[u8], text: String, out: &mut EpubMetadata) {
+fn assign_dc(field: &str, text: String, out: &mut EpubMetadata) {
     // First-wins within a file: an OPF may repeat `dc:creator` for
     // illustrators and translators, and the first is the author by convention.
     let slot = match field {
-        b"title" => &mut out.title,
-        b"creator" => &mut out.author,
-        b"publisher" => &mut out.publisher,
-        b"description" => &mut out.description,
-        b"date" => &mut out.date,
-        b"identifier" => {
+        "title" => &mut out.title,
+        "creator" => &mut out.author,
+        "publisher" => &mut out.publisher,
+        "description" => &mut out.description,
+        "date" => &mut out.date,
+        "identifier" => {
             // Only keep an identifier that actually looks like an ISBN — the
             // element is also used for UUIDs and calibre's internal ids, and
             // storing one of those as an ISBN would be a lie the UI displays.
@@ -379,8 +375,8 @@ fn absorb_meta(
     out: &mut EpubMetadata,
     cover_id: &mut Option<String>,
 ) {
-    let name = attr(e, b"name").unwrap_or_default().to_ascii_lowercase();
-    let content = attr(e, b"content");
+    let name = attr(e, "name").unwrap_or_default().to_ascii_lowercase();
+    let content = attr(e, "content");
     match name.as_str() {
         "cover" => {
             if let Some(c) = content {
@@ -408,18 +404,18 @@ fn absorb_manifest_item(
 ) {
     // Only image items can be a cover; recording the whole manifest would make
     // the "looks like a cover" fallback match an XHTML wrapper page.
-    let media_type = attr(e, b"media-type").unwrap_or_default();
+    let media_type = attr(e, "media-type").unwrap_or_default();
     if !media_type.starts_with("image/") {
         return;
     }
-    if let (Some(id), Some(href)) = (attr(e, b"id"), attr(e, b"href")) {
+    if let (Some(id), Some(href)) = (attr(e, "id"), attr(e, "href")) {
         manifest.insert(id, href);
     }
 }
 
 /// An attribute's value, matched on the LOCAL name so a namespace prefix does
 /// not hide it.
-fn attr(e: &quick_xml::events::BytesStart<'_>, want: &[u8]) -> Option<String> {
+fn attr(e: &quick_xml::events::BytesStart<'_>, want: &str) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.local_name().as_ref().eq_ignore_ascii_case(want) {
             // `normalized_value` decodes, resolves predefined entities and
@@ -436,8 +432,8 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, want: &[u8]) -> Option<String> {
 }
 
 /// Strip a namespace prefix: `dc:creator` → `creator`.
-fn local_name(qname: &[u8]) -> &[u8] {
-    match qname.iter().rposition(|b| *b == b':') {
+fn local_name(qname: &str) -> &str {
+    match qname.rfind(':') {
         Some(i) => &qname[i + 1..],
         None => qname,
     }

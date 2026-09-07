@@ -584,7 +584,7 @@ fn parse_comic_info(xml: &str) -> Result<ComicMetadata, String> {
 
     let mut out = ComicMetadata::default();
     let (mut year, mut month, mut day) = (None, None, None);
-    let mut current: Option<Vec<u8>> = None;
+    let mut current: Option<String> = None;
     let mut text = String::new();
 
     loop {
@@ -594,9 +594,7 @@ fn parse_comic_info(xml: &str) -> Result<ComicMetadata, String> {
                 text.clear();
             }
             Ok(Event::Text(t)) if current.is_some() => {
-                if let Ok(decoded) = t.decode() {
-                    text.push_str(&decoded);
-                }
+                text.push_str(&t);
             }
             Ok(Event::GeneralRef(r)) if current.is_some() => push_entity(&r, &mut text),
             Ok(Event::End(_)) => {
@@ -626,7 +624,7 @@ fn parse_comic_info(xml: &str) -> Result<ComicMetadata, String> {
 }
 
 fn assign_field(
-    field: &[u8],
+    field: &str,
     text: String,
     out: &mut ComicMetadata,
     year: &mut Option<u32>,
@@ -634,11 +632,11 @@ fn assign_field(
     day: &mut Option<u32>,
 ) {
     match field {
-        b"title" => out.title = Some(text),
-        b"series" => out.series_name = Some(text),
+        "title" => out.title = Some(text),
+        "series" => out.series_name = Some(text),
         // "1", "1.5" and "001" all appear. Take the integer part, as the epub
         // reader does with calibre's "1.0".
-        b"number" => {
+        "number" => {
             out.series_index = text
                 .split('.')
                 .next()
@@ -646,20 +644,20 @@ fn assign_field(
         }
         // ComicInfo has no author field; `Writer` is the closest and is what
         // every reader displays as the byline.
-        b"writer" => out.author = Some(text),
-        b"publisher" => out.publisher = Some(text),
-        b"summary" => out.description = Some(text),
-        b"year" => *year = text.trim().parse().ok(),
-        b"month" => *month = text.trim().parse().ok(),
-        b"day" => *day = text.trim().parse().ok(),
+        "writer" => out.author = Some(text),
+        "publisher" => out.publisher = Some(text),
+        "summary" => out.description = Some(text),
+        "year" => *year = text.trim().parse().ok(),
+        "month" => *month = text.trim().parse().ok(),
+        "day" => *day = text.trim().parse().ok(),
         // `PageCount` is deliberately ignored — see the module header.
         _ => {}
     }
 }
 
 /// Strip a namespace prefix, same as the OPF reader.
-fn local_name(qname: &[u8]) -> &[u8] {
-    match qname.iter().rposition(|b| *b == b':') {
+fn local_name(qname: &str) -> &str {
+    match qname.rfind(':') {
         Some(i) => &qname[i + 1..],
         None => qname,
     }

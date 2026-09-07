@@ -200,8 +200,8 @@ pub(crate) fn record_classify(
 pub(crate) fn push_entity(r: &quick_xml::events::BytesRef<'_>, out: &mut String) {
     if let Ok(Some(c)) = r.resolve_char_ref() {
         out.push(c);
-    } else if let Ok(name) = r.decode() {
-        match name.as_ref() {
+    } else {
+        match r.as_ref() {
             "amp" => out.push('&'),
             "lt" => out.push('<'),
             "gt" => out.push('>'),
