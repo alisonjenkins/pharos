@@ -29,7 +29,7 @@ xxhash-rust.workspace = true
 # libavcodec/format/filter/util via pkg-config from the nix devShell
 # (which supplies LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS for the sys
 # crate's bindgen pass).
-ffmpeg-the-third = { version = "5", optional = true }
+ffmpeg-the-third = { version = "6", optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
