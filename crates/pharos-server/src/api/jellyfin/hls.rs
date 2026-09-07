@@ -2091,6 +2091,36 @@ async fn vp9_audio_file(
             f64::from(file.session_start_seg) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
         fmp4::shrink_empty_edits(&mut bytes, session_offset_secs)
             .map_err(|e| error::ErrorInternalServerError(format!("audio init edit list: {e}")))?;
+    } else if name.ends_with(".m4s") {
+        // B189-shaped gap (2026-09-07): the init above was watched for
+        // refetch storms and for carrying a doubled offset, but nothing ever
+        // recorded whether a session that fetched it got a byte of REAL
+        // audio afterward. A session stuck re-requesting init.mp4 and a
+        // session that plays cleanly look identical here — both are 200s —
+        // until this line reports the one thing that tells them apart: did
+        // this play session's audio ever actually start.
+        let mut total_segs = None;
+        if let Some(dur_ms) = item.probe.duration_ms {
+            let grid =
+                super::seek::SegmentGrid::new(dur_ms as f64 / 1000.0, item.probe.frame_rate_mille);
+            total_segs = Some(grid.count());
+        }
+        crate::session_start::note_session_start(
+            &state.session_starts,
+            q.play_session_id.as_deref(),
+            media_id,
+            want_seg,
+            total_segs,
+            f64::from(want_seg) * HlsSegmentCache::AUDIO_SEGMENT_SECONDS,
+            "vp9-audio",
+        );
+        crate::session_start::note_segment_serve(
+            &state.segment_refetches,
+            q.play_session_id.as_deref(),
+            media_id,
+            want_seg,
+            "vp9-audio",
+        );
     }
     // B121 — put the fragment back on the timeline. ffmpeg's HLS muxer numbers
     // a session's `tfdt` from that session's OWN first fragment, so a fragment
