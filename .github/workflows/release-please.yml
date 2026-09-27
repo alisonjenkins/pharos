@@ -3,6 +3,15 @@ name: release-please
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag to (re)tag images for, e.g. v0.2.0. Runs only
+          the tag-release-images job against that tag's commit; leave empty
+          for the normal release-please flow.
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -11,5 +20,135 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    # Skip when this run exists only to backfill image tags for an existing
+    # release (workflow_dispatch with `tag` set) — that path must not create
+    # or update a release PR.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '')
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
+
+  tag-release-images:
+    name: tag release images (ghcr)
+    needs: release-please
+    # `needs.release-please` is skipped on the workflow_dispatch backfill
+    # path, which would otherwise skip this job too — `always()` overrides
+    # that so the explicit condition below is what actually decides it.
+    if: >-
+      always() && !cancelled() &&
+      github.repository == 'alisonjenkins/pharos' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '') ||
+        needs.release-please.outputs.release_created == 'true'
+      )
+    runs-on: pharos-nix-builder-amd64
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
+
+      - name: Resolve target commit and version
+        id: target
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+            git fetch origin --tags --force
+            SHA="$(git rev-list -n 1 "$TAG")"
+          else
+            TAG="${{ needs.release-please.outputs.tag_name }}"
+            SHA="${{ needs.release-please.outputs.sha }}"
+          fi
+          if [[ -z "$TAG" || -z "$SHA" ]]; then
+            echo "could not resolve a tag/sha to work from (tag='$TAG' sha='$SHA')" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+          } >>"$GITHUB_OUTPUT"
+
+      # ci.yml's `publish` job tags the same commit-sha images concurrently
+      # (or has one still queued on this same self-hosted runner), and the
+      # release tag is pushed by release-please using GITHUB_TOKEN, so a tag
+      # push can't trigger a workflow to publish version tags directly. Poll
+      # until the sha-tagged images publish lands, then re-tag from it.
+      - name: Wait for commit-sha images, then tag the release version
+        env:
+          # Same PAT as ci.yml's publish job: these GHCR packages are
+          # user-owned and were created out-of-band, so the repo's
+          # GITHUB_TOKEN has no write grant on them.
+          GHCR_CREDS: alisonjenkins:${{ secrets.GHCR_TOKEN }}
+          SHA: ${{ steps.target.outputs.sha }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          images=(
+            ghcr.io/alisonjenkins/pharos
+            ghcr.io/alisonjenkins/pharos-jellyfin-web
+          )
+          version_tags=("v${VERSION}" "${VERSION}")
+
+          timeout_seconds=5400 # 90 min
+          interval_seconds=60
+
+          wait_for_sha_image() {
+            local repo="$1"
+            local elapsed=0
+            until nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+              "docker://${repo}:${SHA}" >/dev/null 2>&1; do
+              if (( elapsed >= timeout_seconds )); then
+                printf 'event=wait_for_sha_image status=timeout repo=%q sha=%q elapsed_s=%d\n' \
+                  "$repo" "$SHA" "$elapsed" >&2
+                exit 1
+              fi
+              printf 'event=wait_for_sha_image status=waiting repo=%q sha=%q elapsed_s=%d\n' \
+                "$repo" "$SHA" "$elapsed" >&2
+              sleep "$interval_seconds"
+              elapsed=$((elapsed + interval_seconds))
+            done
+          }
+
+          for repo in "${images[@]}"; do
+            wait_for_sha_image "$repo"
+          done
+
+          for repo in "${images[@]}"; do
+            for tag in "${version_tags[@]}"; do
+              nix develop --command skopeo copy --insecure-policy --all \
+                --src-creds "$GHCR_CREDS" \
+                --dest-creds "$GHCR_CREDS" \
+                "docker://${repo}:${SHA}" "docker://${repo}:${tag}"
+            done
+          done
+
+          for repo in "${images[@]}"; do
+            sha_digest="$(nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+              --format '{{.Digest}}' "docker://${repo}:${SHA}")"
+            for tag in "${version_tags[@]}"; do
+              tag_digest="$(nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+                --format '{{.Digest}}' "docker://${repo}:${tag}")"
+              if [[ "$tag_digest" != "$sha_digest" ]]; then
+                printf 'event=verify_digest status=mismatch repo=%q tag=%q tag_digest=%q sha_digest=%q\n' \
+                  "$repo" "$tag" "$tag_digest" "$sha_digest" >&2
+                exit 1
+              fi
+              printf 'event=verify_digest status=ok repo=%q tag=%q digest=%q\n' \
+                "$repo" "$tag" "$tag_digest"
+            done
+          done
