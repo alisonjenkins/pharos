@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
 
       # One command builds `.#pharos` and runs the WHOLE workspace suite
       # (nextest, `--profile nix` timeouts), clippy (`-D warnings`), rustfmt,
@@ -67,7 +67,7 @@ jobs:
     if: ${{ github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
       - name: cargo-audit (RustSec)
         run: nix develop --command cargo audit
       - name: cargo-deny (licenses + bans)
@@ -85,7 +85,7 @@ jobs:
     # only changed workspace crates recompile here.
     steps:
       - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
       # Build both images into the (host-shared, warm) nix store. `publish`
       # reuses these exact store paths as instant cache hits — no artifact
       # upload/download round-trip of a ~100 MB tarball.
@@ -108,7 +108,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
       - name: Push images to GHCR (latest + immutable sha tags)
         env:
           # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
@@ -158,7 +158,7 @@ jobs:
     # cannot ship an image regardless of what this job does.
     steps:
       - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       # Browser binaries come from the nix-pinned playwright-driver

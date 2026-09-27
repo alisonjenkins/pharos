@@ -26,7 +26,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     steps:
       - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       - name: Run SyncPlay group-watch harness
