@@ -137,12 +137,21 @@ jobs:
             done
           done
 
+          # The dev shell prints a banner to stdout; keep only the digest line.
+          digest_of() {
+            local d
+            d="$(nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+              --format '{{.Digest}}' "docker://$1" | grep -E '^sha256:[0-9a-f]{64}$')" || {
+              printf 'event=digest_lookup status=failed ref=%q\n' "$1" >&2
+              return 1
+            }
+            printf '%s\n' "$d"
+          }
+
           for repo in "${images[@]}"; do
-            sha_digest="$(nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
-              --format '{{.Digest}}' "docker://${repo}:${SHA}")"
+            sha_digest="$(digest_of "${repo}:${SHA}")"
             for tag in "${version_tags[@]}"; do
-              tag_digest="$(nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
-                --format '{{.Digest}}' "docker://${repo}:${tag}")"
+              tag_digest="$(digest_of "${repo}:${tag}")"
               if [[ "$tag_digest" != "$sha_digest" ]]; then
                 printf 'event=verify_digest status=mismatch repo=%q tag=%q tag_digest=%q sha_digest=%q\n' \
                   "$repo" "$tag" "$tag_digest" "$sha_digest" >&2
