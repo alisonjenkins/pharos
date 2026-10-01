@@ -112,6 +112,60 @@ struct TranslateCtx<'a> {
     current_pli: Option<&'a str>,
 }
 
+/// Why a `/socket` connection closed — set at every exit from the pump loop
+/// (the compiler enforces this: the loop is an expression and every
+/// `break 'pump` must supply a variant) so `syncplay: /socket disconnected`
+/// names a cause instead of leaving it to be guessed from Loki silence.
+enum SocketCloseCause {
+    /// A rolling deploy drained this socket (`sockets_draining()` /
+    /// `shutdown_signal()` fired).
+    Drain,
+    /// No client traffic for `IDLE_DROP`; the server-side keepalive gave up.
+    IdleTimeout,
+    /// A `send_outbound`/session write failed (TCP reset, backpressure, a
+    /// half-closed peer).
+    SendFailed,
+    /// `stream.next()` returned `None` — the connection ended with no close
+    /// frame (abrupt TCP close, proxy reset, LB idle-reap).
+    StreamEnd,
+    /// The peer sent a WebSocket close frame.
+    PeerClose {
+        code: Option<u16>,
+        description: Option<String>,
+    },
+    /// The stream yielded a protocol/read error.
+    ReadError(String),
+}
+
+impl SocketCloseCause {
+    /// Stable label for the `cause` log field and the
+    /// `pharos_syncplay_socket_closed_total{cause}` metric. Bounded
+    /// cardinality — asserted distinct+stable in
+    /// `socket_close_cause_labels_are_distinct`.
+    fn label(&self) -> &'static str {
+        match self {
+            SocketCloseCause::Drain => "drain",
+            SocketCloseCause::IdleTimeout => "idle_timeout",
+            SocketCloseCause::SendFailed => "send_failed",
+            SocketCloseCause::StreamEnd => "stream_end",
+            SocketCloseCause::PeerClose { .. } => "peer_close",
+            SocketCloseCause::ReadError(_) => "read_error",
+        }
+    }
+}
+
+/// Increment `pharos_syncplay_socket_closed_total{cause}` for the socket that
+/// just closed. Split out from `handle_connection` so the disconnect path's
+/// instrumentation is directly unit-testable without driving a real
+/// WebSocket.
+fn record_socket_closed(cause: &SocketCloseCause) {
+    metrics::counter!(
+        "pharos_syncplay_socket_closed_total",
+        "cause" => cause.label(),
+    )
+    .increment(1);
+}
+
 pub fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/socket", web::get().to(ws_entry));
 }
@@ -253,11 +307,7 @@ async fn handle_connection<S>(
     // polling. Cleared on `ScheduledTasksInfoStop` / disconnect.
     let mut tasks_info_tick: Option<tokio::time::Interval> = None;
 
-    // #1 — set when a rolling-deploy drain closes this socket, so the pump can
-    // send an explicit close frame (the B26 teardown returns early on drain and
-    // would otherwise let the socket linger until TCP timeout).
-    let mut drain_close = false;
-    'pump: loop {
+    let close_cause = 'pump: loop {
         // React to a socket-drain at once: close so the client reconnects to
         // the already-Ready new pod instead of riding its post-deploy
         // exponential backoff. Gated on `sockets_draining()` (fired AFTER the
@@ -266,22 +316,20 @@ async fn handle_connection<S>(
         // top-of-loop poll catches a signal that fired between selects; the
         // `notified()` arm makes the common case instant.
         if crate::state::sockets_draining() {
-            drain_close = true;
-            break 'pump;
+            break 'pump SocketCloseCause::Drain;
         }
         tokio::select! {
             biased;
             _ = crate::state::shutdown_signal().notified() => {
-                drain_close = true;
-                break 'pump;
+                break 'pump SocketCloseCause::Drain;
             }
             _ = keepalive_tick.tick() => {
                 if last_client_seen.elapsed() > IDLE_DROP {
-                    break 'pump;
+                    break 'pump SocketCloseCause::IdleTimeout;
                 }
                 let out = Outbound::new("KeepAlive", serde_json::Value::Null);
                 if send_outbound(&mut session, &out).await.is_err() {
-                    break 'pump;
+                    break 'pump SocketCloseCause::SendFailed;
                 }
             }
             // Live scan-progress push. Only armed after ScheduledTasksInfoStart;
@@ -301,7 +349,7 @@ async fn handle_connection<S>(
                     ),
                 );
                 if send_outbound(&mut session, &out).await.is_err() {
-                    break 'pump;
+                    break 'pump SocketCloseCause::SendFailed;
                 }
             }
             Some(server_msg) = out_rx.recv() => {
@@ -338,7 +386,7 @@ async fn handle_connection<S>(
                         .unwrap_or("");
                     tracing::debug!(device_id = %device_key, msg = %out.message_type, kind, "syncplay: → client");
                     if send_outbound(&mut session, &out).await.is_err() {
-                        break 'pump;
+                        break 'pump SocketCloseCause::SendFailed;
                     }
                 }
             }
@@ -364,12 +412,12 @@ async fn handle_connection<S>(
                 }
                 if let Some(out) = translate_broadcast(b) {
                     if send_outbound(&mut session, &out).await.is_err() {
-                        break 'pump;
+                        break 'pump SocketCloseCause::SendFailed;
                     }
                 }
             }
             frame = stream.next() => {
-                let Some(frame) = frame else { break 'pump };
+                let Some(frame) = frame else { break 'pump SocketCloseCause::StreamEnd };
                 // Any incoming frame counts as client liveness.
                 last_client_seen = Instant::now();
                 match frame {
@@ -387,7 +435,7 @@ async fn handle_connection<S>(
                                 serde_json::Value::Null,
                             );
                             if send_outbound(&mut session, &out).await.is_err() {
-                                break 'pump;
+                                break 'pump SocketCloseCause::SendFailed;
                             }
                             // T83 — forward as a liveness beacon so the group's
                             // ghost prune (MEMBER_TTL_MS) never reaps a member
@@ -432,12 +480,19 @@ async fn handle_connection<S>(
                     Ok(AggregatedMessage::Ping(p)) => {
                         let _ = session.pong(&p).await;
                     }
-                    Ok(AggregatedMessage::Close(_)) | Err(_) => break 'pump,
+                    Ok(AggregatedMessage::Close(reason)) => {
+                        break 'pump SocketCloseCause::PeerClose {
+                            code: reason.as_ref().map(|r| u16::from(r.code)),
+                            description: reason.and_then(|r| r.description),
+                        };
+                    }
+                    Err(e) => break 'pump SocketCloseCause::ReadError(e.to_string()),
                     Ok(_) => {}
                 }
             }
         }
-    }
+    };
+    let drain_close = matches!(close_cause, SocketCloseCause::Drain);
 
     // #1 — a drain-initiated close: tell the client explicitly (WS 1012
     // Service Restart) so it reconnects NOW, rather than letting the socket
@@ -456,7 +511,34 @@ async fn handle_connection<S>(
             .close(Some(actix_ws::CloseCode::Restart.into()))
             .await;
     }
-    tracing::info!(device_id = %device_key, %member_id, "syncplay: /socket disconnected");
+    record_socket_closed(&close_cause);
+    let close_code = match &close_cause {
+        SocketCloseCause::PeerClose { code, .. } => *code,
+        _ => None,
+    };
+    let close_reason = match &close_cause {
+        SocketCloseCause::PeerClose {
+            description: Some(d),
+            ..
+        } if !d.is_empty() => Some(d.as_str()),
+        _ => None,
+    };
+    let read_error = match &close_cause {
+        SocketCloseCause::ReadError(e) => Some(e.as_str()),
+        _ => None,
+    };
+    tracing::info!(
+        device_id = %device_key,
+        %member_id,
+        user = %member_name,
+        cause = close_cause.label(),
+        close_code,
+        close_reason,
+        read_error,
+        lifetime_ms = started.elapsed().as_millis() as u64,
+        since_client_ms = last_client_seen.elapsed().as_millis() as u64,
+        "syncplay: /socket disconnected"
+    );
     // B26 — a socket that broke because WE are draining (SIGTERM: rolling
     // deploy) must NOT dismantle the membership: the whole point of the
     // persisted snapshot is that the next process recovers it. Removing the
@@ -1466,5 +1548,60 @@ mod tests {
             arg: serde_json::json!({}),
         });
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn socket_close_cause_labels_are_distinct() {
+        // Every variant exhaustively, so a new cause added later without a
+        // label stays caught here (and the dashboard breakdown can't silently
+        // start double-counting two causes under one string).
+        let all = [
+            SocketCloseCause::Drain,
+            SocketCloseCause::IdleTimeout,
+            SocketCloseCause::SendFailed,
+            SocketCloseCause::StreamEnd,
+            SocketCloseCause::PeerClose {
+                code: Some(1000),
+                description: None,
+            },
+            SocketCloseCause::ReadError("boom".into()),
+        ];
+        let labels: Vec<&str> = all.iter().map(SocketCloseCause::label).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            labels.len(),
+            "duplicate cause label: {labels:?}"
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "drain",
+                "idle_timeout",
+                "send_failed",
+                "stream_end",
+                "peer_close",
+                "read_error",
+            ],
+            "cause labels must stay stable — a rename breaks the LogQL/PromQL \
+             dashboard contract"
+        );
+    }
+
+    #[actix_web::test]
+    async fn record_socket_closed_increments_counter_for_cause() {
+        let _ = crate::obs::init("info", None);
+        record_socket_closed(&SocketCloseCause::IdleTimeout);
+        let body = crate::obs::render();
+        assert!(
+            body.contains("pharos_syncplay_socket_closed_total"),
+            "missing counter; rendered:\n{body}"
+        );
+        assert!(
+            body.contains("cause=\"idle_timeout\""),
+            "missing cause label; rendered:\n{body}"
+        );
     }
 }
