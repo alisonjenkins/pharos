@@ -426,26 +426,70 @@ struct IgnoreWaitBody {
     ignore_wait: bool,
 }
 
+/// Result of [`creator_now_playing`] — the item to seed plus the diagnostics
+/// (B227) that show, at the point of the decision, whether there was more
+/// than one session record to choose from and how stale the chosen one was.
+#[derive(Debug, Clone)]
+struct SeedCandidate {
+    item_id: String,
+    position_ms: u64,
+    is_paused: bool,
+    session_id: String,
+    /// Count of session records matching (user, device) — more than one
+    /// means a ghost (a Started with no matching Stopped) is sitting beside
+    /// the live session, so `creator_now_playing`'s pick is one guess among
+    /// several rather than the only candidate.
+    candidates: usize,
+    since_activity_ms: u64,
+}
+
+/// Count of `/SyncPlay/New` seeds where more than one session record
+/// matched (user, device) — the ghost condition B227 fixes. A nonzero rate
+/// here is the signal: `sum(rate(pharos_session_seed_multiple_candidates_total[1h]))`.
+fn record_seed_multiple_candidates() {
+    metrics::counter!("pharos_session_seed_multiple_candidates_total").increment(1);
+}
+
+/// Pure decision core of [`creator_now_playing`] — takes the already-filtered
+/// (user, device) matches and picks the seed, recording the B227
+/// diagnostics. Split out so it is testable without the registry actor: a
+/// test can hand it hand-built `SessionRecord`s to exercise the
+/// multiple-candidates path directly.
+fn resolve_seed(matches: Vec<crate::sessions::SessionRecord>) -> Option<SeedCandidate> {
+    let candidates = matches.len();
+    if candidates > 1 {
+        record_seed_multiple_candidates();
+    }
+    let chosen = matches.into_iter().next()?;
+    let item_id = chosen.now_playing_item_id.clone()?;
+    let since_activity_ms = chosen.activity_age_ms();
+    Some(SeedCandidate {
+        item_id,
+        position_ms: chosen.position_ticks / POSITION_TICKS_PER_MS,
+        is_paused: chosen.is_paused,
+        session_id: chosen.id,
+        candidates,
+        since_activity_ms,
+    })
+}
+
 /// Find the creator's currently-playing item so a freshly-created group can
 /// inherit it (real-Jellyfin parity: a new group is seeded from the creating
 /// session's now-playing). Matches the creator's OWN session by (user, device):
 /// jellyfin-web derives an identical `deviceId` across same-UA installs (B53),
 /// so the user id disambiguates two people (e.g. Alison + Lace) on one browser.
-/// Returns `(item_id, position_ms, is_paused)`.
 async fn creator_now_playing(
     state: &crate::state::AppState,
     user_id: &pharos_core::UserId,
     device_id: &str,
-) -> Option<(String, u64, bool)> {
+) -> Option<SeedCandidate> {
     let uid = user_id.0.simple().to_string();
     let sessions = state.sessions.snapshot().await.ok()?;
-    sessions.into_iter().find_map(|s| {
-        if s.user_id != uid || s.device_id != device_id {
-            return None;
-        }
-        let item = s.now_playing_item_id?;
-        Some((item, s.position_ticks / POSITION_TICKS_PER_MS, s.is_paused))
-    })
+    let matches: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| s.user_id == uid && s.device_id == device_id && s.now_playing_item_id.is_some())
+        .collect();
+    resolve_seed(matches)
 }
 
 /// Resolve each queue item's duration, INDEX-ALIGNED with `item_ids`.
@@ -519,7 +563,7 @@ async fn new_group(
     // ~1 min with a blank player until the leader re-set the queue). The seed
     // is silent (no broadcast, no gate) and only applies while the queue is
     // still empty, so a real `SetNewQueue` that lands first always wins.
-    if let Some((item_id, position_ms, is_paused)) = creator_now_playing(
+    if let Some(seed) = creator_now_playing(
         &state,
         &auth.user.id,
         auth.device_id.as_deref().unwrap_or(""),
@@ -527,10 +571,13 @@ async fn new_group(
     .await
     {
         tracing::info!(
-            device_id = %dev, group = %handle.group_id, %item_id, position_ms, is_paused,
+            device_id = %dev, group = %handle.group_id,
+            item_id = %seed.item_id, position_ms = seed.position_ms, is_paused = seed.is_paused,
+            session_id = %seed.session_id, candidates = seed.candidates,
+            since_activity_ms = seed.since_activity_ms,
             "syncplay: seeding new group from creator's now-playing item"
         );
-        let runtime_ms = resolve_runtimes_ms(&state, std::slice::from_ref(&item_id))
+        let runtime_ms = resolve_runtimes_ms(&state, std::slice::from_ref(&seed.item_id))
             .await
             .into_iter()
             .next()
@@ -538,10 +585,10 @@ async fn new_group(
         let _ = handle
             .tx
             .send(GroupMsg::SeedQueue {
-                item_id,
+                item_id: seed.item_id,
                 runtime_ms,
-                position_ms,
-                is_paused,
+                position_ms: seed.position_ms,
+                is_paused: seed.is_paused,
             })
             .await;
     }
@@ -1169,16 +1216,85 @@ mod tests {
             .unwrap();
 
         // Alison creating a group seeds from ALISON's item, not Lace's.
-        assert_eq!(
-            creator_now_playing(&state, &alison, dev).await,
-            Some(("scooby".to_string(), 90_000, false))
-        );
+        let seed = creator_now_playing(&state, &alison, dev).await.unwrap();
+        assert_eq!(seed.item_id, "scooby");
+        assert_eq!(seed.position_ms, 90_000);
+        assert!(!seed.is_paused);
+        assert_eq!(seed.session_id, "alison-sess");
+        assert_eq!(seed.candidates, 1, "only alison's own session matches");
         // A user with no active session yields nothing → no seed sent.
-        assert_eq!(creator_now_playing(&state, &UserId::new(), dev).await, None);
+        assert!(creator_now_playing(&state, &UserId::new(), dev)
+            .await
+            .is_none());
         // Right user, wrong device → no match.
+        assert!(creator_now_playing(&state, &alison, "other-device")
+            .await
+            .is_none());
+    }
+
+    /// Builds a minimal `SessionRecord` for tests that exercise
+    /// [`resolve_seed`] directly — without needing the registry actor to
+    /// produce the "more than one candidate" state.
+    fn make_record(id: &str, item: &str, age_secs: u64) -> crate::sessions::SessionRecord {
+        crate::sessions::SessionRecord {
+            id: id.into(),
+            user_id: "u".into(),
+            user_name: "u".into(),
+            device_id: "d".into(),
+            device_name: "d".into(),
+            client: "c".into(),
+            application_version: "1".into(),
+            now_playing_item_id: Some(item.into()),
+            position_ticks: 0,
+            is_paused: false,
+            playable_media_types: Vec::new(),
+            supported_commands: Vec::new(),
+            max_streaming_bitrate: None,
+            supports_media_control: false,
+            is_active: true,
+            supports_remote_control: true,
+            has_custom_device_name: false,
+            last_activity_date: String::new(),
+            last_playback_check_in: String::new(),
+            activity_at: tokio::time::Instant::now() - std::time::Duration::from_secs(age_secs),
+        }
+    }
+
+    /// B227 signal: more than one session record matching (user, device)
+    /// must show up as `candidates > 1` and increment
+    /// `pharos_session_seed_multiple_candidates_total` — the query that
+    /// proves the stale-seed bug is happening in production TODAY, before
+    /// any eviction fix lands. Without a tie-break, the pick is whichever
+    /// the caller handed first — demonstrating that an unordered ghost can
+    /// beat the live session exactly as alison's did in production.
+    #[actix_web::test]
+    async fn seed_with_a_ghost_session_counts_multiple_candidates() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let ghost = make_record("ghost-sess", "stale-item", 600);
+        let live = make_record("live-sess", "fresh-item", 0);
+        let seed = resolve_seed(vec![ghost, live]).unwrap();
+        assert_eq!(seed.candidates, 2, "ghost + live session both matched");
         assert_eq!(
-            creator_now_playing(&state, &alison, "other-device").await,
-            None
+            seed.item_id, "stale-item",
+            "no tie-break yet — the ghost listed first wins, which is the bug"
+        );
+
+        let count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                (ck.key().name() == "pharos_session_seed_multiple_candidates_total").then_some(v)
+            })
+            .unwrap();
+        assert!(
+            matches!(count, DebugValue::Counter(1)),
+            "exactly one multiple-candidate seed happened — got {count:?}"
         );
     }
 

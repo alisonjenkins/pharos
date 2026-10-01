@@ -52,6 +52,18 @@ pub struct SessionRecord {
     /// ISO8601 UTC, stamped on every event. Never empty — see [`iso_now`].
     pub last_activity_date: String,
     pub last_playback_check_in: String,
+    /// Monotonic stamp of the last Started/Progress event, for age
+    /// comparisons (B227) that must not depend on wall-clock parsing or
+    /// drift. Internal only — never serialized to the wire.
+    #[serde(skip)]
+    pub activity_at: tokio::time::Instant,
+}
+
+impl SessionRecord {
+    /// Milliseconds since this record's last Started/Progress event.
+    pub fn activity_age_ms(&self) -> u64 {
+        u64::try_from(self.activity_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +180,7 @@ impl SessionRegistry {
                                 has_custom_device_name: false,
                                 last_activity_date: iso_now(),
                                 last_playback_check_in: iso_now(),
+                                activity_at: tokio::time::Instant::now(),
                             },
                         );
                     }
@@ -183,6 +196,7 @@ impl SessionRegistry {
                             s.is_paused = is_paused;
                             s.last_activity_date = iso_now();
                             s.last_playback_check_in = s.last_activity_date.clone();
+                            s.activity_at = tokio::time::Instant::now();
                         }
                     }
                     Msg::Apply(SessionEvent::Stopped { session_id }) => {
@@ -221,6 +235,7 @@ impl SessionRegistry {
                                     has_custom_device_name: false,
                                     last_activity_date: iso_now(),
                                     last_playback_check_in: iso_now(),
+                                    activity_at: tokio::time::Instant::now(),
                                 });
                         entry.last_activity_date = iso_now();
                         entry.last_playback_check_in = entry.last_activity_date.clone();
