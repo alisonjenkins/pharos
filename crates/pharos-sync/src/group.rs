@@ -175,6 +175,21 @@ const MEMBER_PRUNE_TICK_MS: u64 = 30_000;
 /// the ordinary lead and the member is left to its own drift correction.
 pub const MAX_RESUME_CATCH_UP_MS: u64 = 5_000;
 
+/// B226 — how recently the current queue entry must have become current for
+/// a `NextItem` naming it (or sending no `PlaylistItemId` at all) to be
+/// treated as the SAME race that produced B37's stale case, rather than a
+/// second genuine advance.
+///
+/// jellyfin-web's `onPlaybackStopped` resolves `getCurrentUser()` before
+/// reading `getCurrentPlaylistItemId()`: if the first `NextItem`'s `PlayQueue`
+/// has already landed by the time that promise settles, the SECOND request's
+/// body names the item the queue is ALREADY on — B37's `pli_is_stale` sees a
+/// match and waves it through, advancing a second time and skipping an
+/// episode. 10s comfortably covers the 1-46s production gap between the two
+/// requests (2026-09-13 19:14:26 / 19:14:29) while staying well under any
+/// plausible gap between two genuinely separate presses of Next.
+const NEXT_ITEM_DEBOUNCE_MS: u64 = 10_000;
+
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -947,6 +962,9 @@ enum NextItemOutcome {
     Stale,
     /// Already on the last queue entry; a no-op, previously silent.
     EndOfQueue,
+    /// B226 — the request named the current entry (or sent none at all)
+    /// inside `NEXT_ITEM_DEBOUNCE_MS` of it becoming current; ignored.
+    Debounced,
 }
 
 impl NextItemOutcome {
@@ -955,6 +973,7 @@ impl NextItemOutcome {
             NextItemOutcome::Advanced => "advanced",
             NextItemOutcome::Stale => "stale",
             NextItemOutcome::EndOfQueue => "end_of_queue",
+            NextItemOutcome::Debounced => "debounced",
         }
     }
 }
@@ -1127,6 +1146,16 @@ struct GroupState {
     /// i.e. never debounces — which is the safe default (never block a
     /// legitimate `NextItem` after a restart/handoff).
     item_started_at: Option<tokio::time::Instant>,
+    /// B226 — when the current item became current VIA A `NextItem` ADVANCE
+    /// specifically, as opposed to any other queue change. Narrower than
+    /// `item_started_at` on purpose: the production race is two back-to-back
+    /// `/SyncPlay/NextItem` requests, so only a `NextItem` itself should ever
+    /// be eligible to debounce the NEXT `NextItem` — a `NextItem` arriving
+    /// just after `SetNewQueue`/`SeedQueue`/`SetPlaylistItem`/`PreviousItem`
+    /// is a normal first press and must not be suppressed. Cleared (`None`)
+    /// by every one of those other transitions. Not persisted, like
+    /// `item_started_at`.
+    next_item_advanced_at: Option<tokio::time::Instant>,
     playback: PlaybackState,
     queue: PlayQueue,
     /// B183 — whether the current queue has ever been BROADCAST, as opposed to
@@ -1176,6 +1205,7 @@ impl GroupState {
             freeze_superseded_at: None,
             buffering_resume_playing: false,
             item_started_at: None,
+            next_item_advanced_at: None,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             // A fresh group has no queue at all; the first real broadcast sets this.
@@ -1553,6 +1583,20 @@ impl GroupState {
     fn item_age_ms(&self) -> Option<u64> {
         self.item_started_at
             .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// B226 — true when the current item became current recently enough, AND
+    /// so little of it has played, that a `NextItem` naming it (or carrying no
+    /// `PlaylistItemId`) is almost certainly the jellyfin-web async race on
+    /// [`NEXT_ITEM_DEBOUNCE_MS`], not a deliberate second press.
+    /// `item_started_at` unknown (hydrated, or a group that never changed
+    /// item) never debounces — see the field's own doc comment.
+    fn next_item_recently_started(&self) -> bool {
+        let Some(advanced_at) = self.next_item_advanced_at else {
+            return false;
+        };
+        let age_ms = u64::try_from(advanced_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        age_ms < NEXT_ITEM_DEBOUNCE_MS && self.current_position_ms() < NEXT_ITEM_DEBOUNCE_MS
     }
 
     /// Re-send the CURRENT play queue to one member (catch-up). Deliberately
@@ -3580,6 +3624,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.queue.playing_index =
                 playing_index.min(state.queue.items.len().saturating_sub(1));
             state.item_started_at = Some(tokio::time::Instant::now());
+            state.next_item_advanced_at = None;
             state.broadcast_play_queue("new_playlist", true, start_position_ms);
             // Settle playback at the NEW item's start before the gate opens.
             // Without this, `state.playback` still holds the previous item's
@@ -3619,6 +3664,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }];
             state.queue.playing_index = 0;
             state.item_started_at = Some(tokio::time::Instant::now());
+            state.next_item_advanced_at = None;
             // Bump the change-timestamp so a fresh joiner's catch-up PlayQueue
             // looks newer than its (empty) client state and is applied.
             state.queue.updated_unix_ms = unix_now_ms().max(state.queue.updated_unix_ms + 1);
@@ -3660,6 +3706,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             {
                 state.queue.playing_index = idx;
                 state.item_started_at = Some(tokio::time::Instant::now());
+                state.next_item_advanced_at = None;
                 state.broadcast_play_queue("set_current_item", true, 0);
                 // Settle at the new item's start before the gate (see SetNewQueue).
                 state.playback = PlaybackState::Paused { position_ms: 0 };
@@ -3703,9 +3750,27 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             let previous_pli = state.current_playlist_item_id().unwrap_or("").to_string();
             let item_age_ms = state.item_age_ms();
             let position_ms = state.current_position_ms();
+            if state.next_item_recently_started() {
+                // B226 — the request names the entry the queue is ALREADY
+                // on (or carries no PlaylistItemId), but that entry only
+                // just became current: this is the jellyfin-web async race
+                // (NEXT_ITEM_DEBOUNCE_MS's doc comment), not a second press.
+                tracing::info!(
+                    group = %state.id,
+                    member = %sender,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    previous = %previous_pli,
+                    item_age_ms = ?item_age_ms,
+                    position_ms,
+                    "syncplay: NextItem debounced — current item just started (B226)"
+                );
+                record_next_item_outcome(NextItemOutcome::Debounced);
+                return;
+            }
             if state.queue.playing_index + 1 < state.queue.items.len() {
                 state.queue.playing_index += 1;
                 state.item_started_at = Some(tokio::time::Instant::now());
+                state.next_item_advanced_at = state.item_started_at;
                 tracing::info!(
                     group = %state.id, index = state.queue.playing_index,
                     member = %sender,
@@ -3755,6 +3820,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             if state.queue.playing_index > 0 {
                 state.queue.playing_index -= 1;
                 state.item_started_at = Some(tokio::time::Instant::now());
+                // Previous is the user's deliberate undo, never the B226
+                // race — clearing this means an immediately-following
+                // NextItem is never debounced by a Previous press.
+                state.next_item_advanced_at = None;
                 tracing::info!(
                     group = %state.id, index = state.queue.playing_index,
                     "syncplay: queue moved to previous item"
@@ -8599,7 +8668,14 @@ mod tests {
     /// B37 — real-Jellyfin NextItem dedupe: the request names the entry the
     /// client believes is playing; a mismatch (double-press, or two members
     /// racing Next) must NOT advance again and skip an episode.
-    #[tokio::test]
+    ///
+    /// The final "valid follow-up" is sent past B226's debounce window
+    /// (`NEXT_ITEM_DEBOUNCE_MS`): sent immediately, naming the entry the
+    /// queue JUST advanced to is indistinguishable from the double-advance
+    /// race B226 exists to catch (see `next_item_naming_the_just_advanced_
+    /// entry_is_debounced`) — this test is about the STALE-id case alone,
+    /// so it steps past that window rather than asserting the ambiguous case.
+    #[tokio::test(start_paused = true)]
     async fn next_item_for_stale_entry_is_ignored() {
         let (h, _sinks, mut leader_rx, leader) = fresh().await;
         let plis = seed_queue(&h, leader, &mut leader_rx).await;
@@ -8632,7 +8708,10 @@ mod tests {
                 "stale NextItem must not advance the queue again (B37)"
             );
         }
-        // A VALID follow-up (naming the now-current entry) advances normally.
+        // A VALID follow-up (naming the now-current entry), well past B226's
+        // debounce window, advances normally.
+        tokio::time::advance(Duration::from_millis(NEXT_ITEM_DEBOUNCE_MS + 1_000)).await;
+        tokio::task::yield_now().await;
         h.tx.send(GroupMsg::NextItem {
             sender: leader,
             playlist_item_id: Some(plis[1].clone()),
@@ -8656,14 +8735,16 @@ mod tests {
     /// anything.
     #[test]
     fn next_item_outcome_labels_are_distinct() {
-        const ALL: [NextItemOutcome; 3] = [
+        const ALL: [NextItemOutcome; 4] = [
             NextItemOutcome::Advanced,
             NextItemOutcome::Stale,
             NextItemOutcome::EndOfQueue,
+            NextItemOutcome::Debounced,
         ];
         assert_eq!(NextItemOutcome::Advanced.label(), "advanced");
         assert_eq!(NextItemOutcome::Stale.label(), "stale");
         assert_eq!(NextItemOutcome::EndOfQueue.label(), "end_of_queue");
+        assert_eq!(NextItemOutcome::Debounced.label(), "debounced");
         let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
         assert_eq!(
             labels.len(),
@@ -8677,7 +8758,14 @@ mod tests {
     /// genuine advance, and a request at the end of the queue (previously a
     /// silent no-op, indistinguishable from the message never reaching the
     /// actor) must each leave a distinct, countable trace.
-    #[tokio::test]
+    ///
+    /// Each genuine advance below is separated by B226's debounce window
+    /// (`NEXT_ITEM_DEBOUNCE_MS`) — sent back-to-back, a second advance naming
+    /// the entry the queue just moved to is exactly the race B226 debounces
+    /// (see `next_item_naming_the_just_advanced_entry_is_debounced`), so this
+    /// test steps the clock past it to isolate the three outcomes it is
+    /// actually about.
+    #[tokio::test(start_paused = true)]
     async fn next_item_outcomes_are_counted() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
@@ -8705,6 +8793,8 @@ mod tests {
         .await
         .unwrap();
         let _ = snapshot_of(&h).await;
+        tokio::time::advance(Duration::from_millis(NEXT_ITEM_DEBOUNCE_MS + 1_000)).await;
+        tokio::task::yield_now().await;
         h.tx.send(GroupMsg::NextItem {
             sender: leader,
             playlist_item_id: Some(plis[1].clone()),
@@ -8714,6 +8804,8 @@ mod tests {
         let _ = snapshot_of(&h).await;
 
         // End of queue: already on the last entry (plis[2]).
+        tokio::time::advance(Duration::from_millis(NEXT_ITEM_DEBOUNCE_MS + 1_000)).await;
+        tokio::task::yield_now().await;
         h.tx.send(GroupMsg::NextItem {
             sender: leader,
             playlist_item_id: Some(plis[2].clone()),
@@ -8761,6 +8853,171 @@ mod tests {
             1,
             "a NextItem at the end of the queue must be counted, not silently dropped"
         );
+    }
+
+    /// B226 — the jellyfin-web async race: a SECOND `NextItem` that names the
+    /// entry the queue JUST advanced to (because the caller's PlayQueue had
+    /// already landed by the time it read `getCurrentPlaylistItemId()`) must
+    /// not advance again. B37's `pli_is_stale` alone lets this through — sent
+    /// equals current — so this is a distinct guard, not a duplicate test.
+    #[tokio::test]
+    async fn next_item_naming_the_just_advanced_entry_is_debounced() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("first NextItem must broadcast the queue change");
+        };
+        assert_eq!(playing_index, 1);
+
+        // The race: a second request arrives naming entry 1 — the one the
+        // queue is ALREADY on — well inside the debounce window.
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "a debounced NextItem must not advance the queue again (B226)"
+            );
+        }
+        assert_eq!(
+            snap.current_item_id.as_deref(),
+            Some("11"),
+            "the queue must still be on entry 1 (item_id \"11\"), not entry 2"
+        );
+
+        let debounced = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_syncplay_next_item_total" {
+                    return None;
+                }
+                if !k
+                    .labels()
+                    .any(|l| l.key() == "outcome" && l.value() == "debounced")
+                {
+                    return None;
+                }
+                match v {
+                    DebugValue::Counter(n) => Some(n),
+                    _ => None,
+                }
+            });
+        assert_eq!(
+            debounced,
+            Some(1),
+            "the debounced request must be counted, not merely dropped"
+        );
+    }
+
+    /// B226 — the same race with NO `PlaylistItemId` at all (a legacy /
+    /// ws-native caller, or a client that sends an empty body). `pli_is_stale`
+    /// never treats `None` as stale, so without the debounce this also
+    /// double-advances.
+    #[tokio::test]
+    async fn next_item_with_no_pli_is_debounced_when_item_just_started() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("first NextItem must broadcast the queue change");
+        };
+        assert_eq!(playing_index, 1);
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "a debounced None-PLI NextItem must not advance the queue (B226)"
+            );
+        }
+        assert_eq!(snap.current_item_id.as_deref(), Some("11"));
+    }
+
+    /// B226 — once the debounce window has passed (or the item has actually
+    /// played), a second `NextItem` naming the current entry is a genuine
+    /// advance, not a race, and must go through.
+    #[tokio::test(start_paused = true)]
+    async fn next_item_advances_once_debounce_window_has_elapsed() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("first NextItem must broadcast the queue change");
+        };
+        assert_eq!(playing_index, 1);
+
+        tokio::time::advance(Duration::from_millis(NEXT_ITEM_DEBOUNCE_MS + 1_000)).await;
+        tokio::task::yield_now().await;
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue { playing_index, .. }) =
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+        else {
+            panic!("a NextItem past the debounce window must advance (B226 must not over-fire)");
+        };
+        assert_eq!(playing_index, 2);
     }
 
     /// B37 — the `MemberLeft` broadcast must carry the member's display name:
