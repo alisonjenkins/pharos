@@ -931,6 +931,42 @@ fn record_gate_outcome(reason: GateReason, opened_at: tokio::time::Instant, outc
     .record(waited.as_secs_f64());
 }
 
+/// How a `NextItem` request was resolved. Every request ends in exactly one
+/// of these — if they ever fail to sum to the request count, a path is
+/// returning without recording an outcome. Instrumented BEFORE the B226 fix
+/// lands (ODD): B37's existing `pli_is_stale` dedupe only catches a request
+/// naming a DIFFERENT entry than current, so production shows ~4 of 16
+/// auto-advance transitions as two back-to-back `advanced` with no
+/// `end_of_queue`/`stale` between them — the double-advance this counter
+/// exists to make visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NextItemOutcome {
+    /// `playing_index` moved to the next entry. The common case.
+    Advanced,
+    /// B37 — the request named an entry other than current; ignored.
+    Stale,
+    /// Already on the last queue entry; a no-op, previously silent.
+    EndOfQueue,
+}
+
+impl NextItemOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            NextItemOutcome::Advanced => "advanced",
+            NextItemOutcome::Stale => "stale",
+            NextItemOutcome::EndOfQueue => "end_of_queue",
+        }
+    }
+}
+
+fn record_next_item_outcome(outcome: NextItemOutcome) {
+    metrics::counter!(
+        "pharos_syncplay_next_item_total",
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+}
+
 /// The playback state a member was hydrated with when it joined, reconnected,
 /// or acked late. Bounded label set — asserted distinct in
 /// `hydrate_states_have_distinct_labels`.
@@ -1082,6 +1118,15 @@ struct GroupState {
     /// paused, played the group out from under the pause. Persisted so a
     /// mid-freeze replica takeover resumes to the right state.
     buffering_resume_playing: bool,
+    /// When the CURRENT queue entry (`queue.playing_index`) became current —
+    /// set wherever `playing_index` changes (`SetNewQueue`, `SeedQueue`,
+    /// `SetPlaylistItem`, `NextItem`, `PreviousItem`). Monotonic and NOT
+    /// persisted, like `buffering_since`/`freeze_superseded_at` above: it
+    /// bounds a race measured in seconds (B226's `NEXT_ITEM_DEBOUNCE_MS`), and
+    /// a replica takeover that forgets it simply treats the item as "old" —
+    /// i.e. never debounces — which is the safe default (never block a
+    /// legitimate `NextItem` after a restart/handoff).
+    item_started_at: Option<tokio::time::Instant>,
     playback: PlaybackState,
     queue: PlayQueue,
     /// B183 — whether the current queue has ever been BROADCAST, as opposed to
@@ -1130,6 +1175,7 @@ impl GroupState {
             buffering_since: None,
             freeze_superseded_at: None,
             buffering_resume_playing: false,
+            item_started_at: None,
             playback: PlaybackState::Idle,
             queue: PlayQueue::default(),
             // A fresh group has no queue at all; the first real broadcast sets this.
@@ -1499,6 +1545,14 @@ impl GroupState {
             (Some(sent), Some(current)) => sent != current,
             _ => false,
         }
+    }
+
+    /// How long the current queue entry has been current, in milliseconds.
+    /// `None` when unknown — a group hydrated from a snapshot (B226: never
+    /// persisted) or one that has never changed item.
+    fn item_age_ms(&self) -> Option<u64> {
+        self.item_started_at
+            .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Re-send the CURRENT play queue to one member (catch-up). Deliberately
@@ -3525,6 +3579,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 .collect();
             state.queue.playing_index =
                 playing_index.min(state.queue.items.len().saturating_sub(1));
+            state.item_started_at = Some(tokio::time::Instant::now());
             state.broadcast_play_queue("new_playlist", true, start_position_ms);
             // Settle playback at the NEW item's start before the gate opens.
             // Without this, `state.playback` still holds the previous item's
@@ -3563,6 +3618,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 runtime_ms,
             }];
             state.queue.playing_index = 0;
+            state.item_started_at = Some(tokio::time::Instant::now());
             // Bump the change-timestamp so a fresh joiner's catch-up PlayQueue
             // looks newer than its (empty) client state and is applied.
             state.queue.updated_unix_ms = unix_now_ms().max(state.queue.updated_unix_ms + 1);
@@ -3603,6 +3659,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 .position(|e| e.playlist_item_id == playlist_item_id)
             {
                 state.queue.playing_index = idx;
+                state.item_started_at = Some(tokio::time::Instant::now());
                 state.broadcast_play_queue("set_current_item", true, 0);
                 // Settle at the new item's start before the gate (see SetNewQueue).
                 state.playback = PlaybackState::Paused { position_ms: 0 };
@@ -3640,14 +3697,25 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     current = state.current_playlist_item_id().unwrap_or(""),
                     "syncplay: NextItem for stale entry ignored (double-press/race)"
                 );
+                record_next_item_outcome(NextItemOutcome::Stale);
                 return;
             }
+            let previous_pli = state.current_playlist_item_id().unwrap_or("").to_string();
+            let item_age_ms = state.item_age_ms();
+            let position_ms = state.current_position_ms();
             if state.queue.playing_index + 1 < state.queue.items.len() {
                 state.queue.playing_index += 1;
+                state.item_started_at = Some(tokio::time::Instant::now());
                 tracing::info!(
                     group = %state.id, index = state.queue.playing_index,
+                    member = %sender,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    previous = %previous_pli,
+                    item_age_ms = ?item_age_ms,
+                    position_ms,
                     "syncplay: queue advanced to next item"
                 );
+                record_next_item_outcome(NextItemOutcome::Advanced);
                 state.broadcast_play_queue("next_item", true, 0);
                 // Settle at the new item's start before the gate (see SetNewQueue).
                 // This is the dominant binge/auto-advance path — without it every
@@ -3656,6 +3724,21 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.playback = PlaybackState::Paused { position_ms: 0 };
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, true, 0, GateReason::NextItem, 0);
+            } else {
+                // Previously a silent no-op: a NextItem that arrives when the
+                // group is already on the last queue entry left no trace at
+                // all, indistinguishable from the request never reaching the
+                // actor. Symmetric with the advanced branch above.
+                tracing::info!(
+                    group = %state.id,
+                    member = %sender,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    previous = %previous_pli,
+                    item_age_ms = ?item_age_ms,
+                    position_ms,
+                    "syncplay: NextItem at end of queue — no-op"
+                );
+                record_next_item_outcome(NextItemOutcome::EndOfQueue);
             }
         }
         GroupMsg::PreviousItem {
@@ -3671,6 +3754,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             if state.queue.playing_index > 0 {
                 state.queue.playing_index -= 1;
+                state.item_started_at = Some(tokio::time::Instant::now());
                 tracing::info!(
                     group = %state.id, index = state.queue.playing_index,
                     "syncplay: queue moved to previous item"
@@ -8564,6 +8648,119 @@ mod tests {
             panic!("valid NextItem must broadcast");
         };
         assert_eq!(playing_index, 2);
+    }
+
+    /// B226 (ODD) — every `NextItem` outcome's label is distinct and stable.
+    /// `EndOfQueue` was a silent no-op before this: unlisted here, it would
+    /// never have been visible that the branch returns without counting
+    /// anything.
+    #[test]
+    fn next_item_outcome_labels_are_distinct() {
+        const ALL: [NextItemOutcome; 3] = [
+            NextItemOutcome::Advanced,
+            NextItemOutcome::Stale,
+            NextItemOutcome::EndOfQueue,
+        ];
+        assert_eq!(NextItemOutcome::Advanced.label(), "advanced");
+        assert_eq!(NextItemOutcome::Stale.label(), "stale");
+        assert_eq!(NextItemOutcome::EndOfQueue.label(), "end_of_queue");
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "next_item outcome labels collide: {labels:?}"
+        );
+    }
+
+    /// B226 (ODD) — every `NextItem` outcome increments
+    /// `pharos_syncplay_next_item_total{outcome}`: a stale double-press, a
+    /// genuine advance, and a request at the end of the queue (previously a
+    /// silent no-op, indistinguishable from the message never reaching the
+    /// actor) must each leave a distinct, countable trace.
+    #[tokio::test]
+    async fn next_item_outcomes_are_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+
+        // Stale: current is plis[0], request names plis[1].
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // Advanced twice: plis[0] -> index 1, then plis[1] -> index 2.
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        // End of queue: already on the last entry (plis[2]).
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: Some(plis[2].clone()),
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+
+        let counted = |outcome: &str| -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| {
+                    let k = ck.key();
+                    if k.name() != "pharos_syncplay_next_item_total" {
+                        return None;
+                    }
+                    if !k
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == outcome)
+                    {
+                        return None;
+                    }
+                    match v {
+                        DebugValue::Counter(n) => Some(n),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(0)
+        };
+
+        assert_eq!(
+            counted("stale"),
+            1,
+            "the mismatched request must count as stale"
+        );
+        assert_eq!(
+            counted("advanced"),
+            2,
+            "both genuine advances must be counted"
+        );
+        assert_eq!(
+            counted("end_of_queue"),
+            1,
+            "a NextItem at the end of the queue must be counted, not silently dropped"
+        );
     }
 
     /// B37 — the `MemberLeft` broadcast must carry the member's display name:
