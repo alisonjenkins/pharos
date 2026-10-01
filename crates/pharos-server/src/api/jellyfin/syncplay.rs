@@ -450,17 +450,30 @@ fn record_seed_multiple_candidates() {
     metrics::counter!("pharos_session_seed_multiple_candidates_total").increment(1);
 }
 
+/// B227 defence in depth: even if eviction (V169) somehow left more than one
+/// session record for the same (user, device) — e.g. ghosts already in the
+/// registry from before that fix was deployed — seed from whichever record
+/// was active most recently rather than whichever `snapshot()` happened to
+/// list first (it sorts by session id, a random UUID, which carries no
+/// relation to recency).
+fn pick_most_recent(
+    candidates: Vec<crate::sessions::SessionRecord>,
+) -> Option<crate::sessions::SessionRecord> {
+    candidates.into_iter().max_by_key(|s| s.activity_at)
+}
+
 /// Pure decision core of [`creator_now_playing`] — takes the already-filtered
 /// (user, device) matches and picks the seed, recording the B227
 /// diagnostics. Split out so it is testable without the registry actor: a
 /// test can hand it hand-built `SessionRecord`s to exercise the
-/// multiple-candidates path directly.
+/// multiple-candidates / most-recent-wins paths without needing the actor
+/// (and its own eviction, V169) to produce that state first.
 fn resolve_seed(matches: Vec<crate::sessions::SessionRecord>) -> Option<SeedCandidate> {
     let candidates = matches.len();
     if candidates > 1 {
         record_seed_multiple_candidates();
     }
-    let chosen = matches.into_iter().next()?;
+    let chosen = pick_most_recent(matches)?;
     let item_id = chosen.now_playing_item_id.clone()?;
     let since_activity_ms = chosen.activity_age_ms();
     Some(SeedCandidate {
@@ -1263,10 +1276,11 @@ mod tests {
     /// B227 signal: more than one session record matching (user, device)
     /// must show up as `candidates > 1` and increment
     /// `pharos_session_seed_multiple_candidates_total` — the query that
-    /// proves the stale-seed bug is happening in production TODAY, before
-    /// any eviction fix lands. Without a tie-break, the pick is whichever
-    /// the caller handed first — demonstrating that an unordered ghost can
-    /// beat the live session exactly as alison's did in production.
+    /// proves the stale-seed bug is happening. Exercised via `resolve_seed`
+    /// directly (not the registry) since V169's eviction means two live
+    /// Started events for the same (user, device) can no longer produce this
+    /// state through the public API — the residual case is a ghost already
+    /// in the registry from before that fix was deployed.
     #[actix_web::test]
     async fn seed_with_a_ghost_session_counts_multiple_candidates() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -1280,8 +1294,8 @@ mod tests {
         let seed = resolve_seed(vec![ghost, live]).unwrap();
         assert_eq!(seed.candidates, 2, "ghost + live session both matched");
         assert_eq!(
-            seed.item_id, "stale-item",
-            "no tie-break yet — the ghost listed first wins, which is the bug"
+            seed.item_id, "fresh-item",
+            "the most recently active record wins"
         );
 
         let count = snapshotter
@@ -1296,6 +1310,78 @@ mod tests {
             matches!(count, DebugValue::Counter(1)),
             "exactly one multiple-candidate seed happened — got {count:?}"
         );
+    }
+
+    /// B227 defence in depth: `pick_most_recent` must pick the live record
+    /// regardless of input order — `snapshot()` sorts by session id (a
+    /// random UUID), which carries no relation to recency.
+    #[actix_web::test]
+    async fn pick_most_recent_ignores_input_order() {
+        let ghost = make_record("ghost-sess", "stale-item", 600);
+        let live = make_record("live-sess", "fresh-item", 0);
+        assert_eq!(
+            pick_most_recent(vec![ghost.clone(), live.clone()])
+                .unwrap()
+                .id,
+            "live-sess"
+        );
+        assert_eq!(pick_most_recent(vec![live, ghost]).unwrap().id, "live-sess");
+    }
+
+    /// B227/V169 — a ghost-producing sequence (Started A, no Stopped,
+    /// Started B, Progress B) must seed from B: eviction removes A the
+    /// moment B's Started lands, so `creator_now_playing` never even sees
+    /// two candidates.
+    #[actix_web::test]
+    async fn seed_after_a_ghost_producing_sequence_returns_the_live_item() {
+        let (state, _token) = seed_auth().await;
+        let user = UserId::new();
+        let dev = "laptop";
+        state
+            .sessions
+            .apply(SessionEvent::Started {
+                session_id: "a".into(),
+                user_id: user,
+                user_name: "u".into(),
+                device_id: dev.into(),
+                device_name: "d".into(),
+                client: "c".into(),
+                version: "1".into(),
+                item_id: "item-x".into(),
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+        // No Stopped for "a" — exactly the ghost condition B227 fixes.
+        state
+            .sessions
+            .apply(SessionEvent::Started {
+                session_id: "b".into(),
+                user_id: user,
+                user_name: "u".into(),
+                device_id: dev.into(),
+                device_name: "d".into(),
+                client: "c".into(),
+                version: "1".into(),
+                item_id: "item-y".into(),
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+        state
+            .sessions
+            .apply(SessionEvent::Progress {
+                session_id: "b".into(),
+                item_id: "item-y".into(),
+                position_ticks: 1_000_000,
+                is_paused: false,
+            })
+            .await
+            .unwrap();
+
+        let seed = creator_now_playing(&state, &user, dev).await.unwrap();
+        assert_eq!(seed.item_id, "item-y");
+        assert_eq!(seed.candidates, 1, "eviction must have removed the ghost");
     }
 
     #[actix_web::test]

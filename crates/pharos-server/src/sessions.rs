@@ -149,6 +149,45 @@ impl SessionRegistry {
                                 s.supports_media_control,
                             )
                         });
+                        // V169/B227 — a device plays one thing at a time. A
+                        // Started for (user, device) supersedes any OTHER
+                        // record already tracked for that same pair: without
+                        // this, a playback that never reports Stopped (a
+                        // SyncPlay item swap destroying the player, a reload,
+                        // a crash) leaves a ghost that outlives the real
+                        // session forever, and `creator_now_playing` (B227)
+                        // could resolve it instead of the live one. Matching
+                        // on (user_id, device_id) — never device alone — is
+                        // load-bearing: B53 same-UA browsers share a device
+                        // id across different users. A capabilities-only stub
+                        // (empty user_id/device_id, `SetCapabilities` pre
+                        // creating it under the incoming session id) never
+                        // matches this filter, so caps inheritance above is
+                        // unaffected, and `id == &session_id` keeps a refresh
+                        // of the SAME session out of its own eviction list.
+                        let uid = user_id.0.simple().to_string();
+                        let mut superseded: Vec<(String, Option<String>)> = Vec::new();
+                        state.retain(|id, s| {
+                            if id == &session_id || s.user_id != uid || s.device_id != device_id {
+                                return true;
+                            }
+                            superseded.push((s.id.clone(), s.now_playing_item_id.clone()));
+                            false
+                        });
+                        if !superseded.is_empty() {
+                            for (old_session_id, old_item_id) in &superseded {
+                                tracing::info!(
+                                    old_session_id = %old_session_id,
+                                    old_item_id = old_item_id.as_deref().unwrap_or(""),
+                                    new_session_id = %session_id,
+                                    user_id = %uid,
+                                    device_id = %device_id,
+                                    "session: superseded by new playback on the same device"
+                                );
+                            }
+                            metrics::counter!("pharos_session_superseded_total")
+                                .increment(superseded.len() as u64);
+                        }
                         state.insert(
                             session_id.clone(),
                             SessionRecord {
@@ -329,5 +368,64 @@ mod tests {
         .unwrap();
         let snap = r.snapshot().await.unwrap();
         assert!(snap.is_empty());
+    }
+
+    fn started_as(session_id: &str, user_id: UserId, device_id: &str, item: &str) -> SessionEvent {
+        SessionEvent::Started {
+            session_id: session_id.into(),
+            user_id,
+            user_name: "u".into(),
+            device_id: device_id.into(),
+            device_name: "dn".into(),
+            client: "c".into(),
+            version: "0".into(),
+            item_id: item.into(),
+            position_ticks: 0,
+        }
+    }
+
+    /// B227/V169 — a device plays one thing at a time: a new Started for a
+    /// (user, device) already tracked must evict the OLD record, leaving
+    /// only the new one. Without this a playback that never reports Stopped
+    /// (a SyncPlay item swap, a reload, a crash) sits forever and can be
+    /// resolved by `creator_now_playing` instead of the live session.
+    #[tokio::test]
+    async fn started_evicts_other_sessions_on_same_user_and_device() {
+        let r = SessionRegistry::spawn();
+        let user = UserId::new();
+        r.apply(started_as("ghost", user, "dev", "stale-item"))
+            .await
+            .unwrap();
+        r.apply(started_as("live", user, "dev", "fresh-item"))
+            .await
+            .unwrap();
+        let snap = r.snapshot().await.unwrap();
+        assert_eq!(snap.len(), 1, "only the new session must remain: {snap:?}");
+        assert_eq!(snap[0].id, "live");
+        assert_eq!(snap[0].now_playing_item_id.as_deref(), Some("fresh-item"));
+    }
+
+    /// B53 — jellyfin-web derives an identical device id across same-UA
+    /// installs, so two different users can share one device id. Eviction
+    /// must key on (user, device), never device alone, or a second person's
+    /// Started would wipe the first person's still-live session.
+    #[tokio::test]
+    async fn started_does_not_evict_a_different_user_on_the_same_device() {
+        let r = SessionRegistry::spawn();
+        let alison = UserId::new();
+        let lace = UserId::new();
+        r.apply(started_as("alison-sess", alison, "shared-dev", "a-item"))
+            .await
+            .unwrap();
+        r.apply(started_as("lace-sess", lace, "shared-dev", "l-item"))
+            .await
+            .unwrap();
+        let mut snap = r.snapshot().await.unwrap();
+        snap.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            snap.len(),
+            2,
+            "different users must not evict each other: {snap:?}"
+        );
     }
 }
