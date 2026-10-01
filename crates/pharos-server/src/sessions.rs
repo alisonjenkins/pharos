@@ -4,7 +4,20 @@
 use pharos_core::UserId;
 use pharos_jellyfin_api::dto::format_iso8601;
 use serde::Serialize;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Mirrors Jellyfin's `SessionManager.CheckForIdlePlayback`
+/// (`Emby.Server.Implementations/Session/SessionManager.cs`): a session
+/// with a `NowPlayingItem` whose last playback check-in is older than this
+/// is treated as stopped (B227/V170). A capabilities-only stub (no
+/// `now_playing_item_id`) is exempt — see [`sweep_idle_sessions`].
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Cadence of the idle sweep. Matching `SESSION_IDLE_TTL` mirrors upstream's
+/// own 5-minute timer and keeps a session from going more than one interval
+/// past the TTL before it is caught.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Current time as ISO8601 UTC. Stamped on every session event so the
 /// serialized `LastActivityDate` / `LastPlaybackCheckIn` are always valid
@@ -114,6 +127,49 @@ pub enum SessionError {
     ReplyDropped,
 }
 
+/// Evict every session record whose `NowPlayingItem` has had no playback
+/// check-in within [`SESSION_IDLE_TTL`] (B227/V170, parity with Jellyfin's
+/// `CheckForIdlePlayback`). A capabilities-only stub (`now_playing_item_id`
+/// is `None`) is left alone: it carries no playback to go idle, and
+/// destroying it would only cost the NEXT `Started` on that session id its
+/// P28 caps inheritance for no parity benefit — real Jellyfin's idle check
+/// is scoped to sessions with a `NowPlayingItem` too.
+///
+/// Gap: real Jellyfin's `OnPlaybackStopped` also persists final `UserData`
+/// (resume position / played state) for the session it idles out.
+/// `SessionRegistry` has no store handle — it is spawned standalone in
+/// `AppState::new`/`load` before `Stores` is threaded through — and wiring
+/// one in is a bigger change than this fix. An idle-evicted session here
+/// just disappears from `/Sessions`; its last reported position was already
+/// persisted by the client's own `/Sessions/Playing/Progress` calls, so the
+/// only loss is a final position between the last progress report and the
+/// idle cutoff.
+fn sweep_idle_sessions(state: &mut std::collections::HashMap<String, SessionRecord>) {
+    let mut evicted: Vec<SessionRecord> = Vec::new();
+    state.retain(|_, s| {
+        if s.now_playing_item_id.is_some() && s.activity_at.elapsed() >= SESSION_IDLE_TTL {
+            evicted.push(s.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for s in &evicted {
+        tracing::info!(
+            session_id = %s.id,
+            user_id = %s.user_id,
+            device_id = %s.device_id,
+            item_id = s.now_playing_item_id.as_deref().unwrap_or(""),
+            idle_ms = s.activity_age_ms(),
+            position_ticks = s.position_ticks,
+            "session: idle-evicted (no playback check-in within SESSION_IDLE_TTL)"
+        );
+    }
+    if !evicted.is_empty() {
+        metrics::counter!("pharos_session_idle_evicted_total").increment(evicted.len() as u64);
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionRegistry {
     tx: mpsc::Sender<Msg>,
@@ -125,7 +181,22 @@ impl SessionRegistry {
         tokio::spawn(async move {
             let mut state: std::collections::HashMap<String, SessionRecord> =
                 std::collections::HashMap::new();
-            while let Some(msg) = rx.recv().await {
+            let mut sweep = tokio::time::interval(SESSION_SWEEP_INTERVAL);
+            // `interval` fires its first tick immediately; consume it here
+            // so the loop below only sweeps on the real cadence.
+            sweep.tick().await;
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    _ = sweep.tick() => {
+                        sweep_idle_sessions(&mut state);
+                        continue;
+                    }
+                    msg = rx.recv() => msg,
+                };
+                let Some(msg) = msg else {
+                    break;
+                };
                 match msg {
                     Msg::Apply(SessionEvent::Started {
                         session_id,
@@ -426,6 +497,87 @@ mod tests {
             snap.len(),
             2,
             "different users must not evict each other: {snap:?}"
+        );
+    }
+
+    /// B227/V170 idle TTL, mirroring Jellyfin's `CheckForIdlePlayback`: a
+    /// session with no playback check-in for longer than `SESSION_IDLE_TTL`
+    /// must be evicted by the periodic sweep.
+    #[tokio::test(start_paused = true)]
+    async fn idle_session_is_evicted_after_the_ttl() {
+        let r = SessionRegistry::spawn();
+        r.apply(started("s1", "100", 0)).await.unwrap();
+        // The actor's sweep interval is constructed lazily on its first
+        // poll. Yielding here lets that happen BEFORE the clock jumps, so
+        // the interval's deadline is computed from the real baseline, not
+        // from a clock that has already advanced past it.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(SESSION_IDLE_TTL + SESSION_SWEEP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        let snap = r.snapshot().await.unwrap();
+        assert!(snap.is_empty(), "an idle session must be swept: {snap:?}");
+    }
+
+    /// A Progress report resets the idle clock: a session that keeps
+    /// checking in must survive past where the ORIGINAL TTL window (counted
+    /// from Started) would have fired.
+    #[tokio::test(start_paused = true)]
+    async fn progress_within_the_ttl_keeps_the_session_alive() {
+        let r = SessionRegistry::spawn();
+        r.apply(started("s1", "100", 0)).await.unwrap();
+        // See idle_session_is_evicted_after_the_ttl: let the actor's sweep
+        // interval register its real baseline deadline before any advance.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(SESSION_IDLE_TTL / 2).await;
+        r.apply(SessionEvent::Progress {
+            session_id: "s1".into(),
+            item_id: "100".into(),
+            position_ticks: 1,
+            is_paused: false,
+        })
+        .await
+        .unwrap();
+        // Total elapsed since Started now exceeds SESSION_IDLE_TTL, but only
+        // SESSION_IDLE_TTL / 2 + 30s has passed since the Progress above.
+        tokio::time::advance(SESSION_IDLE_TTL / 2 + Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        let snap = r.snapshot().await.unwrap();
+        assert_eq!(
+            snap.len(),
+            1,
+            "a session with recent activity must survive: {snap:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_eviction_increments_the_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let r = SessionRegistry::spawn();
+        r.apply(started("s1", "100", 0)).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(SESSION_IDLE_TTL + SESSION_SWEEP_INTERVAL).await;
+        tokio::task::yield_now().await;
+        let _ = r.snapshot().await.unwrap();
+
+        let count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                (ck.key().name() == "pharos_session_idle_evicted_total").then_some(v)
+            })
+            .unwrap();
+        assert!(
+            matches!(count, DebugValue::Counter(1)),
+            "exactly one idle eviction happened — got {count:?}"
         );
     }
 }
