@@ -26,7 +26,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
-crypto-common = { version = "0.1", default-features = false, features = ["std"] }
+crypto-common = { version = "0.2", default-features = false, features = ["std"] }
 derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
@@ -92,7 +92,7 @@ base64 = { version = "0.22" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
-crypto-common = { version = "0.1", default-features = false, features = ["std"] }
+crypto-common = { version = "0.2", default-features = false, features = ["std"] }
 derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
