@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1](https://github.com/alisonjenkins/pharos/compare/v0.2.0...v0.2.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **ci:** ignore the dev-shell banner when reading image digests ([23791ae](https://github.com/alisonjenkins/pharos/commit/23791aec980dc8536ace92a50f62b2ca07e71500))
+* **sessions:** evict a session whose playback check-in has gone idle (V170) ([6f55387](https://github.com/alisonjenkins/pharos/commit/6f55387cabc8f090dad2ac0b42473263b5cdcce2))
+* **sessions:** evict superseded sessions on the same device (B227) ([0b2c8bf](https://github.com/alisonjenkins/pharos/commit/0b2c8bf9e34a4b93a26d7bb2e527f1dd04cd024e))
+* **syncplay:** debounce a NextItem that lands right after another (B226) ([53a1125](https://github.com/alisonjenkins/pharos/commit/53a1125c1df9e4f0bf68574bf088019061efcad2))
+
 ## [0.2.0](https://github.com/alisonjenkins/pharos/compare/v0.1.0...v0.2.0) (2026-09-27)
 
 
