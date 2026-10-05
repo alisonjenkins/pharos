@@ -26,7 +26,11 @@ export default defineConfig({
   // serves a same-origin proxy the specs' login flow requires). This default
   // crawl config uses a different webServer, so it must not glob them in — under
   // it their connectAndLogin never reaches #/login and they time out.
-  testIgnore: ["**/syncplay-group-matrix.spec.ts", "**/syncplay-h264-codec.spec.ts"],
+  testIgnore: [
+    "**/syncplay-group-matrix.spec.ts",
+    "**/syncplay-h264-codec.spec.ts",
+    "**/syncplay-h264-nextitem.spec.ts",
+  ],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

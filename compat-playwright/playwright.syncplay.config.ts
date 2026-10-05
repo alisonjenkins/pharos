@@ -48,7 +48,7 @@ export default defineConfig({
     },
     {
       name: "h264",
-      testMatch: /syncplay-h264-codec\.spec\.ts/,
+      testMatch: /syncplay-h264-(codec|nextitem)\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         launchOptions: {
