@@ -1,6 +1,6 @@
 # 008-remote-sources — play a URL as if it were a library file
 
-**Status**: designed 2026-08-01
+**Status**: designed 2026-08-01; implemented and merged 2026-08-01; no live verification against a real site is recorded
 **Depends on**: 007 (`pharos_cache::generation()` and the client-visible `g=`,
 whose limits this spec has to work around), the HLS transcode path generally.
 **New ids**: V132–, B179–.

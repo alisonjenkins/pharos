@@ -3,7 +3,7 @@
 **Feature directory**: `specs/004-books/`
 **Created**: 2026-07-29
 **Last revised**: 2026-07-29 (post-`/speckit-analyze` refinement — see §Revision log)
-**Status**: planned (Phase 1 design complete; tasks.md needs the amendments in §Revision log)
+**Status**: implemented 2026-07-30 (all 84 tasks closed; verified by query against the live server, T084)
 
 ## Goal
 

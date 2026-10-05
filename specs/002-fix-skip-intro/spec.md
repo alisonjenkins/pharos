@@ -2,7 +2,7 @@
 
 **Feature Branch**: `002-fix-skip-intro`
 **Created**: 2026-07-27
-**Status**: Draft
+**Status**: implemented (shipped as PR #122; verified in production, tasks T024/T025)
 **Input**: "The skip intro button does not appear in the UI. Skip outro does appear to work in the Google TV app."
 
 ## Problem

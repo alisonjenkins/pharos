@@ -2,7 +2,7 @@
 
 **Feature Branch**: `003-cmaf-hw-affinity`
 **Created**: 2026-07-27
-**Status**: Draft
+**Status**: implemented 2026-07-28; all 26 tasks closed 2026-07-29
 **Input**: Group watch of *Hoppers* (3 members) buffered repeatedly and wedged the
 SyncPlay group, while the GPU sat idle. Measured: 420 of 423 transcode jobs ran on
 CPU at 1.81× realtime; NVENC ran 3, at 1.9× the speed, with `capacity 8`,
