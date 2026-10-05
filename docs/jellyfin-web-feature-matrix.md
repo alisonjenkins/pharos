@@ -21,7 +21,9 @@ it calls → pharos status → the test that guards it.
 
 Companion docs (do not duplicate): `docs/jellyfin-parity-audit.md` (endpoint
 audit), `docs/jellyfin-mapping.md` (concept mapping),
-`docs/dioxus-parity-audit.md` (pharos's own UI parity — orthogonal).
+`docs/dioxus-parity-audit.md` (pharos's own UI parity — orthogonal),
+`docs/jellyfin-vr.md` (the one client-side addition pharos ships in the
+bundle, credited to its upstream author).
 
 Backlog task ids referenced below: **T66** (this scaffold), **T67**
 (metadata richness), **T68** (user policy), **T69** (library options), **T70**

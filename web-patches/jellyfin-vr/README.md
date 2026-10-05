@@ -1,8 +1,10 @@
 # jellyfin-vr
 
 Vendored, unmodified copy of the VR player extension for jellyfin-web.
+Written by [yyewolf](https://github.com/yyewolf); all credit for the player
+belongs to them. Usage and limits: [`docs/jellyfin-vr.md`](../../docs/jellyfin-vr.md).
 
-- Upstream: <https://github.com/yyewolf/jellyfinvr> (GPL-3.0; unofficial, unaffiliated with Jellyfin)
+- Upstream: <https://github.com/yyewolf/jellyfinvr> by yyewolf (GPL-3.0; unofficial, unaffiliated with Jellyfin)
 - Licence: GPL-3.0, text in `LICENSE` (compatible with pharos's AGPL-3.0-or-later).
   The text is the canonical one from gnu.org; upstream's LICENSE states
   "Version 3, 29 June 2007".
