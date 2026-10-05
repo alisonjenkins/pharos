@@ -1,6 +1,6 @@
 # ADR-0018: Automatic intro / outro detection (audio fingerprinting)
 
-- **Status:** Proposed
+- **Status:** Accepted (status updated 2026-10-05; see Implementation notes)
 - **Date:** 2026-07-14T00:00:00Z
 - **Deciders:** Alison
 - **Task:** §T T86
@@ -209,6 +209,43 @@ they're exact). Wire shape unchanged.
   credits without clean black bookends.
 - **Silence detection**: rejected as primary — too many false boundaries in
   dialogue.
+
+## Implementation notes (added 2026-10-05)
+
+The status moved from Proposed to Accepted because the feature shipped (T86 is
+done in the baseline `tasks.md`) and runs in production. The decision text
+above is unchanged; this section records where the build departs from it.
+
+Built as decided:
+
+- Pure-Rust fingerprinting on the libav worker pool: `TinyOp::Fingerprint` and
+  `FingerprintMulti`, with `rusty-chromaprint` in `pharos-transcode`.
+- `media_segments` and `episode_fingerprints` tables (migration 0038, both
+  backends), plus a snapshot table (0051). `SEGMENT_SCHEMA_VERSION` and
+  `SEGMENT_DETECT_VERSION` force re-analysis when the algorithm changes.
+- A season-level pairwise pass over the intro and credits windows, run from
+  the gated backfill (`crates/pharos-server/src/segment_backfill.rs`).
+- Consensus with a confidence score (improvement 4). Confidence is the greater
+  of the agreeing-comparison share and the agreeing-seconds share (T102, T107,
+  V88).
+
+Departures:
+
+- It lives in `pharos-transcode::fingerprint`, not a new `pharos-analysis`
+  crate.
+- Alignment is not the verbatim port the ADR describes. Pharos's port of the
+  plugin's seeded candidate-shift search found no candidate shifts on the
+  Mushoku Tensei S03 intros, so 1 of 10 pairs matched. Whether the plugin
+  itself fails on that input was not tested. `specs/002-fix-skip-intro/` replaced it
+  with a bounded exhaustive search over every shift in the windows' overlap
+  (T008); the match, contiguity and bounds rules are unchanged.
+
+Not built, as of this date (no code found):
+
+- The reference-fingerprint fast path for new episodes (improvement 2). A
+  comment in `fingerprint/season.rs` and the 0038 migration still name it.
+- Series-wide reuse across seasons (improvement 3).
+- The black-frame credits refinement (improvement 6, third layer).
 
 ## References
 

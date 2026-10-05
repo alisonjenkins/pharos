@@ -60,7 +60,7 @@ optional **Alternatives considered** / **References**).
 | [0015](0015-postgres-cnpg-deployment.md) | CNPG Postgres for the home deployment; zero-downtime rolling deploys | Accepted |
 | [0016](0016-syncplay-durability-distribution.md) | Durable, multi-replica SyncPlay (persisted groups + advisory-lock ownership) | Accepted |
 | [0017](0017-adaptive-background-io-gate.md) | Adaptive background-I/O gate (shared semaphore, parks while streaming) | Accepted |
-| [0018](0018-intro-outro-detection.md) | Automatic intro / outro detection (audio fingerprinting) | Proposed |
+| [0018](0018-intro-outro-detection.md) | Automatic intro / outro detection (audio fingerprinting) | Accepted |
 | [0019](0019-vr-playback-vendored-client-script.md) | VR playback via a vendored client script in the jellyfin-web bundle | Accepted |
 | [0020](0020-cmaf-hw-affinity.md) | CMAF HLS renditions with per-device hardware affinity | Accepted |
 | [0021](0021-self-tuning-playback-admission.md) | Self-tuning (AIMD) playback admission | Accepted |
