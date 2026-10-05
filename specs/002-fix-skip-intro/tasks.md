@@ -89,7 +89,7 @@ matched, agreeing, confidence — not a bare class.
 ### Implementation for User Story 2
 
 - [X] T014 [US2] Re-read the verdict path in `crates/pharos-transcode/src/fingerprint/season.rs` after T008 lands: confirm `matched = 0` still means "no comparison located a span" and has not become unreachable. If exhaustive search makes `no_span` vanish as a category, that is a signal change and must be stated, not absorbed
-- [ ] T015 [US2] If and only if T003/T004 showed the cause was invisible from the existing log line, add the missing detail to `record_verdicts` in `crates/pharos-server/src/segment_backfill.rs` — carrying the offending value, never a bare class — and land it as its OWN commit ahead of T008 so it can ship and be read first (contract R-OBS-2, constitution ODD step 1)
+- [-] T015 [US2] (NOT NEEDED, see Notes) If and only if T003/T004 showed the cause was invisible from the existing log line, add the missing detail to `record_verdicts` in `crates/pharos-server/src/segment_backfill.rs` — carrying the offending value, never a bare class — and land it as its OWN commit ahead of T008 so it can ship and be read first (contract R-OBS-2, constitution ODD step 1)
 
 **Checkpoint**: the diagnostic that made this bug findable is intact and tested.
 
@@ -125,7 +125,7 @@ re-compared on the next sweep and gains an intro, with no read of the source fil
 - [X] T023 Append this defect to the bug ledger `specs/001-pharos-baseline/bugs.md` with cause and fix, using the next free id after B129, and add the invariant it is now guarded by to `specs/001-pharos-baseline/invariants.md` after V81: shift discovery and point acceptance must use the SAME notion of similarity — a fuzzy acceptance test seeded by an exact-match index can find nothing where thousands of near-matches exist
 - [X] T024 Verify in production by query, not assertion (constitution ODD step 5). After deploy and one sweep pass, run the three checks in `specs/002-fix-skip-intro/quickstart.md` §5 — the recall-by-kind PromQL, the closing-only SQL (145 before), and the named-season LogQL — and report the ACTUAL output
 - [X] T025 Close the loop on the reported symptom: play Mushoku Tensei S03 on the Google TV app, confirm Skip Intro appears over the same window the browser shows, and record the result in `specs/002-fix-skip-intro/research.md`
-- [ ] T026 Update SC-001 in `specs/002-fix-skip-intro/spec.md` from the provisional 80% to the measured figure once T024 reports the post-fix verdict split across the 145 seasons (research R4's open item)
+- [-] T026 (NOT NEEDED, see Notes) Update SC-001 in `specs/002-fix-skip-intro/spec.md` from the provisional 80% to the measured figure once T024 reports the post-fix verdict split across the 145 seasons (research R4's open item)
 - [X] T027 Check episode `3096759618643281933` (Mushoku S03E02, matches nothing in either kind) against the known zeroed/corrupt-file list before accepting it as normal; note the outcome in `specs/002-fix-skip-intro/research.md`
 
 ---
