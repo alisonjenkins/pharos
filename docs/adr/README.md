@@ -35,7 +35,9 @@ optional **Alternatives considered** / **References**).
 > capture decisions already embodied in the codebase, so pharos has a reviewable
 > decision log going forward. Their dates reflect *when documented*, not
 > necessarily when first decided; where the original decision date is known it
-> is noted in-text.
+> is noted in-text. ADRs 0020–0027 were backfilled the same way on 2026-10-05
+> from specs 003–008 and the code; each marks rationale it could not find as
+> "not recorded".
 
 ## Index
 
@@ -58,3 +60,13 @@ optional **Alternatives considered** / **References**).
 | [0015](0015-postgres-cnpg-deployment.md) | CNPG Postgres for the home deployment; zero-downtime rolling deploys | Accepted |
 | [0016](0016-syncplay-durability-distribution.md) | Durable, multi-replica SyncPlay (persisted groups + advisory-lock ownership) | Accepted |
 | [0017](0017-adaptive-background-io-gate.md) | Adaptive background-I/O gate (shared semaphore, parks while streaming) | Accepted |
+| [0018](0018-intro-outro-detection.md) | Automatic intro / outro detection (audio fingerprinting) | Proposed |
+| [0019](0019-vr-playback-vendored-client-script.md) | VR playback via a vendored client script in the jellyfin-web bundle | Accepted |
+| [0020](0020-cmaf-hw-affinity.md) | CMAF HLS renditions with per-device hardware affinity | Accepted |
+| [0021](0021-self-tuning-playback-admission.md) | Self-tuning (AIMD) playback admission | Accepted |
+| [0022](0022-transcode-device-spread.md) | Weighted spread of transcodes across CPU and GPU devices | Accepted |
+| [0023](0023-remote-sources.md) | Remote media sources resolved on demand | Accepted |
+| [0024](0024-books-library.md) | Books as a first-class library kind (client-side readers, no ffmpeg) | Accepted |
+| [0025](0025-kindle-conversion.md) | Kindle-format book conversion (boko, EPUB on delivery, derived state) | Accepted |
+| [0026](0026-client-capability-negotiation.md) | Playback decided by negotiating client against server capabilities | Accepted |
+| [0027](0027-unified-seek-model.md) | One seek model for DirectPlay and HLS | Accepted |
