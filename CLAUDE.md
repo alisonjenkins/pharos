@@ -44,6 +44,16 @@ Spec-driven via GitHub spec-kit (`/speckit-*` skills). Migrated off cavekit
   comments and each other. Never renumber; always append. New bug → append to
   `bugs.md` with cause + fix + the invariant that now guards the class; if no
   invariant covers it, add one to `invariants.md`.
+- **Decisions get an ADR.** `docs/adr/` (template `0000-template.md`) records
+  the load-bearing choices: a technology, a data format, a module boundary, a
+  new third-party dependency that shapes the design (not a version bump or a
+  routine crate), or any behaviour that would be expensive to reverse. A change that makes one ships its ADR in the
+  same PR, as its own commit, and adds a row to `docs/adr/README.md`. A choice
+  recorded in a spec's `plan.md` or `research.md` that meets that bar gets an
+  ADR when the feature lands. ADRs are immutable once Accepted: change a
+  decision with a new ADR that supersedes it and update both Status lines. A
+  decision found in the code with no ADR is backfilled, marking any rationale
+  nobody wrote down as "not recorded" rather than inventing one.
 - **New work**: `/speckit-specify` → `/speckit-clarify` → `/speckit-plan` →
   `/speckit-tasks` → `/speckit-analyze` → `/speckit-implement`, creating a new
   `specs/NNN-<slug>/` per feature. Small fixes against existing behaviour go
