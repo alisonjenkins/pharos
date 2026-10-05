@@ -1,4 +1,5 @@
 import { test, expect } from "@playwright/test";
+import { requireH264 } from "./lib/h264";
 import { VirtualPerson } from "./lib/virtual-person";
 import { waitUntilInSync } from "./lib/sync-oracle";
 
@@ -16,24 +17,7 @@ test.describe("syncplay h264 codec smoke (real-codec browser)", () => {
     test.setTimeout(150_000);
 
     // The smoke is meaningless unless this browser truly decodes h264.
-    const canH264 = await (async () => {
-      const ctx = await browser.newContext();
-      const page = await ctx.newPage();
-      await page.goto("about:blank");
-      const ok = await page.evaluate(
-        () =>
-          (window as any).MediaSource?.isTypeSupported(
-            'video/mp4; codecs="avc1.640028"',
-          ) === true,
-      );
-      await ctx.close();
-      return ok;
-    })();
-    expect(
-      canH264,
-      "PHAROS_H264_BROWSER lacks h264 decode — swap flake.nix to google-chrome " +
-        "(allowUnfree) so the demuxed-CMAF path is exercised",
-    ).toBe(true);
+    await requireH264(browser);
 
     const a = await VirtualPerson.spawn(browser, 0);
     const g = await a.createGroup("h264-smoke");
