@@ -1,4 +1,4 @@
-//! Typed seek primitives shared by every video delivery path (T90).
+//! Typed seek primitives shared by every video delivery path.
 //!
 //! Seeking used to be inconsistent because each delivery handler
 //! (`deliver_stream`/`serve_from_offset` for DirectPlay, `serve_segment` for
