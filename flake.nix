@@ -818,6 +818,11 @@
         # silently no-ops would leave the slowness in place while every test
         # here still passed. Hence the exact-one-match assertions and the
         # post-conditions below.
+        threeJs = pkgs.fetchurl {
+          url = "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.min.js";
+          sha256 = "1yj93pp5g5wg46j9g16lgizxwdg1mwpv9x3h65mwj5rjyj4nf30p";
+        };
+
         jellyfinWebBundle =
           pkgs.runCommand "jellyfin-web-${pkgs.jellyfin-web.version}-epubjs-unpaused"
             { nativeBuildInputs = [ pkgs.gnugrep pkgs.gnused ]; }
@@ -857,6 +862,50 @@
               fi
               if ! grep -qE 'this\.pause=[A-Za-z_$][A-Za-z0-9_$]*\|\|0[^0-9]' "$hits"; then
                 echo "epub.js pause patch did not produce a zero pause." >&2
+                exit 1
+              fi
+
+              # VR playback (web-patches/jellyfin-vr). Upstream is installed
+              # through the JavaScript Injector server plugin, which pharos
+              # has no equivalent of, so ship it in the bundle instead.
+              # three.js is vendored so the headset needs no third-party CDN.
+              mkdir -p "$out/vr"
+              cp ${./web-patches/jellyfin-vr/jellyfin-vr.js} "$out/vr/jellyfin-vr.js"
+              cp ${threeJs} "$out/vr/three.min.js"
+              for f in jellyfin-vr.js three.min.js; do
+                if [ ! -s "$out/vr/$f" ]; then
+                  echo "jellyfin-vr: $out/vr/$f is missing or empty." >&2
+                  exit 1
+                fi
+              done
+              chmod u+w "$out/vr/jellyfin-vr.js"
+
+              # Both rewrites must match exactly once or fail the build: a
+              # silent miss leaves a CDN dependency / no VR button behind.
+              n=$(grep -c "const THREE_URL = 'https://cdn.jsdelivr.net/" "$out/vr/jellyfin-vr.js" || true)
+              if [ "$n" -ne 1 ]; then
+                echo "jellyfin-vr THREE_URL line matched $n times, expected 1." >&2
+                exit 1
+              fi
+              # Relative to the page, like every other bundle file, so it
+              # resolves under /web/ and under a root-served bundle (the
+              # compat harness). Resolved to an absolute URL because
+              # loadScript() de-dupes by comparing against script.src.
+              sed -i "s|const THREE_URL = '[^']*'|const THREE_URL = new URL('vr/three.min.js', document.baseURI).href|" \
+                "$out/vr/jellyfin-vr.js"
+              if ! grep -qF "const THREE_URL = new URL('vr/three.min.js', document.baseURI).href" "$out/vr/jellyfin-vr.js"; then
+                echo "jellyfin-vr THREE_URL rewrite did not apply." >&2
+                exit 1
+              fi
+
+              n=$(grep -c '</body>' "$out/index.html" || true)
+              if [ "$n" -ne 1 ]; then
+                echo "index.html has $n </body> tags, expected 1; jellyfin-web ${pkgs.jellyfin-web.version} changed shape." >&2
+                exit 1
+              fi
+              sed -i 's|</body>|<script src="vr/jellyfin-vr.js" defer></script></body>|' "$out/index.html"
+              if ! grep -qF '<script src="vr/jellyfin-vr.js" defer></script></body>' "$out/index.html"; then
+                echo "jellyfin-vr script tag was not injected into index.html." >&2
                 exit 1
               fi
             '';
