@@ -18,7 +18,6 @@ publish = false
 actix-http = { version = "3", features = ["compress-brotli", "compress-gzip", "compress-zstd", "http2", "ws"] }
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
-ahash = { version = "0.8" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
 bytes = { version = "1" }
@@ -43,7 +42,7 @@ futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
-hashbrown = { version = "0.14", default-features = false, features = ["ahash", "raw"] }
+hashbrown = { version = "0.16" }
 indexmap = { version = "2" }
 itertools = { version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
@@ -51,7 +50,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.20", default-features = false, features = ["encoder", "optimization", "std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
-metrics-util = { version = "0.17" }
+metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
 percent-encoding = { version = "2" }
@@ -106,6 +105,7 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["io", "sink"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
+hashbrown = { version = "0.16" }
 indexmap = { version = "2" }
 itertools = { version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
