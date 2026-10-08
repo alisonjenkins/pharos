@@ -645,7 +645,7 @@ mod tests {
     fn a_panicking_parser_skips_one_file_and_records_why() {
         use metrics_util::debugging::DebuggingRecorder;
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         // Silence the panic hook so the test output stays readable; the panic
@@ -764,7 +764,7 @@ mod tests {
     fn an_unreadable_format_is_recorded_as_such() {
         use metrics_util::debugging::DebuggingRecorder;
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let meta = read_book_meta(std::path::Path::new("/books/Dune.azw3")).expect("still imports");

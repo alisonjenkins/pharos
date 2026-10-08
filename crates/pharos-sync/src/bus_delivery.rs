@@ -289,7 +289,7 @@ mod tests {
         }
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         // No local sink for the member → the message goes to the bus.

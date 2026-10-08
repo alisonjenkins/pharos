@@ -166,7 +166,7 @@ mod tests {
     async fn a_drop_on_a_full_sink_is_counted_by_kind() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let sinks = MemberSinks::new();

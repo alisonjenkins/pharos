@@ -268,7 +268,7 @@ async fn the_provider_that_supplied_the_year_is_recorded() {
     use metrics_util::debugging::DebuggingRecorder;
 
     let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let probe = MediaProbe::default();
@@ -353,7 +353,7 @@ async fn book_metadata_flows_through_the_existing_resolver() {
     use std::io::Write;
 
     let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let td = tempfile::tempdir().unwrap();

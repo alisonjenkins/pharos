@@ -876,7 +876,7 @@ mod tests {
     fn a_cbr_is_readable_but_permanently_coverless() {
         use metrics_util::debugging::DebuggingRecorder;
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let td = tempfile::tempdir().unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
     }
 
     fn classify_labels(
-        snapshotter: &metrics_util::debugging::Snapshotter,
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
     ) -> Option<std::collections::HashMap<String, String>> {
         snapshotter
             .snapshot()

@@ -763,8 +763,7 @@ mod tests {
         name: &str,
     ) -> Vec<(String, f64)> {
         use metrics_util::debugging::DebugValue;
-        let mut out: Vec<(String, f64)> = recorder
-            .snapshotter()
+        let mut out: Vec<(String, f64)> = pharos_test_metrics::snapshotter(recorder)
             .snapshot()
             .into_vec()
             .into_iter()

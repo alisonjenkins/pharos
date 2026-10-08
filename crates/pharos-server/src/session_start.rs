@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn a_session_starting_on_the_final_segment_counts_as_tail() {
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let starts = SessionStarts::new();

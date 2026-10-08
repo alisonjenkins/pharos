@@ -25,6 +25,7 @@ ffmpeg-lib = ["pharos-transcode/backend-lib"]
 
 [dev-dependencies]
 metrics-util.workspace = true
+pharos-test-metrics = { path = "../pharos-test-metrics" }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "sync", "io-util", "fs", "time"] }
 

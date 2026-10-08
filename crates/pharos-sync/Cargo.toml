@@ -24,6 +24,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 metrics-util.workspace = true
+pharos-test-metrics = { path = "../pharos-test-metrics" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 
 [lints]

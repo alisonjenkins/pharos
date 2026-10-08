@@ -4666,7 +4666,7 @@ mod tests {
         let path = cache.segment_path_keyed(key);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5051,7 +5051,7 @@ mod tests {
         let cache = Arc::new(cache);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5166,7 +5166,7 @@ mod tests {
         let path = cache.segment_path_keyed(key);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5391,7 +5391,7 @@ mod tests {
         let opts = slow_opts();
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         // `with_local_recorder` installs the recorder for a CLOSURE on this
         // thread, so the runtime has to be current-thread: the detached driver
         // and both requesters then record into the same snapshot.
@@ -5545,7 +5545,7 @@ mod tests {
     /// The `pharos_segment_produced_total` series carrying `outcome=<want>`,
     /// as `(labels, value)`.
     fn produced_series(
-        snapshotter: &metrics_util::debugging::Snapshotter,
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
         want: &str,
     ) -> Option<(Vec<String>, metrics_util::debugging::DebugValue)> {
         let want = format!("outcome={want}");
@@ -5635,7 +5635,7 @@ mod tests {
         let key = SegmentIdentity::new(44, 8, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5978,7 +5978,7 @@ mod tests {
         let opts = slow_opts();
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6068,7 +6068,7 @@ mod tests {
         ));
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6690,7 +6690,7 @@ mod tests {
         let opts = slow_opts();
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6758,7 +6758,7 @@ mod tests {
         let key = SegmentIdentity::new(11, 5, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6842,7 +6842,7 @@ mod tests {
         let key = SegmentIdentity::new(12, 6, None, None, &opts, SourceGen::LOCAL);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6981,7 +6981,7 @@ mod tests {
         driver_rt.shutdown_timeout(std::time::Duration::ZERO);
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let err = metrics::with_local_recorder(&recorder, || {
             requester_rt.block_on(async {
                 // Everything this request spawns lands on the doomed runtime;

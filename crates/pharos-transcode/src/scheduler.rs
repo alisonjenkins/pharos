@@ -4519,7 +4519,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         // The pinned device is chosen from the table inside, and the per-device
         // assertion below needs it — so it is handed back out rather than
@@ -4712,7 +4712,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let placed: Arc<std::sync::Mutex<Vec<DeviceId>>> = Arc::new(std::sync::Mutex::new(vec![]));
 
         let expected = metrics::with_local_recorder(&recorder, || {
@@ -4843,7 +4843,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5020,7 +5020,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -6043,7 +6043,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6112,7 +6112,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6191,7 +6191,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6281,7 +6281,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6590,7 +6590,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6655,7 +6655,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             // No `tokio::spawn`, no actor: the receiver is dropped immediately,
@@ -7143,7 +7143,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7231,7 +7231,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -7468,7 +7468,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -8966,7 +8966,7 @@ mod tests {
     }
 
     impl Metrics {
-        fn capture(snapshotter: &metrics_util::debugging::Snapshotter) -> Metrics {
+        fn capture(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> Metrics {
             use metrics_util::debugging::DebugValue;
             let mut counters = Vec::new();
             let mut histograms = Vec::new();
@@ -9030,7 +9030,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -9177,7 +9177,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -9254,7 +9254,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -9346,7 +9346,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -9461,7 +9461,7 @@ mod tests {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
 
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()

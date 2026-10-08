@@ -519,7 +519,7 @@ mod tests {
 
         for (name, image, want_verdict, want_reason) in cases {
             let recorder = DebuggingRecorder::new();
-            let snapshotter = recorder.snapshotter();
+            let snapshotter = pharos_test_metrics::snapshotter(&recorder);
             let _guard = metrics::set_default_local_recorder(&recorder);
 
             let p = td.path().join(name);

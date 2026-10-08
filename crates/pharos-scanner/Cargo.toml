@@ -68,6 +68,7 @@ watch = ["dep:notify", "tokio/sync", "tokio/time"]
 [dev-dependencies]
 criterion = { workspace = true }
 metrics-util.workspace = true
+pharos-test-metrics = { path = "../pharos-test-metrics" }
 # The comic tests BUILD a `.cb7` rather than checking a binary blob into the
 # repo, so the fixture's contents are visible in the test that reads them (same
 # choice as the epub fixtures). `compress` is `lzma-rust/encoder` — still pure

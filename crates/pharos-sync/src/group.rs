@@ -4493,7 +4493,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, sinks, _rx1, _m1) = fresh().await;
@@ -4806,7 +4806,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         record_hydrate(HydrateState::Playing, Some(90_000));
@@ -4843,7 +4843,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, sinks, mut leader_rx, leader) = fresh().await;
@@ -6680,7 +6680,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, sinks, mut _rx1, m1) = fresh().await;
@@ -6754,7 +6754,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, sinks, mut _rx1, m1) = fresh().await;
@@ -6831,7 +6831,7 @@ mod tests {
     async fn buffering_freeze_times_out_via_anti_wedge() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, sinks, mut rx1, m1) = fresh().await;
@@ -7273,7 +7273,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         // Thread-local: the actor task shares this thread under the
         // current-thread runtime, so its emissions land in this snapshot.
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -8620,7 +8620,7 @@ mod tests {
     async fn set_playlist_item_for_an_unknown_entry_is_counted() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, _sinks, mut rx1, m1) = fresh().await;
@@ -8770,7 +8770,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, _sinks, mut leader_rx, leader) = fresh().await;
@@ -8865,7 +8865,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let (h, _sinks, mut leader_rx, leader) = fresh().await;
