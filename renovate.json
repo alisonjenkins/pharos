@@ -9,6 +9,11 @@
       "description": "Auto-merge patch and minor updates once CI is green (branch protection on main requires all 4 checks); major bumps still open a PR for manual review.",
       "matchUpdateTypes": ["patch", "minor"],
       "automerge": true
+    },
+    {
+      "description": "@playwright/test must equal nixpkgs playwright-driver.version (browsers come from the nix store, see compat-playwright/package.json). Bump by hand together with the flake nixpkgs pin.",
+      "matchPackageNames": ["@playwright/test", "playwright", "playwright-core"],
+      "enabled": false
     }
   ]
 }
