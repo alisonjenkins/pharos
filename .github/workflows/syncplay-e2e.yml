@@ -13,6 +13,9 @@ on:
       - "compat-playwright/tests/syncplay-*.spec.ts"
       - "compat-playwright/tests/lib/**"
       - "compat-playwright/playwright.syncplay.config.ts"
+      # Scripts injected into the jellyfin-web bundle change what the harness's
+      # real browsers see (the VR player added a row to the track menus).
+      - "web-patches/**"
       - ".github/workflows/syncplay-e2e.yml"
       - "justfile"
 
