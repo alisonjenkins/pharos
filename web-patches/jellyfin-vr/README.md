@@ -9,7 +9,8 @@ belongs to them. Usage and limits: [`docs/jellyfin-vr.md`](../../docs/jellyfin-v
   The text is the canonical one from gnu.org; upstream's LICENSE states
   "Version 3, 29 June 2007".
 - File: `Jellyfin supports plugins for VR.js` at upstream `main`, fetched 2026-10-05
-- Adds a "Watch in VR" entry to the video player's settings menu
+- Adds a "Watch in VR" entry to the end of the video player's action sheets: the
+  settings (gear) menu, and also the audio, subtitle and other pickers
   (VR180, VR360, SBS 3D, OU/top-bottom 3D, WebXR; built for Meta Quest Browser).
 - Format is auto-detected from filename / title markers in `/Items/{id}`.
 

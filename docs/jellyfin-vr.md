@@ -1,9 +1,11 @@
 # VR video in jellyfin-web
 
 The jellyfin-web bundle that pharos serves includes a VR player. It adds a
-**Watch in VR** entry to the video player's settings (gear) menu and plays the
+**Watch in VR** entry to the end of the video player's menus and plays the
 current video as VR180, VR360 or stereoscopic 3D through WebXR. It was built
-for the Meta Quest Browser.
+for the Meta Quest Browser. The entry is in the settings (gear) menu and also
+in every other player picker, such as audio and subtitles; see
+[Limits](#limits).
 
 Decision record: [ADR-0019](adr/0019-vr-playback-vendored-client-script.md).
 
@@ -62,6 +64,12 @@ the aspect ratio cannot tell half-width packings from an ordinary video.
 
 ## Limits
 
+- **The entry is in every player menu.** The script appends **Watch in VR** to
+  each action sheet while a video is on screen, so it is the last row of the
+  audio and subtitle pickers as well as the gear menu. Choosing a track is
+  unaffected, but anything that picks "the last row" of those pickers gets VR
+  instead. The E2E harness's track swaps select rows by `data-id` (real track
+  rows have one; the injected row does not) for that reason.
 - **No transcode fallback.** The player's "compatibility" mode requests an
   H.264 transcode from `/Videos/{id}/stream.mp4?Static=false`. Pharos only
   transcodes progressive `.webm`, so that URL serves the source file. A video

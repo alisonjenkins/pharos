@@ -62,6 +62,14 @@ author in `docs/jellyfin-vr.md` and the vendored directory's README.
   compression). It is `defer` and compressed by the angie front.
 - GPL-3.0 is compatible with the repo's AGPL-3.0-or-later. Upstream's licence
   text ships with the vendored copy.
+- (Added 2026-10-08.) The script appends **Watch in VR** to the end of every
+  player action sheet, not only the gear menu, so it is also the last row of
+  the audio and subtitle pickers. This broke the `syncplay-e2e` track-swap
+  tests, which clicked the last row, and it went unseen because that workflow is
+  path-filtered and did not run when the bundle changed. The harness now selects
+  track rows by `data-id`, which the injected row lacks. Whether to restrict
+  the entry to the gear menu (a build-time patch of the vendored script) is
+  open.
 
 ## Alternatives considered
 
