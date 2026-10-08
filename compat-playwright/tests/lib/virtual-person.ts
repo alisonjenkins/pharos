@@ -219,24 +219,27 @@ export class VirtualPerson implements Probeable {
       .waitFor({ state: "visible", timeout: 10_000 });
   }
 
-  // Switch to the LAST menu entry: for the 2-audio fixture that is the
+  // Switch to the LAST track entry: for the 2-audio fixture that is the
   // alternate track; for subtitles it enables a real track (default is Off).
   // A concrete track index is unstable (subtitle stream indices are 3/4, not
   // 1/2), so we select the alternate by menu position — deterministic switch.
-  async swapAudio(): Promise<void> {
-    await this.openTrackMenu(SELECTORS.osdAudioButton);
+  // The bundled VR player appends its own row after the tracks; only real track
+  // rows carry a data-id, so position is taken among those.
+  private async clickLastTrack(): Promise<void> {
     await this.page
-      .locator(`${SELECTORS.actionSheet} .actionSheetMenuItem`)
+      .locator(`${SELECTORS.actionSheet} ${SELECTORS.trackMenuAny}`)
       .last()
       .click({ timeout: 10_000 });
   }
 
+  async swapAudio(): Promise<void> {
+    await this.openTrackMenu(SELECTORS.osdAudioButton);
+    await this.clickLastTrack();
+  }
+
   async swapSubtitle(): Promise<void> {
     await this.openTrackMenu(SELECTORS.osdSubtitleButton);
-    await this.page
-      .locator(`${SELECTORS.actionSheet} .actionSheetMenuItem`)
-      .last()
-      .click({ timeout: 10_000 });
+    await this.clickLastTrack();
   }
 
   // ---- observation ----

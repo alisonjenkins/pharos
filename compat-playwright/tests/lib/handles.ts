@@ -49,4 +49,10 @@ export const SELECTORS = {
   actionSheet: ".actionSheet",
   // Track actionsheet items carry data-id = the MediaStream index.
   trackMenuItem: (index: number) => `.actionSheetMenuItem[data-id="${index}"]`,
+  // Only real track rows have a data-id. The bundled VR player
+  // (web-patches/jellyfin-vr) appends its own "Watch in VR" row, without one, to
+  // the END of every player action sheet, audio and subtitle pickers included;
+  // clicking it opens a full-screen overlay that blocks every later click. Pick
+  // a track by position from THESE rows, never from `.actionSheetMenuItem`.
+  trackMenuAny: ".actionSheetMenuItem[data-id]",
 } as const;
