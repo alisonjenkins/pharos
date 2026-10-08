@@ -10,6 +10,7 @@ members = [
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
     "crates/pharos-sync",
+    "crates/pharos-test-metrics",
     "crates/pharos-transcode",
     "crates/pharos-ui",
     "workspace-hack",

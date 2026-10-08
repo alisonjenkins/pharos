@@ -3236,6 +3236,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-test-metrics"
+version = "0.0.0"
+dependencies = [
+ "metrics",
+ "metrics-util",
+ "workspace-hack",
+]
+
+[[package]]
 name = "pharos-transcode"
 version = "0.0.0"
 dependencies = [
