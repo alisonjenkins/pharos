@@ -425,7 +425,7 @@ async fn build_suggestions(
 
 fn pseudo_seed() -> u64 {
     let mut buf = [0u8; 8];
-    if getrandom::getrandom(&mut buf).is_err() {
+    if getrandom::fill(&mut buf).is_err() {
         buf = [1, 2, 3, 4, 5, 6, 7, 8];
     }
     u64::from_le_bytes(buf) | 1

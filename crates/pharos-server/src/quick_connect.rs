@@ -267,7 +267,7 @@ fn generate_code() -> String {
     // A CSPRNG failure is effectively impossible on supported platforms;
     // if it ever did, zero bytes still yield a valid (if fixed) code and
     // uniqueness/secret pairing still hold.
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     let n = u64::from_le_bytes(b) % 1_000_000;
     format!("{n:06}")
 }
