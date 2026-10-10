@@ -2626,6 +2626,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 
 [[package]]
+name = "lzma-rust2"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fde178a3caf126c440fa15628147772d8ee590a39477d711353fbe2e58a73a5b"
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3131,7 +3137,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "sevenz-rust2",
+ "sevenz-rust2 0.23.0",
  "sonic-rs",
  "tar",
  "tempfile",
@@ -4185,7 +4191,19 @@ checksum = "cb967eb8b29410e61e8c9005058fcfd5889d0b827856beb25529c73dfc86a98a"
 dependencies = [
  "crc32fast",
  "js-sys",
- "lzma-rust2",
+ "lzma-rust2 0.20.1",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "sevenz-rust2"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a4f883677093690e91fef8ae81fad8bce9e2c3a079b61054f05ce0d3ecf681e"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "lzma-rust2 0.21.0",
  "wasm-bindgen",
 ]
 
@@ -5768,7 +5786,7 @@ dependencies = [
  "libc",
  "libsqlite3-sys",
  "log",
- "lzma-rust2",
+ "lzma-rust2 0.20.1",
  "md-5",
  "memchr",
  "metrics-util",
@@ -5786,7 +5804,7 @@ dependencies = [
  "serde",
  "serde_core",
  "serde_json",
- "sevenz-rust2",
+ "sevenz-rust2 0.22.2",
  "sha1_smol",
  "sha2 0.10.9",
  "sha2 0.11.0",
