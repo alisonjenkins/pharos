@@ -92,7 +92,7 @@ tar = { version = "0.4", default-features = false }
 # Deliberately NOT enabling `embed_image`, which pulls the `image` crate.
 # R11 rests on there being no raster decoder in this workspace; a cover is
 # extracted only when it is ALREADY a JPEG, so nothing needs to decode one.
-lopdf = { version = "0.44", default-features = false }
+lopdf = { version = "0.45", default-features = false }
 # 005-kindle-conversion — MOBI/KF8 (`.mobi`/`.azw`/`.azw3`) → EPUB.
 #
 # Pure Rust, ZERO `unsafe`, and it carries the two pieces that make this
