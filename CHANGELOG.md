@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/alisonjenkins/pharos/compare/v0.2.0...v0.3.0) (2026-10-10)
+
+
+### Features
+
+* **jellyfin-web:** ship the VR player in the web bundle ([bdba4ac](https://github.com/alisonjenkins/pharos/commit/bdba4acf342efbce6594e529379801b12fa551a3))
+* **jellyfin-web:** vendor the jellyfinvr player script ([ad7d834](https://github.com/alisonjenkins/pharos/commit/ad7d834c65157e311a4bc0c684b53151efa56d54))
+
+
+### Bug Fixes
+
+* **ci:** ignore the dev-shell banner when reading image digests ([23791ae](https://github.com/alisonjenkins/pharos/commit/23791aec980dc8536ace92a50f62b2ca07e71500))
+* **deps:** bump tracing-opentelemetry to 0.34 for opentelemetry 0.33 ([b3d4020](https://github.com/alisonjenkins/pharos/commit/b3d40203053381065afe6cc1c500f59771ab6ac4))
+* **deps:** update rust crate getrandom to 0.4 ([fddbf83](https://github.com/alisonjenkins/pharos/commit/fddbf83eeaca042c4af70312fcaa62ad63bfb1c7))
+* **deps:** update rust crate hashbrown to 0.17 ([610ce5c](https://github.com/alisonjenkins/pharos/commit/610ce5c6a9c7dc9827dbb9b0c83a82277d9ceda2))
+* **server:** use getrandom::fill after the 0.4 bump ([654b8eb](https://github.com/alisonjenkins/pharos/commit/654b8eb4ed6258d5ac1cc3e1b8d0fe744447ca2e))
+* **sessions:** evict a session whose playback check-in has gone idle (V170) ([6f55387](https://github.com/alisonjenkins/pharos/commit/6f55387cabc8f090dad2ac0b42473263b5cdcce2))
+* **sessions:** evict superseded sessions on the same device (B227) ([0b2c8bf](https://github.com/alisonjenkins/pharos/commit/0b2c8bf9e34a4b93a26d7bb2e527f1dd04cd024e))
+* **syncplay:** debounce a NextItem that lands right after another (B226) ([53a1125](https://github.com/alisonjenkins/pharos/commit/53a1125c1df9e4f0bf68574bf088019061efcad2))
+* **ui:** keep getrandom 0.2 for the wasm js backend ([8a619fc](https://github.com/alisonjenkins/pharos/commit/8a619fc9bac76a3396f6925b2f61406c14cf160e))
+
 ## [0.2.0](https://github.com/alisonjenkins/pharos/compare/v0.1.0...v0.2.0) (2026-09-27)
 
 
