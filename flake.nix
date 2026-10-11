@@ -3,6 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # jellyfin-web 12 is not supported by pharos yet, so jellyfin-web comes
+    # from this older nixpkgs (10.11.8). Remove when pharos supports 12.
+    nixpkgs-jellyfin-web.url = "github:NixOS/nixpkgs/64c08a7ca051951c8eae34e3e3cb1e202fe36786";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -19,6 +22,7 @@
   outputs =
     {
       nixpkgs,
+      nixpkgs-jellyfin-web,
       flake-utils,
       rust-overlay,
       crane,
@@ -31,6 +35,8 @@
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+
+        jellyfinWebPkg = (import nixpkgs-jellyfin-web { inherit system; }).jellyfin-web;
 
         # Pinned toolchain (rust + clippy + rustfmt + wasm target).
         # Used by the devShell + the buildRustPackage builds below so
@@ -830,11 +836,11 @@
         };
 
         jellyfinWebBundle =
-          pkgs.runCommand "jellyfin-web-${pkgs.jellyfin-web.version}-epubjs-unpaused"
+          pkgs.runCommand "jellyfin-web-${jellyfinWebPkg.version}-epubjs-unpaused"
             { nativeBuildInputs = [ pkgs.gnugrep pkgs.gnused ]; }
             ''
               cp -r --no-preserve=mode,ownership \
-                ${pkgs.jellyfin-web}/share/jellyfin-web "$out"
+                ${jellyfinWebPkg}/share/jellyfin-web "$out"
 
               pat='this\.pause=[A-Za-z_$][A-Za-z0-9_$]*\|\|100'
 
@@ -842,7 +848,7 @@
               n=$(printf '%s' "$hits" | grep -c . || true)
               if [ "$n" -ne 1 ]; then
                 echo "epub.js pause patch matched $n files, expected exactly 1." >&2
-                echo "jellyfin-web ${pkgs.jellyfin-web.version} minified it differently;" >&2
+                echo "jellyfin-web ${jellyfinWebPkg.version} minified it differently;" >&2
                 echo "re-derive the pattern from Locations.process before bumping." >&2
                 exit 1
               fi
@@ -906,7 +912,7 @@
 
               n=$(grep -c '</body>' "$out/index.html" || true)
               if [ "$n" -ne 1 ]; then
-                echo "index.html has $n </body> tags, expected 1; jellyfin-web ${pkgs.jellyfin-web.version} changed shape." >&2
+                echo "index.html has $n </body> tags, expected 1; jellyfin-web ${jellyfinWebPkg.version} changed shape." >&2
                 exit 1
               fi
               sed -i 's|</body>|<script src="vr/jellyfin-vr.js" defer></script></body>|' "$out/index.html"
@@ -1069,7 +1075,7 @@
             # exactly, so the browser revision the npm package expects is
             # the one present in the store path.
             pkgs.nodejs_22
-            pkgs.jellyfin-web
+            jellyfinWebPkg
             # h264-capable Chromium for the SyncPlay h264 codec smoke
             # (compat-playwright/syncplay-h264-codec.spec.ts). The nix-pinned
             # playwright-driver chromium is a FOSS build with NO h264 decode,
