@@ -133,6 +133,45 @@ pub(crate) fn root_like_pattern(root: &str) -> String {
     out
 }
 
+/// Pass attempts before the `sort_name` backfill gives up until the next start.
+pub(crate) const SORT_NAME_BACKFILL_ATTEMPTS: u32 = 5;
+
+/// Delay before the first retry of the `sort_name` backfill; doubles each time.
+pub(crate) const SORT_NAME_BACKFILL_BACKOFF: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// Run one backfill `pass` until it succeeds, retrying transient failures
+/// (a busy database, a statement timeout) with doubling backoff. A pass is
+/// idempotent and resumes where the last stopped, so retrying is safe. On
+/// persistent failure it logs a warning and returns `None` rather than
+/// failing: queries fall back to `title_fold` for the unfilled rows.
+pub(crate) async fn run_sort_name_backfill<F, Fut>(
+    attempts: u32,
+    first_delay: std::time::Duration,
+    mut pass: F,
+) -> Option<u64>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64, sqlx::Error>>,
+{
+    let mut delay = first_delay;
+    for attempt in 1..=attempts {
+        match pass().await {
+            Ok(filled) => return Some(filled),
+            Err(error) if attempt >= attempts => {
+                tracing::warn!(%error, attempts, "sort_name backfill gave up; unfilled rows sort by title_fold until the next start");
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(%error, attempt, retry_in = ?delay, "sort_name backfill failed, retrying");
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+        }
+    }
+    None
+}
+
 /// One `UPDATE` of the library backfill: the library, its own LIKE pattern
 /// and the patterns of every library nested under it, which keep their own
 /// rows. Shortest root first so a nested root's own step always follows the
@@ -240,6 +279,45 @@ mod sweep_guard_tests {
     fn large_absolute_but_small_fraction_is_allowed() {
         // 150 of 10000 (1.5%) — a real bulk delete, well under the cap.
         assert!(!sweep_exceeds_guard(150, 10_000));
+    }
+}
+
+#[cfg(test)]
+mod sort_name_backfill_retry_tests {
+    use super::run_sort_name_backfill;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    const TICK: Duration = Duration::from_millis(1);
+
+    #[tokio::test]
+    async fn retries_a_transient_failure_then_reports_the_rows() {
+        let calls = AtomicU32::new(0);
+        let out = run_sort_name_backfill(5, TICK, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(sqlx::Error::PoolTimedOut)
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out, Some(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_without_panicking_on_a_persistent_failure() {
+        let calls = AtomicU32::new(0);
+        let out = run_sort_name_backfill(3, TICK, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(sqlx::Error::PoolTimedOut) }
+        })
+        .await;
+        assert_eq!(out, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
 
