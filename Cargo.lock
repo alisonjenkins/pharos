@@ -3296,6 +3296,8 @@ version = "0.0.0"
 dependencies = [
  "metrics",
  "metrics-util",
+ "tracing",
+ "tracing-subscriber",
  "workspace-hack",
 ]
 

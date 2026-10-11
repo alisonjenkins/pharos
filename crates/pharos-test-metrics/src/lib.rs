@@ -12,6 +12,8 @@
 //! therefore never overwrites a non-zero stored value. Assert gauges once,
 //! after the code under test has settled.
 
+pub mod spans;
+
 use std::sync::{Arc, Mutex, PoisonError};
 
 use metrics::{SharedString, Unit};
