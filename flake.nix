@@ -175,7 +175,11 @@
               export PGDATA="$TMPDIR/pgdata"
               initdb -U postgres --auth=trust --locale=C --encoding=UTF8 \
                 -D "$PGDATA" >/dev/null 2>&1
-              pg_ctl -D "$PGDATA" -o "-h 127.0.0.1 -p 5433 -k $TMPDIR" -w start
+              # Throwaway DB: durability is worthless here, and fsync dominated
+              # every per-test CREATE DATABASE. NEVER use these in production.
+              pg_ctl -D "$PGDATA" \
+                -o "-h 127.0.0.1 -p 5433 -k $TMPDIR -c fsync=off -c synchronous_commit=off -c full_page_writes=off" \
+                -w start
               createdb -h 127.0.0.1 -p 5433 -U postgres pharos_test
               export PHAROS_TEST_POSTGRES_URL="postgres://postgres@127.0.0.1:5433/pharos_test"
             '';

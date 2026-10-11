@@ -39,7 +39,9 @@ test-postgres:
       export PGDATA="$(mktemp -d)/pgdata"
       trap "pg_ctl -D \"$PGDATA\" stop >/dev/null 2>&1 || true; rm -rf \"$PGDATA\"" EXIT
       initdb -U postgres --auth=trust --locale=C --encoding=UTF8 -D "$PGDATA" >/dev/null
-      pg_ctl -D "$PGDATA" -o "-h 127.0.0.1 -p 5433 -k $PGDATA" -w start >/dev/null
+      # Throwaway DB: fsync/durability off makes each per-test CREATE DATABASE
+      # cheap. NEVER use these settings in production.
+      pg_ctl -D "$PGDATA" -o "-h 127.0.0.1 -p 5433 -k $PGDATA -c fsync=off -c synchronous_commit=off -c full_page_writes=off" -w start >/dev/null
       createdb -h 127.0.0.1 -p 5433 -U postgres pharos_test
       export PHAROS_TEST_POSTGRES_URL="postgres://postgres@127.0.0.1:5433/pharos_test"
       cargo nextest run -p pharos-store-sqlx --features postgres
