@@ -4847,6 +4847,9 @@ enum SortPrimary {
     /// 004-books — a books library's reading order: series, then volume. The
     /// token `SeriesSortName` is what jellyfin-web sends for a shelf view.
     BookSeriesOrder,
+    /// A single metadata column: `PremiereDate`, `ProductionYear`,
+    /// `CommunityRating` or `CriticRating`. Unknown values sort smallest.
+    Keyed(pharos_core::SortKey),
     Name,
 }
 
@@ -4872,6 +4875,10 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         // series" in Jellyfin; for a books library the series is the shelf and
         // the index is the volume.
         "SeriesSortName" => SortPrimary::BookSeriesOrder,
+        "PremiereDate" => SortPrimary::Keyed(pharos_core::SortKey::PremiereDate),
+        "ProductionYear" => SortPrimary::Keyed(pharos_core::SortKey::ProductionYear),
+        "CommunityRating" => SortPrimary::Keyed(pharos_core::SortKey::CommunityRating),
+        "CriticRating" => SortPrimary::Keyed(pharos_core::SortKey::CriticRating),
         _ => SortPrimary::Name,
     }
 }
@@ -5111,6 +5118,17 @@ fn build_media_query(
                     (SortKey::DateCreated, SortDir::Desc),
                     (SortKey::Id, SortDir::Desc),
                 ]
+            }
+        }
+        SortPrimary::Keyed(key) => {
+            if descending {
+                vec![
+                    (key, SortDir::Desc),
+                    (SortKey::Name, SortDir::Asc),
+                    (SortKey::Id, SortDir::Asc),
+                ]
+            } else {
+                vec![(key, SortDir::Asc), (SortKey::Name, SortDir::Asc)]
             }
         }
         SortPrimary::Runtime => {

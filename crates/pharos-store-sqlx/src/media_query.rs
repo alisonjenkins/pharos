@@ -48,6 +48,7 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::PremiereDate => "premiere_date",
         SortKey::ProductionYear => "production_year",
         SortKey::CommunityRating => "community_rating",
+        SortKey::CriticRating => "critic_rating",
         SortKey::Album => "LOWER(album)",
         SortKey::DiscNumber => "disc_number",
         SortKey::TrackNumber => "track_number",
@@ -65,6 +66,20 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::BookSeriesIndex => "COALESCE(book_series_index, 2147483647)",
         SortKey::Id => "id",
     }
+}
+
+/// Metadata columns that are NULL for unscraped items. SQLite sorts NULL
+/// smallest and Postgres sorts it largest, so these terms pin NULL as the
+/// smallest value (`NULLS FIRST` ascending, `NULLS LAST` descending) and an
+/// unknown year/rating lands at the same end on both backends.
+fn sort_key_nullable(key: SortKey) -> bool {
+    matches!(
+        key,
+        SortKey::PremiereDate
+            | SortKey::ProductionYear
+            | SortKey::CommunityRating
+            | SortKey::CriticRating
+    )
 }
 
 /// Build the query fragments + params for `q`. `ph` formats a 1-based bind
@@ -303,7 +318,15 @@ fn build_order(
             SortDir::Asc => "ASC",
             SortDir::Desc => "DESC",
         };
-        terms.push(format!("{col} {d}"));
+        let nulls = if sort_key_nullable(*key) {
+            match dir {
+                SortDir::Asc => " NULLS FIRST",
+                SortDir::Desc => " NULLS LAST",
+            }
+        } else {
+            ""
+        };
+        terms.push(format!("{col} {d}{nulls}"));
     }
     // Always end on the stable id tiebreak so pagination never duplicates
     // or drops a row across pages.
