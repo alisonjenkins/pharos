@@ -12,6 +12,7 @@ use actix_web::{error, web, HttpRequest, HttpResponse};
 use pharos_cache::image_cache::{ImageCacheError, ImageRole};
 use pharos_core::MediaStore;
 use serde::Deserialize;
+use tracing::Instrument as _;
 
 /// B89 — how long a client may reuse a cached image without revalidating.
 /// pharos's image URLs are `(item, role)`-stable and carry a stable `?tag=`, so
@@ -28,6 +29,7 @@ fn image_cache_control() -> String {
 /// A content ETag from the served file's length + mtime — stable while the
 /// cached bytes are, and rotates when the cache re-extracts / re-encodes.
 /// `None` if the file vanished (the caller then 404s on the body read).
+#[tracing::instrument(name = "image.etag", skip_all)]
 async fn file_etag(path: &std::path::Path) -> Option<String> {
     let m = tokio::fs::metadata(path).await.ok()?;
     let len = m.len();
@@ -102,7 +104,10 @@ async fn deliver_image(
             futures_util::stream::empty::<Result<actix_web::web::Bytes, actix_web::Error>>(),
         ));
     }
-    match tokio::fs::read(final_path).await {
+    match tokio::fs::read(final_path)
+        .instrument(tracing::info_span!("image.read"))
+        .await
+    {
         Ok(bytes) => resp.body(bytes),
         Err(_) => HttpResponse::NotFound().body(""),
     }
@@ -456,13 +461,21 @@ async fn serve_image(
     // tile in the library 404'd its image.
     let mut synth_id = false;
     let item = match pharos_jellyfin_api::dto::parse_item_id(id_str).ok_or(()) {
-        Ok(id) => match state.stores.get(id).await {
+        Ok(id) => match state
+            .stores
+            .get(id)
+            .instrument(tracing::info_span!("image.item_lookup"))
+            .await
+        {
             Ok(it) => it,
             Err(_) => return Ok(HttpResponse::NotFound().body("")),
         },
         Err(_) => {
             synth_id = true;
-            match resolve_synth_image_item(state, id_str).await {
+            match resolve_synth_image_item(state, id_str)
+                .instrument(tracing::info_span!("image.synth_resolve"))
+                .await
+            {
                 Some(it) => it,
                 None => return Ok(HttpResponse::NotFound().body("")),
             }
@@ -621,7 +634,12 @@ async fn serve_image(
     // this is a one-time encode per (image, width). Logo/Banner/Art/Disc return
     // None (alpha PNGs a JPEG rescale would wreck) → served untouched.
     let jpeg_path = match effective_width(role, req_width) {
-        Some(width) => cache.scaled_artwork(&jpeg_path, width).await,
+        Some(width) => {
+            cache
+                .scaled_artwork(&jpeg_path, width)
+                .instrument(tracing::info_span!("image.resize", width))
+                .await
+        }
         None => jpeg_path,
     };
     // P46 + P48 — optional re-encode to webp / avif via the
@@ -969,6 +987,7 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
 /// (deleted) file yields `None` so the caller falls through to the upload /
 /// frame-extract path rather than 404ing or erroring on a public route (V6
 /// spirit).
+#[tracing::instrument(name = "image.artwork_lookup", skip_all)]
 async fn local_artwork_path(
     state: &AppState,
     id: u64,
@@ -1049,7 +1068,10 @@ async fn serve_local_artwork(
     let scaled;
     let path = match (target_width, state.images.as_ref()) {
         (Some(width), Some(cache)) => {
-            scaled = cache.scaled_artwork(path, width).await;
+            scaled = cache
+                .scaled_artwork(path, width)
+                .instrument(tracing::info_span!("image.resize", width))
+                .await;
             scaled.as_path()
         }
         _ => path,
@@ -1083,6 +1105,7 @@ async fn serve_local_artwork(
 /// into a cache-owned `sidecar/` subdir keyed by a hash of the source
 /// path so re-encodes are skipped and the user's media folder is left
 /// untouched. Errors if no image cache is configured.
+#[tracing::instrument(name = "image.encode", skip_all, fields(ext = %ext))]
 async fn transcode_sidecar(
     state: &AppState,
     src: &std::path::Path,
@@ -1215,6 +1238,7 @@ fn effective_width(role: ImageRole, requested: Option<u32>) -> Option<u32> {
 /// P46 + P48 — transcode the cached jpeg into a sibling `.{ext}`
 /// file via the `FfmpegBackend` trait. Atomic via `.tmp → final` so
 /// concurrent first-readers don't observe a half-written output.
+#[tracing::instrument(name = "image.encode", skip_all, fields(ext = %ext))]
 async fn transcode_via_backend(
     state: &AppState,
     jpeg_path: &std::path::Path,
