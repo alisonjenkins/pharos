@@ -144,7 +144,7 @@ pub struct JobSpec {
     /// 10-bit AV1 source to a card with no AV1 decode block.
     pub decode_offload: crate::DecodeOffload,
     pub sink: OutputSink,
-    /// B201 — when set, the worker builds a synthetic `lavfi` input (black
+    /// B228 — when set, the worker builds a synthetic `lavfi` input (black
     /// video, plus silence for a muxed audio rendition) instead of decoding
     /// `input`, because the retry ladder already exhausted itself against
     /// this window and it came back short of — or with zero — video frames.

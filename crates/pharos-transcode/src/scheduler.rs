@@ -806,7 +806,7 @@ enum SchedMsg {
         /// callers that need to name this job while it is still running.
         assigned: Option<JobSlot>,
         reply: oneshot::Sender<Result<JobDone, SchedError>>,
-        /// B201 — carried to the `JobSpec` the worker receives, alongside
+        /// B228 — carried to the `JobSpec` the worker receives, alongside
         /// `decode_offload`. `None` for every ordinary submission; see
         /// [`TranscodeScheduler::submit_tracked_with_filler`].
         filler: Option<crate::options::FillerSpec>,
@@ -948,7 +948,7 @@ struct JobCtx {
     /// exported to Tempo, carries the placement facts as a result: a wedged
     /// segment can be read without joining three log lines by job id.
     span: tracing::Span,
-    /// B201 — carried straight into every `JobSpec` this job dispatches as
+    /// B228 — carried straight into every `JobSpec` this job dispatches as
     /// (retries included; see `place`/the dispatch sites). `None` for every
     /// ordinary job.
     filler: Option<crate::options::FillerSpec>,
@@ -1446,7 +1446,7 @@ impl TranscodeScheduler {
             .await
     }
 
-    /// [`Self::submit_tracked`], additionally naming a B201 filler for the
+    /// [`Self::submit_tracked`], additionally naming a B228 filler for the
     /// worker to synthesize instead of decoding `input`.
     ///
     /// A separate method rather than one more parameter on `submit_tracked`
@@ -1773,7 +1773,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 decode_offload,
                 sink: OutputSink::Stdout,
                 // The live progressive path has no retry ladder to exhaust —
-                // B201 filler is an HLS-segment concept.
+                // B228 filler is an HLS-segment concept.
                 filler: None,
             };
             let spawner = state.spawner.clone();

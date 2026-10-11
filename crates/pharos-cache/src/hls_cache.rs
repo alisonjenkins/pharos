@@ -251,7 +251,7 @@ enum SegmentOutcome {
     Ok,
     /// Carried less video than its duration implies — see `short_of_frames`.
     Short,
-    /// B201/V154 — the retry ladder was exhausted (max decode preroll, still
+    /// B228/V171 — the retry ladder was exhausted (max decode preroll, still
     /// short of or with zero video frames) on a window whose source bytes are
     /// gone, so the cache synthesized and served a black-video (+ silent
     /// audio, when muxed) filler for the whole window instead of a 500.
@@ -838,7 +838,7 @@ struct SegmentProvenance<'a> {
     queue_wait_ms: Option<u64>,
     produced_frames: Option<u64>,
     expected_frames: Option<u64>,
-    /// B201 — `true` when these bytes are a synthesized filler (black video
+    /// B228 — `true` when these bytes are a synthesized filler (black video
     /// plus silence) rather than a real transcode, so a segment found on
     /// disk days later is identifiable without re-deriving it from the
     /// frame counts above.
@@ -978,7 +978,7 @@ fn short_of_frames(
     None
 }
 
-/// The SOURCE container's own advertised frame size, for a B201 filler.
+/// The SOURCE container's own advertised frame size, for a B228 filler.
 ///
 /// Deliberately reads this off `source` itself rather than threading a probed
 /// width/height through `TranscodeOptions`/`SegmentOpts` — nothing in the
@@ -987,7 +987,7 @@ fn short_of_frames(
 /// needing an explicit `lavfi` size is the first caller to need it. A stream
 /// header probe is cheap next to the transcode that just failed twice, and it
 /// answers correctly even inside a damaged file: the ~7.5 MiB hole that
-/// destroyed B201's video frames left the container's own stream metadata
+/// destroyed B228's video frames left the container's own stream metadata
 /// (read at open, not at the damaged offset) untouched — the file "decodes
 /// cleanly on both sides of the hole" per the bug report, which is exactly
 /// what this reads.
@@ -2843,7 +2843,7 @@ impl HlsSegmentCache {
         // account for the frames rather than discarding the only evidence of
         // what was actually encoded.
         let mut reported: Option<(u64, f64)> = None;
-        // B201 — whether the bytes that end up cached are a real encode or a
+        // B228 — whether the bytes that end up cached are a real encode or a
         // synthesized filler. Read by the success path below to pick the
         // right `SegmentOutcome` and provenance marker instead of reporting a
         // filler as an ordinary hit.
@@ -2991,7 +2991,7 @@ impl HlsSegmentCache {
             }
         }
         if let Some(why) = shortfall {
-            // B201/V154 — the retry ladder (max decode preroll) is exhausted
+            // B228/V171 — the retry ladder (max decode preroll) is exhausted
             // and this window still cannot yield the frames it was asked
             // for. Every case that reaches this arm warrants a filler:
             // `short_of_frames` already returned `None` above — taking this
@@ -3013,7 +3013,7 @@ impl HlsSegmentCache {
                         source = %source.display(),
                         "hls segment retry ladder exhausted; synthesizing a \
                          filler for this window instead of failing it \
-                         (B201/V154)"
+                         (B228/V171)"
                     );
                     let mut filler_opts = attempt_opts.clone();
                     filler_opts.filler = Some(FillerSpec {
@@ -3428,7 +3428,7 @@ impl HlsSegmentCache {
                     // a NEW job, and promoting the one it replaced would leave
                     // the client waiting on the tier it was rescued from.
                     Some(job_slot.clone()),
-                    // B201 — read off `opts` HERE, in-process, before it
+                    // B228 — read off `opts` HERE, in-process, before it
                     // crosses to the scheduler: `TranscodeOptions::filler` is
                     // `#[serde(skip)]` precisely so it never reaches the
                     // worker via `opts` itself (see that field's doc
@@ -6381,7 +6381,7 @@ mod tests {
         assert_eq!(joined.len(), 256);
     }
 
-    /// A tiny REAL video file — mimics B201's source ("decodes cleanly on
+    /// A tiny REAL video file — mimics B228's source ("decodes cleanly on
     /// both sides of the hole"). The filler tests below never decode it
     /// (their scheduler is a fake worker that ignores the argv entirely),
     /// but `probe_source_dimensions` genuinely opens it with real `ffprobe`
@@ -6412,7 +6412,7 @@ mod tests {
 
     /// A scheduler whose worker fails EVERY real attempt — `frame=0` when
     /// `zero_frames`, else a genuine but short duration — and only succeeds
-    /// once `job.filler` is set, i.e. once B201's synthesis kicks in. Checks
+    /// once `job.filler` is set, i.e. once B228's synthesis kicks in. Checks
     /// `job.filler` (the wire-carried `JobSpec` field), not
     /// `job.opts.filler` — that one is `#[serde(skip)]` and, on a REAL
     /// worker process, would always read `None`; a fake worker that read it
@@ -6500,7 +6500,7 @@ mod tests {
         )
     }
 
-    /// B201/V154 — a window whose real attempts both come back short (not
+    /// B228/V171 — a window whose real attempts both come back short (not
     /// zero) of video, on a NON-final segment, is served as a filler rather
     /// than a 500 once the retry ladder is exhausted.
     ///
@@ -6510,7 +6510,7 @@ mod tests {
     /// `record_segment_outcome(Short, class); return Err(...)` — this test
     /// goes RED as `driver.await.unwrap()` returning
     /// `Err(Transcode("transcode produced an incomplete segment..."))`
-    /// instead of `Ok`, i.e. exactly the B201 500 loop.
+    /// instead of `Ok`, i.e. exactly the B228 500 loop.
     #[test]
     fn a_window_inside_a_damaged_span_serves_filler_rather_than_500() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -6567,7 +6567,7 @@ mod tests {
         );
     }
 
-    /// B201/V154 — the "no video frames at all" case reaches filler too, and
+    /// B228/V171 — the "no video frames at all" case reaches filler too, and
     /// it does so even on the title's FINAL window: `short_of_frames` fires
     /// its zero-frame check unconditionally, before the tail exemption
     /// (T113/B189) is even consulted, so a final window that produced

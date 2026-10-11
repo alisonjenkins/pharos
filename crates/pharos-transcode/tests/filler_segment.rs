@@ -1,4 +1,4 @@
-//! B201/V154 — a filler segment, produced by a REAL ffmpeg through the
+//! B228/V171 — a filler segment, produced by a REAL ffmpeg through the
 //! production argv builder, must actually be a servable segment: it must
 //! carry exactly the frames its window implies, span the window's true
 //! duration, land at the window's true position on the shared timeline (like
@@ -8,7 +8,7 @@
 //! `crates/pharos-cache/src/hls_cache.rs`'s unit tests drive a FAKE scheduler
 //! worker that never looks at the argv at all, so a broken filler argv (one
 //! that, say, still tried to decode the real — damaged — input) would 500
-//! exactly as B201 did while every one of those tests stayed green. This is
+//! exactly as B228 did while every one of those tests stayed green. This is
 //! the test that actually runs the argv `build_args_for_device` emits for a
 //! filler window through the real `ffmpeg` binary and inspects the bytes.
 //!
@@ -24,7 +24,7 @@ use pharos_transcode::{
     SegmentOpts, SegmentVideo,
 };
 
-/// 23.976 fps — the cadence the real B201 incident (and most of this
+/// 23.976 fps — the cadence the real B228 incident (and most of this
 /// library) uses, and the one the task's own expected frame count (144 over
 /// 6.006 s) is stated against.
 fn frame_rate() -> pharos_core::FrameRate {
@@ -226,7 +226,7 @@ fn has_audio_stream(path: &Path) -> bool {
         .any(|s| s["codec_type"] == "audio")
 }
 
-/// The core V154 pin: a filler for a mid-file, nonzero-start window carries
+/// The core V171 pin: a filler for a mid-file, nonzero-start window carries
 /// exactly the frames the window implies, spans the window's true duration,
 /// and lands at the window's true position — the three properties that make
 /// it a SERVABLE segment rather than a black rectangle of the wrong shape or
