@@ -30,6 +30,10 @@ const TOLERATED_PAGE_ERRORS = [
   // Symbol.iterator throw out. Tracked under T30 follow-up — Play
   // button still renders for audio so this is cosmetic.
   /Cannot read properties of undefined \(reading 'Name'\)/i,
+  // jellyfin-web 12's <emby-scrollbuttons> runs `scrollHandler` from a
+  // requestAnimationFrame that can fire after the element detached (fast
+  // navigation). Client-side race, no server involvement.
+  /scrollHandler is not a function/i,
 ];
 
 function recordErrors(page: Page) {
