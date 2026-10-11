@@ -719,8 +719,14 @@ fn push_language_clause(
     ph: &mut impl FnMut(usize) -> String,
 ) {
     let mut ors = Vec::with_capacity(langs.len());
-    for lang in langs.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-        let quoted = serde_json::to_string(&lang.to_lowercase()).unwrap_or_default();
+    // Tags are stored as the muxer wrote them (`fre`, `fra`, `fr`), so each
+    // requested language expands to every spelling of it.
+    let spellings = langs
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .flat_map(|l| pharos_core::language::language_variants(l));
+    for lang in spellings {
+        let quoted = serde_json::to_string(&lang).unwrap_or_default();
         params.push(Param::Text(format!(
             "%\"language\":{}%",
             like_escape(&quoted)
@@ -733,24 +739,25 @@ fn push_language_clause(
     }
 }
 
-/// Distinct track languages across the given `*_tracks_json` blobs, as facet
-/// buckets (count = items carrying the language), most common first. Codes
-/// are lower-cased so `ENG` and `eng` bucket together.
+/// Distinct track languages across `(*_tracks_json blob, item count)` rows, as
+/// facet buckets (count = items carrying the language), most common first.
+/// Codes are folded to ISO 639-2/B so `ENG`, `eng`, `fre` and `fra` each
+/// yield one bucket per language.
 pub(crate) fn language_facets(
-    blobs: impl IntoIterator<Item = String>,
+    blobs: impl IntoIterator<Item = (String, u32)>,
     decode: impl Fn(&str) -> Vec<Option<String>>,
 ) -> Vec<pharos_core::FacetValue> {
     let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    for blob in blobs {
+    for (blob, items) in blobs {
         let langs: std::collections::BTreeSet<String> = decode(&blob)
             .into_iter()
             .flatten()
-            .map(|l| l.trim().to_lowercase())
+            .map(|l| pharos_core::language::canonical_language(&l))
             .filter(|l| !l.is_empty())
             .collect();
         for l in langs {
             let c = counts.entry(l).or_insert(0);
-            *c = c.saturating_add(1);
+            *c = c.saturating_add(items);
         }
     }
     let mut out: Vec<pharos_core::FacetValue> = counts

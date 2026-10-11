@@ -2,6 +2,7 @@
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
 pub mod auth;
+pub mod language;
 pub mod origin;
 pub mod secret;
 pub mod segment_grid;

@@ -50,11 +50,13 @@ async fn seed() -> (web::Data<AppState>, String) {
         })
         .await
         .unwrap();
-    let rows: [(u64, &str, Vec<AudioTrack>, Vec<SubtitleTrack>); 4] = [
+    let rows: [(u64, &str, Vec<AudioTrack>, Vec<SubtitleTrack>); 5] = [
         (1, "A", vec![audio("eng"), audio("jpn")], vec![sub("eng")]),
         (2, "B", vec![audio("fre")], vec![sub("ger"), sub("eng")]),
         (3, "C", vec![audio("ENG")], vec![]),
         (4, "D", vec![], vec![]),
+        // Same languages as B, tagged with the 639-2/T spellings.
+        (5, "E", vec![audio("fra")], vec![sub("deu")]),
     ];
     for (id, title, audio_tracks, subtitle_tracks) in rows {
         stores
@@ -123,8 +125,24 @@ async fn audio_languages_matches_any_listed_language() {
     );
     assert_eq!(
         names(&state, &token, "AudioLanguages=fre,jpn").await,
-        ["A", "B"]
+        ["A", "B", "E"]
     );
+}
+
+/// B and T spellings of one language are the same language, on both sides.
+#[actix_web::test]
+async fn bibliographic_and_terminologic_codes_match_each_other() {
+    let (state, token) = seed().await;
+    for q in [
+        "AudioLanguages=fre",
+        "AudioLanguages=fra",
+        "AudioLanguages=FR",
+    ] {
+        assert_eq!(names(&state, &token, q).await, ["B", "E"], "{q}");
+    }
+    for q in ["SubtitleLanguages=ger", "SubtitleLanguages=deu"] {
+        assert_eq!(names(&state, &token, q).await, ["B", "E"], "{q}");
+    }
 }
 
 #[actix_web::test]
@@ -132,7 +150,7 @@ async fn repeated_language_keys_are_ored() {
     let (state, token) = seed().await;
     assert_eq!(
         names(&state, &token, "audioLanguages=fre&audioLanguages=jpn").await,
-        ["A", "B"]
+        ["A", "B", "E"]
     );
 }
 
@@ -146,11 +164,15 @@ async fn audio_and_subtitle_languages_are_anded() {
             "AudioLanguages=eng,fre&SubtitleLanguages=ger"
         )
         .await,
-        ["B"]
+        ["B", "E"]
     );
     assert_eq!(
         names(&state, &token, "SubtitleLanguages=eng").await,
         ["A", "B"]
+    );
+    assert_eq!(
+        names(&state, &token, "SubtitleLanguages=ger").await,
+        ["B", "E"]
     );
 }
 
@@ -158,7 +180,7 @@ async fn audio_and_subtitle_languages_are_anded() {
 async fn unknown_language_matches_nothing_and_absent_matches_all() {
     let (state, token) = seed().await;
     assert!(names(&state, &token, "AudioLanguages=zzz").await.is_empty());
-    assert_eq!(names(&state, &token, "").await.len(), 4);
+    assert_eq!(names(&state, &token, "").await.len(), 5);
 }
 
 #[actix_web::test]

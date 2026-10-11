@@ -376,13 +376,15 @@ impl PostgresStore {
                 continue;
             }
             let sql = format!(
-                "SELECT {col}, CAST('' AS TEXT), CAST(0 AS BIGINT) FROM media_items \
-                 WHERE {col} IS NOT NULL AND id IN ({matched})"
+                "SELECT {col}, CAST('' AS TEXT), COUNT(*) FROM media_items \
+                 WHERE {col} IS NOT NULL AND id IN ({matched}) GROUP BY {col}"
             );
+            // Grouping by the blob collapses items sharing a track layout
+            // (every episode of a show), so only distinct layouts are decoded.
             let blobs = run_facet(&self.pool, &sql, user, &built.params)
                 .await?
                 .into_iter()
-                .map(|f| f.value);
+                .map(|f| (f.value, f.count));
             let vals = media_query::language_facets(blobs, decode);
             if slot == 0 {
                 out.audio_languages = vals;
