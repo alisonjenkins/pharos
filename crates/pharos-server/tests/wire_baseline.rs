@@ -119,6 +119,38 @@ async fn baseline_system_info_keys() {
     );
 }
 
+/// jellyfin-web 12's playback-settings page iterates
+/// `SystemInfo.CastReceiverApplications` unguarded to fill the Chromecast
+/// receiver picker; an absent key throws `undefined is not iterable`.
+#[actix_web::test]
+async fn system_info_lists_cast_receiver_applications() {
+    let (state, token, _) = seed().await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/System/Info")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let apps = v["CastReceiverApplications"]
+        .as_array()
+        .expect("CastReceiverApplications must be an array");
+    assert!(
+        !apps.is_empty(),
+        "the picker needs at least the stable receiver"
+    );
+    for app in apps {
+        assert!(app["Id"].is_string() && app["Name"].is_string(), "{app}");
+    }
+    assert!(
+        apps.iter().any(|a| a["Id"] == v["CastReceiverId"]),
+        "the advertised CastReceiverId must be one of the listed applications"
+    );
+}
+
 #[actix_web::test]
 async fn baseline_users_me_keys() {
     let (state, token, _) = seed().await;
