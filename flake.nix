@@ -530,6 +530,10 @@
             # dependency while omitting it would make enabling the feature
             # require a rebuild rather than a config change.
             pkgs.yt-dlp
+            # VA-API driver (radeonsi_drv_video.so) for libva, which ffmpeg's
+            # VAAPI backend dlopens. Without it every VAAPI trial encode fails
+            # with "va_openDriver() returns -1".
+            pkgs.mesa
             pkgs.cacert
             pkgs.tzdata
             subtitleFonts
@@ -563,6 +567,8 @@
               # Subtitle burn-in: point libass at the prebuilt font cache
               # (see `fontsConf`) so no burn ever tries to write one.
               "FONTCONFIG_FILE=${fontsConf}/etc/fonts/fonts.conf"
+              # libva searches FHS paths that do not exist in this image.
+              "LIBVA_DRIVERS_PATH=${pkgs.mesa}/lib/dri"
             ];
             WorkingDir = "/var/lib/pharos";
           };
