@@ -161,7 +161,7 @@ async fn person_types_filters_by_credit_kind_case_insensitively() {
     let v = get_json(&state, &token, "/Persons?personTypes=actor").await;
     assert_eq!(names(&v), vec!["Bob Actor", "Carl Actor"]);
     assert_eq!(v["TotalRecordCount"], 2);
-    let v = get_json(&state, &token, "/Persons?PersonTypes=Actor,Writer").await;
+    let v = get_json(&state, &token, "/Persons?PersonTypes=Actor,Writer,Author").await;
     assert_eq!(v["TotalRecordCount"], 5);
 }
 
@@ -210,4 +210,47 @@ async fn name_filters_are_case_insensitive() {
     assert_eq!(names(&v), vec!["Ann Author", "Bob Actor"]);
     let v = get_json(&state, &token, "/Persons?searchTerm=SCREEN").await;
     assert_eq!(names(&v), vec!["Mia Screenwriter"]);
+}
+
+#[actix_web::test]
+async fn person_types_author_matches_writer_credits_on_books() {
+    let (state, token) = seed().await;
+    let uri = format!("/Persons?personTypes=Author&parentId={}", books_wire());
+    let v = get_json(&state, &token, &uri).await;
+    assert_eq!(names(&v), vec!["Ann Author", "Zed Writer"]);
+    let v = get_json(&state, &token, "/Persons?PersonTypes=Author").await;
+    assert_eq!(
+        names(&v),
+        vec!["Ann Author", "Zed Writer"],
+        "a movie's screenwriter is not an Author"
+    );
+    assert_eq!(v["TotalRecordCount"], 2);
+}
+
+#[actix_web::test]
+async fn person_types_writer_keeps_non_book_writers() {
+    let (state, token) = seed().await;
+    let v = get_json(&state, &token, "/Persons?personTypes=Writer").await;
+    assert_eq!(names(&v), vec!["Mia Screenwriter"]);
+}
+
+#[actix_web::test]
+async fn item_people_type_is_author_on_books_and_writer_elsewhere() {
+    let (state, token) = seed().await;
+    let book = get_json(&state, &token, "/Items/1").await;
+    let book_types: Vec<&str> = book["People"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["Type"].as_str().unwrap())
+        .collect();
+    assert_eq!(book_types, vec!["Author", "Author"]);
+    let movie = get_json(&state, &token, "/Items/3").await;
+    let mia = movie["People"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["Name"] == "Mia Screenwriter")
+        .unwrap();
+    assert_eq!(mia["Type"], "Writer");
 }

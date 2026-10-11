@@ -276,6 +276,15 @@ impl PersonKind {
         }
     }
 
+    /// Jellyfin `PersonKind` token for a credit on an item: ebook authors
+    /// are stored as `Writer` but Jellyfin's Books UI keys on `Author`.
+    pub fn wire_type(self, on_book: bool) -> &'static str {
+        match (self, on_book) {
+            (PersonKind::Writer, true) => "Author",
+            _ => self.as_str(),
+        }
+    }
+
     /// LIB-C2 — parse a stored / wire `PersonType` token back into a
     /// kind. Unknown tokens (and the empty string from a legacy row) fall
     /// back to [`PersonKind::Other`] so a stray value never drops the
