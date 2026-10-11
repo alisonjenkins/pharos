@@ -37,8 +37,18 @@ proxy.on("error", (err, _req, res) => {
   if (res && res.writeHead && !res.headersSent) {
     res.writeHead(502, { "content-type": "text/plain" });
     res.end("jf-proxy upstream error: " + err.message);
+  } else if (res && res.destroy) {
+    // WebSocket upgrade: `res` is the raw client socket.
+    console.error("jf-proxy upgrade error:", err.message);
+    res.destroy();
   }
 });
+
+// Node removes the default socket error listener on 'upgrade', so a client
+// reset before or after the upgrade would otherwise be an unhandled 'error'.
+function guardSocket(socket, peer) {
+  socket.on("error", () => peer.destroy());
+}
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -91,7 +101,22 @@ const server = http.createServer((req, res) => {
   proxy.web(req, res);
 });
 // Forward the /socket WebSocket upgrade to pharos.
-server.on("upgrade", (req, socket, head) => proxy.ws(req, socket, head));
+server.on("upgrade", (req, socket, head) => {
+  socket.on("error", () => {
+    if (req.upstreamReq) req.upstreamReq.destroy();
+    socket.destroy();
+  });
+  proxy.ws(req, socket, head);
+});
+// Upstream side: a non-101 reply is relayed by http-proxy; reset errors on the
+// reply or the upgraded socket must tear down the client instead of crashing.
+proxy.on("proxyReqWs", (proxyReq, req, socket) => {
+  req.upstreamReq = proxyReq;
+  proxyReq.on("response", (res) => {
+    res.on("error", () => socket.destroy());
+  });
+  proxyReq.on("upgrade", (_res, proxySocket) => guardSocket(proxySocket, socket));
+});
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`jf-proxy listening on http://127.0.0.1:${PORT} → ${TARGET}`);
 });
