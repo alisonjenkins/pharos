@@ -819,6 +819,7 @@ fn play_queue_reason(r: &str) -> String {
         "queue" => "Queue",
         "queue_next" => "QueueNext",
         "remove_items" => "RemoveItems",
+        "move_item" => "MoveItem",
         "next_item" => "NextItem",
         "previous_item" => "PreviousItem",
         "repeat_mode" => "RepeatMode",
@@ -1336,6 +1337,7 @@ mod tests {
             ("queue", "Queue"),
             ("queue_next", "QueueNext"),
             ("remove_items", "RemoveItems"),
+            ("move_item", "MoveItem"),
         ] {
             let out = translate_outbound(
                 ServerMsg::PlayQueue {

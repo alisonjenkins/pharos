@@ -53,9 +53,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/syncplay/removefromplaylist",
             web::post().to(remove_from_playlist),
         )
-        // Not yet modelled by the engine — accept + ignore so the client's
-        // flow isn't broken by a 404.
-        .route("/syncplay/moveplaylistitem", web::post().to(no_op_204));
+        .route(
+            "/syncplay/moveplaylistitem",
+            web::post().to(move_playlist_item),
+        );
 }
 
 fn no_content() -> HttpResponse {
@@ -436,6 +437,15 @@ struct RemoveFromPlaylistBody {
     clear_playlist: bool,
     #[serde(default)]
     clear_playing_item: bool,
+}
+
+/// `/SyncPlay/MovePlaylistItem` body — `MovePlaylistItemRequestDto`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MovePlaylistItemBody {
+    playlist_item_id: String,
+    #[serde(default)]
+    new_index: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -937,6 +947,29 @@ async fn remove_from_playlist(
     .await
 }
 
+async fn move_playlist_item(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+    body: web::Json<MovePlaylistItemBody>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "moveplaylistitem",
+        move |mid| GroupMsg::MovePlaylistItem {
+            sender: mid,
+            playlist_item_id: body.playlist_item_id,
+            new_index: body.new_index,
+        },
+    )
+    .await
+}
+
 async fn next_item(
     auth: AuthSession,
     hub: web::Data<SessionHub>,
@@ -1105,10 +1138,6 @@ async fn list_groups(
         }
     }
     crate::api::jellyfin::wire::json(&out)
-}
-
-async fn no_op_204(_user: AuthUser) -> impl Responder {
-    HttpResponse::NoContent().finish()
 }
 
 fn now_iso8601() -> String {

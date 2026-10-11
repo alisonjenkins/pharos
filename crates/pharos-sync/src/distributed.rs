@@ -156,6 +156,15 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             clear_playlist,
             clear_playing_item,
         },
+        GroupMsg::MovePlaylistItem {
+            sender,
+            playlist_item_id,
+            new_index,
+        } => RemoteCommand::MovePlaylistItem {
+            sender,
+            playlist_item_id,
+            new_index,
+        },
         GroupMsg::SetPlaylistItem {
             sender,
             playlist_item_id,
