@@ -47,7 +47,10 @@ proxy.on("error", (err, _req, res) => {
 // Node removes the default socket error listener on 'upgrade', so a client
 // reset before or after the upgrade would otherwise be an unhandled 'error'.
 function guardSocket(socket, peer) {
-  socket.on("error", () => peer.destroy());
+  socket.on("error", (err) => {
+    console.error("jf-proxy upgraded socket error:", err.message);
+    peer.destroy();
+  });
 }
 
 const MIME = {
@@ -102,7 +105,8 @@ const server = http.createServer((req, res) => {
 });
 // Forward the /socket WebSocket upgrade to pharos.
 server.on("upgrade", (req, socket, head) => {
-  socket.on("error", () => {
+  socket.on("error", (err) => {
+    console.error("jf-proxy client socket error:", err.message);
     if (req.upstreamReq) req.upstreamReq.destroy();
     socket.destroy();
   });
@@ -116,7 +120,10 @@ proxy.on("proxyReqWs", (proxyReq, req, socket) => {
   socket.once("end", tearDownUpstream);
   socket.once("close", tearDownUpstream);
   proxyReq.on("response", (res) => {
-    res.on("error", () => socket.destroy());
+    res.on("error", (err) => {
+      console.error("jf-proxy upstream reply error:", err.message);
+      socket.destroy();
+    });
   });
   proxyReq.on("upgrade", (_res, proxySocket) => guardSocket(proxySocket, socket));
 });
