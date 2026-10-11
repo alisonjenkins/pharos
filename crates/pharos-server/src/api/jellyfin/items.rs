@@ -316,6 +316,25 @@ struct NameGuidFacetDto<'a> {
     id: &'a str,
 }
 
+/// A `NameValuePair` facet element (`AudioLanguages` / `SubtitleLanguages` in
+/// `QueryFilters`): `Name` is the display name, `Value` the code a
+/// `?AudioLanguages=` chip sends back.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct NameValueFacetDto {
+    name: String,
+    value: String,
+}
+
+fn language_facet_pairs(fs: &[pharos_core::FacetValue]) -> Vec<NameValueFacetDto> {
+    fs.iter()
+        .map(|f| NameValueFacetDto {
+            name: pharos_jellyfin_api::dto::language_display_name(&f.value),
+            value: f.value.clone(),
+        })
+        .collect()
+}
+
 /// A facet value carrying its item count — the element type of the pharos
 /// `FacetCounts` extension (not part of the SDK `QueryFilters`; strict clients
 /// ignore the whole unknown block).
@@ -350,6 +369,8 @@ struct QueryFiltersDto<'a> {
     tags: Vec<&'a str>,
     official_ratings: Vec<&'a str>,
     years: Vec<i64>,
+    audio_languages: Vec<NameValueFacetDto>,
+    subtitle_languages: Vec<NameValueFacetDto>,
     facet_counts: FacetCountsDto<'a>,
 }
 
@@ -449,7 +470,11 @@ async fn items_filters2(
     let Some(base) = build_facet_base(&state, user.0.id, &q).await? else {
         return Ok(crate::api::jellyfin::wire::json(&QueryFiltersDto::default()));
     };
-    let req = FacetRequest::default();
+    let req = FacetRequest {
+        audio_languages: true,
+        subtitle_languages: true,
+        ..FacetRequest::default()
+    };
     let facets = state
         .stores
         .facets(&base, &req)
@@ -467,6 +492,8 @@ async fn items_filters2(
         .filter_map(|f| f.value.parse::<i64>().ok())
         .collect();
     Ok(crate::api::jellyfin::wire::json(&QueryFiltersDto {
+        audio_languages: language_facet_pairs(&facets.audio_languages),
+        subtitle_languages: language_facet_pairs(&facets.subtitle_languages),
         genres: name_guid_facets(&facets.genres),
         studios: name_guid_facets(&facets.studios),
         tags,
@@ -3577,6 +3604,15 @@ fn parse_kind_filter(include: Option<&str>) -> KindFilter {
     }
 }
 
+fn split_csv(raw: Option<&str>) -> Vec<String> {
+    raw.into_iter()
+        .flat_map(|r| r.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
     match parse_kind_filter(include) {
         KindFilter::Unset => items,
@@ -3903,6 +3939,13 @@ struct ListQuery {
     /// without. Real Jellyfin honours both directions.
     #[serde(default)]
     has_subtitles: Option<bool>,
+    /// `AudioLanguages` / `SubtitleLanguages`: comma-CSV (jellyfin-web's
+    /// repeated keys are merged by `CiQuery`). OR within one list, AND
+    /// across the two.
+    #[serde(default)]
+    audio_languages: Option<String>,
+    #[serde(default)]
+    subtitle_languages: Option<String>,
     /// Resolution-category booleans jellyfin-web's "Quality" filter
     /// chips send. We compare against `probe.width` since aspect
     /// ratios vary and height alone undercounts widescreen content.
@@ -5012,6 +5055,8 @@ fn build_media_query(
         f.media_type_kinds = kinds;
     }
     f.has_subtitles = q.has_subtitles;
+    f.audio_languages = split_csv(q.audio_languages.as_deref());
+    f.subtitle_languages = split_csv(q.subtitle_languages.as_deref());
     f.is_4k = q.is_4k;
     f.is_hd = q.is_hd;
     f.is_3d = q.is_3d;

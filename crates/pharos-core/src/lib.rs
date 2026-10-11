@@ -2774,6 +2774,12 @@ pub struct MediaFilters {
     /// when the `item_genres` entity join is empty (un-backfilled pre-LIB-C4
     /// rows), preserving the legacy `restrict_to_parent` genre fallback.
     pub genre_probe_token: Option<String>,
+    /// `AudioLanguages` — keep items with at least one audio track whose
+    /// language is in this set (case-insensitive). Empty = inert.
+    pub audio_languages: Vec<String>,
+    /// `SubtitleLanguages` — as [`MediaFilters::audio_languages`], over the
+    /// embedded subtitle tracks.
+    pub subtitle_languages: Vec<String>,
 }
 
 impl MediaFilters {
@@ -2795,6 +2801,8 @@ impl MediaFilters {
             || !self.genre_probe_names.is_empty()
             || self.path_prefix.is_some()
             || self.genre_probe_token.is_some()
+            || !self.audio_languages.is_empty()
+            || !self.subtitle_languages.is_empty()
     }
 }
 
@@ -2841,6 +2849,10 @@ pub struct FacetRequest {
     pub years: bool,
     pub official_ratings: bool,
     pub people: bool,
+    /// Distinct audio-track language codes in scope.
+    pub audio_languages: bool,
+    /// Distinct embedded subtitle-track language codes in scope.
+    pub subtitle_languages: bool,
 }
 
 impl Default for FacetRequest {
@@ -2855,6 +2867,8 @@ impl Default for FacetRequest {
             years: true,
             official_ratings: true,
             people: false,
+            audio_languages: false,
+            subtitle_languages: false,
         }
     }
 }
@@ -2868,6 +2882,8 @@ impl FacetRequest {
             || self.years
             || self.official_ratings
             || self.people
+            || self.audio_languages
+            || self.subtitle_languages
     }
 }
 
@@ -2899,6 +2915,10 @@ pub struct MediaFacets {
     pub years: Vec<FacetValue>,
     pub official_ratings: Vec<FacetValue>,
     pub people: Vec<FacetValue>,
+    /// Audio languages, most common first; `value == wire_id ==` the
+    /// lower-cased stored language code.
+    pub audio_languages: Vec<FacetValue>,
+    pub subtitle_languages: Vec<FacetValue>,
 }
 
 pub trait MediaStore: Send + Sync {
