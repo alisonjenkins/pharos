@@ -1227,28 +1227,137 @@ async fn item_tags_remove(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Query params of `GET /Persons` (jellyfin-web's Books "Authors" tab and
+/// the A-Z picker). Unknown params are ignored.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct PersonsQuery {
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    person_types: Option<String>,
+    #[serde(default)]
+    start_index: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    name_starts_with: Option<String>,
+    #[serde(default)]
+    name_starts_with_or_greater: Option<String>,
+    #[serde(default)]
+    name_less_than: Option<String>,
+    #[serde(default)]
+    search_term: Option<String>,
+}
+
+/// Per-person credit counts restricted to the items under `ParentId` and/or
+/// the credit kinds in `PersonTypes`. `None` when neither param is present
+/// (the unscoped `people_with_counts` totals apply). An unknown `ParentId`
+/// yields an empty map.
+async fn scoped_person_counts(
+    state: &AppState,
+    policy: &pharos_core::UserPolicy,
+    q: &PersonsQuery,
+) -> Result<Option<std::collections::HashMap<String, u32>>, actix_web::Error> {
+    use pharos_core::{MediaQuery, PersonStore};
+    let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+    let wanted: Vec<String> = split_tag_csv(q.person_types.as_deref())
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let parent = resolve_parent_filter(state, q.parent_id.as_deref()).await?;
+    if wanted.is_empty() && matches!(parent, ParentResolution::All) {
+        return Ok(None);
+    }
+    let mut counts = std::collections::HashMap::new();
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(Some(counts));
+    }
+    let mut mq = MediaQuery::default();
+    match &parent {
+        ParentResolution::Filter(pf) => mq.parent = Some(pf.clone()),
+        ParentResolution::PathPrefix(p) => mq.filters.path_prefix = Some(p.clone()),
+        ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t.clone()),
+        ParentResolution::All | ParentResolution::Empty => {}
+    }
+    apply_policy_scope(&mut mq, policy, &state.parental_ratings);
+    let (items, _total) = state.stores.query(&mq).await.map_err(ise)?;
+    for item in &items {
+        let credits = state.stores.people_for_item(item.id).await.map_err(ise)?;
+        for credit in credits {
+            let kind = credit.kind.as_str().to_ascii_lowercase();
+            if wanted.is_empty() || wanted.contains(&kind) {
+                let n = counts.entry(credit.wire_id).or_insert(0u32);
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+    Ok(Some(counts))
+}
+
 /// `GET /Persons` — LIB-C2: people (cast & crew) as entity rows. Lists
-/// every person with its item count, name-ordered, `Id` = the 32-hex
-/// person wire id (= `people.wire_id` = `person_id_for(name)`), so a
-/// client click routes to `/Items?ParentId=<person id>` which
+/// people with their item count, name-ordered (case-insensitive), `Id` =
+/// the 32-hex person wire id (= `people.wire_id` = `person_id_for(name)`),
+/// so a client click routes to `/Items?ParentId=<person id>` which
 /// `restrict_to_parent` resolves via the `item_people` indexed join.
+/// `ParentId` / `PersonTypes` scope the list to people credited on the
+/// items under that parent / with those credit kinds (count = scoped
+/// credits); the name params and `StartIndex` / `Limit` filter and page it.
 /// Unlike /Genres there is no backfill (no legacy people column).
 async fn list_persons(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
+    q: CiQuery<PersonsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::PersonStore;
+    let q = q.into_inner();
     let rows = state
         .stores
         .people_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|pc| person_dto(&state, pc.person.clone(), pc.item_count))
+    let scoped = scoped_person_counts(&state, &user.0.policy, &q).await?;
+    let lower = |s: &Option<String>| s.as_deref().map(str::to_lowercase);
+    let starts_with = lower(&q.name_starts_with);
+    let or_greater = lower(&q.name_starts_with_or_greater);
+    let less_than = lower(&q.name_less_than);
+    let search = lower(&q.search_term);
+    let mut keyed: Vec<(String, pharos_core::Person, u32)> = rows
+        .into_iter()
+        .filter_map(|pc| {
+            let count = match &scoped {
+                Some(counts) => *counts.get(&pc.person.wire_id)?,
+                None => pc.item_count,
+            };
+            let name = pc.person.name.to_lowercase();
+            let sort_key = pc
+                .person
+                .sort_name
+                .as_deref()
+                .unwrap_or(&pc.person.name)
+                .to_lowercase();
+            let keep = starts_with.as_deref().map_or(true, |p| name.starts_with(p))
+                && or_greater
+                    .as_deref()
+                    .map_or(true, |p| sort_key.as_str() >= p)
+                && less_than.as_deref().map_or(true, |p| sort_key.as_str() < p)
+                && search.as_deref().map_or(true, |p| name.contains(p));
+            keep.then_some((sort_key, pc.person, count))
+        })
         .collect();
-    let total = items.len() as u32;
-    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let total = u32::try_from(keyed.len()).unwrap_or(u32::MAX);
+    let start = q.start_index.unwrap_or(0);
+    let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    let items: Vec<serde_json::Value> = keyed
+        .into_iter()
+        .skip(start as usize)
+        .take(take)
+        .map(|(_, person, count)| person_dto(&state, person, count))
+        .collect();
+    Ok(crate::api::jellyfin::wire::query_result(
+        items, total, start,
+    ))
 }
 
 /// `GET /Persons/{id}` — LIB-C2: a single Person item resolved by its
