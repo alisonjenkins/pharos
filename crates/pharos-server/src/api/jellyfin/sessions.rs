@@ -126,25 +126,36 @@ struct CapabilitiesBody {
     id: Option<String>,
 }
 
+/// The `/Sessions` view for one caller: admins see every active session,
+/// non-admins only their own (V9: user A must not read user B's now-playing
+/// item). Shared by `GET /Sessions` and the `/socket` `SessionsStart` push.
+pub(crate) async fn visible_sessions(
+    state: &AppState,
+    user_id_hex: &str,
+    admin: bool,
+) -> Result<Vec<crate::sessions::SessionRecord>, String> {
+    let snap = state.sessions.snapshot().await.map_err(|e| e.to_string())?;
+    Ok(if admin {
+        snap
+    } else {
+        snap.into_iter()
+            .filter(|s| s.user_id == user_id_hex)
+            .collect()
+    })
+}
+
 async fn list_sessions(
     state: web::Data<AppState>,
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let snap = state
-        .sessions
-        .snapshot()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // Real Jellyfin: admins see every active session, non-admins only
-    // their own. Bare `_user: AuthUser` (no filter) was a V9 leak —
-    // user A could read user B's now-playing item via /Sessions.
-    let filtered: Vec<_> = if user.0.policy.admin {
-        snap
-    } else {
-        let bearer = user.0.id.0.simple().to_string();
-        snap.into_iter().filter(|s| s.user_id == bearer).collect()
-    };
-    Ok(crate::api::jellyfin::wire::json(&filtered))
+    let visible = visible_sessions(
+        &state,
+        &user.0.id.0.simple().to_string(),
+        user.0.policy.admin,
+    )
+    .await
+    .map_err(error::ErrorInternalServerError)?;
+    Ok(crate::api::jellyfin::wire::json(&visible))
 }
 
 async fn playing_started(
