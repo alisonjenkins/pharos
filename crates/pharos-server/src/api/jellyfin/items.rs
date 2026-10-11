@@ -163,7 +163,8 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         web::delete().to(collection_items_remove),
     )
     .route("/collections", web::post().to(create_collection))
-    .route("/collections", web::get().to(list_collections));
+    .route("/collections", web::get().to(list_collections))
+    .route("/items/{id}/collections", web::get().to(item_collections));
     // /Shows/NextUp has a real impl now that episode hierarchy
     // exists. Keep it after the empty-stub loop so the route is
     // registered with our handler.
@@ -1317,6 +1318,46 @@ async fn list_collections(
         .iter()
         .map(|cc| collection_dto(&state, &cc.collection, cc.item_count))
         .collect();
+    let total = items.len() as u32;
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
+}
+
+/// `GET /Items/{itemId}/Collections` (Jellyfin 12) — the box sets that
+/// contain one item. Membership is looked up per collection through
+/// `collection_items`, the same join `/Items?ParentId=<collection id>`
+/// uses. A real item in no box set yields an empty result; an unknown
+/// item id is 404, as in Jellyfin. Synthesised ids (series, library,
+/// box set) are never box-set members, so they yield an empty result.
+async fn item_collections(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let raw = path.into_inner();
+    let canonical = canonical_wire_id(&raw);
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) {
+        state.stores.get(id).await.map_err(|e| match e {
+            pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+            other => error::ErrorInternalServerError(other.to_string()),
+        })?;
+        let rows = state
+            .stores
+            .collections_with_counts()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for cc in &rows {
+            let members = state
+                .stores
+                .collection_items(&cc.collection.wire_id)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            if members.contains(&id) {
+                items.push(collection_dto(&state, &cc.collection, cc.item_count));
+            }
+        }
+    }
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
