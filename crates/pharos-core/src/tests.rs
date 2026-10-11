@@ -836,6 +836,19 @@ fn sort_name_pads_digit_runs_so_numbers_compare_by_value() {
 }
 
 #[test]
+fn sort_name_clamps_runs_longer_than_the_pad_width() {
+    let twenty = "9".repeat(20);
+    let long = "1".repeat(22);
+    let longer = "2".repeat(25);
+    assert!(sort_name(&format!("Ep {twenty}")) <= sort_name(&format!("Ep {long}")));
+    assert_eq!(
+        sort_name(&format!("Ep {long}")),
+        sort_name(&format!("Ep {longer}"))
+    );
+    assert!(sort_name("Ep 5") < sort_name(&format!("Ep {long}")));
+}
+
+#[test]
 fn sort_name_folds_unicode_case_like_title_fold() {
     assert_eq!(sort_name("Émile"), "Émile".to_lowercase());
 }
