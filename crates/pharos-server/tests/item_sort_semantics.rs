@@ -27,6 +27,9 @@ struct Row {
     /// `(album, year)` makes the row an audio track on that album.
     album: Option<(&'static str, u32)>,
     rating: Option<&'static str>,
+    /// `(series name, series year)` makes the row an episode of that show.
+    series: Option<(&'static str, u32)>,
+    created: Option<i64>,
 }
 
 impl Row {
@@ -41,6 +44,8 @@ impl Row {
             plays: None,
             album: None,
             rating: None,
+            series: None,
+            created: None,
         }
     }
 }
@@ -67,15 +72,24 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                 title: r.title.into(),
                 kind: if r.album.is_some() {
                     MediaKind::Audio
+                } else if r.series.is_some() {
+                    MediaKind::Episode
                 } else {
                     MediaKind::Movie
                 },
+                series: r.series.map(|(name, year)| pharos_core::SeriesInfo {
+                    series_name: name.to_string(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    series_folder: Some(format!("/tv/{name}")),
+                    series_year: Some(year),
+                }),
                 probe: pharos_core::MediaProbe {
                     album: r.album.map(|(a, _)| a.to_string()),
                     year: r.album.map(|(_, y)| y),
                     ..Default::default()
                 },
-                created_at: Some(1_000),
+                created_at: Some(r.created.unwrap_or(1_000)),
                 metadata: MediaMetadata {
                     production_year: r.year,
                     premiere_date: r.premiere,
@@ -261,6 +275,67 @@ async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
         desc,
         vec!["NC17", "TvMa", "R", "Fifteen", "Pg13", "G", "TvY", "Unrated", "Blank", "None"]
     );
+}
+
+/// One episode per show; the episode title is irrelevant to series order.
+fn show_rows() -> Vec<Row> {
+    let ep = |id: u64, show: &'static str, year: u32, created: i64| Row {
+        series: Some((show, year)),
+        created: Some(created),
+        ..Row::new(id, "Pilot")
+    };
+    vec![
+        ep(1, "Bravo", 2001, 10),
+        ep(2, "The Delta", 2005, 5),
+        ep(3, "Alpha", 1999, 30),
+        ep(4, "Charlie", 2001, 20),
+        // A later episode of Bravo makes it the most recently added show.
+        ep(5, "Bravo", 2001, 40),
+    ]
+}
+
+#[actix_web::test]
+async fn series_tiles_pair_each_sort_key_with_its_own_sort_order() {
+    let (state, token) = seed(show_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let base = "IncludeItemTypes=Series&Recursive=true";
+    let name_asc = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=ProductionYear,SortName&SortOrder=Descending,Ascending")
+    );
+    assert_eq!(name_asc, vec!["The Delta", "Bravo", "Charlie", "Alpha"]);
+    let name_desc = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=ProductionYear,SortName&SortOrder=Descending,Descending")
+    );
+    assert_eq!(name_desc, vec!["The Delta", "Charlie", "Bravo", "Alpha"]);
+    let premiere = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=PremiereDate,SortName&SortOrder=Ascending")
+    );
+    assert_eq!(premiere, vec!["Alpha", "Bravo", "Charlie", "The Delta"]);
+    // SortName drops the leading article, so "The Delta" sorts under D.
+    let by_name = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=SortName&SortOrder=Descending")
+    );
+    assert_eq!(by_name, vec!["The Delta", "Charlie", "Bravo", "Alpha"]);
+}
+
+#[actix_web::test]
+async fn series_tiles_sort_by_newest_episode_added() {
+    let (state, token) = seed(show_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(
+        &app,
+        token.as_str(),
+        "IncludeItemTypes=Series&Recursive=true&SortBy=DateCreated&SortOrder=Descending"
+    );
+    assert_eq!(got, vec!["Bravo", "Alpha", "Charlie", "The Delta"]);
 }
 
 fn titled(titles: &[&'static str]) -> Vec<Row> {

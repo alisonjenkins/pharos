@@ -5128,6 +5128,85 @@ fn sort_needs_chain(sort_by: Option<&str>, orders: &[bool]) -> bool {
     })
 }
 
+/// Whether `SortBy` token `i` sorts descending: it takes `SortOrder` token `i`,
+/// a shorter list repeats its last entry, an absent one is ascending —
+/// Jellyfin's rule.
+fn sort_desc_at(orders: &[bool], i: usize) -> bool {
+    orders
+        .get(i)
+        .or_else(|| orders.last())
+        .copied()
+        .unwrap_or(false)
+}
+
+/// One sortable value of a synthesised row (a series tile, an album). `Missing`
+/// is smallest, like NULL in the SQL chain, so an unknown year or rating lands
+/// at the same end as it does for stored rows.
+#[derive(Debug, Clone, PartialEq)]
+enum SortVal {
+    Missing,
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+impl SortVal {
+    fn cmp_to(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Missing, Self::Missing) => Ordering::Equal,
+            (Self::Missing, _) => Ordering::Less,
+            (_, Self::Missing) => Ordering::Greater,
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Float(a), Self::Float(b)) => a.total_cmp(b),
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            // A key yields one variant for every row, so this is unreachable
+            // in practice; equal keeps the sort total rather than panicking.
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn opt_int(v: Option<i64>) -> Self {
+        v.map_or(Self::Missing, Self::Int)
+    }
+
+    fn opt_float(v: Option<f32>) -> Self {
+        v.map_or(Self::Missing, |f| Self::Float(f64::from(f)))
+    }
+}
+
+/// Order two synthesised rows by `chain`; `value` yields a row's value for a
+/// key. The caller keeps its own stable order as the final tiebreak.
+fn compare_by_chain<T>(
+    a: &T,
+    b: &T,
+    chain: &[(pharos_core::SortKey, pharos_core::SortDir)],
+    value: impl Fn(&T, pharos_core::SortKey) -> SortVal,
+) -> std::cmp::Ordering {
+    for (key, dir) in chain {
+        let ord = value(a, *key).cmp_to(&value(b, *key));
+        let ord = match dir {
+            pharos_core::SortDir::Asc => ord,
+            pharos_core::SortDir::Desc => ord.reverse(),
+        };
+        if ord.is_ne() {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Unix seconds of 1 January `year` (UTC), for ranking a bare year against
+/// full premiere dates.
+fn year_start_epoch(year: i32) -> i64 {
+    let y = i64::from(year) - 1;
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    // Day-of-year of 1 January in a March-based year is 306.
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + 306;
+    (era * 146_097 + doe - 719_468) * 86_400
+}
+
 /// The `(key, direction)` chain for a multi-key `SortBy`, each token paired
 /// with its `SortOrder` token (a shorter list repeats its last entry, an
 /// absent one is ascending — Jellyfin's rule). The caller's builder appends
@@ -5140,12 +5219,11 @@ fn sort_chain(
     use pharos_core::{SortDir, SortKey};
     let mut chain: Vec<(SortKey, SortDir)> = Vec::new();
     for (i, token) in sort_tokens(sort_by).into_iter().enumerate() {
-        let desc = orders
-            .get(i)
-            .or_else(|| orders.last())
-            .copied()
-            .unwrap_or(false);
-        let dir = if desc { SortDir::Desc } else { SortDir::Asc };
+        let dir = if sort_desc_at(orders, i) {
+            SortDir::Desc
+        } else {
+            SortDir::Asc
+        };
         let keys: Vec<SortKey> = match (token, sort_token_primary(token)) {
             ("ParentIndexNumber", _) if episode_scoped => vec![SortKey::SeasonNumber],
             ("ParentIndexNumber", _) => vec![SortKey::DiscNumber],
@@ -6565,6 +6643,68 @@ fn name_matches_letter(name: &str, prefix_lower: &str) -> bool {
     }
 }
 
+/// What a synthesised Series tile can be sorted by.
+#[derive(Debug, Default)]
+struct ShowSortKeys {
+    name: String,
+    premiere_date: Option<i64>,
+    production_year: Option<i64>,
+    community_rating: Option<f32>,
+    official_rating_rank: i32,
+    /// Newest episode's `created_at`, so a show with a fresh episode surfaces
+    /// in "recently added".
+    created_at: Option<i64>,
+}
+
+impl ShowSortKeys {
+    fn for_series(
+        series: &pharos_core::SeriesInfo,
+        meta: Option<&pharos_core::SeriesMetadata>,
+    ) -> Self {
+        let year = series.series_year.and_then(|y| i32::try_from(y).ok());
+        Self {
+            name: series.series_name.clone(),
+            premiere_date: meta
+                .and_then(|m| m.premiere_date)
+                .or_else(|| year.map(year_start_epoch)),
+            production_year: year.map(i64::from),
+            community_rating: meta.and_then(|m| m.community_rating),
+            official_rating_rank: meta
+                .and_then(|m| m.official_rating.as_deref())
+                .map_or(0, pharos_core::parental_rank::parental_rating_rank),
+            created_at: None,
+        }
+    }
+
+    fn supports(key: pharos_core::SortKey) -> bool {
+        use pharos_core::SortKey;
+        matches!(
+            key,
+            SortKey::Name
+                | SortKey::SortName
+                | SortKey::PremiereDate
+                | SortKey::ProductionYear
+                | SortKey::CommunityRating
+                | SortKey::ParentalRating
+                | SortKey::DateCreated
+        )
+    }
+
+    fn value(&self, key: pharos_core::SortKey) -> SortVal {
+        use pharos_core::SortKey;
+        match key {
+            SortKey::Name => SortVal::Text(self.name.to_lowercase()),
+            SortKey::SortName => SortVal::Text(pharos_core::sort_name(&self.name)),
+            SortKey::PremiereDate => SortVal::opt_int(self.premiere_date),
+            SortKey::ProductionYear => SortVal::opt_int(self.production_year),
+            SortKey::CommunityRating => SortVal::opt_float(self.community_rating),
+            SortKey::ParentalRating => SortVal::Int(i64::from(self.official_rating_rank)),
+            SortKey::DateCreated => SortVal::opt_int(self.created_at),
+            _ => SortVal::Missing,
+        }
+    }
+}
+
 async fn maybe_list_virtual_shows(
     state: &AppState,
     user_id: UserId,
@@ -6638,7 +6778,7 @@ async fn maybe_list_virtual_shows(
     }
 
     // Build one representative DTO per distinct key, name-sorted.
-    let mut reps: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut reps: BTreeMap<String, (ShowSortKeys, serde_json::Value)> = BTreeMap::new();
     match mode {
         ShowFolderKind::Series => {
             use pharos_core::SeriesMetadataStore;
@@ -6679,9 +6819,13 @@ async fn maybe_list_virtual_shows(
                     .unwrap_or(0);
                 let episode_count = series_eps.get(&skey).copied().unwrap_or(0);
                 let meta = meta_map.get(series.series_key());
-                reps.entry(sort_key).or_insert_with(|| {
-                    series_dto(&state.server_id, series, season_count, episode_count, meta)
+                let slot = reps.entry(sort_key).or_insert_with(|| {
+                    (
+                        ShowSortKeys::for_series(series, meta),
+                        series_dto(&state.server_id, series, season_count, episode_count, meta),
+                    )
                 });
+                slot.0.created_at = slot.0.created_at.max(ep.created_at);
             }
         }
         ShowFolderKind::Season => {
@@ -6696,22 +6840,43 @@ async fn maybe_list_virtual_shows(
                 let sort_key = format!("{season_n:06}");
                 let episode_count = season_eps.get(&season_n).copied().unwrap_or(0);
                 reps.entry(sort_key).or_insert_with(|| {
-                    season_dto(
-                        &state.server_id,
-                        series,
-                        season_n,
-                        &season_display_name(season_n),
-                        episode_count,
+                    (
+                        ShowSortKeys::default(),
+                        season_dto(
+                            &state.server_id,
+                            series,
+                            season_n,
+                            &season_display_name(season_n),
+                            episode_count,
+                        ),
                     )
                 });
             }
         }
     }
 
-    let mut items: Vec<serde_json::Value> = reps.into_values().collect();
-    if descending {
-        items.reverse();
+    let mut rows: Vec<(ShowSortKeys, serde_json::Value)> = reps.into_values().collect();
+    // Seasons keep their numeric order (only direction follows SortOrder); a
+    // series list honours the requested keys, falling back to name order when
+    // none of them applies to a series tile.
+    let chain: Vec<_> = match (mode, q.sort_by.as_deref()) {
+        (ShowFolderKind::Series, Some(raw)) => {
+            sort_chain(raw, &parse_sort_orders(q.sort_order.as_deref()), false)
+                .into_iter()
+                .filter(|(key, _)| ShowSortKeys::supports(*key))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    if chain.is_empty() {
+        if descending {
+            rows.reverse();
+        }
+    } else {
+        // Stable: ties keep the name-then-folder order the map produced.
+        rows.sort_by(|a, b| compare_by_chain(&a.0, &b.0, &chain, ShowSortKeys::value));
     }
+    let mut items: Vec<serde_json::Value> = rows.into_iter().map(|(_, dto)| dto).collect();
     let total = items.len() as u32;
     let start = q.start_index as usize;
     let end = start.saturating_add(q.take_limit()).min(items.len());
