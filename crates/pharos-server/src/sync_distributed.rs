@@ -236,8 +236,18 @@ pub async fn build(
         loop {
             match cmd_rx.recv().await {
                 Ok(payload) => {
-                    if let Ok(BusMsg::Command { group_id, cmd }) = serde_json::from_str(&payload) {
-                        let _ = reg.deliver_command(group_id, cmd).await;
+                    match serde_json::from_str::<BusMsg>(&payload) {
+                        Ok(BusMsg::Command { group_id, cmd }) => {
+                            let _ = reg.deliver_command(group_id, cmd).await;
+                        }
+                        Ok(BusMsg::Deliver { .. }) => {}
+                        // A command variant this build does not know (a newer
+                        // replica mid rolling deploy) lands here and is lost;
+                        // count it so the skew is visible rather than silent.
+                        Err(e) => {
+                            tracing::warn!(error = %e, "syncplay: undecodable bus envelope dropped");
+                            metrics::counter!("pharos_syncplay_bus_undecodable_total").increment(1);
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

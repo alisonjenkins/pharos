@@ -260,3 +260,48 @@ pub(crate) fn spawn_remote_handle(
         epoch_unix_ms,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::group::QueueMode;
+    use crate::messages::MemberId;
+
+    /// A command crosses the bus as JSON; it must come back as the same
+    /// `GroupMsg` the owner's actor would have received locally.
+    fn survives_the_bus(make: impl Fn() -> GroupMsg) {
+        let cmd = to_remote_command(make()).expect("forwardable");
+        let wire = serde_json::to_string(&cmd).unwrap();
+        let back: RemoteCommand = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            format!("{:?}", back.into_group_msg()),
+            format!("{:?}", make())
+        );
+    }
+
+    #[test]
+    fn queue_commands_round_trip_over_the_bus() {
+        let sender = MemberId::new();
+        for mode in [QueueMode::Queue, QueueMode::QueueNext] {
+            survives_the_bus(|| GroupMsg::Queue {
+                sender,
+                item_ids: vec!["10".into(), "11".into()],
+                item_runtimes_ms: vec![Some(1_000), None],
+                mode,
+            });
+        }
+        survives_the_bus(|| GroupMsg::RemoveFromPlaylist {
+            sender,
+            playlist_item_ids: vec!["a".into(), "b".into()],
+            clear_playlist: true,
+            clear_playing_item: false,
+        });
+        survives_the_bus(|| GroupMsg::MovePlaylistItem {
+            sender,
+            playlist_item_id: "a".into(),
+            new_index: -3,
+        });
+    }
+}
