@@ -25,7 +25,7 @@ fn scratch_db_path() -> std::path::PathBuf {
     ))
 }
 
-/// A database at schema 0053 holding `titles` as movies with ids 1..=n.
+/// A database at schema 0053 holding `titles` as movies with ids 0..n.
 async fn populated_old_db(url: &str, titles: &[&str]) {
     let opts = SqliteConnectOptions::from_str(url)
         .unwrap()
@@ -48,7 +48,7 @@ async fn populated_old_db(url: &str, titles: &[&str]) {
     migrator.run(&pool).await.unwrap();
     for (i, title) in titles.iter().enumerate() {
         sqlx::query("INSERT INTO media_items (id, path, title, kind) VALUES (?, ?, ?, 'movie')")
-            .bind(i64::try_from(i).unwrap() + 1)
+            .bind(i64::try_from(i).unwrap())
             .bind(format!("/m/{i}.mkv"))
             .bind(*title)
             .execute(&pool)
@@ -77,23 +77,108 @@ async fn migration_backfills_existing_rows_and_is_idempotent() {
     let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
     populated_old_db(&url, &refs).await;
 
-    let store = SqliteStore::connect(&url).await.unwrap();
+    let store = SqliteStore::connect_without_backfill(&url).await.unwrap();
+    let before = sort_names(&store).await;
+    assert_eq!(before.len(), 1_203);
+    assert!(
+        before.iter().all(|(_, s)| s.is_none()),
+        "migrating alone must not rewrite rows"
+    );
+
+    assert_eq!(store.backfill_sort_names().await.unwrap(), 1_203);
     let rows = sort_names(&store).await;
-    assert_eq!(rows.len(), 1_203);
     assert!(
         rows.iter().all(|(_, s)| s.is_some()),
-        "every pre-existing row must be backfilled"
+        "every pre-existing row, id 0 included, must be backfilled"
     );
+    assert_eq!(rows[0].0, 0);
     assert_eq!(rows[0].1.as_deref(), Some("matrix"));
     assert_eq!(rows[1].1.as_deref(), Some("ep 00000000000000000010"));
     assert_eq!(rows[2].1.as_deref(), Some("ep 00000000000000000002"));
-    store.pool().close().await;
 
-    // A second connect finds nothing to fill and leaves the values alone.
-    let again = SqliteStore::connect(&url).await.unwrap();
-    assert_eq!(sort_names(&again).await, rows);
-    again.pool().close().await;
+    // A rerun finds nothing to fill and leaves the values alone.
+    assert_eq!(store.backfill_sort_names().await.unwrap(), 0);
+    assert_eq!(sort_names(&store).await, rows);
+    store.pool().close().await;
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn connect_fills_old_rows_in_the_background() {
+    let path = scratch_db_path();
+    let url = format!("sqlite://{}", path.display());
+    populated_old_db(&url, &["The Matrix", "Ep 2"]).await;
+
+    let store = SqliteStore::connect(&url).await.unwrap();
+    // `connect` returns before the backfill necessarily finished.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let rows = sort_names(&store).await;
+        if rows.iter().all(|(_, s)| s.is_some()) {
+            assert_eq!(rows[0].1.as_deref(), Some("matrix"));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background backfill never finished"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    store.pool().close().await;
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn unfilled_rows_sort_by_title_fold_until_backfilled() {
+    use pharos_core::{MediaQuery, SortDir, SortKey};
+
+    let store = SqliteStore::connect_without_backfill("sqlite::memory:")
+        .await
+        .unwrap();
+    for (id, title) in [(1u64, "Alpha"), (2, "The Matrix"), (3, "Nemo"), (4, "Zeta")] {
+        store
+            .put(MediaItem {
+                id,
+                path: format!("/m/{id}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    // Put "The Matrix" back into the pre-migration state.
+    sqlx::query("UPDATE media_items SET sort_name = NULL WHERE id = 2")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let order = |store: &SqliteStore| {
+        let q = MediaQuery {
+            sort: vec![(SortKey::SortName, SortDir::Asc)],
+            ..Default::default()
+        };
+        let store = store.clone();
+        async move {
+            store
+                .query(&q)
+                .await
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|i| i.title)
+                .collect::<Vec<_>>()
+        }
+    };
+    // The unfilled row keeps its plain-fold position (under T) mid-backfill.
+    assert_eq!(
+        order(&store).await,
+        vec!["Alpha", "Nemo", "The Matrix", "Zeta"]
+    );
+    store.backfill_sort_names().await.unwrap();
+    assert_eq!(
+        order(&store).await,
+        vec!["Alpha", "The Matrix", "Nemo", "Zeta"]
+    );
 }
 
 #[tokio::test]
@@ -126,7 +211,7 @@ async fn postgres_stores_and_backfills_sort_names() {
         eprintln!("SKIP postgres_stores_and_backfills_sort_names: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
-    let store = PostgresStore::connect(&url).await.unwrap();
+    let store = PostgresStore::connect_without_backfill(&url).await.unwrap();
     let id = 910_054_i64;
     store
         .put(MediaItem {
@@ -156,7 +241,8 @@ async fn postgres_stores_and_backfills_sort_names() {
     .execute(store.pool())
     .await
     .unwrap();
-    let again = PostgresStore::connect(&url).await.unwrap();
+    let again = PostgresStore::connect_without_backfill(&url).await.unwrap();
+    again.backfill_sort_names().await.unwrap();
     let filled: (Option<String>,) =
         sqlx::query_as("SELECT sort_name FROM media_items WHERE id = $1")
             .bind(old_id)

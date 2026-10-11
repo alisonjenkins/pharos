@@ -51,11 +51,14 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres
 /// locks are released between batches on a large library.
 const SORT_NAME_BACKFILL_BATCH: i64 = 500;
 
+/// Rows between progress log lines (a multiple of the batch size).
+const SORT_NAME_BACKFILL_PROGRESS_EVERY: u64 = 5_000;
+
 /// Fill `media_items.sort_name` for rows that predate migration 0054.
 /// Keyset-paged on `id` and idempotent (`sort_name IS NULL`), so a crash
 /// mid-way or a second run just continues. Returns the rows it filled.
 pub(crate) async fn backfill_sort_names(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let mut after = 0_i64;
+    let mut after = -1_i64;
     let mut filled = 0_u64;
     loop {
         let rows: Vec<(i64, String)> = sqlx::query_as(
@@ -82,6 +85,9 @@ pub(crate) async fn backfill_sort_names(pool: &PgPool) -> Result<u64, sqlx::Erro
         tx.commit().await?;
         filled = filled.saturating_add(u64::try_from(rows.len()).unwrap_or(0));
         after = last;
+        if filled % SORT_NAME_BACKFILL_PROGRESS_EVERY == 0 {
+            tracing::info!(rows = filled, "sort_name backfill progress");
+        }
     }
 }
 
@@ -124,17 +130,47 @@ fn now_unix_secs() -> i64 {
 }
 
 impl PostgresStore {
-    pub async fn connect(url: &str) -> Result<Self, StoreError> {
+    /// Open a pool and run migrations to latest; see [`PostgresStore::connect`]
+    /// for the variant that also starts the `sort_name` backfill.
+    pub async fn connect_without_backfill(url: &str) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(8)
             .connect(url)
             .await?;
         MIGRATOR.run(&pool).await?;
-        let filled = backfill_sort_names(&pool).await?;
-        if filled > 0 {
-            tracing::info!(rows = filled, "backfilled media_items.sort_name");
-        }
         Ok(Self { pool })
+    }
+
+    /// Connect, migrate, and start filling `media_items.sort_name` for rows
+    /// that predate migration 0054 in the background, so startup never waits
+    /// on it. Unfilled rows sort by `title_fold` in the meantime.
+    pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        let store = Self::connect_without_backfill(url).await?;
+        store.spawn_sort_name_backfill();
+        Ok(store)
+    }
+
+    /// The task ends when the backfill finishes, gives up, or the pool closes;
+    /// nothing awaits it because a missed run is harmless (see `connect`).
+    fn spawn_sort_name_backfill(&self) {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let filled = crate::run_sort_name_backfill(
+                crate::SORT_NAME_BACKFILL_ATTEMPTS,
+                crate::SORT_NAME_BACKFILL_BACKOFF,
+                || backfill_sort_names(&pool),
+            )
+            .await;
+            if let Some(rows) = filled.filter(|n| *n > 0) {
+                tracing::info!(rows, "backfilled media_items.sort_name");
+            }
+        });
+    }
+
+    /// Fill `sort_name` for every row still NULL, in batches. Idempotent;
+    /// returns the rows filled by this call.
+    pub async fn backfill_sort_names(&self) -> Result<u64, StoreError> {
+        Ok(backfill_sort_names(&self.pool).await?)
     }
 
     pub fn pool(&self) -> &PgPool {
