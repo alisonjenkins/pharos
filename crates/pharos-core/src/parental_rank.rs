@@ -6,6 +6,12 @@
 //! a `(score, subScore)` pair per rating string, compared lexicographically.
 //! A string two regions both define takes the first region listed (US, then
 //! GB, AU, DE) so every string has exactly one rank.
+//!
+//! This table only orders results. It is deliberately independent of the
+//! config-overridable gating table in `pharos-server`'s `parental.rs`
+//! (`MaxParentalRating`), whose scores are compared against a user's numeric
+//! ceiling and must not shift. The two agree on relative order (`G` <= `PG` <
+//! `PG-13` < `R` <= `TV-MA` < `NC-17`); this one is finer-grained and wider.
 
 use std::sync::LazyLock;
 
@@ -23,7 +29,10 @@ const BASE: &[(&str, i32, i32)] = &[
     ("pg-13", 13, 0),
     ("tv-14", 14, 0),
     ("r", 17, 0),
-    ("nc-17", 17, 1),
+    // Jellyfin scores NC-17 with TV-MA; the gating table puts it above, so
+    // sort it above too (sub-score 2) rather than disagree on order.
+    ("nc-17", 17, 2),
+    ("ec", 0, 0),
     ("tv-ma", 17, 1),
     ("tv-x", 18, 0),
     ("tv-ao", 18, 0),
@@ -125,9 +134,11 @@ pub fn parental_rating_ranks() -> &'static [(String, i32)] {
 }
 
 /// Rank of an official rating: `0` for an empty or unrecognised one, otherwise
-/// a value that grows with maturity. Case and surrounding whitespace ignored.
+/// a value that grows with maturity. Case and surrounding spaces ignored —
+/// exactly what the SQL side's `LOWER(TRIM(x))` does (both strip only U+0020
+/// and fold ASCII), so a tab or newline leaves the rating unknown on both.
 pub fn parental_rating_rank(rating: &str) -> i32 {
-    let key = rating.trim().to_lowercase();
+    let key = rating.trim_matches(' ').to_ascii_lowercase();
     RANKS
         .iter()
         .find(|(name, _)| *name == key)
@@ -143,7 +154,9 @@ mod tests {
         let r = parental_rating_rank;
         assert!(r("") < r("G"));
         assert!(r("G") < r("PG") && r("PG") < r("PG-13") && r("PG-13") < r("R"));
-        assert!(r("R") < r("NC-17"));
+        assert!(r("R") < r("TV-MA") && r("TV-MA") < r("NC-17"));
+        assert!(r("NC-17") < r("TV-X"));
+        assert_eq!(r("EC"), r("G"));
         assert!(r("TV-Y") < r("TV-Y7") && r("TV-Y7") < r("TV-PG"));
         assert!(r("TV-PG") < r("TV-14") && r("TV-14") < r("TV-MA"));
         assert!(r("U") < r("12A") && r("12A") < r("15") && r("15") < r("18"));
@@ -155,6 +168,9 @@ mod tests {
     fn unknown_and_blank_rank_lowest() {
         assert_eq!(parental_rating_rank("Not Rated"), 0);
         assert_eq!(parental_rating_rank("   "), 0);
+        // SQL TRIM strips spaces only; the Rust side must agree.
+        assert_eq!(parental_rating_rank("PG-13\n"), 0);
+        assert_eq!(parental_rating_rank("\tR"), 0);
         assert_eq!(
             parental_rating_rank(" pg-13 "),
             parental_rating_rank("PG-13")

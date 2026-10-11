@@ -23,6 +23,11 @@ impl ParentalRatingMap {
     /// The built-in US rating scores, mirroring Jellyfin's default
     /// `ratings.csv` for the `us` region. Scores are ordinal — only their
     /// ordering vs `MaxParentalRating` matters.
+    ///
+    /// This is the GATING table (config-overridable, compared against a
+    /// numeric ceiling). `SortBy=ParentalRating` uses the separate, fixed
+    /// `pharos_core::parental_rank` table; the two agree on relative order but
+    /// do not share scores, so changing one never alters the other.
     pub fn us_default() -> Self {
         let entries = [
             ("Approved", 0),

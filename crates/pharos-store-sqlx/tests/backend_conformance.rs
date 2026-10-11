@@ -960,6 +960,53 @@ where
         .any(|c| c.series_key == "/media/conformance/Conformance Show (2001)"));
 
     // -----------------------------------------------------------------
+    // SortKey::ParentalRating: the CASE ranking must order identically on
+    // both engines — known ratings by maturity (case and surrounding spaces
+    // ignored), unknown / empty / NULL lowest, ties by id.
+    // -----------------------------------------------------------------
+    let rating_rows: [(MediaId, Option<&str>); 8] = [
+        (9601, Some("NC-17")),
+        (9602, Some(" pg-13 ")),
+        (9603, Some("tv-ma")),
+        (9604, Some("G")),
+        (9605, Some("Not Rated")),
+        (9606, Some("")),
+        (9607, None),
+        (9608, Some("PG-13\n")),
+    ];
+    for (id, rating) in rating_rows {
+        let mut item = media_item(id, &format!("Rating {id}"));
+        item.metadata.official_rating = rating.map(str::to_string);
+        MediaStore::put(&store, item).await.unwrap();
+    }
+    for (dir, expected) in [
+        (
+            pharos_core::SortDir::Asc,
+            [9605, 9606, 9607, 9608, 9604, 9602, 9603, 9601],
+        ),
+        (
+            pharos_core::SortDir::Desc,
+            [9601, 9603, 9602, 9604, 9605, 9606, 9607, 9608],
+        ),
+    ] {
+        let (items, _) = MediaStore::query(
+            &store,
+            &MediaQuery {
+                sort: vec![(pharos_core::SortKey::ParentalRating, dir)],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let got: Vec<MediaId> = items
+            .iter()
+            .map(|i| i.id)
+            .filter(|id| (9601..=9608).contains(id))
+            .collect();
+        assert_eq!(got, expected, "ParentalRating {dir:?} order");
+    }
+
+    // -----------------------------------------------------------------
     // MediaSegmentStore (T86 / B123). The scan stamp is what separates
     // "analysed, found nothing" from "never analysed", and it had no
     // conformance coverage at all — its Postgres placeholders were only
