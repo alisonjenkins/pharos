@@ -10,6 +10,7 @@ use pharos_core::{
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tracing::Instrument as _;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::metadata::{
@@ -543,7 +544,9 @@ impl<P: Prober> FsScanner<P> {
         let WalkOutcome {
             files: paths,
             errors: walk_errors,
-        } = walk(root.to_path_buf(), self.extensions.clone()).await?;
+        } = walk(root.to_path_buf(), self.extensions.clone())
+            .instrument(tracing::info_span!("scan.walk"))
+            .await?;
         let groups = group_editions(paths);
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
@@ -613,157 +616,162 @@ impl<P: Prober> FsScanner<P> {
         // Chunked so the write lock is never held for a whole huge library.
         const SEEN_FLUSH: usize = 512;
         let mut seen_batch: Vec<(pharos_core::MediaId, i64, u64)> = Vec::new();
-        for (i, (primary, alts)) in groups.into_iter().enumerate() {
-            // Stop queueing work the moment cancellation is requested; the sweep
-            // below is skipped too, so the partial run prunes nothing.
-            if is_cancelled() {
-                break;
-            }
-            // Groups fully resolved in phase 1 so far = those iterated that did
-            // NOT defer to the probe stream (`pending`). Probed groups are
-            // counted later, as their stream result lands (phase 3).
-            emit((i as u64).saturating_sub(pending.len() as u64));
-            if seen_batch.len() >= SEEN_FLUSH {
-                store.mark_seen_batch(&seen_batch, scan_id).await?;
-                seen_batch.clear();
-            }
-            // Cheap fs stat up front: lets us skip the expensive probe when
-            // the file is byte-for-byte unchanged since the last scan. A
-            // stat failure (file vanished mid-scan, permission flip) just
-            // falls through to the probe path, which logs + skips on error
-            // (V6) — we never abort the whole scan for one file.
-            let id = stable_id(&primary);
-            let stat = tokio::fs::metadata(&primary).await.ok();
-            let sig = stat.as_ref().map(|m| (mtime_secs(m), m.len()));
-
-            // Did a row already exist for this id before this run? Drives the
-            // added-vs-updated split in the outcome. `scan_state` returns
-            // `None` for an absent row (genuinely new) or a pre-0016 row with
-            // no signature yet — both are re-probed below, but only the truly
-            // new ones count as `added`.
-            // A file that FAILED to probe writes no row at all, so nothing below
-            // can skip it: `scan_state` is `None`, the move-detection
-            // fingerprint runs a whole-file hash, and the probe then re-reads
-            // it in full — on every pass, forever. The memo is the only record
-            // that the attempt happened. `--force` still overrides it.
-            if !self.force
-                && self
-                    .probe_memo
-                    .as_ref()
-                    .is_some_and(|m| m.is_known_bad(id, sig))
-            {
-                // Deliberately NOT added to `seen_batch`: there is no row to
-                // mark seen, and inventing one would put an unplayable item in
-                // the library (V6).
-                outcome.skipped += 1;
-                continue;
-            }
-
-            let existing_state = store.scan_state(id).await?;
-            if let Some(state) = existing_state {
-                // Existing-by-path: the row is keyed on this exact path
-                // (its id is stable_id(path)). Skip the probe iff the
-                // signature still matches; otherwise re-probe + put. `--force`
-                // (self.force) bypasses the skip so every file is re-probed.
-                if let Some((mtime, size)) = sig {
-                    if !self.force
-                        && state.file_mtime == mtime
-                        && state.file_size == size
-                        && state.probe_schema_version == expected_schema_version(&primary)
-                    {
-                        seen_batch.push((id, mtime, size));
-                        seen += 1;
-                        outcome.skipped += 1;
-                        continue;
-                    }
+        async {
+            for (i, (primary, alts)) in groups.into_iter().enumerate() {
+                // Stop queueing work the moment cancellation is requested; the sweep
+                // below is skipped too, so the partial run prunes nothing.
+                if is_cancelled() {
+                    break;
                 }
-                pending.push(Pending {
-                    primary,
-                    alts,
-                    id,
-                    sig,
-                    fp: None,
-                    existed: true,
-                });
-                continue;
-            }
-
-            // LIB-A7 — no row keyed on this path. Before treating the file as
-            // new, fingerprint its content and look for an existing row under
-            // a *different* path: that distinguishes a move/rename (same
-            // bytes, old path gone) from a genuine new file or a duplicate.
-            // Fingerprinting is blocking IO marshalled off the reactor (V5);
-            // a hash failure (vanished/permission) just falls through to the
-            // probe path, which logs + skips on error (V6).
-            let fp = match crate::fingerprint::fingerprint_async(&primary, None).await {
-                Ok(fp) => Some(fp),
-                Err(err) => {
-                    tracing::warn!(
-                        path = %primary.display(),
-                        error = %err,
-                        "fingerprint failed; treating as new (no move detection)",
-                    );
-                    None
+                // Groups fully resolved in phase 1 so far = those iterated that did
+                // NOT defer to the probe stream (`pending`). Probed groups are
+                // counted later, as their stream result lands (phase 3).
+                emit((i as u64).saturating_sub(pending.len() as u64));
+                if seen_batch.len() >= SEEN_FLUSH {
+                    store.mark_seen_batch(&seen_batch, scan_id).await?;
+                    seen_batch.clear();
                 }
-            };
-            let cand = match fp {
-                Some(fp) => store.find_by_fp(fp).await?,
-                None => None,
-            };
-            match cand {
-                // Case b — a row already carries this fingerprint *and* it is
-                // this exact path (a previously-rebound / legacy-id row). The
-                // row's id != stable_id(path); re-binding again would be a
-                // no-op and re-inserting under `id` would duplicate it. Just
-                // re-stamp the signature + fingerprint. NO insert. Idempotent:
-                // this is the steady state reached after a move.
-                Some(c) if c.path == primary => {
-                    if let Some((mtime, size)) = sig {
-                        seen_batch.push((c.id, mtime, size));
-                    }
-                    if let Some(fp) = fp {
-                        store.set_fingerprint(c.id, fp).await?;
-                    }
-                    seen += 1;
+                // Cheap fs stat up front: lets us skip the expensive probe when
+                // the file is byte-for-byte unchanged since the last scan. A
+                // stat failure (file vanished mid-scan, permission flip) just
+                // falls through to the probe path, which logs + skips on error
+                // (V6) — we never abort the whole scan for one file.
+                let id = stable_id(&primary);
+                let stat = tokio::fs::metadata(&primary).await.ok();
+                let sig = stat.as_ref().map(|m| (mtime_secs(m), m.len()));
+
+                // Did a row already exist for this id before this run? Drives the
+                // added-vs-updated split in the outcome. `scan_state` returns
+                // `None` for an absent row (genuinely new) or a pre-0016 row with
+                // no signature yet — both are re-probed below, but only the truly
+                // new ones count as `added`.
+                // A file that FAILED to probe writes no row at all, so nothing below
+                // can skip it: `scan_state` is `None`, the move-detection
+                // fingerprint runs a whole-file hash, and the probe then re-reads
+                // it in full — on every pass, forever. The memo is the only record
+                // that the attempt happened. `--force` still overrides it.
+                if !self.force
+                    && self
+                        .probe_memo
+                        .as_ref()
+                        .is_some_and(|m| m.is_known_bad(id, sig))
+                {
+                    // Deliberately NOT added to `seen_batch`: there is no row to
+                    // mark seen, and inventing one would put an unplayable item in
+                    // the library (V6).
                     outcome.skipped += 1;
                     continue;
                 }
-                // Case c vs d — the fingerprint match lives under a different
-                // path. If that old path is gone from disk it is a MOVE: keep
-                // the existing id (so user_data survives), rebind its path.
-                // If the old path still exists it is a genuine DUPLICATE and
-                // falls through to a fresh insert under `id`.
-                Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
-                    store.rebind_path(c.id, &primary).await?;
+
+                let existing_state = store.scan_state(id).await?;
+                if let Some(state) = existing_state {
+                    // Existing-by-path: the row is keyed on this exact path
+                    // (its id is stable_id(path)). Skip the probe iff the
+                    // signature still matches; otherwise re-probe + put. `--force`
+                    // (self.force) bypasses the skip so every file is re-probed.
                     if let Some((mtime, size)) = sig {
-                        seen_batch.push((c.id, mtime, size));
+                        if !self.force
+                            && state.file_mtime == mtime
+                            && state.file_size == size
+                            && state.probe_schema_version == expected_schema_version(&primary)
+                        {
+                            seen_batch.push((id, mtime, size));
+                            seen += 1;
+                            outcome.skipped += 1;
+                            continue;
+                        }
                     }
-                    if let Some(fp) = fp {
-                        store.set_fingerprint(c.id, fp).await?;
-                    }
-                    seen += 1;
-                    outcome.updated.push(c.id);
-                    continue;
-                }
-                // Case a (cand None) or case d (cand present, old path still
-                // on disk → duplicate): probe + insert a new row under `id`.
-                _ => {
                     pending.push(Pending {
                         primary,
                         alts,
                         id,
                         sig,
-                        fp,
-                        existed: false,
+                        fp: None,
+                        existed: true,
                     });
+                    continue;
+                }
+
+                // LIB-A7 — no row keyed on this path. Before treating the file as
+                // new, fingerprint its content and look for an existing row under
+                // a *different* path: that distinguishes a move/rename (same
+                // bytes, old path gone) from a genuine new file or a duplicate.
+                // Fingerprinting is blocking IO marshalled off the reactor (V5);
+                // a hash failure (vanished/permission) just falls through to the
+                // probe path, which logs + skips on error (V6).
+                let fp = match crate::fingerprint::fingerprint_async(&primary, None).await {
+                    Ok(fp) => Some(fp),
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %primary.display(),
+                            error = %err,
+                            "fingerprint failed; treating as new (no move detection)",
+                        );
+                        None
+                    }
+                };
+                let cand = match fp {
+                    Some(fp) => store.find_by_fp(fp).await?,
+                    None => None,
+                };
+                match cand {
+                    // Case b — a row already carries this fingerprint *and* it is
+                    // this exact path (a previously-rebound / legacy-id row). The
+                    // row's id != stable_id(path); re-binding again would be a
+                    // no-op and re-inserting under `id` would duplicate it. Just
+                    // re-stamp the signature + fingerprint. NO insert. Idempotent:
+                    // this is the steady state reached after a move.
+                    Some(c) if c.path == primary => {
+                        if let Some((mtime, size)) = sig {
+                            seen_batch.push((c.id, mtime, size));
+                        }
+                        if let Some(fp) = fp {
+                            store.set_fingerprint(c.id, fp).await?;
+                        }
+                        seen += 1;
+                        outcome.skipped += 1;
+                        continue;
+                    }
+                    // Case c vs d — the fingerprint match lives under a different
+                    // path. If that old path is gone from disk it is a MOVE: keep
+                    // the existing id (so user_data survives), rebind its path.
+                    // If the old path still exists it is a genuine DUPLICATE and
+                    // falls through to a fresh insert under `id`.
+                    Some(c) if !tokio::fs::try_exists(&c.path).await.unwrap_or(false) => {
+                        store.rebind_path(c.id, &primary).await?;
+                        if let Some((mtime, size)) = sig {
+                            seen_batch.push((c.id, mtime, size));
+                        }
+                        if let Some(fp) = fp {
+                            store.set_fingerprint(c.id, fp).await?;
+                        }
+                        seen += 1;
+                        outcome.updated.push(c.id);
+                        continue;
+                    }
+                    // Case a (cand None) or case d (cand present, old path still
+                    // on disk → duplicate): probe + insert a new row under `id`.
+                    _ => {
+                        pending.push(Pending {
+                            primary,
+                            alts,
+                            id,
+                            sig,
+                            fp,
+                            existed: false,
+                        });
+                    }
                 }
             }
+            // Flush the remaining skip-path stamps before the probe stream + sweep
+            // (sweep deletes rows not stamped with this scan_id, so every seen file
+            // must be committed first).
+            store.mark_seen_batch(&seen_batch, scan_id).await?;
+            seen_batch.clear();
+            Ok::<(), DomainError>(())
         }
-        // Flush the remaining skip-path stamps before the probe stream + sweep
-        // (sweep deletes rows not stamped with this scan_id, so every seen file
-        // must be committed first).
-        store.mark_seen_batch(&seen_batch, scan_id).await?;
-        seen_batch.clear();
+        .instrument(tracing::info_span!("scan.stat_skip"))
+        .await?;
 
         // Every group that skipped in phase 1 is now resolved; the remainder
         // (`pending`) is what the probe stream still has to work through.
@@ -832,102 +840,107 @@ impl<P: Prober> FsScanner<P> {
             })
             .buffer_unordered(self.probe_concurrency);
 
-        while let Some((probed_id, sig, existed, fp, item, meta)) = stream.next().await {
-            // Cancellation: stop draining the probe stream. Already-written rows
-            // stay (each `put` is atomic); the sweep below is skipped so nothing
-            // is pruned. Remaining in-flight probes are dropped with the stream.
-            if is_cancelled() {
-                break;
-            }
-            // Count every probe result (hit or miss) so progress reaches 100%
-            // even when a file fails to probe (V6 — a miss writes nothing).
-            probed_done += 1;
-            emit(phase1_done + probed_done);
-            // Record the outcome either way, so the next pass can skip a file
-            // that cannot be probed and re-try one that has been replaced. This
-            // is the only place a probe MISS leaves any trace — a miss writes
-            // no row (V6), which is what made it repeat forever.
-            if let Some(memo) = self.probe_memo.as_ref() {
-                match &item {
-                    Some(_) => memo.forget(probed_id),
-                    None => memo.record(probed_id, sig),
+        async {
+            while let Some((probed_id, sig, existed, fp, item, meta)) = stream.next().await {
+                // Cancellation: stop draining the probe stream. Already-written rows
+                // stay (each `put` is atomic); the sweep below is skipped so nothing
+                // is pruned. Remaining in-flight probes are dropped with the stream.
+                if is_cancelled() {
+                    break;
                 }
+                // Count every probe result (hit or miss) so progress reaches 100%
+                // even when a file fails to probe (V6 — a miss writes nothing).
+                probed_done += 1;
+                emit(phase1_done + probed_done);
+                // Record the outcome either way, so the next pass can skip a file
+                // that cannot be probed and re-try one that has been replaced. This
+                // is the only place a probe MISS leaves any trace — a miss writes
+                // no row (V6), which is what made it repeat forever.
+                if let Some(memo) = self.probe_memo.as_ref() {
+                    match &item {
+                        Some(_) => memo.forget(probed_id),
+                        None => memo.record(probed_id, sig),
+                    }
+                }
+                let Some(mut item) = item else { continue };
+                let item_id = item.id;
+                // LIB-D7 — merge resolved metadata onto the probe-built item
+                // BEFORE `put` (which consumes it). `merge_metadata_into_item`
+                // also returns the UNION of probe + NFO genres and consumes the
+                // artwork refs, so we capture them here (genres + artwork are
+                // applied after the row exists — FK on item id).
+                let MergedEntities {
+                    genres,
+                    artwork,
+                    people,
+                    studios,
+                    collections,
+                    tags,
+                } = merge_metadata_into_item(&mut item, meta);
+                // Captured before `put` consumes the item; the cover write below
+                // needs them and must run AFTER the row exists.
+                let (item_kind, item_path) = (item.kind, item.path.clone());
+                store.put(item).await?;
+                // 004-books — a book's cover lives inside the file, so it has no
+                // sidecar path to record and is extracted + cached here instead.
+                self.store_book_cover(store, item_id, item_kind, &item_path)
+                    .await;
+                // LIB-C4 — populate the item_genres join. UNION of the probe's
+                // (possibly comma/pipe-separated) `genre` column with the NFO
+                // `<genre>` tags resolved above; `link_item_genres` is idempotent
+                // (de-dupes), so the union never double-inserts.
+                store.link_item_genres(item_id, &genres).await?;
+                // LIB-C2 — populate the item_people join from the NFO cast/crew
+                // the resolver parsed. `link_item_people` upserts each person row
+                // (carrying its headshot / provider ids) then replaces the item's
+                // credits wholesale, so a rescan keeps the join current.
+                store.link_item_people(item_id, &people).await?;
+                // LIB-C3 — populate the item_studios join from the NFO <studio>
+                // tags the resolver parsed. `link_item_studios` upserts each
+                // studio row then replaces the item's studios wholesale, so a
+                // rescan keeps the join current.
+                store.link_item_studios(item_id, &studios).await?;
+                // LIB-C5 — populate the collection_items membership join from the
+                // NFO <set>/<collection> tags the resolver parsed. Each named box
+                // set is upserted and the item appended (idempotent), so a rescan
+                // keeps NFO-driven box-set membership current alongside any manual
+                // CRUD additions.
+                store.link_item_collections(item_id, &collections).await?;
+                // LIB-C6 — populate the item_tags join from the NFO <tag>
+                // elements + the filename provider's quality/source tokens the
+                // resolver parsed. `link_item_tags` upserts each tag row then
+                // replaces the item's tags wholesale, so a rescan keeps the join
+                // current (a dropped <tag> clears its stale link).
+                store.link_item_tags(item_id, &tags).await?;
+                // LIB-D7 — persist discovered artwork (local sidecars from D4 +
+                // any NFO thumb/fanart URLs) keyed by item id + role. One row per
+                // role; the resolver fed refs in priority order so the first per
+                // role is the winner. `set_artwork` upserts.
+                persist_artwork(store, item_id, &artwork).await?;
+                // Persist the freshly-stat'd signature so the next scan can
+                // skip this file. mark_seen is an UPDATE — the put() above
+                // guarantees the row exists first.
+                if let Some((mtime, size)) = sig {
+                    store.mark_seen(item_id, scan_id, mtime, size).await?;
+                }
+                // LIB-A7 — stamp the content fingerprint so a later move of this
+                // file is recognised by content rather than swept + re-inserted.
+                if let Some(fp) = fp {
+                    store.set_fingerprint(item_id, fp).await?;
+                }
+                // A pre-existing row (signature changed) is an update; a row
+                // with no prior state is a fresh insert.
+                if existed {
+                    outcome.updated.push(item_id);
+                } else {
+                    outcome.added.push(item_id);
+                }
+                seen += 1;
             }
-            let Some(mut item) = item else { continue };
-            let item_id = item.id;
-            // LIB-D7 — merge resolved metadata onto the probe-built item
-            // BEFORE `put` (which consumes it). `merge_metadata_into_item`
-            // also returns the UNION of probe + NFO genres and consumes the
-            // artwork refs, so we capture them here (genres + artwork are
-            // applied after the row exists — FK on item id).
-            let MergedEntities {
-                genres,
-                artwork,
-                people,
-                studios,
-                collections,
-                tags,
-            } = merge_metadata_into_item(&mut item, meta);
-            // Captured before `put` consumes the item; the cover write below
-            // needs them and must run AFTER the row exists.
-            let (item_kind, item_path) = (item.kind, item.path.clone());
-            store.put(item).await?;
-            // 004-books — a book's cover lives inside the file, so it has no
-            // sidecar path to record and is extracted + cached here instead.
-            self.store_book_cover(store, item_id, item_kind, &item_path)
-                .await;
-            // LIB-C4 — populate the item_genres join. UNION of the probe's
-            // (possibly comma/pipe-separated) `genre` column with the NFO
-            // `<genre>` tags resolved above; `link_item_genres` is idempotent
-            // (de-dupes), so the union never double-inserts.
-            store.link_item_genres(item_id, &genres).await?;
-            // LIB-C2 — populate the item_people join from the NFO cast/crew
-            // the resolver parsed. `link_item_people` upserts each person row
-            // (carrying its headshot / provider ids) then replaces the item's
-            // credits wholesale, so a rescan keeps the join current.
-            store.link_item_people(item_id, &people).await?;
-            // LIB-C3 — populate the item_studios join from the NFO <studio>
-            // tags the resolver parsed. `link_item_studios` upserts each
-            // studio row then replaces the item's studios wholesale, so a
-            // rescan keeps the join current.
-            store.link_item_studios(item_id, &studios).await?;
-            // LIB-C5 — populate the collection_items membership join from the
-            // NFO <set>/<collection> tags the resolver parsed. Each named box
-            // set is upserted and the item appended (idempotent), so a rescan
-            // keeps NFO-driven box-set membership current alongside any manual
-            // CRUD additions.
-            store.link_item_collections(item_id, &collections).await?;
-            // LIB-C6 — populate the item_tags join from the NFO <tag>
-            // elements + the filename provider's quality/source tokens the
-            // resolver parsed. `link_item_tags` upserts each tag row then
-            // replaces the item's tags wholesale, so a rescan keeps the join
-            // current (a dropped <tag> clears its stale link).
-            store.link_item_tags(item_id, &tags).await?;
-            // LIB-D7 — persist discovered artwork (local sidecars from D4 +
-            // any NFO thumb/fanart URLs) keyed by item id + role. One row per
-            // role; the resolver fed refs in priority order so the first per
-            // role is the winner. `set_artwork` upserts.
-            persist_artwork(store, item_id, &artwork).await?;
-            // Persist the freshly-stat'd signature so the next scan can
-            // skip this file. mark_seen is an UPDATE — the put() above
-            // guarantees the row exists first.
-            if let Some((mtime, size)) = sig {
-                store.mark_seen(item_id, scan_id, mtime, size).await?;
-            }
-            // LIB-A7 — stamp the content fingerprint so a later move of this
-            // file is recognised by content rather than swept + re-inserted.
-            if let Some(fp) = fp {
-                store.set_fingerprint(item_id, fp).await?;
-            }
-            // A pre-existing row (signature changed) is an update; a row
-            // with no prior state is a fresh insert.
-            if existed {
-                outcome.updated.push(item_id);
-            } else {
-                outcome.added.push(item_id);
-            }
-            seen += 1;
+            Ok::<(), DomainError>(())
         }
+        .instrument(tracing::info_span!("scan.probe_write"))
+        .await?;
         // LIB-A3 — mark-and-sweep. Everything still on disk under `root`
         // got mark_seen'd above; anything else with a row under this root
         // prefix vanished and is deleted in one atomic, root-scoped pass.
@@ -951,7 +964,10 @@ impl<P: Prober> FsScanner<P> {
             tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
             Vec::new()
         } else if walk_errors == 0 {
-            store.sweep_unseen(scan_id, &root_prefix).await?
+            store
+                .sweep_unseen(scan_id, &root_prefix)
+                .instrument(tracing::info_span!("scan.sweep"))
+                .await?
         } else {
             tracing::warn!(
                 scan_id,
@@ -3714,6 +3730,31 @@ mod tests {
                     _ => None,
                 });
         assert_eq!(runs, Some(2), "one duration observation per scan");
+    }
+
+    /// A slow scan must be attributable to a phase from the trace alone.
+    #[tokio::test]
+    async fn a_scan_opens_a_span_per_phase() {
+        let (spans, _guard) = pharos_test_metrics::spans::capture();
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"aaaa").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        for phase in [
+            "scan.walk",
+            "scan.stat_skip",
+            "scan.probe_write",
+            "scan.sweep",
+        ] {
+            assert!(
+                spans.contains(phase),
+                "missing span {phase}; got {:?}",
+                spans.names()
+            );
+        }
     }
 
     #[tokio::test]
