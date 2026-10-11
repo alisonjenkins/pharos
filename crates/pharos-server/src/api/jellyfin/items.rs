@@ -4321,6 +4321,49 @@ struct AlbumAgg {
     /// Earliest release-year tag across the album's tracks.
     year: Option<u32>,
     child_count: u32,
+    /// Earliest track `premiere_date` (Unix seconds).
+    premiere_date: Option<i64>,
+    /// Newest track `created_at`, so a freshly added track surfaces its album.
+    created_at: Option<i64>,
+    runtime_ms: u64,
+}
+
+impl AlbumAgg {
+    fn supports(key: pharos_core::SortKey) -> bool {
+        use pharos_core::SortKey;
+        matches!(
+            key,
+            SortKey::Name
+                | SortKey::SortName
+                | SortKey::AlbumArtist
+                | SortKey::PremiereDate
+                | SortKey::ProductionYear
+                | SortKey::DateCreated
+                | SortKey::Runtime
+        )
+    }
+
+    fn value(&self, key: pharos_core::SortKey) -> SortVal {
+        use pharos_core::SortKey;
+        match key {
+            SortKey::Name => SortVal::Text(self.name.to_lowercase()),
+            SortKey::SortName => SortVal::Text(pharos_core::sort_name(&self.name)),
+            SortKey::AlbumArtist => self
+                .album_artist
+                .as_deref()
+                .map_or(SortVal::Missing, |a| SortVal::Text(a.to_lowercase())),
+            // Tracks without a premiere date still carry a release-year tag.
+            SortKey::PremiereDate => SortVal::opt_int(self.premiere_date.or_else(|| {
+                self.year
+                    .and_then(|y| i32::try_from(y).ok())
+                    .map(year_start_epoch)
+            })),
+            SortKey::ProductionYear => SortVal::opt_int(self.year.map(i64::from)),
+            SortKey::DateCreated => SortVal::opt_int(self.created_at),
+            SortKey::Runtime => SortVal::Int(i64::try_from(self.runtime_ms).unwrap_or(i64::MAX)),
+            _ => SortVal::Missing,
+        }
+    }
 }
 
 /// Group audio rows into albums. `keep` decides which TRACKS participate
@@ -4340,8 +4383,19 @@ fn aggregate_albums(items: &[MediaItem], keep: impl Fn(&MediaItem) -> bool) -> V
             album_artist: None,
             year: None,
             child_count: 0,
+            premiere_date: None,
+            created_at: None,
+            runtime_ms: 0,
         });
         e.child_count += 1;
+        e.premiere_date = match (e.premiere_date, i.metadata.premiere_date) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        e.created_at = e.created_at.max(i.created_at);
+        e.runtime_ms = e
+            .runtime_ms
+            .saturating_add(i.probe.duration_ms.unwrap_or(0));
         if e.album_artist.is_none() {
             e.album_artist = i
                 .probe
@@ -4403,38 +4457,29 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
-/// Sort synthesised albums per the request: the music rails ask for
-/// `PremiereDate,ProductionYear,SortName` (year first); anything else
-/// falls back to name. Descending flips the whole chain.
+/// Sort synthesised albums per the request: each `SortBy` key an album has
+/// data for (name, artist, premiere date, year, date added, runtime) takes its
+/// own `SortOrder` token, as in `sort_chain`; with none of those the order is
+/// by name. The music rails ask for `PremiereDate,ProductionYear,SortName`.
 fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]) {
-    let by_year = sort_tokens(sort_by.unwrap_or(""))
-        .first()
-        .is_some_and(|t| matches!(*t, "PremiereDate" | "ProductionYear"));
-    // Same pairing as `sort_chain`: key N takes SortOrder token N, a short
-    // list repeats its last entry. The name key is the second one after a
-    // year key and the first otherwise.
-    let desc_at = |i: usize| orders.get(i).or_else(|| orders.last()).copied() == Some(true);
+    let chain: Vec<_> = sort_by
+        .map(|raw| sort_chain(raw, orders, false))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, _)| AlbumAgg::supports(*key))
+        .collect();
     let by_name = |a: &AlbumAgg, b: &AlbumAgg| a.name.to_lowercase().cmp(&b.name.to_lowercase());
-    if by_year {
-        let (year_desc, name_desc) = (desc_at(0), desc_at(1));
-        aggs.sort_by(|a, b| {
-            let year = if year_desc {
-                b.year.cmp(&a.year)
-            } else {
-                a.year.cmp(&b.year)
-            };
-            year.then_with(|| {
-                if name_desc {
-                    by_name(b, a)
-                } else {
-                    by_name(a, b)
-                }
-            })
-        });
-    } else if desc_at(0) {
-        aggs.sort_by(|a, b| by_name(b, a));
+    if chain.is_empty() {
+        if sort_desc_at(orders, 0) {
+            aggs.sort_by(|a, b| by_name(b, a));
+        } else {
+            aggs.sort_by(by_name);
+        }
     } else {
-        aggs.sort_by(by_name);
+        // `aggs` comes from a HashMap, so name is the deterministic tiebreak.
+        aggs.sort_by(|a, b| {
+            compare_by_chain(a, b, &chain, AlbumAgg::value).then_with(|| by_name(a, b))
+        });
     }
 }
 
