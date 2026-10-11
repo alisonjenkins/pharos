@@ -263,12 +263,50 @@ pub async fn flush_due<S: UserDataStore>(
     store: &S,
     now: Instant,
 ) -> usize {
-    write_held(coalescer, store, coalescer.take_due(now), now).await
+    write_held(coalescer, store, coalescer.take_due(now), now, "tick").await
 }
 
 /// Write every held report, for shutdown. Returns how many were written.
 pub async fn flush_all<S: UserDataStore>(coalescer: &ProgressCoalescer, store: &S) -> usize {
-    write_held(coalescer, store, coalescer.take_all(), Instant::now()).await
+    write_held(
+        coalescer,
+        store,
+        coalescer.take_all(),
+        Instant::now(),
+        "shutdown",
+    )
+    .await
+}
+
+/// A report that was not written now, for `pharos_progress_writes_total`.
+pub fn count_held() {
+    metrics::counter!("pharos_progress_writes_total", "outcome" => "coalesced", "reason" => "held")
+        .increment(1);
+}
+
+/// One database write of a progress report, timed and counted.
+/// `pharos_progress_writes_total{outcome,reason}` splits the reports into
+/// written (and why), held and failed; `pharos_progress_persist_seconds` is
+/// the write's latency, the tail the route's p99 came from.
+pub async fn persist<S: UserDataStore>(
+    store: &S,
+    key: &ProgressKey,
+    progress: PlaybackProgress,
+    reason: &'static str,
+) -> pharos_core::DomainResult<pharos_core::UserItemData> {
+    let started = Instant::now();
+    let result = store
+        .record_playback_progress(key.user, key.item, progress)
+        .await;
+    metrics::histogram!("pharos_progress_persist_seconds").record(started.elapsed().as_secs_f64());
+    let outcome = if result.is_ok() {
+        "persisted"
+    } else {
+        "failed"
+    };
+    metrics::counter!("pharos_progress_writes_total", "outcome" => outcome, "reason" => reason)
+        .increment(1);
+    result
 }
 
 async fn write_held<S: UserDataStore>(
@@ -276,13 +314,11 @@ async fn write_held<S: UserDataStore>(
     store: &S,
     held: Vec<(ProgressKey, PlaybackProgress)>,
     now: Instant,
+    reason: &'static str,
 ) -> usize {
     let mut written = 0;
     for (key, progress) in held {
-        match store
-            .record_playback_progress(key.user, key.item, progress)
-            .await
-        {
+        match persist(store, &key, progress, reason).await {
             Ok(_) => {
                 coalescer.persisted(&key, now, &progress);
                 written += 1;
