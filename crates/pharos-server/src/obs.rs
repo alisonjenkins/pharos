@@ -101,11 +101,11 @@ pub enum ObsError {
     Otlp(String),
 }
 
-/// Upper bounds for every `*_seconds` metric: 5 ms (a cached DB read) to 30 s
-/// (a slow transcode segment). Without explicit buckets the exporter emits a
-/// summary, whose quantiles cannot be aggregated across pods.
+/// Upper bounds for every `*_seconds` metric: 1 ms (a primary-key DB read) to
+/// 30 s (a slow transcode segment). Without explicit buckets the exporter
+/// emits a summary, whose quantiles cannot be aggregated across pods.
 const SECONDS_BUCKETS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
 static INIT: Once = Once::new();
@@ -274,6 +274,10 @@ mod tests {
         );
         assert!(body.contains("pharos_obs_probe_seconds_bucket{k=\"v\",le=\"0.005\"}"));
         assert!(body.contains("le=\"30\""));
+        assert!(
+            body.contains("le=\"0.001\""),
+            "sub-5ms store calls need a 1 ms bucket"
+        );
         assert!(!body.contains("pharos_obs_probe_seconds{k=\"v\",quantile"));
     }
 
