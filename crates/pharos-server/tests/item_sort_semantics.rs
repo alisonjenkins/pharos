@@ -5,8 +5,8 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaMetadata, MediaStore, SecretString, TokenStore, UserDataStore,
-    UserId, UserPolicy, UserRecord, UserStore,
+    MediaItem, MediaKind, MediaMetadata, MediaStore, SecretString, SeriesMetadata,
+    SeriesMetadataStore, TokenStore, UserDataStore, UserId, UserPolicy, UserRecord, UserStore,
 };
 use pharos_server::{
     api::jellyfin,
@@ -30,6 +30,8 @@ struct Row {
     /// `(series name, series year)` makes the row an episode of that show.
     series: Option<(&'static str, u32)>,
     created: Option<i64>,
+    album_artist: Option<&'static str>,
+    duration_ms: Option<u64>,
 }
 
 impl Row {
@@ -46,6 +48,8 @@ impl Row {
             rating: None,
             series: None,
             created: None,
+            album_artist: None,
+            duration_ms: None,
         }
     }
 }
@@ -87,6 +91,8 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                 probe: pharos_core::MediaProbe {
                     album: r.album.map(|(a, _)| a.to_string()),
                     year: r.album.map(|(_, y)| y),
+                    album_artist: r.album_artist.map(str::to_string),
+                    duration_ms: r.duration_ms,
                     ..Default::default()
                 },
                 created_at: Some(r.created.unwrap_or(1_000)),
@@ -335,6 +341,61 @@ async fn series_tiles_pair_each_sort_key_with_its_own_sort_order() {
 }
 
 #[actix_web::test]
+async fn series_tiles_sort_by_community_and_parental_rating() {
+    let (state, token) = seed(show_rows()).await;
+    for (name, community, rating) in [
+        ("Alpha", 9.0, "R"),
+        ("Bravo", 7.5, "PG"),
+        ("Charlie", 5.0, "TV-MA"),
+    ] {
+        state
+            .stores
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: format!("/tv/{name}"),
+                series_name: name.to_string(),
+                community_rating: Some(community),
+                official_rating: Some(rating.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(build_app(state)).await;
+    let base = "IncludeItemTypes=Series&Recursive=true";
+    // "The Delta" has no metadata: unknown sorts lowest, so last descending.
+    let community = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=CommunityRating&SortOrder=Descending")
+    );
+    assert_eq!(community, vec!["Alpha", "Bravo", "Charlie", "The Delta"]);
+    let rating_asc = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=ParentalRating&SortOrder=Ascending")
+    );
+    assert_eq!(rating_asc, vec!["The Delta", "Bravo", "Alpha", "Charlie"]);
+    let rating_desc = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=ParentalRating&SortOrder=Descending")
+    );
+    assert_eq!(rating_desc, vec!["Charlie", "Alpha", "Bravo", "The Delta"]);
+}
+
+#[actix_web::test]
+async fn series_tiles_page_consistently_under_a_multi_key_sort() {
+    let (state, token) = seed(show_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let q = "IncludeItemTypes=Series&Recursive=true\
+             &SortBy=ProductionYear,SortName&SortOrder=Descending,Ascending";
+    let page1 = names!(&app, token.as_str(), format!("{q}&StartIndex=0&Limit=2"));
+    let page2 = names!(&app, token.as_str(), format!("{q}&StartIndex=2&Limit=2"));
+    assert_eq!(page1, vec!["The Delta", "Bravo"]);
+    assert_eq!(page2, vec!["Charlie", "Alpha"]);
+}
+
+#[actix_web::test]
 async fn series_tiles_sort_by_newest_episode_added() {
     let (state, token) = seed(show_rows()).await;
     let app = test::init_service(build_app(state)).await;
@@ -542,6 +603,50 @@ async fn album_grid_sorts_by_newest_track_added() {
         format!("{base}&SortBy=DateCreated&SortOrder=Ascending")
     );
     assert_eq!(oldest, vec!["Charlie", "Alpha", "Bravo"]);
+}
+
+#[actix_web::test]
+async fn album_grid_sorts_by_premiere_artist_and_runtime() {
+    let track = |id: u64,
+                 album: &'static str,
+                 artist: &'static str,
+                 premiere: Option<i64>,
+                 duration_ms: u64| Row {
+        album: Some((album, 2000)),
+        album_artist: Some(artist),
+        premiere,
+        duration_ms: Some(duration_ms),
+        ..Row::new(id, album)
+    };
+    let rows = vec![
+        track(1, "Bravo", "Zed", Some(300), 1_000),
+        track(2, "Bravo", "Zed", Some(400), 2_000),
+        track(3, "Alpha", "Yan", Some(100), 5_000),
+        // No premiere date: falls back to the album's release-year tag.
+        track(4, "Charlie", "Xi", None, 1_000),
+    ];
+    let (state, token) = seed(rows).await;
+    let app = test::init_service(build_app(state)).await;
+    let base = "IncludeItemTypes=MusicAlbum&Recursive=true";
+    let premiere = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=PremiereDate&SortOrder=Ascending")
+    );
+    assert_eq!(premiere, vec!["Alpha", "Bravo", "Charlie"]);
+    let artist = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=AlbumArtist&SortOrder=Ascending")
+    );
+    assert_eq!(artist, vec!["Charlie", "Alpha", "Bravo"]);
+    // Bravo's two tracks sum to 3s, between Alpha's 5s and Charlie's 1s.
+    let runtime = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=Runtime&SortOrder=Descending")
+    );
+    assert_eq!(runtime, vec!["Alpha", "Bravo", "Charlie"]);
 }
 
 #[actix_web::test]
