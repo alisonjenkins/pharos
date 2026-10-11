@@ -112,6 +112,9 @@ server.on("upgrade", (req, socket, head) => {
 // reply or the upgraded socket must tear down the client instead of crashing.
 proxy.on("proxyReqWs", (proxyReq, req, socket) => {
   req.upstreamReq = proxyReq;
+  const tearDownUpstream = () => proxyReq.destroy();
+  socket.once("end", tearDownUpstream);
+  socket.once("close", tearDownUpstream);
   proxyReq.on("response", (res) => {
     res.on("error", () => socket.destroy());
   });
