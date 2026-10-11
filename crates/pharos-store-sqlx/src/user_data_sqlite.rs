@@ -52,7 +52,7 @@ impl UserDataStore for SqliteStore {
         let item_i64 = media_id_i64(item)?;
         let pos_i64 = i64::try_from(progress.position_ticks)
             .map_err(|e| DomainError::Backend(format!("position overflow: {e}")))?;
-        let row: UserDataRow = sqlx::query_as(
+        let row: Option<UserDataRow> = sqlx::query_as(
             "INSERT INTO user_data
                (user_id, item_id, played, play_count, last_played_position_ticks,
                 is_favorite, last_played_at, audio_stream_index, subtitle_stream_index)
@@ -62,6 +62,7 @@ impl UserDataStore for SqliteStore {
                last_played_at = excluded.last_played_at,
                audio_stream_index = COALESCE(excluded.audio_stream_index, user_data.audio_stream_index),
                subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_data.subtitle_stream_index)
+             WHERE user_data.last_played_at <= excluded.last_played_at
              RETURNING played, play_count, last_played_position_ticks, is_favorite,
                        last_played_at, audio_stream_index, subtitle_stream_index",
         )
@@ -71,10 +72,15 @@ impl UserDataStore for SqliteStore {
         .bind(progress.at)
         .bind(progress.audio_stream_index.map(i64::from))
         .bind(progress.subtitle_stream_index.map(i64::from))
-        .fetch_one(self.pool())
+        .fetch_optional(self.pool())
         .await
         .map_err(map_err)?;
-        Ok(row_to_data(row))
+        match row {
+            Some(row) => Ok(row_to_data(row)),
+            // The stored row is newer than this report (it was held back and
+            // a later write, e.g. a Stopped, got there first): keep the row.
+            None => self.get_user_data(user, item).await,
+        }
     }
 
     #[tracing::instrument(skip(self, data), fields(user.id = %user.0, media.id = %item))]
@@ -335,6 +341,30 @@ mod tests {
             },
             "only position and timestamp move; a report silent about tracks keeps them"
         );
+    }
+
+    #[tokio::test]
+    async fn a_report_older_than_the_stored_row_is_dropped() {
+        let (s, uid, id) = fixture().await;
+        let finished = UserItemData {
+            played: true,
+            play_count: 1,
+            last_played_position_ticks: 0,
+            last_played_at: 2_000,
+            ..Default::default()
+        };
+        s.set_user_data(uid, id, finished).await.unwrap();
+        let got = s
+            .record_playback_progress(uid, id, progress(9_000, 1_999))
+            .await
+            .unwrap();
+        assert_eq!(got, finished, "a stale report returns the stored row");
+        assert_eq!(s.get_user_data(uid, id).await.unwrap(), finished);
+        let same_second = s
+            .record_playback_progress(uid, id, progress(9_000, 2_000))
+            .await
+            .unwrap();
+        assert_eq!(same_second.last_played_position_ticks, 9_000);
     }
 
     #[tokio::test]
