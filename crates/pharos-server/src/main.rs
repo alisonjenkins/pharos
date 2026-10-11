@@ -1399,6 +1399,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         "starting pharos"
     );
 
+    obs::register_static_series();
+
     let stores = Stores::connect(&cfg.database.url).await?;
     let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
     // LIB-C1 — reconcile the typed `libraries` table from config (one row
