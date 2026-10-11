@@ -24,22 +24,62 @@ impl FromRequest for AuthUser {
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_token(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
-        Box::pin(async move {
-            let token = token.ok_or_else(|| ErrorUnauthorized("missing token"))?;
-            let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
-            let uid = state
-                .stores
-                .resolve(&token)
-                .await
-                .map_err(|e| auth_failure(e, "invalid token"))?;
-            let record = state
-                .stores
-                .get(uid)
-                .await
-                .map_err(|e| auth_failure(e, "user revoked"))?;
-            Ok(AuthUser(record.into_user()))
-        })
+        Box::pin(async move { authenticate(state, token).await.map(AuthUser) })
     }
+}
+
+/// Token to [`User`]: the one place a request is accepted or turned away, so
+/// every rejection is counted with its reason. A missing token costs no
+/// database call; a token the store does not know costs exactly one.
+async fn authenticate(
+    state: Option<web::Data<AppState>>,
+    token: Option<String>,
+) -> Result<User, actix_web::Error> {
+    let Some(token) = token else {
+        count_rejection("missing_token");
+        return Err(ErrorUnauthorized("missing token"));
+    };
+    let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
+    let uid = state
+        .stores
+        .resolve(&token)
+        .await
+        .map_err(|e| auth_failure(e, Rejected::InvalidToken))?;
+    let record = state
+        .stores
+        .get(uid)
+        .await
+        .map_err(|e| auth_failure(e, Rejected::UserRevoked))?;
+    Ok(record.into_user())
+}
+
+/// Why a request that carried (or lacked) a token was refused; the label is
+/// the `reason` of `pharos_auth_rejected_total`, so a stale-token client that
+/// retries every few seconds is one query away.
+#[derive(Clone, Copy)]
+enum Rejected {
+    InvalidToken,
+    UserRevoked,
+}
+
+impl Rejected {
+    fn label(self) -> &'static str {
+        match self {
+            Rejected::InvalidToken => "invalid_token",
+            Rejected::UserRevoked => "user_revoked",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Rejected::InvalidToken => "invalid token",
+            Rejected::UserRevoked => "user revoked",
+        }
+    }
+}
+
+fn count_rejection(reason: &'static str) {
+    metrics::counter!("pharos_auth_rejected_total", "reason" => reason).increment(1);
 }
 
 /// Like [`AuthUser`] but also yields the client's `deviceId` — the session key
@@ -77,22 +117,8 @@ impl FromRequest for AuthSession {
         let device_id = device_id_from_request(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
         Box::pin(async move {
-            let token = token.ok_or_else(|| ErrorUnauthorized("missing token"))?;
-            let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
-            let uid = state
-                .stores
-                .resolve(&token)
-                .await
-                .map_err(|e| auth_failure(e, "invalid token"))?;
-            let record = state
-                .stores
-                .get(uid)
-                .await
-                .map_err(|e| auth_failure(e, "user revoked"))?;
-            Ok(AuthSession {
-                user: record.into_user(),
-                device_id,
-            })
+            let user = authenticate(state, token).await?;
+            Ok(AuthSession { user, device_id })
         })
     }
 }
@@ -108,15 +134,19 @@ impl FromRequest for AuthSession {
 /// request with 401 for sixteen seconds: the pauses were dropped, and the
 /// clients were told their credentials were bad when nothing about them was
 /// (B216).
-fn auth_failure(e: pharos_core::AuthError, rejected: &'static str) -> actix_web::Error {
+fn auth_failure(e: pharos_core::AuthError, rejected: Rejected) -> actix_web::Error {
     match e {
         pharos_core::AuthError::Backend(detail) => {
             tracing::warn!(error = %detail, "auth store unavailable; answering 503, not 401");
+            count_rejection("store_unavailable");
             actix_web::error::ErrorServiceUnavailable(format!(
                 "auth store unavailable, retry: {detail}"
             ))
         }
-        _ => ErrorUnauthorized(rejected),
+        _ => {
+            count_rejection(rejected.label());
+            ErrorUnauthorized(rejected.message())
+        }
     }
 }
 
@@ -318,7 +348,7 @@ mod tests {
     fn a_backend_failure_is_503_and_a_bad_token_is_401() {
         let backend = auth_failure(
             pharos_core::AuthError::Backend("pool timed out".into()),
-            "invalid token",
+            Rejected::InvalidToken,
         );
         assert_eq!(
             backend.as_response_error().status_code(),
@@ -330,7 +360,7 @@ mod tests {
             pharos_core::AuthError::UserNotFound,
             pharos_core::AuthError::InvalidCredentials,
         ] {
-            let err = auth_failure(e, "invalid token");
+            let err = auth_failure(e, Rejected::InvalidToken);
             assert_eq!(
                 err.as_response_error().status_code(),
                 actix_web::http::StatusCode::UNAUTHORIZED
