@@ -65,6 +65,14 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         )
         .route("/users/{user_id}/views", web::get().to(user_views))
         .route("/userviews", web::get().to(user_views_query))
+        .route(
+            "/userviews/groupingoptions",
+            web::get().to(view_grouping_options),
+        )
+        .route(
+            "/users/{user_id}/groupingoptions",
+            web::get().to(user_view_grouping_options),
+        )
         .route("/library/virtualfolders", web::get().to(virtual_folders))
         .route(
             "/library/virtualfolders",
@@ -3492,6 +3500,39 @@ async fn user_views_query(
     Ok(crate::api::jellyfin::wire::json(
         &synth_views_body(&state).await,
     ))
+}
+
+/// `GET /UserViews/GroupingOptions` — the libraries jellyfin-web's home
+/// settings let a user fold into one "My Media" group, as
+/// `SpecialViewOptionDto[]` (`{Name, Id}`). Every library view qualifies.
+async fn view_grouping_options(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    _q: CiQuery<UserViewsQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    Ok(crate::api::jellyfin::wire::json(
+        &grouping_options(&state).await,
+    ))
+}
+
+/// `GET /Users/{userId}/GroupingOptions` — the pre-10.9 spelling of
+/// [`view_grouping_options`] that jellyfin-web's legacy apiclient still calls.
+async fn user_view_grouping_options(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    _path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    Ok(crate::api::jellyfin::wire::json(
+        &grouping_options(&state).await,
+    ))
+}
+
+async fn grouping_options(state: &AppState) -> Vec<serde_json::Value> {
+    library_views(state)
+        .await
+        .into_iter()
+        .map(|v| serde_json::json!({ "Name": v["Name"], "Id": v["Id"] }))
+        .collect()
 }
 
 /// Synthesise a `Folder`/`CollectionFolder` view per configured
