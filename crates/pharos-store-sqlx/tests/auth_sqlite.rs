@@ -51,6 +51,23 @@ async fn unknown_user_is_user_not_found() {
 }
 
 #[tokio::test]
+async fn device_for_token_returns_issuing_device_and_none_when_unknown() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let token = s.issue(uid, "dev-7").await.unwrap();
+    assert_eq!(
+        s.device_for_token(token.0.expose())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("dev-7")
+    );
+    assert_eq!(s.device_for_token("no-such-token").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn issue_then_resolve_token() {
     let s = fresh().await;
     let r = record("ali", "h", false);
