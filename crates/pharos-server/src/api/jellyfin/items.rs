@@ -2027,6 +2027,81 @@ struct PlaybackInfoBody {
     /// `i64` because Jellyfin's "off" sentinel is `-1`.
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<i64>,
+    /// jellyfin-web sends these `false` to force a transcode after a
+    /// direct-play failure. Absent means allowed.
+    enable_direct_play: Option<bool>,
+    enable_direct_stream: Option<bool>,
+    enable_transcoding: Option<bool>,
+    allow_video_stream_copy: Option<bool>,
+    allow_audio_stream_copy: Option<bool>,
+}
+
+/// Which delivery paths a PlaybackInfo request allows; everything is allowed
+/// unless the body says `false`.
+#[derive(Debug, Clone, Copy)]
+struct PlaybackSwitches {
+    direct_play: bool,
+    direct_stream: bool,
+    transcoding: bool,
+    video_copy: bool,
+    audio_copy: bool,
+}
+
+impl Default for PlaybackSwitches {
+    fn default() -> Self {
+        Self {
+            direct_play: true,
+            direct_stream: true,
+            transcoding: true,
+            video_copy: true,
+            audio_copy: true,
+        }
+    }
+}
+
+impl PlaybackSwitches {
+    fn from_body(b: &PlaybackInfoBody) -> Self {
+        let allowed = |v: Option<bool>| v != Some(false);
+        Self {
+            direct_play: allowed(b.enable_direct_play),
+            direct_stream: allowed(b.enable_direct_stream),
+            transcoding: allowed(b.enable_transcoding),
+            video_copy: allowed(b.allow_video_stream_copy),
+            audio_copy: allowed(b.allow_audio_stream_copy),
+        }
+    }
+
+    /// Whether the request turned off any delivery path. Only then is an
+    /// unplayable response the request's doing rather than the negotiator's.
+    fn restricts(&self) -> bool {
+        !(self.direct_play && self.direct_stream && self.transcoding)
+    }
+}
+
+/// Fold the request's switches into the negotiated decision. A remux that
+/// copies a stream the client forbids copying becomes a full transcode, and a
+/// DirectPlay with both direct paths disabled becomes one too. When
+/// transcoding is also disabled the decision is left alone: the caller then
+/// strips the TranscodingUrl and reports the source as unplayable.
+fn apply_playback_switches(
+    decision: Decision,
+    sw: &PlaybackSwitches,
+    remote_ceiling: Option<u64>,
+) -> Decision {
+    let transcode = || Decision::Transcode {
+        target_container: "ts".into(),
+        target_video_codec: Some("h264".into()),
+        target_audio_codec: Some("aac".into()),
+        max_video_bitrate_bps: remote_ceiling,
+    };
+    match decision {
+        Decision::VideoRemux { .. } if !sw.video_copy => transcode(),
+        Decision::AudioRemux { .. } if !sw.audio_copy => transcode(),
+        Decision::DirectPlay if !sw.direct_play && !sw.direct_stream && sw.transcoding => {
+            transcode()
+        }
+        other => other,
+    }
 }
 
 /// Parse an IP from either a bare address (X-Forwarded-For form) or a
@@ -2449,6 +2524,7 @@ async fn playback_info(
             media_sources: Vec::new(),
             play_session_id: uuid::Uuid::new_v4().simple().to_string(),
             start_position_ticks: resume_ticks,
+            error_code: None,
         }));
     }
     // Bump this show to the front of the background trickplay pre-generator —
@@ -2502,14 +2578,24 @@ async fn playback_info(
     // Consume the POST body once: the DeviceProfile drives negotiation, and
     // the track picks (present when jellyfin-web reloads for an audio/subtitle
     // switch) fall back into the transcode URL below.
-    let (profile, body_audio_index, body_subtitle_index) = match body.map(web::Json::into_inner) {
-        Some(b) => (
-            b.device_profile.unwrap_or_default(),
-            b.audio_stream_index,
-            b.subtitle_stream_index,
-        ),
-        None => (DeviceProfile::default(), None, None),
-    };
+    let (profile, body_audio_index, body_subtitle_index, switches) =
+        match body.map(web::Json::into_inner) {
+            Some(b) => {
+                let switches = PlaybackSwitches::from_body(&b);
+                (
+                    b.device_profile.unwrap_or_default(),
+                    b.audio_stream_index,
+                    b.subtitle_stream_index,
+                    switches,
+                )
+            }
+            None => (
+                DeviceProfile::default(),
+                None,
+                None,
+                PlaybackSwitches::default(),
+            ),
+        };
     // The client's explicit SubtitleStreamIndex pick — query string wins,
     // falling back to the POST body (jellyfin-web's track-switch reload
     // sends it only in the body). Resolved once, early, so both the
@@ -2717,6 +2803,16 @@ async fn playback_info(
             decision
         };
 
+    // The request's own switches (a retry after a direct-play failure) come
+    // last so they override every negotiated outcome above.
+    let decision = {
+        let adjusted = apply_playback_switches(decision.clone(), &switches, remote_ceiling);
+        if adjusted != decision {
+            downgrade = Some("client_switch");
+        }
+        adjusted
+    };
+
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
     // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
     // their Media Source Extensions frequently CANNOT decode H.264
@@ -2768,7 +2864,7 @@ async fn playback_info(
     }
     let renditions_param = renditions.join(",");
 
-    let direct_play = decision.is_direct();
+    let direct_play = decision.is_direct() && switches.direct_play;
     // B77 — `SupportsDirectStream` promises the raw `/stream` file is playable
     // AS-IS: pharos's `/stream` serves the source verbatim (no container remux,
     // no audio transcode — the only massaging is `deliver_stream`'s webm
@@ -2780,11 +2876,12 @@ async fn playback_info(
     // the container/audio), so it must transcode via the TranscodingUrl below.
     // Native players that CAN play such files declare it in their profile →
     // DirectPlay, unaffected.
-    let supports_direct_stream = direct_play
-        || (matches!(
-            decision,
-            Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
-        ) && webm_relabel_playable);
+    let supports_direct_stream = switches.direct_stream
+        && (decision.is_direct()
+            || (matches!(
+                decision,
+                Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
+            ) && webm_relabel_playable));
     // Forward the client's audio/subtitle track selection into the VP9 HLS
     // URL — jellyfin-web re-requests PlaybackInfo with these when the user
     // switches tracks. The VP9 segment handler maps them into ffmpeg (audio
@@ -2891,6 +2988,7 @@ async fn playback_info(
         Decision::AudioRemux { .. } => Some(universal_audio_url.clone()),
         _ => None,
     };
+    let transcoding_url = transcoding_url.filter(|_| switches.transcoding);
     // B74 — native players (Android TV / ExoPlayer) use the TranscodingUrl
     // verbatim and do NOT client-seek a transcode, so a resume must ride the
     // URL as `StartTimeTicks` (real Jellyfin does exactly this). Web self-seeks
@@ -3010,7 +3108,7 @@ async fn playback_info(
     );
     // The same verdict as a metric, so "how many sessions are transcoding, and
     // for what reason" is a query rather than a log trawl. Label cardinality is
-    // bounded: 4 decisions × 7 block reasons × 3 downgrades.
+    // bounded: 4 decisions × 7 block reasons × 4 downgrades.
     metrics::counter!(
         "pharos_playback_decision_total",
         "decision" => decision_kind,
@@ -3374,6 +3472,7 @@ async fn playback_info(
         name: item.title.clone(),
         supports_direct_play: direct_play,
         supports_direct_stream,
+        supports_transcoding: switches.transcoding,
         transcoding_url,
         transcoding_sub_protocol,
         media_streams: streams.clone(),
@@ -3421,10 +3520,14 @@ async fn playback_info(
 
     // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep
     // a local copy of UserData.PlaybackPositionTicks.
+    let playable = media_sources.first().is_some_and(|s| {
+        s.supports_direct_play || s.supports_direct_stream || s.transcoding_url.is_some()
+    });
     let response = PlaybackInfoResponseDto {
         media_sources,
         play_session_id: play_session_id.clone(),
         start_position_ticks: resume_ticks,
+        error_code: (!playable && switches.restricts()).then_some("NoCompatibleStream"),
     };
     // B70 — the native TV crashes PARSING this 200; log the exact body (gated
     // by PHAROS_LOG_ALL_REQUESTS) so the offending field can be diffed vs the
@@ -8601,5 +8704,59 @@ mod series_dto_tests {
         assert_eq!(v["Genres"], serde_json::json!([]));
         assert_eq!(v["ProviderIds"], serde_json::json!({}));
         assert_eq!(v["Type"], "Series");
+    }
+}
+
+#[cfg(test)]
+mod playback_switch_tests {
+    use super::{apply_playback_switches, PlaybackSwitches};
+    use pharos_jellyfin_api::device_profile::Decision;
+
+    fn video_remux() -> Decision {
+        Decision::VideoRemux {
+            target_container: "mp4".into(),
+            target_audio_codec: None,
+        }
+    }
+
+    #[test]
+    fn forbidding_a_stream_copy_turns_that_remux_into_a_transcode() {
+        let no_video_copy = PlaybackSwitches {
+            video_copy: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            apply_playback_switches(video_remux(), &no_video_copy, None),
+            Decision::Transcode { .. }
+        ));
+        // The audio flag does not touch a video remux.
+        let no_audio_copy = PlaybackSwitches {
+            audio_copy: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_playback_switches(video_remux(), &no_audio_copy, None),
+            video_remux()
+        );
+        assert!(matches!(
+            apply_playback_switches(
+                Decision::AudioRemux {
+                    target_audio_codec: "aac".into()
+                },
+                &no_audio_copy,
+                None
+            ),
+            Decision::Transcode { .. }
+        ));
+    }
+
+    #[test]
+    fn default_switches_change_nothing() {
+        for d in [Decision::DirectPlay, video_remux()] {
+            assert_eq!(
+                apply_playback_switches(d.clone(), &PlaybackSwitches::default(), None),
+                d
+            );
+        }
     }
 }

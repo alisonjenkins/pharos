@@ -902,6 +902,10 @@ pub struct PlaybackInfoResponseDto {
     pub media_sources: Vec<MediaSourceInfoDto>,
     pub play_session_id: String,
     pub start_position_ticks: u64,
+    /// `PlaybackErrorCode`, set only when the request disabled every path
+    /// that could play the source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
 }
 
 /// Jellyfin `QuickConnectResult` — returned by `/QuickConnect/Initiate` and the
