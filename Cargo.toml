@@ -157,6 +157,23 @@ opt-level = 3
 [profile.dev.package.password-hash]
 opt-level = 3
 
+# Profile of the flake checks (flake.nix `ciArgs`): dev, but dependencies
+# optimised. Plain dev ran sort_name_migration for ~5 min (SQLite and sqlx
+# unoptimised) against seconds in release; workspace crates stay opt-level 0
+# so the ~160 test binaries still compile fast.
+[profile.ci]
+inherits = "dev"
+debug = false
+
+[profile.ci.package."*"]
+opt-level = 2
+
+[profile.ci.package.pharos-store-sqlx]
+opt-level = 2
+
+[profile.ci.package.pharos-core]
+opt-level = 2
+
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = 1
