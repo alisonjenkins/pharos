@@ -4464,7 +4464,7 @@ async fn maybe_list_music(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
+    let descending = first_sort_order_descending(q.sort_order.as_deref());
 
     if let Some(artist) = artist_parent {
         // Discography: albums whose album artist is this artist, falling
@@ -5030,6 +5030,11 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         .map(str::trim)
         .find(|s| !s.is_empty())
         .unwrap_or("SortName");
+    sort_token_primary(primary)
+}
+
+/// One `SortBy` token → its [`SortPrimary`].
+fn sort_token_primary(primary: &str) -> SortPrimary {
     match primary {
         "None" | "Default" => SortPrimary::None,
         "Random" => SortPrimary::Random,
@@ -5050,6 +5055,103 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         "DatePlayed" => SortPrimary::Keyed(pharos_core::SortKey::DatePlayed),
         _ => SortPrimary::Name,
     }
+}
+
+/// Parse a (possibly comma-separated) `SortOrder` into one `descending` flag
+/// per token. Anything but `Descending` (case-insensitive) is ascending.
+fn parse_sort_orders(sort_order: Option<&str>) -> Vec<bool> {
+    sort_order
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.eq_ignore_ascii_case("Descending"))
+        .collect()
+}
+
+/// Whether the first (or only) `SortOrder` token is `Descending`.
+fn first_sort_order_descending(sort_order: Option<&str>) -> bool {
+    parse_sort_orders(sort_order)
+        .first()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// `SortBy` tokens split on commas, blanks dropped.
+fn sort_tokens(sort_by: &str) -> Vec<&str> {
+    sort_by
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Whether a request needs the per-key chain rather than the single-primary
+/// shape. The single-primary shape reproduces the legacy results exactly for
+/// one key (plus the tie-break tokens clients append, such as the
+/// `ParentIndexNumber,IndexNumber,SortName` album/season order), so it stays
+/// the path for those; a metadata key first, a second real key, or a
+/// multi-valued `SortOrder` takes the chain.
+fn sort_needs_chain(sort_by: Option<&str>, orders: &[bool]) -> bool {
+    let Some(raw) = sort_by else {
+        return false;
+    };
+    let tokens = sort_tokens(raw);
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+    if orders.len() > 1 || matches!(sort_token_primary(first), SortPrimary::Keyed(_)) {
+        return true;
+    }
+    rest.iter().any(|t| {
+        !matches!(
+            *t,
+            "SortName" | "Name" | "IndexNumber" | "ParentIndexNumber"
+        )
+    })
+}
+
+/// The `(key, direction)` chain for a multi-key `SortBy`, each token paired
+/// with its `SortOrder` token (a shorter list repeats its last entry, an
+/// absent one is ascending — Jellyfin's rule). The caller's builder appends
+/// the `id` tiebreak.
+fn sort_chain(
+    sort_by: &str,
+    orders: &[bool],
+    episode_scoped: bool,
+) -> Vec<(pharos_core::SortKey, pharos_core::SortDir)> {
+    use pharos_core::{SortDir, SortKey};
+    let mut chain: Vec<(SortKey, SortDir)> = Vec::new();
+    for (i, token) in sort_tokens(sort_by).into_iter().enumerate() {
+        let desc = orders
+            .get(i)
+            .or_else(|| orders.last())
+            .copied()
+            .unwrap_or(false);
+        let dir = if desc { SortDir::Desc } else { SortDir::Asc };
+        let keys: Vec<SortKey> = match (token, sort_token_primary(token)) {
+            ("ParentIndexNumber", _) if episode_scoped => vec![SortKey::SeasonNumber],
+            ("ParentIndexNumber", _) => vec![SortKey::DiscNumber],
+            ("IndexNumber", _) if episode_scoped => vec![SortKey::IndexNumber],
+            ("IndexNumber", _) => vec![SortKey::TrackNumber],
+            (_, SortPrimary::None | SortPrimary::Random) => Vec::new(),
+            (_, SortPrimary::DateCreated) => vec![SortKey::DateCreated],
+            (_, SortPrimary::Runtime) => vec![SortKey::Runtime],
+            (_, SortPrimary::AlbumArtist) => vec![SortKey::AlbumArtist],
+            (_, SortPrimary::Album) => vec![SortKey::Album],
+            (_, SortPrimary::BookSeriesOrder) => {
+                vec![SortKey::BookSeries, SortKey::BookSeriesIndex]
+            }
+            (_, SortPrimary::Keyed(key)) => vec![key],
+            (_, SortPrimary::TrackOrder | SortPrimary::Name) => vec![SortKey::Name],
+        };
+        for key in keys {
+            if !chain.iter().any(|(k, _)| *k == key) {
+                chain.push((key, dir));
+            }
+        }
+    }
+    chain
 }
 
 /// T68 — narrow a built [`MediaQuery`] to what the requesting user's policy
@@ -5236,7 +5338,8 @@ fn build_media_query(
 
     // Sort chain — replicate the in-memory stable-sort + conditional reverse.
     let primary = sort_primary(q.sort_by.as_deref());
-    let descending = matches!(q.sort_order.as_deref(), Some("Descending"));
+    let orders = parse_sort_orders(q.sort_order.as_deref());
+    let descending = orders.first().copied().unwrap_or(false);
     let collection_parent = matches!(
         parent,
         ParentResolution::Filter(pharos_core::ParentFilter::Collection { .. })
@@ -5270,7 +5373,7 @@ fn build_media_query(
     } else {
         primary
     };
-    mq.sort = match effective_primary {
+    let legacy_sort = match effective_primary {
         SortPrimary::None | SortPrimary::Random => Vec::new(),
         SortPrimary::Name => {
             if descending {
@@ -5291,17 +5394,8 @@ fn build_media_query(
                 ]
             }
         }
-        SortPrimary::Keyed(key) => {
-            if descending {
-                vec![
-                    (key, SortDir::Desc),
-                    (SortKey::Name, SortDir::Asc),
-                    (SortKey::Id, SortDir::Asc),
-                ]
-            } else {
-                vec![(key, SortDir::Asc), (SortKey::Name, SortDir::Asc)]
-            }
-        }
+        // Always routed through `sort_chain` (see `sort_needs_chain`).
+        SortPrimary::Keyed(_) => Vec::new(),
         SortPrimary::Runtime => {
             if descending {
                 vec![
@@ -5404,6 +5498,16 @@ fn build_media_query(
                 ]
             }
         }
+    };
+
+    mq.sort = match q.sort_by.as_deref() {
+        Some(raw)
+            if sort_needs_chain(Some(raw), &orders)
+                && !matches!(effective_primary, SortPrimary::Random) =>
+        {
+            sort_chain(raw, &orders, episode_scoped)
+        }
+        _ => legacy_sort,
     };
 
     // PlayCount / DatePlayed read the requesting user's user_data row.
@@ -6483,10 +6587,7 @@ async fn maybe_list_virtual_shows(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
-    let descending = q
-        .sort_order
-        .as_deref()
-        .is_some_and(|o| o.eq_ignore_ascii_case("Descending"));
+    let descending = first_sort_order_descending(q.sort_order.as_deref());
 
     // B93 — child / recursive counts per key so the Series/Season folder DTOs
     // advertise ChildCount (a series' seasons, a season's episodes). Computed
