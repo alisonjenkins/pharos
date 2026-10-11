@@ -217,6 +217,20 @@ impl TokenStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self, token))]
+    async fn device_for_token(&self, token: &str) -> AuthResult<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT device_id FROM auth_tokens \
+             WHERE token_hash = ? AND (expires_at IS NULL OR expires_at > ?)",
+        )
+        .bind(crate::auth_token::hash(token))
+        .bind(now_unix_secs())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|(device_id,)| device_id))
+    }
+
+    #[tracing::instrument(skip(self, token))]
     async fn revoke(&self, token: &str) -> AuthResult<()> {
         sqlx::query("DELETE FROM auth_tokens WHERE token_hash = ?")
             .bind(crate::auth_token::hash(token))

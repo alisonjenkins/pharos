@@ -224,6 +224,14 @@ pub trait TokenStore: Send + Sync {
 
     fn revoke(&self, token: &str) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 
+    /// The `device_id` a live token was issued to, or `None` for an unknown or
+    /// expired token. Lets a request that cannot carry a device id itself (a
+    /// browser WebSocket handshake) still be attributed to its device.
+    fn device_for_token(
+        &self,
+        token: &str,
+    ) -> impl std::future::Future<Output = AuthResult<Option<String>>> + Send;
+
     /// Tokens issued to `user`. Drives admin "active devices" list. Each
     /// entry carries the device_id (Emby-Authorization header) + issued_at
     /// unix-seconds. Token strings deliberately not exposed.

@@ -1129,6 +1129,13 @@ impl TokenStore for AnyStore {
         }
     }
 
+    async fn device_for_token(&self, token: &str) -> AuthResult<Option<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.device_for_token(token).await,
+            AnyStore::Postgres(p) => p.device_for_token(token).await,
+        }
+    }
+
     async fn revoke(&self, token: &str) -> AuthResult<()> {
         match self {
             AnyStore::Sqlite(s) => s.revoke(token).await,
