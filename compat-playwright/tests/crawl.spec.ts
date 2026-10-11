@@ -189,8 +189,11 @@ test.describe("jellyfin-web crawl", () => {
     const errors = recordErrors(page);
     await connect(page);
     await signIn(page);
-    await page.goto("/#/mypreferencesdisplay");
-    await page.waitForURL(/#\/mypreferencesdisplay/, { timeout: 15_000 });
+    // jellyfin-web 12's display page is keyed on `?userId=` and shows a spinner
+    // forever without it, so reach it the way a user does: via the menu link.
+    await page.goto("/#/mypreferencesmenu");
+    await page.locator("a.lnkDisplayPreferences").click({ timeout: 15_000 });
+    await page.waitForURL(/#\/mypreferencesdisplay\?userId=/, { timeout: 15_000 });
     await page
       .getByRole("heading", { name: /display/i })
       .first()
