@@ -146,6 +146,17 @@ debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
 
+# Argon2id with its default 19 MiB cost takes ~0.5 s per hash at opt-level 0,
+# and every login/create-user test pays it. Optimise only the hashing crates.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.dev.package.password-hash]
+opt-level = 3
+
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = 1
