@@ -130,6 +130,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         cfg.route(path, web::get().to(empty_items_result));
     }
     cfg.route("/items/{id}/similar", web::get().to(items_similar));
+    cfg.route("/items/{id}/ancestors", web::get().to(item_ancestors));
     // /Genres (LIB-C4) + /Studios (LIB-C3) are entity-backed: each lists
     // its entity rows with an item count via the indexed *_with_counts
     // store query (genres/item_genres, studios/item_studios).
@@ -5959,6 +5960,82 @@ async fn fetch_item_dto(
         );
     }
     Ok(crate::api::jellyfin::wire::json(&dto))
+}
+
+/// `GET /Items/{itemId}/Ancestors` — the breadcrumb trail jellyfin-web draws
+/// on a detail page: a bare `BaseItemDto[]`, nearest parent first and the
+/// library last (Jellyfin's `GetParents` order). An episode yields
+/// season, series, library; a season yields series, library; a series, a
+/// movie or a track yields its library. Libraries, box sets, playlists and
+/// the other synthesised ids (albums, artists, genres) are top-level and
+/// yield an empty array.
+async fn item_ancestors(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    let raw = path.into_inner();
+    let canonical = canonical_wire_id(&raw);
+    let id_str: &str = canonical.as_ref();
+    let internal = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+
+    // Wire ids of the ancestors, nearest first.
+    let mut chain: Vec<String> = Vec::new();
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        let item = state.stores.get(id).await.map_err(|e| match e {
+            pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+            other => internal(other),
+        })?;
+        if let Some(series) = item
+            .series
+            .as_ref()
+            .filter(|_| item.kind == MediaKind::Episode)
+        {
+            if let Some(season) = series.season_number {
+                chain.push(season_id_for_key(
+                    series.series_folder.as_deref(),
+                    &series.series_name,
+                    season,
+                ));
+            }
+            chain.push(series_id_for_key(
+                series.series_folder.as_deref(),
+                &series.series_name,
+            ));
+        }
+        chain.extend(library_parent_id(&state, &item));
+    } else {
+        // A synthesised show folder: borrow the chain of any episode it
+        // groups, keeping only what sits above it.
+        let all = state.list_items_cached().await.map_err(internal)?;
+        for item in all.iter().filter(|i| i.kind == MediaKind::Episode) {
+            let Some(series) = item.series.as_ref() else {
+                continue;
+            };
+            let series_id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+            let season_id = series.season_number.map(|n| {
+                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n)
+            });
+            if season_id.as_deref() == Some(id_str) {
+                chain.push(series_id);
+            } else if series_id != id_str {
+                continue;
+            }
+            chain.extend(library_parent_id(&state, item));
+            break;
+        }
+    }
+
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(chain.len());
+    for wire_id in &chain {
+        let dto = match library_view_for_id(&state, wire_id).await {
+            Some(view) => Some(view),
+            None => synth_series_or_season(&state, wire_id).await?,
+        };
+        out.extend(dto);
+    }
+    Ok(crate::api::jellyfin::wire::json(&out))
 }
 
 /// If `id_str` matches the library id of any configured root, return
