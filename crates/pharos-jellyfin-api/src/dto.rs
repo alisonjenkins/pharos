@@ -1555,6 +1555,7 @@ impl BaseItemDto {
     /// string for crew), and `Type` is the Jellyfin `PersonType` token.
     /// Replaces the hardcoded empty `people` `build` set.
     pub fn with_people(mut self, people: &[pharos_core::ItemPerson]) -> Self {
+        let on_book = self.kind == pharos_core::MediaKind::Book.base_item_kind();
         self.people = people
             .iter()
             .map(|p| {
@@ -1581,7 +1582,7 @@ impl BaseItemDto {
                     name: p.name.clone(),
                     id: p.wire_id.clone(),
                     role,
-                    kind: p.kind.as_str(),
+                    kind: p.kind.wire_type(on_book),
                     primary_image_tag,
                 }
             })

@@ -1285,7 +1285,10 @@ async fn scoped_person_counts(
     for item in &items {
         let credits = state.stores.people_for_item(item.id).await.map_err(ise)?;
         for credit in credits {
-            let kind = credit.kind.as_str().to_ascii_lowercase();
+            let kind = credit
+                .kind
+                .wire_type(item.kind == MediaKind::Book)
+                .to_ascii_lowercase();
             if wanted.is_empty() || wanted.contains(&kind) {
                 let n = counts.entry(credit.wire_id).or_insert(0u32);
                 *n = n.saturating_add(1);
