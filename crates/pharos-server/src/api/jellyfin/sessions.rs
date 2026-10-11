@@ -209,6 +209,12 @@ async fn playing_progress(
     let body = body.into_inner();
     let position_ticks = body.position_ticks.unwrap_or(0);
     let item_id_str = body.item_id.clone();
+    let parsed_item_id = pharos_jellyfin_api::dto::parse_item_id(&item_id_str);
+    // One read serves both the broadcast's kind and the DTO's runtime.
+    let item = match parsed_item_id {
+        Some(id) => state.stores.get(id).await.ok(),
+        None => None,
+    };
 
     if let Some(session_id) = body.play_session_id.clone() {
         state
@@ -226,10 +232,7 @@ async fn playing_progress(
         // Resolve the item's kind so the broadcast can stamp the
         // kotlin-REQUIRED `NowPlayingItem.Type` (a Type-less BaseItemDto
         // throws MissingFieldException and crashes native Android TV — B78).
-        let item_kind = match pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
-            Some(id) => state.stores.get(id).await.ok().map(|m| m.kind),
-            None => None,
-        };
+        let item_kind = item.as_ref().map(|m| m.kind);
         state.notify_playback_progress(
             &session_id,
             &user.0.id.0.simple().to_string(),
@@ -247,7 +250,7 @@ async fn playing_progress(
     // parse_item_id: clients echo the canonical 32-hex wire id (B15) — a
     // plain decimal parse silently failed here, so resume positions
     // stopped persisting for hex-era clients.
-    if let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
+    if let Some(item_id) = parsed_item_id {
         // Keep nudging the pre-generator from progress too: covers a server
         // restart mid-episode (session started before this process) and
         // clients that skip /Sessions/Playing. Deduped by the worker, so the
@@ -275,11 +278,8 @@ async fn playing_progress(
                 // B36 — broadcast the full DTO (with PlayedPercentage
                 // from the item's runtime) so other windows' resume
                 // bars track the live position.
-                let runtime = state
-                    .stores
-                    .get(item_id)
-                    .await
-                    .ok()
+                let runtime = item
+                    .as_ref()
                     .and_then(|it| it.probe.run_time_ticks())
                     .unwrap_or(0);
                 let dto = pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(
