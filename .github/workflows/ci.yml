@@ -111,11 +111,9 @@ jobs:
       - uses: alisonjenkins/setup-host-nix@v1.0.1
       - name: Push images to GHCR (latest + immutable sha tags)
         env:
-          # A PAT with write:packages, NOT the workflow GITHUB_TOKEN: these
-          # GHCR packages are user-owned + were created out-of-band, so the
-          # repo's GITHUB_TOKEN has no write grant on them (permission_denied:
-          # write_package). The PAT sidesteps GHCR's user-package Actions-access.
-          GHCR_CREDS: alisonjenkins:${{ secrets.GHCR_TOKEN }}
+          # The workflow token: both GHCR packages grant this repo Write under
+          # "Manage Actions access", so no expiring PAT is needed.
+          GHCR_CREDS: ${{ github.actor }}:${{ github.token }}
         run: |
           set -euo pipefail
           # Flux image automation orders tags numerically, and a commit SHA

@@ -89,10 +89,9 @@ jobs:
       # until the sha-tagged images publish lands, then re-tag from it.
       - name: Wait for commit-sha images, then tag the release version
         env:
-          # Same PAT as ci.yml's publish job: these GHCR packages are
-          # user-owned and were created out-of-band, so the repo's
-          # GITHUB_TOKEN has no write grant on them.
-          GHCR_CREDS: alisonjenkins:${{ secrets.GHCR_TOKEN }}
+          # The workflow token, as in ci.yml's publish job: both GHCR packages
+          # grant this repo Write under "Manage Actions access".
+          GHCR_CREDS: ${{ github.actor }}:${{ github.token }}
           SHA: ${{ steps.target.outputs.sha }}
           VERSION: ${{ steps.target.outputs.version }}
         run: |
