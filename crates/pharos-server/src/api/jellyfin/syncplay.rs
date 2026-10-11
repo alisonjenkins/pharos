@@ -447,6 +447,7 @@ struct RemoveFromPlaylistBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct MovePlaylistItemBody {
+    #[serde(default)]
     playlist_item_id: String,
     #[serde(default)]
     new_index: i64,
@@ -986,6 +987,10 @@ async fn move_playlist_item(
     body: web::Json<MovePlaylistItemBody>,
 ) -> HttpResponse {
     let body = body.into_inner();
+    // Jellyfin binds a missing Guid to Guid.Empty, which names no entry: 204.
+    if body.playlist_item_id.is_empty() {
+        return no_content();
+    }
     dispatch(
         &hub,
         &registry,

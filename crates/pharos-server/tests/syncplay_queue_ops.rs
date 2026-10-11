@@ -393,6 +393,30 @@ async fn move_playlist_item_posted_by_one_member_reaches_both() {
 }
 
 #[actix_web::test]
+async fn move_playlist_item_without_an_id_is_a_no_op_204() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let _ = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/MovePlaylistItem",
+        serde_json::json!({ "NewIndex": 1 })
+    );
+    assert_eq!(status, 204, "Jellyfin binds the missing id to Guid.Empty");
+    let _ = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": ["20"], "Mode": "Queue" })
+    );
+    let q = next_queue(&mut rx_a, "queue").await;
+    assert_eq!(q.item_ids, ["10", "11", "12", "20"], "nothing moved");
+}
+
+#[actix_web::test]
 async fn clear_playlist_with_clear_playing_item_empties_the_queue_for_both() {
     serve!(party().await => app, token, rx_a, rx_b);
     let _ = seeded!(app, token, rx_a, rx_b);
