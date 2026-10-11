@@ -34,8 +34,10 @@ async fn fixture() -> Fixture {
     let mut ids = Vec::new();
     for (name, admin) in [("admin", true), ("plain", false)] {
         let id = UserId::new();
-        let mut policy = UserPolicy::default();
-        policy.admin = admin;
+        let policy = UserPolicy {
+            admin,
+            ..UserPolicy::default()
+        };
         stores
             .create(UserRecord {
                 id,
@@ -163,4 +165,65 @@ async fn sessions_start_never_leaks_other_users_sessions_to_non_admin() {
     let list = push["Data"].as_array().unwrap();
     assert_eq!(list.len(), 1, "{push}");
     assert_eq!(list[0]["UserId"], f.user_id.0.simple().to_string());
+}
+
+#[actix_web::test]
+async fn activity_log_entry_start_pushes_new_entries_to_admin_until_stop() {
+    let f = fixture().await;
+    let mut ws = f.connect(&f.admin_token).await;
+
+    send(
+        &mut ws,
+        "ActivityLogEntryStart",
+        Value::String("0,1000".into()),
+    )
+    .await;
+    // no entry yet: subscribing alone must not spam
+    assert!(
+        next_of(&mut ws, "ActivityLogEntry", Duration::from_millis(600))
+            .await
+            .is_none()
+    );
+
+    f.state
+        .record_activity("alice signed in", "SessionStarted", None, Some("from web"));
+    let push = next_of(&mut ws, "ActivityLogEntry", WAIT)
+        .await
+        .expect("a push");
+    let entries = push["Data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{push}");
+    assert_eq!(entries[0]["Name"], "alice signed in");
+    assert_eq!(entries[0]["Type"], "SessionStarted");
+    assert_eq!(entries[0]["Severity"], "Information");
+    assert!(entries[0]["Id"].is_i64() && entries[0]["Date"].is_string());
+
+    send(&mut ws, "ActivityLogEntryStop", Value::Null).await;
+    // round-trip a KeepAlive so the Stop is processed before the next entry
+    send(&mut ws, "KeepAlive", Value::Null).await;
+    assert!(next_of(&mut ws, "KeepAlive", WAIT).await.is_some());
+    f.state
+        .record_activity("after stop", "SessionStarted", None, None);
+    assert!(next_of(&mut ws, "ActivityLogEntry", QUIET).await.is_none());
+}
+
+#[actix_web::test]
+async fn activity_log_entry_start_is_ignored_for_non_admin() {
+    let f = fixture().await;
+    let mut ws = f.connect(&f.user_token).await;
+
+    send(&mut ws, "ActivityLogEntryStart", Value::Null).await;
+    send(&mut ws, "KeepAlive", Value::Null).await;
+    assert!(next_of(&mut ws, "KeepAlive", WAIT).await.is_some());
+    f.state
+        .record_activity("admin only", "SessionStarted", None, None);
+    assert!(next_of(&mut ws, "ActivityLogEntry", QUIET).await.is_none());
+}
+
+#[actix_web::test]
+async fn unknown_subscription_types_are_ignored() {
+    let f = fixture().await;
+    let mut ws = f.connect(&f.admin_token).await;
+    send(&mut ws, "FooStart", Value::Null).await;
+    send(&mut ws, "KeepAlive", Value::Null).await;
+    assert!(next_of(&mut ws, "KeepAlive", WAIT).await.is_some());
 }

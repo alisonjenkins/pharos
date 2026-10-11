@@ -110,6 +110,10 @@ pub enum SocketBroadcast {
         /// Percent `0.0..=100.0`; serialized as a string to match Jellyfin.
         progress: f64,
     },
+    /// A new dashboard activity-log entry (pre-shaped `ActivityLogEntry`
+    /// JSON). Admin-only: delivered solely to sockets that sent
+    /// `ActivityLogEntryStart` and belong to an admin.
+    ActivityLogEntry { entry: serde_json::Value },
 }
 
 /// Resolved on-disk directories the dashboard storage panel
@@ -526,6 +530,9 @@ impl AppState {
             "UserId": user_id,
             "Severity": "Information",
             "ShortOverview": overview,
+        });
+        let _ = self.bus.send(SocketBroadcast::ActivityLogEntry {
+            entry: entry.clone(),
         });
         if let Ok(mut log) = self.activity_log.lock() {
             log.push_front(entry);

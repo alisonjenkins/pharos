@@ -336,6 +336,9 @@ async fn handle_connection<S>(
     // `Sessions` push subscription (`SessionsStart`/`SessionsStop`). Each push
     // carries the same per-caller view as `GET /Sessions`.
     let mut sessions_tick: Option<tokio::time::Interval> = None;
+    // `ActivityLogEntry` push subscription; only ever true for admins, like
+    // `GET /System/ActivityLog/Entries`.
+    let mut activity_subscribed = false;
 
     let close_cause = 'pump: loop {
         // React to a socket-drain at once: close so the client reconnects to
@@ -446,6 +449,9 @@ async fn handle_connection<S>(
                 // subscriber. Stay connected; the next library refresh
                 // will sync the client anyway.
                 let Ok(b) = broadcast_msg else { continue };
+                if matches!(b, SocketBroadcast::ActivityLogEntry { .. }) && !activity_subscribed {
+                    continue;
+                }
                 // V9: UserDataChanged + PlaybackProgress are scoped
                 // to one user. Drop the broadcast on this socket
                 // unless the bound bearer matches — otherwise user A
@@ -530,6 +536,14 @@ async fn handle_connection<S>(
                                 tokio::time::MissedTickBehavior::Skip,
                             );
                             sessions_tick = Some(iv);
+                            continue 'pump;
+                        }
+                        if inbound.message_type == "ActivityLogEntryStart" {
+                            activity_subscribed = is_admin;
+                            continue 'pump;
+                        }
+                        if inbound.message_type == "ActivityLogEntryStop" {
+                            activity_subscribed = false;
                             continue 'pump;
                         }
                         if inbound.message_type == "SessionsStop" {
@@ -1092,6 +1106,10 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 "ItemId": item_id,
                 "Progress": format!("{:.1}", progress.clamp(0.0, 100.0)),
             }),
+        )),
+        SocketBroadcast::ActivityLogEntry { entry } => Some(Outbound::new(
+            "ActivityLogEntry",
+            serde_json::Value::Array(vec![entry]),
         )),
     }
 }
