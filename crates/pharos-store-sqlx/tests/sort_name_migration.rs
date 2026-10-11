@@ -46,15 +46,19 @@ async fn populated_old_db(url: &str, titles: &[&str]) {
             .collect(),
     );
     migrator.run(&pool).await.unwrap();
+    // One transaction: a file-backed autocommit insert per row costs an fsync
+    // each, which took over a minute for 1,200 rows on a loaded CI disk.
+    let mut tx = pool.begin().await.unwrap();
     for (i, title) in titles.iter().enumerate() {
         sqlx::query("INSERT INTO media_items (id, path, title, kind) VALUES (?, ?, ?, 'movie')")
             .bind(i64::try_from(i).unwrap())
             .bind(format!("/m/{i}.mkv"))
             .bind(*title)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .unwrap();
     }
+    tx.commit().await.unwrap();
     pool.close().await;
 }
 
