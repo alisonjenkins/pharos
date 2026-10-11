@@ -452,6 +452,13 @@ pub struct ServerConfig {
     /// on read so a typo doesn't make every touch mark played.
     #[serde(default = "default_played_threshold_pct")]
     pub played_threshold_pct: u32,
+    /// Seconds between database writes of one play session's resume position.
+    /// Clients report every ~10 s; writing each report made the progress
+    /// route the busiest in the server. A report is still written at once on
+    /// the first tick, a pause flip, a seek and Stopped. A crash loses at
+    /// most this much progress. 0 writes every report.
+    #[serde(default = "default_playback_progress_persist_secs")]
+    pub playback_progress_persist_secs: u64,
     /// P43 — inter-probe sleep in milliseconds for the scanner +
     /// `/Library/Refresh` background pass. 0 (default) keeps the
     /// CLI scan behaviour unchanged. Production deployments with
@@ -516,6 +523,10 @@ pub struct ServerConfig {
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_playback_progress_persist_secs() -> u64 {
+    crate::progress_writes::DEFAULT_INTERVAL_SECS
 }
 
 fn default_remote_default_bitrate_bps() -> u64 {

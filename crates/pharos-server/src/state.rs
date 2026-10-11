@@ -252,6 +252,8 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// Which progress reports reach the database now and which are held.
+    pub progress_writes: Arc<crate::progress_writes::ProgressCoalescer>,
     /// Track preferences a newly created user starts with (`[user_defaults]`).
     /// Stock by default, in which case creation writes no preferences row.
     pub user_defaults: crate::config::UserDefaultsConfig,
@@ -615,6 +617,9 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
+                std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
+            )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
@@ -708,6 +713,9 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
+                std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
+            )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
             scan_rate_limit_ms: 0,
@@ -760,6 +768,11 @@ impl AppState {
     /// remote capping. See `remote_default_bitrate_bps`.
     pub fn with_remote_default_bitrate_bps(mut self, bps: u64) -> Self {
         self.remote_default_bitrate_bps = bps;
+        self
+    }
+
+    pub fn with_progress_persist_interval(mut self, interval: std::time::Duration) -> Self {
+        self.progress_writes = Arc::new(crate::progress_writes::ProgressCoalescer::new(interval));
         self
     }
 

@@ -26,6 +26,11 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+/// Default seconds between writes of one session's position: above the ~10 s
+/// report cadence so a steady client is written every other report, short
+/// enough that the lost tail of a crash is invisible on resume.
+pub const DEFAULT_INTERVAL_SECS: u64 = 15;
+
 /// Jellyfin position ticks per second (100 ns units).
 const TICKS_PER_SEC: u64 = 10_000_000;
 
