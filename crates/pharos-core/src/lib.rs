@@ -272,7 +272,7 @@ impl PersonKind {
             PersonKind::Producer => "Producer",
             PersonKind::Composer => "Composer",
             PersonKind::GuestStar => "GuestStar",
-            PersonKind::Other => "Other",
+            PersonKind::Other => "Unknown",
         }
     }
 
