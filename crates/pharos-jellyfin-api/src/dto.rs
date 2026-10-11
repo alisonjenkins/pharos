@@ -1730,9 +1730,10 @@ impl BaseItemDto {
         Self {
             id: wire_item_id(item.id),
             name: item.title.clone(),
-            // The store writes `media_items.sort_name` as `sort_name(title)`,
-            // so this is the stored value (and the NULL-row fallback) without
-            // a second column on `MediaItem`.
+            // `MediaItem` does not carry the stored `media_items.sort_name`
+            // (adding it touches every row mapping); `put` always writes
+            // `sort_name(title)`, so this matches what the SQL sorts by except
+            // for rows written by an older `sort_name` algorithm.
             sort_name: Some(pharos_core::sort_name(&item.title)).filter(|s| !s.is_empty()),
             server_id: server_id.to_string(),
             kind,
