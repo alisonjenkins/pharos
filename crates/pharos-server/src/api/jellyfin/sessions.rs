@@ -18,6 +18,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: lowercase canonical paths; `LowercasePath` middleware
     // rewrites jellyfin-web's PascalCase before the router matches.
     cfg.route("/sessions", web::get().to(list_sessions))
+        .route("/sessions/logout", web::post().to(logout))
         .route("/sessions/playing", web::post().to(playing_started))
         .route(
             "/sessions/playing/progress",
@@ -41,6 +42,24 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/sessions/{id}/playing",
             web::post().to(session_play_request),
         );
+}
+
+/// `POST /Sessions/Logout` — end the calling session. Revokes only the
+/// token on this request, so the user's other devices stay signed in.
+async fn logout(
+    state: web::Data<AppState>,
+    _user: AuthUser,
+    req: HttpRequest,
+) -> Result<impl Responder, actix_web::Error> {
+    use pharos_core::TokenStore;
+    let token = crate::api::jellyfin::auth_extractor::extract_token(&req)
+        .ok_or_else(|| error::ErrorUnauthorized("missing token"))?;
+    state
+        .stores
+        .revoke(&token)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(HttpResponse::NoContent().finish())
 }
 
 #[derive(Debug, Deserialize)]
