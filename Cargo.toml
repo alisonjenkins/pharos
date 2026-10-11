@@ -55,6 +55,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # so an instrumentation contract can be verified by disarming it and watching
 # the test go red rather than by reading the code.
 metrics-util = "0.20"
+metrics-process = "2"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "html_reports"] }
 dioxus = { version = "0.7", default-features = false, features = ["macro", "html", "hooks", "signals"] }
 dioxus-web = { version = "0.7", default-features = false }
