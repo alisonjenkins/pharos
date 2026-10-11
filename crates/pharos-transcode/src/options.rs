@@ -395,12 +395,12 @@ pub struct TranscodeOptions {
     /// the difference.
     #[serde(default)]
     pub muxed_audio_source: Option<MuxedAudio>,
-    /// B201 — when set, this segment is a FILLER: black video (+ silence for
+    /// B228 — when set, this segment is a FILLER: black video (+ silence for
     /// a muxed audio rendition) generated from an ffmpeg `lavfi` source
     /// instead of decoded from the real input, because the retry ladder
     /// (max decode preroll) still came back short of — or with zero — video
     /// frames. The frames are not in the source; no further retry conjures
-    /// them (V154).
+    /// them (V171).
     ///
     /// `#[serde(skip)]`, exactly like [`Self::source_video_codec`] and for
     /// the same reason: `RenditionKey` digests these options through serde,
@@ -499,7 +499,7 @@ impl RenditionKey {
         o.duration_ticks = None;
         o.decode_preroll_seconds = None;
         o.burn_subtitle_stream_index = None;
-        // B201 — `filler` is `#[serde(skip)]` (see its own doc comment for
+        // B228 — `filler` is `#[serde(skip)]` (see its own doc comment for
         // why: unlike this field, ANY non-skip presence — even neutralised
         // to a constant here — would still shift every OTHER rendition's
         // hash), so it is already absent from `canon` below and needs no

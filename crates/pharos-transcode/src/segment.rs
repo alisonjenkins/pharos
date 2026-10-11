@@ -314,7 +314,7 @@ impl ResolvedSegment {
             },
             // The real (non-filler) attempt this produces. `produce_segment`
             // sets this on its OWN clone of the result if the retry ladder is
-            // exhausted (B201) — never here, so a freshly-resolved segment is
+            // exhausted (B228) — never here, so a freshly-resolved segment is
             // never accidentally born a filler.
             filler: None,
         }

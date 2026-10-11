@@ -447,7 +447,7 @@ pub const DECODE_PREROLL_RETRY_SECONDS: f64 = 45.0;
 /// divides no frame rate exactly — timestamps round to under 3 µs.
 pub const FMP4_TRACK_TIMESCALE: u32 = 90_000;
 
-/// B201 — frame rate for a filler window's `lavfi` `color` source when
+/// B228 — frame rate for a filler window's `lavfi` `color` source when
 /// `TranscodeOptions::source_frame_rate` is unknown. 24000/1001 (23.976 fps)
 /// is the most common film/TV cadence in this library; an unknown rate is
 /// rare (it comes off `SegmentWindow::rate()`, itself sourced from the
@@ -633,7 +633,7 @@ fn build_args_for_device(
     device: crate::protocol::DeviceId,
     output: &str,
     offload: DecodeOffload,
-    // B201 — same shape as `offload`: decided by the process holding the
+    // B228 — same shape as `offload`: decided by the process holding the
     // retry history (the segment cache), travels beside the device on
     // `protocol::JobSpec::filler` rather than inside `opts`
     // (`TranscodeOptions::filler` exists purely for the caller's own
@@ -646,7 +646,7 @@ fn build_args_for_device(
         .decode_preroll_seconds
         .unwrap_or(DECODE_PREROLL_SECONDS);
     let hwaccel = device.hwaccel();
-    // B201 — a filler window is fully synthetic: nothing here is decoded, so
+    // B228 — a filler window is fully synthetic: nothing here is decoded, so
     // every source-shaped fact (burn, the muxed-audio copy input, the
     // per-track audio index) makes no sense against black lavfi frames.
     // Strip them from a CLONE before the encoder-selection logic below runs
@@ -776,7 +776,7 @@ fn build_args_for_device(
     };
     match filler {
         Some(f) => {
-            // B201 — no seek, no real input: `-t` below (unchanged) crops
+            // B228 — no seek, no real input: `-t` below (unchanged) crops
             // these infinite lavfi sources to exactly the window's duration,
             // and `-output_ts_offset` (unchanged, computed from `start`
             // above) still anchors the result to this window's true position
@@ -805,7 +805,7 @@ fn build_args_for_device(
             if f.audio_codec.is_some() {
                 // Silence, not a copy of the continuous encode: the design
                 // deliberately trades the partial real audio this window
-                // might have had for one uniform mechanism (B201).
+                // might have had for one uniform mechanism (B228).
                 a.push("-f".into());
                 a.push("lavfi".into());
                 a.push("-i".into());
@@ -1464,7 +1464,7 @@ mod tests {
             .map(|i| args[i + 1].as_str())
     }
 
-    /// B201 — the filler's two `-f lavfi` inputs carry the rendition's OWN
+    /// B228 — the filler's two `-f lavfi` inputs carry the rendition's OWN
     /// size and rate, never a guess: `color` gets `FillerSpec::width`/
     /// `height` and `opts.source_frame_rate` (the same value a real segment
     /// of this rendition pins `-r`/`-enc_time_base` to below); `anullsrc`
@@ -1526,13 +1526,13 @@ mod tests {
         assert!(!vo.contains("anullsrc"), "{vo}");
     }
 
-    /// B201 — a filler decodes NOTHING and burns NOTHING: even when the
+    /// B228 — a filler decodes NOTHING and burns NOTHING: even when the
     /// FAILED real attempt's own options carry a burn index and a
     /// muxed-audio copy source (the ordinary shape for the rendition this
     /// window belongs to), the filler argv must not seek, hwaccel, map, or
     /// otherwise reference any of it — a broken filler-input branch that
     /// fell through to the real-segment code would reproduce exactly the
-    /// B201 500 (the real input cannot be decoded), invisibly to every cache
+    /// B228 500 (the real input cannot be decoded), invisibly to every cache
     /// test, which drives a fake worker that never looks at the argv at all.
     #[test]
     fn filler_argv_carries_no_seek_hwaccel_map_or_burn_remnants() {
