@@ -3591,6 +3591,8 @@ fn parse_kind_filter(include: Option<&str>) -> KindFilter {
     if !wanted.is_empty() {
         return KindFilter::Kinds(wanted);
     }
+    // `Audiobook`/`AudioBook` land here on purpose: audiobooks are out of scope
+    // (specs/004-books), so no stored kind is one and the query matches nothing.
     // No stored kind named. If any named type is one pharos synthesises, leave
     // the query unfiltered and let the path that understands it answer.
     let any_synth = named.iter().any(|t| {
