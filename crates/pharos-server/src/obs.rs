@@ -2,7 +2,7 @@
 //! is lock-free via `OnceLock<PrometheusHandle>` — render() does not contend.
 
 use actix_web::HttpMessage;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::sync::{Once, OnceLock};
 use std::time::Instant;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -101,6 +101,13 @@ pub enum ObsError {
     Otlp(String),
 }
 
+/// Upper bounds for every `*_seconds` metric: 5 ms (a cached DB read) to 30 s
+/// (a slow transcode segment). Without explicit buckets the exporter emits a
+/// summary, whose quantiles cannot be aggregated across pods.
+const SECONDS_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
 static INIT: Once = Once::new();
 static RESULT: OnceLock<Result<PrometheusHandle, ObsError>> = OnceLock::new();
 /// Keeps the OTLP tracer provider alive for the process lifetime so the batch
@@ -141,6 +148,8 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
             // the condition having cleared. Adding one means re-publishing
             // those on a timer first.
             PrometheusBuilder::new()
+                .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)
+                .map_err(|e| ObsError::Prom(e.to_string()))?
                 .install_recorder()
                 .map_err(|e| ObsError::Prom(e.to_string()))
         })();
@@ -250,6 +259,22 @@ mod tests {
         // Both renders return a string (may be empty until metrics emitted).
         let _ = h1.render();
         let _ = h2.render();
+    }
+
+    /// Timing metrics must export as real histograms so quantiles aggregate
+    /// across pods; a summary cannot be merged.
+    #[test]
+    fn seconds_metrics_render_as_histograms_not_summaries() {
+        init("info", None).unwrap();
+        metrics::histogram!("pharos_obs_probe_seconds", "k" => "v").record(0.02);
+        let body = render();
+        assert!(
+            body.contains("# TYPE pharos_obs_probe_seconds histogram"),
+            "not a histogram; rendered:\n{body}"
+        );
+        assert!(body.contains("pharos_obs_probe_seconds_bucket{k=\"v\",le=\"0.005\"}"));
+        assert!(body.contains("le=\"30\""));
+        assert!(!body.contains("pharos_obs_probe_seconds{k=\"v\",quantile"));
     }
 
     #[test]
