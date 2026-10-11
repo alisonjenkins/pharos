@@ -1392,6 +1392,9 @@ mod tests {
         // after.
         use pharos_sync::SessionHub;
         use tokio::sync::mpsc;
+        // Paused clock auto-advances while every task is idle, so the 150ms
+        // registration delay and the 2s bounded wait cost no real time.
+        tokio::time::pause();
         let hub = SessionHub::new();
         let dev = "user:dev-race";
         // Register ~150ms late, as the socket task would.
