@@ -636,10 +636,14 @@ fn flush_digit_run(out: &mut String, digits: &mut String) {
     if digits.is_empty() {
         return;
     }
-    for _ in digits.len()..SORT_NAME_DIGIT_WIDTH {
-        out.push('0');
+    if digits.len() > SORT_NAME_DIGIT_WIDTH {
+        // Longer than any u64: clamp so every over-long run compares equal
+        // and above all shorter ones, instead of ordering by raw digits.
+        out.push_str(&"9".repeat(SORT_NAME_DIGIT_WIDTH));
+    } else {
+        out.push_str(&"0".repeat(SORT_NAME_DIGIT_WIDTH - digits.len()));
+        out.push_str(digits);
     }
-    out.push_str(digits);
     digits.clear();
 }
 
