@@ -632,10 +632,15 @@ fn default_server_name() -> String {
     "pharos".into()
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ObsConfig {
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+    /// Fraction of new traces exported over OTLP, 0.0..=1.0. A request that
+    /// arrives with a sampled `traceparent` is always kept (parent-based), so
+    /// only traces that start here are thinned. 1.0 keeps everything.
+    #[serde(default = "default_sampling_ratio")]
+    pub sampling_ratio: f64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Directory pharos writes / surfaces log files from. When set,
@@ -740,6 +745,10 @@ impl MediaConfig {
     }
 }
 
+fn default_sampling_ratio() -> f64 {
+    1.0
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -754,11 +763,18 @@ pub enum ConfigError {
     },
     #[error("parse: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("obs.sampling_ratio must be within 0.0..=1.0, got {0}")]
+    SamplingRatio(f64),
 }
 
 impl Config {
     pub fn from_toml_str(s: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(s)?)
+        let cfg: Self = toml::from_str(s)?;
+        let ratio = cfg.obs.sampling_ratio;
+        if !(0.0..=1.0).contains(&ratio) {
+            return Err(ConfigError::SamplingRatio(ratio));
+        }
+        Ok(cfg)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, ConfigError> {
@@ -920,6 +936,37 @@ mod tests {
         assert_eq!(c.obs.log_level, "debug");
         assert_eq!(c.media.roots, vec![PathBuf::from("/srv/media")]);
         assert!(c.obs.otlp_endpoint.is_none());
+    }
+
+    #[test]
+    fn sampling_ratio_defaults_to_everything() {
+        let c = Config::from_toml_str(SAMPLE).unwrap();
+        assert_eq!(c.obs.sampling_ratio, 1.0);
+    }
+
+    #[test]
+    fn sampling_ratio_is_read_from_toml() {
+        let s = SAMPLE.replace("log_level = \"debug\"", "sampling_ratio = 0.25");
+        assert_eq!(Config::from_toml_str(&s).unwrap().obs.sampling_ratio, 0.25);
+    }
+
+    /// The Helm chart renders the default as the bare integer `1`.
+    #[test]
+    fn sampling_ratio_accepts_a_toml_integer() {
+        let s = SAMPLE.replace("log_level = \"debug\"", "sampling_ratio = 1");
+        assert_eq!(Config::from_toml_str(&s).unwrap().obs.sampling_ratio, 1.0);
+    }
+
+    #[test]
+    fn sampling_ratio_outside_zero_to_one_is_rejected() {
+        for bad in ["1.5", "-0.1"] {
+            let s = SAMPLE.replace("log_level = \"debug\"", &format!("sampling_ratio = {bad}"));
+            let err = Config::from_toml_str(&s).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::SamplingRatio(_)),
+                "{bad} -> {err}"
+            );
+        }
     }
 
     #[test]
