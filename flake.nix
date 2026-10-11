@@ -99,6 +99,12 @@
         # commits (keyed by Cargo.lock + build inputs). A code-only change then
         # recompiles just the workspace crates, not all of crates.io.
         pharosDeps = craneLib.buildDepsOnly pharosCommonArgs;
+        # Checks (tests/doctests/clippy) build with the `ci` cargo profile
+        # (Cargo.toml: dev with optimised deps) on their own deps artifact:
+        # crane defaults to `release`, and optimising ~160 test binaries
+        # dominated CI wall-clock. The shipped binary stays `release`.
+        ciArgs = pharosCommonArgs // { CARGO_PROFILE = "ci"; };
+        pharosCiDeps = craneLib.buildDepsOnly ciArgs;
         pharosBins = craneLib.buildPackage (
           pharosCommonArgs
           // {
@@ -123,9 +129,9 @@
         # flake `check`, so `nix flake check` (CI) gates the binary on a green
         # suite built from the exact same source + toolchain that ships.
         pharosTests = craneLib.cargoNextest (
-          pharosCommonArgs
+          ciArgs
           // {
-            cargoArtifacts = pharosDeps;
+            cargoArtifacts = pharosCiDeps;
             cargoExtraArgs = "--workspace";
             cargoNextestExtraArgs = "--profile nix";
             # HEAVY ffmpeg integration tests (whole-file VP9 encodes etc.) are
@@ -141,18 +147,18 @@
         );
         # nextest doesn't run doctests — cover them separately (same deps).
         pharosDoctests = craneLib.cargoDocTest (
-          pharosCommonArgs
+          ciArgs
           // {
-            cargoArtifacts = pharosDeps;
+            cargoArtifacts = pharosCiDeps;
             cargoExtraArgs = "--workspace";
           }
         );
         # Lint + format gates on the same compiled deps — V17's
         # `-D warnings` (clippy::unwrap_used/expect_used deny) enforced here.
         pharosClippy = craneLib.cargoClippy (
-          pharosCommonArgs
+          ciArgs
           // {
-            cargoArtifacts = pharosDeps;
+            cargoArtifacts = pharosCiDeps;
             cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
           }
         );
@@ -165,9 +171,9 @@
         # PHAROS_TEST_POSTGRES_URL (set below); its sqlite arm runs in the plain
         # `checks.tests` already.
         pharosPgTests = craneLib.cargoNextest (
-          pharosCommonArgs
+          ciArgs
           // {
-            cargoArtifacts = pharosDeps;
+            cargoArtifacts = pharosCiDeps;
             cargoExtraArgs = "-p pharos-store-sqlx --features postgres";
             cargoNextestExtraArgs = "--profile nix";
             nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [ pkgs.postgresql ];
