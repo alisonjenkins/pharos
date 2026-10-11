@@ -47,6 +47,44 @@ use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
+/// Rows per transaction in [`backfill_sort_names`]: small enough that row
+/// locks are released between batches on a large library.
+const SORT_NAME_BACKFILL_BATCH: i64 = 500;
+
+/// Fill `media_items.sort_name` for rows that predate migration 0054.
+/// Keyset-paged on `id` and idempotent (`sort_name IS NULL`), so a crash
+/// mid-way or a second run just continues. Returns the rows it filled.
+pub(crate) async fn backfill_sort_names(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut after = 0_i64;
+    let mut filled = 0_u64;
+    loop {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, title FROM media_items \
+             WHERE sort_name IS NULL AND id > $1 ORDER BY id LIMIT $2",
+        )
+        .bind(after)
+        .bind(SORT_NAME_BACKFILL_BATCH)
+        .fetch_all(pool)
+        .await?;
+        let Some(last) = rows.last().map(|(id, _)| *id) else {
+            return Ok(filled);
+        };
+        let mut tx = pool.begin().await?;
+        for (id, title) in &rows {
+            sqlx::query(
+                "UPDATE media_items SET sort_name = $1 WHERE id = $2 AND sort_name IS NULL",
+            )
+            .bind(pharos_core::sort_name(title))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        filled = filled.saturating_add(u64::try_from(rows.len()).unwrap_or(0));
+        after = last;
+    }
+}
+
 /// LIB-B4 — `MEDIA_COLUMNS` with each column qualified by a table alias,
 /// for the search join (so the FromRow still maps the plain column names).
 fn media_columns_prefixed_pg(alias: &str) -> String {
@@ -92,6 +130,10 @@ impl PostgresStore {
             .connect(url)
             .await?;
         MIGRATOR.run(&pool).await?;
+        let filled = backfill_sort_names(&pool).await?;
+        if filled > 0 {
+            tracing::info!(rows = filled, "backfilled media_items.sort_name");
+        }
         Ok(Self { pool })
     }
 
@@ -632,16 +674,17 @@ impl MediaStore for PostgresStore {
                 production_locations_json, trailers_json, \
                 synopsis, content_rating, network, release_date, original_language, \
                 book_format, book_page_count, book_author, book_publisher, \
-                book_series, book_series_index, book_isbn) \
+                book_series, book_series_index, book_isbn, sort_name) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, \
                      $28, $29, $30, $31, $32, \
                      $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, \
                      $48, $49, $50, $51, $52, $53, $54, \
-                     $55, $56, $57, $58, $59, $60, $61)
+                     $55, $56, $57, $58, $59, $60, $61, $62)
              ON CONFLICT (id) DO UPDATE SET path = EXCLUDED.path,
                                             title = EXCLUDED.title,
                                             title_fold = EXCLUDED.title_fold,
+                                            sort_name = EXCLUDED.sort_name,
                                             kind = EXCLUDED.kind,
                                             size_bytes = EXCLUDED.size_bytes,
                                             duration_ms = EXCLUDED.duration_ms,
@@ -776,6 +819,7 @@ impl MediaStore for PostgresStore {
                 .map(|v| v as i64),
         )
         .bind(item.book.as_ref().and_then(|b| b.isbn.clone()))
+        .bind(pharos_core::sort_name(&item.title))
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;

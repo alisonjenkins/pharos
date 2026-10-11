@@ -588,6 +588,62 @@ pub trait GenreStore: Send + Sync {
     fn backfill_genres(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
+/// Zero-padded width of a digit run in a [`sort_name`]; wide enough for any
+/// `u64`, so "Ep 2" sorts before "Ep 10" without a run ever overflowing it.
+const SORT_NAME_DIGIT_WIDTH: usize = 20;
+
+/// Leading words Jellyfin's default `SortRemoveWords` drops from a sort name.
+const SORT_NAME_ARTICLES: [&str; 3] = ["the", "a", "an"];
+
+/// The key `SortBy=SortName` orders items by: the title lowercased the same
+/// way as `title_fold`, minus one leading article (`the` / `a` / `an`), with
+/// every run of ASCII digits zero-padded so numbers compare by value. An
+/// article is only dropped when a word follows it, so a title that is just
+/// "The" keeps its text.
+pub fn sort_name(title: &str) -> String {
+    let folded = title.trim().to_lowercase();
+    let body = strip_leading_article(&folded);
+    let mut out = String::with_capacity(body.len());
+    let mut digits = String::new();
+    for ch in body.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            continue;
+        }
+        flush_digit_run(&mut out, &mut digits);
+        out.push(ch);
+    }
+    flush_digit_run(&mut out, &mut digits);
+    out
+}
+
+fn strip_leading_article(folded: &str) -> &str {
+    for article in SORT_NAME_ARTICLES {
+        let Some(rest) = folded.strip_prefix(article) else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            return rest;
+        }
+    }
+    folded
+}
+
+fn flush_digit_run(out: &mut String, digits: &mut String) {
+    if digits.is_empty() {
+        return;
+    }
+    for _ in digits.len()..SORT_NAME_DIGIT_WIDTH {
+        out.push('0');
+    }
+    out.push_str(digits);
+    digits.clear();
+}
+
 /// LIB-C4 — split a raw `media_items.genre` string into individual genre
 /// names. Jellyfin's wire convention separates genres with `|`; NFO /
 /// ffprobe tags often use `,`. We split on either, trim, and drop blanks.

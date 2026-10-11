@@ -809,3 +809,33 @@ fn book_format_round_trips_and_knows_what_a_client_can_open() {
         );
     }
 }
+
+#[test]
+fn sort_name_drops_one_leading_article_case_insensitively() {
+    assert_eq!(sort_name("The Matrix"), "matrix");
+    assert_eq!(sort_name("THE Matrix"), "matrix");
+    assert_eq!(sort_name("A Quiet Place"), "quiet place");
+    assert_eq!(sort_name("An American Tail"), "american tail");
+    assert_eq!(sort_name("The The"), "the");
+}
+
+#[test]
+fn sort_name_keeps_titles_that_only_start_like_an_article() {
+    assert_eq!(sort_name("Theory of Everything"), "theory of everything");
+    assert_eq!(sort_name("Anchorman"), "anchorman");
+    assert_eq!(sort_name("A.I."), "a.i.");
+    assert_eq!(sort_name("The"), "the");
+    assert_eq!(sort_name("A"), "a");
+}
+
+#[test]
+fn sort_name_pads_digit_runs_so_numbers_compare_by_value() {
+    assert!(sort_name("Ep 2") < sort_name("Ep 10"));
+    assert!(sort_name("Ep 10") < sort_name("Ep 100"));
+    assert_eq!(sort_name("Ep 2"), "ep 00000000000000000002");
+}
+
+#[test]
+fn sort_name_folds_unicode_case_like_title_fold() {
+    assert_eq!(sort_name("Émile"), "Émile".to_lowercase());
+}
