@@ -35,27 +35,17 @@ jobs:
       # shipped artifact (same source + toolchain the image is built from), not
       # a separately cargo-built one, and the deps are store-cached instead of
       # recompiled every ephemeral-runner run.
-      - name: nix flake check (build + tests + clippy + fmt + doctests)
+      #
+      # T80 — the store suite against a REAL postgres — is `checks.postgres`
+      # (`pharosPgTests` in flake.nix), so it runs inside this same command,
+      # in parallel with the other checks. The postgres arms skip themselves
+      # in the plain workspace nextest (PHAROS_TEST_POSTGRES_URL unset), and
+      # sqlx checks neither placeholder arity nor column names at compile
+      # time, so that check is what catches a postgres-only defect (e.g. the
+      # `mark_seen_batch` override that existed for sqlite only, T117).
+      # `just test-postgres` is the local equivalent of the same check.
+      - name: nix flake check (build + tests + clippy + fmt + doctests + postgres)
         run: nix flake check -L
-
-      # T80 — the store suite against a REAL postgres.
-      #
-      # `nix flake check` does NOT cover it: the postgres arms skip themselves
-      # when PHAROS_TEST_POSTGRES_URL is unset (they are the bulk of the
-      # "N skipped" line), and sqlx checks neither placeholder arity nor column
-      # names at compile time. So a postgres-only defect compiles, passes the
-      # whole suite, and reaches production untouched — which is what happened
-      # with `mark_seen_batch`: it had a sqlite override and none for postgres,
-      # so every scan on the deployment fell back to one autocommit UPDATE per
-      # file (T117), and no test anywhere called it.
-      #
-      # A STEP here rather than a parallel job on purpose. The self-hosted pool
-      # is small, and a fifth job spent 25 minutes queued behind the others
-      # while adding nothing but wall-clock; this runner already has the
-      # devShell warm. `just test-postgres` brings up its own postgres via nix,
-      # so there is no service container and no credentials either way.
-      - name: store suite against real postgres (T80)
-        run: nix develop --command just test-postgres
 
   audit:
     name: supply-chain
