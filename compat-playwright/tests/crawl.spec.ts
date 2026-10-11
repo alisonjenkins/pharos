@@ -216,6 +216,12 @@ test.describe("jellyfin-web crawl", () => {
       .getByRole("heading", { name: /audio settings|video quality|playback/i })
       .first()
       .waitFor({ timeout: 15_000 });
+    // The form is filled after /System/Info and /Localization/cultures return;
+    // the headings render first, so wait for the language list before judging
+    // errors or a late page error slips past the assertion.
+    await expect(page.locator("#selectAudioLanguage option")).not.toHaveCount(0, {
+      timeout: 15_000,
+    });
     expect(errors, errors.join("\n")).toHaveLength(0);
   });
 
