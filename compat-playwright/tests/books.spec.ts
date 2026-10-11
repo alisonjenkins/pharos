@@ -226,8 +226,9 @@ test.describe("books: unmodified jellyfin-web opens an epub", () => {
     await page.frameLocator("iframe").first().locator("#ch1-marker").waitFor({ timeout: 60_000 });
 
     expect(downloads.length, "the reader must have fetched the epub").toBeGreaterThan(0);
-    // Query auth, no Authorization header — the shape getItemDownloadUrl builds.
-    expect(downloads[0]).toContain("api_key=");
+    // Query auth, no Authorization header. jellyfin-web 12's reader spells the
+    // parameter `ApiKey`, 10.11's spelled it `api_key`; the server takes both.
+    expect(downloads[0]).toMatch(/[?&]api_?key=/i);
   });
 
   // T057 — the SECOND reader. `comicsPlayer` sits behind the same
