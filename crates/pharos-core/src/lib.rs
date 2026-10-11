@@ -3310,7 +3310,10 @@ pub trait UserDataStore: Send + Sync {
     /// Touches only the resume position, `last_played_at` and the tracks the
     /// report names; `played`, `play_count` and `is_favorite` are left exactly
     /// as they are, so a concurrent change to them is never overwritten by a
-    /// stale read-modify-write.
+    /// stale read-modify-write. A report older than the stored
+    /// `last_played_at` is dropped and the stored row returned: a report held
+    /// back for a while must not overwrite what a later event (a stop, on this
+    /// replica or another) already wrote.
     fn record_playback_progress(
         &self,
         user: UserId,

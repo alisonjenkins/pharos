@@ -571,6 +571,27 @@ where
             .unwrap(),
         after_progress
     );
+    // A report older than the stored row changes nothing.
+    let stale = UserDataStore::record_playback_progress(
+        &store,
+        uid,
+        item_id,
+        pharos_core::PlaybackProgress {
+            position_ticks: 1,
+            at: 1_700_000_100,
+            audio_stream_index: Some(9),
+            subtitle_stream_index: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(stale, after_progress);
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, item_id)
+            .await
+            .unwrap(),
+        after_progress
+    );
 
     // -----------------------------------------------------------------
     // 6. PreferenceStore

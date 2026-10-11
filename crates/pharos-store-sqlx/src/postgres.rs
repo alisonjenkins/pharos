@@ -3228,7 +3228,7 @@ impl UserDataStore for PostgresStore {
         let item_i64 = media_id_i64(item)?;
         let pos_i64 = i64::try_from(progress.position_ticks)
             .map_err(|e| DomainError::Backend(format!("position overflow: {e}")))?;
-        let row: PgUserDataRow = sqlx::query_as(
+        let row: Option<PgUserDataRow> = sqlx::query_as(
             "INSERT INTO user_data
                (user_id, item_id, played, play_count, last_played_position_ticks,
                 is_favorite, last_played_at, audio_stream_index, subtitle_stream_index)
@@ -3240,6 +3240,7 @@ impl UserDataStore for PostgresStore {
                  COALESCE(EXCLUDED.audio_stream_index, user_data.audio_stream_index),
                subtitle_stream_index =
                  COALESCE(EXCLUDED.subtitle_stream_index, user_data.subtitle_stream_index)
+             WHERE user_data.last_played_at <= EXCLUDED.last_played_at
              RETURNING played, play_count, last_played_position_ticks, is_favorite,
                        last_played_at, audio_stream_index, subtitle_stream_index",
         )
@@ -3249,10 +3250,15 @@ impl UserDataStore for PostgresStore {
         .bind(progress.at)
         .bind(progress.audio_stream_index)
         .bind(progress.subtitle_stream_index)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
-        Ok(row_to_user_data(row))
+        match row {
+            Some(row) => Ok(row_to_user_data(row)),
+            // The stored row is newer than this report (it was held back and
+            // a later write, e.g. a Stopped, got there first): keep the row.
+            None => self.get_user_data(user, item).await,
+        }
     }
 
     #[tracing::instrument(skip(self, data), fields(user.id = %user.0, media.id = %item))]
