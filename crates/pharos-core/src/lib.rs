@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod language;
 pub mod origin;
+pub mod parental_rank;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
@@ -2625,6 +2626,9 @@ pub enum SortKey {
     CommunityRating,
     /// `CriticRating` — the metadata `critic_rating`.
     CriticRating,
+    /// `ParentalRating` — [`parental_rank::parental_rating_rank`] of
+    /// `official_rating`; unknown and empty ratings rank lowest.
+    ParentalRating,
     /// `PlayCount` — the requesting user's `user_data.play_count`. Needs
     /// [`UserDataQuery::user`]; ignored without one.
     PlayCount,

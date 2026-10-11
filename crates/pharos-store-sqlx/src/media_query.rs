@@ -12,6 +12,8 @@
 //! [`SortKey`] → column expression map (`sort_key_column`), which can never
 //! carry user input.
 
+use std::sync::LazyLock;
+
 use pharos_core::{MediaFilters, MediaKind, MediaQuery, ParentFilter, SortDir, SortKey, UserId};
 
 /// One bound parameter, in WHERE/ORDER appearance order. The backend binds
@@ -35,10 +37,24 @@ pub(crate) struct BuiltQuery {
     pub params: Vec<Param>,
 }
 
+/// `CASE` mapping `official_rating` to its maturity rank (0 for NULL, empty
+/// or unrecognised). Built from the closed rating table in `pharos-core`, so
+/// the only interpolated text is table constants (letters, digits, `-+`);
+/// no NULL results, hence no NULLS clause. Identical on both backends.
+static PARENTAL_RATING_ORDER: LazyLock<String> = LazyLock::new(|| {
+    let mut sql = String::from("CASE LOWER(TRIM(official_rating))");
+    for (name, rank) in pharos_core::parental_rank::parental_rating_ranks() {
+        sql.push_str(&format!(" WHEN '{name}' THEN {rank}"));
+    }
+    sql.push_str(" ELSE 0 END");
+    sql
+});
+
 /// Map a [`SortKey`] to its fixed SQL column expression. CLOSED SET — the
 /// only text interpolated into the query. Never accepts user strings.
 fn sort_key_column(key: SortKey) -> &'static str {
     match key {
+        SortKey::ParentalRating => PARENTAL_RATING_ORDER.as_str(),
         // Unicode case-fold (Rust `to_lowercase` via `title_fold`), with an
         // ASCII fallback for pre-0028 rows, so accented / mixed-case titles
         // sort identically to the legacy in-memory `to_lowercase` order.

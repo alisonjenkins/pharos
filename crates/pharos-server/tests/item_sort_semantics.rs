@@ -26,6 +26,7 @@ struct Row {
     plays: Option<(u32, i64)>,
     /// `(album, year)` makes the row an audio track on that album.
     album: Option<(&'static str, u32)>,
+    rating: Option<&'static str>,
 }
 
 impl Row {
@@ -39,6 +40,7 @@ impl Row {
             critic: None,
             plays: None,
             album: None,
+            rating: None,
         }
     }
 }
@@ -79,6 +81,7 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                     premiere_date: r.premiere,
                     community_rating: r.community,
                     critic_rating: r.critic,
+                    official_rating: r.rating.map(str::to_string),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -217,6 +220,47 @@ async fn community_and_critic_rating_sort_by_score() {
         "SortBy=CriticRating&SortOrder=Descending"
     );
     assert_eq!(critic, vec!["Alpha", "Charlie", "Bravo", "Delta"]);
+}
+
+#[actix_web::test]
+async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
+    let rated = |id: u64, title: &'static str, rating: &'static str| Row {
+        rating: Some(rating),
+        ..Row::new(id, title)
+    };
+    let rows = vec![
+        rated(1, "NC17", "NC-17"),
+        rated(2, "Pg13", "PG-13"),
+        rated(3, "TvMa", "tv-ma"),
+        rated(4, "G", "G"),
+        rated(5, "Fifteen", "15"),
+        rated(6, "Unrated", "Not Rated"),
+        rated(7, "Blank", ""),
+        Row::new(8, "None"),
+        rated(9, "TvY", "TV-Y"),
+        rated(10, "R", "R"),
+    ];
+    let (state, token) = seed(rows).await;
+    let app = test::init_service(build_app(state)).await;
+    // Ties (unknown/blank/none; G/TV-Y) fall to the id tiebreak.
+    let asc = names!(
+        &app,
+        token.as_str(),
+        "SortBy=ParentalRating&SortOrder=Ascending"
+    );
+    assert_eq!(
+        asc,
+        vec!["Unrated", "Blank", "None", "G", "TvY", "Pg13", "Fifteen", "R", "NC17", "TvMa"]
+    );
+    let desc = names!(
+        &app,
+        token.as_str(),
+        "SortBy=ParentalRating&SortOrder=Descending"
+    );
+    assert_eq!(
+        desc,
+        vec!["NC17", "TvMa", "R", "Fifteen", "Pg13", "G", "TvY", "Unrated", "Blank", "None"]
+    );
 }
 
 fn titled(titles: &[&'static str]) -> Vec<Row> {

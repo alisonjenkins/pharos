@@ -5066,6 +5066,7 @@ fn sort_token_primary(primary: &str) -> SortPrimary {
         "ProductionYear" => SortPrimary::Keyed(pharos_core::SortKey::ProductionYear),
         "CommunityRating" => SortPrimary::Keyed(pharos_core::SortKey::CommunityRating),
         "CriticRating" => SortPrimary::Keyed(pharos_core::SortKey::CriticRating),
+        "ParentalRating" => SortPrimary::Keyed(pharos_core::SortKey::ParentalRating),
         "PlayCount" => SortPrimary::Keyed(pharos_core::SortKey::PlayCount),
         "DatePlayed" => SortPrimary::Keyed(pharos_core::SortKey::DatePlayed),
         "Name" => SortPrimary::Name,
