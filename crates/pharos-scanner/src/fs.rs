@@ -494,8 +494,45 @@ impl<P: Prober> FsScanner<P> {
     /// root's items (V10: the store performs a single atomic DELETE). The
     /// swept count is threaded into [`MediaStore::finish_scan`] and the
     /// deleted ids are logged at info (broadcasting deltas is A4).
+    ///
+    /// Records `pharos_scan_duration_seconds{outcome}` and
+    /// `pharos_scan_items_total{result}` for every run.
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
     pub async fn scan_into<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
+        &self,
+        root: &Path,
+        store: &S,
+    ) -> DomainResult<ScanOutcome> {
+        let started = std::time::Instant::now();
+        let result = self.scan_run(root, store).await;
+        let cancelled = self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
+        let outcome_label = match (&result, cancelled) {
+            (Err(_), _) => "error",
+            (Ok(_), true) => "cancelled",
+            (Ok(_), false) => "ok",
+        };
+        metrics::histogram!("pharos_scan_duration_seconds", "outcome" => outcome_label)
+            .record(started.elapsed().as_secs_f64());
+        if let Ok(out) = &result {
+            for (label, n) in [
+                ("added", out.added.len()),
+                ("updated", out.updated.len()),
+                ("skipped", out.skipped),
+                ("removed", out.removed.len()),
+            ] {
+                metrics::counter!("pharos_scan_items_total", "result" => label)
+                    .increment(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+        }
+        result
+    }
+
+    async fn scan_run<
         S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
     >(
         &self,
@@ -3616,6 +3653,67 @@ mod tests {
             1,
             "the still-present file must not be pruned by an incomplete walk"
         );
+    }
+
+    fn scan_counter(snap: &pharos_test_metrics::CumulativeSnapshotter, result: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| match v {
+                DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_items_total"
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "result" && l.value() == result) =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_scan_records_its_duration_and_what_it_found() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"aaaa").await;
+        write_file(td.path(), "b.mkv", b"bbbb").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(scan_counter(&snapshotter, "added"), 2);
+        assert_eq!(scan_counter(&snapshotter, "skipped"), 0);
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(scan_counter(&snapshotter, "added"), 2, "no new files");
+        assert_eq!(scan_counter(&snapshotter, "skipped"), 2);
+
+        let runs =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| match v {
+                    DebugValue::Histogram(h)
+                        if ck.key().name() == "pharos_scan_duration_seconds"
+                            && ck
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "outcome" && l.value() == "ok") =>
+                    {
+                        Some(h.len())
+                    }
+                    _ => None,
+                });
+        assert_eq!(runs, Some(2), "one duration observation per scan");
     }
 
     #[tokio::test]
