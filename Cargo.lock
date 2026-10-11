@@ -3251,8 +3251,11 @@ dependencies = [
 name = "pharos-store-sqlx"
 version = "0.0.0"
 dependencies = [
+ "metrics",
+ "metrics-util",
  "pharos-core",
  "pharos-sync",
+ "pharos-test-metrics",
  "proptest",
  "serde",
  "serde_json",

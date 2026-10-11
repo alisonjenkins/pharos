@@ -123,6 +123,7 @@ impl SqliteStore {
             .connect_with(opts)
             .await?;
         MIGRATOR.run(&pool).await?;
+        crate::pool_metrics::spawn_pool_sampler("sqlite", pool.clone());
         Ok(Self { pool })
     }
 

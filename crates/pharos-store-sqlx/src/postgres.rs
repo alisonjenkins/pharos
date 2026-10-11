@@ -138,6 +138,7 @@ impl PostgresStore {
             .connect(url)
             .await?;
         MIGRATOR.run(&pool).await?;
+        crate::pool_metrics::spawn_pool_sampler("postgres", pool.clone());
         Ok(Self { pool })
     }
 

@@ -20,6 +20,8 @@ mod transcode_session_sqlite;
 #[cfg(feature = "sqlite")]
 mod sync_group_sqlite;
 
+mod pool_metrics;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 

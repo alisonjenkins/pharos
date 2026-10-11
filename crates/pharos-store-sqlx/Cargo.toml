@@ -14,6 +14,7 @@ postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
 [dependencies]
 pharos-core = { path = "../pharos-core" }
 pharos-sync = { path = "../pharos-sync" }
+metrics.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -27,6 +28,8 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 proptest = "1"
+metrics-util.workspace = true
+pharos-test-metrics = { path = "../pharos-test-metrics" }
 
 [lints]
 workspace = true
