@@ -3,6 +3,7 @@
 //! Cargo feature. Every method delegates to the active variant.
 
 use crate::postgres::PostgresStore;
+use crate::query_metrics::timed;
 use crate::sqlite::SqliteStore;
 use crate::{RuntimeConfig, ServerConfigStore, StoreError};
 use pharos_core::{
@@ -120,10 +121,13 @@ impl ServerConfigStore for AnyStore {
 // ---------------------------------------------------------------------
 impl MediaStore for AnyStore {
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
-        match self {
-            AnyStore::Sqlite(s) => MediaStore::get(s, id).await,
-            AnyStore::Postgres(p) => MediaStore::get(p, id).await,
-        }
+        timed("get_item", async {
+            match self {
+                AnyStore::Sqlite(s) => MediaStore::get(s, id).await,
+                AnyStore::Postgres(p) => MediaStore::get(p, id).await,
+            }
+        })
+        .await
     }
 
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
@@ -141,17 +145,23 @@ impl MediaStore for AnyStore {
     }
 
     async fn query(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
-        match self {
-            AnyStore::Sqlite(s) => s.query(q).await,
-            AnyStore::Postgres(p) => p.query(q).await,
-        }
+        timed("query_items", async {
+            match self {
+                AnyStore::Sqlite(s) => s.query(q).await,
+                AnyStore::Postgres(p) => p.query(q).await,
+            }
+        })
+        .await
     }
 
     async fn search(&self, q: &SearchQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
-        match self {
-            AnyStore::Sqlite(s) => s.search(q).await,
-            AnyStore::Postgres(p) => p.search(q).await,
-        }
+        timed("search_items", async {
+            match self {
+                AnyStore::Sqlite(s) => s.search(q).await,
+                AnyStore::Postgres(p) => p.search(q).await,
+            }
+        })
+        .await
     }
 
     async fn facets(
@@ -197,10 +207,13 @@ impl MediaStore for AnyStore {
         items: &[(MediaId, i64, u64)],
         scan_id: i64,
     ) -> DomainResult<()> {
-        match self {
-            AnyStore::Sqlite(s) => s.mark_seen_batch(items, scan_id).await,
-            AnyStore::Postgres(p) => p.mark_seen_batch(items, scan_id).await,
-        }
+        timed("mark_seen_batch", async {
+            match self {
+                AnyStore::Sqlite(s) => s.mark_seen_batch(items, scan_id).await,
+                AnyStore::Postgres(p) => p.mark_seen_batch(items, scan_id).await,
+            }
+        })
+        .await
     }
 
     async fn sweep_unseen(&self, scan_id: i64, root_prefix: &str) -> DomainResult<Vec<MediaId>> {
@@ -1020,10 +1033,13 @@ impl SyncGroupStore for AnyStore {
 // ---------------------------------------------------------------------
 impl UserDataStore for AnyStore {
     async fn get_user_data(&self, user: UserId, item: MediaId) -> DomainResult<UserItemData> {
-        match self {
-            AnyStore::Sqlite(s) => s.get_user_data(user, item).await,
-            AnyStore::Postgres(p) => p.get_user_data(user, item).await,
-        }
+        timed("get_user_data", async {
+            match self {
+                AnyStore::Sqlite(s) => s.get_user_data(user, item).await,
+                AnyStore::Postgres(p) => p.get_user_data(user, item).await,
+            }
+        })
+        .await
     }
 
     async fn set_user_data(
@@ -1032,10 +1048,13 @@ impl UserDataStore for AnyStore {
         item: MediaId,
         data: UserItemData,
     ) -> DomainResult<()> {
-        match self {
-            AnyStore::Sqlite(s) => s.set_user_data(user, item, data).await,
-            AnyStore::Postgres(p) => p.set_user_data(user, item, data).await,
-        }
+        timed("set_user_data", async {
+            match self {
+                AnyStore::Sqlite(s) => s.set_user_data(user, item, data).await,
+                AnyStore::Postgres(p) => p.set_user_data(user, item, data).await,
+            }
+        })
+        .await
     }
 
     async fn user_data_bulk(
@@ -1043,10 +1062,13 @@ impl UserDataStore for AnyStore {
         user: UserId,
         items: &[MediaId],
     ) -> DomainResult<Vec<UserItemData>> {
-        match self {
-            AnyStore::Sqlite(s) => s.user_data_bulk(user, items).await,
-            AnyStore::Postgres(p) => p.user_data_bulk(user, items).await,
-        }
+        timed("user_data_bulk", async {
+            match self {
+                AnyStore::Sqlite(s) => s.user_data_bulk(user, items).await,
+                AnyStore::Postgres(p) => p.user_data_bulk(user, items).await,
+            }
+        })
+        .await
     }
 
     async fn resumable_items(&self, user: UserId) -> DomainResult<Vec<MediaId>> {
