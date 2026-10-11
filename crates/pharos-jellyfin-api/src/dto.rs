@@ -407,6 +407,11 @@ impl UserPolicyDto {
 pub struct BaseItemDto {
     pub id: String,
     pub name: String,
+    /// The key `SortBy=SortName` orders by. jellyfin-web takes `SortName[0]`
+    /// as the list-view group letter and throws on an empty string, so an
+    /// empty sort name is omitted and the client falls back to `Name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_name: Option<String>,
     pub server_id: String,
     #[serde(rename = "Type")]
     pub kind: &'static str,
@@ -1725,6 +1730,10 @@ impl BaseItemDto {
         Self {
             id: wire_item_id(item.id),
             name: item.title.clone(),
+            // The store writes `media_items.sort_name` as `sort_name(title)`,
+            // so this is the stored value (and the NULL-row fallback) without
+            // a second column on `MediaItem`.
+            sort_name: Some(pharos_core::sort_name(&item.title)).filter(|s| !s.is_empty()),
             server_id: server_id.to_string(),
             kind,
             media_type,

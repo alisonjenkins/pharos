@@ -362,6 +362,42 @@ async fn sort_name_ignores_leading_articles_but_name_does_not() {
 }
 
 #[actix_web::test]
+async fn item_dto_carries_the_sort_name_as_a_plain_string() {
+    let (state, token) = seed(titled(&["The Matrix", "Ep 10", ""])).await;
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?SortBy=Name")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let sort_name = |name: &str| {
+        v["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["Name"] == name)
+            .unwrap()
+            .get("SortName")
+            .cloned()
+    };
+    assert_eq!(
+        sort_name("The Matrix"),
+        Some(serde_json::json!("matrix")),
+        "article dropped, lowercased"
+    );
+    assert_eq!(
+        sort_name("Ep 10"),
+        Some(serde_json::json!(pharos_core::sort_name("Ep 10")))
+    );
+    // jellyfin-web reads SortName[0] and throws on "", so an empty one is absent.
+    assert_eq!(sort_name(""), None);
+}
+
+#[actix_web::test]
 async fn sort_name_orders_numbers_by_value() {
     let (state, token) = seed(titled(&["Ep 10", "Ep 2", "Ep 1", "Ep 100"])).await;
     let app = test::init_service(build_app(state)).await;
