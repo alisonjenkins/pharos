@@ -5,7 +5,7 @@
 //! Non-SyncPlay messages (KeepAlive, Sessions, etc.) are accepted and
 //! ignored — phase 2 will fan them out to the relevant subsystems.
 
-use super::auth_extractor::AuthUser;
+use super::auth_extractor::{extract_token, AuthUser};
 use super::socket_messages::{
     CommandData, GeneralCommandMessageData, GroupInfoData, GroupStateUpdate, GroupUpdateData,
     Inbound, LibraryUpdateInfoData, NowPlayingItemLite, Outbound, PlayQueueUpdate, PlayRequestData,
@@ -16,6 +16,7 @@ use crate::state::{AppState, SocketBroadcast};
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, Session};
 use futures_util::StreamExt;
+use pharos_core::TokenStore;
 use pharos_jellyfin_api::dto::format_iso8601_ms;
 use pharos_sync::{
     group::{GroupHandle, GroupMsg},
@@ -195,7 +196,22 @@ async fn ws_entry(
     // SyncPlay member and fight over the socket (disconnect/reconnect war,
     // observed live: Alison+Lace+Jana on Firefox). Must match
     // `AuthSession::sync_key` on the HTTP command path exactly.
-    let device_id = device_id_from_query(req.query_string()).map(|d| format!("{user_id_str}:{d}"));
+    //
+    // jellyfin-web 12 opens `/socket?ApiKey=<token>` with no `deviceId`, so
+    // fall back to the device the token was issued to — the same value the
+    // client sends as `DeviceId` on its HTTP calls.
+    let query_device = device_id_from_query(req.query_string());
+    let device_id = match query_device {
+        Some(d) => Some(d),
+        None => match extract_token(&req) {
+            Some(token) => state.stores.device_for_token(&token).await.map_err(|e| {
+                tracing::warn!(error = %e, "socket: token device lookup failed");
+                actix_web::error::ErrorServiceUnavailable("auth store unavailable, retry")
+            })?,
+            None => None,
+        },
+    }
+    .map(|d| format!("{user_id_str}:{d}"));
     actix_web::rt::spawn(handle_connection(
         session,
         stream,
