@@ -4847,8 +4847,9 @@ enum SortPrimary {
     /// 004-books — a books library's reading order: series, then volume. The
     /// token `SeriesSortName` is what jellyfin-web sends for a shelf view.
     BookSeriesOrder,
-    /// A single metadata column: `PremiereDate`, `ProductionYear`,
-    /// `CommunityRating` or `CriticRating`. Unknown values sort smallest.
+    /// A single metadata or user-data column: `PremiereDate`,
+    /// `ProductionYear`, `CommunityRating`, `CriticRating`, `PlayCount` or
+    /// `DatePlayed`. Unknown values sort smallest.
     Keyed(pharos_core::SortKey),
     Name,
 }
@@ -4879,6 +4880,8 @@ fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
         "ProductionYear" => SortPrimary::Keyed(pharos_core::SortKey::ProductionYear),
         "CommunityRating" => SortPrimary::Keyed(pharos_core::SortKey::CommunityRating),
         "CriticRating" => SortPrimary::Keyed(pharos_core::SortKey::CriticRating),
+        "PlayCount" => SortPrimary::Keyed(pharos_core::SortKey::PlayCount),
+        "DatePlayed" => SortPrimary::Keyed(pharos_core::SortKey::DatePlayed),
         _ => SortPrimary::Name,
     }
 }
@@ -5234,6 +5237,16 @@ fn build_media_query(
             }
         }
     };
+
+    // PlayCount / DatePlayed read the requesting user's user_data row.
+    if mq.user_data.user.is_none()
+        && mq
+            .sort
+            .iter()
+            .any(|(k, _)| matches!(k, SortKey::PlayCount | SortKey::DatePlayed))
+    {
+        mq.user_data.user = Some(user_id);
+    }
 
     // Pagination — SQL paginates unless the Random path needs the full set.
     if force_unpaged {

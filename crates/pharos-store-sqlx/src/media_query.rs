@@ -49,6 +49,9 @@ fn sort_key_column(key: SortKey) -> &'static str {
         SortKey::ProductionYear => "production_year",
         SortKey::CommunityRating => "community_rating",
         SortKey::CriticRating => "critic_rating",
+        // Per-user; a missing user_data row is "never played".
+        SortKey::PlayCount => "COALESCE(ud.play_count, 0)",
+        SortKey::DatePlayed => "COALESCE(ud.last_played_at, 0)",
         SortKey::Album => "LOWER(album)",
         SortKey::DiscNumber => "disc_number",
         SortKey::TrackNumber => "track_number",
@@ -281,11 +284,17 @@ pub(crate) fn build(
 /// re-deriving it.
 pub(crate) fn needs_user_data_join(q: &MediaQuery) -> bool {
     q.user_data.is_active()
+        || (q.user_data.user.is_some() && q.sort.iter().any(|(k, _)| sort_key_uses_user_data(*k)))
+}
+
+/// Sort keys read the per-user `ud` join rather than `media_items`.
+fn sort_key_uses_user_data(key: SortKey) -> bool {
+    matches!(key, SortKey::PlayCount | SortKey::DatePlayed)
 }
 
 /// The user id whose `user_data` the join keys on, when active.
 pub(crate) fn user_data_user(q: &MediaQuery) -> Option<UserId> {
-    if q.user_data.is_active() {
+    if needs_user_data_join(q) {
         q.user_data.user
     } else {
         None
@@ -313,6 +322,11 @@ fn build_order(
         ));
     }
     for (key, dir) in &q.sort {
+        // Without a user there is no `ud` join to read; skip the key rather
+        // than emit SQL that names a table that is not in the FROM clause.
+        if sort_key_uses_user_data(*key) && q.user_data.user.is_none() {
+            continue;
+        }
         let col = sort_key_column(*key);
         let d = match dir {
             SortDir::Asc => "ASC",
