@@ -103,7 +103,7 @@ async fn is_4k_true_returns_uhd_only() {
 async fn is_hd_true_returns_720_and_1080() {
     let (state, token) = seed_widths().await;
     let n = names(state, &token, "IsHd=true").await;
-    assert_eq!(n, vec!["HD1080", "HD720"]);
+    assert_eq!(n, vec!["HD720", "HD1080"]);
 }
 
 #[actix_web::test]
@@ -121,7 +121,7 @@ async fn min_max_width_bounds_pick_specific_class() {
     let (state, token) = seed_widths().await;
     // 1280..=1920 → HD720 + HD1080 only.
     let n = names(state, &token, "MinWidth=1280&MaxWidth=1920").await;
-    assert_eq!(n, vec!["HD1080", "HD720"]);
+    assert_eq!(n, vec!["HD720", "HD1080"]);
 }
 
 #[actix_web::test]
