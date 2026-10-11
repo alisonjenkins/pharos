@@ -207,6 +207,80 @@ async fn community_and_critic_rating_sort_by_score() {
     assert_eq!(critic, vec!["Alpha", "Charlie", "Bravo", "Delta"]);
 }
 
+fn year_tie_rows() -> Vec<Row> {
+    vec![
+        Row {
+            year: Some(2001),
+            premiere: Some(10),
+            ..Row::new(1, "Bravo")
+        },
+        Row {
+            year: Some(2001),
+            premiere: Some(10),
+            ..Row::new(2, "Alpha")
+        },
+        Row {
+            year: Some(2010),
+            premiere: Some(10),
+            ..Row::new(3, "Charlie")
+        },
+        Row {
+            year: Some(1999),
+            premiere: Some(5),
+            ..Row::new(4, "Delta")
+        },
+    ]
+}
+
+#[actix_web::test]
+async fn book_rows_sort_year_descending_then_name_ascending() {
+    let (state, token) = seed(year_tie_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(
+        &app,
+        token.as_str(),
+        "SortBy=ProductionYear,SortName&SortOrder=Descending,Ascending"
+    );
+    assert_eq!(got, vec!["Charlie", "Alpha", "Bravo", "Delta"]);
+}
+
+#[actix_web::test]
+async fn short_sort_order_repeats_its_last_entry() {
+    let (state, token) = seed(year_tie_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(
+        &app,
+        token.as_str(),
+        "SortBy=ProductionYear,SortName&SortOrder=Descending"
+    );
+    assert_eq!(got, vec!["Charlie", "Bravo", "Alpha", "Delta"]);
+    let none = names!(&app, token.as_str(), "SortBy=ProductionYear,SortName");
+    assert_eq!(none, vec!["Delta", "Alpha", "Bravo", "Charlie"]);
+}
+
+#[actix_web::test]
+async fn three_key_sort_order_pairs_each_key() {
+    let (state, token) = seed(year_tie_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(
+        &app,
+        token.as_str(),
+        "SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending,Descending,Ascending"
+    );
+    assert_eq!(got, vec!["Charlie", "Alpha", "Bravo", "Delta"]);
+}
+
+#[actix_web::test]
+async fn multi_key_sort_pages_consistently() {
+    let (state, token) = seed(year_tie_rows()).await;
+    let app = test::init_service(build_app(state)).await;
+    let q = "SortBy=ProductionYear,SortName&SortOrder=Descending,Ascending";
+    let page1 = names!(&app, token.as_str(), format!("{q}&StartIndex=0&Limit=2"));
+    let page2 = names!(&app, token.as_str(), format!("{q}&StartIndex=2&Limit=2"));
+    assert_eq!(page1, vec!["Charlie", "Alpha"]);
+    assert_eq!(page2, vec!["Bravo", "Delta"]);
+}
+
 #[actix_web::test]
 async fn play_count_and_date_played_sort_by_the_requesting_users_data() {
     let rows = vec![
