@@ -9091,13 +9091,15 @@ mod tests {
     async fn ready_before_seek_schedule_time_does_not_resolve_gate() {
         let (h, sinks, mut leader_rx, leader) = fresh().await;
         let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
-        // Give the group a real lead (~2.2s: rtt 4s → half 2s = cap).
+        // Give the group a real lead (700ms: MIN_LEAD 200 + rtt 1s / 2). The
+        // gate compares against the wall clock, so tokio's paused time cannot
+        // skip the wait; a short lead keeps the real sleep small.
         h.tx.send(GroupMsg::ObserveClock {
             member_id: m2,
             t1: 0,
-            t2: 2_000,
-            t3: 2_000,
-            t4: 4_000,
+            t2: 500,
+            t3: 500,
+            t4: 1_000,
         })
         .await
         .unwrap();
@@ -9136,8 +9138,8 @@ mod tests {
             );
         }
         while m2_rx.try_recv().is_ok() {}
-        // Past When (lead ≈2.2s), the same Readys are legitimate ACKs.
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        // Past When (lead 700ms), the same Readys are legitimate ACKs.
+        tokio::time::sleep(Duration::from_millis(800)).await;
         for mid in [leader, m2] {
             h.tx.send(GroupMsg::MemberReady {
                 member_id: mid,
