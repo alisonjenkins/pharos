@@ -915,24 +915,37 @@ async fn delete_device(
     if !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
     }
-    let device_id =
+    // 12.0 makes `id` an array; `CiQuery` joins repeated `id=` into one CSV.
+    let device_ids: Vec<&str> =
         q.id.as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
+            .collect();
+    if device_ids.is_empty() {
+        return Err(error::ErrorBadRequest("missing id"));
+    }
     let users = state
         .stores
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut revoked = 0u64;
-    for u in users {
-        revoked += state
-            .stores
-            .revoke_tokens_by_device(u.id, device_id)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    for device_id in &device_ids {
+        for u in &users {
+            revoked += state
+                .stores
+                .revoke_tokens_by_device(u.id, device_id)
+                .await
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        }
     }
-    tracing::info!(device_id, revoked, "device deleted (tokens revoked)");
+    tracing::info!(
+        devices = device_ids.len(),
+        revoked,
+        "devices deleted (tokens revoked)"
+    );
     Ok(HttpResponse::NoContent().finish())
 }
 

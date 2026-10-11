@@ -96,3 +96,34 @@ async fn delete_device_revokes_and_is_admin_only() {
         204
     );
 }
+
+#[actix_web::test]
+async fn delete_device_accepts_repeated_ids() {
+    use pharos_core::{TokenStore, UserStore};
+    let f = seed_rich().await;
+    let uid = f.state.stores.list().await.unwrap()[0].id;
+    let a = f.state.stores.issue(uid, "dev-a").await.unwrap();
+    let b = f.state.stores.issue(uid, "dev-b").await.unwrap();
+    let c = f.state.stores.issue(uid, "dev-c").await.unwrap();
+    let (a, b, c) = (
+        a.0.expose().to_string(),
+        b.0.expose().to_string(),
+        c.0.expose().to_string(),
+    );
+    for t in [&a, &b, &c] {
+        assert_eq!(send(&f, "GET", "/System/Info", t).await, 200);
+    }
+    assert_eq!(
+        send(
+            &f,
+            "DELETE",
+            "/Devices?id=dev-a&id=dev-b",
+            f.admin_token.as_str()
+        )
+        .await,
+        204
+    );
+    assert_eq!(send(&f, "GET", "/System/Info", &a).await, 401);
+    assert_eq!(send(&f, "GET", "/System/Info", &b).await, 401);
+    assert_eq!(send(&f, "GET", "/System/Info", &c).await, 200);
+}
