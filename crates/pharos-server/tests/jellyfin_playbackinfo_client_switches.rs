@@ -9,7 +9,7 @@ use pharos_core::{
     UserRecord, UserStore,
 };
 use pharos_server::{
-    api::jellyfin,
+    api::jellyfin::{self, device_profile::Decision},
     auth::BuiltinAuth,
     middleware::LowercasePath,
     state::{AppState, Stores},
@@ -39,6 +39,7 @@ async fn setup() -> (web::Data<AppState>, String) {
     for (id, path, container, vcodec, acodec) in [
         (1u64, "/a.mp4", "mp4", "h264", "aac"),
         (2u64, "/b.avi", "avi", "mpeg4", "mp3"),
+        (3u64, "/c.mp4", "mp4", "h264", "mp3"),
     ] {
         stores
             .put(MediaItem {
@@ -71,6 +72,16 @@ async fn playback_info(
     id: u64,
     switches: &str,
 ) -> serde_json::Value {
+    playback_info_with(state, token, id, PROFILE, switches).await
+}
+
+async fn playback_info_with(
+    state: &web::Data<AppState>,
+    token: &str,
+    id: u64,
+    profile: &str,
+    switches: &str,
+) -> serde_json::Value {
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -82,7 +93,7 @@ async fn playback_info(
         .uri(&format!("/Items/{id}/PlaybackInfo"))
         .insert_header(("X-Emby-Token", token))
         .insert_header(("content-type", "application/json"))
-        .set_payload(format!("{{{PROFILE}{switches}}}"))
+        .set_payload(format!("{{{profile}{switches}}}"))
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
     serde_json::from_slice(&body).unwrap()
@@ -120,10 +131,91 @@ async fn disabling_direct_play_and_stream_forces_a_transcode_url() {
 }
 
 #[actix_web::test]
-async fn disabling_only_direct_play_leaves_direct_stream() {
+async fn disabling_only_direct_play_still_builds_a_transcoding_url() {
     let (state, token) = setup().await;
     let v = playback_info(&state, &token, 1, r#","EnableDirectPlay":false"#).await;
-    assert_eq!(flags(&v), (false, true, true, false), "{v}");
+    assert_eq!(flags(&v), (false, true, true, true), "{v}");
+}
+
+#[actix_web::test]
+async fn forbidding_video_copy_clears_direct_stream() {
+    let (state, token) = setup().await;
+    let v = playback_info(
+        &state,
+        &token,
+        1,
+        r#","EnableDirectPlay":false,"AllowVideoStreamCopy":false"#,
+    )
+    .await;
+    assert_eq!(flags(&v), (false, false, true, true), "{v}");
+}
+
+/// mp4 h264/mp3 against an mp4 h264/aac profile is an AudioRemux: the video
+/// would copy. With video copy forbidden the URL must be a full transcode.
+#[actix_web::test]
+async fn forbidding_video_copy_turns_an_audio_remux_into_a_transcode() {
+    let (state, token) = setup().await;
+    let registered = |v: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            let id = v["PlaySessionId"].as_str().unwrap().to_string();
+            state
+                .transcode_sessions
+                .get(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .decision
+        }
+    };
+    let copy_allowed = playback_info(
+        &state,
+        &token,
+        3,
+        r#","EnableDirectPlay":false,"EnableDirectStream":false"#,
+    )
+    .await;
+    assert!(
+        matches!(registered(copy_allowed).await, Decision::AudioRemux { .. }),
+        "control: the source is an AudioRemux"
+    );
+    let copy_forbidden = playback_info(
+        &state,
+        &token,
+        3,
+        r#","EnableDirectPlay":false,"EnableDirectStream":false,"AllowVideoStreamCopy":false"#,
+    )
+    .await;
+    assert!(matches!(
+        registered(copy_forbidden).await,
+        Decision::Transcode { .. }
+    ));
+}
+
+/// A client whose only transcoding target is mp4/hevc must not be handed the
+/// hardcoded h264-in-ts target when it forces a transcode.
+#[actix_web::test]
+async fn forced_transcode_uses_the_clients_own_transcoding_profile() {
+    let (state, token) = setup().await;
+    let hevc = r#""DeviceProfile":{
+      "DirectPlayProfiles":[{"Type":"Video","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac"}],
+      "TranscodingProfiles":[{"Container":"mp4","Type":"Video","Protocol":"hls","VideoCodec":"hevc","AudioCodec":"aac"}]
+    }"#;
+    let v = playback_info_with(&state, &token, 1, hevc, r#","EnableDirectPlay":false"#).await;
+    let id = v["PlaySessionId"].as_str().unwrap();
+    let decision = state
+        .transcode_sessions
+        .get(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .decision;
+    match decision {
+        Decision::Transcode {
+            target_container, ..
+        } => assert_eq!(target_container, "mp4", "hardcoded ts target leaked"),
+        other => panic!("expected a transcode, got {other:?}"),
+    }
 }
 
 #[actix_web::test]
