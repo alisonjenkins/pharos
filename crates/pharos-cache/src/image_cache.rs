@@ -12,7 +12,7 @@
 use pharos_core::MediaKind;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use tracing::instrument;
+use tracing::{instrument, Instrument as _};
 
 #[derive(Debug, Clone)]
 pub struct ImageCache {
@@ -279,8 +279,12 @@ impl ImageCache {
         let lock = self
             .locks
             .lock(format!("fetch:{id}:{role:?}:{index}"))
+            .instrument(tracing::info_span!("image.single_flight_wait"))
             .await;
-        let _guard = lock.lock().await;
+        let _guard = lock
+            .lock()
+            .instrument(tracing::info_span!("image.single_flight_wait"))
+            .await;
         if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
             return Ok(out_path);
         }
@@ -299,6 +303,7 @@ impl ImageCache {
         let tmp_path = out_path.with_extension("jpg.tmp");
         match self
             .extract(source, kind, role, duration_ms, &tmp_path)
+            .instrument(tracing::info_span!("image.extract"))
             .await
         {
             Ok(()) => {}
@@ -354,8 +359,12 @@ impl ImageCache {
         let lock = self
             .locks
             .lock(format!("fetch:{id}:{role:?}:{index}"))
+            .instrument(tracing::info_span!("image.single_flight_wait"))
             .await;
-        let _guard = lock.lock().await;
+        let _guard = lock
+            .lock()
+            .instrument(tracing::info_span!("image.single_flight_wait"))
+            .await;
         // Re-check under the lock: another waiter may have healed + marked.
         if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
             return;
@@ -371,6 +380,7 @@ impl ImageCache {
         let tmp_path = out_path.with_extension("heal.tmp");
         match self
             .extract(source, kind, role, duration_ms, &tmp_path)
+            .instrument(tracing::info_span!("image.extract"))
             .await
         {
             Ok(()) => {
@@ -413,7 +423,10 @@ impl ImageCache {
         // threshold survives only as the fallback for a format whose header we
         // cannot read, where guessing wrong by scaling risks upscaling.
         const SCALE_THRESHOLD_BYTES: u64 = 256 * 1024;
-        match intrinsic_width(source).await {
+        match intrinsic_width(source)
+            .instrument(tracing::info_span!("image.header_read"))
+            .await
+        {
             // Already at or near the requested size: re-encoding would cost
             // latency and quality for nothing, and scaling UP is always wrong.
             // The 20% band stops a 480-px cap re-encoding a 500-px sidecar.
@@ -444,8 +457,15 @@ impl ImageCache {
         // Single-flight per (source, mtime, width): a grid re-uses the same
         // sidecar for every visible tile, so concurrent scalers otherwise raced
         // on one `.jpg.tmp` (T95/V36).
-        let lock = self.locks.lock(format!("scale:{key:016x}:w{width}")).await;
-        let _guard = lock.lock().await;
+        let lock = self
+            .locks
+            .lock(format!("scale:{key:016x}:w{width}"))
+            .instrument(tracing::info_span!("image.scale_wait"))
+            .await;
+        let _guard = lock
+            .lock()
+            .instrument(tracing::info_span!("image.scale_wait"))
+            .await;
         if tokio::fs::try_exists(&out).await.unwrap_or(false) {
             return out;
         }
@@ -453,7 +473,11 @@ impl ImageCache {
             return source.to_path_buf();
         }
         let tmp = out.with_extension("jpg.tmp");
-        match self.scale_to(source, width, &tmp).await {
+        match self
+            .scale_to(source, width, &tmp)
+            .instrument(tracing::info_span!("image.scale"))
+            .await
+        {
             Ok(()) => match tokio::fs::rename(&tmp, &out).await {
                 Ok(()) => out,
                 Err(_) => source.to_path_buf(),
@@ -1185,6 +1209,56 @@ mod tests {
         tokio::fs::write(&small, vec![0u8; 4096]).await.unwrap();
         let out = cache.scaled_artwork(&small, 480).await;
         assert_eq!(out, small, "small art must pass through unscaled");
+    }
+
+    /// A 5 s image request with 4 ms of spans is undebuggable: every wait and
+    /// every heavy step on a cache miss must show up in the trace.
+    #[tokio::test]
+    async fn a_cache_miss_traces_its_queueing_and_extract() {
+        let (spans, _guard) = pharos_test_metrics::spans::capture();
+        let td = tempfile::TempDir::new().unwrap();
+        let cache = ImageCache::new(td.path()).with_ffmpeg("/no/such/ffmpeg");
+        let _ = cache
+            .fetch(
+                7,
+                ImageRole::Primary,
+                MediaKind::Movie,
+                Path::new("/n"),
+                0,
+                None,
+            )
+            .await;
+        for name in ["image.single_flight_wait", "image.extract"] {
+            assert!(
+                spans.contains(name),
+                "missing {name}; got {:?}",
+                spans.names()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scaling_a_wide_sidecar_traces_header_read_queueing_and_resize() {
+        let (spans, _guard) = pharos_test_metrics::spans::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache")).with_ffmpeg("/no/such/ffmpeg");
+        // Signature + IHDR claiming 2000 px wide: enough for the header probe
+        // to decide a rescale is due. The (absent) ffmpeg then fails, which
+        // is fine: the spans are what is under test.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&2000u32.to_be_bytes());
+        png.extend_from_slice(&3000u32.to_be_bytes());
+        let src = dir.path().join("poster.png");
+        tokio::fs::write(&src, png).await.unwrap();
+        let _ = cache.scaled_artwork(&src, 480).await;
+        for name in ["image.header_read", "image.scale_wait", "image.scale"] {
+            assert!(
+                spans.contains(name),
+                "missing {name}; got {:?}",
+                spans.names()
+            );
+        }
     }
 
     #[tokio::test]
