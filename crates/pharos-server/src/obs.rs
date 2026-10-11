@@ -223,6 +223,12 @@ where
     Ok(tracing_opentelemetry::layer().with_tracer(tracer))
 }
 
+/// Create the counters whose first event must not be their first sample, so
+/// `rate()` / `increase()` see them from startup. Call once after [`init`].
+pub fn register_static_series() {
+    pharos_cache::hls_cache::register_segment_metrics();
+}
+
 /// Render Prometheus exposition text for `/metrics`. Lock-free.
 pub fn render() -> String {
     match RESULT.get() {
@@ -279,6 +285,24 @@ mod tests {
             "sub-5ms store calls need a 1 ms bucket"
         );
         assert!(!body.contains("pharos_obs_probe_seconds{k=\"v\",quantile"));
+    }
+
+    /// Production showed only `outcome="ok"`; the short/filler/failed series
+    /// must be on `/metrics` at zero from the first scrape.
+    #[test]
+    fn static_series_are_rendered_at_zero_from_startup() {
+        init("info", None).unwrap();
+        register_static_series();
+        let body = render();
+        for outcome in ["short", "filler", "failed", "cancelled"] {
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with("pharos_segment_produced_total{")
+                        && l.contains(&format!("outcome=\"{outcome}\""))
+                        && l.ends_with(" 0")),
+                "no zero series for {outcome}; rendered:\n{body}"
+            );
+        }
     }
 
     #[test]
