@@ -197,6 +197,18 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where `/SyncPlay/Queue` inserts new entries — Jellyfin's `GroupQueueMode`.
+/// Variant names are the wire strings, so the HTTP body deserialises straight
+/// into it and an unknown mode is rejected rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum QueueMode {
+    /// Append after the last entry.
+    #[default]
+    Queue,
+    /// Insert directly after the playing entry.
+    QueueNext,
+}
+
 #[derive(Debug)]
 pub enum GroupMsg {
     /// Register a member in the group's roster. The member's socket sink is
@@ -304,6 +316,15 @@ pub enum GroupMsg {
     SetPlaylistItem {
         sender: MemberId,
         playlist_item_id: String,
+    },
+    /// Jellyfin HTTP `/SyncPlay/Queue` — add items to the existing queue
+    /// without disturbing playback.
+    Queue {
+        sender: MemberId,
+        item_ids: Vec<String>,
+        /// Index-aligned with `item_ids`, as for [`GroupMsg::SetNewQueue`].
+        item_runtimes_ms: Vec<Option<u64>>,
+        mode: QueueMode,
     },
     /// Advance to the next / previous queue entry (leader only).
     /// `playlist_item_id` is the entry the CLIENT believes is playing —
@@ -461,6 +482,13 @@ pub enum RemoteCommand {
         sender: MemberId,
         playlist_item_id: String,
     },
+    Queue {
+        sender: MemberId,
+        item_ids: Vec<String>,
+        #[serde(default)]
+        item_runtimes_ms: Vec<Option<u64>>,
+        mode: QueueMode,
+    },
     NextItem {
         sender: MemberId,
         #[serde(default)]
@@ -583,6 +611,17 @@ impl RemoteCommand {
             } => GroupMsg::SetPlaylistItem {
                 sender,
                 playlist_item_id,
+            },
+            RemoteCommand::Queue {
+                sender,
+                item_ids,
+                item_runtimes_ms,
+                mode,
+            } => GroupMsg::Queue {
+                sender,
+                item_ids,
+                item_runtimes_ms,
+                mode,
             },
             RemoteCommand::NextItem {
                 sender,
@@ -739,6 +778,16 @@ struct PlayQueue {
 }
 
 impl PlayQueue {
+    /// Add `entries` at the tail, or directly after the playing entry for
+    /// [`QueueMode::QueueNext`]. The playing entry keeps its index either way.
+    fn enqueue(&mut self, entries: Vec<QueueEntry>, mode: QueueMode) {
+        let at = match mode {
+            QueueMode::Queue => self.items.len(),
+            QueueMode::QueueNext => self.playing_index.saturating_add(1).min(self.items.len()),
+        };
+        self.items.splice(at..at, entries);
+    }
+
     fn item_infos(&self) -> Vec<QueueItemInfo> {
         self.items
             .iter()
@@ -1556,6 +1605,15 @@ impl GroupState {
             self.send_playback_state(mid);
         }
         true
+    }
+
+    /// Broadcast a queue edit that leaves playback as it is (Queue, QueueNext,
+    /// RemoveItems, MoveItem): `IsPlaying` and the start position are the
+    /// group's live ones, as in Jellyfin's `GetPlayQueueUpdate`.
+    fn broadcast_queue_edit(&mut self, reason: &str) {
+        let is_playing = matches!(self.playback, PlaybackState::Playing { .. });
+        let position_ms = self.current_position_ms();
+        self.broadcast_play_queue(reason, is_playing, position_ms);
     }
 
     /// The `playlist_item_id` of the queue entry the group currently plays.
@@ -2795,6 +2853,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::SeekTo { sender, .. }
         | GroupMsg::SetNewQueue { sender, .. }
         | GroupMsg::SetPlaylistItem { sender, .. }
+        | GroupMsg::Queue { sender, .. }
         | GroupMsg::NextItem { sender, .. }
         | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
@@ -2826,6 +2885,7 @@ fn controls_existing_queue(msg: &GroupMsg) -> bool {
             | GroupMsg::LeaderPlay { .. }
             | GroupMsg::LeaderPause { .. }
             | GroupMsg::LeaderSeek { .. }
+            | GroupMsg::Queue { .. }
     )
 }
 
@@ -3728,6 +3788,43 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
                 metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "set_playlist_item", "reason" => "unknown_entry").increment(1);
             }
+        }
+        GroupMsg::Queue {
+            sender,
+            item_ids,
+            item_runtimes_ms,
+            mode,
+        } => {
+            if item_ids.is_empty() || state.queue.items.is_empty() {
+                // Nothing to add, or no queue to add to: a queue with no
+                // playing entry would make the first appended item "current"
+                // with no playback behind it. Jellyfin's group would hold the
+                // items with no playing index; we have no such state, so the
+                // client's own SetNewQueue is the way to start one.
+                tracing::warn!(
+                    group = %state.id, sender = %sender,
+                    requested = item_ids.len(),
+                    queue_len = state.queue.items.len(),
+                    "syncplay: Queue with nothing to add or no queue to extend — ignored"
+                );
+                metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "queue", "reason" => "nothing_to_queue").increment(1);
+                return;
+            }
+            let entries = item_ids
+                .into_iter()
+                .enumerate()
+                .map(|(i, item_id)| QueueEntry {
+                    item_id,
+                    playlist_item_id: Uuid::new_v4().simple().to_string(),
+                    runtime_ms: item_runtimes_ms.get(i).copied().flatten(),
+                })
+                .collect();
+            state.queue.enqueue(entries, mode);
+            let reason = match mode {
+                QueueMode::Queue => "queue",
+                QueueMode::QueueNext => "queue_next",
+            };
+            state.broadcast_queue_edit(reason);
         }
         GroupMsg::NextItem {
             sender,
@@ -9175,5 +9272,157 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("11"));
+    }
+    fn entry(item_id: &str) -> QueueEntry {
+        QueueEntry {
+            item_id: item_id.into(),
+            playlist_item_id: format!("pli-{item_id}"),
+            runtime_ms: None,
+        }
+    }
+
+    fn queue_of(ids: &[&str], playing_index: usize) -> PlayQueue {
+        PlayQueue {
+            items: ids.iter().map(|i| entry(i)).collect(),
+            playing_index,
+            ..PlayQueue::default()
+        }
+    }
+
+    fn item_ids(q: &PlayQueue) -> Vec<&str> {
+        q.items.iter().map(|e| e.item_id.as_str()).collect()
+    }
+
+    #[test]
+    fn enqueue_appends_at_the_tail_and_keeps_the_playing_entry() {
+        let mut q = queue_of(&["a", "b", "c"], 1);
+        q.enqueue(vec![entry("x"), entry("y")], QueueMode::Queue);
+        assert_eq!(item_ids(&q), ["a", "b", "c", "x", "y"]);
+        assert_eq!(q.playing_index, 1);
+    }
+
+    #[test]
+    fn enqueue_next_inserts_right_after_the_playing_entry() {
+        let mut q = queue_of(&["a", "b", "c"], 1);
+        q.enqueue(vec![entry("x"), entry("y")], QueueMode::QueueNext);
+        assert_eq!(item_ids(&q), ["a", "b", "x", "y", "c"]);
+        assert_eq!(q.playing_index, 1);
+
+        let mut last = queue_of(&["a", "b"], 1);
+        last.enqueue(vec![entry("x")], QueueMode::QueueNext);
+        assert_eq!(item_ids(&last), ["a", "b", "x"]);
+    }
+
+    /// Collect the next `PlayQueue` on `rx` as (reason, item ids, playlist
+    /// item ids, playing index, is_playing, last_update).
+    async fn next_play_queue(
+        rx: &mut mpsc::Receiver<ServerMsg>,
+    ) -> (String, Vec<String>, Vec<String>, usize, bool, u64) {
+        let Some(ServerMsg::PlayQueue {
+            reason,
+            items,
+            playing_index,
+            is_playing,
+            last_update_unix_ms,
+            ..
+        }) = recv_matching(rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::PlayQueue { .. })
+        })
+        .await
+        else {
+            panic!("expected a PlayQueue broadcast");
+        };
+        (
+            reason,
+            items.iter().map(|i| i.item_id.clone()).collect(),
+            items.into_iter().map(|i| i.playlist_item_id).collect(),
+            playing_index,
+            is_playing,
+            last_update_unix_ms,
+        )
+    }
+
+    #[tokio::test]
+    async fn queue_broadcasts_the_extended_queue_to_every_member() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let (_, _, _, _, _, before) = next_play_queue(&mut m2_rx).await;
+
+        h.tx.send(GroupMsg::Queue {
+            sender: leader,
+            item_ids: vec!["20".into(), "21".into()],
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::Queue,
+        })
+        .await
+        .unwrap();
+
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, new_plis, playing, _, after) = next_play_queue(rx).await;
+            assert_eq!(reason, "queue");
+            assert_eq!(ids, ["10", "11", "12", "20", "21"]);
+            assert_eq!(
+                &new_plis[..3],
+                plis.as_slice(),
+                "existing entries keep their ids"
+            );
+            assert_eq!(playing, 0, "playback is not disturbed");
+            assert!(
+                after > before,
+                "LastUpdate must advance so clients apply it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_next_inserts_after_the_playing_entry() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let _ = seed_queue(&h, leader, &mut leader_rx).await;
+        h.tx.send(GroupMsg::Queue {
+            sender: leader,
+            item_ids: vec!["20".into()],
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::QueueNext,
+        })
+        .await
+        .unwrap();
+        let (reason, ids, _, playing, _, _) = next_play_queue(&mut leader_rx).await;
+        assert_eq!(reason, "queue_next");
+        assert_eq!(ids, ["10", "20", "11", "12"]);
+        assert_eq!(playing, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_with_no_items_or_no_queue_is_ignored() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        h.tx.send(GroupMsg::Queue {
+            sender: leader,
+            item_ids: vec!["20".into()],
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::Queue,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        assert_eq!(snapshot_of(&h).await.current_item_id, None);
+        assert!(
+            leader_rx.try_recv().is_err(),
+            "no queue to extend, no broadcast"
+        );
+
+        let _ = seed_queue(&h, leader, &mut leader_rx).await;
+        h.tx.send(GroupMsg::Queue {
+            sender: leader,
+            item_ids: Vec::new(),
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::Queue,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(!matches!(m, ServerMsg::PlayQueue { reason, .. } if reason == "queue"));
+        }
     }
 }

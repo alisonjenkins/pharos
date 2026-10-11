@@ -816,6 +816,8 @@ fn play_queue_reason(r: &str) -> String {
         // position — Jellyfin's "NewPlaylist" does exactly that.
         "new_playlist" | "user_joined" => "NewPlaylist",
         "set_current_item" => "SetCurrentItem",
+        "queue" => "Queue",
+        "queue_next" => "QueueNext",
         "next_item" => "NextItem",
         "previous_item" => "PreviousItem",
         "repeat_mode" => "RepeatMode",
@@ -1318,6 +1320,37 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["Command"], "Pause");
         assert_eq!(v["Data"]["PositionTicks"], 654_321u64 * 10_000);
+    }
+
+    #[test]
+    fn translate_queue_edits_use_jellyfins_play_queue_update_reasons() {
+        // jellyfin-web's QueueCore switches on `Reason`; an unmapped engine
+        // reason falls back to NewPlaylist, which reloads the player.
+        let ctx = TranslateCtx {
+            group_id: None,
+            epoch_unix_ms: 0,
+            current_pli: None,
+        };
+        for (engine, wire) in [("queue", "Queue"), ("queue_next", "QueueNext")] {
+            let out = translate_outbound(
+                ServerMsg::PlayQueue {
+                    reason: engine.into(),
+                    items: Vec::new(),
+                    playing_index: 0,
+                    start_position_ms: 0,
+                    is_playing: false,
+                    repeat_mode: "RepeatNone".into(),
+                    shuffle_mode: "Sorted".into(),
+                    last_update_unix_ms: 1,
+                },
+                &ctx,
+            )
+            .unwrap();
+            let v: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+            assert_eq!(v["Data"]["Type"], "PlayQueue");
+            assert_eq!(v["Data"]["Data"]["Reason"], wire, "engine reason {engine}");
+        }
     }
 
     #[test]

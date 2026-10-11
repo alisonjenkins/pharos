@@ -12,7 +12,7 @@
 
 use crate::api::jellyfin::auth_extractor::{AuthSession, AuthUser};
 use actix_web::{web, HttpResponse, Responder};
-use pharos_sync::group::{GroupHandle, GroupMsg};
+use pharos_sync::group::{GroupHandle, GroupMsg, QueueMode};
 use pharos_sync::messages::{GroupId, MemberId};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/syncplay/setplaylistitem",
             web::post().to(set_playlist_item),
         )
+        .route("/syncplay/queue", web::post().to(queue))
         .route("/syncplay/nextitem", web::post().to(next_item))
         .route("/syncplay/previousitem", web::post().to(previous_item))
         .route("/syncplay/setrepeatmode", web::post().to(set_repeat_mode))
@@ -410,6 +411,16 @@ struct NextItemBody {
 #[serde(rename_all = "PascalCase")]
 struct SetPlaylistItemBody {
     playlist_item_id: String,
+}
+
+/// `/SyncPlay/Queue` body — `QueueRequestDto`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueueBody {
+    #[serde(default)]
+    item_ids: Vec<String>,
+    #[serde(default)]
+    mode: QueueMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -857,6 +868,31 @@ async fn set_playlist_item(
         move |mid| GroupMsg::SetPlaylistItem {
             sender: mid,
             playlist_item_id: pli,
+        },
+    )
+    .await
+}
+
+async fn queue(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+    body: web::Json<QueueBody>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    let item_runtimes_ms = resolve_runtimes_ms(&state, &body.item_ids).await;
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "queue",
+        move |mid| GroupMsg::Queue {
+            sender: mid,
+            item_ids: body.item_ids,
+            item_runtimes_ms,
+            mode: body.mode,
         },
     )
     .await

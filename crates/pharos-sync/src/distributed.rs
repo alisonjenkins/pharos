@@ -134,6 +134,17 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             playing_index,
             start_position_ms,
         },
+        GroupMsg::Queue {
+            sender,
+            item_ids,
+            item_runtimes_ms,
+            mode,
+        } => RemoteCommand::Queue {
+            sender,
+            item_ids,
+            item_runtimes_ms,
+            mode,
+        },
         GroupMsg::SetPlaylistItem {
             sender,
             playlist_item_id,
