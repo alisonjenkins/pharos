@@ -16,31 +16,11 @@ use pharos_server::{
     middleware::LowercasePath,
     state::{AppState, Stores},
 };
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::{layer::Context, prelude::*, Layer};
+use tracing_subscriber::prelude::*;
 
-#[derive(Clone, Default)]
-struct StoreCallLog(Arc<Mutex<Vec<String>>>);
-
-impl StoreCallLog {
-    fn take(&self) -> Vec<String> {
-        std::mem::take(&mut *self.0.lock().unwrap())
-    }
-}
-
-impl<S: tracing::Subscriber> Layer<S> for StoreCallLog {
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _ctx: Context<'_, S>,
-    ) {
-        let meta = attrs.metadata();
-        if meta.target().starts_with("pharos_store_sqlx") {
-            self.0.lock().unwrap().push(meta.name().to_string());
-        }
-    }
-}
+#[path = "common/store_calls.rs"]
+mod store_calls;
+use store_calls::StoreCallLog;
 
 async fn seed() -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
