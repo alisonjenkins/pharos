@@ -48,6 +48,15 @@ fn parse_tasks_info_interval(data: &serde_json::Value) -> u64 {
         .max(500)
 }
 
+/// Parse the `<startDelayMs>` half of a `*Start` frame's `Data`; 0 when
+/// absent/unparseable.
+fn parse_start_delay_ms(data: &serde_json::Value) -> u64 {
+    data.as_str()
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 /// Extract the `deviceId` query parameter from the `/socket` URL
 /// (`/socket?api_key=…&deviceId=…`). Jellyfin clients put it in the query
 /// string on the WS handshake; it is the stable session key the HTTP SyncPlay
@@ -223,6 +232,7 @@ async fn ws_entry(
         bus_rx,
         user.0.name,
         user_id_str,
+        user.0.policy.admin,
     ));
     Ok(response)
 }
@@ -239,6 +249,7 @@ async fn handle_connection<S>(
     mut bus_rx: broadcast::Receiver<SocketBroadcast>,
     member_name: String,
     bound_user_id: String,
+    is_admin: bool,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -322,6 +333,9 @@ async fn handle_connection<S>(
     // the dashboard's Scheduled Tasks panel animates a live scan bar without
     // polling. Cleared on `ScheduledTasksInfoStop` / disconnect.
     let mut tasks_info_tick: Option<tokio::time::Interval> = None;
+    // `Sessions` push subscription (`SessionsStart`/`SessionsStop`). Each push
+    // carries the same per-caller view as `GET /Sessions`.
+    let mut sessions_tick: Option<tokio::time::Interval> = None;
 
     let close_cause = 'pump: loop {
         // React to a socket-drain at once: close so the client reconnects to
@@ -366,6 +380,27 @@ async fn handle_connection<S>(
                 );
                 if send_outbound(&mut session, &out).await.is_err() {
                     break 'pump SocketCloseCause::SendFailed;
+                }
+            }
+            _ = async {
+                match sessions_tick.as_mut() {
+                    Some(t) => { t.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                match crate::api::jellyfin::sessions::visible_sessions(
+                    &state, &bound_user_id, is_admin,
+                ).await {
+                    Ok(list) => {
+                        let out = Outbound::new(
+                            "Sessions",
+                            serde_json::to_value(&list).unwrap_or_else(|_| serde_json::json!([])),
+                        );
+                        if send_outbound(&mut session, &out).await.is_err() {
+                            break 'pump SocketCloseCause::SendFailed;
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "socket: Sessions push snapshot failed"),
                 }
             }
             Some(server_msg) = out_rx.recv() => {
@@ -481,6 +516,24 @@ async fn handle_connection<S>(
                         }
                         if inbound.message_type == "ScheduledTasksInfoStop" {
                             tasks_info_tick = None;
+                            continue 'pump;
+                        }
+                        if inbound.message_type == "SessionsStart" {
+                            let interval_ms = parse_tasks_info_interval(&inbound.data);
+                            let delay_ms = parse_start_delay_ms(&inbound.data);
+                            let mut iv = tokio::time::interval_at(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(delay_ms),
+                                std::time::Duration::from_millis(interval_ms),
+                            );
+                            iv.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Skip,
+                            );
+                            sessions_tick = Some(iv);
+                            continue 'pump;
+                        }
+                        if inbound.message_type == "SessionsStop" {
+                            sessions_tick = None;
                             continue 'pump;
                         }
                         handle_inbound(
