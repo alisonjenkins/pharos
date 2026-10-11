@@ -242,6 +242,17 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .expect("connect in-memory sqlite");
     let (uid1, uid2, item1) = seed(&sqlite).await;
 
+    // A stored sort name that differs from sort_name(title) must be carried
+    // verbatim; a NULL one (not yet backfilled) is derived from the title.
+    sqlx::query("UPDATE media_items SET sort_name = 'custom-sort-key' WHERE id = 1")
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE media_items SET sort_name = NULL WHERE id = 2")
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+
     // The migrate engine requires an EMPTY target. The shared
     // PHAROS_TEST_POSTGRES_URL database is also written by `backend_conformance`
     // (which runs concurrently under nextest), so migrating into it collides on
@@ -320,6 +331,19 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         Some("A movie about migrating.")
     );
 
+    let pg_sort_names: Vec<(i64, Option<String>)> =
+        sqlx::query_as("SELECT id, sort_name FROM media_items WHERE id IN (1, 2) ORDER BY id")
+            .fetch_all(postgres.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        pg_sort_names,
+        vec![
+            (1, Some("custom-sort-key".to_string())),
+            (2, Some(pharos_core::sort_name("Migrate Episode"))),
+        ]
+    );
+
     let genre_item_ids = GenreStore::item_ids_for_genre(&postgres, &genre_wire_id("Sci-Fi"))
         .await
         .unwrap();
@@ -336,4 +360,52 @@ async fn migrate_sqlite_to_postgres_round_trip() {
 
     let pg_user2 = UserStore::get(&postgres, uid2).await.unwrap();
     assert_eq!(pg_user2.name, "migrate-user-2");
+}
+
+#[tokio::test]
+async fn migrating_a_source_without_sort_name_derives_it_from_the_title() {
+    let Ok(pg_url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP migrating_a_source_without_sort_name: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let sqlite = SqliteStore::connect("sqlite::memory:").await.unwrap();
+    seed(&sqlite).await;
+    sqlx::query("ALTER TABLE media_items DROP COLUMN sort_name")
+        .execute(sqlite.pool())
+        .await
+        .expect("drop sort_name to look like a pre-0054 source");
+
+    let base = pg_url
+        .rsplit_once('/')
+        .expect("postgres url has a db path")
+        .0;
+    let db = "pharos_migrate_no_sort_name";
+    {
+        use sqlx::Connection;
+        let mut admin = sqlx::postgres::PgConnection::connect(&format!("{base}/postgres"))
+            .await
+            .unwrap();
+        for sql in [
+            format!("DROP DATABASE IF EXISTS {db}"),
+            format!("CREATE DATABASE {db}"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut admin)
+                .await
+                .unwrap();
+        }
+    }
+    let postgres = PostgresStore::connect(&format!("{base}/{db}"))
+        .await
+        .unwrap();
+
+    pharos_store_sqlx::migrate::migrate_sqlite_to_postgres(&sqlite, &postgres)
+        .await
+        .expect("a source without sort_name must still migrate");
+
+    let got: Option<String> = sqlx::query_scalar("SELECT sort_name FROM media_items WHERE id = 1")
+        .fetch_one(postgres.pool())
+        .await
+        .unwrap();
+    assert_eq!(got, Some(pharos_core::sort_name("Migrate Movie")));
 }

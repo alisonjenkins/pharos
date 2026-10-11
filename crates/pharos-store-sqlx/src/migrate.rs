@@ -542,30 +542,50 @@ struct MediaItemRow {
     title_fold: Option<String>,
     attachments_json: Option<String>,
     probe_schema_version: i64,
+    sort_name: Option<String>,
+}
+
+/// The SELECT expression for `sort_name`: the column, or `NULL` on a source
+/// database that predates migration 0054 (the copy then derives it from the
+/// title, same as a row the background backfill has not reached yet).
+async fn sort_name_source(sp: &SqlitePool) -> Result<&'static str, StoreError> {
+    let (present,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'sort_name'",
+    )
+    .fetch_one(sp)
+    .await
+    .map_err(StoreError::Sqlx)?;
+    Ok(if present > 0 { "sort_name" } else { "NULL" })
 }
 
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 51-placeholder statement while still batching the
+/// manageable fixed 52-placeholder statement while still batching the
 /// whole copy as a single round of prepared-statement reuse.
 async fn copy_media_items(
     sp: &SqlitePool,
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<u64, StoreError> {
-    let select_sql = format!("SELECT {MEDIA_MIGRATE_COLUMNS} FROM media_items ORDER BY id");
+    let sort_name_expr = sort_name_source(sp).await?;
+    let select_sql = format!(
+        "SELECT {MEDIA_MIGRATE_COLUMNS}, {sort_name_expr} AS sort_name FROM media_items ORDER BY id"
+    );
     let rows: Vec<MediaItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
         .fetch_all(sp)
         .await
         .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
     let insert_sql = format!(
-        "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}) VALUES \
+        "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
          $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51)"
+         $45,$46,$47,$48,$49,$50,$51,$52)"
     );
     for row in rows {
+        let sort_name = row
+            .sort_name
+            .unwrap_or_else(|| pharos_core::sort_name(&row.title));
         sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
             .bind(row.id)
             .bind(row.path)
@@ -618,6 +638,7 @@ async fn copy_media_items(
             .bind(row.title_fold)
             .bind(row.attachments_json)
             .bind(row.probe_schema_version)
+            .bind(sort_name)
             .execute(&mut **tx)
             .await
             .map_err(StoreError::Sqlx)?;
