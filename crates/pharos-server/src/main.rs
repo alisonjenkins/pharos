@@ -1930,6 +1930,27 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // own remove-on-empty; without this the sync_groups table grew forever
     // and B24 recovery could re-attach a device to week-old leftovers).
     pharos_server::sync_recovery::spawn_snapshot_janitor(app_state.stores.clone());
+
+    // Held progress reports are written by this tick when their client goes
+    // quiet, and once more on the way out so a rolling deploy loses none.
+    let progress_writes = app_state.progress_writes.clone();
+    let progress_store = app_state.stores.clone();
+    let progress_flusher = progress_writes.flush_period().map(|period| {
+        let (writes, store) = (progress_writes.clone(), progress_store.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                pharos_server::progress_writes::flush_due(
+                    &writes,
+                    &store,
+                    std::time::Instant::now(),
+                )
+                .await;
+            }
+        })
+    });
     // B29 — hydrate fresh persisted groups at boot so the ghost prune can
     // dissolve no-show parties within minutes instead of them haunting the
     // join picker until the janitor's 48h cutoff.
@@ -2083,7 +2104,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         drain_handle.stop(true).await;
     });
 
-    server.await?;
+    let served = server.await;
+    // The server has stopped, so no report can arrive after this flush, which
+    // runs whether it stopped cleanly or not.
+    if let Some(flusher) = progress_flusher {
+        flusher.abort();
+    }
+    let flushed =
+        pharos_server::progress_writes::flush_all(&progress_writes, &progress_store).await;
+    tracing::info!(flushed, "held playback progress written on shutdown");
+    served?;
     // P31 — shutdown reached. If the SSDP responder is alive, send
     // byebye frames so DLNA clients drop pharos immediately instead
     // of waiting out the CACHE-CONTROL TTL.

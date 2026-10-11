@@ -286,7 +286,9 @@ async fn playing_progress(
                 .await
             {
                 Ok(data) => {
-                    state.progress_writes.persisted(&key, Instant::now());
+                    state
+                        .progress_writes
+                        .persisted(&key, Instant::now(), &progress);
                     // B36 — broadcast the full DTO (with PlayedPercentage
                     // from the item's runtime) so other windows' resume
                     // bars track the live position.
