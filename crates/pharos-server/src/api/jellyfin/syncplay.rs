@@ -12,7 +12,7 @@
 
 use crate::api::jellyfin::auth_extractor::{AuthSession, AuthUser};
 use actix_web::{web, HttpResponse, Responder};
-use pharos_sync::group::{GroupHandle, GroupMsg, QueueMode};
+use pharos_sync::group::{GroupHandle, GroupMsg, QueueMode, MAX_QUEUE_LEN};
 use pharos_sync::messages::{GroupId, MemberId};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,10 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const POSITION_TICKS_PER_MS: u64 = 10_000;
+
+/// Most items one `/SyncPlay/Queue` request may add; each costs a store
+/// lookup for its runtime.
+const MAX_QUEUE_REQUEST_ITEMS: usize = 1_000;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: paths registered lowercase; `LowercasePath` middleware
@@ -906,7 +910,34 @@ async fn queue(
     body: web::Json<QueueBody>,
 ) -> HttpResponse {
     let body = body.into_inner();
-    let item_runtimes_ms = resolve_runtimes_ms(&state, &body.item_ids).await;
+    if body.item_ids.len() > MAX_QUEUE_REQUEST_ITEMS {
+        return HttpResponse::BadRequest().body(format!(
+            "SyncPlay Queue takes at most {MAX_QUEUE_REQUEST_ITEMS} items per request"
+        ));
+    }
+    if body
+        .item_ids
+        .iter()
+        .any(|id| pharos_jellyfin_api::dto::WireId::parse(id).is_none())
+    {
+        return HttpResponse::BadRequest().body("SyncPlay Queue ItemIds must be item ids");
+    }
+    // Only a caller that is in a group costs store lookups and a roster
+    // snapshot; anyone else is answered by `dispatch` (NotInGroup / recovery).
+    let group = auth
+        .sync_key()
+        .and_then(|key| hub.resolve(&key))
+        .and_then(|sess| sess.group);
+    let mut item_runtimes_ms = Vec::new();
+    if let Some(group) = group {
+        let queued = group.snapshot().await.map_or(0, |s| s.queue_len);
+        if queued.saturating_add(body.item_ids.len()) > MAX_QUEUE_LEN {
+            return HttpResponse::BadRequest().body(format!(
+                "SyncPlay queue is full: at most {MAX_QUEUE_LEN} entries per group"
+            ));
+        }
+        item_runtimes_ms = resolve_runtimes_ms(&state, &body.item_ids).await;
+    }
     dispatch(
         &hub,
         &registry,
