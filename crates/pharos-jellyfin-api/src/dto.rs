@@ -29,6 +29,28 @@ pub fn sidecar_base_index(probe: &pharos_core::MediaProbe) -> u32 {
     max_audio.max(max_sub) + 1
 }
 
+/// One entry of `SystemInfo.CastReceiverApplications` (Jellyfin
+/// `CastReceiverApplication`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CastReceiverApplicationDto {
+    pub id: &'static str,
+    pub name: &'static str,
+}
+
+/// The receivers stock Jellyfin advertises; `STABLE` matches `CastReceiverId`.
+pub const CAST_RECEIVER_STABLE_ID: &str = "F007D354";
+pub const CAST_RECEIVER_APPLICATIONS: [CastReceiverApplicationDto; 2] = [
+    CastReceiverApplicationDto {
+        id: CAST_RECEIVER_STABLE_ID,
+        name: "Stable",
+    },
+    CastReceiverApplicationDto {
+        id: "6F511C87",
+        name: "Unstable",
+    },
+];
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SystemInfoDto {
@@ -40,6 +62,7 @@ pub struct SystemInfoDto {
     pub local_address: String,
     pub startup_wizard_completed: bool,
     pub cast_receiver_id: &'static str,
+    pub cast_receiver_applications: Vec<CastReceiverApplicationDto>,
     pub operating_system_display_name: &'static str,
     pub has_pending_restart: bool,
     pub is_shutting_down: bool,
