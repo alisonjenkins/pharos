@@ -545,19 +545,6 @@ struct MediaItemRow {
     sort_name: Option<String>,
 }
 
-/// The SELECT expression for `sort_name`: the column, or `NULL` on a source
-/// database that predates migration 0054 (the copy then derives it from the
-/// title, same as a row the background backfill has not reached yet).
-async fn sort_name_source(sp: &SqlitePool) -> Result<&'static str, StoreError> {
-    let (present,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM pragma_table_info('media_items') WHERE name = 'sort_name'",
-    )
-    .fetch_one(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    Ok(if present > 0 { "sort_name" } else { "NULL" })
-}
-
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
@@ -567,10 +554,11 @@ async fn copy_media_items(
     sp: &SqlitePool,
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<u64, StoreError> {
-    let sort_name_expr = sort_name_source(sp).await?;
-    let select_sql = format!(
-        "SELECT {MEDIA_MIGRATE_COLUMNS}, {sort_name_expr} AS sort_name FROM media_items ORDER BY id"
-    );
+    // `SqliteStore::connect` always runs the migrations, so the source has the
+    // column; rows the background backfill has not reached yet are NULL and
+    // get their sort name derived from the title below.
+    let select_sql =
+        format!("SELECT {MEDIA_MIGRATE_COLUMNS}, sort_name FROM media_items ORDER BY id");
     let rows: Vec<MediaItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
         .fetch_all(sp)
         .await
