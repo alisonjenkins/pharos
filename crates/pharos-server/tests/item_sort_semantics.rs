@@ -5,8 +5,8 @@
 
 use actix_web::{test, web, App};
 use pharos_core::{
-    MediaItem, MediaKind, MediaMetadata, MediaStore, SecretString, TokenStore, UserId, UserPolicy,
-    UserRecord, UserStore,
+    MediaItem, MediaKind, MediaMetadata, MediaStore, SecretString, TokenStore, UserDataStore,
+    UserId, UserPolicy, UserRecord, UserStore,
 };
 use pharos_server::{
     api::jellyfin,
@@ -22,6 +22,8 @@ struct Row {
     premiere: Option<i64>,
     community: Option<f32>,
     critic: Option<f32>,
+    /// `(play_count, last_played_at)` for the test user.
+    plays: Option<(u32, i64)>,
 }
 
 impl Row {
@@ -33,6 +35,7 @@ impl Row {
             premiere: None,
             community: None,
             critic: None,
+            plays: None,
         }
     }
 }
@@ -70,6 +73,21 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
             })
             .await
             .unwrap();
+        if let Some((count, at)) = r.plays {
+            stores
+                .set_user_data(
+                    uid,
+                    r.id,
+                    pharos_core::UserItemData {
+                        played: true,
+                        play_count: count,
+                        last_played_at: at,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
     }
     let token = stores.issue(uid, "t").await.unwrap();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
@@ -187,4 +205,37 @@ async fn community_and_critic_rating_sort_by_score() {
         "SortBy=CriticRating&SortOrder=Descending"
     );
     assert_eq!(critic, vec!["Alpha", "Charlie", "Bravo", "Delta"]);
+}
+
+#[actix_web::test]
+async fn play_count_and_date_played_sort_by_the_requesting_users_data() {
+    let rows = vec![
+        Row {
+            plays: Some((2, 500)),
+            ..Row::new(1, "Bravo")
+        },
+        Row {
+            plays: Some((9, 100)),
+            ..Row::new(2, "Alpha")
+        },
+        Row {
+            plays: Some((5, 900)),
+            ..Row::new(3, "Charlie")
+        },
+        Row::new(4, "Delta"),
+    ];
+    let (state, token) = seed(rows).await;
+    let app = test::init_service(build_app(state)).await;
+    let by_count = names!(
+        &app,
+        token.as_str(),
+        "SortBy=PlayCount&SortOrder=Descending"
+    );
+    assert_eq!(by_count, vec!["Alpha", "Charlie", "Bravo", "Delta"]);
+    let by_date = names!(
+        &app,
+        token.as_str(),
+        "SortBy=DatePlayed&SortOrder=Descending"
+    );
+    assert_eq!(by_date, vec!["Charlie", "Bravo", "Alpha", "Delta"]);
 }

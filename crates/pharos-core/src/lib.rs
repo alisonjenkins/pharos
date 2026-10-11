@@ -2562,6 +2562,12 @@ pub enum SortKey {
     CommunityRating,
     /// `CriticRating` — the metadata `critic_rating`.
     CriticRating,
+    /// `PlayCount` — the requesting user's `user_data.play_count`. Needs
+    /// [`UserDataQuery::user`]; ignored without one.
+    PlayCount,
+    /// `DatePlayed` — the requesting user's `user_data.last_played_at`.
+    /// Needs [`UserDataQuery::user`]; ignored without one.
+    DatePlayed,
     /// `Album` — case-folded `album` probe column.
     Album,
     /// `ParentIndexNumber` — audio `disc_number` (multi-disc album order).
