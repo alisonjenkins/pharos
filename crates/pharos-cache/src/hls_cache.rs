@@ -402,6 +402,63 @@ fn record_audio_wait(outcome: &'static str) {
     metrics::counter!("pharos_audio_wait_total", "outcome" => outcome).increment(1);
 }
 
+/// Every `reason` a failed or coalesced-failed segment can carry; mirrors
+/// [`failure_reason`].
+const FAILURE_REASONS: [&str; 8] = [
+    "source_missing",
+    "permission",
+    "io",
+    "transcode",
+    "bad_path",
+    "scheduler_busy",
+    "source_unreadable",
+    "audio_not_ready",
+];
+
+/// Create every `pharos_segment_produced_total` series at zero. Call once after
+/// the recorder is installed; without it a series only appears on its first
+/// event, and `rate()` / `increase()` cannot see that first event (so the
+/// first short or failed segment after a deploy never alerts).
+pub fn register_segment_metrics() {
+    for class in [JobClass::Interactive, JobClass::Background] {
+        for outcome in [
+            SegmentOutcome::Ok,
+            SegmentOutcome::Short,
+            SegmentOutcome::Filler,
+            SegmentOutcome::Empty,
+            SegmentOutcome::Cancelled,
+        ] {
+            metrics::counter!(
+                "pharos_segment_produced_total",
+                "outcome" => outcome.label(),
+                "reason" => "none",
+                "class" => class.label(),
+            )
+            .increment(0);
+        }
+        for outcome in [SegmentOutcome::Shed, SegmentOutcome::CoalescedShed] {
+            metrics::counter!(
+                "pharos_segment_produced_total",
+                "outcome" => outcome.label(),
+                "reason" => "scheduler_busy",
+                "class" => class.label(),
+            )
+            .increment(0);
+        }
+        for outcome in [SegmentOutcome::Failed, SegmentOutcome::CoalescedFailed] {
+            for reason in FAILURE_REASONS {
+                metrics::counter!(
+                    "pharos_segment_produced_total",
+                    "outcome" => outcome.label(),
+                    "reason" => reason,
+                    "class" => class.label(),
+                )
+                .increment(0);
+            }
+        }
+    }
+}
+
 /// Count one segment production attempt.
 fn record_segment_outcome(outcome: SegmentOutcome, class: JobClass) {
     metrics::counter!(
@@ -8315,6 +8372,60 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+        }
+    }
+
+    /// `rate()` and `increase()` need the series to exist BEFORE its first
+    /// event: a counter born at 1 has no earlier sample to diff against, so the
+    /// first short/failed segment after a deploy would never alert. Production
+    /// showed `outcome="ok"` alone for that reason.
+    #[test]
+    fn every_outcome_series_exists_at_zero_before_any_segment_is_produced() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, register_segment_metrics);
+        let rows: Vec<(Vec<String>, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == "pharos_segment_produced_total")
+            .map(|(ck, _, _, v)| {
+                let labels = ck
+                    .key()
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                let DebugValue::Counter(n) = v else {
+                    panic!("not a counter")
+                };
+                (labels, n)
+            })
+            .collect();
+        assert!(
+            rows.iter().all(|(_, n)| *n == 0),
+            "pre-registration must not count"
+        );
+        for outcome in [
+            "ok",
+            "short",
+            "filler",
+            "empty",
+            "failed",
+            "shed",
+            "coalesced_failed",
+            "coalesced_shed",
+            "cancelled",
+        ] {
+            for class in ["interactive", "background"] {
+                let want_outcome = format!("outcome={outcome}");
+                let want_class = format!("class={class}");
+                assert!(
+                    rows.iter()
+                        .any(|(l, _)| l.contains(&want_outcome) && l.contains(&want_class)),
+                    "no zero series for {outcome}/{class}; got {rows:?}"
+                );
+            }
         }
     }
 
