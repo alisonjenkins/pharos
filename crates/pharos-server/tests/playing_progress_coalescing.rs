@@ -273,6 +273,77 @@ async fn a_zero_interval_writes_every_report() {
     );
 }
 
+fn counter(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    outcome: &str,
+    reason: &str,
+) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| {
+            let has = |k: &str, v: &str| key.key().labels().any(|l| l.key() == k && l.value() == v);
+            match value {
+                DebugValue::Counter(n)
+                    if key.key().name() == "pharos_progress_writes_total"
+                        && has("outcome", outcome)
+                        && has("reason", reason) =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn persist_latency_samples(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> usize {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(key, _, _, value)| match value {
+            DebugValue::Histogram(h) if key.key().name() == "pharos_progress_persist_seconds" => {
+                Some(h.len())
+            }
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+#[actix_web::test]
+async fn writes_are_counted_by_outcome_and_reason_and_timed() {
+    let (state, token, _uid) = seed().await;
+    let app = app!(state);
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    progress!(app, token, 10u64);
+    progress!(app, token, 11u64);
+    progress!(app, token, 12u64);
+    progress!(app, token, 13u64, true);
+    assert_eq!(counter(&snapshotter, "persisted", "first"), 1);
+    assert_eq!(counter(&snapshotter, "coalesced", "held"), 2);
+    assert_eq!(counter(&snapshotter, "persisted", "pause_change"), 1);
+    assert_eq!(
+        persist_latency_samples(&snapshotter),
+        2,
+        "one sample per write"
+    );
+
+    progress!(app, token, 13u64, true);
+    flush_due(&state.progress_writes, &state.stores, later(20)).await;
+    assert_eq!(counter(&snapshotter, "persisted", "tick"), 1);
+    progress!(app, token, 13u64, true);
+    flush_all(&state.progress_writes, &state.stores).await;
+    assert_eq!(counter(&snapshotter, "persisted", "shutdown"), 1);
+    assert_eq!(counter(&snapshotter, "failed", "tick"), 0);
+}
+
 fn later(secs: u64) -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(secs)
 }

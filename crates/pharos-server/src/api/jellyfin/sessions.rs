@@ -4,7 +4,7 @@
 //! `SessionRegistry` actor (V18) for in-memory tracking, and return
 //! 204 No Content. GET /Sessions returns the actor's snapshot.
 
-use crate::progress_writes::{Decision, ProgressKey};
+use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::{
     api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser},
     sessions::SessionEvent,
@@ -275,16 +275,11 @@ async fn playing_progress(
         };
         // Only the database write is deferred: the session registry and the
         // socket fan-out above already ran for this report.
-        if let Decision::Persist(_) =
-            state
-                .progress_writes
-                .admit(&key, Instant::now(), body.is_paused, progress)
-        {
-            match state
-                .stores
-                .record_playback_progress(user.0.id, item_id, progress)
-                .await
-            {
+        let decision = state
+            .progress_writes
+            .admit(&key, Instant::now(), body.is_paused, progress);
+        if let Decision::Persist(reason) = decision {
+            match progress_writes::persist(&state.stores, &key, progress, reason.label()).await {
                 Ok(data) => {
                     state
                         .progress_writes
@@ -310,6 +305,8 @@ async fn playing_progress(
                     tracing::warn!(error = %e, item = item_id, "playback progress not persisted");
                 }
             }
+        } else {
+            progress_writes::count_held();
         }
     }
     Ok(HttpResponse::NoContent().finish())
