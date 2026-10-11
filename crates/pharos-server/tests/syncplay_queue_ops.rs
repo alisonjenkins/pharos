@@ -38,6 +38,8 @@ struct Party {
     member_sinks: MemberSinks,
     rx_a: mpsc::Receiver<ServerMsg>,
     rx_b: mpsc::Receiver<ServerMsg>,
+    /// The hub key of device B, for tests that take it out of its group.
+    key_b: String,
 }
 
 /// Two devices of one user, both members of one real group actor.
@@ -93,6 +95,7 @@ async fn party() -> Party {
         member_sinks,
         rx_a,
         rx_b,
+        key_b: format!("{}:{DEV_B}", uid.0.simple()),
     }
 }
 
@@ -108,6 +111,7 @@ macro_rules! serve {
             member_sinks,
             rx_a: mut $rx_a,
             rx_b: mut $rx_b,
+            key_b: _,
         } = $party;
         let $app = test::init_service(
             App::new()
@@ -230,6 +234,103 @@ async fn queue_next_inserts_after_the_playing_entry_for_both_members() {
         assert_eq!(q.item_ids, ["10", "20", "11", "12"]);
         assert_eq!(q.playing_index, 0);
     }
+}
+
+#[actix_web::test]
+async fn queue_rejects_oversized_and_malformed_requests_with_400() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let _ = seeded!(app, token, rx_a, rx_b);
+
+    let too_many: Vec<String> = (0..1_001).map(|i| i.to_string()).collect();
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": too_many, "Mode": "Queue" })
+    );
+    assert_eq!(status, 400, "more items than one request may carry");
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": ["20", "not-an-item-id"], "Mode": "Queue" })
+    );
+    assert_eq!(status, 400, "an id that is not an item id");
+
+    // Neither request may have reached the group.
+    let _ = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": ["21"], "Mode": "Queue" })
+    );
+    let q = next_queue(&mut rx_a, "queue").await;
+    assert_eq!(q.item_ids, ["10", "11", "12", "21"]);
+}
+
+#[actix_web::test]
+async fn queue_rejects_requests_that_overflow_the_group_queue_with_400() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let _ = seeded!(app, token, rx_a, rx_b);
+
+    // 3 seeded + 4 x 1000 fits under the 5000 cap; one more batch does not.
+    let batch: Vec<String> = (0..1_000).map(|i| (100 + i).to_string()).collect();
+    for _ in 0..4 {
+        let status = post!(
+            app,
+            token,
+            DEV_B,
+            "/SyncPlay/Queue",
+            serde_json::json!({ "ItemIds": batch, "Mode": "Queue" })
+        );
+        assert_eq!(status, 204);
+        let _ = next_queue(&mut rx_a, "queue").await;
+        let _ = next_queue(&mut rx_b, "queue").await;
+    }
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": batch, "Mode": "Queue" })
+    );
+    assert_eq!(status, 400, "the group queue is at its cap");
+}
+
+#[actix_web::test]
+async fn queue_from_a_caller_in_no_group_is_answered_not_in_group() {
+    let p = party().await;
+    p.hub.detach_group(&p.key_b);
+    serve!(p => app, token, rx_a, rx_b);
+    let _ = &mut rx_a;
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/Queue",
+        serde_json::json!({ "ItemIds": ["20"], "Mode": "Queue" })
+    );
+    assert_eq!(status, 204);
+    let deadline = Duration::from_secs(2);
+    let got = tokio::time::timeout(deadline, async {
+        while let Some(m) = rx_b.recv().await {
+            if matches!(m, ServerMsg::NotInGroup) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        got,
+        Ok(true),
+        "the group-less caller must be told NotInGroup"
+    );
 }
 
 /// The SDKs send playlist item ids as dashed `Guid`s; the engine mints them

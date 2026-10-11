@@ -197,6 +197,11 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Most entries one group's play queue may hold. Every member's client
+/// fetches metadata for the whole queue on each update, so an unbounded
+/// `/SyncPlay/Queue` loop is a cheap way to make every update expensive.
+pub const MAX_QUEUE_LEN: usize = 5_000;
+
 /// Where `/SyncPlay/Queue` inserts new entries — Jellyfin's `GroupQueueMode`.
 /// Variant names are the wire strings, so the HTTP body deserialises straight
 /// into it and an unknown mode is rejected rather than guessed at.
@@ -722,6 +727,8 @@ pub struct GroupSnapshot {
     /// HTTP seek handler prewarm that item's segments). None on an empty
     /// queue.
     pub current_item_id: Option<String>,
+    /// Number of entries in the play queue.
+    pub queue_len: usize,
 }
 
 struct MemberRec {
@@ -3936,6 +3943,16 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             item_runtimes_ms,
             mode,
         } => {
+            if state.queue.items.len().saturating_add(item_ids.len()) > MAX_QUEUE_LEN {
+                tracing::warn!(
+                    group = %state.id, sender = %sender,
+                    requested = item_ids.len(),
+                    queue_len = state.queue.items.len(),
+                    "syncplay: Queue would exceed the queue cap — ignored"
+                );
+                metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "queue", "reason" => "queue_full").increment(1);
+                return;
+            }
             if item_ids.is_empty() || state.queue.items.is_empty() {
                 // Nothing to add, or no queue to add to: a queue with no
                 // playing entry would make the first appended item "current"
@@ -4171,6 +4188,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .items
                     .get(state.queue.playing_index)
                     .map(|e| e.item_id.clone()),
+                queue_len: state.queue.items.len(),
             };
             let _ = reply.send(snap);
         }
@@ -9632,6 +9650,23 @@ mod tests {
         while let Ok(m) = leader_rx.try_recv() {
             assert!(!matches!(m, ServerMsg::PlayQueue { reason, .. } if reason == "queue"));
         }
+    }
+
+    #[tokio::test]
+    async fn queue_beyond_the_cap_is_ignored_by_the_group() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let _ = seed_queue(&h, leader, &mut leader_rx).await;
+        let fill = |n: usize| GroupMsg::Queue {
+            sender: leader,
+            item_ids: (0..n).map(|i| i.to_string()).collect(),
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::Queue,
+        };
+        h.tx.send(fill(MAX_QUEUE_LEN - 3)).await.unwrap();
+        let (_, ids, _, _, _, _) = next_play_queue(&mut leader_rx).await;
+        assert_eq!(ids.len(), MAX_QUEUE_LEN);
+        h.tx.send(fill(1)).await.unwrap();
+        assert_eq!(snapshot_of(&h).await.queue_len, MAX_QUEUE_LEN);
     }
 
     fn ids(v: &[&str]) -> Vec<String> {
