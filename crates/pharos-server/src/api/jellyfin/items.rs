@@ -2080,26 +2080,27 @@ impl PlaybackSwitches {
 
 /// Fold the request's switches into the negotiated decision. A remux that
 /// copies a stream the client forbids copying becomes a full transcode, and a
-/// DirectPlay with both direct paths disabled becomes one too. When
+/// DirectPlay with direct play disabled becomes one too, so a TranscodingUrl
+/// exists whenever direct play is off. `AudioRemux` copies the VIDEO and
+/// re-encodes the audio for a video source, so it is gated on `video_copy`;
+/// only an audio-only item is gated on `audio_copy`. `forced_transcode`
+/// supplies the target (re-negotiated from the client's own profile). When
 /// transcoding is also disabled the decision is left alone: the caller then
 /// strips the TranscodingUrl and reports the source as unplayable.
 fn apply_playback_switches(
     decision: Decision,
     sw: &PlaybackSwitches,
-    remote_ceiling: Option<u64>,
+    is_video: bool,
+    forced_transcode: impl Fn() -> Decision,
 ) -> Decision {
-    let transcode = || Decision::Transcode {
-        target_container: "ts".into(),
-        target_video_codec: Some("h264".into()),
-        target_audio_codec: Some("aac".into()),
-        max_video_bitrate_bps: remote_ceiling,
-    };
+    if !sw.transcoding {
+        return decision;
+    }
     match decision {
-        Decision::VideoRemux { .. } if !sw.video_copy => transcode(),
-        Decision::AudioRemux { .. } if !sw.audio_copy => transcode(),
-        Decision::DirectPlay if !sw.direct_play && !sw.direct_stream && sw.transcoding => {
-            transcode()
-        }
+        Decision::VideoRemux { .. } if !sw.video_copy => forced_transcode(),
+        Decision::AudioRemux { .. } if is_video && !sw.video_copy => forced_transcode(),
+        Decision::AudioRemux { .. } if !is_video && !sw.audio_copy => forced_transcode(),
+        Decision::DirectPlay if !sw.direct_play => forced_transcode(),
         other => other,
     }
 }
@@ -2805,9 +2806,21 @@ async fn playback_info(
 
     // The request's own switches (a retry after a direct-play failure) come
     // last so they override every negotiated outcome above.
+    // Re-negotiated from the client's own profile with direct play cleared,
+    // like the remote-source path, so the target is one it can decode.
+    let pre_switch_decision = decision.clone();
     let decision = {
-        let adjusted = apply_playback_switches(decision.clone(), &switches, remote_ceiling);
-        if adjusted != decision {
+        let forced_transcode = || {
+            let mut forced = profile.clone();
+            forced.direct_play_profiles.clear();
+            let (d, _) = negotiate_explained(&forced, &source, &server_codecs);
+            match remote_ceiling {
+                Some(ceiling) => d.clamp_video_bitrate(ceiling),
+                None => d,
+            }
+        };
+        let adjusted = apply_playback_switches(decision, &switches, is_video, forced_transcode);
+        if adjusted != pre_switch_decision {
             downgrade = Some("client_switch");
         }
         adjusted
@@ -2876,10 +2889,15 @@ async fn playback_info(
     // the container/audio), so it must transcode via the TranscodingUrl below.
     // Native players that CAN play such files declare it in their profile →
     // DirectPlay, unaffected.
+    // Judged on the pre-switch decision: a DirectPlay forced into a transcode
+    // by EnableDirectPlay=false still has a raw stream to offer. A forbidden
+    // video copy takes the raw stream away (Jellyfin: `!enableDirectStream ||
+    // !allowVideoStreamCopy`).
     let supports_direct_stream = switches.direct_stream
-        && (decision.is_direct()
+        && switches.video_copy
+        && (pre_switch_decision.is_direct()
             || (matches!(
-                decision,
+                pre_switch_decision,
                 Decision::VideoRemux { .. } | Decision::AudioRemux { .. }
             ) && webm_relabel_playable));
     // Forward the client's audio/subtitle track selection into the VP9 HLS
@@ -8719,44 +8737,62 @@ mod playback_switch_tests {
         }
     }
 
+    fn audio_remux() -> Decision {
+        Decision::AudioRemux {
+            target_audio_codec: "aac".into(),
+        }
+    }
+
+    fn forced() -> Decision {
+        Decision::Transcode {
+            target_container: "mp4".into(),
+            target_video_codec: Some("hevc".into()),
+            target_audio_codec: None,
+            max_video_bitrate_bps: None,
+        }
+    }
+
+    fn apply(d: Decision, sw: &PlaybackSwitches, is_video: bool) -> Decision {
+        apply_playback_switches(d, sw, is_video, forced)
+    }
+
     #[test]
-    fn forbidding_a_stream_copy_turns_that_remux_into_a_transcode() {
-        let no_video_copy = PlaybackSwitches {
+    fn forbidding_video_copy_transcodes_both_video_remuxes() {
+        let sw = PlaybackSwitches {
             video_copy: false,
             ..Default::default()
         };
-        assert!(matches!(
-            apply_playback_switches(video_remux(), &no_video_copy, None),
-            Decision::Transcode { .. }
-        ));
-        // The audio flag does not touch a video remux.
-        let no_audio_copy = PlaybackSwitches {
+        assert_eq!(apply(video_remux(), &sw, true), forced());
+        // AudioRemux on a video source copies the VIDEO and re-encodes audio.
+        assert_eq!(apply(audio_remux(), &sw, true), forced());
+        // An audio-only item has no video to copy.
+        assert_eq!(apply(audio_remux(), &sw, false), audio_remux());
+    }
+
+    #[test]
+    fn forbidding_audio_copy_only_touches_audio_only_remux() {
+        let sw = PlaybackSwitches {
             audio_copy: false,
             ..Default::default()
         };
-        assert_eq!(
-            apply_playback_switches(video_remux(), &no_audio_copy, None),
-            video_remux()
-        );
-        assert!(matches!(
-            apply_playback_switches(
-                Decision::AudioRemux {
-                    target_audio_codec: "aac".into()
-                },
-                &no_audio_copy,
-                None
-            ),
-            Decision::Transcode { .. }
-        ));
+        assert_eq!(apply(audio_remux(), &sw, false), forced());
+        assert_eq!(apply(audio_remux(), &sw, true), audio_remux());
+        assert_eq!(apply(video_remux(), &sw, true), video_remux());
+    }
+
+    #[test]
+    fn disabling_direct_play_forces_the_renegotiated_transcode() {
+        let sw = PlaybackSwitches {
+            direct_play: false,
+            ..Default::default()
+        };
+        assert_eq!(apply(Decision::DirectPlay, &sw, true), forced());
     }
 
     #[test]
     fn default_switches_change_nothing() {
-        for d in [Decision::DirectPlay, video_remux()] {
-            assert_eq!(
-                apply_playback_switches(d.clone(), &PlaybackSwitches::default(), None),
-                d
-            );
+        for d in [Decision::DirectPlay, video_remux(), audio_remux()] {
+            assert_eq!(apply(d.clone(), &PlaybackSwitches::default(), true), d);
         }
     }
 }
