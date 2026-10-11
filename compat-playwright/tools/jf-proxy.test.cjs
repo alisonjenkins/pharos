@@ -105,6 +105,30 @@ test("rejected upgrade relays the status to the client", async () => {
   }
 });
 
+test("client closes before upstream replies: upstream connection is closed", async () => {
+  let upstreamClosed;
+  const closed = new Promise((r) => (upstreamClosed = r));
+  const up = await rawUpstream((c) => {
+    c.on("error", () => {});
+    c.on("data", () => {});
+    c.on("close", () => upstreamClosed());
+  });
+  const proxy = await startProxy(up.address().port);
+  try {
+    const c = net.connect(proxy.port, "127.0.0.1");
+    c.on("error", () => {});
+    c.write(UPGRADE);
+    await new Promise((r) => setTimeout(r, 100));
+    c.end();
+    const timedOut = new Promise((r) => setTimeout(() => r("timeout"), 1000));
+    const result = await Promise.race([closed.then(() => "closed"), timedOut]);
+    assert.strictEqual(result, "closed", "upstream connection left open after client reset");
+  } finally {
+    proxy.child.kill();
+    up.close();
+  }
+});
+
 test("client resets mid-upgrade while upstream is slow: proxy survives", async () => {
   const up = await rawUpstream((c) => c.on("error", () => {}));
   const proxy = await startProxy(up.address().port);
