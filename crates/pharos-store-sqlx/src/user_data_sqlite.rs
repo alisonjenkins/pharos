@@ -5,7 +5,9 @@
 //! so callers don't branch on existence.
 
 use crate::sqlite::SqliteStore;
-use pharos_core::{DomainError, DomainResult, MediaId, UserDataStore, UserId, UserItemData};
+use pharos_core::{
+    DomainError, DomainResult, MediaId, PlaybackProgress, UserDataStore, UserId, UserItemData,
+};
 
 fn map_err<E: std::fmt::Display>(e: E) -> DomainError {
     DomainError::Backend(e.to_string())
@@ -37,6 +39,42 @@ impl UserDataStore for SqliteStore {
         .await
         .map_err(map_err)?;
         Ok(row.map(row_to_data).unwrap_or_default())
+    }
+
+    #[tracing::instrument(skip(self, progress), fields(user.id = %user.0, media.id = %item))]
+    async fn record_playback_progress(
+        &self,
+        user: UserId,
+        item: MediaId,
+        progress: PlaybackProgress,
+    ) -> DomainResult<UserItemData> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let item_i64 = media_id_i64(item)?;
+        let pos_i64 = i64::try_from(progress.position_ticks)
+            .map_err(|e| DomainError::Backend(format!("position overflow: {e}")))?;
+        let row: UserDataRow = sqlx::query_as(
+            "INSERT INTO user_data
+               (user_id, item_id, played, play_count, last_played_position_ticks,
+                is_favorite, last_played_at, audio_stream_index, subtitle_stream_index)
+             VALUES (?, ?, 0, 0, ?, 0, ?, ?, ?)
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+               last_played_position_ticks = excluded.last_played_position_ticks,
+               last_played_at = excluded.last_played_at,
+               audio_stream_index = COALESCE(excluded.audio_stream_index, user_data.audio_stream_index),
+               subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_data.subtitle_stream_index)
+             RETURNING played, play_count, last_played_position_ticks, is_favorite,
+                       last_played_at, audio_stream_index, subtitle_stream_index",
+        )
+        .bind(id_bytes)
+        .bind(item_i64)
+        .bind(pos_i64)
+        .bind(progress.at)
+        .bind(progress.audio_stream_index.map(i64::from))
+        .bind(progress.subtitle_stream_index.map(i64::from))
+        .fetch_one(self.pool())
+        .await
+        .map_err(map_err)?;
+        Ok(row_to_data(row))
     }
 
     #[tracing::instrument(skip(self, data), fields(user.id = %user.0, media.id = %item))]
@@ -237,6 +275,85 @@ mod tests {
         s.set_user_data(uid, id, b).await.unwrap();
         let back = s.get_user_data(uid, id).await.unwrap();
         assert_eq!(back, b);
+    }
+
+    fn progress(position_ticks: u64, at: i64) -> PlaybackProgress {
+        PlaybackProgress {
+            position_ticks,
+            at,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_on_a_missing_row_creates_an_unplayed_one() {
+        let (s, uid, id) = fixture().await;
+        let got = s
+            .record_playback_progress(uid, id, progress(500, 42))
+            .await
+            .unwrap();
+        assert_eq!(got.last_played_position_ticks, 500);
+        assert_eq!(got.last_played_at, 42);
+        assert!(!got.played && !got.is_favorite);
+        assert_eq!(got.play_count, 0);
+        assert_eq!(s.get_user_data(uid, id).await.unwrap(), got);
+    }
+
+    #[tokio::test]
+    async fn progress_leaves_played_count_and_favourite_alone() {
+        let (s, uid, id) = fixture().await;
+        s.set_user_data(
+            uid,
+            id,
+            UserItemData {
+                played: true,
+                play_count: 4,
+                last_played_position_ticks: 1,
+                is_favorite: true,
+                last_played_at: 1,
+                audio_stream_index: Some(2),
+                subtitle_stream_index: Some(-1),
+            },
+        )
+        .await
+        .unwrap();
+        let got = s
+            .record_playback_progress(uid, id, progress(900, 77))
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            UserItemData {
+                played: true,
+                play_count: 4,
+                last_played_position_ticks: 900,
+                is_favorite: true,
+                last_played_at: 77,
+                audio_stream_index: Some(2),
+                subtitle_stream_index: Some(-1),
+            },
+            "only position and timestamp move; a report silent about tracks keeps them"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_that_names_tracks_replaces_them() {
+        let (s, uid, id) = fixture().await;
+        let got = s
+            .record_playback_progress(
+                uid,
+                id,
+                PlaybackProgress {
+                    audio_stream_index: Some(3),
+                    subtitle_stream_index: Some(5),
+                    ..progress(1, 1)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.audio_stream_index, Some(3));
+        assert_eq!(got.subtitle_stream_index, Some(5));
     }
 
     #[tokio::test]

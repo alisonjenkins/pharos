@@ -10,7 +10,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
-use pharos_core::{MediaStore, UserDataStore};
+use pharos_core::{MediaStore, PlaybackProgress, UserDataStore};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -258,23 +258,20 @@ async fn playing_progress(
         if let Some(tx) = &state.trickplay_priority {
             let _ = tx.send(item_id);
         }
-        if let Ok(mut data) = state.stores.get_user_data(user.0.id, item_id).await {
-            data.last_played_position_ticks = position_ticks;
-            data.last_played_at = now_unix();
-            // Only when the report names them — a report that is silent about
-            // tracks is not a statement that the user chose none.
-            if body.audio_stream_index.is_some() {
-                data.audio_stream_index = body.audio_stream_index;
-            }
-            if body.subtitle_stream_index.is_some() {
-                data.subtitle_stream_index = body.subtitle_stream_index;
-            }
-            if state
-                .stores
-                .set_user_data(user.0.id, item_id, data)
-                .await
-                .is_ok()
-            {
+        // A report that is silent about tracks is not a statement that the
+        // user chose none; the store keeps the stored choice for a `None`.
+        let progress = PlaybackProgress {
+            position_ticks,
+            at: now_unix(),
+            audio_stream_index: body.audio_stream_index,
+            subtitle_stream_index: body.subtitle_stream_index,
+        };
+        match state
+            .stores
+            .record_playback_progress(user.0.id, item_id, progress)
+            .await
+        {
+            Ok(data) => {
                 // B36 — broadcast the full DTO (with PlayedPercentage
                 // from the item's runtime) so other windows' resume
                 // bars track the live position.
@@ -288,6 +285,9 @@ async fn playing_progress(
                 if let Ok(entry) = serde_json::to_value(&dto) {
                     state.notify_user_data_changed(&user.0.id.0.simple().to_string(), vec![entry]);
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, item = item_id, "playback progress not persisted");
             }
         }
     }

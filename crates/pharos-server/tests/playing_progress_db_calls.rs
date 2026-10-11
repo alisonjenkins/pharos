@@ -106,7 +106,7 @@ async fn a_progress_report_store_call_count() {
     eprintln!("STORE CALLS: {}", calls.len());
     assert_eq!(
         calls,
-        ["resolve", "get", "get", "get_user_data", "set_user_data"],
-        "one progress report: token, user, item (kind and runtime), user data read, write"
+        ["resolve", "get", "get", "record_playback_progress"],
+        "one progress report: token, user, item (kind and runtime), one user-data upsert"
     );
 }

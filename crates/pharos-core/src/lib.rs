@@ -3288,11 +3288,34 @@ pub struct UserItemData {
     pub subtitle_stream_index: Option<i32>,
 }
 
+/// What one in-flight playback report says about the item: where the viewer
+/// is and, when the report names them, which tracks they are playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaybackProgress {
+    pub position_ticks: u64,
+    /// Unix seconds at which the report was taken.
+    pub at: i64,
+    pub audio_stream_index: Option<i32>,
+    pub subtitle_stream_index: Option<i32>,
+}
+
 pub trait UserDataStore: Send + Sync {
     fn get_user_data(
         &self,
         user: UserId,
         item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<UserItemData>> + Send;
+
+    /// Record a playback report in one statement and return the row as stored.
+    /// Touches only the resume position, `last_played_at` and the tracks the
+    /// report names; `played`, `play_count` and `is_favorite` are left exactly
+    /// as they are, so a concurrent change to them is never overwritten by a
+    /// stale read-modify-write.
+    fn record_playback_progress(
+        &self,
+        user: UserId,
+        item: MediaId,
+        progress: PlaybackProgress,
     ) -> impl std::future::Future<Output = DomainResult<UserItemData>> + Send;
 
     fn set_user_data(
