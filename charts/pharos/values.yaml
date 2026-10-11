@@ -131,6 +131,10 @@ config:
   obs:
     logLevel: "info"
     otlpEndpoint: null
+    # Fraction (0.0-1.0) of NEW traces exported to otlpEndpoint. A request that
+    # arrives with a sampled traceparent is always kept, so only traces that
+    # start in pharos are thinned. 1 = export everything.
+    samplingRatio: 1
     # Persist client-log / crash-report uploads (POST /ClientLog/Document, B66)
     # onto the cache PVC so the native Android-TV app's "Send logs to server"
     # lands on disk (readable via /System/Logs) instead of only the log stream.

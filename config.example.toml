@@ -10,6 +10,10 @@ name = "pharos"
 [obs]
 log_level = "info"
 # otlp_endpoint = "http://localhost:4317"
+# Fraction (0.0-1.0) of new traces exported over OTLP. A request carrying a
+# sampled traceparent is always kept; only traces started here are thinned.
+# 1.0 (default) exports every trace.
+# sampling_ratio = 0.1
 
 [media]
 roots = ["/srv/media"]
