@@ -123,6 +123,16 @@ static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = 
 /// that collector (e.g. Tempo) via a batch processor. Must be called from
 /// within the tokio runtime (the gRPC exporter needs it).
 pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHandle, ObsError> {
+    init_with_sampling(log_level, otlp_endpoint, 1.0)
+}
+
+/// [`init`] with an OTLP `sampling_ratio` (0.0..=1.0): the fraction of traces
+/// STARTED here that are exported. A sampled remote parent is always kept.
+pub fn init_with_sampling(
+    log_level: &str,
+    otlp_endpoint: Option<&str>,
+    sampling_ratio: f64,
+) -> Result<PrometheusHandle, ObsError> {
     INIT.call_once(|| {
         let outcome = (|| -> Result<PrometheusHandle, ObsError> {
             let filter =
@@ -131,7 +141,7 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
             // Optional OTLP span-export layer. `Option<Layer>` is itself a
             // Layer (None = no-op), so the registry composes uniformly.
             let otel_layer = match otlp_endpoint {
-                Some(ep) => Some(build_otel_layer(ep)?),
+                Some(ep) => Some(build_otel_layer(ep, sampling_ratio)?),
                 None => None,
             };
             let _ = tracing_subscriber::registry()
@@ -199,11 +209,25 @@ fn install_panic_hook() {
     }));
 }
 
+/// Parent-based sampler: an incoming sampled `traceparent` is honoured so a
+/// distributed trace is never cut in half; only root spans started here are
+/// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
+fn sampler_for(ratio: f64) -> opentelemetry_sdk::trace::Sampler {
+    use opentelemetry_sdk::trace::Sampler;
+    let root = if ratio >= 1.0 {
+        Sampler::AlwaysOn
+    } else {
+        Sampler::TraceIdRatioBased(ratio.max(0.0))
+    };
+    Sampler::ParentBased(Box::new(root))
+}
+
 /// Build the OTLP/gRPC span-export layer pointed at `endpoint`, registering
 /// the provider globally + in `TRACER_PROVIDER` so it outlives `init`. Generic
 /// over the subscriber `S` so it composes onto the layered registry.
 fn build_otel_layer<S>(
     endpoint: &str,
+    sampling_ratio: f64,
 ) -> Result<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>, ObsError>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
@@ -220,6 +244,7 @@ where
         .with_attribute(opentelemetry::KeyValue::new("service.name", "pharos"))
         .build();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_sampler(sampler_for(sampling_ratio))
         .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
@@ -331,6 +356,50 @@ mod tests {
         ] {
             assert!(body.contains(name), "missing {name}; rendered:\n{body}");
         }
+    }
+
+    fn decide(sampler: &opentelemetry_sdk::trace::Sampler, parent_sampled: Option<bool>) -> bool {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState,
+        };
+        use opentelemetry_sdk::trace::{SamplingDecision, ShouldSample};
+        let parent = parent_sampled.map(|sampled| {
+            let flags = if sampled {
+                TraceFlags::SAMPLED
+            } else {
+                TraceFlags::default()
+            };
+            opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+                TraceId::from(7u128),
+                SpanId::from(7u64),
+                flags,
+                true,
+                TraceState::default(),
+            ))
+        });
+        let result = sampler.should_sample(
+            parent.as_ref(),
+            TraceId::from(0xFFFF_FFFF_FFFF_FFFF_u128),
+            "t",
+            &SpanKind::Server,
+            &[],
+            &[],
+        );
+        result.decision == SamplingDecision::RecordAndSample
+    }
+
+    #[test]
+    fn ratio_one_keeps_every_trace_and_zero_keeps_none() {
+        assert!(decide(&sampler_for(1.0), None));
+        assert!(!decide(&sampler_for(0.0), None));
+    }
+
+    /// Thinning must never orphan a distributed trace: a sampled parent stays
+    /// sampled, an unsampled one stays dropped, whatever the local ratio.
+    #[test]
+    fn a_sampled_parent_is_kept_even_at_ratio_zero() {
+        assert!(decide(&sampler_for(0.0), Some(true)));
+        assert!(!decide(&sampler_for(1.0), Some(false)));
     }
 
     #[test]
