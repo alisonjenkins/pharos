@@ -562,18 +562,41 @@ async fn user_configuration_update(
     // an operator unable to set up an account for someone else. Jellyfin gates
     // the same endpoint on elevation rather than identity. Nothing here carries
     // policy or credentials, so this widens preference-setting only.
-    let target_str = path.into_inner();
+    write_user_configuration(&state, &user, path.into_inner(), body.into_inner()).await
+}
+
+/// `POST /Users/Configuration` (Jellyfin 10.11/12 SDK
+/// `updateUserConfiguration`): the user is the bearer unless an admin names
+/// another with `userId`.
+pub(super) async fn set_own_configuration(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: crate::api::jellyfin::ci_query::CiQuery<crate::api::jellyfin::admin::TargetUserQuery>,
+    body: web::Json<serde_json::Value>,
+) -> Result<impl Responder, actix_web::Error> {
+    let target = q
+        .user_id
+        .clone()
+        .unwrap_or_else(|| user.0.id.0.simple().to_string());
+    write_user_configuration(&state, &user, target, body.into_inner()).await
+}
+
+async fn write_user_configuration(
+    state: &AppState,
+    user: &AuthUser,
+    target_str: String,
+    body: serde_json::Value,
+) -> Result<HttpResponse, actix_web::Error> {
     let bearer = user.0.id.0.simple().to_string();
     let target = if target_str == bearer {
         user.0.id
     } else {
-        crate::api::jellyfin::admin::require_admin(&user)?;
+        crate::api::jellyfin::admin::require_admin(user)?;
         let parsed = uuid::Uuid::parse_str(&target_str)
             .map_err(|_| error::ErrorBadRequest("invalid user id"))?;
         pharos_core::UserId(parsed)
     };
-    let json = serde_json::to_string(&body.into_inner())
-        .map_err(|e| error::ErrorBadRequest(e.to_string()))?;
+    let json = serde_json::to_string(&body).map_err(|e| error::ErrorBadRequest(e.to_string()))?;
     state
         .stores
         .set_user_configuration(target, &json)

@@ -31,6 +31,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         "/users/password",
         web::post().to(crate::api::jellyfin::admin::set_own_password),
     )
+    .route(
+        "/users/configuration",
+        web::post().to(crate::api::jellyfin::system::set_own_configuration),
+    )
     .route("/users/{user_id}", web::get().to(user_by_id))
     .route(
         "/quickconnect/enabled",
