@@ -35,6 +35,14 @@ const TOLERATED_CONSOLE: RegExp[] = [
   /service worker/i,
 ];
 
+// jellyfin-web 12's SDK opens a bare `/socket` (no ApiKey) as soon as the
+// server is connected, before sign-in; any server must refuse it, so the
+// browser logs this. Tolerated only on pre-login routes — the same error after
+// sign-in means the authenticated socket failed.
+const UNAUTHENTICATED_SOCKET =
+  /WebSocket connection to '[^']*\/socket' failed: HTTP Authentication failed/;
+const PRE_LOGIN_ROUTE = /#\/(login|selectserver|addserver)/;
+
 // Allowed 4xx URLs (probes the client makes that pharos legitimately
 // 404s — keep narrow!).
 const ALLOWED_404_PATTERNS: RegExp[] = [
@@ -55,6 +63,7 @@ function start(page: Page): Capture {
     if (msg.type() !== "error" && msg.type() !== "warning") return;
     const text = msg.text();
     if (TOLERATED_CONSOLE.some((re) => re.test(text))) return;
+    if (UNAUTHENTICATED_SOCKET.test(text) && PRE_LOGIN_ROUTE.test(page.url())) return;
     cap.consoleErrors.push(text.slice(0, 250));
   });
   page.on("pageerror", (err) => {
