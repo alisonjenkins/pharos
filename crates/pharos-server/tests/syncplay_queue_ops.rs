@@ -28,6 +28,24 @@ struct QueueView {
     item_ids: Vec<String>,
     playlist_item_ids: Vec<String>,
     playing_index: usize,
+    is_playing: bool,
+}
+
+/// Whether an `Idle` state update reaches `rx` within `wait`.
+async fn idle_within(rx: &mut mpsc::Receiver<ServerMsg>, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    while let Ok(Some(m)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if matches!(
+            m,
+            ServerMsg::StateUpdate {
+                state: pharos_sync::messages::GroupPlayState::Idle,
+                ..
+            }
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 struct Party {
@@ -153,9 +171,11 @@ async fn next_queue(rx: &mut mpsc::Receiver<ServerMsg>, reason: &str) -> QueueVi
                 reason: r,
                 items,
                 playing_index,
+                is_playing,
                 ..
             })) if r == reason => {
                 return QueueView {
+                    is_playing,
                     reason: r,
                     item_ids: items.iter().map(|i| i.item_id.clone()).collect(),
                     playlist_item_ids: items.into_iter().map(|i| i.playlist_item_id).collect(),
@@ -433,5 +453,62 @@ async fn clear_playlist_with_clear_playing_item_empties_the_queue_for_both() {
     for rx in [&mut rx_a, &mut rx_b] {
         let q = next_queue(rx, "remove_items").await;
         assert!(q.item_ids.is_empty());
+        assert!(!q.is_playing);
+        assert!(
+            idle_within(rx, Duration::from_secs(2)).await,
+            "clearing the playing entry too must stop the group"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn clear_playlist_keeps_the_playing_entry_and_the_group_running() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let before = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/RemoveFromPlaylist",
+        serde_json::json!({ "ClearPlaylist": true, "ClearPlayingItem": false })
+    );
+    assert_eq!(status, 204);
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let q = next_queue(rx, "remove_items").await;
+        assert_eq!(q.item_ids, ["10"]);
+        assert_eq!(q.playlist_item_ids, before.playlist_item_ids[..1]);
+        assert!(q.is_playing, "the playing entry stays and keeps playing");
+        assert!(
+            !idle_within(rx, Duration::from_millis(300)).await,
+            "a group that still has its playing entry must not stop"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn removing_the_playing_entry_over_http_moves_on_and_keeps_playing() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let before = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/RemoveFromPlaylist",
+        serde_json::json!({ "PlaylistItemIds": [as_guid(&before.playlist_item_ids[0])] })
+    );
+    assert_eq!(status, 204);
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let q = next_queue(rx, "remove_items").await;
+        assert_eq!(q.item_ids, ["11", "12"]);
+        assert_eq!(q.playing_index, 0, "the next entry is now current");
+        assert!(q.is_playing, "playback carries on with the replacement");
+        assert!(
+            !idle_within(rx, Duration::from_millis(300)).await,
+            "the group still has a queue, so it must not stop"
+        );
     }
 }
