@@ -638,6 +638,15 @@ fn push_residual_clauses(
         ));
     }
 
+    push_language_clause("audio_tracks_json", &f.audio_languages, clauses, params, ph);
+    push_language_clause(
+        "subtitle_tracks_json",
+        &f.subtitle_languages,
+        clauses,
+        params,
+        ph,
+    );
+
     // Genres= — the LEGACY probe-column filter: whole probe.genre string
     // (case-folded) must be in the requested set.
     if !f.genre_probe_names.is_empty() {
@@ -694,4 +703,78 @@ pub(crate) fn like_escape(s: &str) -> String {
 
 fn kind_str(k: MediaKind) -> &'static str {
     k.as_str()
+}
+
+/// `AudioLanguages` / `SubtitleLanguages`: the track columns are JSON text on
+/// both backends, so membership is a `LIKE` over the compact serde output
+/// (`"language":"eng"`) -- the one form that works on SQLite and Postgres
+/// alike. ORs within one list; the caller ANDs the two lists by pushing two
+/// clauses. A language value is JSON-encoded first, so a quote or backslash
+/// in it cannot break out of the pattern.
+fn push_language_clause(
+    column: &str,
+    langs: &[String],
+    clauses: &mut Vec<String>,
+    params: &mut Vec<Param>,
+    ph: &mut impl FnMut(usize) -> String,
+) {
+    let mut ors = Vec::with_capacity(langs.len());
+    for lang in langs.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+        let quoted = serde_json::to_string(&lang.to_lowercase()).unwrap_or_default();
+        params.push(Param::Text(format!(
+            "%\"language\":{}%",
+            like_escape(&quoted)
+        )));
+        let p = ph(params.len());
+        ors.push(format!("LOWER({column}) LIKE {p} ESCAPE '\\'"));
+    }
+    if !ors.is_empty() {
+        clauses.push(format!("({})", ors.join(" OR ")));
+    }
+}
+
+/// Distinct track languages across the given `*_tracks_json` blobs, as facet
+/// buckets (count = items carrying the language), most common first. Codes
+/// are lower-cased so `ENG` and `eng` bucket together.
+pub(crate) fn language_facets(
+    blobs: impl IntoIterator<Item = String>,
+    decode: impl Fn(&str) -> Vec<Option<String>>,
+) -> Vec<pharos_core::FacetValue> {
+    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for blob in blobs {
+        let langs: std::collections::BTreeSet<String> = decode(&blob)
+            .into_iter()
+            .flatten()
+            .map(|l| l.trim().to_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+        for l in langs {
+            let c = counts.entry(l).or_insert(0);
+            *c = c.saturating_add(1);
+        }
+    }
+    let mut out: Vec<pharos_core::FacetValue> = counts
+        .into_iter()
+        .map(|(value, count)| pharos_core::FacetValue {
+            wire_id: value.clone(),
+            value,
+            count,
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+    out
+}
+
+pub(crate) fn audio_track_languages(blob: &str) -> Vec<Option<String>> {
+    crate::audio_track_json::decode(Some(blob))
+        .into_iter()
+        .map(|t| t.language)
+        .collect()
+}
+
+pub(crate) fn subtitle_track_languages(blob: &str) -> Vec<Option<String>> {
+    crate::subtitle_track_json::decode(Some(blob))
+        .into_iter()
+        .map(|t| t.language)
+        .collect()
 }

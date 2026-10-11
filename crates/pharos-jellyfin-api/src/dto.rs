@@ -1009,7 +1009,7 @@ pub struct MediaStreamDto {
 
 /// Map a 2/3-letter ISO-639 language code to an English display name, falling
 /// back to the upper-cased code. Covers the languages common in a home library.
-fn language_display_name(code: &str) -> String {
+pub fn language_display_name(code: &str) -> String {
     match code.trim().to_ascii_lowercase().as_str() {
         "en" | "eng" => "English",
         "ja" | "jpn" => "Japanese",

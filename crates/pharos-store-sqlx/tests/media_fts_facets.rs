@@ -395,6 +395,8 @@ async fn facets_request_gating() {
         years: false,
         official_ratings: false,
         people: false,
+        audio_languages: false,
+        subtitle_languages: false,
     };
     let f = s.facets(&MediaQuery::default(), &req).await.unwrap();
     assert!(!f.genres.is_empty());

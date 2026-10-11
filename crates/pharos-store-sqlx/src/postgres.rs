@@ -358,6 +358,38 @@ impl PostgresStore {
             );
             out.official_ratings = run_facet(&self.pool, &sql, user, &built.params).await?;
         }
+        for (want, col, decode, slot) in [
+            (
+                req.audio_languages,
+                "audio_tracks_json",
+                media_query::audio_track_languages as fn(&str) -> Vec<Option<String>>,
+                0,
+            ),
+            (
+                req.subtitle_languages,
+                "subtitle_tracks_json",
+                media_query::subtitle_track_languages,
+                1,
+            ),
+        ] {
+            if !want {
+                continue;
+            }
+            let sql = format!(
+                "SELECT {col}, CAST('' AS TEXT), CAST(0 AS BIGINT) FROM media_items \
+                 WHERE {col} IS NOT NULL AND id IN ({matched})"
+            );
+            let blobs = run_facet(&self.pool, &sql, user, &built.params)
+                .await?
+                .into_iter()
+                .map(|f| f.value);
+            let vals = media_query::language_facets(blobs, decode);
+            if slot == 0 {
+                out.audio_languages = vals;
+            } else {
+                out.subtitle_languages = vals;
+            }
+        }
         Ok(out)
     }
 }
