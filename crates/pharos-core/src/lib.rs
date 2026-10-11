@@ -2560,6 +2560,8 @@ pub enum SortKey {
     ProductionYear,
     /// `CommunityRating` — the metadata `community_rating`.
     CommunityRating,
+    /// `CriticRating` — the metadata `critic_rating`.
+    CriticRating,
     /// `Album` — case-folded `album` probe column.
     Album,
     /// `ParentIndexNumber` — audio `disc_number` (multi-disc album order).
