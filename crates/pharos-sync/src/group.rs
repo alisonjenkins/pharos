@@ -326,6 +326,15 @@ pub enum GroupMsg {
         item_runtimes_ms: Vec<Option<u64>>,
         mode: QueueMode,
     },
+    /// Jellyfin HTTP `/SyncPlay/RemoveFromPlaylist` — drop entries by
+    /// `playlist_item_id`, or (`clear_playlist`) everything but the playing
+    /// entry, which goes too only with `clear_playing_item`.
+    RemoveFromPlaylist {
+        sender: MemberId,
+        playlist_item_ids: Vec<String>,
+        clear_playlist: bool,
+        clear_playing_item: bool,
+    },
     /// Advance to the next / previous queue entry (leader only).
     /// `playlist_item_id` is the entry the CLIENT believes is playing —
     /// real Jellyfin no-ops the request when it doesn't match the current
@@ -489,6 +498,12 @@ pub enum RemoteCommand {
         item_runtimes_ms: Vec<Option<u64>>,
         mode: QueueMode,
     },
+    RemoveFromPlaylist {
+        sender: MemberId,
+        playlist_item_ids: Vec<String>,
+        clear_playlist: bool,
+        clear_playing_item: bool,
+    },
     NextItem {
         sender: MemberId,
         #[serde(default)]
@@ -623,6 +638,17 @@ impl RemoteCommand {
                 item_runtimes_ms,
                 mode,
             },
+            RemoteCommand::RemoveFromPlaylist {
+                sender,
+                playlist_item_ids,
+                clear_playlist,
+                clear_playing_item,
+            } => GroupMsg::RemoveFromPlaylist {
+                sender,
+                playlist_item_ids,
+                clear_playlist,
+                clear_playing_item,
+            },
             RemoteCommand::NextItem {
                 sender,
                 playlist_item_id,
@@ -749,6 +775,16 @@ fn record_socket_return(rec: &mut MemberRec) -> Option<f64> {
     Some(outage_secs)
 }
 
+/// Canonical form of a playlist item id for comparison. The engine mints
+/// dashless lowercase hex, but the Jellyfin SDKs echo ids as `Guid`s and may
+/// send them dashed or upper-cased.
+fn pli_key(id: &str) -> String {
+    id.chars()
+        .filter(|c| *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// One entry in the group's play queue.
 struct QueueEntry {
     item_id: String,
@@ -786,6 +822,44 @@ impl PlayQueue {
             QueueMode::QueueNext => self.playing_index.saturating_add(1).min(self.items.len()),
         };
         self.items.splice(at..at, entries);
+    }
+
+    /// Drop the entries named in `ids`; returns whether the PLAYING entry was
+    /// one of them. A removed playing entry hands over to the nearest
+    /// surviving entry before it (the first entry when it was first), as in
+    /// Jellyfin's `RemoveFromPlaylist`; `playing_index` is 0 on an empty queue.
+    fn remove_entries(&mut self, ids: &[String]) -> bool {
+        let wanted: HashSet<String> = ids.iter().map(|id| pli_key(id)).collect();
+        let named = |e: &QueueEntry| wanted.contains(&pli_key(&e.playlist_item_id));
+        let playing_removed = self.items.get(self.playing_index).is_some_and(named);
+        let removed_before = self
+            .items
+            .iter()
+            .take(self.playing_index)
+            .filter(|e| named(e))
+            .count();
+        self.items.retain(|e| !named(e));
+        self.playing_index = if playing_removed {
+            self.playing_index
+                .saturating_sub(removed_before.saturating_add(1))
+        } else {
+            self.playing_index.saturating_sub(removed_before)
+        };
+        playing_removed
+    }
+
+    /// Empty the queue, keeping the playing entry (as the only one) unless
+    /// `clear_playing`; returns whether the playing entry is gone.
+    fn clear_entries(&mut self, clear_playing: bool) -> bool {
+        let keep = if clear_playing || self.playing_index >= self.items.len() {
+            None
+        } else {
+            Some(self.items.swap_remove(self.playing_index))
+        };
+        self.items.clear();
+        self.items.extend(keep);
+        self.playing_index = 0;
+        clear_playing
     }
 
     fn item_infos(&self) -> Vec<QueueItemInfo> {
@@ -2854,6 +2928,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::SetNewQueue { sender, .. }
         | GroupMsg::SetPlaylistItem { sender, .. }
         | GroupMsg::Queue { sender, .. }
+        | GroupMsg::RemoveFromPlaylist { sender, .. }
         | GroupMsg::NextItem { sender, .. }
         | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
@@ -2886,6 +2961,7 @@ fn controls_existing_queue(msg: &GroupMsg) -> bool {
             | GroupMsg::LeaderPause { .. }
             | GroupMsg::LeaderSeek { .. }
             | GroupMsg::Queue { .. }
+            | GroupMsg::RemoveFromPlaylist { .. }
     )
 }
 
@@ -3825,6 +3901,52 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 QueueMode::QueueNext => "queue_next",
             };
             state.broadcast_queue_edit(reason);
+        }
+        GroupMsg::RemoveFromPlaylist {
+            sender,
+            playlist_item_ids,
+            clear_playlist,
+            clear_playing_item,
+        } => {
+            if state.queue.items.is_empty() {
+                tracing::warn!(
+                    group = %state.id, sender = %sender,
+                    "syncplay: RemoveFromPlaylist on an empty queue — ignored"
+                );
+                metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "remove_from_playlist", "reason" => "empty_queue").increment(1);
+                return;
+            }
+            let was_playing = matches!(state.playback, PlaybackState::Playing { .. });
+            let playing_removed = if clear_playlist {
+                state.queue.clear_entries(clear_playing_item)
+            } else {
+                state.queue.remove_entries(&playlist_item_ids)
+            };
+            if !playing_removed {
+                state.broadcast_queue_edit("remove_items");
+                return;
+            }
+            // The playing entry is gone. Tell everyone the new queue, then
+            // either restart on the entry that took its place (Jellyfin's
+            // RestartCurrentItem) or, with nothing left, stop the group.
+            state.item_started_at = Some(tokio::time::Instant::now());
+            state.next_item_advanced_at = None;
+            if state.queue.items.is_empty() {
+                state.broadcast_play_queue("remove_items", false, 0);
+                state.cancel_gate(GateOutcome::Superseded);
+                state.clear_buffering_freeze(FreezeOutcome::Superseded);
+                state.playback = PlaybackState::Idle;
+                state.item_started_at = None;
+                state.broadcast(ServerMsg::StateUpdate {
+                    state: GroupPlayState::Idle,
+                    reason: "Stop".into(),
+                });
+            } else {
+                state.broadcast_play_queue("remove_items", was_playing, 0);
+                state.playback = PlaybackState::Paused { position_ms: 0 };
+                let pending = state.follower_ids();
+                state.enter_waiting(pending, was_playing, 0, GateReason::PlaylistItem, 0);
+            }
         }
         GroupMsg::NextItem {
             sender,
@@ -9425,6 +9547,196 @@ mod tests {
         let _ = snapshot_of(&h).await;
         while let Ok(m) = leader_rx.try_recv() {
             assert!(!matches!(m, ServerMsg::PlayQueue { reason, .. } if reason == "queue"));
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn remove_before_the_playing_entry_keeps_it_playing() {
+        let mut q = queue_of(&["a", "b", "c", "d"], 2);
+        assert!(!q.remove_entries(&ids(&["pli-a", "pli-d"])));
+        assert_eq!(item_ids(&q), ["b", "c"]);
+        assert_eq!(q.playing_index, 1);
+        assert_eq!(q.items[q.playing_index].item_id, "c");
+    }
+
+    #[test]
+    fn removing_the_playing_entry_falls_back_to_the_one_before_it() {
+        let mut q = queue_of(&["a", "b", "c"], 2);
+        assert!(q.remove_entries(&ids(&["pli-c"])));
+        assert_eq!(item_ids(&q), ["a", "b"]);
+        assert_eq!(q.playing_index, 1, "the entry before the removed one");
+
+        let mut q = queue_of(&["a", "b", "c", "d"], 2);
+        assert!(q.remove_entries(&ids(&["pli-b", "pli-c"])));
+        assert_eq!(item_ids(&q), ["a", "d"]);
+        assert_eq!(q.playing_index, 0, "nearest survivor before both");
+    }
+
+    #[test]
+    fn removing_the_first_playing_entry_picks_the_next_one() {
+        let mut q = queue_of(&["a", "b"], 0);
+        assert!(q.remove_entries(&ids(&["pli-a"])));
+        assert_eq!(item_ids(&q), ["b"]);
+        assert_eq!(q.playing_index, 0);
+    }
+
+    #[test]
+    fn removing_everything_empties_the_queue() {
+        let mut q = queue_of(&["a", "b"], 1);
+        assert!(q.remove_entries(&ids(&["pli-a", "pli-b"])));
+        assert!(q.items.is_empty());
+        assert_eq!(q.playing_index, 0);
+    }
+
+    #[test]
+    fn remove_matches_ids_however_the_client_spells_them() {
+        let mut q = queue_of(&["a", "b"], 0);
+        assert!(!q.remove_entries(&ids(&["PLI-B"])));
+        assert_eq!(item_ids(&q), ["a"]);
+    }
+
+    #[test]
+    fn clear_keeps_the_playing_entry_unless_told_otherwise() {
+        let mut q = queue_of(&["a", "b", "c"], 1);
+        assert!(!q.clear_entries(false));
+        assert_eq!(item_ids(&q), ["b"]);
+        assert_eq!(q.playing_index, 0);
+
+        let mut q = queue_of(&["a", "b", "c"], 1);
+        assert!(q.clear_entries(true));
+        assert!(q.items.is_empty());
+    }
+
+    async fn two_member_group_with_queue() -> (
+        GroupHandle,
+        MemberId,
+        mpsc::Receiver<ServerMsg>,
+        mpsc::Receiver<ServerMsg>,
+        Vec<String>,
+    ) {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (_m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let _ = next_play_queue(&mut m2_rx).await;
+        (h, leader, leader_rx, m2_rx, plis)
+    }
+
+    #[tokio::test]
+    async fn removing_a_queued_entry_broadcasts_the_shorter_queue_to_every_member() {
+        let (h, leader, mut leader_rx, mut m2_rx, plis) = two_member_group_with_queue().await;
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: leader,
+            playlist_item_ids: vec![plis[2].clone()],
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, new_plis, playing, _, _) = next_play_queue(rx).await;
+            assert_eq!(reason, "remove_items");
+            assert_eq!(ids, ["10", "11"]);
+            assert_eq!(new_plis, plis[..2]);
+            assert_eq!(playing, 0, "the playing entry was not touched");
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_the_playing_entry_moves_playback_to_a_neighbour() {
+        let (h, leader, mut leader_rx, mut m2_rx, plis) = two_member_group_with_queue().await;
+        h.tx.send(GroupMsg::NextItem {
+            sender: leader,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let _ = next_play_queue(rx).await;
+        }
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: leader,
+            playlist_item_ids: vec![plis[1].clone()],
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, _, playing, _, _) = next_play_queue(rx).await;
+            assert_eq!(reason, "remove_items");
+            assert_eq!(ids, ["10", "12"]);
+            assert_eq!(playing, 0, "falls back to the entry before the removed one");
+        }
+        assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_entry_stops_the_group() {
+        let (h, sinks, mut rx, leader) = fresh().await;
+        let (_m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec!["10".into()],
+            item_runtimes_ms: Vec::new(),
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+        let (_, _, plis, _, _, _) = next_play_queue(&mut rx).await;
+        let _ = next_play_queue(&mut m2_rx).await;
+
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: leader,
+            playlist_item_ids: plis,
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut rx, &mut m2_rx] {
+            let (reason, ids, _, _, is_playing, _) = next_play_queue(rx).await;
+            assert_eq!(reason, "remove_items");
+            assert!(ids.is_empty());
+            assert!(!is_playing);
+            let idle = recv_matching(rx, Duration::from_secs(2), |m| {
+                matches!(
+                    m,
+                    ServerMsg::StateUpdate {
+                        state: GroupPlayState::Idle,
+                        ..
+                    }
+                )
+            })
+            .await;
+            assert!(idle.is_some(), "an emptied queue must stop the group");
+        }
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.current_item_id, None);
+        assert_eq!(snap.play_state, GroupPlayState::Idle);
+    }
+
+    #[tokio::test]
+    async fn clearing_the_playlist_keeps_only_the_playing_entry() {
+        let (h, leader, mut leader_rx, mut m2_rx, plis) = two_member_group_with_queue().await;
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: leader,
+            playlist_item_ids: Vec::new(),
+            clear_playlist: true,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, new_plis, playing, _, _) = next_play_queue(rx).await;
+            assert_eq!(reason, "remove_items");
+            assert_eq!(ids, ["10"]);
+            assert_eq!(new_plis, plis[..1]);
+            assert_eq!(playing, 0);
         }
     }
 }

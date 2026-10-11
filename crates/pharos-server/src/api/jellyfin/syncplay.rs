@@ -49,10 +49,13 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // TTL, and a group-less pinger gets NotInGroup via `dispatch` (healing
         // a wedged client without the user touching anything).
         .route("/syncplay/ping", web::post().to(ping))
+        .route(
+            "/syncplay/removefromplaylist",
+            web::post().to(remove_from_playlist),
+        )
         // Not yet modelled by the engine — accept + ignore so the client's
         // flow isn't broken by a 404.
-        .route("/syncplay/moveplaylistitem", web::post().to(no_op_204))
-        .route("/syncplay/removefromplaylist", web::post().to(no_op_204));
+        .route("/syncplay/moveplaylistitem", web::post().to(no_op_204));
 }
 
 fn no_content() -> HttpResponse {
@@ -421,6 +424,18 @@ struct QueueBody {
     item_ids: Vec<String>,
     #[serde(default)]
     mode: QueueMode,
+}
+
+/// `/SyncPlay/RemoveFromPlaylist` body — `RemoveFromPlaylistRequestDto`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RemoveFromPlaylistBody {
+    #[serde(default)]
+    playlist_item_ids: Vec<String>,
+    #[serde(default)]
+    clear_playlist: bool,
+    #[serde(default)]
+    clear_playing_item: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -893,6 +908,30 @@ async fn queue(
             item_ids: body.item_ids,
             item_runtimes_ms,
             mode: body.mode,
+        },
+    )
+    .await
+}
+
+async fn remove_from_playlist(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
+    body: web::Json<RemoveFromPlaylistBody>,
+) -> HttpResponse {
+    let body = body.into_inner();
+    dispatch(
+        &hub,
+        &registry,
+        &state.stores,
+        auth.sync_key(),
+        "removefromplaylist",
+        move |mid| GroupMsg::RemoveFromPlaylist {
+            sender: mid,
+            playlist_item_ids: body.playlist_item_ids,
+            clear_playlist: body.clear_playlist,
+            clear_playing_item: body.clear_playing_item,
         },
     )
     .await

@@ -818,6 +818,7 @@ fn play_queue_reason(r: &str) -> String {
         "set_current_item" => "SetCurrentItem",
         "queue" => "Queue",
         "queue_next" => "QueueNext",
+        "remove_items" => "RemoveItems",
         "next_item" => "NextItem",
         "previous_item" => "PreviousItem",
         "repeat_mode" => "RepeatMode",
@@ -1331,7 +1332,11 @@ mod tests {
             epoch_unix_ms: 0,
             current_pli: None,
         };
-        for (engine, wire) in [("queue", "Queue"), ("queue_next", "QueueNext")] {
+        for (engine, wire) in [
+            ("queue", "Queue"),
+            ("queue_next", "QueueNext"),
+            ("remove_items", "RemoveItems"),
+        ] {
             let out = translate_outbound(
                 ServerMsg::PlayQueue {
                     reason: engine.into(),
