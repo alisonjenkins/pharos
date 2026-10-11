@@ -67,6 +67,8 @@ function start(page: Page): Capture {
     cap.consoleErrors.push(text.slice(0, 250));
   });
   page.on("pageerror", (err) => {
+    // jellyfin-web 12 <emby-scrollbuttons> rAF-after-detach race; client-only.
+    if (/scrollHandler is not a function/i.test(err.message)) return;
     cap.pageErrors.push(err.message.slice(0, 250));
   });
   page.on("response", (resp) => {
