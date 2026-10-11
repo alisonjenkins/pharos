@@ -7,7 +7,7 @@
 
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_store_sqlx::sqlite::SqliteStore;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use std::borrow::Cow;
 use std::str::FromStr;
 
@@ -30,7 +30,11 @@ async fn populated_old_db(url: &str, titles: &[&str]) {
     let opts = SqliteConnectOptions::from_str(url)
         .unwrap()
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // The fixture is throwaway: skip the fsync every one of the 53
+        // migrations would otherwise pay (a 2-row test did 440 fsyncs, which
+        // took ~100 s on the CI runner's disk).
+        .synchronous(SqliteSynchronous::Off);
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(opts)
