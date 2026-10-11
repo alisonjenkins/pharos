@@ -200,6 +200,52 @@ async fn put_stores_the_sort_name_for_new_and_rewritten_items() {
     );
 }
 
+#[tokio::test]
+async fn fts_reindexes_on_title_change_but_not_on_sort_name_updates() {
+    let store = SqliteStore::connect_without_backfill("sqlite::memory:")
+        .await
+        .unwrap();
+    let item = |title: &str| MediaItem {
+        id: 3,
+        path: "/m/3.mkv".into(),
+        title: title.into(),
+        kind: MediaKind::Movie,
+        ..Default::default()
+    };
+    let hits = |term: &'static str| {
+        let pool = store.pool().clone();
+        async move {
+            sqlx::query_as::<_, (i64,)>("SELECT rowid FROM media_fts WHERE media_fts MATCH ?")
+                .bind(term)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
+    store.put(item("Alpha")).await.unwrap();
+    assert_eq!(hits("alpha").await, 1);
+    store.put(item("Beta")).await.unwrap();
+    assert_eq!((hits("alpha").await, hits("beta").await), (0, 1));
+
+    sqlx::query("UPDATE media_items SET sort_name = 'changed' WHERE id = 3")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(hits("beta").await, 1);
+
+    let (sql,): (String,) = sqlx::query_as(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'media_fts_au'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        sql.contains("UPDATE OF title, overview"),
+        "the FTS update trigger must be column-scoped, got: {sql}"
+    );
+}
+
 /// Postgres runs the same assertions whenever `PHAROS_TEST_POSTGRES_URL` is
 /// set (`just test-postgres`): the INSERT's `$N` arity is not compile-checked.
 #[cfg(feature = "postgres")]
