@@ -110,6 +110,8 @@ const SECONDS_BUCKETS: &[f64] = &[
 
 static INIT: Once = Once::new();
 static RESULT: OnceLock<Result<PrometheusHandle, ObsError>> = OnceLock::new();
+/// Reads /proc (cpu, rss, fds, threads) into gauges; refreshed per scrape.
+static PROCESS: OnceLock<metrics_process::Collector> = OnceLock::new();
 /// Keeps the OTLP tracer provider alive for the process lifetime so the batch
 /// span processor keeps flushing (dropping it would stop export).
 static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
@@ -147,11 +149,15 @@ pub fn init(log_level: &str, otlp_endpoint: Option<&str>) -> Result<PrometheusHa
             // silently, and the alert that reads them would go quiet without
             // the condition having cleared. Adding one means re-publishing
             // those on a timer first.
-            PrometheusBuilder::new()
+            let handle = PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)
                 .map_err(|e| ObsError::Prom(e.to_string()))?
                 .install_recorder()
-                .map_err(|e| ObsError::Prom(e.to_string()))
+                .map_err(|e| ObsError::Prom(e.to_string()))?;
+            let collector = metrics_process::Collector::default();
+            collector.describe();
+            let _ = PROCESS.set(collector);
+            Ok(handle)
         })();
         let _ = RESULT.set(outcome);
     });
@@ -232,7 +238,12 @@ pub fn register_static_series() {
 /// Render Prometheus exposition text for `/metrics`. Lock-free.
 pub fn render() -> String {
     match RESULT.get() {
-        Some(Ok(h)) => h.render(),
+        Some(Ok(h)) => {
+            if let Some(process) = PROCESS.get() {
+                process.collect();
+            }
+            h.render()
+        }
         _ => String::new(),
     }
 }
@@ -302,6 +313,23 @@ mod tests {
                         && l.ends_with(" 0")),
                 "no zero series for {outcome}; rendered:\n{body}"
             );
+        }
+    }
+
+    /// CPU, memory, fds and threads of the pharos process itself, refreshed on
+    /// every scrape, so a leak or a CPU spike shows up without node-exporter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_metrics_are_rendered_on_every_scrape() {
+        init("info", None).unwrap();
+        let body = render();
+        for name in [
+            "process_cpu_seconds_total",
+            "process_resident_memory_bytes",
+            "process_open_fds",
+            "process_threads",
+        ] {
+            assert!(body.contains(name), "missing {name}; rendered:\n{body}");
         }
     }
 
