@@ -541,10 +541,13 @@ mod tests {
         let epub = convert_to_epub(&src).expect("a DRM-free azw3 must convert");
         let mut z = zip::ZipArchive::new(std::io::Cursor::new(epub)).expect("output must be a zip");
         let first = z.by_index(0).unwrap();
-        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.name().expect("entry name must decode"), "mimetype");
         assert_eq!(first.compression(), zip::CompressionMethod::Stored);
         drop(first);
-        let names: Vec<String> = z.file_names().map(str::to_string).collect();
+        let names: Vec<String> = z
+            .file_names()
+            .map(|n| n.expect("entry name must decode").into_owned())
+            .collect();
         assert!(
             names.iter().any(|n| n == "META-INF/container.xml"),
             "no container.xml in {names:?}"

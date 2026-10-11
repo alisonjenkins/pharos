@@ -220,7 +220,7 @@ pub fn read_comic_cover(path: &Path) -> Result<Option<Vec<u8>>, ComicError> {
             let idx = (0..zip.len())
                 .find(|i| {
                     zip.by_index_raw(*i)
-                        .map(|e| e.name() == entry)
+                        .map(|e| e.name().is_ok_and(|n| n == entry))
                         .unwrap_or(false)
                 })
                 .ok_or_else(|| ComicError::Unreadable {
@@ -390,7 +390,9 @@ fn read_zip(path: &Path) -> Result<(Vec<String>, Option<String>), ComicError> {
         let Ok(entry) = zip.by_index_raw(i) else {
             continue;
         };
-        let name = entry.name().to_string();
+        let Ok(name) = entry.name().map(|n| n.into_owned()) else {
+            continue;
+        };
         if info_idx.is_none() && is_comic_info(&name) {
             info_idx = Some(i);
         }

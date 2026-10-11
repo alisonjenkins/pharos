@@ -150,7 +150,7 @@ pub fn read_epub_cover(path: &Path) -> Result<Option<Vec<u8>>, EpubError> {
     let idx = (0..zip.len())
         .find(|i| {
             zip.by_index_raw(*i)
-                .map(|e| e.name().eq_ignore_ascii_case(&href))
+                .map(|e| e.name().is_ok_and(|n| n.eq_ignore_ascii_case(&href)))
                 .unwrap_or(false)
         })
         // A manifest that names an entry the archive does not contain. Rare,
@@ -218,7 +218,7 @@ fn read_entry<R: std::io::Read + std::io::Seek>(
 ) -> Result<String, std::io::Error> {
     let idx = (0..zip.len()).find(|i| {
         zip.by_index_raw(*i)
-            .map(|e| e.name().eq_ignore_ascii_case(name))
+            .map(|e| e.name().is_ok_and(|n| n.eq_ignore_ascii_case(name)))
             .unwrap_or(false)
     });
     let Some(idx) = idx else {
