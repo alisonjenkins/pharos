@@ -530,7 +530,7 @@ async fn set_user_policy(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct SetPasswordBody {
+pub(super) struct SetPasswordBody {
     #[serde(default)]
     new_pw: String,
     /// Jellyfin's UI sends `CurrentPw`. Required on a self
@@ -559,13 +559,44 @@ async fn set_user_password(
     path: web::Path<String>,
     body: web::Json<SetPasswordBody>,
 ) -> Result<impl Responder, actix_web::Error> {
-    // Either the bearer matches the path id, or the bearer is admin.
     let target = parse_user_id(&path.into_inner())?;
+    change_password(&state, &user, target, body.into_inner()).await
+}
+
+/// Optional `userId` query on the self-service endpoints. Absent means the
+/// bearer; naming someone else needs admin.
+#[derive(Deserialize, Default)]
+pub(super) struct TargetUserQuery {
+    #[serde(default)]
+    pub(super) user_id: Option<String>,
+}
+
+/// `POST /Users/Password` (Jellyfin 10.11/12 SDK `updateUserPassword`):
+/// the bearer changes their own password; `userId` is optional.
+pub(super) async fn set_own_password(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    q: CiQuery<TargetUserQuery>,
+    body: web::Json<SetPasswordBody>,
+) -> Result<impl Responder, actix_web::Error> {
+    let target = match q.user_id.as_deref() {
+        Some(raw) => parse_user_id(raw)?,
+        None => user.0.id,
+    };
+    change_password(&state, &user, target, body.into_inner()).await
+}
+
+async fn change_password(
+    state: &AppState,
+    user: &AuthUser,
+    target: UserId,
+    body: SetPasswordBody,
+) -> Result<HttpResponse, actix_web::Error> {
+    // Either the bearer is the target, or the bearer is admin.
     let is_self = target == user.0.id;
     if !is_self && !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
     }
-    let body = body.into_inner();
     // V8: a stolen session token must NOT be enough to change a
     // user's password. Self-change requires CurrentPw to match the
     // existing hash. Admin changing someone else's password (or
