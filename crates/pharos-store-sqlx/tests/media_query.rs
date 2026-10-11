@@ -87,6 +87,29 @@ async fn seed(store: &SqliteStore, n: u64) {
     }
 }
 
+/// Minimal-row bulk seed as ONE statement: only the columns the
+/// kind-filtered Name-sorted query reads. `seed` costs ~110 us per
+/// `put()` (60 binds + a span each), which is ~2.3 s at 20k rows.
+async fn seed_bulk_lean(store: &SqliteStore, n: u64) {
+    sqlx::query(
+        "WITH RECURSIVE ids(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM ids WHERE id < ?) \
+         INSERT INTO media_items (id, path, title, kind, created_at) \
+         SELECT id, \
+                '/media/root-' || (id % 3) || '/file-' || printf('%06d', id) || '.mkv', \
+                'Title ' || printf('%05d', 99999 - id), \
+                CASE id % 3 WHEN 0 THEN ? WHEN 1 THEN ? ELSE ? END, \
+                1700000000 + id \
+         FROM ids",
+    )
+    .bind(n as i64)
+    .bind(kind_for(0).as_str())
+    .bind(kind_for(1).as_str())
+    .bind(kind_for(2).as_str())
+    .execute(store.pool())
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn pagination_and_total_record_count() {
     let s = fresh().await;
@@ -754,7 +777,7 @@ async fn stackable_entity_filters_and_tag_intersection() {
 #[tokio::test]
 async fn large_library_20k_pagination_total() {
     let s = fresh().await;
-    seed(&s, 20_000).await;
+    seed_bulk_lean(&s, 20_000).await;
     let q = MediaQuery {
         kinds: vec![MediaKind::Audio],
         sort: vec![(SortKey::Name, SortDir::Asc)],
