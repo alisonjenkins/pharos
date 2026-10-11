@@ -470,6 +470,37 @@ async fn album_grid_pairs_year_and_name_with_their_own_sort_order() {
 }
 
 #[actix_web::test]
+async fn album_grid_sorts_by_newest_track_added() {
+    let track = |id: u64, album: &'static str, created: i64| Row {
+        album: Some((album, 2000)),
+        created: Some(created),
+        ..Row::new(id, album)
+    };
+    let rows = vec![
+        track(1, "Bravo", 10),
+        track(2, "Alpha", 30),
+        track(3, "Charlie", 20),
+        // A later track makes Bravo the most recently added album.
+        track(4, "Bravo", 40),
+    ];
+    let (state, token) = seed(rows).await;
+    let app = test::init_service(build_app(state)).await;
+    let base = "IncludeItemTypes=MusicAlbum&Recursive=true";
+    let recent = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=DateCreated&SortOrder=Descending")
+    );
+    assert_eq!(recent, vec!["Bravo", "Alpha", "Charlie"]);
+    let oldest = names!(
+        &app,
+        token.as_str(),
+        format!("{base}&SortBy=DateCreated&SortOrder=Ascending")
+    );
+    assert_eq!(oldest, vec!["Charlie", "Alpha", "Bravo"]);
+}
+
+#[actix_web::test]
 async fn multi_key_sort_pages_consistently() {
     let (state, token) = seed(year_tie_rows()).await;
     let app = test::init_service(build_app(state)).await;
