@@ -242,7 +242,7 @@ async fn a_real_epub_survives_scan_to_wire() {
     assert!(
         (0..zip.len()).any(|i| zip
             .by_index_raw(i)
-            .map(|e| e.name() == "OEBPS/content.opf")
+            .map(|e| e.name().is_ok_and(|n| n == "OEBPS/content.opf"))
             .unwrap_or(false)),
         "the served archive must still contain its OPF"
     );
