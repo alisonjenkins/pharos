@@ -43,6 +43,8 @@ fn sort_key_column(key: SortKey) -> &'static str {
         // ASCII fallback for pre-0028 rows, so accented / mixed-case titles
         // sort identically to the legacy in-memory `to_lowercase` order.
         SortKey::Name => "COALESCE(title_fold, LOWER(title))",
+        // Rows not yet backfilled (migration 0054) fall back to the plain fold.
+        SortKey::SortName => "COALESCE(sort_name, title_fold, LOWER(title))",
         SortKey::DateCreated => "created_at",
         SortKey::Runtime => "duration_ms",
         SortKey::PremiereDate => "premiere_date",

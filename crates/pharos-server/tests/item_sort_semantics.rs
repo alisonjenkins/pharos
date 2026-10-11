@@ -207,6 +207,52 @@ async fn community_and_critic_rating_sort_by_score() {
     assert_eq!(critic, vec!["Alpha", "Charlie", "Bravo", "Delta"]);
 }
 
+fn titled(titles: &[&'static str]) -> Vec<Row> {
+    titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Row::new(i as u64 + 1, t))
+        .collect()
+}
+
+#[actix_web::test]
+async fn sort_name_ignores_leading_articles_but_name_does_not() {
+    let (state, token) = seed(titled(&["Zeta", "The Matrix", "Nemo", "Alpha", "A Zoo"])).await;
+    let app = test::init_service(build_app(state)).await;
+    let expected = vec!["Alpha", "The Matrix", "Nemo", "Zeta", "A Zoo"];
+    let default = names!(&app, token.as_str(), "SortOrder=Ascending");
+    assert_eq!(default, expected);
+    let sort_name = names!(&app, token.as_str(), "SortBy=SortName");
+    assert_eq!(sort_name, expected);
+    let name = names!(&app, token.as_str(), "SortBy=Name");
+    assert_eq!(name, vec!["A Zoo", "Alpha", "Nemo", "The Matrix", "Zeta"]);
+    let desc = names!(&app, token.as_str(), "SortBy=SortName&SortOrder=Descending");
+    assert_eq!(desc, vec!["A Zoo", "Zeta", "Nemo", "The Matrix", "Alpha"]);
+}
+
+#[actix_web::test]
+async fn sort_name_orders_numbers_by_value() {
+    let (state, token) = seed(titled(&["Ep 10", "Ep 2", "Ep 1", "Ep 100"])).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(&app, token.as_str(), "SortBy=SortName");
+    assert_eq!(got, vec!["Ep 1", "Ep 2", "Ep 10", "Ep 100"]);
+}
+
+#[actix_web::test]
+async fn sort_name_pages_without_gaps_or_repeats() {
+    let (state, token) = seed(titled(&["The B", "A C", "An A", "D", "The E"])).await;
+    let app = test::init_service(build_app(state)).await;
+    let mut seen = Vec::new();
+    for start in [0, 2, 4] {
+        seen.extend(names!(
+            &app,
+            token.as_str(),
+            format!("SortBy=SortName&StartIndex={start}&Limit=2")
+        ));
+    }
+    assert_eq!(seen, vec!["An A", "The B", "A C", "D", "The E"]);
+}
+
 fn year_tie_rows() -> Vec<Row> {
     vec![
         Row {

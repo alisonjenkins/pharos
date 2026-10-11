@@ -4851,7 +4851,11 @@ enum SortPrimary {
     /// `ProductionYear`, `CommunityRating`, `CriticRating`, `PlayCount` or
     /// `DatePlayed`. Unknown values sort smallest.
     Keyed(pharos_core::SortKey),
+    /// `SortBy=Name`: the plain case-folded title (Jellyfin's `CleanName`).
     Name,
+    /// `SortBy=SortName`, the default, and any unrecognised token: the stored
+    /// sort name (articles dropped, digits padded).
+    SortName,
 }
 
 /// Map the raw `SortBy` to its [`SortPrimary`], replicating the legacy
@@ -4887,7 +4891,8 @@ fn sort_token_primary(primary: &str) -> SortPrimary {
         "CriticRating" => SortPrimary::Keyed(pharos_core::SortKey::CriticRating),
         "PlayCount" => SortPrimary::Keyed(pharos_core::SortKey::PlayCount),
         "DatePlayed" => SortPrimary::Keyed(pharos_core::SortKey::DatePlayed),
-        _ => SortPrimary::Name,
+        "Name" => SortPrimary::Name,
+        _ => SortPrimary::SortName,
     }
 }
 
@@ -4977,7 +4982,8 @@ fn sort_chain(
                 vec![SortKey::BookSeries, SortKey::BookSeriesIndex]
             }
             (_, SortPrimary::Keyed(key)) => vec![key],
-            (_, SortPrimary::TrackOrder | SortPrimary::Name) => vec![SortKey::Name],
+            (_, SortPrimary::Name) => vec![SortKey::Name],
+            (_, SortPrimary::TrackOrder | SortPrimary::SortName) => vec![SortKey::SortName],
         };
         for key in keys {
             if !chain.iter().any(|(k, _)| *k == key) {
@@ -5214,6 +5220,16 @@ fn build_media_query(
                 vec![(SortKey::Name, SortDir::Asc)]
             }
         }
+        SortPrimary::SortName => {
+            if descending {
+                vec![
+                    (SortKey::SortName, SortDir::Desc),
+                    (SortKey::Id, SortDir::Desc),
+                ]
+            } else {
+                vec![(SortKey::SortName, SortDir::Asc)]
+            }
+        }
         SortPrimary::DateCreated => {
             // Legacy baseline (ascending param) = created_at DESC, id DESC
             // (newest-first); the Descending param reverses to ASC/ASC.
@@ -5242,13 +5258,13 @@ fn build_media_query(
             if descending {
                 vec![
                     (SortKey::AlbumArtist, SortDir::Desc),
-                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::SortName, SortDir::Desc),
                     (SortKey::Id, SortDir::Desc),
                 ]
             } else {
                 vec![
                     (SortKey::AlbumArtist, SortDir::Asc),
-                    (SortKey::Name, SortDir::Asc),
+                    (SortKey::SortName, SortDir::Asc),
                 ]
             }
         }
@@ -5256,13 +5272,13 @@ fn build_media_query(
             if descending {
                 vec![
                     (SortKey::Album, SortDir::Desc),
-                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::SortName, SortDir::Desc),
                     (SortKey::Id, SortDir::Desc),
                 ]
             } else {
                 vec![
                     (SortKey::Album, SortDir::Asc),
-                    (SortKey::Name, SortDir::Asc),
+                    (SortKey::SortName, SortDir::Asc),
                 ]
             }
         }
@@ -5275,14 +5291,14 @@ fn build_media_query(
                 vec![
                     (SortKey::BookSeries, SortDir::Desc),
                     (SortKey::BookSeriesIndex, SortDir::Desc),
-                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::SortName, SortDir::Desc),
                     (SortKey::Id, SortDir::Desc),
                 ]
             } else {
                 vec![
                     (SortKey::BookSeries, SortDir::Asc),
                     (SortKey::BookSeriesIndex, SortDir::Asc),
-                    (SortKey::Name, SortDir::Asc),
+                    (SortKey::SortName, SortDir::Asc),
                 ]
             }
         }
@@ -5305,28 +5321,28 @@ fn build_media_query(
                     vec![
                         (SortKey::SeasonNumber, SortDir::Desc),
                         (SortKey::IndexNumber, SortDir::Desc),
-                        (SortKey::Name, SortDir::Desc),
+                        (SortKey::SortName, SortDir::Desc),
                         (SortKey::Id, SortDir::Desc),
                     ]
                 } else {
                     vec![
                         (SortKey::SeasonNumber, SortDir::Asc),
                         (SortKey::IndexNumber, SortDir::Asc),
-                        (SortKey::Name, SortDir::Asc),
+                        (SortKey::SortName, SortDir::Asc),
                     ]
                 }
             } else if descending {
                 vec![
                     (SortKey::DiscNumber, SortDir::Desc),
                     (SortKey::TrackNumber, SortDir::Desc),
-                    (SortKey::Name, SortDir::Desc),
+                    (SortKey::SortName, SortDir::Desc),
                     (SortKey::Id, SortDir::Desc),
                 ]
             } else {
                 vec![
                     (SortKey::DiscNumber, SortDir::Asc),
                     (SortKey::TrackNumber, SortDir::Asc),
-                    (SortKey::Name, SortDir::Asc),
+                    (SortKey::SortName, SortDir::Asc),
                 ]
             }
         }
@@ -8593,7 +8609,7 @@ mod episode_sort_tests {
         let keys = sort_keys(&q, &ParentResolution::All);
         assert_eq!(
             keys.first(),
-            Some(&SortKey::Name),
+            Some(&SortKey::SortName),
             "non-episode default must stay SortName: {keys:?}"
         );
     }

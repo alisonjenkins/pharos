@@ -2603,8 +2603,11 @@ pub enum ParentFilter {
 /// in-memory `filter_and_sort` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
-    /// `SortName` — case-folded title. The default.
+    /// `Name` — case-folded title (`title_fold`).
     Name,
+    /// `SortName` — [`sort_name`] of the title: no leading article, digits
+    /// padded. The default.
+    SortName,
     /// `DateCreated` / `DateAdded` — `created_at`.
     DateCreated,
     /// `RuntimeTicks` / `Runtime` — `duration_ms`.

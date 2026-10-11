@@ -1692,7 +1692,7 @@ async fn sort_by_albumartist_groups_tracks() {
     let token = stores.issue(uid, "t").await.unwrap();
     for (id, title, artist) in [
         (1u64, "Z song", "Beta"),
-        (2, "A song", "Alpha"),
+        (2, "B song", "Alpha"),
         (3, "M song", "Alpha"),
     ] {
         stores
@@ -1727,8 +1727,8 @@ async fn sort_by_albumartist_groups_tracks() {
         .iter()
         .map(|i| i["Name"].as_str().unwrap())
         .collect();
-    // Alpha tracks first (A song, M song), then Beta (Z song).
-    assert_eq!(names, vec!["A song", "M song", "Z song"]);
+    // Alpha tracks first (B song, M song), then Beta (Z song).
+    assert_eq!(names, vec!["B song", "M song", "Z song"]);
 }
 
 #[actix_web::test]
