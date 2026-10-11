@@ -541,6 +541,37 @@ where
         .unwrap();
     assert_eq!(got_data, data);
 
+    // A playback report moves position and timestamp only; played, count,
+    // favourite and the stored tracks are the report's to leave alone.
+    let after_progress = UserDataStore::record_playback_progress(
+        &store,
+        uid,
+        item_id,
+        pharos_core::PlaybackProgress {
+            position_ticks: 99_000,
+            at: 1_700_000_900,
+            audio_stream_index: Some(4),
+            subtitle_stream_index: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        after_progress,
+        UserItemData {
+            last_played_position_ticks: 99_000,
+            last_played_at: 1_700_000_900,
+            audio_stream_index: Some(4),
+            ..data
+        }
+    );
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, item_id)
+            .await
+            .unwrap(),
+        after_progress
+    );
+
     // -----------------------------------------------------------------
     // 6. PreferenceStore
     // -----------------------------------------------------------------

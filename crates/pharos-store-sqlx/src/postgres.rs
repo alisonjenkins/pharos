@@ -22,10 +22,11 @@ use pharos_core::{
     DomainResult, EntityCounts, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library,
     LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe,
     MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount,
-    PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ScanState, SecretString, SeriesInfo, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
-    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenStore,
-    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    PersonKind, PersonRef, PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore,
+    PreferenceStore, ScanState, SecretString, SeriesInfo, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
+    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
+    UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -3214,6 +3215,44 @@ impl UserDataStore for PostgresStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(row_to_user_data).unwrap_or_default())
+    }
+
+    #[tracing::instrument(skip(self, progress), fields(user.id = %user.0, media.id = %item))]
+    async fn record_playback_progress(
+        &self,
+        user: UserId,
+        item: MediaId,
+        progress: PlaybackProgress,
+    ) -> DomainResult<UserItemData> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let item_i64 = media_id_i64(item)?;
+        let pos_i64 = i64::try_from(progress.position_ticks)
+            .map_err(|e| DomainError::Backend(format!("position overflow: {e}")))?;
+        let row: PgUserDataRow = sqlx::query_as(
+            "INSERT INTO user_data
+               (user_id, item_id, played, play_count, last_played_position_ticks,
+                is_favorite, last_played_at, audio_stream_index, subtitle_stream_index)
+             VALUES ($1, $2, 0, 0, $3, 0, $4, $5, $6)
+             ON CONFLICT (user_id, item_id) DO UPDATE SET
+               last_played_position_ticks = EXCLUDED.last_played_position_ticks,
+               last_played_at = EXCLUDED.last_played_at,
+               audio_stream_index =
+                 COALESCE(EXCLUDED.audio_stream_index, user_data.audio_stream_index),
+               subtitle_stream_index =
+                 COALESCE(EXCLUDED.subtitle_stream_index, user_data.subtitle_stream_index)
+             RETURNING played, play_count, last_played_position_ticks, is_favorite,
+                       last_played_at, audio_stream_index, subtitle_stream_index",
+        )
+        .bind(id_bytes)
+        .bind(item_i64)
+        .bind(pos_i64)
+        .bind(progress.at)
+        .bind(progress.audio_stream_index)
+        .bind(progress.subtitle_stream_index)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row_to_user_data(row))
     }
 
     #[tracing::instrument(skip(self, data), fields(user.id = %user.0, media.id = %item))]

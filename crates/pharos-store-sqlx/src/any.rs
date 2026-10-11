@@ -10,8 +10,8 @@ use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult,
     EntityCounts, Fingerprint, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore, PersistedSyncGroup,
-    PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore, Playlist,
-    PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString,
+    PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore, PlaybackProgress,
+    Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString,
     SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore,
     SyncGroupStore, Tag, TagCount, TagStore, TokenRecord, TokenStore, TranscodeSessionStore,
     UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
@@ -1040,6 +1040,18 @@ impl UserDataStore for AnyStore {
             }
         })
         .await
+    }
+
+    async fn record_playback_progress(
+        &self,
+        user: UserId,
+        item: MediaId,
+        progress: PlaybackProgress,
+    ) -> DomainResult<UserItemData> {
+        match self {
+            AnyStore::Sqlite(s) => s.record_playback_progress(user, item, progress).await,
+            AnyStore::Postgres(p) => p.record_playback_progress(user, item, progress).await,
+        }
     }
 
     async fn set_user_data(
