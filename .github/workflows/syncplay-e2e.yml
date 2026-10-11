@@ -14,6 +14,7 @@ on:
       - "compat-playwright/tests/lib/**"
       - "compat-playwright/playwright.syncplay.config.ts"
       - "compat-playwright/tools/jf-proxy.cjs"
+      - "compat-playwright/tools/jf-proxy.test.cjs"
       # Scripts injected into the jellyfin-web bundle change what the harness's
       # real browsers see (the VR player added a row to the track menus).
       - "web-patches/**"
@@ -36,6 +37,8 @@ jobs:
           cores: 16
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
+      - name: Run jf-proxy unit tests
+        run: nix develop --command node --test compat-playwright/tools/jf-proxy.test.cjs
       - name: Run SyncPlay group-watch harness
         run: nix develop --command just compat-syncplay
       - name: Upload Playwright report + traces on failure
