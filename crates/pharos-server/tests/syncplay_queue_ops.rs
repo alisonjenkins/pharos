@@ -267,6 +267,31 @@ async fn remove_from_playlist_posted_by_one_member_reaches_both() {
 }
 
 #[actix_web::test]
+async fn move_playlist_item_posted_by_one_member_reaches_both() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let before = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/MovePlaylistItem",
+        serde_json::json!({
+            "PlaylistItemId": as_guid(&before.playlist_item_ids[2]),
+            "NewIndex": 0,
+        })
+    );
+    assert_eq!(status, 204);
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let q = next_queue(rx, "move_item").await;
+        assert_eq!(q.item_ids, ["12", "10", "11"]);
+        assert_eq!(q.playlist_item_ids[0], before.playlist_item_ids[2]);
+        assert_eq!(q.playing_index, 1, "the playing entry follows its item");
+    }
+}
+
+#[actix_web::test]
 async fn clear_playlist_with_clear_playing_item_empties_the_queue_for_both() {
     serve!(party().await => app, token, rx_a, rx_b);
     let _ = seeded!(app, token, rx_a, rx_b);

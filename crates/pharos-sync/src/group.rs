@@ -335,6 +335,14 @@ pub enum GroupMsg {
         clear_playlist: bool,
         clear_playing_item: bool,
     },
+    /// Jellyfin HTTP `/SyncPlay/MovePlaylistItem` — reposition one entry.
+    /// `new_index` is clamped into the queue; the playing entry stays the
+    /// playing entry wherever it ends up.
+    MovePlaylistItem {
+        sender: MemberId,
+        playlist_item_id: String,
+        new_index: i64,
+    },
     /// Advance to the next / previous queue entry (leader only).
     /// `playlist_item_id` is the entry the CLIENT believes is playing —
     /// real Jellyfin no-ops the request when it doesn't match the current
@@ -504,6 +512,11 @@ pub enum RemoteCommand {
         clear_playlist: bool,
         clear_playing_item: bool,
     },
+    MovePlaylistItem {
+        sender: MemberId,
+        playlist_item_id: String,
+        new_index: i64,
+    },
     NextItem {
         sender: MemberId,
         #[serde(default)]
@@ -648,6 +661,15 @@ impl RemoteCommand {
                 playlist_item_ids,
                 clear_playlist,
                 clear_playing_item,
+            },
+            RemoteCommand::MovePlaylistItem {
+                sender,
+                playlist_item_id,
+                new_index,
+            } => GroupMsg::MovePlaylistItem {
+                sender,
+                playlist_item_id,
+                new_index,
             },
             RemoteCommand::NextItem {
                 sender,
@@ -846,6 +868,39 @@ impl PlayQueue {
             self.playing_index.saturating_sub(removed_before)
         };
         playing_removed
+    }
+
+    /// Move the entry named `id` to `new_index` (clamped into the queue, so a
+    /// negative index lands first and an oversized one last); the playing
+    /// entry stays the playing entry. Returns false when no entry has that id.
+    fn move_entry(&mut self, id: &str, new_index: i64) -> bool {
+        let key = pli_key(id);
+        let Some(old) = self
+            .items
+            .iter()
+            .position(|e| pli_key(&e.playlist_item_id) == key)
+        else {
+            return false;
+        };
+        let playing = self
+            .items
+            .get(self.playing_index)
+            .map(|e| e.playlist_item_id.clone());
+        let moved = self.items.remove(old);
+        let new_index = usize::try_from(new_index.max(0))
+            .unwrap_or(usize::MAX)
+            .min(self.items.len());
+        self.items.insert(new_index, moved);
+        if let Some(playing) = playing {
+            if let Some(at) = self
+                .items
+                .iter()
+                .position(|e| e.playlist_item_id == playing)
+            {
+                self.playing_index = at;
+            }
+        }
+        true
     }
 
     /// Empty the queue, keeping the playing entry (as the only one) unless
@@ -2929,6 +2984,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::SetPlaylistItem { sender, .. }
         | GroupMsg::Queue { sender, .. }
         | GroupMsg::RemoveFromPlaylist { sender, .. }
+        | GroupMsg::MovePlaylistItem { sender, .. }
         | GroupMsg::NextItem { sender, .. }
         | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
@@ -2962,6 +3018,7 @@ fn controls_existing_queue(msg: &GroupMsg) -> bool {
             | GroupMsg::LeaderSeek { .. }
             | GroupMsg::Queue { .. }
             | GroupMsg::RemoveFromPlaylist { .. }
+            | GroupMsg::MovePlaylistItem { .. }
     )
 }
 
@@ -3947,6 +4004,23 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 let pending = state.follower_ids();
                 state.enter_waiting(pending, was_playing, 0, GateReason::PlaylistItem, 0);
             }
+        }
+        GroupMsg::MovePlaylistItem {
+            sender,
+            playlist_item_id,
+            new_index,
+        } => {
+            if !state.queue.move_entry(&playlist_item_id, new_index) {
+                tracing::warn!(
+                    group = %state.id, sender = %sender,
+                    requested = %playlist_item_id,
+                    queue_len = state.queue.items.len(),
+                    "syncplay: MovePlaylistItem for an entry not in the queue — ignored"
+                );
+                metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "move_playlist_item", "reason" => "unknown_entry").increment(1);
+                return;
+            }
+            state.broadcast_queue_edit("move_item");
         }
         GroupMsg::NextItem {
             sender,
@@ -9607,6 +9681,92 @@ mod tests {
         let mut q = queue_of(&["a", "b", "c"], 1);
         assert!(q.clear_entries(true));
         assert!(q.items.is_empty());
+    }
+
+    #[test]
+    fn move_entry_repositions_and_the_playing_entry_follows_its_item() {
+        // Playing "b" (index 1); move an entry from before it to after it.
+        let mut q = queue_of(&["a", "b", "c", "d"], 1);
+        assert!(q.move_entry("pli-a", 3));
+        assert_eq!(item_ids(&q), ["b", "c", "d", "a"]);
+        assert_eq!(q.items[q.playing_index].item_id, "b");
+
+        // Move the playing entry itself.
+        let mut q = queue_of(&["a", "b", "c"], 0);
+        assert!(q.move_entry("pli-a", 2));
+        assert_eq!(item_ids(&q), ["b", "c", "a"]);
+        assert_eq!(q.items[q.playing_index].item_id, "a");
+
+        // From after the playing entry to before it.
+        let mut q = queue_of(&["a", "b", "c"], 1);
+        assert!(q.move_entry("pli-c", 0));
+        assert_eq!(item_ids(&q), ["c", "a", "b"]);
+        assert_eq!(q.items[q.playing_index].item_id, "b");
+    }
+
+    #[test]
+    fn move_entry_clamps_the_index_and_rejects_unknown_ids() {
+        let mut q = queue_of(&["a", "b", "c"], 0);
+        assert!(q.move_entry("pli-b", 99));
+        assert_eq!(item_ids(&q), ["a", "c", "b"]);
+        assert!(q.move_entry("pli-b", -5));
+        assert_eq!(item_ids(&q), ["b", "a", "c"]);
+        assert_eq!(q.items[q.playing_index].item_id, "a");
+
+        assert!(!q.move_entry("pli-zzz", 1));
+        assert_eq!(item_ids(&q), ["b", "a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn moving_an_entry_broadcasts_the_new_order_without_touching_playback() {
+        let (h, leader, mut leader_rx, mut m2_rx, plis) = two_member_group_with_queue().await;
+        let (_, _, _, _, _, before) = {
+            h.tx.send(GroupMsg::Queue {
+                sender: leader,
+                item_ids: vec!["13".into()],
+                item_runtimes_ms: Vec::new(),
+                mode: QueueMode::Queue,
+            })
+            .await
+            .unwrap();
+            let _ = next_play_queue(&mut m2_rx).await;
+            next_play_queue(&mut leader_rx).await
+        };
+        h.tx.send(GroupMsg::MovePlaylistItem {
+            sender: leader,
+            playlist_item_id: plis[2].clone(),
+            new_index: 0,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, new_plis, playing, _, after) = next_play_queue(rx).await;
+            assert_eq!(reason, "move_item");
+            assert_eq!(ids, ["12", "10", "11", "13"]);
+            assert_eq!(new_plis[0], plis[2]);
+            assert_eq!(playing, 1, "the playing entry (10) follows its item");
+            assert!(after > before);
+        }
+        assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn moving_an_unknown_entry_is_ignored() {
+        let (h, leader, mut leader_rx, _m2_rx, _plis) = two_member_group_with_queue().await;
+        h.tx.send(GroupMsg::MovePlaylistItem {
+            sender: leader,
+            playlist_item_id: "not-in-this-queue".into(),
+            new_index: 0,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "an unknown entry must not broadcast a queue"
+            );
+        }
     }
 
     async fn two_member_group_with_queue() -> (
