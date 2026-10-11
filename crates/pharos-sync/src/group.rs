@@ -1736,11 +1736,19 @@ impl GroupState {
         true
     }
 
+    /// Whether the group is playing or about to be: during a readiness gate
+    /// `playback` is parked Paused while the gate's `resume_playing` says what
+    /// it settles to (right after SetNewQueue / SetPlaylistItem).
+    fn intends_playing(&self) -> bool {
+        matches!(self.playback, PlaybackState::Playing { .. })
+            || self.waiting.as_ref().is_some_and(|w| w.resume_playing)
+    }
+
     /// Broadcast a queue edit that leaves playback as it is (Queue, QueueNext,
     /// RemoveItems, MoveItem): `IsPlaying` and the start position are the
     /// group's live ones, as in Jellyfin's `GetPlayQueueUpdate`.
     fn broadcast_queue_edit(&mut self, reason: &str) {
-        let is_playing = matches!(self.playback, PlaybackState::Playing { .. });
+        let is_playing = self.intends_playing();
         let position_ms = self.current_position_ms();
         self.broadcast_play_queue(reason, is_playing, position_ms);
     }
@@ -3973,7 +3981,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 metrics::counter!("pharos_syncplay_command_ignored_total", "command" => "remove_from_playlist", "reason" => "empty_queue").increment(1);
                 return;
             }
-            let was_playing = matches!(state.playback, PlaybackState::Playing { .. });
+            let was_playing = state.intends_playing();
             let playing_removed = if clear_playlist {
                 state.queue.clear_entries(clear_playing_item)
             } else {
@@ -3986,6 +3994,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // The playing entry is gone. Tell everyone the new queue, then
             // either restart on the entry that took its place (Jellyfin's
             // RestartCurrentItem) or, with nothing left, stop the group.
+            // The gate is deliberate: on RemoveItems jellyfin-web (12.2
+            // QueueCore) calls setCurrentPlaylistItem when the playing entry
+            // changed, the same load path as NextItem/SetCurrentItem, so every
+            // client loads the replacement and posts Ready.
             state.item_started_at = Some(tokio::time::Instant::now());
             state.next_item_advanced_at = None;
             if state.queue.items.is_empty() {
@@ -9783,6 +9795,128 @@ mod tests {
         (h, leader, leader_rx, m2_rx, plis)
     }
 
+    async fn ready_all(h: &GroupHandle, members: &[MemberId], pli: &str) {
+        for mid in members {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: *mid,
+                position_ms: 0,
+                playlist_item_id: Some(pli.to_string()),
+                is_playing: false,
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Two members and a three-entry queue, both Ready for entry 0 so the
+    /// initial gate has resolved and the group is Playing.
+    async fn playing_group() -> (
+        GroupHandle,
+        Vec<MemberId>,
+        mpsc::Receiver<ServerMsg>,
+        mpsc::Receiver<ServerMsg>,
+        Vec<String>,
+    ) {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let _ = next_play_queue(&mut m2_rx).await;
+        ready_all(&h, &[leader, m2], &plis[0]).await;
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let play = recv_matching(rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::Play { .. })
+            })
+            .await;
+            assert!(play.is_some(), "the load gate must resolve to Play");
+        }
+        (h, vec![leader, m2], leader_rx, m2_rx, plis)
+    }
+
+    #[tokio::test]
+    async fn removing_the_playing_entry_before_anyone_is_ready_still_resumes_playing() {
+        // Right after SetNewQueue `playback` is parked Paused behind the gate,
+        // but the gate resolves to Playing: the edit must say so.
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "gf").await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let _ = next_play_queue(&mut m2_rx).await;
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: leader,
+            playlist_item_ids: vec![plis[0].clone()],
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (reason, ids, _, playing, is_playing, _) = next_play_queue(rx).await;
+            assert_eq!(reason, "remove_items");
+            assert_eq!(ids, ["11", "12"]);
+            assert_eq!(playing, 0);
+            assert!(is_playing, "the gate was heading to Playing");
+        }
+        // The replacement gate must also resolve to Playing.
+        ready_all(&h, &[leader, m2], &plis[1]).await;
+        let play = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(play.is_some(), "the replacement gate must resume playing");
+    }
+
+    #[tokio::test]
+    async fn removing_the_playing_entry_of_a_playing_group_keeps_it_playing() {
+        let (h, members, mut leader_rx, mut m2_rx, plis) = playing_group().await;
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: members[0],
+            playlist_item_ids: vec![plis[0].clone()],
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        for rx in [&mut leader_rx, &mut m2_rx] {
+            let (_, _, _, _, is_playing, _) = next_play_queue(rx).await;
+            assert!(is_playing);
+        }
+        ready_all(&h, &members, &plis[1]).await;
+        let play = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Play { .. })
+        })
+        .await;
+        assert!(play.is_some(), "the replacement entry must start playing");
+    }
+
+    #[tokio::test]
+    async fn removing_the_playing_entry_of_a_paused_group_keeps_it_paused() {
+        let (h, members, mut leader_rx, mut m2_rx, plis) = playing_group().await;
+        h.tx.send(GroupMsg::PauseShared { sender: members[0] })
+            .await
+            .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+        h.tx.send(GroupMsg::RemoveFromPlaylist {
+            sender: members[0],
+            playlist_item_ids: vec![plis[0].clone()],
+            clear_playlist: false,
+            clear_playing_item: false,
+        })
+        .await
+        .unwrap();
+        let (_, _, _, _, is_playing, _) = next_play_queue(&mut leader_rx).await;
+        assert!(!is_playing);
+        ready_all(&h, &members, &plis[1]).await;
+        let _ = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::Play { .. }),
+                "a paused group must not start playing"
+            );
+        }
+        assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Paused);
+    }
+
     #[tokio::test]
     async fn removing_a_queued_entry_broadcasts_the_shorter_queue_to_every_member() {
         let (h, leader, mut leader_rx, mut m2_rx, plis) = two_member_group_with_queue().await;
@@ -9824,11 +9958,17 @@ mod tests {
         .await
         .unwrap();
         for rx in [&mut leader_rx, &mut m2_rx] {
-            let (reason, ids, _, playing, _, _) = next_play_queue(rx).await;
+            let (reason, ids, _, playing, is_playing, _) = next_play_queue(rx).await;
             assert_eq!(reason, "remove_items");
             assert_eq!(ids, ["10", "12"]);
             assert_eq!(playing, 0, "falls back to the entry before the removed one");
+            assert!(is_playing, "playback continues on the neighbour");
         }
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "the neighbour loads behind a readiness gate"
+        );
         assert_eq!(snapshot_of(&h).await.current_item_id.as_deref(), Some("10"));
     }
 
