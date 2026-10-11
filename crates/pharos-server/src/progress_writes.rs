@@ -21,7 +21,7 @@
 //! Only the database write is deferred. Session registry updates and socket
 //! fan-out stay on the request path.
 
-use pharos_core::{MediaId, PlaybackProgress, UserId};
+use pharos_core::{MediaId, PlaybackProgress, UserDataStore, UserId};
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -124,8 +124,14 @@ impl ProgressCoalescer {
         }
     }
 
-    pub fn interval(&self) -> Duration {
-        self.interval
+    /// How often [`flush_due`] should run, or `None` when nothing is ever
+    /// held. A third of the interval bounds the lag on top of it to ~33%.
+    pub fn flush_period(&self) -> Option<Duration> {
+        if self.interval.is_zero() {
+            None
+        } else {
+            Some((self.interval / 3).max(Duration::from_secs(1)))
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProgressKey, Entry>> {
@@ -186,11 +192,14 @@ impl ProgressCoalescer {
         }
     }
 
-    /// The report admitted last was written: nothing is held for the session.
-    pub fn persisted(&self, key: &ProgressKey, now: Instant) {
+    /// `written` reached the database. A newer report that arrived while the
+    /// write was in flight stays held.
+    pub fn persisted(&self, key: &ProgressKey, now: Instant, written: &PlaybackProgress) {
         if let Some(entry) = self.lock().get_mut(key) {
             entry.last_persist = now;
-            entry.pending = None;
+            if entry.pending.as_ref() == Some(written) {
+                entry.pending = None;
+            }
         }
     }
 
@@ -243,6 +252,48 @@ impl ProgressCoalescer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Write the held reports that are an interval old. A session that went
+/// silent without a Stopped (a crashed player, a closed tab) would otherwise
+/// keep its last held position out of the database. A failed write is handed
+/// back to be retried on the next tick. Returns how many were written.
+pub async fn flush_due<S: UserDataStore>(
+    coalescer: &ProgressCoalescer,
+    store: &S,
+    now: Instant,
+) -> usize {
+    write_held(coalescer, store, coalescer.take_due(now), now).await
+}
+
+/// Write every held report, for shutdown. Returns how many were written.
+pub async fn flush_all<S: UserDataStore>(coalescer: &ProgressCoalescer, store: &S) -> usize {
+    write_held(coalescer, store, coalescer.take_all(), Instant::now()).await
+}
+
+async fn write_held<S: UserDataStore>(
+    coalescer: &ProgressCoalescer,
+    store: &S,
+    held: Vec<(ProgressKey, PlaybackProgress)>,
+    now: Instant,
+) -> usize {
+    let mut written = 0;
+    for (key, progress) in held {
+        match store
+            .record_playback_progress(key.user, key.item, progress)
+            .await
+        {
+            Ok(_) => {
+                coalescer.persisted(&key, now, &progress);
+                written += 1;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, item = key.item, "held playback progress not written");
+                coalescer.hold(&key, progress);
+            }
+        }
+    }
+    written
 }
 
 fn sweep_idle(entries: &mut HashMap<ProgressKey, Entry>, now: Instant, idle_ttl: Duration) {
@@ -318,7 +369,7 @@ mod tests {
     ) -> Decision {
         let d = c.admit(k, t, paused, report(secs, secs as i64));
         if matches!(d, Decision::Persist(_)) {
-            c.persisted(k, t);
+            c.persisted(k, t, &report(secs, secs as i64));
         }
         d
     }
@@ -448,6 +499,31 @@ mod tests {
         c.admit(&k, at(t0, 21), false, report(121, 121));
         c.hold(&k, report(110, 110));
         assert_eq!(c.take_all(), vec![(k, report(121, 121))]);
+    }
+
+    #[test]
+    fn confirming_an_older_write_does_not_clear_a_newer_held_report() {
+        let (c, t0) = coalescer();
+        let k = key("s");
+        tick(&c, &k, t0, 100, false);
+        let older = report(110, 110);
+        c.admit(&k, at(t0, 10), false, older);
+        c.admit(&k, at(t0, 11), false, report(111, 111));
+        c.persisted(&k, at(t0, 12), &older);
+        assert_eq!(c.take_all(), vec![(k, report(111, 111))]);
+    }
+
+    #[test]
+    fn flush_period_is_a_third_of_the_interval_and_absent_when_off() {
+        assert_eq!(
+            ProgressCoalescer::new(Duration::from_secs(15)).flush_period(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            ProgressCoalescer::new(Duration::from_secs(1)).flush_period(),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(ProgressCoalescer::new(Duration::ZERO).flush_period(), None);
     }
 
     #[test]

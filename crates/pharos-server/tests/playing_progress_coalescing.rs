@@ -16,6 +16,7 @@ use pharos_server::{
     api::jellyfin,
     auth::BuiltinAuth,
     middleware::LowercasePath,
+    progress_writes::{flush_all, flush_due},
     state::{AppState, Stores},
 };
 use tracing_subscriber::prelude::*;
@@ -269,5 +270,90 @@ async fn a_zero_interval_writes_every_report() {
     assert_eq!(
         stored(&state, uid).await.last_played_position_ticks,
         12 * SEC
+    );
+}
+
+fn later(secs: u64) -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(secs)
+}
+
+#[actix_web::test]
+async fn a_silent_session_has_its_held_position_written_by_the_tick() {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    progress!(app, token, 10u64);
+    progress!(app, token, 11u64);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        10 * SEC
+    );
+
+    let none_yet = flush_due(&state.progress_writes, &state.stores, later(1)).await;
+    assert_eq!(none_yet, 0, "a report younger than the interval stays held");
+    let written = flush_due(&state.progress_writes, &state.stores, later(20)).await;
+    assert_eq!(written, 1);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        11 * SEC
+    );
+    assert_eq!(
+        flush_due(&state.progress_writes, &state.stores, later(40)).await,
+        0,
+        "written once, not on every tick"
+    );
+}
+
+#[actix_web::test]
+async fn shutdown_writes_every_held_report() {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    progress!(app, token, 10u64);
+    progress!(app, token, 11u64);
+    progress!(app, token, 12u64);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        10 * SEC
+    );
+
+    assert_eq!(flush_all(&state.progress_writes, &state.stores).await, 1);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        12 * SEC
+    );
+    assert_eq!(flush_all(&state.progress_writes, &state.stores).await, 0);
+}
+
+#[actix_web::test]
+async fn nothing_flushed_after_the_stop_undoes_it() {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    progress!(app, token, 50u64);
+    progress!(app, token, 52u64);
+    // A tick already took the held report and is mid-write when the stop lands.
+    let in_flight = state.progress_writes.take_due(later(20));
+    assert_eq!(in_flight.len(), 1);
+    // The row's clock is whole seconds; make the stop strictly newer.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    stopped!(app, token, 57u64);
+
+    for (key, progress) in in_flight {
+        state
+            .stores
+            .record_playback_progress(key.user, key.item, progress)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        flush_due(&state.progress_writes, &state.stores, later(60)).await,
+        0
+    );
+    assert_eq!(flush_all(&state.progress_writes, &state.stores).await, 0);
+
+    let ud = stored(&state, uid).await;
+    assert!(ud.played);
+    assert_eq!(ud.play_count, 1);
+    assert_eq!(
+        ud.last_played_position_ticks, 0,
+        "the finished item has no resume point"
     );
 }
