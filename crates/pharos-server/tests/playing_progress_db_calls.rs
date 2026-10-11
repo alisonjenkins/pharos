@@ -68,25 +68,28 @@ async fn a_progress_report_store_call_count() {
     let log = StoreCallLog::default();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(log.clone()));
 
-    let resp = test::call_service(
-        &app,
-        test::TestRequest::post()
+    let report = |ticks: u64| {
+        let req = test::TestRequest::post()
             .uri("/Sessions/Playing/Progress")
             .insert_header(("X-Emby-Token", token.as_str()))
             .insert_header(("content-type", "application/json"))
-            .set_payload(r#"{"ItemId":"1","PlaySessionId":"s","PositionTicks":100000000}"#)
-            .to_request(),
-    )
-    .await;
-    assert_eq!(resp.status().as_u16(), 204);
-    let calls = log.take();
-    for s in &calls {
-        eprintln!("CALL: {s}");
-    }
-    eprintln!("STORE CALLS: {}", calls.len());
+            .set_payload(format!(
+                r#"{{"ItemId":"1","PlaySessionId":"s","PositionTicks":{ticks}}}"#
+            ))
+            .to_request();
+        test::call_service(&app, req)
+    };
+
+    assert_eq!(report(100_000_000).await.status().as_u16(), 204);
     assert_eq!(
-        calls,
+        log.take(),
         ["resolve", "get", "get", "record_playback_progress"],
-        "one progress report: token, user, item (kind and runtime), one user-data upsert"
+        "first report: token, user, item (kind and runtime), one user-data upsert"
+    );
+    assert_eq!(report(110_000_000).await.status().as_u16(), 204);
+    assert_eq!(
+        log.take(),
+        ["resolve", "get", "get"],
+        "a held report costs no user-data call"
     );
 }

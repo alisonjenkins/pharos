@@ -4,6 +4,7 @@
 //! `SessionRegistry` actor (V18) for in-memory tracking, and return
 //! 204 No Content. GET /Sessions returns the actor's snapshot.
 
+use crate::progress_writes::{Decision, ProgressKey};
 use crate::{
     api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser},
     sessions::SessionEvent,
@@ -12,6 +13,7 @@ use crate::{
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::{MediaStore, PlaybackProgress, UserDataStore};
 use serde::Deserialize;
+use std::time::Instant;
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -266,28 +268,45 @@ async fn playing_progress(
             audio_stream_index: body.audio_stream_index,
             subtitle_stream_index: body.subtitle_stream_index,
         };
-        match state
-            .stores
-            .record_playback_progress(user.0.id, item_id, progress)
-            .await
+        let key = ProgressKey {
+            user: user.0.id,
+            item: item_id,
+            session: body.play_session_id.clone().unwrap_or_default(),
+        };
+        // Only the database write is deferred: the session registry and the
+        // socket fan-out above already ran for this report.
+        if let Decision::Persist(_) =
+            state
+                .progress_writes
+                .admit(&key, Instant::now(), body.is_paused, progress)
         {
-            Ok(data) => {
-                // B36 — broadcast the full DTO (with PlayedPercentage
-                // from the item's runtime) so other windows' resume
-                // bars track the live position.
-                let runtime = item
-                    .as_ref()
-                    .and_then(|it| it.probe.run_time_ticks())
-                    .unwrap_or(0);
-                let dto = pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(
-                    item_id, data, runtime,
-                );
-                if let Ok(entry) = serde_json::to_value(&dto) {
-                    state.notify_user_data_changed(&user.0.id.0.simple().to_string(), vec![entry]);
+            match state
+                .stores
+                .record_playback_progress(user.0.id, item_id, progress)
+                .await
+            {
+                Ok(data) => {
+                    state.progress_writes.persisted(&key, Instant::now());
+                    // B36 — broadcast the full DTO (with PlayedPercentage
+                    // from the item's runtime) so other windows' resume
+                    // bars track the live position.
+                    let runtime = item
+                        .as_ref()
+                        .and_then(|it| it.probe.run_time_ticks())
+                        .unwrap_or(0);
+                    let dto = pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(
+                        item_id, data, runtime,
+                    );
+                    if let Ok(entry) = serde_json::to_value(&dto) {
+                        state.notify_user_data_changed(
+                            &user.0.id.0.simple().to_string(),
+                            vec![entry],
+                        );
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, item = item_id, "playback progress not persisted");
+                Err(e) => {
+                    tracing::warn!(error = %e, item = item_id, "playback progress not persisted");
+                }
             }
         }
     }
@@ -308,6 +327,7 @@ async fn playing_stopped(
     body: web::Json<StoppedBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
+    let progress_session = body.play_session_id.clone().unwrap_or_default();
     if let Some(session_id) = body.play_session_id {
         state
             .sessions
@@ -328,6 +348,13 @@ async fn playing_stopped(
         // stopped persisting for hex-era clients.
         if let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(&item_id_str) {
             let position = body.position_ticks.unwrap_or(0);
+            // The stop below is this session's final write; a report still
+            // held for it is older and must not follow it into the database.
+            state.progress_writes.forget(&ProgressKey {
+                user: user.0.id,
+                item: item_id,
+                session: progress_session,
+            });
             let runtime = state
                 .stores
                 .get(item_id)

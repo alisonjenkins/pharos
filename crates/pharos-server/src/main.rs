@@ -1805,6 +1805,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         web: cfg.server.ui_dir.clone(),
     });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
+    state = state.with_progress_persist_interval(std::time::Duration::from_secs(
+        cfg.server.playback_progress_persist_secs,
+    ));
     state = state.with_user_defaults(cfg.user_defaults.clone());
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
