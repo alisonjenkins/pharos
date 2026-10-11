@@ -228,6 +228,21 @@ async fn person_types_author_matches_writer_credits_on_books() {
 }
 
 #[actix_web::test]
+async fn unrecognised_credit_kind_is_emitted_as_unknown() {
+    let (state, token) = seed().await;
+    {
+        use pharos_core::PersonStore;
+        state
+            .stores
+            .link_item_people(3, &[credit("Odd Role", PersonKind::Other)])
+            .await
+            .unwrap();
+    }
+    let movie = get_json(&state, &token, "/Items/3").await;
+    assert_eq!(movie["People"][0]["Type"], "Unknown");
+}
+
+#[actix_web::test]
 async fn person_types_writer_keeps_non_book_writers() {
     let (state, token) = seed().await;
     let v = get_json(&state, &token, "/Persons?personTypes=Writer").await;
