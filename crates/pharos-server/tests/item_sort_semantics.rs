@@ -24,6 +24,8 @@ struct Row {
     critic: Option<f32>,
     /// `(play_count, last_played_at)` for the test user.
     plays: Option<(u32, i64)>,
+    /// `(album, year)` makes the row an audio track on that album.
+    album: Option<(&'static str, u32)>,
 }
 
 impl Row {
@@ -36,6 +38,7 @@ impl Row {
             community: None,
             critic: None,
             plays: None,
+            album: None,
         }
     }
 }
@@ -60,7 +63,16 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                 id: r.id,
                 path: format!("/m/{}.mkv", r.id).into(),
                 title: r.title.into(),
-                kind: MediaKind::Movie,
+                kind: if r.album.is_some() {
+                    MediaKind::Audio
+                } else {
+                    MediaKind::Movie
+                },
+                probe: pharos_core::MediaProbe {
+                    album: r.album.map(|(a, _)| a.to_string()),
+                    year: r.album.map(|(_, y)| y),
+                    ..Default::default()
+                },
                 created_at: Some(1_000),
                 metadata: MediaMetadata {
                     production_year: r.year,
@@ -312,6 +324,28 @@ async fn three_key_sort_order_pairs_each_key() {
         &app,
         token.as_str(),
         "SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending,Descending,Ascending"
+    );
+    assert_eq!(got, vec!["Charlie", "Alpha", "Bravo", "Delta"]);
+}
+
+#[actix_web::test]
+async fn album_grid_pairs_year_and_name_with_their_own_sort_order() {
+    let track = |id: u64, album: &'static str, year: u32| Row {
+        album: Some((album, year)),
+        ..Row::new(id, album)
+    };
+    let rows = vec![
+        track(1, "Bravo", 2001),
+        track(2, "Alpha", 2001),
+        track(3, "Charlie", 2010),
+        track(4, "Delta", 1999),
+    ];
+    let (state, token) = seed(rows).await;
+    let app = test::init_service(build_app(state)).await;
+    let got = names!(
+        &app,
+        token.as_str(),
+        "IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=ProductionYear,SortName&SortOrder=Descending,Ascending"
     );
     assert_eq!(got, vec!["Charlie", "Alpha", "Bravo", "Delta"]);
 }

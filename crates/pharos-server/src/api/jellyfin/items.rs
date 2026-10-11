@@ -4240,24 +4240,35 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
 /// Sort synthesised albums per the request: the music rails ask for
 /// `PremiereDate,ProductionYear,SortName` (year first); anything else
 /// falls back to name. Descending flips the whole chain.
-fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, descending: bool) {
-    let by_year = sort_by
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .next()
-        .is_some_and(|t| matches!(t, "PremiereDate" | "ProductionYear"));
+fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]) {
+    let by_year = sort_tokens(sort_by.unwrap_or(""))
+        .first()
+        .is_some_and(|t| matches!(*t, "PremiereDate" | "ProductionYear"));
+    // Same pairing as `sort_chain`: key N takes SortOrder token N, a short
+    // list repeats its last entry. The name key is the second one after a
+    // year key and the first otherwise.
+    let desc_at = |i: usize| orders.get(i).or_else(|| orders.last()).copied() == Some(true);
+    let by_name = |a: &AlbumAgg, b: &AlbumAgg| a.name.to_lowercase().cmp(&b.name.to_lowercase());
     if by_year {
+        let (year_desc, name_desc) = (desc_at(0), desc_at(1));
         aggs.sort_by(|a, b| {
-            a.year
-                .cmp(&b.year)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            let year = if year_desc {
+                b.year.cmp(&a.year)
+            } else {
+                a.year.cmp(&b.year)
+            };
+            year.then_with(|| {
+                if name_desc {
+                    by_name(b, a)
+                } else {
+                    by_name(a, b)
+                }
+            })
         });
+    } else if desc_at(0) {
+        aggs.sort_by(|a, b| by_name(b, a));
     } else {
-        aggs.sort_by_key(|a| a.name.to_lowercase());
-    }
-    if descending {
-        aggs.reverse();
+        aggs.sort_by(by_name);
     }
 }
 
@@ -4298,7 +4309,7 @@ async fn maybe_list_music(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let descending = first_sort_order_descending(q.sort_order.as_deref());
+    let orders = parse_sort_orders(q.sort_order.as_deref());
 
     if let Some(artist) = artist_parent {
         // Discography: albums whose album artist is this artist, falling
@@ -4310,7 +4321,7 @@ async fn maybe_list_music(
                 .or(i.probe.artist.as_deref())
                 .is_some_and(|a| a.eq_ignore_ascii_case(&artist))
         });
-        sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
+        sort_album_aggs(&mut aggs, q.sort_by.as_deref(), &orders);
         let mut items: Vec<serde_json::Value> = Vec::new();
         for a in aggs.iter() {
             items.push(synth_album_dto(state, a).await);
@@ -4412,7 +4423,7 @@ async fn maybe_list_music(
     if !exclude_ids.is_empty() {
         aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
     }
-    sort_album_aggs(&mut aggs, q.sort_by.as_deref(), descending);
+    sort_album_aggs(&mut aggs, q.sort_by.as_deref(), &orders);
     let total = aggs.len() as u32;
     let start = q.start_index as usize;
     let mut page: Vec<serde_json::Value> = Vec::new();
