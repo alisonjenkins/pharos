@@ -244,7 +244,7 @@ async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
     };
     let rows = vec![
         rated(1, "NC17", "NC-17"),
-        rated(2, "Pg13", "PG-13"),
+        rated(2, "Pg13", " pg-13 "),
         rated(3, "TvMa", "tv-ma"),
         rated(4, "G", "G"),
         rated(5, "Fifteen", "15"),
@@ -253,10 +253,12 @@ async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
         Row::new(8, "None"),
         rated(9, "TvY", "TV-Y"),
         rated(10, "R", "R"),
+        // SQL TRIM strips spaces only, so a trailing newline is unknown.
+        rated(11, "Newline", "PG-13\n"),
     ];
     let (state, token) = seed(rows).await;
     let app = test::init_service(build_app(state)).await;
-    // Ties (unknown/blank/none; G/TV-Y) fall to the id tiebreak.
+    // Ties (unknown/blank/none/newline; G/TV-Y) fall to the id tiebreak.
     let asc = names!(
         &app,
         token.as_str(),
@@ -264,7 +266,10 @@ async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
     );
     assert_eq!(
         asc,
-        vec!["Unrated", "Blank", "None", "G", "TvY", "Pg13", "Fifteen", "R", "NC17", "TvMa"]
+        vec![
+            "Unrated", "Blank", "None", "Newline", "G", "TvY", "Pg13", "Fifteen", "R", "TvMa",
+            "NC17"
+        ]
     );
     let desc = names!(
         &app,
@@ -273,7 +278,10 @@ async fn parental_rating_sorts_by_maturity_with_unknown_lowest() {
     );
     assert_eq!(
         desc,
-        vec!["NC17", "TvMa", "R", "Fifteen", "Pg13", "G", "TvY", "Unrated", "Blank", "None"]
+        vec![
+            "NC17", "TvMa", "R", "Fifteen", "Pg13", "G", "TvY", "Unrated", "Blank", "None",
+            "Newline"
+        ]
     );
 }
 
