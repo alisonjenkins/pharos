@@ -231,3 +231,57 @@ async fn queue_next_inserts_after_the_playing_entry_for_both_members() {
         assert_eq!(q.playing_index, 0);
     }
 }
+
+/// The SDKs send playlist item ids as dashed `Guid`s; the engine mints them
+/// dashless.
+fn as_guid(pli: &str) -> String {
+    uuid::Uuid::parse_str(pli).unwrap().hyphenated().to_string()
+}
+
+#[actix_web::test]
+async fn remove_from_playlist_posted_by_one_member_reaches_both() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let before = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/RemoveFromPlaylist",
+        serde_json::json!({ "PlaylistItemIds": [as_guid(&before.playlist_item_ids[1])] })
+    );
+    assert_eq!(status, 204);
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let q = next_queue(rx, "remove_items").await;
+        assert_eq!(q.item_ids, ["10", "12"]);
+        assert_eq!(
+            q.playlist_item_ids,
+            [
+                before.playlist_item_ids[0].clone(),
+                before.playlist_item_ids[2].clone()
+            ]
+        );
+        assert_eq!(q.playing_index, 0);
+    }
+}
+
+#[actix_web::test]
+async fn clear_playlist_with_clear_playing_item_empties_the_queue_for_both() {
+    serve!(party().await => app, token, rx_a, rx_b);
+    let _ = seeded!(app, token, rx_a, rx_b);
+
+    let status = post!(
+        app,
+        token,
+        DEV_B,
+        "/SyncPlay/RemoveFromPlaylist",
+        serde_json::json!({ "ClearPlaylist": true, "ClearPlayingItem": true })
+    );
+    assert_eq!(status, 204);
+
+    for rx in [&mut rx_a, &mut rx_b] {
+        let q = next_queue(rx, "remove_items").await;
+        assert!(q.item_ids.is_empty());
+    }
+}
