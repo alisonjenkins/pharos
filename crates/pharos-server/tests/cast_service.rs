@@ -361,23 +361,27 @@ async fn start_plays_the_group_item_on_the_tv_and_shows_the_owner_once() {
 }
 
 #[tokio::test]
-async fn other_members_never_keep_a_stale_seat_entry() {
+async fn other_members_are_never_told_the_owner_joined_or_left_for_a_cast() {
     let mut rig = Rig::new().await;
     while rig.bob.rx.try_recv().is_ok() {}
     rig.start_owner().await;
-    let seat = rig.seat_member();
-    wait_msg(
-        &mut rig.bob.rx,
-        "the seat's join announcement",
-        |m| matches!(m, ServerMsg::MemberJoined { member } if member.member_id == seat),
-    )
-    .await;
-    wait_msg(
-        &mut rig.bob.rx,
-        "the seat's retraction (T059)",
-        |m| matches!(m, ServerMsg::MemberLeft { member_id, .. } if *member_id == seat),
-    )
-    .await;
+    eventually("PlayNow", || has_command(&rig.living_room, "PlayNow")).await;
+    rig.service.stop(rig.owner.id, CastReason::UserStop).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut announced = Vec::new();
+    while let Ok(m) = rig.bob.rx.try_recv() {
+        if matches!(
+            m,
+            ServerMsg::MemberJoined { .. } | ServerMsg::MemberLeft { .. }
+        ) {
+            announced.push(m);
+        }
+    }
+    assert!(
+        announced.is_empty(),
+        "start and end of a cast must be silent to other members: {announced:?}"
+    );
 }
 
 #[tokio::test]
