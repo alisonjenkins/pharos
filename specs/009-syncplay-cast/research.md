@@ -78,3 +78,33 @@ On start, the sender's own player must stop or it plays twice. The server sends 
 - Real-TV behaviour (S2) cannot be proven in CI: the receiver emulator proves the logic, a manual run on a real TV is the only evidence for SC-001/SC-002. Report that run as unwitnessed until done.
 - Receiver seek accuracy may make 2 s infeasible; SC-002 is then restated from the spike, not silently loosened.
 - Group owner failover (rolling deploy) must hand the TV connection to the new owner without a visible glitch beyond the existing V25 bound.
+
+## Spike S1 outcome (2026-10-12; sources: crates.io API, rust-cast/cast-sender repos, jellyfin-chromecast master 2026-09-23, jellyfin AuthorizationContext.cs)
+
+**Crate decision: hand-roll** `CastTransport` on `tokio-rustls` + `prost` + `tokio_util::codec::LengthDelimitedCodec` (about 400 lines). `rust_cast` 0.21 (MIT) is blocking, pins `protobuf =3.7.2` exactly, and needs `spawn_blocking` plus a reader thread; `cast-sender` 0.3 is smol/native-tls (openssl) and young; `chromecast` is stale. Fallback if hand-rolling stalls: `rust_cast` with `thread_safe` on a dedicated thread. TLS: a rustls verifier that accepts the Chromecast's self-signed certificate (optionally pinned by fingerprint).
+
+**Protocol surface**: one protobuf message `CastMessage` (protocol_version, source_id, destination_id, namespace, payload_type, payload_utf8); 4-byte big-endian length framing. Namespaces: `tp.connection` (CONNECT to `receiver-0`, then to the app `transportId`, CLOSE), `tp.heartbeat` (PING/PONG about every 5 s, answer the device's pings), `receiver` (LAUNCH `F007D354`, GET_STATUS, STOP; parse `RECEIVER_STATUS.status.applications[].{appId,transportId,sessionId}`), and `urn:x-cast:com.connectsdk` (JSON strings both ways).
+
+**Receiver command shapes** (only `command`, `serverAddress`, `accessToken` are mandatory; `userId`, `deviceId`, `serverId`, `serverVersion` are ignored; `receiverName` optional but should be set and stable because the receiver derives `DeviceId = btoa(receiverName)`; `serverAddress` is a base URL without trailing slash):
+
+```json
+{"command":"PlayNow","serverAddress":"http://pharos:8096","accessToken":"<tok>","receiverName":"Living Room TV","maxBitrate":20000000,
+ "options":{"items":[{"Id":"<itemId>","Type":"Movie"}],"startIndex":0,"startPositionTicks":0,"mediaSourceId":"..","audioStreamIndex":1,"subtitleStreamIndex":3}}
+{"command":"Pause", ...}  {"command":"Unpause", ...}  {"command":"Stop", ...}
+{"command":"Seek","options":{"position":120}, ...}        // seconds
+{"command":"SetAudioStreamIndex","options":{"index":2}, ...}
+```
+
+`PlayNow.items[0]` is dereferenced, so the list must be non-empty; only `Id` is functionally needed (the receiver re-fetches the item and fetches PlaybackInfo itself with its own DeviceProfile) but `Type` must be sent (an `Episode` with `smart` expands to the season, so the driver sends `Movie`/`Video` semantics and controls the queue itself). `PlayNext` only enqueues (idle behaviour UNVERIFIED). `NextTrack`/`PreviousTrack` act only on the receiver's own playlist, so item changes use `PlayNow`. Volume/mute commands are no-ops on the receiver. No `Identify` step is needed; credentials travel on every message.
+
+**Receiver reports** (JSON objects on the same namespace, sent to the LAST sender id): `playbackstart`, `playbackprogress`, `playbackstop`, `playstatechange` (also after our commands: immediately, +100 ms, +500 ms), `volumechange`, `repeatmodechange`, `error`, `playbackerror`, `connectionerror`. Payload `data.PlayState.{PositionTicks,IsPaused,ItemId,PlayMethod,PlaySessionId,...}`. Progress cadence: bus message on every time-update between 1.5 s and 5 s after each server report, so treat it as roughly 1 Hz, not a fixed 5 s.
+
+**Consequences for the plan**
+1. Config needs `[cast] server_url`: a base URL the TV can reach, plain `http://` on a LAN works; an HTTPS URL with a private CA fails on the TV.
+2. Pharos auth must not require the request's `DeviceId` header to equal the token's bound device. The receiver always sends its own `btoa(receiverName)`; real Jellyfin tolerates this. T005 follow-up: verify pharos in `auth_extractor.rs`, and decide session keying so receiver reports do not create a stray second session (key by token, or recognise the TV's derived device id).
+3. The receiver posts its own `/Sessions/Capabilities/Full` on the first message; it overwrites capabilities stored for that token's session, so the virtual TV session must not rely on stored caps.
+4. The user is resolved from the token alone on the receiver's `GET /Items/{id}` calls (no `userId` param); the TV token routes must resolve user from the token.
+5. A second sender silently takes over the receiver's replies (`window.senderId` is the last sender) and replaces its credentials: the `tv_busy` rejection must also refuse a TV already running a foreign cast, detected from `GET_STATUS` (an app already running with another sender is "busy").
+6. Heartbeat or TLS loss kills the virtual connection and the receiver app may exit without a message, which the `Lost` state treats like any other connection loss.
+
+UNVERIFIED still: the `@jellyfin/sdk` Authorization header string the receiver sends; `PlayNext` while idle; whether `F007D354` is the id of the code read (the id is registered in the Google Cast console, not in source); idle-timeout behaviour in production receivers.
