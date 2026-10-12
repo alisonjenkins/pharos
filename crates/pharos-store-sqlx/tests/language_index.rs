@@ -7,7 +7,10 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{AudioTrack, MediaItem, MediaKind, MediaProbe, MediaStore, SubtitleTrack};
+use pharos_core::{
+    AudioTrack, MediaFilters, MediaItem, MediaKind, MediaProbe, MediaQuery, MediaStore,
+    SubtitleTrack,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::borrow::Cow;
@@ -64,6 +67,8 @@ trait Inspect {
     /// Delete the item the way any writer could, without going through
     /// `sweep_unseen`.
     async fn delete_item(&self, id: i64);
+    /// Rewrite one index row.
+    async fn retag_row(&self, id: i64, from: &str, to: &str);
     /// Start counting every row write (insert, update, delete) to the index.
     async fn count_index_writes(&self);
     async fn index_writes(&self) -> i64;
@@ -94,6 +99,16 @@ impl Inspect for SqliteStore {
     async fn delete_item(&self, id: i64) {
         sqlx::query("DELETE FROM media_items WHERE id = ?")
             .bind(id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn retag_row(&self, id: i64, from: &str, to: &str) {
+        sqlx::query("UPDATE media_item_languages SET lang = ? WHERE item_id = ? AND lang = ?")
+            .bind(to)
+            .bind(id)
+            .bind(from)
             .execute(self.pool())
             .await
             .unwrap();
@@ -157,6 +172,16 @@ impl Inspect for pharos_store_sqlx::postgres::PostgresStore {
     async fn delete_item(&self, id: i64) {
         sqlx::query("DELETE FROM media_items WHERE id = $1")
             .bind(id)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn retag_row(&self, id: i64, from: &str, to: &str) {
+        sqlx::query("UPDATE media_item_languages SET lang = $1 WHERE item_id = $2 AND lang = $3")
+            .bind(to)
+            .bind(id)
+            .bind(from)
             .execute(self.pool())
             .await
             .unwrap();
@@ -284,6 +309,97 @@ async fn put_and_sweep_keep_rows_in_step<S: MediaStore + Inspect>(s: &S, base: u
     assert_eq!(s.language_rows(keep as i64).await, [row("audio", "jpn")]);
 }
 
+/// Ids (relative to `base`) of the items under `root` passing the language
+/// filters.
+async fn matching<S: MediaStore>(
+    s: &S,
+    root: &str,
+    base: u64,
+    audio: &[&str],
+    subs: &[&str],
+) -> Vec<u64> {
+    let q = MediaQuery {
+        filters: MediaFilters {
+            path_prefix: Some(root.to_string()),
+            audio_languages: audio.iter().map(|l| l.to_string()).collect(),
+            subtitle_languages: subs.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (items, total) = s.query(&q).await.unwrap();
+    assert_eq!(total as usize, items.len());
+    let mut ids: Vec<u64> = items.iter().map(|i| i.id - base).collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A: audio fre, subs eng.  B: audio fra, subs deu.  C: audio eng, subs fre.
+/// D: audio fr.  E: audio jpn, subs eng.
+async fn seed_five<S: MediaStore>(s: &S, base: u64, root: &str) {
+    let rows = [
+        (0, vec![audio("fre")], vec![sub("eng")]),
+        (1, vec![audio("fra")], vec![sub("deu")]),
+        (2, vec![audio("eng")], vec![sub("fre")]),
+        (3, vec![audio("fr")], vec![]),
+        (4, vec![audio("jpn")], vec![sub("eng")]),
+    ];
+    for (n, a, t) in rows {
+        let mut item = movie(base + n, a, t);
+        item.path = format!("{root}/{n}.mkv").into();
+        s.put(item).await.unwrap();
+    }
+}
+
+/// OR within a list, AND across the two, fre/fra/fr one language, spellings
+/// of the request folded, blank lists inert, and a re-put moves the item.
+async fn filters_are_correct<S: MediaStore>(s: &S, base: u64) {
+    let root = format!("/lang-filter-{base}");
+    seed_five(s, base, &root).await;
+
+    macro_rules! m {
+        ($a:expr, $t:expr) => {
+            matching(s, &root, base, $a, $t)
+        };
+    }
+    assert_eq!(m!(&["fre"], &[]).await, [0, 1, 3], "fre");
+    assert_eq!(m!(&["fra"], &[]).await, [0, 1, 3], "fra");
+    assert_eq!(m!(&["FR"], &[]).await, [0, 1, 3], "fr");
+    assert_eq!(m!(&["eng"], &[]).await, [2], "eng");
+    assert_eq!(m!(&["fre", "jpn"], &[]).await, [0, 1, 3, 4], "or");
+    assert_eq!(m!(&[], &["eng"]).await, [0, 4], "subs eng");
+    assert_eq!(m!(&[], &["fra"]).await, [2], "subs fra");
+    assert_eq!(m!(&["fre"], &["eng"]).await, [0], "and");
+    assert_eq!(m!(&["fre"], &["deu"]).await, [1], "and, T spelling");
+    assert_eq!(m!(&["fre"], &["jpn"]).await, Vec::<u64>::new(), "and, none");
+    assert_eq!(m!(&["zzz"], &[]).await, Vec::<u64>::new(), "unknown");
+    assert_eq!(m!(&[" "], &[]).await, [0, 1, 2, 3, 4], "blank is inert");
+
+    let mut changed = movie(base, vec![audio("eng")], vec![]);
+    changed.path = format!("{root}/0.mkv").into();
+    s.put(changed).await.unwrap();
+    assert_eq!(m!(&["fre"], &[]).await, [1, 3]);
+    assert_eq!(m!(&["eng"], &[]).await, [0, 2]);
+    assert_eq!(m!(&[], &["eng"]).await, [4]);
+}
+
+/// The filter reads the index, not the blob: with a row retagged the blob
+/// still says `fra` yet the filter follows the table.
+async fn filter_reads_the_table<S: MediaStore + Inspect>(s: &S, base: u64) {
+    let root = format!("/lang-table-{base}");
+    let mut item = movie(base, vec![audio("fra")], vec![]);
+    item.path = format!("{root}/0.mkv").into();
+    s.put(item).await.unwrap();
+    assert_eq!(matching(s, &root, base, &["fre"], &[]).await, [0]);
+
+    s.retag_row(base as i64, "fre", "ger").await;
+    assert_eq!(
+        matching(s, &root, base, &["fre"], &[]).await,
+        Vec::<u64>::new()
+    );
+    assert_eq!(matching(s, &root, base, &["ger"], &[]).await, [0]);
+}
+
 /// A writer that does not go through `put()` (a replica on an older binary
 /// during a rolling deploy, a hand-run statement) keeps the rows right too:
 /// the triggers derive them from the blobs.
@@ -297,6 +413,11 @@ async fn any_writer_keeps_the_rows_right<S: MediaStore + Inspect>(s: &S, base: u
     let french = pharos_store_sqlx::audio_track_json::encode(&[audio("fra")]).unwrap();
     s.write_audio_blob(id, &french).await;
     assert_eq!(s.language_rows(id).await, [row("audio", "fre")]);
+    assert_eq!(matching(s, &root, base, &["fre"], &[]).await, [0]);
+    assert_eq!(
+        matching(s, &root, base, &["eng"], &[]).await,
+        Vec::<u64>::new()
+    );
 
     // A blob that is not a track list is "no tracks", not an error.
     s.write_audio_blob(id, "this is not json").await;
@@ -390,6 +511,22 @@ async fn sqlite_put_and_sweep_keep_rows_in_step() {
 }
 
 #[tokio::test]
+async fn sqlite_filters_are_correct() {
+    let s = SqliteStore::connect_without_backfill("sqlite::memory:")
+        .await
+        .unwrap();
+    filters_are_correct(&s, 100).await;
+}
+
+#[tokio::test]
+async fn sqlite_filter_reads_the_table() {
+    let s = SqliteStore::connect_without_backfill("sqlite::memory:")
+        .await
+        .unwrap();
+    filter_reads_the_table(&s, 200).await;
+}
+
+#[tokio::test]
 async fn sqlite_any_writer_keeps_the_rows_right() {
     let s = SqliteStore::connect_without_backfill("sqlite::memory:")
         .await
@@ -430,6 +567,8 @@ async fn postgres_language_index() {
     };
     let s = fresh_pg(&url, "pharos_langidx").await;
     put_and_sweep_keep_rows_in_step(&s, 920_056).await;
+    filters_are_correct(&s, 940_100).await;
+    filter_reads_the_table(&s, 940_200).await;
     any_writer_keeps_the_rows_right(&s, 940_400).await;
     rescans_of_unchanged_items_write_no_index_rows(&s, 940_500).await;
     stamping_items_seen_writes_no_index_rows(&s, 940_600).await;
