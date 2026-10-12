@@ -101,6 +101,9 @@ const TICKS_PER_MS: i64 = 10_000;
 /// Receivers echo our own command back as reports for ~0.5 s and a progress
 /// report can predate the command's effect, so the planner stays quiet this long.
 const SETTLE: Duration = Duration::from_secs(2);
+const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(250);
+/// Short enough that a TV coming back is noticed well inside the default 20 s grace.
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(4);
 
 pub fn spawn<T: CastTransport + 'static>(
     transport: T,
@@ -125,6 +128,8 @@ pub fn spawn<T: CastTransport + 'static>(
         load_deadline: None,
         sent: Vec::new(),
         user_pending_until: None,
+        loss_since: None,
+        last_cause: None,
     };
     let task = tokio::spawn(driver.run());
     CastDriverHandle { intents, task }
@@ -159,6 +164,7 @@ impl GroupClock {
 #[derive(Debug, Clone)]
 struct LoadedItem {
     item_id: String,
+    item_type: String,
 }
 
 /// The last receiver report: `position_ms` was true at `at`.
@@ -234,6 +240,21 @@ enum Exit {
     Failed(CastReason),
 }
 
+/// Why a command sequence stopped early.
+#[derive(Debug, Clone, Copy)]
+enum Halt {
+    Exit(Exit),
+    /// The connection was lost and re-established; the reload carries the group state.
+    Recovered,
+}
+
+fn settle(result: Result<(), Halt>) -> Option<Exit> {
+    match result {
+        Ok(()) | Err(Halt::Recovered) => None,
+        Err(Halt::Exit(exit)) => Some(exit),
+    }
+}
+
 struct Driver<T> {
     transport: T,
     cfg: DriverConfig,
@@ -251,6 +272,8 @@ struct Driver<T> {
     load_deadline: Option<Instant>,
     sent: Vec<Sent>,
     user_pending_until: Option<Instant>,
+    loss_since: Option<Instant>,
+    last_cause: Option<String>,
 }
 
 impl<T: CastTransport> Driver<T> {
@@ -298,8 +321,9 @@ impl<T: CastTransport> Driver<T> {
         self.transport.close().await;
         match exit {
             Exit::Ended(reason) => {
+                let detail = self.last_cause.take().unwrap_or_default();
                 self.enter(ConnState::Ended).await;
-                self.record(CastEvent::Ended, reason, "");
+                self.record(CastEvent::Ended, reason, &detail);
                 self.emit(DriverEvent::Ended { reason }).await;
             }
             Exit::Failed(reason) => {
@@ -356,11 +380,19 @@ impl<T: CastTransport> Driver<T> {
         Ok(())
     }
 
-    async fn send_or_exit(&mut self, body: CommandBody) -> Option<Exit> {
+    /// Send a command; a transport failure runs the loss path and halts the caller's sequence.
+    async fn send_cmd(&mut self, body: CommandBody) -> Result<(), Halt> {
         let name = body.name();
         match self.send(body).await {
-            Ok(()) => None,
-            Err(e) => Some(self.lost(&format!("sending {name}: {e}"))),
+            Ok(()) => Ok(()),
+            Err(e) => self.loss_halt(&format!("sending {name}: {e}")).await,
+        }
+    }
+
+    async fn loss_halt(&mut self, detail: &str) -> Result<(), Halt> {
+        match self.on_loss(detail).await {
+            Some(exit) => Err(Halt::Exit(exit)),
+            None => Err(Halt::Recovered),
         }
     }
 
@@ -378,16 +410,136 @@ impl<T: CastTransport> Driver<T> {
         Exit::Failed(CastReason::TvUnreachable)
     }
 
-    fn lost(&self, detail: &str) -> Exit {
+    /// The connection is gone: retry with backoff until `reconnect_grace` runs out,
+    /// then reload the item at the group's current position. `None` means recovered
+    /// (the driver is Loading again); `Some` is the end of the cast.
+    async fn on_loss(&mut self, detail: &str) -> Option<Exit> {
+        let since = *self.loss_since.get_or_insert_with(Instant::now);
         self.record(CastEvent::Lost, CastReason::TvUnreachable, detail);
-        Exit::Ended(CastReason::TvUnreachable)
+        tracing::warn!(tv = %self.cfg.receiver_name, detail, "cast connection lost");
+        self.load_deadline = None;
+        self.transport.close().await;
+        self.enter(ConnState::Lost).await;
+
+        let deadline = since + self.cfg.reconnect_grace;
+        let mut backoff = RECONNECT_BACKOFF_START;
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let cause = match tokio::time::timeout_at(deadline, self.reopen()).await {
+                Ok(Ok(())) => {
+                    tracing::info!(tv = %self.cfg.receiver_name, attempt, "cast reconnect attempt succeeded");
+                    return None;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!(
+                    "attempt {attempt} still running when the {:?} grace ran out",
+                    self.cfg.reconnect_grace
+                ),
+            };
+            let now = Instant::now();
+            tracing::info!(
+                tv = %self.cfg.receiver_name,
+                attempt,
+                cause = %cause,
+                backoff_ms = millis(backoff),
+                "cast reconnect attempt failed"
+            );
+            self.last_cause = Some(cause);
+            if now >= deadline {
+                return Some(Exit::Ended(CastReason::GraceExpired));
+            }
+            let wake = (now + backoff).min(deadline);
+            if let Some(exit) = self.wait_while_lost(wake).await {
+                return Some(exit);
+            }
+            backoff = backoff.saturating_mul(2).min(RECONNECT_BACKOFF_CAP);
+        }
+    }
+
+    /// Connect, relaunch and reload the current item at the group's current position.
+    async fn reopen(&mut self) -> Result<(), CastError> {
+        self.transport.connect().await?;
+        self.transport.launch(RECEIVER_APP_ID).await?;
+        let Some(item) = self.loaded.clone() else {
+            self.enter(ConnState::Connecting).await;
+            return Ok(());
+        };
+        let target = self
+            .clock
+            .map(|c| c.target_at(Instant::now()))
+            .unwrap_or(Target {
+                position_ms: 0,
+                playing: true,
+            });
+        self.start_item(item, target.position_ms, target.playing)
+            .await
+    }
+
+    async fn wait_while_lost(&mut self, wake: Instant) -> Option<Exit> {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep_until(wake) => return None,
+                intent = self.intents.recv() => match intent {
+                    None => return Some(Exit::Ended(CastReason::UserStop)),
+                    Some(intent) => {
+                        if let Some(exit) = self.on_intent_while_lost(intent) {
+                            return Some(exit);
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// Nothing can be sent while lost: remember what the group wants for the reload.
+    fn on_intent_while_lost(&mut self, intent: GroupIntent) -> Option<Exit> {
+        self.user_pending_until = None;
+        match intent {
+            GroupIntent::Stop => {
+                self.held.clear();
+                Some(Exit::Ended(CastReason::UserStop))
+            }
+            GroupIntent::Load {
+                item_id,
+                item_type,
+                position_ms,
+                playing,
+            } => {
+                self.held.clear();
+                self.set_desired(LoadedItem { item_id, item_type }, position_ms, playing);
+                None
+            }
+            GroupIntent::Play {
+                position_ms,
+                apply_at,
+            } => {
+                self.enqueue(position_ms, true, false, apply_at);
+                None
+            }
+            GroupIntent::Pause {
+                position_ms,
+                apply_at,
+            } => {
+                self.enqueue(position_ms, false, false, apply_at);
+                None
+            }
+            GroupIntent::Seek {
+                position_ms,
+                playing,
+                apply_at,
+            } => {
+                self.enqueue(position_ms, playing, true, apply_at);
+                None
+            }
+        }
     }
 
     async fn on_transport(&mut self, event: TransportEvent) -> Option<Exit> {
         match event {
             TransportEvent::Report(report) => self.on_report(report).await,
-            TransportEvent::HeartbeatLost => Some(self.lost("heartbeat lost")),
-            TransportEvent::Closed { reason } => Some(self.lost(&format!("closed: {reason}"))),
+            TransportEvent::HeartbeatLost => self.on_loss("heartbeat lost").await,
+            TransportEvent::Closed { reason } => self.on_loss(&format!("closed: {reason}")).await,
         }
     }
 
@@ -399,7 +551,13 @@ impl<T: CastTransport> Driver<T> {
                 item_type,
                 position_ms,
                 playing,
-            } => self.load(item_id, item_type, position_ms, playing).await,
+            } => {
+                self.held.clear();
+                settle(
+                    self.load(LoadedItem { item_id, item_type }, position_ms, playing)
+                        .await,
+                )
+            }
             GroupIntent::Stop => {
                 self.held.clear();
                 if let Err(e) = self.send(CommandBody::Stop).await {
@@ -431,6 +589,11 @@ impl<T: CastTransport> Driver<T> {
         force_seek: bool,
         apply_at: Instant,
     ) -> Option<Exit> {
+        self.enqueue(position_ms, playing, force_seek, apply_at);
+        self.flush_due(Instant::now()).await
+    }
+
+    fn enqueue(&mut self, position_ms: i64, playing: bool, force_seek: bool, apply_at: Instant) {
         let send_at = apply_at
             .checked_sub(self.cfg.latency_estimate)
             .unwrap_or(apply_at);
@@ -449,7 +612,6 @@ impl<T: CastTransport> Driver<T> {
                 force_seek,
             },
         );
-        self.flush_due(Instant::now()).await
     }
 
     /// Timed intents wait for the receiver to be Following: commands sent
@@ -464,27 +626,39 @@ impl<T: CastTransport> Driver<T> {
     async fn flush_due(&mut self, now: Instant) -> Option<Exit> {
         while self.next_due().is_some_and(|at| at <= now) {
             let h = self.held.pop_front()?;
-            if let Some(exit) = self
+            let applied = self
                 .apply(h.position_ms, h.playing, h.force_seek, h.apply_at)
-                .await
-            {
-                return Some(exit);
+                .await;
+            if let Err(halt) = applied {
+                return settle(Err(halt));
             }
         }
         None
     }
 
-    async fn load(
+    /// Record what the group wants on the TV, before anything is sent.
+    fn set_desired(&mut self, item: LoadedItem, position_ms: i64, playing: bool) {
+        self.clock = Some(GroupClock {
+            position_ms,
+            at: Instant::now(),
+            playing,
+        });
+        self.loaded = Some(item);
+        self.last_report = None;
+        self.planner = PlannerState::new();
+        self.expected_paused = false;
+    }
+
+    async fn start_item(
         &mut self,
-        item_id: String,
-        item_type: String,
+        item: LoadedItem,
         position_ms: i64,
         playing: bool,
-    ) -> Option<Exit> {
+    ) -> Result<(), CastError> {
         let body = CommandBody::PlayNow(PlayNowOptions {
             items: vec![PlayItem {
-                id: item_id.clone(),
-                kind: item_type,
+                id: item.item_id.clone(),
+                kind: item.item_type.clone(),
             }],
             start_index: 0,
             start_position_ticks: position_ms.saturating_mul(TICKS_PER_MS),
@@ -492,22 +666,23 @@ impl<T: CastTransport> Driver<T> {
             audio_stream_index: None,
             subtitle_stream_index: None,
         });
-        if let Some(exit) = self.send_or_exit(body).await {
-            return Some(exit);
-        }
-        self.held.clear();
-        self.clock = Some(GroupClock {
-            position_ms,
-            at: Instant::now(),
-            playing,
-        });
-        self.loaded = Some(LoadedItem { item_id });
-        self.last_report = None;
-        self.planner = PlannerState::new();
-        self.expected_paused = false;
+        self.set_desired(item, position_ms, playing);
+        self.send(body).await?;
         self.load_deadline = Some(Instant::now() + self.cfg.max_load_wait);
         self.enter(ConnState::Loading).await;
-        None
+        Ok(())
+    }
+
+    async fn load(
+        &mut self,
+        item: LoadedItem,
+        position_ms: i64,
+        playing: bool,
+    ) -> Result<(), Halt> {
+        match self.start_item(item, position_ms, playing).await {
+            Ok(()) => Ok(()),
+            Err(e) => self.loss_halt(&format!("sending PlayNow: {e}")).await,
+        }
     }
 
     /// Bring the receiver to the group's new position and play state.
@@ -517,10 +692,10 @@ impl<T: CastTransport> Driver<T> {
         playing: bool,
         force_seek: bool,
         at: Instant,
-    ) -> Option<Exit> {
+    ) -> Result<(), Halt> {
         if self.loaded.is_none() {
             tracing::debug!(tv = %self.cfg.receiver_name, position_ms, "cast intent before any Load ignored");
-            return None;
+            return Ok(());
         }
         let threshold = i64::try_from(self.cfg.planner.threshold_ms).unwrap_or(i64::MAX);
         let off = match &self.last_report {
@@ -534,23 +709,19 @@ impl<T: CastTransport> Driver<T> {
         });
         if playing && self.expected_paused {
             self.expected_paused = false;
-            if let Some(exit) = self.send_or_exit(CommandBody::Unpause).await {
-                return Some(exit);
-            }
+            self.send_cmd(CommandBody::Unpause).await?;
         }
         if !playing && !self.expected_paused {
             self.expected_paused = true;
-            if let Some(exit) = self.send_or_exit(CommandBody::Pause).await {
-                return Some(exit);
-            }
+            self.send_cmd(CommandBody::Pause).await?;
         }
         if force_seek || off {
             let body = CommandBody::Seek(SeekOptions {
                 position: position_ms as f64 / 1000.0,
             });
-            return self.send_or_exit(body).await;
+            self.send_cmd(body).await?;
         }
-        None
+        Ok(())
     }
 
     async fn on_report(&mut self, report: ReceiverReport) -> Option<Exit> {
@@ -601,17 +772,27 @@ impl<T: CastTransport> Driver<T> {
             ConnState::Loading => {
                 self.load_deadline = None;
                 self.enter(ConnState::Following).await;
+                if let Some(since) = self.loss_since.take() {
+                    self.record(
+                        CastEvent::Reconnected,
+                        CastReason::TvUnreachable,
+                        &format!(
+                            "following again {:?} after the connection was lost",
+                            now.saturating_duration_since(since)
+                        ),
+                    );
+                }
                 let playing = self.clock.map_or(true, |c| c.playing);
                 if !playing {
                     self.expected_paused = true;
-                    if let Some(exit) = self.send_or_exit(CommandBody::Pause).await {
-                        return Some(exit);
+                    if let Err(halt) = self.send_cmd(CommandBody::Pause).await {
+                        return settle(Err(halt));
                     }
                 }
                 self.flush_due(now).await
             }
             ConnState::Following if matches!(report, ReceiverReport::PlaybackProgress(_)) => {
-                self.correct(now, snapshot).await
+                settle(self.correct(now, snapshot).await)
             }
             _ => None,
         }
@@ -701,15 +882,17 @@ impl<T: CastTransport> Driver<T> {
         }
     }
 
-    async fn correct(&mut self, now: Instant, snapshot: Snapshot) -> Option<Exit> {
-        let clock = self.clock?;
+    async fn correct(&mut self, now: Instant, snapshot: Snapshot) -> Result<(), Halt> {
+        let Some(clock) = self.clock else {
+            return Ok(());
+        };
         if self.user_pending_until.is_some_and(|until| now < until) {
             tracing::debug!(tv = %self.cfg.receiver_name, "cast planner held while a receiver-originated change awaits the group");
-            return None;
+            return Ok(());
         }
         if let Some(sent) = self.last_command_at {
             if now.saturating_duration_since(sent) < SETTLE {
-                return None;
+                return Ok(());
             }
         }
         let target = clock.target_at(now);
@@ -731,7 +914,7 @@ impl<T: CastTransport> Driver<T> {
             &mut self.planner,
         );
         let (kind, body) = match action {
-            Action::None => return None,
+            Action::None => return Ok(()),
             Action::Seek { to_ms } => (
                 CorrectionKind::Seek,
                 CommandBody::Seek(SeekOptions {
@@ -757,7 +940,7 @@ impl<T: CastTransport> Driver<T> {
             CorrectionKind::Resume => self.expected_paused = false,
             CorrectionKind::Seek => {}
         }
-        self.send_or_exit(body).await
+        self.send_cmd(body).await
     }
 }
 
@@ -1353,5 +1536,201 @@ mod tests {
         let heard = user_events(&mut rig.events);
         assert!(heard.is_empty(), "echoes leaked as user actions: {heard:?}");
         assert!(rig.fake.commands().len() >= 5, "{:?}", names(&rig));
+    }
+
+    fn play_now_start_ms(cmd: &crate::messages::ReceiverCommand) -> i64 {
+        match &cmd.body {
+            CommandBody::PlayNow(o) => o.start_position_ticks / TICKS_PER_MS,
+            other => panic!("expected PlayNow, got {other:?}"),
+        }
+    }
+
+    fn lift_refusal_after(fake: &FakeReceiverHandle, after: Duration) {
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            fake.configure(|c| c.refuse_connect = false);
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_connection_is_retried_with_backoff_and_resumes_at_the_group_position() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(10_000, true).await;
+        rig.until_state(ConnState::Following).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let lost_at = Instant::now();
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+        lift_refusal_after(&rig.fake, Duration::from_secs(6));
+
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Lost));
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Loading));
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Following));
+        let down = lost_at.elapsed();
+        assert!(
+            down >= Duration::from_secs(6) && down <= Duration::from_secs(10),
+            "reconnected after {down:?}"
+        );
+
+        let cmds = rig.fake.commands();
+        assert_eq!(cmds.len(), 2, "{cmds:?}");
+        let resumed_at = play_now_start_ms(cmds.get(1).unwrap());
+        assert!(
+            (18_000..=22_000).contains(&resumed_at),
+            "re-Load must start at the group's current position, got {resumed_at}"
+        );
+        assert!((rig.fake.state().position_ms - resumed_at).abs() < 500);
+
+        let all = series(&snap);
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "lost")),
+            1
+        );
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "reconnected")),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tv_that_stays_away_ends_the_cast_when_the_grace_expires() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        let lost_at = Instant::now();
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Lost));
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Ended));
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::Ended {
+                reason: CastReason::GraceExpired
+            }
+        );
+        assert_eq!(lost_at.elapsed(), Duration::from_secs(20));
+        let all = series(&snap);
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "lost")),
+            1
+        );
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("reason", "grace_expired")),
+            1
+        );
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "reconnected")),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_failed_reconnect_names_its_cause_in_the_seat_log() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(VecWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+        rig.until_state(ConnState::Ended).await;
+
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let ended = text
+            .lines()
+            .find(|l| l.contains("cast seat") && l.contains("grace_expired"))
+            .unwrap_or_else(|| panic!("no grace_expired seat line in:\n{text}"));
+        assert!(ended.contains("refuse_connect set"), "{ended}");
+        let lost = text
+            .lines()
+            .find(|l| l.contains("cast seat") && l.contains("event=\"lost\""))
+            .unwrap_or_else(|| panic!("no lost seat line in:\n{text}"));
+        assert!(lost.contains("connection dropped"), "{lost}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_while_lost_ends_at_once_without_waiting_for_the_grace() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Lost));
+        let t = Instant::now();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.handle.send(GroupIntent::Stop).await.unwrap();
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Ended));
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::Ended {
+                reason: CastReason::UserStop
+            }
+        );
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn group_intents_arriving_while_lost_shape_the_reload() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+        lift_refusal_after(&rig.fake, Duration::from_secs(3));
+        assert_eq!(rig.next().await, DriverEvent::State(ConnState::Lost));
+        rig.handle
+            .send(GroupIntent::Seek {
+                position_ms: 100_000,
+                playing: false,
+                apply_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        rig.until_state(ConnState::Following).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let state = rig.fake.state();
+        assert!(state.paused, "{state:?}");
+        assert!((state.position_ms - 100_000).abs() < 300, "{state:?}");
+    }
+
+    #[derive(Clone)]
+    struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VecWriter {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedBuf(self.0.clone())
+        }
+    }
+
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
