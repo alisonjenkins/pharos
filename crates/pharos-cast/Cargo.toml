@@ -13,6 +13,7 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 metrics-util.workspace = true
+proptest = "1"
 tracing-subscriber.workspace = true
 
 [lints]
