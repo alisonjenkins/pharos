@@ -33,7 +33,7 @@ description: "Task list for SyncPlay Cast Target"
 
 ### Spikes (record each outcome in `research.md`; they may change later tasks)
 
-- [ ] T005 Spike S1: choose CASTV2 crate vs `rustls`+`prost` (licence vs AGPL-3.0-or-later, async, maintenance); capture the real `PlayNow` / `Seek` / `Pause` / `Unpause` / `Stop` message shapes and receiver progress messages from `jellyfin/jellyfin-chromecast`; confirm TV-token mint path in `crates/pharos-server/src/api/jellyfin/auth_extractor.rs` and the token store, and whether the token store supports per-token scopes (if not, size the smallest addition and give it its own task before T052)
+- [X] T005 Spike S1: choose CASTV2 crate vs `rustls`+`prost` (licence vs AGPL-3.0-or-later, async, maintenance); capture the real `PlayNow` / `Seek` / `Pause` / `Unpause` / `Stop` message shapes and receiver progress messages from `jellyfin/jellyfin-chromecast`; confirm TV-token mint path in `crates/pharos-server/src/api/jellyfin/auth_extractor.rs` and the token store, and whether the token store supports per-token scopes (if not, size the smallest addition and give it its own task before T052)
 - [ ] T006 [P] Spike S4: in `compat-playwright/`, confirm jellyfin-web 10.11.x lists a server-supplied `GET /Sessions` entry in its device picker; record the minimal field set and fix `supports_remote_control` inconsistency between REST (`sessions.rs:167`) and socket broadcast (`socket.rs ~895-915`) as a failing test in `crates/pharos-server/tests/jellyfin_sessions.rs`
 - [ ] T007 [P] Spike S3: in `compat-playwright/`, with two jellyfin-web contexts in a SyncPlay group, send the first context a `PlayState` `Stop` over its socket and record whether it stops locally or turns it into a SyncPlay request
 
@@ -53,7 +53,7 @@ description: "Task list for SyncPlay Cast Target"
 - [X] T016 Implement the receiver emulator `FakeReceiver` in `crates/pharos-cast/src/fake.rs`: handles the stock command set, mirrors `playbackstart/progress/stop` every 1.5 s, injectable latency, drift, drop-connection and seek-inaccuracy; unit tests for each knob
 - [ ] T017 Implement the real CASTV2 `CastTransport` in `crates/pharos-cast/src/transport.rs` per spike S1 (TLS 8009, heartbeat, launch `F007D354`), with connect timeout and retry with backoff; integration test against the emulator exposed over a local TLS socket if the chosen crate allows, else gated behind a `real-tv` feature
 - [X] T018 [P] Add `[cast]` / `[[cast.tvs]]` config in `crates/pharos-server/src/config.rs` per `contracts/cast-surface.md` with validation errors naming the entry and value; test valid, duplicate-name and bad-address cases
-- [ ] T019 Add TV-token mint and revoke in `crates/pharos-server/src/cast.rs` (device-bound, bounded lifetime, hashed at rest, id returned separately from secret); tests: bounded lifetime, revoked token fails auth, secret absent from `Debug` and logs (V8)
+- [X] T019 Add TV-token mint and revoke in `crates/pharos-server/src/cast.rs` (device-bound, bounded lifetime, hashed at rest, id returned separately from secret); tests: bounded lifetime, revoked token fails auth, secret absent from `Debug` and logs (V8)
 
 - [X] T057 [P] Failing test then fix: leader election in `crates/pharos-sync/src/group.rs` (`elect_leader`, `remove_member`) never picks a `Controller` or `CastSeat` while a `Player` is connected, so leader-only commands and handoff Pause stay answerable (found in review of T009)
 - [X] T058 [P] Failing test then fix: `MemberJoined`/`MemberLeft` broadcasts do not announce a hidden `CastSeat` as a separate member when its paired `Controller` exists, consistent with the collapsed roster (`crates/pharos-sync/src/group.rs`, review of T051)
@@ -79,7 +79,7 @@ description: "Task list for SyncPlay Cast Target"
 
 - [ ] T050 [P] [US1] (roster test done in 26e279d2; `tv_busy`, slow-Loading and stable-session-id tests remain) Failing tests: the roster shows a casting user once (TV as device) in `crates/pharos-sync/tests/group_conformance.rs`; a `tv_busy` rejection, a slow-Loading start within the freeze bound, and a decode-failure end with a reason in `crates/pharos-server/tests/cast_start.rs`; virtual session id is stable across restart in `cast_virtual_session.rs` (analyze F1, F6, F11)
 - [X] T051 [US1] Implement the one-entry roster projection in `crates/pharos-sync/src/group.rs` (group-update/roster builder) so T050 passes
-- [ ] T052 [US1] Scope the TV token to playback endpoints only in `crates/pharos-server/src/cast.rs` and add a test that it is refused on admin and library-mutation routes (analyze F8)
+- [ ] T052 [US1] Scope the TV token to playback endpoints only (analyze F8). T005 found tokens carry NO scope field, so this needs: a nullable `scope` column on `auth_tokens` (sqlite + postgres migrations, `just test-postgres` afterwards), `TokenStore::issue_with_ttl` taking a scope, the scope returned by `resolve`, and a check in the `AuthUser`/`AuthSession` extractors (`crates/pharos-server/src/api/jellyfin/auth_extractor.rs`) that refuses a `Playback`-scoped token on admin and library-mutation routes; plus a test that proves the refusal through the real extractor. Replace the `// T052:` comment at the mint site in `crates/pharos-server/src/cast.rs`
 
 ### Implementation
 
