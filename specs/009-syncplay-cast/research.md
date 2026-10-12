@@ -108,3 +108,22 @@ On start, the sender's own player must stop or it plays twice. The server sends 
 6. Heartbeat or TLS loss kills the virtual connection and the receiver app may exit without a message, which the `Lost` state treats like any other connection loss.
 
 UNVERIFIED still: the `@jellyfin/sdk` Authorization header string the receiver sends; `PlayNext` while idle; whether `F007D354` is the id of the code read (the id is registered in the Google Cast console, not in source); idle-timeout behaviour in production receivers.
+
+## T005 outcome: token store
+
+Read-only investigation of how access tokens work today (2026-10-12).
+
+**What exists**
+- `pharos_core::TokenStore` (`crates/pharos-core/src/auth.rs`): `issue(user, device_id) -> AuthToken`, `resolve(token) -> UserId`, `revoke(token)`, `tokens_for(user)`, `revoke_tokens_by_device(user, device_id)`. Impls: `SqliteStore` (`auth_sqlite.rs`), `PostgresStore` (`postgres.rs`), `AnyStore` dispatch (`any.rs`).
+- Created: `Uuid::new_v4().simple()` secret, returned once as `AuthToken(SecretString)`. Stored hashed: only `SHA-256(token)` hex is in `auth_tokens.token_hash` (PK), with `user_id`, `device_id`, `created_at`, `expires_at` (migration 0030). A DB leak yields no usable tokens.
+- Looked up: `resolve` hashes the presented token and matches `expires_at IS NULL OR expires_at > now`. The `AuthUser` / `AuthSession` extractors (`api/jellyfin/auth_extractor.rs`) read the token from X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization / Authorization, `api_key`, or the `JellyfinAuth` cookie, then `resolve` and `UserStore::get`. A store `Backend` error answers 503, anything else 401 (B216 / V165).
+- Expired: fixed 90-day TTL (`auth_token::TTL_SECS`, private to `pharos-store-sqlx`); expiry is enforced in `resolve`. There is no sweeper; expired rows stay until the user is deleted.
+- Revoked: `revoke(secret)` deletes the row (idempotent), `revoke_tokens_by_device(user, device_id)` deletes by device, user deletion cascades.
+
+**Device binding**: `device_id` is stored at issue time but never compared on `resolve`. A request carrying the token with a different `DeviceId` header is accepted (the extractor only uses `DeviceId` as a session key for SyncPlay via `AuthSession`). So consequence 2 needs no auth change.
+
+**Scope**: tokens carry no scope or permission field. Every token authenticates as its user with that user's full policy (an owner token reaches admin routes if the owner is admin). T052 therefore needs a new column plus a check in the extractor; it cannot be done in `cast.rs` alone.
+
+**Sessions**: `SessionRegistry` is keyed by `PlaySessionId` for `Playing`/`Progress`/`Stopped`; `Capabilities` is keyed `"<user>-<DeviceId header>"`. Nothing is keyed by token. Receiver reports with the receiver's own DeviceId create a record whose `DeviceId` is `btoa(receiverName)`, separate from any virtual TV session the cast driver creates, and `Capabilities/Full` creates a second record under the receiver's device id. The cast session layer must key by `PlaySessionId`, not device.
+
+**Missing (what T019 had to add)**: a caller-chosen lifetime (only the 90-day constant existed) and a token id separate from the secret (revoke needed the secret). Added as `TokenStore::issue_with_ttl` and `TokenStore::revoke_by_id`, where the id is the stored SHA-256 hash.
