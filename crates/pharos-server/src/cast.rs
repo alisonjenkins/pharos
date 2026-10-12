@@ -5,7 +5,7 @@
 //! its own. It goes through the normal token path ([`TokenStore`]): hashed at
 //! rest, expiring, revocable.
 
-use pharos_core::{AuthError, AuthToken, SecretString, TokenId, TokenStore, UserId};
+use pharos_core::{AuthError, AuthToken, SecretString, TokenId, TokenScope, TokenStore, UserId};
 use std::time::Duration;
 
 /// How long a TV token lives when the caller has no better bound: one
@@ -108,7 +108,7 @@ pub async fn mint_tv_token<S: TokenStore>(
             lifetime,
         })?;
     match store
-        .issue_with_ttl(user, &tv_device_id(tv_name), ttl_secs)
+        .issue_with_ttl(user, &tv_device_id(tv_name), ttl_secs, TokenScope::Full)
         .await
     {
         Ok(issued) => Ok(TvToken {

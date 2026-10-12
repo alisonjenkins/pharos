@@ -23,10 +23,10 @@ use pharos_core::{
     ItemPerson, Library, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata,
     MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person,
     PersonCount, PersonKind, PersonRef, PersonStore, PlaybackProgress, Playlist, PlaylistEntry,
-    PlaylistStore, PreferenceStore, ScanState, SecretString, SeriesInfo, SeriesMatchCandidate,
-    SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
-    TagCount, TagStore, TokenId, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    PlaylistStore, PreferenceStore, ResolvedToken, ScanState, SecretString, SeriesInfo,
+    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore,
+    SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope, TokenStore,
+    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -3034,7 +3034,12 @@ impl PostgresStore {
 impl TokenStore for PostgresStore {
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
         Ok(self
-            .issue_with_ttl(user_id, device_id, crate::auth_token::TTL_SECS)
+            .issue_with_ttl(
+                user_id,
+                device_id,
+                crate::auth_token::TTL_SECS,
+                TokenScope::Full,
+            )
             .await?
             .secret)
     }
@@ -3045,6 +3050,7 @@ impl TokenStore for PostgresStore {
         user_id: UserId,
         device_id: &str,
         ttl_secs: i64,
+        scope: TokenScope,
     ) -> AuthResult<IssuedToken> {
         // The raw token is returned to the client but never stored — only
         // its SHA-256 hash is persisted (a DB leak must not yield usable
@@ -3054,14 +3060,15 @@ impl TokenStore for PostgresStore {
         let now = now_unix_secs();
         let user_bytes = user_id.0.as_bytes().to_vec();
         sqlx::query(
-            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(&id)
         .bind(user_bytes)
         .bind(device_id)
         .bind(now)
         .bind(now.saturating_add(ttl_secs))
+        .bind(scope.to_stored())
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -3082,8 +3089,24 @@ impl TokenStore for PostgresStore {
     }
 
     #[tracing::instrument(skip(self, token))]
-    async fn resolve(&self, token: &str) -> AuthResult<UserId> {
-        self.user_for_token_hash(&self.token_id(token)).await
+    async fn resolve_scoped(&self, token: &str) -> AuthResult<ResolvedToken> {
+        // Look up by hash and reject expired tokens (expires_at NULL = never).
+        let row: Option<(Vec<u8>, Option<String>)> = sqlx::query_as(
+            "SELECT user_id, scope FROM auth_tokens \
+             WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > $2)",
+        )
+        .bind(crate::auth_token::hash(token))
+        .bind(now_unix_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let (bytes, scope) = row.ok_or(AuthError::InvalidToken)?;
+        let uuid =
+            Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
+        Ok(ResolvedToken {
+            user: UserId(uuid),
+            scope: TokenScope::from_stored(scope.as_deref())?,
+        })
     }
 
     fn token_id(&self, token: &str) -> String {
