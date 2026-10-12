@@ -123,6 +123,8 @@ pub fn spawn<T: CastTransport + 'static>(
         expected_paused: false,
         held: VecDeque::new(),
         load_deadline: None,
+        sent: Vec::new(),
+        user_pending_until: None,
     };
     let task = tokio::spawn(driver.run());
     CastDriverHandle { intents, task }
@@ -195,6 +197,37 @@ async fn sleep_until_opt(at: Option<Instant>) {
     }
 }
 
+/// What a command we sent should make the receiver report back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    Load,
+    Stop,
+    Pause,
+    Unpause,
+    Seek { to_ms: i64 },
+}
+
+impl Effect {
+    fn of(body: &CommandBody) -> Option<Self> {
+        match body {
+            CommandBody::PlayNow(_) => Some(Self::Load),
+            CommandBody::Stop => Some(Self::Stop),
+            CommandBody::Pause => Some(Self::Pause),
+            CommandBody::Unpause => Some(Self::Unpause),
+            CommandBody::Seek(o) => Some(Self::Seek {
+                to_ms: (o.position * 1000.0).round() as i64,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sent {
+    at: Instant,
+    effect: Effect,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
     Ended(CastReason),
@@ -216,6 +249,8 @@ struct Driver<T> {
     expected_paused: bool,
     held: VecDeque<Held>,
     load_deadline: Option<Instant>,
+    sent: Vec<Sent>,
+    user_pending_until: Option<Instant>,
 }
 
 impl<T: CastTransport> Driver<T> {
@@ -307,9 +342,16 @@ impl<T: CastTransport> Driver<T> {
 
     async fn send(&mut self, body: CommandBody) -> Result<(), CastError> {
         let name = body.name();
+        let effect = Effect::of(&body);
         let command = self.envelope(body);
         self.transport.send(&command).await?;
-        self.last_command_at = Some(Instant::now());
+        let now = Instant::now();
+        self.last_command_at = Some(now);
+        self.sent
+            .retain(|s| now.saturating_duration_since(s.at) <= SETTLE);
+        if let Some(effect) = effect {
+            self.sent.push(Sent { at: now, effect });
+        }
         tracing::debug!(tv = %self.cfg.receiver_name, command = name, "cast command sent");
         Ok(())
     }
@@ -350,6 +392,7 @@ impl<T: CastTransport> Driver<T> {
     }
 
     async fn on_intent(&mut self, intent: GroupIntent) -> Option<Exit> {
+        self.user_pending_until = None;
         match intent {
             GroupIntent::Load {
                 item_id,
@@ -528,6 +571,14 @@ impl<T: CastTransport> Driver<T> {
             }
         }
         if matches!(report, ReceiverReport::PlaybackStop(_)) {
+            if self.state == ConnState::Following {
+                if self.echoes(now, |e| matches!(e, Effect::Stop)) {
+                    tracing::debug!(tv = %self.cfg.receiver_name, "cast playbackstop is the echo of our own command");
+                } else {
+                    self.user_acted(now, "stop", None);
+                    self.emit(DriverEvent::UserStopped).await;
+                }
+            }
             return None;
         }
         let Some(ticks) = ps.position_ticks else {
@@ -539,7 +590,13 @@ impl<T: CastTransport> Driver<T> {
             paused: ps.is_paused.unwrap_or(false),
             at: now,
         };
-        self.last_report = Some(snapshot);
+        let previous = self.last_report.replace(snapshot);
+        if self.state == ConnState::Following {
+            if let Some(previous) = previous {
+                let changed = matches!(report, ReceiverReport::PlayStateChange(_));
+                self.classify(now, previous, snapshot, changed).await;
+            }
+        }
         match self.state {
             ConnState::Loading => {
                 self.load_deadline = None;
@@ -560,8 +617,96 @@ impl<T: CastTransport> Driver<T> {
         }
     }
 
+    fn echoes(&self, now: Instant, matches: impl Fn(&Effect) -> bool) -> bool {
+        self.sent
+            .iter()
+            .any(|s| now.saturating_duration_since(s.at) <= SETTLE && matches(&s.effect))
+    }
+
+    fn user_acted(&mut self, now: Instant, what: &str, position_ms: Option<i64>) {
+        let cooldown = Duration::from_millis(self.cfg.planner.cooldown_ms);
+        self.user_pending_until = Some(now + cooldown);
+        tracing::info!(
+            tv = %self.cfg.receiver_name,
+            what,
+            position_ms,
+            hold_planner_ms = self.cfg.planner.cooldown_ms,
+            "cast receiver-originated change, not caused by a command of ours"
+        );
+    }
+
+    /// Tell a change the TV made itself from the echo of a command we sent.
+    async fn classify(
+        &mut self,
+        now: Instant,
+        previous: Snapshot,
+        current: Snapshot,
+        is_state_change: bool,
+    ) {
+        if previous.paused != current.paused {
+            let paused = current.paused;
+            let ours = self.echoes(now, |e| {
+                matches!(
+                    (e, paused),
+                    (Effect::Pause, true) | (Effect::Unpause, false)
+                )
+            });
+            if ours {
+                tracing::debug!(tv = %self.cfg.receiver_name, paused, "cast play state change is the echo of our own command");
+            } else {
+                self.expected_paused = paused;
+                self.user_acted(
+                    now,
+                    if paused { "pause" } else { "resume" },
+                    Some(current.position_ms),
+                );
+                let position_ms = current.position_ms;
+                self.emit(if paused {
+                    DriverEvent::UserPaused { position_ms }
+                } else {
+                    DriverEvent::UserResumed { position_ms }
+                })
+                .await;
+            }
+        }
+        if !is_state_change {
+            return;
+        }
+        let threshold = i64::try_from(self.cfg.planner.threshold_ms).unwrap_or(i64::MAX);
+        let jump = current
+            .position_ms
+            .saturating_sub(previous.position_at(now))
+            .abs();
+        if jump <= threshold {
+            return;
+        }
+        let before = previous.position_at(now);
+        // A seek lands with receiver error, so match its direction, not its landing point.
+        let moved = current.position_ms.saturating_sub(before).signum();
+        let ours = self.sent.iter().any(|s| match s.effect {
+            Effect::Seek { to_ms } => {
+                now.saturating_duration_since(s.at) <= SETTLE
+                    && to_ms.saturating_sub(before).signum() == moved
+            }
+            _ => false,
+        });
+        if ours {
+            tracing::debug!(tv = %self.cfg.receiver_name, jump_ms = jump, "cast position jump is the echo of our own seek");
+        } else {
+            self.user_acted(now, "seek", Some(current.position_ms));
+            self.emit(DriverEvent::UserSeeked {
+                position_ms: current.position_ms,
+            })
+            .await;
+        }
+    }
+
     async fn correct(&mut self, now: Instant, snapshot: Snapshot) -> Option<Exit> {
         let clock = self.clock?;
+        if self.user_pending_until.is_some_and(|until| now < until) {
+            tracing::debug!(tv = %self.cfg.receiver_name, "cast planner held while a receiver-originated change awaits the group");
+            return None;
+        }
         if let Some(sent) = self.last_command_at {
             if now.saturating_duration_since(sent) < SETTLE {
                 return None;
@@ -1052,5 +1197,161 @@ mod tests {
             counter(&all, "pharos_cast_seat_total", ("reason", "tv_unreachable")),
             1
         );
+    }
+
+    fn user_events(events: &mut mpsc::Receiver<DriverEvent>) -> Vec<DriverEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if !matches!(ev, DriverEvent::State(_)) {
+                out.push(ev);
+            }
+        }
+        out
+    }
+
+    async fn following_rig() -> Rig {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_on_the_tv_remote_is_reported_and_not_undone() {
+        let mut rig = following_rig().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        rig.fake.user_pause();
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::UserPaused { position_ms: 2_000 }
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            names(&rig),
+            ["PlayNow"],
+            "no Unpause while the group decides"
+        );
+        assert!(rig.fake.state().paused);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_on_the_tv_remote_is_reported() {
+        let mut rig = following_rig().await;
+        rig.handle
+            .send(GroupIntent::Pause {
+                position_ms: 0,
+                apply_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            user_events(&mut rig.events).is_empty(),
+            "our own Pause is not the user"
+        );
+        rig.fake.user_unpause();
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::UserResumed { position_ms: 0 }
+        );
+        assert_eq!(names(&rig), ["PlayNow", "Pause"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_seek_on_the_tv_remote_is_reported_then_corrected_only_after_one_cooldown() {
+        let mut rig = following_rig().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        rig.fake.user_seek(Duration::from_secs(90));
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::UserSeeked {
+                position_ms: 90_000
+            }
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            names(&rig),
+            ["PlayNow"],
+            "planner is quiet while the group answers"
+        );
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            names(&rig),
+            ["PlayNow", "Seek"],
+            "unanswered for a cooldown: the planner takes over again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_group_answer_ends_the_suppression() {
+        let mut rig = following_rig().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        rig.fake.user_seek(Duration::from_secs(90));
+        assert!(matches!(rig.next().await, DriverEvent::UserSeeked { .. }));
+        rig.handle
+            .send(GroupIntent::Seek {
+                position_ms: 3_000,
+                playing: true,
+                apply_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(names(&rig), ["PlayNow", "Seek"]);
+        assert!(
+            user_events(&mut rig.events).is_empty(),
+            "{:?}",
+            rig.fake.state()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_on_the_tv_remote_is_reported_without_ending_the_driver() {
+        let mut rig = following_rig().await;
+        rig.fake.user_stop();
+        assert_eq!(rig.next().await, DriverEvent::UserStopped);
+        assert!(!rig.handle.is_finished());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn our_own_commands_and_their_echoes_are_never_reported_as_the_user() {
+        let fake_cfg = FakeReceiverConfig {
+            command_latency_ms: 150,
+            drift_ms: 3_000,
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        let intents = [
+            GroupIntent::Seek {
+                position_ms: 60_000,
+                playing: true,
+                apply_at: Instant::now(),
+            },
+            GroupIntent::Pause {
+                position_ms: 61_000,
+                apply_at: Instant::now() + Duration::from_secs(1),
+            },
+            GroupIntent::Play {
+                position_ms: 61_000,
+                apply_at: Instant::now() + Duration::from_secs(3),
+            },
+            GroupIntent::Load {
+                item_id: "item-2".into(),
+                item_type: "Movie".into(),
+                position_ms: 10_000,
+                playing: true,
+            },
+        ];
+        for intent in intents {
+            rig.handle.send(intent).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let heard = user_events(&mut rig.events);
+        assert!(heard.is_empty(), "echoes leaked as user actions: {heard:?}");
+        assert!(rig.fake.commands().len() >= 5, "{:?}", names(&rig));
     }
 }
