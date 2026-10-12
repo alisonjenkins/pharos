@@ -83,6 +83,13 @@ pub enum SocketBroadcast {
         command: String,
         arg: serde_json::Value,
     },
+    /// A cast started or ended through a route. Not a wire message: the cast
+    /// directory refreshes its cache on it and then sends [`Self::SessionsChanged`].
+    CastChanged,
+    /// The set of sessions changed with no playback event behind it (a cast
+    /// started or ended). Each socket answers with a `Sessions` patch carrying
+    /// the virtual TV sessions its viewer may see, so the picker refreshes.
+    SessionsChanged,
     /// P10 — playback progress update fans out so jellyfin-web's
     /// "Currently Watching" sidebar + remote-control UIs reflect the
     /// active position without polling. Fired by
