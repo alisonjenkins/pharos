@@ -665,7 +665,12 @@ async fn join_group(
     no_content()
 }
 
-async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpResponse {
+async fn leave_group(
+    auth: AuthSession,
+    hub: web::Data<SessionHub>,
+    state: web::Data<crate::state::AppState>,
+) -> HttpResponse {
+    end_owned_cast(&state, &auth).await;
     if let Some(dev) = auth.sync_key() {
         if let Some(sess) = hub.resolve(&dev) {
             if let Some(h) = hub.detach_group(&dev) {
@@ -689,6 +694,24 @@ async fn leave_group(auth: AuthSession, hub: web::Data<SessionHub>) -> HttpRespo
         }
     }
     no_content()
+}
+
+/// A user who owns a cast seat cannot leave the group and keep it: the seat
+/// would outlive the member it stands for. Ending it first (reason
+/// `owner_left`) also restores the owner and retracts the seat from the roster
+/// before the owner's own removal is announced. Idempotent: no seat, no-op.
+async fn end_owned_cast(state: &crate::state::AppState, auth: &AuthSession) {
+    let Some(service) = state.cast.service() else {
+        return;
+    };
+    let user = auth.user.id;
+    if !service.snapshot().await.iter().any(|c| c.owner == user) {
+        return;
+    }
+    service
+        .stop(user, pharos_cast::events::CastReason::OwnerLeft)
+        .await;
+    let _ = state.bus.send(crate::state::SocketBroadcast::CastChanged);
 }
 
 async fn set_new_queue(
