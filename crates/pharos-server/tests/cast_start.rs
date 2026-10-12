@@ -146,3 +146,43 @@ async fn rejections_use_stable_reasons_and_statuses_that_name_who_is_at_fault() 
     assert!(body.starts_with("tv_busy"), "{body}");
     assert_eq!(rig.service.snapshot().await.len(), 1, "bob took no seat");
 }
+
+#[actix_web::test]
+async fn the_owner_alone_is_told_to_stop_its_local_player() {
+    let mut rig = CastRig::new().await;
+    rig.bus_events();
+
+    let (status, body) = rig.play_on_tv(&rig.alice).await;
+    assert_eq!(status, 204, "{body}");
+
+    let targeted: Vec<_> = rig
+        .bus_events()
+        .into_iter()
+        .filter_map(|b| match b {
+            SocketBroadcast::DeviceCommand {
+                device_key,
+                controlling_user_id,
+                command,
+                ..
+            } => Some((device_key, controlling_user_id, command)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        targeted,
+        vec![(
+            rig.alice.key.clone(),
+            rig.alice.id.0.simple().to_string(),
+            "Stop".to_string()
+        )]
+    );
+
+    let (status, _) = rig.play_on_tv(&rig.bob).await;
+    assert_eq!(status, 409);
+    assert!(
+        !rig.bus_events()
+            .iter()
+            .any(|b| matches!(b, SocketBroadcast::DeviceCommand { .. })),
+        "a refused start leaves the caller's player alone"
+    );
+}
