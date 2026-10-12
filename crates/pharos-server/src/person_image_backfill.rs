@@ -88,7 +88,6 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use pharos_store_sqlx::sqlite::SqliteStore;
 
     /// Resolves every name to a deterministic CDN-shaped URL — no network.
     struct FakeResolver;
@@ -108,8 +107,8 @@ mod tests {
         }
     }
 
-    async fn store() -> SqliteStore {
-        SqliteStore::connect("sqlite::memory:")
+    async fn store() -> Stores {
+        Stores::connect("sqlite::memory:")
             .await
             .expect("connect in-memory sqlite")
     }
