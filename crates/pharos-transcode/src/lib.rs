@@ -25,6 +25,7 @@ pub mod options;
 pub mod probe;
 pub mod protocol;
 pub mod rate_store;
+pub mod resident_preflight;
 pub mod scheduler;
 pub mod segment;
 pub mod subwin;
