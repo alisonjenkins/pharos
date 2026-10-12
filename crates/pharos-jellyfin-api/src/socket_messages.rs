@@ -169,6 +169,17 @@ pub struct SessionPlayStateLite {
 pub struct SessionsBroadcastEntry {
     pub id: String,
     pub user_id: String,
+    /// Identity of the device behind the session. Progress patches omit these
+    /// (the client already holds them); a session the client has never seen,
+    /// such as a configured Cast TV, needs them to be listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     pub playable_media_types: Vec<&'static str>,
     pub last_activity_date: String,
     pub last_playback_check_in: String,

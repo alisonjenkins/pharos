@@ -4,6 +4,7 @@ pub mod bg_io;
 pub mod book_convert;
 pub mod book_cover;
 pub mod cast;
+pub mod cast_sessions;
 pub mod cli;
 pub mod config;
 pub mod dlna;

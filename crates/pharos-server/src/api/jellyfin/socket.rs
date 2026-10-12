@@ -254,6 +254,10 @@ async fn handle_connection<S>(
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
     let started = Instant::now();
+    let viewer = crate::cast_sessions::ViewerInfo {
+        user_id: bound_user_id.clone(),
+        is_admin,
+    };
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
     // Register this socket so HTTP SyncPlay handlers can reach it by deviceId.
@@ -395,10 +399,13 @@ async fn handle_connection<S>(
                     &state, &bound_user_id, is_admin,
                 ).await {
                     Ok(list) => {
-                        let out = Outbound::new(
+                        let mut out = Outbound::new(
                             "Sessions",
                             serde_json::to_value(&list).unwrap_or_else(|_| serde_json::json!([])),
                         );
+                        if let Some(directory) = &state.cast_directory {
+                            append_virtual_sessions(&mut out, directory.as_ref(), &viewer);
+                        }
                         if send_outbound(&mut session, &out).await.is_err() {
                             break 'pump SocketCloseCause::SendFailed;
                         }
@@ -467,7 +474,10 @@ async fn handle_connection<S>(
                         continue;
                     }
                 }
-                if let Some(out) = translate_broadcast(b) {
+                if let Some(mut out) = translate_broadcast(b) {
+                    if let Some(directory) = &state.cast_directory {
+                        append_virtual_sessions(&mut out, directory.as_ref(), &viewer);
+                    }
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump SocketCloseCause::SendFailed;
                     }
@@ -1007,6 +1017,29 @@ async fn send_outbound(session: &mut Session, msg: &Outbound) -> Result<(), acti
 /// Translate a server-side `SocketBroadcast` into a Jellyfin-shaped
 /// `Outbound`. T40 phase 2 — keeps the wire format identical to what
 /// jellyfin-web expects when it subscribes via Sessions/LibraryChanged.
+/// Add the TVs `viewer` may see to a `Sessions` patch, built from the same
+/// projection `GET /Sessions` uses so both surfaces carry identical values.
+fn append_virtual_sessions(
+    out: &mut Outbound,
+    directory: &dyn crate::cast_sessions::CastDirectory,
+    viewer: &crate::cast_sessions::ViewerInfo,
+) {
+    if out.message_type != "Sessions" {
+        return;
+    }
+    let Some(entries) = out.data.as_array_mut() else {
+        return;
+    };
+    for tv in crate::cast_sessions::visible_sessions(directory, viewer) {
+        match serde_json::to_value(SessionsBroadcastEntry::from(&tv)) {
+            Ok(v) => entries.push(v),
+            Err(e) => {
+                tracing::warn!(tv = %tv.device_name, error = %e, "cast: virtual session not serialisable; omitted from Sessions patch");
+            }
+        }
+    }
+}
+
 pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     match b {
         SocketBroadcast::LibraryChanged { added, removed } => {
@@ -1078,6 +1111,10 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             let entry = SessionsBroadcastEntry {
                 id: session_id,
                 user_id,
+                user_name: None,
+                device_id: None,
+                device_name: None,
+                client: None,
                 playable_media_types: Vec::new(),
                 last_activity_date: now_iso.clone(),
                 last_playback_check_in: now_iso,

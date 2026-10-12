@@ -7,7 +7,7 @@
 use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::{
     api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser},
-    sessions::SessionEvent,
+    sessions::{SessionEvent, SessionRecord},
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
@@ -150,13 +150,24 @@ async fn list_sessions(
     state: web::Data<AppState>,
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let visible = visible_sessions(
+    let mut visible = visible_sessions(
         &state,
         &user.0.id.0.simple().to_string(),
         user.0.policy.admin,
     )
     .await
     .map_err(error::ErrorInternalServerError)?;
+    if let Some(directory) = &state.cast_directory {
+        let viewer = crate::cast_sessions::ViewerInfo {
+            user_id: user.0.id.0.simple().to_string(),
+            is_admin: user.0.policy.admin,
+        };
+        visible.extend(
+            crate::cast_sessions::visible_sessions(directory.as_ref(), &viewer)
+                .iter()
+                .map(SessionRecord::from),
+        );
+    }
     Ok(crate::api::jellyfin::wire::json(&visible))
 }
 

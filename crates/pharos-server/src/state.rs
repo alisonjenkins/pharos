@@ -226,6 +226,9 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// 009 — what the cast service knows, so configured TVs can be listed as
+    /// sessions. `None` (the default) keeps `/Sessions` exactly as it was.
+    pub cast_directory: Option<Arc<dyn crate::cast_sessions::CastDirectory>>,
     /// T87 — the last segment-transcode options each PlaySessionId used,
     /// keyed by play session. Lets the SyncPlay seek handler PREWARM the
     /// target segments for every group member's exact variant (audio pick,
@@ -612,6 +615,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            cast_directory: None,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
@@ -708,6 +712,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            cast_directory: None,
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
