@@ -33,7 +33,10 @@ use std::time::Duration;
 use notify::{
     Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use pharos_core::{MediaStore, Prober, ScanOutcome};
+use pharos_core::{
+    CollectionStore, GenreStore, MediaStore, PersonStore, Prober, ScanOutcome, StudioStore,
+    TagStore,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -138,7 +141,15 @@ pub fn spawn_watch<P, S>(
 ) -> Result<WatchHandle, WatchError>
 where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + StudioStore
+        + CollectionStore
+        + TagStore
+        + Send
+        + Sync
+        + 'static,
 {
     // Bridge the notify OS thread → async task. notify's callback runs on
     // its own thread; `try_send` never blocks it (a full channel drops the
@@ -184,7 +195,15 @@ async fn watch_loop<P, S>(
     out_tx: mpsc::Sender<ScanOutcome>,
 ) where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + StudioStore
+        + CollectionStore
+        + TagStore
+        + Send
+        + Sync
+        + 'static,
 {
     let exts = scanner.extensions_snapshot();
     loop {
@@ -274,7 +293,15 @@ async fn process_batch<P, S>(
 ) -> pharos_core::DomainResult<Option<ScanOutcome>>
 where
     P: Prober + Send + Sync + 'static,
-    S: MediaStore + pharos_core::GenreStore + Send + Sync + 'static,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + StudioStore
+        + CollectionStore
+        + TagStore
+        + Send
+        + Sync
+        + 'static,
 {
     // Remove/rename in the batch → defer to a full incremental scan of the
     // root. It performs the atomic root-scoped sweep + move detection and
