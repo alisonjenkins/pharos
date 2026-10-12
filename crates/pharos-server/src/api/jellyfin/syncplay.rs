@@ -167,7 +167,7 @@ async fn recover_and_apply(
 /// persisted membership (the rolling-deploy wedge of 2026-07-26, where
 /// next/unpause/seek issued during the socket-reconnect gap were silently
 /// lost). Every terminal path records a [`CommandOutcome`].
-async fn dispatch(
+pub(crate) async fn dispatch(
     hub: &SessionHub,
     registry: &GroupRegistry,
     stores: &crate::state::Stores,

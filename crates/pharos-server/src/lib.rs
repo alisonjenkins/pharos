@@ -5,6 +5,7 @@ pub mod book_convert;
 pub mod book_cover;
 pub mod cast;
 pub mod cast_adapter;
+pub mod cast_service;
 pub mod cast_sessions;
 pub mod cli;
 pub mod config;
