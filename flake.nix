@@ -162,6 +162,21 @@
             cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
           }
         );
+        # `pharosClippy` builds with default features, so the `postgres`
+        # backend's server code (AnyStore, which `Stores` aliases) is never
+        # type-checked there and rotted once already (person_image_backfill's
+        # tests). Compile-only on purpose: the store's real-Postgres tests run
+        # in `pharosPgTests`; this only has to keep pharos-server's lib, bins
+        # and tests building under the feature. Same deps artifact as the
+        # other checks; the postgres-only crates are checked, not built, here.
+        pharosClippyPostgres = craneLib.cargoClippy (
+          ciArgs
+          // {
+            pname = "pharos-clippy-postgres";
+            cargoArtifacts = pharosCiDeps;
+            cargoClippyExtraArgs = "-p pharos-server --features pharos-server/postgres --all-targets -- -D warnings";
+          }
+        );
         pharosFmt = craneLib.cargoFmt { inherit (pharosCommonArgs) pname version src; };
         # Postgres-backend conformance: the store trait suite run against a REAL
         # Postgres started INSIDE the nix sandbox (TCP on loopback — the sandbox
@@ -1141,6 +1156,7 @@
         checks.tests = pharosTests;
         checks.doctests = pharosDoctests;
         checks.clippy = pharosClippy;
+        checks.clippy-postgres = pharosClippyPostgres;
         checks.fmt = pharosFmt;
         # Runs the store conformance suite against a real ephemeral Postgres.
         checks.postgres = pharosPgTests;
