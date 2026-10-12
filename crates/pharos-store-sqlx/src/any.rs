@@ -137,6 +137,16 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn put_batch(&self, items: &[MediaItem]) -> DomainResult<()> {
+        timed("put_batch", async {
+            match self {
+                AnyStore::Sqlite(s) => s.put_batch(items).await,
+                AnyStore::Postgres(p) => p.put_batch(items).await,
+            }
+        })
+        .await
+    }
+
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
         match self {
             AnyStore::Sqlite(s) => MediaStore::list(s).await,
