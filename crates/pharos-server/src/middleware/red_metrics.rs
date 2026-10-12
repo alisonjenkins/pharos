@@ -76,6 +76,29 @@ impl Drop for AbortGuard {
     }
 }
 
+/// Path label for requests that match no route. The raw path is attacker
+/// controlled (`/.env`, `/.git/config`, ...) and would mint a series each.
+const UNMATCHED_PATH: &str = "unmatched";
+
+/// Standard methods verbatim; anything else is `OTHER`, for the same reason.
+fn method_label(method: &actix_web::http::Method) -> String {
+    use actix_web::http::Method;
+    let standard = [
+        Method::GET,
+        Method::HEAD,
+        Method::POST,
+        Method::PUT,
+        Method::DELETE,
+        Method::PATCH,
+        Method::OPTIONS,
+    ];
+    if standard.contains(method) {
+        method.to_string()
+    } else {
+        "OTHER".to_string()
+    }
+}
+
 pub struct RedMetrics;
 
 impl<S, B> Transform<S, ServiceRequest> for RedMetrics
@@ -116,10 +139,10 @@ where
     }
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let method = req.method().to_string();
+        let method = method_label(req.method());
         let path = req
             .match_pattern()
-            .unwrap_or_else(|| req.path().to_string());
+            .unwrap_or_else(|| UNMATCHED_PATH.to_string());
         let inner = self.inner.clone();
         let start = Instant::now();
         Box::pin(async move {
@@ -253,6 +276,42 @@ mod tests {
                     .any(|l| l.starts_with("http_client_aborted_total") && l.contains("/finishes")),
             "completed request counted as an abort; rendered:\n{body}"
         );
+    }
+
+    /// Scanner traffic (`/.env`, `/.git/config`, ...) matches no route; its raw
+    /// path must not become a label, or every probe mints a histogram's worth
+    /// of series. Non-standard methods collapse the same way.
+    #[actix_web::test]
+    async fn unmatched_paths_and_odd_methods_share_one_series() {
+        let _ = crate::obs::init("info", None);
+        let app = test::init_service(App::new().wrap(RedMetrics).route(
+            "/known",
+            web::get().to(|| async { HttpResponse::Ok().finish() }),
+        ))
+        .await;
+        for junk in ["/.env", "/.git/config", "/wp-login.php"] {
+            let req = test::TestRequest::get().uri(junk).to_request();
+            test::call_service(&app, req).await;
+        }
+        let req = test::TestRequest::default()
+            .method(actix_web::http::Method::from_bytes(b"BREW").unwrap())
+            .uri("/coffee")
+            .to_request();
+        test::call_service(&app, req).await;
+
+        let body = crate::obs::render();
+        for raw in ["/.env", "/.git/config", "/wp-login.php", "/coffee", "BREW"] {
+            assert!(!body.contains(raw), "{raw} leaked into labels:\n{body}");
+        }
+        let series: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("http_requests_total{") && l.contains("status=\"404\""))
+            .collect();
+        assert!(
+            series.iter().any(|l| l.contains("path=\"unmatched\"")),
+            "no unmatched series: {series:?}"
+        );
+        assert!(series.iter().any(|l| l.contains("method=\"OTHER\"")));
     }
 
     #[actix_web::test]
