@@ -383,6 +383,16 @@ pub enum GroupMsg {
         member_id: MemberId,
         ignore: bool,
     },
+    /// Re-classify a member (e.g. a Cast adapter registering its TV seat, or a
+    /// remote-control client turning into a `Controller`). Non-`Player` kinds
+    /// leave every gate and freeze they were holding and never join one again.
+    /// Like `SetIgnoreWait` there is no reply: the new kind is observable on
+    /// the next roster / `Snapshot`.
+    SetMemberKind {
+        member: MemberId,
+        kind: MemberKind,
+        cast: Option<CastBinding>,
+    },
     /// A member's `/socket` reconnected (its fresh sink is already swapped into
     /// the per-replica `MemberSinks`; the member persists across socket churn).
     /// Re-sends the catch-up so the reconnected client immediately re-syncs to
@@ -731,8 +741,31 @@ pub struct GroupSnapshot {
     pub queue_len: usize,
 }
 
+/// What a roster entry is. Closed enum, not a bool pair, so a "controller that
+/// is also a seat" is unrepresentable. Only `Player` members ack readiness
+/// gates and report buffering; the others hear every group update but never
+/// hold a gate (V139, V161).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MemberKind {
+    #[default]
+    Player,
+    Controller,
+    CastSeat,
+}
+
+/// The cast a `Controller` / `CastSeat` member belongs to: the TV's name and
+/// the user who owns the session. Two members with equal bindings are the same
+/// cast and are shown as one roster entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastBinding {
+    pub tv: String,
+    pub owner: String,
+}
+
 struct MemberRec {
     name: String,
+    kind: MemberKind,
+    cast: Option<CastBinding>,
     offset: ClockOffset,
     buffering: bool,
     /// Jellyfin `/SyncPlay/SetIgnoreWait` — the client halted its own playback
@@ -1838,7 +1871,8 @@ impl GroupState {
             // a disconnected member can never ack, so including it freezes the
             // group until the 30s anti-wedge (it stays in the roster for the
             // reconnect grace and rejoins gates once its socket is back).
-            .filter(|(_, m)| !m.ignore_wait && m.connected)
+            // Only Players ack: a Controller or CastSeat never will (V139, V161).
+            .filter(|(_, m)| m.kind == MemberKind::Player && !m.ignore_wait && m.connected)
             .map(|(id, _)| *id)
             .collect()
     }
@@ -2386,6 +2420,8 @@ impl GroupState {
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
+                        kind: MemberKind::Player,
+                        cast: None,
                         connected: false,
                         last_seen: now,
                         socket_gone_since: Some((now, SocketGoneCause::Hydrated)),
@@ -2988,6 +3024,9 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::BufferingEnd { member_id }
         | GroupMsg::ObserveClock { member_id, .. }
         | GroupMsg::SetIgnoreWait { member_id, .. }
+        | GroupMsg::SetMemberKind {
+            member: member_id, ..
+        }
         | GroupMsg::ResyncMember { member_id } => Some(*member_id),
         GroupMsg::LeaderPlay { sender, .. }
         | GroupMsg::LeaderPause { sender }
@@ -3108,6 +3147,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     offset: ClockOffset::default(),
                     buffering: false,
                     ignore_wait: false,
+                    kind: MemberKind::Player,
+                    cast: None,
                     connected: true,
                     last_seen: tokio::time::Instant::now(),
                     socket_gone_since: None,
@@ -3371,6 +3412,15 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 return;
             }
             if let Some(rec) = state.members.get_mut(&member_id) {
+                if rec.kind != MemberKind::Player {
+                    tracing::info!(
+                        group = %state.id,
+                        member = %member_id,
+                        kind = ?rec.kind,
+                        "syncplay: buffering report from a non-player ignored (V139)"
+                    );
+                    return;
+                }
                 rec.buffering = true;
             }
             // V19: one corrective Pause, not a storm. If already paused due
@@ -3631,7 +3681,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             let buffering: HashSet<MemberId> = state
                 .members
                 .iter()
-                .filter(|(_, m)| m.buffering && !m.ignore_wait)
+                .filter(|(_, m)| m.buffering && !m.ignore_wait && m.kind == MemberKind::Player)
                 .map(|(id, _)| *id)
                 .collect();
             if buffering.is_empty() {
@@ -3765,6 +3815,16 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 metrics::counter!("pharos_syncplay_ready_heal_total", "group_state" => "paused")
                     .increment(1);
                 state.send_playback_state(member_id);
+            }
+        }
+        GroupMsg::SetMemberKind { member, kind, cast } => {
+            if let Some(rec) = state.members.get_mut(&member) {
+                rec.kind = kind;
+                rec.cast = cast;
+                if kind != MemberKind::Player {
+                    rec.buffering = false;
+                    release_gate_holds_for(state, member);
+                }
             }
         }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
@@ -7997,6 +8057,8 @@ mod tests {
             offset: ClockOffset::default(),
             buffering: false,
             ignore_wait: false,
+            kind: MemberKind::Player,
+            cast: None,
             connected: true,
             last_seen,
         };

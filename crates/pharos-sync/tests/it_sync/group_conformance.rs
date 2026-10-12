@@ -12,7 +12,9 @@
 //! - network-blip: a member who drops and rejoins picks up the current
 //!   playback state on rejoin.
 
-use pharos_sync::group::{GroupHandle, GroupMsg, GroupSnapshot, Joined, MIN_LEAD_MS};
+use pharos_sync::group::{
+    CastBinding, GroupHandle, GroupMsg, GroupSnapshot, Joined, MemberKind, MIN_LEAD_MS,
+};
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use pharos_sync::{LocalDelivery, MemberSinks};
 use std::sync::Arc;
@@ -347,4 +349,161 @@ async fn after_handoff_old_leader_cannot_issue_play() {
         ServerMsg::Play { position_ms, .. } => assert_eq!(position_ms, 1234),
         other => panic!("expected Play, got {other:?}"),
     }
+}
+
+async fn set_kind(h: &GroupHandle, member: MemberId, kind: MemberKind, cast: Option<CastBinding>) {
+    h.tx.send(GroupMsg::SetMemberKind { member, kind, cast })
+        .await
+        .unwrap();
+}
+
+fn is_play(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::Play { .. })
+}
+
+fn is_pause(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::Pause { .. })
+}
+
+/// V139/V161 — a Controller and a CastSeat never ack, so neither may hold a
+/// queue-change or Seek gate; both stay in the roster and still hear the group.
+#[tokio::test]
+async fn non_player_members_never_hold_a_gate_but_stay_in_the_roster() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, mut p2_rx) = add_member(&h, &sinks, "p2").await;
+    let (seat, mut seat_rx) = add_member(&h, &sinks, "tv").await;
+    let (ctrl, mut ctrl_rx) = add_member(&h, &sinks, "phone").await;
+    let cast = CastBinding {
+        tv: "Living Room".into(),
+        owner: "ali".into(),
+    };
+    set_kind(&h, seat, MemberKind::CastSeat, Some(cast.clone())).await;
+    set_kind(&h, ctrl, MemberKind::Controller, Some(cast)).await;
+
+    h.tx.send(GroupMsg::SetNewQueue {
+        sender: leader,
+        item_ids: vec!["ep1".into()],
+        item_runtimes_ms: Vec::new(),
+        playing_index: 0,
+        start_position_ms: 0,
+    })
+    .await
+    .unwrap();
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 0,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "queue-change gate must complete on the Player acks alone"
+    );
+
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 30_000,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 30_000,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "seek gate must complete on the Player acks alone"
+    );
+
+    for rx in [&mut seat_rx, &mut ctrl_rx, &mut p2_rx] {
+        assert!(
+            wait_for(rx, Duration::from_millis(500), |m| matches!(
+                m,
+                ServerMsg::Seek { .. }
+            ))
+            .await
+            .is_some(),
+            "every member, whatever its kind, receives the Seek"
+        );
+    }
+    let snap = snapshot(&h).await;
+    assert_eq!(snap.member_count, 4);
+    for name in ["tv", "phone"] {
+        assert!(
+            snap.participants.iter().any(|p| p == name),
+            "{name} missing"
+        );
+    }
+}
+
+/// V139 — a buffering report from a non-player must neither freeze the group
+/// nor stay behind as a holdout that blocks the Player's recovery.
+#[tokio::test]
+async fn non_player_buffering_is_not_a_freeze_wait_target() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, _p2_rx) = add_member(&h, &sinks, "p2").await;
+    let (seat, _seat_rx) = add_member(&h, &sinks, "tv").await;
+    set_kind(&h, seat, MemberKind::CastSeat, None).await;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 10_000,
+    })
+    .await
+    .unwrap();
+    drain(&mut leader_rx).await;
+
+    h.tx.send(GroupMsg::BufferingStart {
+        member_id: seat,
+        position_ms: 10_000,
+        playlist_item_id: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(300), is_pause)
+            .await
+            .is_none(),
+        "a CastSeat buffering report must not freeze the group"
+    );
+
+    h.tx.send(GroupMsg::BufferingStart {
+        member_id: p2,
+        position_ms: 10_000,
+        playlist_item_id: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(500), is_pause)
+            .await
+            .is_some(),
+        "a Player buffering still freezes the group"
+    );
+    h.tx.send(GroupMsg::BufferingEnd { member_id: p2 })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "the freeze must lift without waiting on the CastSeat"
+    );
 }

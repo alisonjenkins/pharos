@@ -201,6 +201,7 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::AddMember { .. }
         | GroupMsg::Snapshot { .. }
         | GroupMsg::SeedQueue { .. }
+        | GroupMsg::SetMemberKind { .. }
         | GroupMsg::MemberSocketLost { .. } => return None,
     })
 }
