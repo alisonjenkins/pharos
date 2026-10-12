@@ -97,6 +97,12 @@ config:
     ssdpEnabled: false
     ssdpAdvertiseUrl: null
     playedThresholdPct: 90
+    # Seconds between database writes of one play session's resume position
+    # (clients report every ~10 s). Pause, seek, Stopped and the first report
+    # are written at once; the rest are held in memory. A crash loses at most
+    # this many seconds of position per live session, a graceful stop none.
+    # 0 writes every report.
+    playbackProgressPersistSecs: 15
     scanRateLimitMs: 0
     # #11 — concurrent per-file probes during a scan. 0 = the scanner's
     # conservative default (leaves shared-storage I/O headroom so a scan doesn't
