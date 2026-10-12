@@ -41,7 +41,10 @@ pub enum GroupIntent {
         playing: bool,
         apply_at: Instant,
     },
-    Stop,
+    /// End the cast; `reason` is why, and is what gets recorded.
+    Stop {
+        reason: CastReason,
+    },
 }
 
 /// What the server must hear.
@@ -496,9 +499,9 @@ impl<T: CastTransport> Driver<T> {
     fn on_intent_while_lost(&mut self, intent: GroupIntent) -> Option<Exit> {
         self.user_pending_until = None;
         match intent {
-            GroupIntent::Stop => {
+            GroupIntent::Stop { reason } => {
                 self.held.clear();
-                Some(Exit::Ended(CastReason::UserStop))
+                Some(Exit::Ended(reason))
             }
             GroupIntent::Load {
                 item_id,
@@ -558,12 +561,12 @@ impl<T: CastTransport> Driver<T> {
                         .await,
                 )
             }
-            GroupIntent::Stop => {
+            GroupIntent::Stop { reason } => {
                 self.held.clear();
                 if let Err(e) = self.send(CommandBody::Stop).await {
                     tracing::warn!(tv = %self.cfg.receiver_name, error = %e, "cast Stop command failed while ending");
                 }
-                Some(Exit::Ended(CastReason::UserStop))
+                Some(Exit::Ended(reason))
             }
             GroupIntent::Play {
                 position_ms,
@@ -1150,7 +1153,12 @@ mod tests {
         let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
         rig.load(0, true).await;
         rig.until_state(ConnState::Following).await;
-        rig.handle.send(GroupIntent::Stop).await.unwrap();
+        rig.handle
+            .send(GroupIntent::Stop {
+                reason: CastReason::UserStop,
+            })
+            .await
+            .unwrap();
         assert_eq!(rig.next().await, DriverEvent::State(ConnState::Ended));
         assert_eq!(
             rig.next().await,
@@ -1164,6 +1172,39 @@ mod tests {
             .iter()
             .any(|c| c.body == CommandBody::Stop));
         rig.handle.join().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_ends_once_with_the_reason_it_carries() {
+        for reason in [
+            CastReason::UserStop,
+            CastReason::GroupGone,
+            CastReason::OwnerLeft,
+        ] {
+            let recorder = DebuggingRecorder::new();
+            let snap = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+
+            let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+            rig.load(0, true).await;
+            rig.until_state(ConnState::Following).await;
+            rig.handle.send(GroupIntent::Stop { reason }).await.unwrap();
+            assert_eq!(rig.next().await, DriverEvent::State(ConnState::Ended));
+            assert_eq!(rig.next().await, DriverEvent::Ended { reason });
+            rig.handle.join().await.unwrap();
+
+            let all = series(&snap);
+            assert_eq!(
+                counter(&all, "pharos_cast_seat_total", ("event", "ended")),
+                1,
+                "exactly one Ended for {reason:?}: {all:?}"
+            );
+            assert_eq!(
+                counter(&all, "pharos_cast_seat_total", ("reason", reason.label())),
+                1,
+                "{all:?}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1674,7 +1715,12 @@ mod tests {
         assert_eq!(rig.next().await, DriverEvent::State(ConnState::Lost));
         let t = Instant::now();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        rig.handle.send(GroupIntent::Stop).await.unwrap();
+        rig.handle
+            .send(GroupIntent::Stop {
+                reason: CastReason::UserStop,
+            })
+            .await
+            .unwrap();
         assert_eq!(rig.next().await, DriverEvent::State(ConnState::Ended));
         assert_eq!(
             rig.next().await,

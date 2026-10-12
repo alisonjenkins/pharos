@@ -242,6 +242,24 @@ impl Rig {
             .sum()
     }
 
+    fn event_total(&self, event: &str) -> u64 {
+        self.snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_cast_seat_total")
+            .filter(|(ck, _, _, _)| {
+                ck.key()
+                    .labels()
+                    .any(|x| x.key() == "event" && x.value() == event)
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
     fn tv_token(&self) -> String {
         self.living_room
             .commands()
@@ -537,7 +555,8 @@ async fn stopping_on_the_tv_ends_the_cast_with_user_stop() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(rig.service.snapshot().await.is_empty(), "cast ended");
-    assert!(rig.seat_total("ended", "user_stop") >= 1);
+    assert_eq!(rig.seat_total("ended", "user_stop"), 1);
+    assert_eq!(rig.event_total("ended"), 1);
     let roster = rig.roster_seen_by(Who::Owner).await;
     assert!(roster.iter().all(|m| m.device.is_none()), "{roster:?}");
 }
@@ -663,7 +682,8 @@ async fn grace_expiry_ends_the_cast_and_restores_the_owner() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(rig.service.snapshot().await.is_empty(), "cast ended");
-    assert!(rig.seat_total("ended", "grace_expired") >= 1);
+    assert_eq!(rig.seat_total("ended", "grace_expired"), 1);
+    assert_eq!(rig.event_total("ended"), 1);
     assert_eq!(rig.token_status(&token).await, StatusCode::UNAUTHORIZED);
     let roster = rig.roster_seen_by(Who::Bob).await;
     assert!(roster.iter().all(|m| m.device.is_none()), "{roster:?}");
@@ -692,5 +712,24 @@ async fn a_dissolved_group_ends_the_cast_with_group_gone() {
     }
     assert!(rig.service.snapshot().await.is_empty(), "cast ended");
     assert_eq!(rig.seat_total("ended", "group_gone"), 1);
+    assert_eq!(rig.event_total("ended"), 1);
     assert_eq!(rig.token_status(&token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_service_ended_cast_is_recorded_once_with_its_true_reason() {
+    for (reason, label) in [
+        (CastReason::UserStop, "user_stop"),
+        (CastReason::OwnerLeft, "owner_left"),
+    ] {
+        let rig = Rig::new().await;
+        rig.start_owner().await;
+        eventually("PlayNow", || has_command(&rig.living_room, "PlayNow")).await;
+
+        rig.service.stop(rig.owner.id, reason).await;
+
+        assert!(rig.service.snapshot().await.is_empty());
+        assert_eq!(rig.seat_total("ended", label), 1, "{label}");
+        assert_eq!(rig.event_total("ended"), 1, "{label}: one Ended per end");
+    }
 }

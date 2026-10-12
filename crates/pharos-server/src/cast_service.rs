@@ -608,7 +608,8 @@ impl<F: TransportFactory> Actor<F> {
                 &group_label,
                 &message,
             );
-            self.teardown(&mut cast, EndedBy::Service).await;
+            self.teardown(&mut cast, EndedBy::Service, CastReason::GroupGone)
+                .await;
             return Err(CastReject {
                 reason: CastRejectReason::Unavailable,
                 message,
@@ -749,20 +750,7 @@ impl<F: TransportFactory> Actor<F> {
         let Some(mut cast) = self.casts.remove(&tv) else {
             return;
         };
-        self.teardown(&mut cast, by).await;
-        // The driver records its own `Ended`; and a Stop it is sent is recorded
-        // by it as `user_stop` whatever the real cause, so record the real one.
-        if by == EndedBy::Service && reason != CastReason::UserStop {
-            obs::record_cast_event(
-                CastEvent::Ended,
-                reason,
-                &cast.owner_name,
-                &cast.sender_device,
-                &cast.tv,
-                &cast.group.group_id.to_string(),
-                &format!("seat {} removed", cast.seat_member),
-            );
-        }
+        self.teardown(&mut cast, by, reason).await;
         tracing::info!(
             tv = %cast.tv, owner = %cast.owner_name, group = %cast.group.group_id,
             reason = reason.label(), "cast ended"
@@ -770,14 +758,14 @@ impl<F: TransportFactory> Actor<F> {
     }
 
     /// Release everything a cast holds: tasks, driver, sink, group seat, token.
-    async fn teardown(&self, cast: &mut ActiveCast, by: EndedBy) {
+    async fn teardown(&self, cast: &mut ActiveCast, by: EndedBy, reason: CastReason) {
         cast.forwarder.abort();
         cast.pump.abort();
         cast.watcher.abort();
         let _ = (&mut cast.forwarder).await;
 
         if by == EndedBy::Service {
-            let _ = cast.driver.send(GroupIntent::Stop).await;
+            let _ = cast.driver.send(GroupIntent::Stop { reason }).await;
         }
         self.finish_driver(cast, by).await;
 
