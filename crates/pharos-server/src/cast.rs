@@ -14,7 +14,7 @@ pub const DEFAULT_TV_TOKEN_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60
 
 /// Device name a TV token is stored under, so it shows up as a cast token in
 /// the device list and can be revoked by device.
-fn tv_device_id(tv_name: &str) -> String {
+pub(crate) fn tv_device_id(tv_name: &str) -> String {
     format!("cast:{tv_name}")
 }
 

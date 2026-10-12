@@ -5,6 +5,8 @@
 //! Each cast also has three small owned tasks (group messages to the driver,
 //! driver events to the actor, group-closed watcher) that never touch state.
 
+mod hydrate;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -19,7 +21,7 @@ use pharos_cast::messages::AccessToken;
 use pharos_cast::obs::{self, ConnState};
 use pharos_cast::transport::{CastError, CastTransport};
 use pharos_core::{TokenId, UserId};
-use pharos_sync::group::{CastBinding, GroupHandle, GroupMsg, MemberKind};
+use pharos_sync::group::{CastBinding, CastSeatInfo, GroupHandle, GroupMsg, MemberKind};
 use pharos_sync::hub::member_id_for_device;
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
@@ -177,6 +179,11 @@ enum Command {
     Snapshot {
         reply: oneshot::Sender<Vec<CastInfo>>,
     },
+    /// A persisted seat found in a group this replica runs.
+    Resume {
+        group: GroupHandle,
+        seat: CastSeatInfo,
+    },
 }
 
 /// Cheap to clone; every method is a message to the actor.
@@ -235,6 +242,8 @@ pub fn spawn<F: TransportFactory>(
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
     let (internal_tx, internal_rx) = mpsc::channel(COMMAND_QUEUE);
     let (opened_tx, opened_rx) = mpsc::channel(COMMAND_QUEUE);
+    let (resumed_tx, resumed_rx) = mpsc::channel(COMMAND_QUEUE);
+    hydrate::spawn_listener(deps.registry.clone(), tx.downgrade());
     let actor = Actor {
         deps,
         cfg,
@@ -242,11 +251,13 @@ pub fn spawn<F: TransportFactory>(
         casts: HashMap::new(),
         by_user: HashMap::new(),
         pending: HashMap::new(),
+        resuming: HashMap::new(),
         next_id: 0,
         internal_tx,
         opened_tx,
+        resumed_tx,
     };
-    tokio::spawn(actor.run(rx, internal_rx, opened_rx));
+    tokio::spawn(actor.run(rx, internal_rx, opened_rx, resumed_rx));
     CastServiceHandle { tx }
 }
 
@@ -322,9 +333,12 @@ struct Actor<F: TransportFactory> {
     casts: HashMap<String, ActiveCast>,
     by_user: HashMap<UserId, String>,
     pending: HashMap<String, PendingStart>,
+    /// Persisted seats whose TV is connecting, by TV name.
+    resuming: HashMap<String, hydrate::ResumeParams>,
     next_id: u64,
     internal_tx: mpsc::Sender<Internal>,
     opened_tx: mpsc::Sender<Opened<F::Transport>>,
+    resumed_tx: mpsc::Sender<hydrate::Resumed<F::Transport>>,
 }
 
 fn unix_now_ms() -> u64 {
@@ -361,6 +375,7 @@ impl<F: TransportFactory> Actor<F> {
         mut commands: mpsc::Receiver<Command>,
         mut internal: mpsc::Receiver<Internal>,
         mut opened: mpsc::Receiver<Opened<F::Transport>>,
+        mut resumed: mpsc::Receiver<hydrate::Resumed<F::Transport>>,
     ) {
         let mut ping = tokio::time::interval(SEAT_PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -373,13 +388,25 @@ impl<F: TransportFactory> Actor<F> {
                 },
                 Some(msg) = internal.recv() => self.on_internal(msg).await,
                 Some(done) = opened.recv() => self.on_opened(done).await,
+                Some(done) = resumed.recv() => self.on_resumed(done).await,
                 _ = ping.tick() => self.ping_seats(),
             }
         }
-        let users: Vec<UserId> = self.by_user.keys().copied().collect();
-        for user in users {
-            self.end(user, CastReason::UserStop, EndedBy::Service).await;
+        self.release_all();
+    }
+
+    /// The service is going away with the process. The group keeps its seats so
+    /// the next process (or replica) can resume them from the snapshot, and the
+    /// tokens are revoked by that resume: only the tasks and the sinks go.
+    fn release_all(&mut self) {
+        for (_, cast) in self.casts.drain() {
+            cast.forwarder.abort();
+            cast.pump.abort();
+            cast.watcher.abort();
+            cast.driver.abort();
+            self.deps.sinks.remove(cast.seat_member, SEAT_SINK_GEN);
         }
+        self.by_user.clear();
     }
 
     async fn on_command(&mut self, cmd: Command) {
@@ -389,6 +416,7 @@ impl<F: TransportFactory> Actor<F> {
                 self.end(user, reason, EndedBy::Service).await;
                 let _ = done.send(());
             }
+            Command::Resume { group, seat } => self.begin_resume(group, seat).await,
             Command::Snapshot { reply } => {
                 let mut all: Vec<CastInfo> = self
                     .casts
@@ -519,7 +547,10 @@ impl<F: TransportFactory> Actor<F> {
                 ),
             ));
         }
-        if self.casts.contains_key(&tv.name) || self.pending.contains_key(&tv.name) {
+        if self.casts.contains_key(&tv.name)
+            || self.pending.contains_key(&tv.name)
+            || self.resuming.contains_key(&tv.name)
+        {
             return Err(self.reject(
                 &req,
                 &group_label,
@@ -750,21 +781,25 @@ impl<F: TransportFactory> Actor<F> {
             return;
         };
         let label = command.label();
+        let Some(owner_key) = cast.owner_key.clone() else {
+            // A resumed cast does not know the owner's device, but it knows the
+            // owner's member: speak to the group as that member.
+            let msg = command_msg(command, cast.owner_member);
+            if cast.group.tx.send(msg).await.is_err() {
+                tracing::warn!(
+                    tv, owner = %cast.owner_name, command = label,
+                    "cast: a command from the TV's remote found its group gone"
+                );
+            }
+            return;
+        };
         let response = crate::api::jellyfin::syncplay::dispatch(
             &self.deps.hub,
             &self.deps.registry,
             &self.deps.stores,
-            cast.owner_key.clone(),
+            Some(owner_key),
             label,
-            move |sender| match command {
-                GroupCommandRequest::Pause => GroupMsg::PauseShared { sender },
-                GroupCommandRequest::Unpause => GroupMsg::Unpause { sender },
-                GroupCommandRequest::Seek { position_ms } => GroupMsg::SeekTo {
-                    sender,
-                    position_ms,
-                },
-                GroupCommandRequest::StopCast => GroupMsg::MemberPing { member_id: sender },
-            },
+            move |sender| command_msg(command, sender),
         )
         .await;
         if !response.status().is_success() {
@@ -943,6 +978,18 @@ impl<F: TransportFactory> Actor<F> {
             pump,
             watcher,
         }
+    }
+}
+
+fn command_msg(command: GroupCommandRequest, sender: MemberId) -> GroupMsg {
+    match command {
+        GroupCommandRequest::Pause => GroupMsg::PauseShared { sender },
+        GroupCommandRequest::Unpause => GroupMsg::Unpause { sender },
+        GroupCommandRequest::Seek { position_ms } => GroupMsg::SeekTo {
+            sender,
+            position_ms,
+        },
+        GroupCommandRequest::StopCast => GroupMsg::MemberPing { member_id: sender },
     }
 }
 
