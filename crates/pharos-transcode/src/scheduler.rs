@@ -3621,6 +3621,9 @@ fn spawn_run_task(
         // once" invariant depends on this.
         let run_handle = tokio::spawn(async move {
             let mut worker = worker;
+            // The pipeline the run that produced the timing used: a fallback
+            // retry changes it.
+            let mut ran = spec.vaapi_pipeline;
             let resident = spec.vaapi_pipeline == crate::VaapiPipeline::Resident;
             let retry_spec = resident.then(|| JobSpec {
                 vaapi_pipeline: crate::VaapiPipeline::Hybrid,
@@ -3650,22 +3653,25 @@ fn spawn_run_task(
                     "stage" => "run",
                 )
                 .increment(1);
+                ran = crate::VaapiPipeline::Hybrid;
                 result = worker.run(retry).await;
             }
             let timing = match result {
                 WorkerRunResult::Done { .. } => worker.take_stage_timing(),
                 _ => None,
             };
-            (worker, result, timing)
+            (worker, result, timing, ran)
         });
         let (returned, result) = match run_handle.await {
-            Ok((w, WorkerRunResult::Died, _)) => {
+            Ok((w, WorkerRunResult::Died, ..)) => {
                 drop(w);
                 (None, WorkerRunResult::Died)
             }
-            Ok((w, r, timing)) => {
+            Ok((w, r, timing, ran)) => {
                 if let Some(t) = timing {
-                    span.in_scope(|| t.record(crate::stage_timing::device_kind(device), codec));
+                    span.in_scope(|| {
+                        t.record(crate::stage_timing::device_kind(device), codec, ran.label())
+                    });
                 }
                 (Some(w), r)
             }
@@ -4233,12 +4239,18 @@ mod tests {
                         .map(|l| l.value().to_string())
                         .unwrap_or_default()
                 };
-                (get("device_kind"), get("codec"))
+                (
+                    get("device_kind"),
+                    format!("{}/{}", get("codec"), get("pipeline")),
+                )
             })
             .collect();
         assert!(!labels.is_empty(), "no stage timing exported");
+        // The flag is off, so the VAAPI job ran the hybrid pipeline.
         assert!(
-            labels.iter().all(|(d, c)| d == "vaapi" && c == "h264"),
+            labels
+                .iter()
+                .all(|(d, c)| d == "vaapi" && c == "h264/hybrid"),
             "{labels:?}"
         );
     }

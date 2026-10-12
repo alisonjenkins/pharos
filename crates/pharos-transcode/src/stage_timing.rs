@@ -432,12 +432,13 @@ impl StageTiming {
     /// Export as histograms and as one event on the current span (the
     /// scheduler calls this inside the job's `transcode_job` span). Labels
     /// are bounded: device kind, codec, stage; never an item or job id.
-    pub fn record(&self, device_kind: &'static str, codec: &'static str) {
+    pub fn record(&self, device_kind: &'static str, codec: &'static str, pipeline: &'static str) {
         for (stage, secs) in self.stages() {
             metrics::histogram!(
                 "pharos_transcode_stage_seconds",
                 "device_kind" => device_kind,
                 "codec" => codec,
+                "pipeline" => pipeline,
                 "stage" => stage.label(),
             )
             .record(secs);
@@ -447,6 +448,7 @@ impl StageTiming {
                 "pharos_transcode_effective_fps",
                 "device_kind" => device_kind,
                 "codec" => codec,
+                "pipeline" => pipeline,
             )
             .record(fps);
         }
@@ -455,6 +457,7 @@ impl StageTiming {
                 "pharos_transcode_speed_ratio",
                 "device_kind" => device_kind,
                 "codec" => codec,
+                "pipeline" => pipeline,
             )
             .record(speed);
         }
@@ -463,6 +466,7 @@ impl StageTiming {
                 "pharos_transcode_frames_total",
                 "device_kind" => device_kind,
                 "codec" => codec,
+                "pipeline" => pipeline,
             )
             .increment(p.frames);
         }
@@ -470,6 +474,7 @@ impl StageTiming {
         tracing::info!(
             device_kind,
             codec,
+            pipeline,
             spawn_ms = ms(self.spawn_secs),
             first_frame_ms = self.first_frame_secs.map(ms),
             total_ms = ms(self.total_secs),
@@ -792,7 +797,7 @@ mod tests {
             progress: Some(parse_progress(PROGRESS)),
             bench: Some(parse_benchmark_all(BENCH)),
         };
-        metrics::with_local_recorder(&recorder, || t.record("vaapi", "h264"));
+        metrics::with_local_recorder(&recorder, || t.record("vaapi", "h264", "resident"));
         let rows = snapshotter.snapshot().into_vec();
         let mut stages: Vec<String> = rows
             .iter()
@@ -822,5 +827,13 @@ mod tests {
         assert!(rows
             .iter()
             .any(|(k, ..)| k.key().name() == "pharos_transcode_effective_fps"));
+        // Every series carries the pipeline, bounded to hybrid | resident.
+        assert!(rows
+            .iter()
+            .filter(|(k, ..)| k.key().name().starts_with("pharos_transcode_"))
+            .all(|(k, ..)| k
+                .key()
+                .labels()
+                .any(|l| l.key() == "pipeline" && l.value() == "resident")));
     }
 }
