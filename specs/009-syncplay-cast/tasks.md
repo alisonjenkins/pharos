@@ -47,12 +47,12 @@ description: "Task list for SyncPlay Cast Target"
 
 ### Cast building blocks (`pharos-cast`)
 
-- [ ] T013 [P] Define typed connectsdk DTOs from spike S1 in `crates/pharos-cast/src/messages.rs` (command out, report in) with serde round-trip tests against captured fixtures
+- [X] T013 [P] Define typed connectsdk DTOs from spike S1 in `crates/pharos-cast/src/messages.rs` (command out, report in) with serde round-trip tests against captured fixtures
 - [X] T014 [P] Write failing tests then implement the pure planner `plan(target, observed, now, state) -> Action {None|Seek|Pause|Resume}` in `crates/pharos-cast/src/drift.rs` with dead-band, hysteresis and report-age interpolation (the 1500 ms threshold and 5000 ms cooldown are provisional until T048 re-tunes them from the real-TV measurement); add proptests (never two corrections inside the cooldown; never seeks when within threshold; paused target never seeks forward)
-- [ ] T015 Define `trait CastTransport` (connect, launch, send, recv, close; native `async fn`, no `async_trait`) in `crates/pharos-cast/src/transport.rs`
-- [ ] T016 Implement the receiver emulator `FakeReceiver` in `crates/pharos-cast/src/fake.rs`: handles the stock command set, mirrors `playbackstart/progress/stop` every 1.5 s, injectable latency, drift, drop-connection and seek-inaccuracy; unit tests for each knob
+- [X] T015 Define `trait CastTransport` (connect, launch, send, recv, close; native `async fn`, no `async_trait`) in `crates/pharos-cast/src/transport.rs`
+- [X] T016 Implement the receiver emulator `FakeReceiver` in `crates/pharos-cast/src/fake.rs`: handles the stock command set, mirrors `playbackstart/progress/stop` every 1.5 s, injectable latency, drift, drop-connection and seek-inaccuracy; unit tests for each knob
 - [ ] T017 Implement the real CASTV2 `CastTransport` in `crates/pharos-cast/src/transport.rs` per spike S1 (TLS 8009, heartbeat, launch `F007D354`), with connect timeout and retry with backoff; integration test against the emulator exposed over a local TLS socket if the chosen crate allows, else gated behind a `real-tv` feature
-- [ ] T018 [P] Add `[cast]` / `[[cast.tvs]]` config in `crates/pharos-server/src/config.rs` per `contracts/cast-surface.md` with validation errors naming the entry and value; test valid, duplicate-name and bad-address cases
+- [X] T018 [P] Add `[cast]` / `[[cast.tvs]]` config in `crates/pharos-server/src/config.rs` per `contracts/cast-surface.md` with validation errors naming the entry and value; test valid, duplicate-name and bad-address cases
 - [ ] T019 Add TV-token mint and revoke in `crates/pharos-server/src/cast.rs` (device-bound, bounded lifetime, hashed at rest, id returned separately from secret); tests: bounded lifetime, revoked token fails auth, secret absent from `Debug` and logs (V8)
 
 - [X] T057 [P] Failing test then fix: leader election in `crates/pharos-sync/src/group.rs` (`elect_leader`, `remove_member`) never picks a `Controller` or `CastSeat` while a `Player` is connected, so leader-only commands and handoff Pause stay answerable (found in review of T009)
