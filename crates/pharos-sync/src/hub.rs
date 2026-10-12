@@ -20,7 +20,8 @@ use crate::group::GroupHandle;
 use crate::messages::{MemberId, ServerMsg};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 
 /// Fixed UUIDv5 namespace for deriving a device's [`MemberId`] from its
 /// `deviceId`. DETERMINISTIC on purpose (B24): the persisted group snapshot
@@ -102,11 +103,57 @@ pub struct SessionHub {
     /// started at 1 again. Counting across devices costs nothing (the value is
     /// only ever compared with itself) and makes reuse unrepresentable.
     next_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Bumped after every [`register`](SessionHub::register) has landed in the
+    /// map. [`resolve_wait`](SessionHub::resolve_wait) parks on it. One
+    /// hub-wide signal rather than a waiter per device: there is no per-key
+    /// state to leak or clean up, and the only cost is that a registration
+    /// wakes every parked waiter to re-check its own key (waiters are the rare
+    /// HTTP-before-socket race, so there are almost never any).
+    registrations: Arc<RegistrationSignal>,
+}
+
+struct RegistrationSignal(watch::Sender<u64>);
+
+impl Default for RegistrationSignal {
+    fn default() -> Self {
+        Self(watch::channel(0).0)
+    }
 }
 
 impl SessionHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Resolve a device, waiting up to `deadline` for its `/socket` to register.
+    ///
+    /// Closes the race where the HTTP `/SyncPlay/*` call lands before the
+    /// socket's spawned registration task: returns the moment the registration
+    /// happens (no polling interval), or `None` once `deadline` has elapsed.
+    /// Interest is registered BEFORE the map is checked, so a registration
+    /// between the check and the park is never lost.
+    pub async fn resolve_wait(
+        &self,
+        device_id: &str,
+        deadline: Duration,
+    ) -> Option<ResolvedSession> {
+        let mut rx = self.registrations.0.subscribe();
+        let wait = async {
+            loop {
+                if let Some(s) = self.resolve(device_id) {
+                    return Some(s);
+                }
+                // Err only if the sender is dropped, which cannot happen while
+                // `self` holds it; treat it as "nothing more will arrive".
+                rx.changed().await.ok()?;
+            }
+        };
+        tokio::time::timeout(deadline, wait).await.ok().flatten()
+    }
+
+    /// Number of tasks currently parked in [`resolve_wait`](Self::resolve_wait).
+    pub fn waiter_count(&self) -> usize {
+        self.registrations.0.receiver_count()
     }
 
     /// Register a `/socket` connection. On a device's FIRST connect this derives
@@ -139,11 +186,15 @@ impl SessionHub {
         e.name = name;
         e.sink = sink;
         e.conn_gen = gen;
-        Registered {
+        let registered = Registered {
             member_id: e.member_id,
             group: e.group.clone(),
             gen: e.conn_gen,
-        }
+        };
+        // Release the shard lock before waking waiters, who `resolve` at once.
+        drop(e);
+        self.registrations.0.send_modify(|n| *n = n.wrapping_add(1));
+        registered
     }
 
     /// The device's current connection generation, if registered.
@@ -323,6 +374,81 @@ mod tests {
         let left = hub.remove_if_current_gen("devB", again.gen).unwrap();
         assert_eq!(left.group_id, handle.group_id);
         assert!(hub.resolve("devB").is_none());
+    }
+
+    const DEADLINE: Duration = Duration::from_secs(2);
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_wait_returns_immediately_when_already_registered() {
+        let hub = SessionHub::new();
+        hub.register("devW1".into(), "w".into(), sink());
+        let t0 = tokio::time::Instant::now();
+        let s = hub.resolve_wait("devW1", DEADLINE).await;
+        assert!(s.is_some());
+        assert_eq!(t0.elapsed(), Duration::ZERO, "no wait when present");
+        assert_eq!(hub.waiter_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_wait_wakes_the_instant_a_registration_arrives() {
+        let hub = SessionHub::new();
+        let h2 = hub.clone();
+        let reg = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(130)).await;
+            h2.register("devW2".into(), "late".into(), sink());
+        });
+        let t0 = tokio::time::Instant::now();
+        let s = hub.resolve_wait("devW2", DEADLINE).await.unwrap();
+        assert_eq!(s.name, "late");
+        // Polling at 50 ms would land on 150 ms; a notification lands on 130.
+        assert_eq!(t0.elapsed(), Duration::from_millis(130));
+        reg.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_wait_ignores_other_devices_and_still_times_out() {
+        let hub = SessionHub::new();
+        let h2 = hub.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            h2.register("someone-else".into(), "x".into(), sink());
+        });
+        let t0 = tokio::time::Instant::now();
+        assert!(hub.resolve_wait("devW3", DEADLINE).await.is_none());
+        assert_eq!(t0.elapsed(), DEADLINE, "gives up exactly at the deadline");
+        assert_eq!(hub.waiter_count(), 0, "timed-out waiter is cleaned up");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_wait_wakes_every_concurrent_waiter_on_one_key() {
+        let hub = SessionHub::new();
+        let t0 = tokio::time::Instant::now();
+        let waiters: Vec<_> = (0..50)
+            .map(|_| {
+                let h = hub.clone();
+                tokio::spawn(async move { h.resolve_wait("devW4", DEADLINE).await.is_some() })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(hub.waiter_count(), 50);
+        hub.register("devW4".into(), "w".into(), sink());
+        for w in waiters {
+            assert!(w.await.unwrap(), "every waiter must resolve");
+        }
+        assert_eq!(
+            t0.elapsed(),
+            Duration::from_millis(10),
+            "woken on registration, not at the deadline"
+        );
+        assert_eq!(hub.waiter_count(), 0, "no waiter outlives its wake-up");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_wait_dropped_future_leaves_no_waiter() {
+        let hub = SessionHub::new();
+        let fut = hub.resolve_wait("devW5", DEADLINE);
+        let _ = tokio::time::timeout(Duration::from_millis(5), fut).await;
+        assert_eq!(hub.waiter_count(), 0, "a cancelled wait must not leak");
     }
 
     /// B24 — the member id must survive a PROCESS RESTART, not just a socket
