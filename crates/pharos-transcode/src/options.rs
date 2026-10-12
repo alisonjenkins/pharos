@@ -162,6 +162,54 @@ pub enum SourceCodec {
     Mpeg2,
 }
 
+/// What the source's pixels look like, as far as the GPU-resident VAAPI path
+/// cares: that path hands decoded surfaces straight to the encoder, so it is
+/// only right for plain 8-bit SDR 4:2:0 with even dimensions. Anything else
+/// takes the CPU-filter path, which converts and pads in software.
+///
+/// `Unknown` is the default and reads as "not plain": a caller with no probe
+/// to hand must never get the faster path by accident. `#[serde(skip)]` on
+/// [`TranscodeOptions::source_video_kind`] for the same reason as
+/// `source_video_codec`: it is a property of the input, which the rendition key
+/// already hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SourceVideoKind {
+    #[default]
+    Unknown,
+    /// 8-bit 4:2:0 SDR, even width and height.
+    Plain8BitSdr,
+    /// Known, and not plain: 10-bit, 4:2:2/4:4:4, HDR transfer or odd size.
+    Other,
+}
+
+impl SourceVideoKind {
+    /// Classify from the probe's fields (`MediaProbe::pixel_format`,
+    /// `color_transfer`, `width`, `height`). Any missing field is `Unknown`.
+    pub fn classify(
+        pixel_format: Option<&str>,
+        color_transfer: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Self {
+        let (Some(pix), Some(w), Some(h)) = (pixel_format, width, height) else {
+            return Self::Unknown;
+        };
+        let eight_bit_420 = matches!(pix.trim(), "yuv420p" | "nv12");
+        let hdr = matches!(
+            color_transfer
+                .map(|t| t.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("smpte2084" | "arib-std-b67")
+        );
+        let even = w % 2 == 0 && h % 2 == 0;
+        if eight_bit_420 && !hdr && even {
+            Self::Plain8BitSdr
+        } else {
+            Self::Other
+        }
+    }
+}
+
 impl SourceCodec {
     /// Every variant, in the order the boot probe trials them.
     pub const ALL: [Self; 6] = [
@@ -315,6 +363,10 @@ pub struct TranscodeOptions {
     /// browser holds `immutable` for a year, which is issue #114 exactly.
     #[serde(skip)]
     pub source_video_codec: Option<SourceCodec>,
+    /// Whether the source is plain 8-bit SDR; see [`SourceVideoKind`]. Read by
+    /// the scheduler to decide the VAAPI pipeline, never by the worker.
+    #[serde(skip)]
+    pub source_video_kind: SourceVideoKind,
     pub audio: Option<AudioCodec>,
     pub video_bitrate_bps: Option<u64>,
     pub audio_bitrate_bps: Option<u64>,
@@ -553,6 +605,7 @@ mod tests {
     fn ticks_to_seconds_roundtrip() {
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mp4,
             video: None,
@@ -579,6 +632,7 @@ mod tests {
     fn zero_start_returns_none() {
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mp4,
             video: None,
@@ -626,6 +680,7 @@ mod tests {
     fn cmaf_opts() -> TranscodeOptions {
         TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: Container::Fmp4,
             source_frame_rate: None,
             video: Some(VideoCodec::H264),
@@ -724,6 +779,50 @@ mod tests {
     }
 
     #[test]
+    fn only_plain_eight_bit_sdr_with_even_dimensions_is_plain() {
+        use SourceVideoKind::*;
+        let k = SourceVideoKind::classify;
+        assert_eq!(
+            k(Some("yuv420p"), Some("bt709"), Some(1920), Some(1080)),
+            Plain8BitSdr
+        );
+        assert_eq!(
+            k(Some("yuv420p"), None, Some(1280), Some(720)),
+            Plain8BitSdr
+        );
+        assert_eq!(
+            k(Some("yuv420p10le"), Some("bt709"), Some(1920), Some(1080)),
+            Other
+        );
+        assert_eq!(k(Some("yuv444p"), None, Some(1920), Some(1080)), Other);
+        assert_eq!(
+            k(Some("yuv420p"), Some("smpte2084"), Some(3840), Some(2160)),
+            Other
+        );
+        assert_eq!(
+            k(
+                Some("yuv420p"),
+                Some("arib-std-b67"),
+                Some(1920),
+                Some(1080)
+            ),
+            Other
+        );
+        assert_eq!(k(Some("yuv420p"), None, Some(1919), Some(1080)), Other);
+        assert_eq!(k(Some("yuv420p"), None, Some(1920), Some(1081)), Other);
+    }
+
+    #[test]
+    fn a_missing_probe_field_is_unknown_never_plain() {
+        use SourceVideoKind::Unknown;
+        let k = SourceVideoKind::classify;
+        assert_eq!(k(None, None, Some(1920), Some(1080)), Unknown);
+        assert_eq!(k(Some("yuv420p"), None, None, Some(1080)), Unknown);
+        assert_eq!(k(Some("yuv420p"), None, Some(1920), None), Unknown);
+        assert_eq!(SourceVideoKind::default(), Unknown);
+    }
+
+    #[test]
     fn audio_codec_maps_to_known_ffmpeg_lib() {
         assert_eq!(AudioCodec::Aac.ffmpeg_codec(), "aac");
         assert_eq!(AudioCodec::Opus.ffmpeg_codec(), "libopus");
@@ -747,6 +846,7 @@ mod tests {
             source_frame_rate: None,
             video: Some(VideoCodec::H264),
             source_video_codec: None,
+            source_video_kind: Default::default(),
             audio: None,
             video_bitrate_bps: Some(3_000_000),
             audio_bitrate_bps: None,

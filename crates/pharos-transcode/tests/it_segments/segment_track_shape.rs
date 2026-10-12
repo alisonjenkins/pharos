@@ -116,6 +116,7 @@ fn make_chaptered_source(dir: &Path) -> PathBuf {
 fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
     let opts = SegmentOpts {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         container: SegmentContainer::Fmp4,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Separate,

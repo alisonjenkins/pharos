@@ -97,6 +97,7 @@ fn transcode_segment(
 ) -> bool {
     let opts = TranscodeOptions {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),
@@ -181,6 +182,7 @@ fn transcode_segment_from_sidecar(
 ) -> bool {
     let opts = TranscodeOptions {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         source_frame_rate: None,
         container: Container::Mp4,
         video: Some(VideoCodec::H264),

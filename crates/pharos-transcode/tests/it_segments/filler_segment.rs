@@ -81,6 +81,7 @@ fn window() -> pharos_core::SegmentWindow {
 fn segment_opts() -> SegmentOpts {
     SegmentOpts {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         container: SegmentContainer::Fmp4,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Separate,

@@ -706,6 +706,7 @@ mod tests {
     fn h264_opts() -> TranscodeOptions {
         TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -1199,6 +1200,7 @@ mod pool_tests {
     fn fmp4(video: VideoCodec) -> TranscodeOptions {
         TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(video),

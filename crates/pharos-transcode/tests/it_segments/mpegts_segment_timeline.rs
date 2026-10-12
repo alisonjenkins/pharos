@@ -86,6 +86,7 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
     let seg = dir.join("seg1.ts");
     let opts = pharos_transcode::TranscodeOptions {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         source_frame_rate: None,
         container: pharos_transcode::Container::Mpegts,
         video: Some(pharos_transcode::VideoCodec::H264),

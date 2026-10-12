@@ -153,6 +153,10 @@ pub struct SegmentOpts {
     /// scheduler reads it to decide whether the device it places this segment
     /// on can decode the source at all.
     pub source_video_codec: Option<crate::options::SourceCodec>,
+    /// [`TranscodeOptions::source_video_kind`]. Lowered unchanged. Skipped by
+    /// serde so it cannot move a key digested from these options.
+    #[serde(skip)]
+    pub source_video_kind: crate::options::SourceVideoKind,
     /// How this segment gets its audio. See [`AudioDelivery`] — there is no
     /// value here meaning "encode audio for this segment".
     pub audio: AudioDelivery,
@@ -292,6 +296,7 @@ impl ResolvedSegment {
             source_frame_rate: s.window.rate(),
             video: s.video.map(VideoCodec::from),
             source_video_codec: s.source_video_codec,
+            source_video_kind: s.source_video_kind,
             // ALWAYS `None`: a segment never runs an audio encoder. When it
             // carries audio at all, the bytes are COPIED from the continuous
             // encode — which `muxed_audio_source` below now always names,
@@ -331,6 +336,7 @@ mod tests {
     fn lowering_preserves_every_field() {
         let s = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -401,6 +407,7 @@ mod tests {
     fn a_resolved_muxed_segment_copies_its_audio_and_never_drops_it() {
         let base = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {

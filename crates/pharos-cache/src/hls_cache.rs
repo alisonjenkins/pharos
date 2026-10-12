@@ -4821,6 +4821,7 @@ mod tests {
     fn segment_transcode_opts() -> TranscodeOptions {
         SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -4857,6 +4858,7 @@ mod tests {
     fn segment_opts() -> SegmentOpts {
         SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: SegmentContainer::Mpegts,
             video: Some(SegmentVideo::H264),
             audio: AudioDelivery::Muxed(ContinuousAudio {
@@ -5127,6 +5129,7 @@ mod tests {
     fn slow_opts() -> SegmentOpts {
         SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -8355,6 +8358,7 @@ mod tests {
     ) -> SegmentOpts {
         SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container,
             video,
             audio: match audio {
@@ -8966,6 +8970,7 @@ mod tests {
         force_insert(&cache, 7, 0, b"segment-bytes").await;
         let opts = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -8991,6 +8996,7 @@ mod tests {
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
         let opts = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -9054,6 +9060,7 @@ mod tests {
         let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
         let opts = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -9094,6 +9101,7 @@ mod tests {
         // Touch seg 0 so it's more-recent than seg 1.
         let opts = SegmentOpts {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             container: pharos_transcode::SegmentContainer::Mpegts,
             video: None,
             audio: AudioDelivery::Separate,
@@ -9135,6 +9143,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             let opts = SegmentOpts {
                 source_video_codec: None,
+                source_video_kind: Default::default(),
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: AudioDelivery::Separate,
@@ -9156,6 +9165,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             let opts = SegmentOpts {
                 source_video_codec: None,
+                source_video_kind: Default::default(),
                 container: pharos_transcode::SegmentContainer::Mpegts,
                 video: None,
                 audio: AudioDelivery::Separate,
