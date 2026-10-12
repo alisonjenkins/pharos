@@ -3381,6 +3381,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pharos-cache",
+ "pharos-cast",
  "pharos-core",
  "pharos-discovery",
  "pharos-jellyfin-api",
