@@ -44,6 +44,7 @@ pub struct CastRig {
     pub hub: SessionHub,
     pub group: GroupHandle,
     pub registry: GroupRegistry,
+    pub sinks: MemberSinks,
     pub service: CastServiceHandle,
     pub receiver: FakeReceiverHandle,
     pub factory: FakeTransportFactory,
@@ -207,8 +208,9 @@ impl CastRig {
             state.clone(),
             web::Data::new(registry.clone()),
             web::Data::new(hub.clone()),
-            web::Data::new(sinks),
+            web::Data::new(sinks.clone()),
         );
+        let sinks_for_rig = sinks;
         let srv = actix_test::start(move || {
             App::new()
                 .app_data(s.clone())
@@ -225,6 +227,7 @@ impl CastRig {
             hub,
             group,
             registry,
+            sinks: sinks_for_rig,
             service,
             receiver,
             factory,
