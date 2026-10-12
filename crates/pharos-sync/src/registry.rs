@@ -20,7 +20,7 @@ use super::messages::GroupId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 fn unix_now_ms() -> u64 {
     SystemTime::now()
@@ -58,6 +58,17 @@ enum Msg {
         group_id: GroupId,
         cmd: RemoteCommand,
     },
+    IsOwned {
+        group_id: GroupId,
+        reply: oneshot::Sender<bool>,
+    },
+    TryLease {
+        key: GroupId,
+        reply: oneshot::Sender<bool>,
+    },
+    ReleaseLease {
+        key: GroupId,
+    },
 }
 
 /// The registry actor's mutable state.
@@ -72,6 +83,11 @@ struct Actor {
     /// `Some` in distributed mode: ownership election + hydration + command bus
     /// + snapshot persistence.
     distributed: Option<Distributed>,
+    /// Announces a group this replica just took over from a persisted snapshot.
+    hydrated: broadcast::Sender<GroupHandle>,
+    /// Keys leased through [`GroupRegistry::try_lease`], so asking twice from
+    /// the holder does not contend with its own lock.
+    leases: HashSet<GroupId>,
 }
 
 impl Actor {
@@ -131,6 +147,10 @@ impl Actor {
             );
             self.owned.insert(group_id);
             self.groups.insert(group_id, h.clone());
+            if json.is_some() {
+                // No subscriber is fine: nothing needs resuming.
+                let _ = self.hydrated.send(h.clone());
+            }
             h
         } else {
             // Another replica owns it: reuse a live remote router if cached,
@@ -173,6 +193,33 @@ impl Actor {
         }
     }
 
+    /// Whether this replica runs the group's actor right now.
+    fn is_owned(&mut self, group_id: GroupId) -> bool {
+        self.cached_owned(group_id).is_some()
+    }
+
+    async fn try_lease(&mut self, key: GroupId) -> bool {
+        if self.leases.contains(&key) {
+            return true;
+        }
+        let granted = match &self.distributed {
+            Some(d) => d.ownership.try_own(key).await,
+            None => true,
+        };
+        if granted {
+            self.leases.insert(key);
+        }
+        granted
+    }
+
+    fn release_lease(&mut self, key: GroupId) {
+        if self.leases.remove(&key) {
+            if let Some(d) = &self.distributed {
+                d.ownership.release(key);
+            }
+        }
+    }
+
     fn list(&mut self) -> Vec<GroupHandle> {
         self.groups.retain(|_, h| !h.tx.is_closed());
         self.groups.values().cloned().collect()
@@ -182,7 +229,11 @@ impl Actor {
 #[derive(Clone)]
 pub struct GroupRegistry {
     tx: mpsc::Sender<Msg>,
+    hydrated: broadcast::Sender<GroupHandle>,
 }
+
+/// Groups announced to late subscribers' queues before they lag.
+const HYDRATED_BACKLOG: usize = 64;
 
 impl GroupRegistry {
     /// Spawn a single-replica registry. `delivery` reaches members
@@ -201,12 +252,16 @@ impl GroupRegistry {
 
     fn spawn_with(delivery: Arc<dyn Delivery>, distributed: Option<Distributed>) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(64);
+        let (hydrated, _) = broadcast::channel(HYDRATED_BACKLOG);
+        let announce = hydrated.clone();
         tokio::spawn(async move {
             let mut actor = Actor {
                 groups: HashMap::new(),
                 owned: HashSet::new(),
                 delivery,
                 distributed,
+                hydrated: announce,
+                leases: HashSet::new(),
             };
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -229,10 +284,59 @@ impl GroupRegistry {
                     Msg::DeliverCommand { group_id, cmd } => {
                         actor.deliver_command(group_id, cmd).await;
                     }
+                    Msg::IsOwned { group_id, reply } => {
+                        let _ = reply.send(actor.is_owned(group_id));
+                    }
+                    Msg::TryLease { key, reply } => {
+                        let _ = reply.send(actor.try_lease(key).await);
+                    }
+                    Msg::ReleaseLease { key } => actor.release_lease(key),
                 }
             }
         });
-        Self { tx }
+        Self { tx, hydrated }
+    }
+
+    /// Groups this replica takes over from a persisted snapshot (a restart, a
+    /// failover), each announced once after its actor is running. A group
+    /// created fresh is never announced.
+    pub fn subscribe_hydrated(&self) -> broadcast::Receiver<GroupHandle> {
+        self.hydrated.subscribe()
+    }
+
+    /// Whether this replica runs the group's actor (a remote handle, or an
+    /// unknown group, is not owned).
+    pub async fn is_owned(&self, group_id: GroupId) -> Result<bool, RegistryError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::IsOwned {
+                group_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| RegistryError::ActorDown)?;
+        rx.await.map_err(|_| RegistryError::ReplyDropped)
+    }
+
+    /// Take the cross-replica lease named `key`, on the same election as group
+    /// ownership: at most one replica holds it, asking again as the holder is a
+    /// no-op, and a single-replica registry always grants it. `key` is any id
+    /// that cannot be a group's, so leases never contend with groups.
+    pub async fn try_lease(&self, key: GroupId) -> Result<bool, RegistryError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::TryLease { key, reply: tx })
+            .await
+            .map_err(|_| RegistryError::ActorDown)?;
+        rx.await.map_err(|_| RegistryError::ReplyDropped)
+    }
+
+    /// Give a lease back. Idempotent.
+    pub async fn release_lease(&self, key: GroupId) -> Result<(), RegistryError> {
+        self.tx
+            .send(Msg::ReleaseLease { key })
+            .await
+            .map_err(|_| RegistryError::ActorDown)
     }
 
     /// Route a bus-forwarded command to this replica's owned actor for the

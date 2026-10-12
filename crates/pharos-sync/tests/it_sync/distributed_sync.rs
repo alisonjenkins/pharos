@@ -452,3 +452,101 @@ async fn get_or_create_upgrades_remote_handle_to_owned_after_lock_frees() {
         .expect("after the lock frees, a retried get_or_create must own + hydrate");
     assert_eq!(snap.member_count, 1, "roster hydrated from the snapshot");
 }
+
+/// T043 — a service on the replica that takes a group over must hear about it:
+/// that is where a persisted cast seat gets its connection back. A fresh group
+/// has nothing to resume and announces nothing.
+#[tokio::test]
+async fn a_takeover_announces_the_hydrated_group_but_a_new_group_does_not() {
+    let bus = Arc::new(LocalSyncBus::new());
+    let owners = FakeOwnerMap::default();
+    let store = FakeStore::default();
+    let a = spawn_replica(bus.clone(), owners.clone(), store.clone(), 1);
+    let b = spawn_replica(bus.clone(), owners.clone(), store.clone(), 2);
+    let mut a_heard = a.registry.subscribe_hydrated();
+    let mut b_heard = b.registry.subscribe_hydrated();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let handle_a = a.registry.create().await.unwrap();
+    let gid = handle_a.group_id;
+    let _rx = join(&handle_a, &a.sinks, MemberId::new(), "ali").await;
+    let _ = snapshot(&handle_a).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        a_heard.try_recv().is_err(),
+        "a new group is not a hydration"
+    );
+
+    // B cannot own it while A does.
+    let remote = b.registry.get_or_create(gid).await.unwrap();
+    assert!(remote.snapshot().await.is_none());
+    assert!(
+        b_heard.try_recv().is_err(),
+        "a remote handle is not a hydration"
+    );
+
+    owners.0.lock().unwrap().remove(&gid);
+    let owned = b.registry.get_or_create(gid).await.unwrap();
+    let heard = tokio::time::timeout(Duration::from_secs(2), b_heard.recv())
+        .await
+        .expect("the takeover is announced")
+        .unwrap();
+    assert_eq!(heard.group_id, gid);
+    assert!(owned.snapshot().await.is_some());
+}
+
+#[tokio::test]
+async fn is_owned_is_true_only_on_the_replica_running_the_actor() {
+    let bus = Arc::new(LocalSyncBus::new());
+    let owners = FakeOwnerMap::default();
+    let store = FakeStore::default();
+    let a = spawn_replica(bus.clone(), owners.clone(), store.clone(), 1);
+    let b = spawn_replica(bus.clone(), owners.clone(), store.clone(), 2);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let gid = a.registry.create().await.unwrap().group_id;
+    let _remote = b.registry.get_or_create(gid).await.unwrap();
+
+    assert!(a.registry.is_owned(gid).await.unwrap());
+    assert!(!b.registry.is_owned(gid).await.unwrap());
+    assert!(
+        !b.registry.is_owned(GroupId::new()).await.unwrap(),
+        "unknown group"
+    );
+}
+
+/// T043 — one lease per key across replicas: the primitive that keeps a TV's
+/// Cast connection single-owner. Idempotent for the holder, exclusive for the
+/// rest, and free again after release.
+#[tokio::test]
+async fn a_lease_is_exclusive_across_replicas_and_idempotent_for_its_holder() {
+    let bus = Arc::new(LocalSyncBus::new());
+    let owners = FakeOwnerMap::default();
+    let store = FakeStore::default();
+    let a = spawn_replica(bus.clone(), owners.clone(), store.clone(), 1);
+    let b = spawn_replica(bus.clone(), owners.clone(), store.clone(), 2);
+    let key = GroupId::new();
+
+    assert!(a.registry.try_lease(key).await.unwrap());
+    assert!(
+        a.registry.try_lease(key).await.unwrap(),
+        "re-asking is a no-op"
+    );
+    assert!(!b.registry.try_lease(key).await.unwrap(), "held elsewhere");
+
+    a.registry.release_lease(key).await.unwrap();
+    assert!(
+        b.registry.try_lease(key).await.unwrap(),
+        "free after release"
+    );
+    assert!(!a.registry.try_lease(key).await.unwrap());
+}
+
+#[tokio::test]
+async fn without_distribution_every_lease_is_granted() {
+    let sinks = MemberSinks::new();
+    let registry = GroupRegistry::spawn(Arc::new(pharos_sync::LocalDelivery::new(sinks)));
+    let key = GroupId::new();
+    assert!(registry.try_lease(key).await.unwrap());
+    assert!(registry.try_lease(key).await.unwrap());
+}
