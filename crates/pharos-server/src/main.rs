@@ -1941,13 +1941,22 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // quiet, and once more on the way out so a rolling deploy loses none.
     let progress_writes = app_state.progress_writes.clone();
     let progress_store = app_state.stores.clone();
+    // The tick is stopped by this token, never aborted: an abort could land
+    // between taking a report out of the hold and writing it.
+    let progress_flusher_stop = tokio_util::sync::CancellationToken::new();
     let progress_flusher = progress_writes.flush_period().map(|period| {
         let (writes, store) = (progress_writes.clone(), progress_store.clone());
+        let stop = progress_flusher_stop.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                // Once started, a flush runs to the end before `stop` is
+                // looked at again.
                 pharos_server::progress_writes::flush_due(
                     &writes,
                     &store,
@@ -2113,12 +2122,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let served = server.await;
     // The server has stopped, so no report can arrive after this flush, which
     // runs whether it stopped cleanly or not.
+    progress_flusher_stop.cancel();
     if let Some(flusher) = progress_flusher {
-        flusher.abort();
+        // Wait for a flush in progress, so nothing it took is missing from
+        // the hold when the final flush looks. A write is limited to 5 s, so
+        // this cannot hang.
+        if let Err(e) = flusher.await {
+            tracing::error!(error = %e, "progress flush tick ended abnormally");
+        }
     }
-    let flushed =
-        pharos_server::progress_writes::flush_all(&progress_writes, &progress_store).await;
-    tracing::info!(flushed, "held playback progress written on shutdown");
+    let outcome = pharos_server::progress_writes::flush_all_within(
+        &progress_writes,
+        &progress_store,
+        pharos_server::progress_writes::SHUTDOWN_FLUSH_DEADLINE,
+    )
+    .await;
+    if outcome.abandoned > 0 {
+        tracing::warn!(
+            written = outcome.written,
+            abandoned = outcome.abandoned,
+            "held playback progress abandoned on shutdown"
+        );
+    } else {
+        tracing::info!(
+            written = outcome.written,
+            "held playback progress written on shutdown"
+        );
+    }
     served?;
     // P31 — shutdown reached. If the SSDP responder is alive, send
     // byebye frames so DLNA clients drop pharos immediately instead
