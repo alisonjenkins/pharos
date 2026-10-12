@@ -49,6 +49,12 @@ const LANGUAGES: &[(&str, &str, &str)] = &[
     ("vie", "vie", "vi"),
 ];
 
+/// Every spelling the table knows, 639-2/B, 639-2/T and 639-1, so a copy of the
+/// table elsewhere (the `language_codes` SQL table) can be checked against it.
+pub fn known_codes() -> impl Iterator<Item = &'static str> {
+    LANGUAGES.iter().flat_map(|(b, t, a)| [*b, *t, *a])
+}
+
 fn entry(code: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
     LANGUAGES
         .iter()
