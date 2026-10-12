@@ -48,10 +48,12 @@ pub enum CastReason {
     TokenFailed,
     /// The TV a persisted seat points at is no longer configured.
     TvRemoved,
+    /// A start reached a replica that does not run the group.
+    NotGroupOwner,
 }
 
 impl CastReason {
-    pub const ALL: [CastReason; 11] = [
+    pub const ALL: [CastReason; 12] = [
         CastReason::NotInGroup,
         CastReason::TvBusy,
         CastReason::TvUnreachable,
@@ -63,6 +65,7 @@ impl CastReason {
         CastReason::UserStop,
         CastReason::TokenFailed,
         CastReason::TvRemoved,
+        CastReason::NotGroupOwner,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -78,6 +81,7 @@ impl CastReason {
             CastReason::UserStop => "user_stop",
             CastReason::TokenFailed => "token_failed",
             CastReason::TvRemoved => "tv_removed",
+            CastReason::NotGroupOwner => "not_group_owner",
         }
     }
 }
@@ -141,7 +145,8 @@ mod tests {
                 "grace_expired",
                 "user_stop",
                 "token_failed",
-                "tv_removed"
+                "tv_removed",
+                "not_group_owner"
             ]
         );
         assert_labels_bounded(&labels);
