@@ -127,12 +127,25 @@ const LONG_RUNNING_SECONDS: &[&str] = &[
     "pharos_segment_transcode_seconds",
     "pharos_transcode_encode_seconds",
     "pharos_transcode_queue_wait_seconds",
+    "pharos_transcode_stage_seconds",
     "pharos_scan_duration_seconds",
     "pharos_media_integrity_seconds",
 ];
 
 const LONG_SECONDS_BUCKETS: &[f64] = &[
     0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
+
+/// Encoded frames per wall second: a software 4K encode manages a handful, a
+/// hardware 1080p one a few hundred.
+const FPS_BUCKETS: &[f64] = &[
+    1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 150.0, 250.0, 400.0, 600.0, 1000.0,
+];
+
+/// Media seconds produced per wall second; below 1 a segment cannot keep up
+/// with playback.
+const SPEED_RATIO_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0,
 ];
 
 /// Indexed key reads take 0.05-0.5 ms, below the first general bucket.
@@ -199,6 +212,19 @@ pub fn init_with_sampling(
                     .set_buckets_for_metric(Matcher::Full((*name).into()), LONG_SECONDS_BUCKETS)
                     .map_err(|e| ObsError::Prom(e.to_string()))?;
             }
+            // Neither name ends in `_seconds`, so without these they would
+            // fall through to a summary, which cannot be aggregated across pods.
+            builder = builder
+                .set_buckets_for_metric(
+                    Matcher::Full("pharos_transcode_effective_fps".into()),
+                    FPS_BUCKETS,
+                )
+                .map_err(|e| ObsError::Prom(e.to_string()))?
+                .set_buckets_for_metric(
+                    Matcher::Full("pharos_transcode_speed_ratio".into()),
+                    SPEED_RATIO_BUCKETS,
+                )
+                .map_err(|e| ObsError::Prom(e.to_string()))?;
             let handle = builder
                 .set_buckets_for_metric(
                     Matcher::Full("pharos_store_query_seconds".into()),
@@ -485,6 +511,40 @@ mod tests {
         assert!(bucket_bounds(&body, "pharos_store_query_seconds").contains(&"0.0001".to_string()));
         let http = bucket_bounds(&body, "http_request_duration_seconds");
         assert!(http.contains(&"30".to_string()) && !http.contains(&"3600".to_string()));
+    }
+
+    /// The stage-timing metrics must render as histograms with their own
+    /// ladders, not as summaries (fps and speed have no `_seconds` suffix) and
+    /// not capped at 30 s (a stage can be a minute).
+    #[test]
+    fn stage_timing_metrics_get_histogram_ladders_that_fit_them() {
+        init("info", None).unwrap();
+        metrics::histogram!("pharos_transcode_effective_fps", "device_kind" => "vaapi", "codec" => "h264")
+            .record(110.0);
+        metrics::histogram!("pharos_transcode_speed_ratio", "device_kind" => "vaapi", "codec" => "h264")
+            .record(4.6);
+        metrics::histogram!(
+            "pharos_transcode_stage_seconds",
+            "device_kind" => "vaapi", "codec" => "h264", "stage" => "total"
+        )
+        .record(90.0);
+        let body = render();
+        let fps = bucket_bounds(&body, "pharos_transcode_effective_fps");
+        assert!(
+            fps.contains(&"1000".to_string()),
+            "fps must be a histogram: {fps:?}"
+        );
+        let speed = bucket_bounds(&body, "pharos_transcode_speed_ratio");
+        assert!(
+            speed.contains(&"0.1".to_string()) && speed.contains(&"50".to_string()),
+            "{speed:?}"
+        );
+        let stage = bucket_bounds(&body, "pharos_transcode_stage_seconds");
+        assert!(
+            stage.contains(&"3600".to_string()),
+            "stage must reach 1 h: {stage:?}"
+        );
+        assert!(!body.contains("pharos_transcode_effective_fps{") || !body.contains("quantile"));
     }
 
     #[test]
