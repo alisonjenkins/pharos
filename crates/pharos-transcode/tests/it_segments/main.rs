@@ -7,3 +7,4 @@ mod muxed_audio_content;
 mod segment_audio_continuity;
 mod segment_frame_completeness;
 mod segment_track_shape;
+mod vaapi_resident;
