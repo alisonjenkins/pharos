@@ -1083,7 +1083,7 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 last_playback_check_in: now_iso,
                 is_active: true,
                 supports_media_control: false,
-                supports_remote_control: false,
+                supports_remote_control: true,
                 has_custom_device_name: false,
                 supported_commands: Vec::new(),
                 now_playing_item,
