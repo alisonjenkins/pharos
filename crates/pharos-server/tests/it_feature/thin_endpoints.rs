@@ -7,7 +7,7 @@
 use actix_web::test;
 use serde_json::Value;
 
-mod common;
+use crate::common;
 use common::{build_app, seed_rich};
 
 async fn send(f: &common::Fixture, method: &str, uri: &str, token: &str) -> u16 {
