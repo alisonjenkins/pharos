@@ -557,6 +557,12 @@ pub type SpawnFuture = Pin<Box<dyn Future<Output = std::io::Result<Box<dyn Worke
 pub trait Worker: Send {
     fn id(&self) -> WorkerId;
     fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a>;
+
+    /// Timing of the job the last `run` completed, if the worker collected
+    /// any. Taken once: a second call returns `None`.
+    fn take_stage_timing(&mut self) -> Option<crate::stage_timing::StageTiming> {
+        None
+    }
 }
 
 /// Boxed future a [`WorkerSpawner::spawn_streaming`] call returns.
@@ -3562,6 +3568,7 @@ fn spawn_run_task(
 ) {
     let job_id = spec.job_id;
     let mut spec = spec;
+    let codec = crate::stage_timing::codec_label(spec.opts.video);
     tokio::spawn(async move {
         let _guard = span.enter();
         // The probe does not record rotation or field order, and the resident
@@ -3645,14 +3652,23 @@ fn spawn_run_task(
                 .increment(1);
                 result = worker.run(retry).await;
             }
-            (worker, result)
+            let timing = match result {
+                WorkerRunResult::Done { .. } => worker.take_stage_timing(),
+                _ => None,
+            };
+            (worker, result, timing)
         });
         let (returned, result) = match run_handle.await {
-            Ok((w, WorkerRunResult::Died)) => {
+            Ok((w, WorkerRunResult::Died, _)) => {
                 drop(w);
                 (None, WorkerRunResult::Died)
             }
-            Ok((w, r)) => (Some(w), r),
+            Ok((w, r, timing)) => {
+                if let Some(t) = timing {
+                    span.in_scope(|| t.record(crate::stage_timing::device_kind(device), codec));
+                }
+                (Some(w), r)
+            }
             Err(join_err) => {
                 // Panic or cancellation inside the worker run — treat as a
                 // death so the bounded-retry path resolves the reply.
@@ -4137,6 +4153,94 @@ mod tests {
                 r.rows
             );
         }
+    }
+
+    /// A worker that reports a fixed `StageTiming`, once, after each run.
+    struct TimedWorker {
+        id: WorkerId,
+        pending: Option<crate::stage_timing::StageTiming>,
+    }
+
+    impl Worker for TimedWorker {
+        fn id(&self) -> WorkerId {
+            self.id
+        }
+        fn run<'a>(&'a mut self, _job: JobSpec) -> RunFuture<'a> {
+            self.pending = Some(crate::stage_timing::StageTiming {
+                spawn_secs: 0.002,
+                first_frame_secs: Some(0.25),
+                total_secs: 2.0,
+                ..Default::default()
+            });
+            Box::pin(async { WorkerRunResult::Done { out_bytes: 1 } })
+        }
+        fn take_stage_timing(&mut self) -> Option<crate::stage_timing::StageTiming> {
+            self.pending.take()
+        }
+    }
+
+    struct TimedSpawner;
+
+    impl WorkerSpawner for TimedSpawner {
+        fn spawn(&self, id: WorkerId) -> SpawnFuture {
+            Box::pin(
+                async move { Ok(Box::new(TimedWorker { id, pending: None }) as Box<dyn Worker>) },
+            )
+        }
+    }
+
+    /// The scheduler exports a worker's timing under the job's device kind and
+    /// codec, so a dashboard can split VAAPI from CPU.
+    #[test]
+    fn a_finished_job_exports_its_stage_timing_by_device_kind_and_codec() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Vaapi, 0);
+                let s = TranscodeScheduler::spawn(
+                    DeviceTable::from_probe(&[(gpu, 2)], 1),
+                    Arc::new(TimedSpawner),
+                    SchedConfig::default(),
+                );
+                s.submit(
+                    PathBuf::from("/m/a.mkv"),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint::default(),
+                )
+                .await
+                .unwrap();
+            });
+        });
+        let labels: Vec<(String, String)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_transcode_stage_seconds")
+            .map(|(k, ..)| {
+                let get = |name: &str| {
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == name)
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default()
+                };
+                (get("device_kind"), get("codec"))
+            })
+            .collect();
+        assert!(!labels.is_empty(), "no stage timing exported");
+        assert!(
+            labels.iter().all(|(d, c)| d == "vaapi" && c == "h264"),
+            "{labels:?}"
+        );
     }
 
     fn table() -> DeviceTable {

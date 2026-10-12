@@ -284,6 +284,12 @@ pub enum WorkerEvent {
         job_id: JobId,
         out_bytes: u64,
     },
+    /// Where a successful job's time went, sent just before its `Done`.
+    /// Never sent for a failed job, and not at all when the mode is `off`.
+    Timing {
+        job_id: JobId,
+        timing: crate::stage_timing::StageTiming,
+    },
     Failed {
         job_id: JobId,
         error: WorkerError,
@@ -554,6 +560,21 @@ mod tests {
                 job_id: JobId(1),
                 out_bytes: 4096,
                 frames: 12,
+            },
+            WorkerEvent::Timing {
+                job_id: JobId(1),
+                timing: crate::stage_timing::StageTiming {
+                    spawn_secs: 0.002,
+                    first_frame_secs: Some(0.3),
+                    total_secs: 2.0,
+                    progress: Some(crate::stage_timing::ProgressReport {
+                        frames: 144,
+                        out_time_us: 6_000_000,
+                        speed: Some(3.0),
+                        ended: true,
+                    }),
+                    bench: Some(crate::stage_timing::BenchReport::default()),
+                },
             },
             WorkerEvent::Done {
                 job_id: JobId(1),

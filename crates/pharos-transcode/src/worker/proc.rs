@@ -20,6 +20,7 @@ use crate::protocol::{JobSpec, WorkerId};
 use crate::scheduler::{
     LiveByteStream, RunFuture, SpawnFuture, StreamFuture, Worker, WorkerRunResult, WorkerSpawner,
 };
+use crate::stage_timing::{StageTiming, StageTimingMode, ENV_STAGE_TIMING};
 use bytes::Bytes;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -41,6 +42,7 @@ pub struct ProcSpawner {
     handshake_timeout: Duration,
     heartbeat_timeout: Duration,
     inspector: std::sync::Arc<crate::resident_preflight::SourceInspector>,
+    stage_timing: StageTimingMode,
 }
 
 impl Default for ProcSpawner {
@@ -65,7 +67,14 @@ impl ProcSpawner {
             inspector: std::sync::Arc::new(crate::resident_preflight::SourceInspector::new(
                 super::exec::ffmpeg_bin(),
             )),
+            stage_timing: StageTimingMode::default(),
         }
+    }
+
+    /// How much per-job timing the spawned workers collect.
+    pub fn with_stage_timing(mut self, mode: StageTimingMode) -> Self {
+        self.stage_timing = mode;
+        self
     }
 
     pub fn with_heartbeat_timeout(mut self, d: Duration) -> Self {
@@ -114,6 +123,7 @@ pub(crate) async fn spawn_worker_proc(
     worker_bin: &std::path::Path,
     handshake_timeout: Duration,
     media_stdout: bool,
+    stage_timing: StageTimingMode,
 ) -> io::Result<(Child, OwnedReadHalf, OwnedWriteHalf, Handshake)> {
     let (parent_fd, child_fd) = make_socketpair()?;
     // Don't leak the parent end into the child.
@@ -130,6 +140,7 @@ pub(crate) async fn spawn_worker_proc(
             Stdio::inherit()
         })
         .stderr(Stdio::inherit())
+        .env(ENV_STAGE_TIMING, stage_timing.as_str())
         .kill_on_drop(true);
     // SAFETY: dup2 is async-signal-safe.
     unsafe {
@@ -181,9 +192,10 @@ impl WorkerSpawner for ProcSpawner {
         let worker_bin = self.worker_bin.clone();
         let handshake_timeout = self.handshake_timeout;
         let heartbeat_timeout = self.heartbeat_timeout;
+        let stage_timing = self.stage_timing;
         Box::pin(async move {
             let (child, rd, wr, handshake) =
-                spawn_worker_proc(&worker_bin, handshake_timeout, false).await?;
+                spawn_worker_proc(&worker_bin, handshake_timeout, false, stage_timing).await?;
             Ok(Box::new(ProcWorker {
                 id,
                 rd,
@@ -191,6 +203,7 @@ impl WorkerSpawner for ProcSpawner {
                 _child: child,
                 handshake,
                 heartbeat_timeout,
+                last_timing: None,
             }) as Box<dyn Worker>)
         })
     }
@@ -198,9 +211,10 @@ impl WorkerSpawner for ProcSpawner {
     fn spawn_streaming(&self, spec: JobSpec) -> StreamFuture {
         let worker_bin = self.worker_bin.clone();
         let handshake_timeout = self.handshake_timeout;
+        let stage_timing = self.stage_timing;
         Box::pin(async move {
             let (mut child, mut rd, mut wr, _handshake) =
-                spawn_worker_proc(&worker_bin, handshake_timeout, true).await?;
+                spawn_worker_proc(&worker_bin, handshake_timeout, true, stage_timing).await?;
             // The media pipe = the worker's (and thus ffmpeg's) stdout.
             let stdout = child
                 .stdout
@@ -267,6 +281,8 @@ pub struct ProcWorker {
     _child: Child,
     handshake: Handshake,
     heartbeat_timeout: Duration,
+    /// Set by a `Timing` event, handed out once by `take_stage_timing`.
+    last_timing: Option<StageTiming>,
 }
 
 impl ProcWorker {
@@ -280,8 +296,13 @@ impl Worker for ProcWorker {
         self.id
     }
 
+    fn take_stage_timing(&mut self) -> Option<StageTiming> {
+        self.last_timing.take()
+    }
+
     fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
         Box::pin(async move {
+            self.last_timing = None;
             if write_frame(&mut self.wr, &WorkerCmd::Job(job))
                 .await
                 .is_err()
@@ -306,6 +327,10 @@ impl Worker for ProcWorker {
                         WorkerEvent::Accepted { .. } | WorkerEvent::Progress { .. } => {
                             // Progress resets the heartbeat window (next
                             // loop iteration re-arms the timeout).
+                            continue;
+                        }
+                        WorkerEvent::Timing { timing, .. } => {
+                            self.last_timing = Some(timing);
                             continue;
                         }
                         WorkerEvent::Done { out_bytes, .. } => {
