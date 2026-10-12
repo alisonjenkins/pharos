@@ -7,14 +7,12 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use super::common;
 use pharos_core::{
     AudioTrack, FacetRequest, MediaFilters, MediaItem, MediaKind, MediaProbe, MediaQuery,
     MediaStore, SubtitleTrack,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use std::borrow::Cow;
-use std::str::FromStr;
 
 /// The last migration before the language index was added.
 const BEFORE_LANGUAGE_INDEX: i64 = 55;
@@ -651,17 +649,6 @@ async fn postgres_language_index() {
     language_codes_match_the_rust_table(&s).await;
 }
 
-fn scratch_db_path() -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "pharos-language-index-migration-{}-{nanos}.db",
-        std::process::id()
-    ))
-}
-
 /// Track blobs for the rows a database that predates the migration holds:
 /// `(id, audio blob, subtitle blob, expected rows)`.
 #[allow(clippy::type_complexity)]
@@ -696,25 +683,7 @@ fn old_rows() -> Vec<(i64, Option<String>, Option<String>, Vec<(String, String)>
 /// A database at schema 0055 holding `old_rows()` plus `filler` blob-less
 /// movies.
 async fn populated_old_db(url: &str, filler: usize) {
-    let opts = SqliteConnectOptions::from_str(url)
-        .unwrap()
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(opts)
-        .await
-        .unwrap();
-    let mut migrator = sqlx::migrate!("./migrations/sqlite");
-    migrator.migrations = Cow::Owned(
-        migrator
-            .migrations
-            .iter()
-            .filter(|m| m.version <= BEFORE_LANGUAGE_INDEX)
-            .cloned()
-            .collect(),
-    );
-    migrator.run(&pool).await.unwrap();
+    let pool = common::migrated_to(url, BEFORE_LANGUAGE_INDEX).await;
     let mut tx = pool.begin().await.unwrap();
     let rows = old_rows();
     for i in 0..(rows.len() + filler) {
@@ -742,7 +711,7 @@ async fn populated_old_db(url: &str, filler: usize) {
 /// the spellings folded, and tolerates blobs it cannot read.
 #[tokio::test]
 async fn sqlite_migration_indexes_existing_rows() {
-    let path = scratch_db_path();
+    let path = common::scratch_db_path("language-index-migration");
     let url = format!("sqlite://{}", path.display());
     populated_old_db(&url, 600).await;
 
@@ -785,7 +754,7 @@ async fn postgres_migration_indexes_existing_rows() {
         .await
         .unwrap();
     let mut migrator = sqlx::migrate!("./migrations/postgres");
-    migrator.migrations = Cow::Owned(
+    migrator.migrations = std::borrow::Cow::Owned(
         migrator
             .migrations
             .iter()

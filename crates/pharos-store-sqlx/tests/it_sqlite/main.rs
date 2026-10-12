@@ -4,6 +4,8 @@
 mod auth_sqlite;
 mod bg_leadership;
 mod book_roundtrip;
+#[path = "../common/mod.rs"]
+mod common;
 mod language_index;
 mod media_fts_facets;
 mod media_query;
