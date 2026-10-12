@@ -1,7 +1,9 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{AuthError, SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+use pharos_core::{
+    AuthError, SecretString, TokenScope, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 
 async fn fresh() -> SqliteStore {
@@ -165,7 +167,10 @@ async fn issue_with_ttl_bounds_lifetime_and_id_is_the_stored_hash() {
     let r = record("ali", "h", false);
     let uid = r.id;
     s.create(r).await.unwrap();
-    let issued = s.issue_with_ttl(uid, "cast:Den", 3600).await.unwrap();
+    let issued = s
+        .issue_with_ttl(uid, "cast:Den", 3600, TokenScope::Full)
+        .await
+        .unwrap();
     let (stored, created, expires): (String, i64, i64) =
         sqlx::query_as("SELECT token_hash, created_at, expires_at FROM auth_tokens")
             .fetch_one(s.pool())
@@ -183,7 +188,10 @@ async fn zero_ttl_token_is_already_expired() {
     let r = record("ali", "h", false);
     let uid = r.id;
     s.create(r).await.unwrap();
-    let issued = s.issue_with_ttl(uid, "cast:Den", 0).await.unwrap();
+    let issued = s
+        .issue_with_ttl(uid, "cast:Den", 0, TokenScope::Full)
+        .await
+        .unwrap();
     match s.resolve(issued.secret.0.expose()).await {
         Err(AuthError::InvalidToken) => {}
         other => panic!("expected InvalidToken, got {other:?}"),
@@ -196,7 +204,10 @@ async fn revoke_by_id_invalidates_and_is_idempotent() {
     let r = record("ali", "h", false);
     let uid = r.id;
     s.create(r).await.unwrap();
-    let issued = s.issue_with_ttl(uid, "cast:Den", 3600).await.unwrap();
+    let issued = s
+        .issue_with_ttl(uid, "cast:Den", 3600, TokenScope::Full)
+        .await
+        .unwrap();
     let other = s.issue(uid, "dev").await.unwrap();
     s.revoke_by_id(&issued.id).await.unwrap();
     s.revoke_by_id(&issued.id).await.unwrap();
@@ -205,4 +216,47 @@ async fn revoke_by_id_invalidates_and_is_idempotent() {
         Err(AuthError::InvalidToken)
     ));
     assert_eq!(s.resolve(other.0.expose()).await.unwrap(), uid);
+}
+
+#[tokio::test]
+async fn a_playback_token_resolves_with_its_scope_and_a_login_token_is_full() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let tv = s
+        .issue_with_ttl(uid, "cast:Den", 3600, TokenScope::Playback)
+        .await
+        .unwrap();
+    let login = s.issue(uid, "dev").await.unwrap();
+    let tv = s.resolve_scoped(tv.secret.0.expose()).await.unwrap();
+    let login = s.resolve_scoped(login.0.expose()).await.unwrap();
+    assert_eq!((tv.user, tv.scope), (uid, TokenScope::Playback));
+    assert_eq!((login.user, login.scope), (uid, TokenScope::Full));
+}
+
+#[tokio::test]
+async fn a_row_with_no_scope_is_full_and_an_unknown_scope_is_refused() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let legacy = s.issue(uid, "dev").await.unwrap();
+    let stored: (Option<String>,) = sqlx::query_as("SELECT scope FROM auth_tokens")
+        .fetch_one(s.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored.0, None, "Full is stored as NULL, as before scopes");
+    assert_eq!(
+        s.resolve_scoped(legacy.0.expose()).await.unwrap().scope,
+        TokenScope::Full
+    );
+    sqlx::query("UPDATE auth_tokens SET scope = 'superuser'")
+        .execute(s.pool())
+        .await
+        .unwrap();
+    match s.resolve_scoped(legacy.0.expose()).await {
+        Err(AuthError::Backend(m)) => assert!(m.contains("superuser"), "{m}"),
+        other => panic!("expected Backend naming the scope, got {other:?}"),
+    }
 }

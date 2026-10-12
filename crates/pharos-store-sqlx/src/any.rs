@@ -11,11 +11,11 @@ use pharos_core::{
     EntityCounts, Fingerprint, GenreCount, GenreStore, IssuedToken, ItemPerson, Library,
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
     PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore,
-    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState,
-    SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio,
-    StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenRecord,
-    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
-    UserStore,
+    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
+    ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
+    TokenId, TokenRecord, TokenScope, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -1172,10 +1172,11 @@ impl TokenStore for AnyStore {
         user_id: UserId,
         device_id: &str,
         ttl_secs: i64,
+        scope: TokenScope,
     ) -> AuthResult<IssuedToken> {
         match self {
-            AnyStore::Sqlite(s) => s.issue_with_ttl(user_id, device_id, ttl_secs).await,
-            AnyStore::Postgres(p) => p.issue_with_ttl(user_id, device_id, ttl_secs).await,
+            AnyStore::Sqlite(s) => s.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
+            AnyStore::Postgres(p) => p.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
         }
     }
 
@@ -1186,10 +1187,10 @@ impl TokenStore for AnyStore {
         }
     }
 
-    async fn resolve(&self, token: &str) -> AuthResult<UserId> {
+    async fn resolve_scoped(&self, token: &str) -> AuthResult<ResolvedToken> {
         match self {
-            AnyStore::Sqlite(s) => s.resolve(token).await,
-            AnyStore::Postgres(p) => p.resolve(token).await,
+            AnyStore::Sqlite(s) => s.resolve_scoped(token).await,
+            AnyStore::Postgres(p) => p.resolve_scoped(token).await,
         }
     }
 

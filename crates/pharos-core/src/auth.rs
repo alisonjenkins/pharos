@@ -224,15 +224,67 @@ pub struct IssuedToken {
     pub secret: AuthToken,
 }
 
+/// What a stored token may do. A closed set: a new scope is a deliberate
+/// code change, and every consumer matches it exhaustively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TokenScope {
+    /// The owner's full permissions. Every token issued before scopes existed,
+    /// and every token a login issues.
+    #[default]
+    Full,
+    /// Playback endpoints only: what a cast receiver needs to fetch and
+    /// report on the media it was told to play.
+    Playback,
+}
+
+impl TokenScope {
+    /// Stable string for logs and metrics labels.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Playback => "playback",
+        }
+    }
+
+    /// The value stored in the `scope` column. `Full` is stored as absent, so
+    /// a row written by [`TokenStore::issue`] is the same row it always was.
+    pub fn to_stored(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::Playback => Some(self.label()),
+        }
+    }
+
+    /// Parse the `scope` column. `NULL` (every pre-scope row) is `Full`; a
+    /// value this build does not know is an error, never a silent `Full`.
+    pub fn from_stored(stored: Option<&str>) -> AuthResult<Self> {
+        match stored {
+            None | Some("full") => Ok(Self::Full),
+            Some("playback") => Ok(Self::Playback),
+            Some(other) => Err(AuthError::Backend(format!(
+                "unknown token scope {other:?} in auth_tokens.scope"
+            ))),
+        }
+    }
+}
+
+/// The user and scope a presented token resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedToken {
+    pub user: UserId,
+    pub scope: TokenScope,
+}
+
 /// Persistence of session tokens.
 pub trait TokenStore: Send + Sync {
     /// Like [`TokenStore::issue`] but with a caller-chosen lifetime in
-    /// seconds and the token's id returned beside the secret.
+    /// seconds and scope, and the token's id returned beside the secret.
     fn issue_with_ttl(
         &self,
         user_id: UserId,
         device_id: &str,
         ttl_secs: i64,
+        scope: TokenScope,
     ) -> impl std::future::Future<Output = AuthResult<IssuedToken>> + Send;
 
     /// Revoke by [`TokenId`]. Idempotent: an unknown id is `Ok`.
@@ -247,7 +299,17 @@ pub trait TokenStore: Send + Sync {
         device_id: &str,
     ) -> impl std::future::Future<Output = AuthResult<AuthToken>> + Send;
 
-    fn resolve(&self, token: &str) -> impl std::future::Future<Output = AuthResult<UserId>> + Send;
+    /// The user and scope behind `token`.
+    fn resolve_scoped(
+        &self,
+        token: &str,
+    ) -> impl std::future::Future<Output = AuthResult<ResolvedToken>> + Send;
+
+    /// The user behind `token`, ignoring its scope. Use [`Self::resolve_scoped`]
+    /// wherever the scope decides whether a request may proceed.
+    fn resolve(&self, token: &str) -> impl std::future::Future<Output = AuthResult<UserId>> + Send {
+        async move { self.resolve_scoped(token).await.map(|r| r.user) }
+    }
 
     fn revoke(&self, token: &str) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 

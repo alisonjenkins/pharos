@@ -2,8 +2,8 @@
 
 use crate::sqlite::SqliteStore;
 use pharos_core::{
-    AuthError, AuthResult, AuthToken, IssuedToken, SecretString, TokenId, TokenStore, UserId,
-    UserPolicy, UserRecord, UserStore,
+    AuthError, AuthResult, AuthToken, IssuedToken, ResolvedToken, SecretString, TokenId,
+    TokenScope, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
 use uuid::Uuid;
 
@@ -177,7 +177,12 @@ fn record_from_row(row: UserRow) -> AuthResult<UserRecord> {
 impl TokenStore for SqliteStore {
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
         Ok(self
-            .issue_with_ttl(user_id, device_id, crate::auth_token::TTL_SECS)
+            .issue_with_ttl(
+                user_id,
+                device_id,
+                crate::auth_token::TTL_SECS,
+                TokenScope::Full,
+            )
             .await?
             .secret)
     }
@@ -188,6 +193,7 @@ impl TokenStore for SqliteStore {
         user_id: UserId,
         device_id: &str,
         ttl_secs: i64,
+        scope: TokenScope,
     ) -> AuthResult<IssuedToken> {
         // The raw token is returned to the client but never stored — only
         // its SHA-256 hash is persisted (a DB leak must not yield usable
@@ -197,14 +203,15 @@ impl TokenStore for SqliteStore {
         let now = now_unix_secs();
         let user_bytes = user_id.0.as_bytes().to_vec();
         sqlx::query(
-            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(user_bytes)
         .bind(device_id)
         .bind(now)
         .bind(now.saturating_add(ttl_secs))
+        .bind(scope.to_stored())
         .execute(self.pool())
         .await
         .map_err(map_sqlx)?;
@@ -225,10 +232,10 @@ impl TokenStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self, token))]
-    async fn resolve(&self, token: &str) -> AuthResult<UserId> {
+    async fn resolve_scoped(&self, token: &str) -> AuthResult<ResolvedToken> {
         // Look up by hash and reject expired tokens (expires_at NULL = never).
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT user_id FROM auth_tokens \
+        let row: Option<(Vec<u8>, Option<String>)> = sqlx::query_as(
+            "SELECT user_id, scope FROM auth_tokens \
              WHERE token_hash = ? AND (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(crate::auth_token::hash(token))
@@ -236,10 +243,13 @@ impl TokenStore for SqliteStore {
         .fetch_optional(self.pool())
         .await
         .map_err(map_sqlx)?;
-        let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
+        let (bytes, scope) = row.ok_or(AuthError::InvalidToken)?;
         let uuid =
             Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
-        Ok(UserId(uuid))
+        Ok(ResolvedToken {
+            user: UserId(uuid),
+            scope: TokenScope::from_stored(scope.as_deref())?,
+        })
     }
 
     #[tracing::instrument(skip(self, token))]
