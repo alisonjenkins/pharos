@@ -653,6 +653,22 @@ impl crate::ServerConfigStore for SqliteStore {
     }
 }
 
+impl SqliteStore {
+    async fn put_rows_in_tx(&self, rows: &[&MediaItem]) -> DomainResult<()> {
+        use crate::sqlite_put::{bind_item, upsert_sql, MAX_ROWS_PER_STATEMENT};
+        let backend = |e: sqlx::Error| DomainError::Backend(e.to_string());
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        for chunk in rows.chunks(MAX_ROWS_PER_STATEMENT) {
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(upsert_sql(chunk.len())));
+            for item in chunk {
+                q = bind_item(q, item)?;
+            }
+            q.execute(&mut *tx).await.map_err(backend)?;
+        }
+        tx.commit().await.map_err(backend)
+    }
+}
+
 impl MediaStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
@@ -678,6 +694,31 @@ impl MediaStore for SqliteStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
+    }
+
+    /// One transaction (one WAL commit) for the whole batch instead of one per
+    /// item. If any statement fails the transaction rolls back and the items
+    /// are written one at a time, so a single bad row is reported by id and
+    /// does not cost its neighbours.
+    #[tracing::instrument(skip(self, items), fields(batch.len = items.len()))]
+    async fn put_batch(&self, items: &[MediaItem]) -> DomainResult<()> {
+        let rows = crate::put_batch::dedupe_last_wins(items);
+        match rows.as_slice() {
+            [] => return Ok(()),
+            [one] => return self.put((*one).clone()).await,
+            _ => {}
+        }
+        match self.put_rows_in_tx(&rows).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    batch.len = rows.len(),
+                    error = %e,
+                    "put_batch: transaction failed; retrying item by item"
+                );
+                crate::put_batch::put_each(self, &rows).await
+            }
+        }
     }
 
     #[tracing::instrument(skip(self))]

@@ -29,6 +29,10 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
 
 pub(crate) const PUT_COLUMN_COUNT: usize = 62;
 
+/// Rows per `INSERT`. SQLite caps bound variables at 32766 per statement.
+pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 500;
+const _: () = assert!(MAX_ROWS_PER_STATEMENT * PUT_COLUMN_COUNT <= 32_766);
+
 /// `created_at` keeps the value already stored (rows that predate migration
 /// 0010 have none, hence the COALESCE).
 pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
