@@ -1,0 +1,11 @@
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'rot90.mp4':
+  Duration: 00:00:03.00, start: 0.000000, bitrate: 6755 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1920x1080 [SAR 1:1 DAR 16:9], 6637 kb/s, 24 fps, 24 tbr, 12288 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+    Side data:
+      Display Matrix: rotation of 90.00 degrees
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp, 69 kb/s (default)
+    Metadata:
+      handler_name    : SoundHandler
+At least one output file must be specified

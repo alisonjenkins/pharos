@@ -1,0 +1,6 @@
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'tff.mp4':
+  Duration: 00:00:02.00, start: 0.000000, bitrate: 1173 kb/s
+  Stream #0:0[0x1](und): Video: h264 (Main) (avc1 / 0x31637661), yuv420p(top first), 640x360 [SAR 1:1 DAR 16:9], 1173 kb/s, 12.50 fps, 12.50 tbr, 12800 tbn (default)
+    Metadata:
+      handler_name    : VideoHandler
+At least one output file must be specified
