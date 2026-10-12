@@ -18,9 +18,7 @@ use pharos_server::{
 };
 use tracing_subscriber::prelude::*;
 
-#[path = "common/store_calls.rs"]
-mod store_calls;
-use store_calls::StoreCallLog;
+use crate::store_calls::StoreCallLog;
 
 async fn seed() -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
