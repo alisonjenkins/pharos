@@ -45,6 +45,7 @@ pub struct CastRig {
     pub registry: GroupRegistry,
     pub service: CastServiceHandle,
     pub receiver: FakeReceiverHandle,
+    pub factory: FakeTransportFactory,
     pub directory: Arc<RuntimeCastDirectory>,
     pub bus: broadcast::Receiver<SocketBroadcast>,
     pub alice: Person,
@@ -155,7 +156,7 @@ impl CastRig {
                 stores: stores.clone(),
             },
             cfg.clone(),
-            factory,
+            factory.clone(),
         );
         runtime.install(service.clone());
 
@@ -191,6 +192,7 @@ impl CastRig {
             registry,
             service,
             receiver,
+            factory,
             directory,
             bus,
             alice,

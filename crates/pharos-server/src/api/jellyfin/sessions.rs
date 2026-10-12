@@ -6,11 +6,13 @@
 
 use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::{
-    api::jellyfin::auth_extractor::{auth_header_from_request, AuthUser},
+    api::jellyfin::auth_extractor::{auth_header_from_request, AuthSession, AuthUser},
+    cast_service::{CastReject, CastRejectReason, StartCast},
+    cast_sessions::tv_session_id,
     sessions::{SessionEvent, SessionRecord},
-    state::AppState,
+    state::{AppState, SocketBroadcast},
 };
-use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
+use actix_web::{error, http::StatusCode, web, HttpRequest, HttpResponse, Responder};
 use pharos_core::{MediaStore, PlaybackProgress, UserDataStore};
 use serde::Deserialize;
 use std::time::Instant;
@@ -597,23 +599,126 @@ fn title_case(s: &str) -> String {
     }
 }
 
+/// The configured TV a session id names, if any. Only these ids are virtual;
+/// every other id is a real player and keeps the plain relay.
+fn virtual_tv_name(state: &AppState, session_id: &str) -> Option<String> {
+    let directory = state.cast_directory.as_ref()?;
+    let wanted = session_id.to_ascii_lowercase();
+    directory
+        .config()
+        .tvs
+        .iter()
+        .find(|tv| tv_session_id(&tv.name) == wanted)
+        .map(|tv| tv.name.clone())
+}
+
+/// The HTTP status for a refused cast start. A refusal that is the caller's to
+/// fix is 4xx; one that is a dependency failing (the TV, the token store, the
+/// service) is 503, so the caller's next move follows from the status (V165).
+const fn reject_status(reason: CastRejectReason) -> StatusCode {
+    match reason {
+        CastRejectReason::NotInGroup => StatusCode::BAD_REQUEST,
+        CastRejectReason::NotPermitted => StatusCode::FORBIDDEN,
+        CastRejectReason::TvBusy | CastRejectReason::UserHasSeat => StatusCode::CONFLICT,
+        CastRejectReason::TvUnreachable
+        | CastRejectReason::TokenFailed
+        | CastRejectReason::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// `<reason>: <message>` as the plain-text body Jellyfin clients show, so the
+/// stable reason is both machine-readable and part of the sentence.
+fn reject_response(reject: &CastReject) -> HttpResponse {
+    HttpResponse::build(reject_status(reject.reason)).body(format!(
+        "{}: {}",
+        reject.reason.label(),
+        reject.message
+    ))
+}
+
+/// Hand the caller's seat in their SyncPlay group over to `tv_name`.
+async fn start_cast(state: &AppState, auth: &AuthSession, tv_name: String) -> HttpResponse {
+    let Some(service) = state.cast.service() else {
+        return reject_response(&CastReject {
+            reason: CastRejectReason::Unavailable,
+            message: format!("casting to {tv_name:?} is not running on this server"),
+        });
+    };
+    let Some(owner_sync_key) = auth.sync_key() else {
+        return reject_response(&CastReject {
+            reason: CastRejectReason::NotInGroup,
+            message: "the request carried no deviceId, so it cannot be tied to a SyncPlay group"
+                .into(),
+        });
+    };
+    let started = service
+        .start(StartCast {
+            user_id: auth.user.id,
+            user_name: auth.user.name.clone(),
+            owner_sync_key,
+            tv_name,
+        })
+        .await;
+    match started {
+        Ok(()) => {
+            let _ = state.bus.send(SocketBroadcast::CastChanged);
+            HttpResponse::NoContent().finish()
+        }
+        Err(reject) => reject_response(&reject),
+    }
+}
+
 /// `POST /Sessions/{id}/Playing` — "play these items here". Body
 /// carries `ItemIds`, `StartPositionTicks`, `PlayCommand` (PlayNow /
 /// PlayNext / PlayLast). Forwards verbatim as a `Play` command so
 /// the receiving client kicks off playback.
+///
+/// A configured TV's id is not a player: picking it hands the caller's seat in
+/// their SyncPlay group to the TV instead (spec 009).
 async fn session_play_request(
     state: web::Data<AppState>,
-    user: AuthUser,
+    auth: AuthSession,
     path: web::Path<String>,
     body: Option<web::Json<serde_json::Value>>,
-) -> impl Responder {
+) -> HttpResponse {
     let session_id = path.into_inner();
+    if let Some(tv_name) = virtual_tv_name(&state, &session_id) {
+        return start_cast(&state, &auth, tv_name).await;
+    }
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
-    let controlling = user.0.id.0.simple().to_string();
+    let controlling = auth.user.id.0.simple().to_string();
     // "Play" is a distinct MessageType (PlayRequest), not a PlaystateCommand —
     // the socket translator routes it accordingly (B79).
     state.notify_session_command(&session_id, &controlling, "Play", arg);
     HttpResponse::NoContent().finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_reject_reason_has_a_status_and_only_dependency_failures_are_5xx() {
+        for reason in CastRejectReason::ALL {
+            let status = reject_status(reason);
+            let dependency = matches!(
+                reason,
+                CastRejectReason::TvUnreachable
+                    | CastRejectReason::TokenFailed
+                    | CastRejectReason::Unavailable
+            );
+            assert_eq!(
+                status.is_server_error(),
+                dependency,
+                "{} -> {status}",
+                reason.label()
+            );
+        }
+        assert_eq!(
+            reject_status(CastRejectReason::NotPermitted),
+            StatusCode::FORBIDDEN
+        );
+    }
 }
