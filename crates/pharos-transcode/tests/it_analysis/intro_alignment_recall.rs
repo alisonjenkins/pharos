@@ -20,7 +20,7 @@
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use common::{load_fixture, of_kind, FixtureRow};
 use pharos_transcode::fingerprint::align::{compare, AlignConfig};
