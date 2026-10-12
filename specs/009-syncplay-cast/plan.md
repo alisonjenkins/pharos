@@ -89,7 +89,7 @@ compat-playwright/                    # cast spec using the emulator
 0. Instrumentation commit (metrics, log events, `label()` methods with distinctness test) — ships and can be read before the behaviour.
 1. Spikes S1–S4; record results in `research.md`.
 2. `MemberKind` + persistence + gate exclusion in `pharos-sync` (red tests first).
-3. `pharos-cast` (transport trait, emulator, drift planner, `CastSeat`).
+3. `pharos-cast` (transport trait, emulator, drift planner, `CastDriver`).
 4. Server orchestration: config, virtual sessions, route interception, hand-off/restore, token mint/revoke, leave/dissolve cleanup.
 5. Distributed ownership + restart hydration of the connection.
 6. Compat harness + real-TV run; invariants/bugs appended.

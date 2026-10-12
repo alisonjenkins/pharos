@@ -23,7 +23,8 @@ Two `jellyfin-web` contexts in one group plus the emulator as the TV. Steps: mem
 2. Two people join a group and play an item; one picks the TV from the player's device list.
 3. Expect: the TV starts within 15 s at the group position; the picker's owner's own player stops; pause/seek from the other person reach the TV within 1 s.
 4. Switch the TV off. Expect: the other member is not frozen beyond the bounded freeze; the owner can resume locally.
-5. Run the queries below and record the output in this file. Until then the real-TV claims are unwitnessed.
+5. Measurement: SC-001 on a real TV is position error against the group clock from interpolated receiver reports (command-to-apply is only observable on the emulator); SC-002 is that error sampled over a full item.
+6. Run the queries below and record the output in this file. Until then the real-TV claims are unwitnessed.
 
 ## 4. Verify by query (name the signal first)
 
