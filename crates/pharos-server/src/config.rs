@@ -395,6 +395,15 @@ pub struct ServerConfig {
     /// shared-result single-flight is unaffected.
     #[serde(default = "default_true")]
     pub transcode_queue_background: bool,
+    /// Keep a VAAPI segment's frames on the GPU from decoder to encoder
+    /// (`-hwaccel_output_format vaapi`, no download/`hwupload`). Default false.
+    ///
+    /// Applies only to VAAPI placements of H.264/HEVC targets with no burn-in,
+    /// a plain 8-bit SDR source and no rotation or interlacing; everything else
+    /// keeps today's CPU-filter pipeline. A resident run that fails is retried
+    /// once on that pipeline. See `pharos_transcode::ResidentVerdict`.
+    #[serde(default)]
+    pub transcode_vaapi_gpu_resident: bool,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.
@@ -876,6 +885,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn gpu_resident_vaapi_is_off_unless_asked_for() {
+        let parse =
+            |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
+        assert!(!parse("").expect("parses").transcode_vaapi_gpu_resident);
+        assert!(
+            parse("transcode_vaapi_gpu_resident = true")
+                .expect("parses")
+                .transcode_vaapi_gpu_resident
+        );
+    }
 
     /// 008 — the feature is off unless somebody says otherwise, and the rest of
     /// the section still has usable defaults so turning it on is one line.

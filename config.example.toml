@@ -17,6 +17,14 @@ name = "pharos"
 # session, i.e. at most this many seconds of resume position. 0 writes every
 # report (the old behaviour).
 # playback_progress_persist_secs = 15
+# VAAPI only. Keep decoded frames on the GPU from decoder to encoder instead of
+# downloading them, running CPU filters and uploading them again. Used for
+# H.264/HEVC targets with no burned-in subtitles, a plain 8-bit SDR source and
+# no rotation or interlacing; every other job keeps the CPU-filter pipeline,
+# and a GPU-resident run that fails is retried once on it. See
+# pharos_transcode_vaapi_pipeline_total{verdict} and
+# pharos_transcode_vaapi_resident_fallback_total{reason}. Default false.
+# transcode_vaapi_gpu_resident = false
 
 [obs]
 log_level = "info"

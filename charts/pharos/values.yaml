@@ -90,6 +90,11 @@ config:
     hwaccel: "auto"
     transcodeHwSessionCap: 2
     transcodeProbeCaps: true
+    # VAAPI only: keep decoded frames on the GPU from decoder to encoder. Applies
+    # to H.264/HEVC targets with no burn-in and a plain 8-bit SDR source; other
+    # jobs keep the CPU-filter pipeline and a failed resident run is retried on
+    # it. Needs `gpu` below to expose the render node. Off by default.
+    transcodeVaapiGpuResident: false
     subtitleCacheMaxBytes: 67108864         # 64 MiB
     subtitleCacheMaxEntries: 1024
     liveTvM3u: null

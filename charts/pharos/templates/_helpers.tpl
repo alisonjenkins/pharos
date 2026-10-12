@@ -72,6 +72,7 @@ trickplay_widths = [{{ range $i, $w := $s.trickplayWidths }}{{ if $i }}, {{ end 
 hwaccel = {{ $s.hwaccel | quote }}
 transcode_hw_session_cap = {{ $s.transcodeHwSessionCap | int64 }}
 transcode_probe_caps = {{ $s.transcodeProbeCaps }}
+transcode_vaapi_gpu_resident = {{ $s.transcodeVaapiGpuResident | default false }}
 subtitle_cache_max_bytes = {{ $s.subtitleCacheMaxBytes | int64 }}
 subtitle_cache_max_entries = {{ $s.subtitleCacheMaxEntries | int64 }}
 {{- if $s.liveTvM3u }}

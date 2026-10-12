@@ -1060,6 +1060,8 @@ async fn build_transcode_scheduler(
     // speculative work to shed-not-queue without touching the interactive
     // queue — see `SchedConfig::queue_background`.
     queue_background: bool,
+    // `[server] transcode_vaapi_gpu_resident`: see `SchedConfig::vaapi_gpu_resident`.
+    vaapi_gpu_resident: bool,
     // Where the probe result is persisted — the transcode cache directory, so
     // the measurement that decided a placement ages out with the segments that
     // placement produced. `None` disables persistence (no cache dir
@@ -1350,6 +1352,7 @@ async fn build_transcode_scheduler(
             std::sync::Arc::new(ProcSpawner::new()),
             SchedConfig {
                 queue_background,
+                vaapi_gpu_resident,
                 ..SchedConfig::default()
             },
         ),
@@ -1454,6 +1457,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 cfg.server.transcode_hw_session_cap,
                 cfg.server.transcode_probe_caps,
                 cfg.server.transcode_queue_background,
+                cfg.server.transcode_vaapi_gpu_resident,
                 cfg.server.transcode_cache_dir.clone(),
             )
             .await
