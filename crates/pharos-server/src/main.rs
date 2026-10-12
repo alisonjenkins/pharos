@@ -1097,7 +1097,8 @@ async fn build_transcode_scheduler(
     use pharos_transcode::worker::ProcSpawner;
 
     // Confirm a worker spawns + handshakes before wiring the scheduler.
-    // The probe worker is dropped (killed) immediately.
+    // The probe worker is dropped (killed) immediately, so it runs no job and
+    // the default stage-timing mode is irrelevant here.
     let probe = ProcSpawner::new();
     if let Err(e) = probe.spawn(WorkerId(0)).await {
         tracing::warn!(error = %e, worker = %probe.worker_bin().display(), "transcode worker probe failed");
