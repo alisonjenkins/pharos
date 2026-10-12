@@ -444,12 +444,9 @@ async fn non_player_members_never_hold_a_gate_but_stay_in_the_roster() {
     }
     let snap = snapshot(&h).await;
     assert_eq!(snap.member_count, 4);
-    for name in ["tv", "phone"] {
-        assert!(
-            snap.participants.iter().any(|p| p == name),
-            "{name} missing"
-        );
-    }
+    // The phone and the TV share a cast, so they list as one name.
+    assert!(snap.participants.iter().any(|p| p == "phone"));
+    assert_eq!(snap.participants.len(), 3);
 }
 
 /// V139 — a buffering report from a non-player must neither freeze the group
@@ -569,4 +566,95 @@ async fn channel_attached_sink_receives_the_same_stream_as_a_socket_sink() {
         "scenario must produce commands: {socket:?}"
     );
     assert_eq!(adapter, socket, "adapter and socket sinks diverged");
+}
+
+async fn join_roster(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    name: &str,
+) -> (MemberId, Vec<pharos_sync::MemberSummary>) {
+    let (tx, _rx) = mpsc::channel(64);
+    let mid = MemberId::new();
+    sinks.insert(mid, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: mid,
+        name: name.into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let joined: Joined = joined.await.unwrap();
+    (mid, joined.members)
+}
+
+/// FR-005 — a user driving a TV has a Controller (their phone) and a CastSeat
+/// (the TV) bound to the same cast. The roster shows ONE entry: the user, with
+/// the TV as the device. It is a projection, so the raw member count is intact.
+#[tokio::test]
+async fn casting_user_appears_once_in_the_roster_with_the_tv_as_device() {
+    let (h, sinks) = spawn_group();
+    let (_bob, _) = join_roster(&h, &sinks, "bob").await;
+    let (ctrl, _) = join_roster(&h, &sinks, "ali").await;
+    let (seat, _) = join_roster(&h, &sinks, "Living Room").await;
+    let cast = |owner: &str| {
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: owner.into(),
+        })
+    };
+    set_kind(&h, ctrl, MemberKind::Controller, cast("ali")).await;
+    set_kind(&h, seat, MemberKind::CastSeat, cast("ali")).await;
+
+    let (_carol, roster) = join_roster(&h, &sinks, "carol").await;
+    let mut names: Vec<_> = roster.iter().map(|m| m.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ali", "bob", "carol"], "roster: {roster:?}");
+    let ali = roster.iter().find(|m| m.name == "ali").unwrap();
+    assert_eq!(ali.device.as_deref(), Some("Living Room"));
+    assert!(
+        roster
+            .iter()
+            .filter(|m| m.name != "ali")
+            .all(|m| m.device.is_none()),
+        "ordinary members carry no device"
+    );
+
+    let snap = snapshot(&h).await;
+    assert_eq!(
+        snap.member_count, 4,
+        "projection must not change the roster"
+    );
+    assert_eq!(snap.participants.len(), 3);
+}
+
+/// A seat whose Controller belongs to a different owner is a different cast:
+/// nothing is collapsed.
+#[tokio::test]
+async fn roster_keeps_members_of_different_casts_apart() {
+    let (h, sinks) = spawn_group();
+    let (ctrl, _) = join_roster(&h, &sinks, "ali").await;
+    let (seat, _) = join_roster(&h, &sinks, "Living Room").await;
+    set_kind(
+        &h,
+        ctrl,
+        MemberKind::Controller,
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: "ali".into(),
+        }),
+    )
+    .await;
+    set_kind(
+        &h,
+        seat,
+        MemberKind::CastSeat,
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: "bob".into(),
+        }),
+    )
+    .await;
+    let (_c, roster) = join_roster(&h, &sinks, "carol").await;
+    assert_eq!(roster.len(), 3, "roster: {roster:?}");
 }

@@ -55,6 +55,10 @@ pub struct MemberSummary {
     pub member_id: MemberId,
     pub name: String,
     pub is_leader: bool,
+    /// The device a casting user is playing on (the TV's name). Absent for an
+    /// ordinary member, so their wire form is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// Coarse group playback state, mirrored to Jellyfin's `GroupStateType`

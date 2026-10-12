@@ -2332,14 +2332,43 @@ impl GroupState {
         self.delivery.deliver(to, msg);
     }
 
+    /// The roster as clients see it. A user casting to a TV has a Controller
+    /// and a CastSeat bound to the same cast (same TV, same owner); they show as
+    /// ONE entry, the Controller's, with the TV as `device`. Derived on every
+    /// call and never stored, so the underlying members are untouched.
     fn member_summaries(&self) -> Vec<MemberSummary> {
+        let has = |kind: MemberKind, cast: &CastBinding| {
+            self.members
+                .values()
+                .any(|m| m.kind == kind && m.cast.as_ref() == Some(cast))
+        };
+        let paired = |cast: &CastBinding| {
+            has(MemberKind::Controller, cast) && has(MemberKind::CastSeat, cast)
+        };
         let mut out: Vec<_> = self
             .members
             .iter()
-            .map(|(id, m)| MemberSummary {
-                member_id: *id,
-                name: m.name.clone(),
-                is_leader: Some(*id) == self.leader,
+            .filter(|(_, m)| {
+                !(m.kind == MemberKind::CastSeat && m.cast.as_ref().is_some_and(paired))
+            })
+            .map(|(id, m)| {
+                let pair = m
+                    .cast
+                    .as_ref()
+                    .filter(|c| m.kind == MemberKind::Controller && paired(c));
+                let seat_leads = pair.is_some_and(|c| {
+                    self.members.iter().any(|(sid, s)| {
+                        s.kind == MemberKind::CastSeat
+                            && s.cast.as_ref() == Some(c)
+                            && Some(*sid) == self.leader
+                    })
+                });
+                MemberSummary {
+                    member_id: *id,
+                    name: m.name.clone(),
+                    is_leader: Some(*id) == self.leader || seat_leads,
+                    device: pair.map(|c| c.tv.clone()),
+                }
             })
             .collect();
         out.sort_by_key(|s| s.member_id);
@@ -3196,6 +3225,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 member_id,
                 name,
                 is_leader: Some(member_id) == state.leader,
+                device: None,
             };
             state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
             // B183 — a queue that was only SEEDED has never been sent to anyone,

@@ -239,6 +239,7 @@ pub(crate) fn spawn_remote_handle(
                                 member_id,
                                 name: name.clone(),
                                 is_leader: true,
+                                device: None,
                             }],
                         });
                     }
