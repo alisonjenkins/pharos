@@ -1,7 +1,7 @@
 //! Token to [`User`]: the decision every authenticated call on either API
 //! makes, implemented once (V172).
 
-use pharos_core::{AuthError, TokenStore, User, UserId, UserStore};
+use pharos_core::{AuthError, TokenScope, TokenStore, User, UserId, UserStore};
 use tokio::sync::broadcast;
 
 use crate::state::{AppState, Stores};
@@ -37,6 +37,19 @@ pub async fn user_for_token(stores: &Stores, token: &str) -> Result<User, TokenR
         .await
         .map_err(|e| classify(e, TokenRefusal::InvalidToken))?;
     live_user(stores, uid).await
+}
+
+/// [`user_for_token`], with the scope the token was issued with: what an
+/// HTTP request checks its route against.
+pub async fn scoped_user_for_token(
+    stores: &Stores,
+    token: &str,
+) -> Result<(User, TokenScope), TokenRefusal> {
+    let resolved = stores
+        .resolve_scoped(token)
+        .await
+        .map_err(|e| classify(e, TokenRefusal::InvalidToken))?;
+    Ok((live_user(stores, resolved.user).await?, resolved.scope))
 }
 
 /// [`user_for_token`] for a token known only by its

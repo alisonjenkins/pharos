@@ -4,7 +4,7 @@
 //! trait, not the full server state.
 
 use crate::state::AppState;
-use pharos_core::{SecretString, TokenStore, UserId, UserStore};
+use pharos_core::{SecretString, TokenScope, TokenStore, UserId, UserStore};
 use pharos_sync::group::GroupHandle;
 use pharos_sync::TokenResolver;
 use std::future::Future;
@@ -31,7 +31,11 @@ impl TokenResolver for StoreTokenResolver {
         &'a self,
         token: &'a SecretString,
     ) -> Pin<Box<dyn Future<Output = Option<UserId>> + Send + 'a>> {
-        Box::pin(async move { self.0.stores.resolve(token.expose()).await.ok() })
+        Box::pin(async move {
+            // The SyncPlay socket is not on a playback token's allowlist.
+            let resolved = self.0.stores.resolve_scoped(token.expose()).await.ok()?;
+            (resolved.scope == TokenScope::Full).then_some(resolved.user)
+        })
     }
 
     fn may_create(&self, user: UserId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
