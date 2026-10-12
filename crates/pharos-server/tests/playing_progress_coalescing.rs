@@ -16,7 +16,7 @@ use pharos_server::{
     api::jellyfin,
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    progress_writes::{flush_all, flush_due},
+    progress_writes::{flush_all, flush_all_within, flush_due},
     state::{AppState, Stores},
 };
 use tracing_subscriber::prelude::*;
@@ -486,5 +486,171 @@ async fn nothing_flushed_after_the_stop_undoes_it() {
     assert_eq!(
         ud.last_played_position_ticks, 0,
         "the finished item has no resume point"
+    );
+}
+
+#[actix_web::test]
+async fn a_stop_without_a_play_session_id_still_beats_the_older_held_report() {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    progress!(app, token, 50u64);
+    progress!(app, token, 52u64);
+    // The stop names no PlaySessionId, so it cannot forget the held report
+    // (keyed by "s1"); the store's guard has to refuse it instead.
+    post!(
+        app,
+        token,
+        "/Sessions/Playing/Stopped",
+        serde_json::json!({ "ItemId": "1", "PositionTicks": 57u64 * SEC })
+    );
+    flush_due(&state.progress_writes, &state.stores, later(60)).await;
+    flush_all(&state.progress_writes, &state.stores).await;
+
+    let ud = stored(&state, uid).await;
+    assert!(ud.played);
+    assert_eq!(ud.last_played_position_ticks, 0, "no resume point");
+}
+
+/// A store whose progress writes can be made to fail or never finish.
+struct Wrapped {
+    inner: Stores,
+    mode: std::sync::Mutex<Mode>,
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Pass,
+    Fail,
+    Stall,
+}
+
+impl Wrapped {
+    fn new(inner: &Stores) -> Self {
+        Self {
+            inner: inner.clone(),
+            mode: std::sync::Mutex::new(Mode::Pass),
+        }
+    }
+    fn set(&self, m: Mode) {
+        *self.mode.lock().unwrap() = m;
+    }
+}
+
+impl UserDataStore for Wrapped {
+    async fn get_user_data(
+        &self,
+        user: UserId,
+        item: pharos_core::MediaId,
+    ) -> pharos_core::DomainResult<pharos_core::UserItemData> {
+        self.inner.get_user_data(user, item).await
+    }
+    async fn record_playback_progress(
+        &self,
+        user: UserId,
+        item: pharos_core::MediaId,
+        progress: pharos_core::PlaybackProgress,
+    ) -> pharos_core::DomainResult<pharos_core::UserItemData> {
+        let mode = *self.mode.lock().unwrap();
+        match mode {
+            Mode::Pass => {
+                self.inner
+                    .record_playback_progress(user, item, progress)
+                    .await
+            }
+            Mode::Fail => Err(pharos_core::DomainError::Backend("down".into())),
+            Mode::Stall => std::future::pending().await,
+        }
+    }
+    async fn set_user_data(
+        &self,
+        user: UserId,
+        item: pharos_core::MediaId,
+        data: pharos_core::UserItemData,
+    ) -> pharos_core::DomainResult<()> {
+        self.inner.set_user_data(user, item, data).await
+    }
+    async fn user_data_bulk(
+        &self,
+        user: UserId,
+        items: &[pharos_core::MediaId],
+    ) -> pharos_core::DomainResult<Vec<pharos_core::UserItemData>> {
+        self.inner.user_data_bulk(user, items).await
+    }
+    async fn resumable_items(
+        &self,
+        user: UserId,
+    ) -> pharos_core::DomainResult<Vec<pharos_core::MediaId>> {
+        self.inner.resumable_items(user).await
+    }
+}
+
+/// One held report for item 1, then the stored row aged so the flush lands.
+async fn one_held_report() -> (web::Data<AppState>, Wrapped, UserId) {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    progress!(app, token, 10u64);
+    progress!(app, token, 11u64);
+    age_row(&state, uid).await;
+    let store = Wrapped::new(&state.stores);
+    (state, store, uid)
+}
+
+#[actix_web::test]
+async fn a_failed_write_keeps_the_held_report_for_the_next_flush() {
+    let (state, store, uid) = one_held_report().await;
+    store.set(Mode::Fail);
+    assert_eq!(
+        flush_due(&state.progress_writes, &store, later(20)).await,
+        0
+    );
+    store.set(Mode::Pass);
+    assert_eq!(
+        flush_due(&state.progress_writes, &store, later(40)).await,
+        1
+    );
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        11 * SEC
+    );
+}
+
+#[actix_web::test]
+async fn a_flush_cancelled_mid_write_puts_the_taken_reports_back() {
+    let (state, store, uid) = one_held_report().await;
+    store.set(Mode::Stall);
+    // The tick has taken the report out of the hold and is stuck writing it
+    // when shutdown cancels it.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        flush_due(&state.progress_writes, &store, later(20)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the write never finished");
+
+    store.set(Mode::Pass);
+    assert_eq!(flush_all(&state.progress_writes, &store).await, 1);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        11 * SEC,
+        "the taken report was still there for the shutdown flush"
+    );
+}
+
+#[actix_web::test]
+async fn the_shutdown_flush_gives_up_at_its_deadline_and_counts_what_it_abandoned() {
+    let (state, store, uid) = one_held_report().await;
+    store.set(Mode::Stall);
+    let out = flush_all_within(
+        &state.progress_writes,
+        &store,
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(out.written, 0);
+    assert_eq!(out.abandoned, 1);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        10 * SEC,
+        "nothing was written"
     );
 }

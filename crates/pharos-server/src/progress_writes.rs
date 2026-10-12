@@ -23,6 +23,7 @@
 
 use pharos_core::{MediaId, PlaybackProgress, UserDataStore, UserId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,15 @@ const BACKWARD_SLACK: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
 /// A session with nothing held and no report for this long is forgotten.
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// One held-report write is given up on after this long, so one stalled
+/// connection cannot hold the rest of a flush hostage.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Held reports written at the same time by a flush.
+const FLUSH_CONCURRENCY: usize = 8;
+/// The shutdown flush stops after this long. Chart default: the pod gets 60 s
+/// to stop, of which `drainGraceSecs` (10) and actix's graceful stop (30) run
+/// before the flush; 10 s keeps the sum under it.
+pub const SHUTDOWN_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 /// A full table is swept for idle sessions at most this often.
 const MIN_SWEEP_GAP: Duration = Duration::from_secs(1);
 /// Longest `PlaySessionId` kept verbatim in a tracking key. The id is chosen
@@ -324,19 +334,58 @@ pub async fn flush_due<S: UserDataStore>(
     store: &S,
     now: Instant,
 ) -> usize {
-    write_held(coalescer, store, coalescer.take_due(now), now, "tick").await
-}
-
-/// Write every held report, for shutdown. Returns how many were written.
-pub async fn flush_all<S: UserDataStore>(coalescer: &ProgressCoalescer, store: &S) -> usize {
+    let written = AtomicUsize::new(0);
     write_held(
         coalescer,
         store,
-        coalescer.take_all(),
-        Instant::now(),
-        "shutdown",
+        coalescer.take_due(now),
+        now,
+        "tick",
+        &written,
     )
-    .await
+    .await;
+    written.into_inner()
+}
+
+/// Write every held report, for shutdown, within [`SHUTDOWN_FLUSH_DEADLINE`].
+/// Returns how many were written.
+pub async fn flush_all<S: UserDataStore>(coalescer: &ProgressCoalescer, store: &S) -> usize {
+    flush_all_within(coalescer, store, SHUTDOWN_FLUSH_DEADLINE)
+        .await
+        .written
+}
+
+/// What a shutdown flush did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushOutcome {
+    pub written: usize,
+    /// Reports still unwritten when the deadline hit or a write failed.
+    pub abandoned: usize,
+}
+
+/// Write every held report, giving up after `deadline` so a stalled database
+/// cannot keep the pod from exiting before SIGKILL. Writes run a few at a time
+/// and each is bounded by [`WRITE_TIMEOUT`]. What did not make it is counted
+/// in `abandoned`.
+pub async fn flush_all_within<S: UserDataStore>(
+    coalescer: &ProgressCoalescer,
+    store: &S,
+    deadline: Duration,
+) -> FlushOutcome {
+    let written = AtomicUsize::new(0);
+    let held = coalescer.take_all();
+    let flush = write_held(coalescer, store, held, Instant::now(), "shutdown", &written);
+    if tokio::time::timeout(deadline, flush).await.is_err() {
+        tracing::warn!(
+            ?deadline,
+            "shutdown flush of held playback progress hit its deadline"
+        );
+    }
+    // Cancelled and failed writes were put back by `Taken`.
+    FlushOutcome {
+        written: written.into_inner(),
+        abandoned: coalescer.take_all().len(),
+    }
 }
 
 /// A report that was not written now, for `pharos_progress_writes_total`.
@@ -386,27 +435,75 @@ pub async fn persist<S: UserDataStore>(
     result
 }
 
+/// A report taken out of the hold that has not been written yet. Dropping it
+/// without [`Taken::written`] (the write failed, timed out, or the whole
+/// flush was cancelled mid-way) puts the report back in the hold, so a taken
+/// report is never lost between `take_due`/`take_all` and the database.
+struct Taken<'a> {
+    coalescer: &'a ProgressCoalescer,
+    key: ProgressKey,
+    progress: PlaybackProgress,
+    done: bool,
+}
+
+impl Taken<'_> {
+    fn mark_written(&mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.coalescer.hold(&self.key, self.progress);
+        }
+    }
+}
+
 async fn write_held<S: UserDataStore>(
     coalescer: &ProgressCoalescer,
     store: &S,
     held: Vec<(ProgressKey, PlaybackProgress)>,
     now: Instant,
     reason: &'static str,
-) -> usize {
-    let mut written = 0;
-    for (key, progress) in held {
-        match persist(store, &key, progress, reason, true).await {
-            Ok(_) => {
-                coalescer.persisted(&key, now, &progress);
-                written += 1;
+    written: &AtomicUsize,
+) {
+    use futures_util::StreamExt;
+    // Every report is wrapped before the first await, so cancelling this
+    // future drops the not yet started ones as well and they go back too.
+    let batch: Vec<Taken<'_>> = held
+        .into_iter()
+        .map(|(key, progress)| Taken {
+            coalescer,
+            key,
+            progress,
+            done: false,
+        })
+        .collect();
+    futures_util::stream::iter(batch)
+        .for_each_concurrent(FLUSH_CONCURRENCY, |mut taken| async move {
+            let write = persist(store, &taken.key, taken.progress, reason, true);
+            match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+                Ok(Ok(_)) => {
+                    coalescer.persisted(&taken.key, now, &taken.progress);
+                    taken.mark_written();
+                    written.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, item = taken.key.item, "held playback progress not written");
+                }
+                Err(_) => {
+                    metrics::counter!(
+                        "pharos_progress_writes_total",
+                        "outcome" => "failed",
+                        "reason" => reason
+                    )
+                    .increment(1);
+                    tracing::warn!(item = taken.key.item, "held playback progress write timed out");
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, item = key.item, "held playback progress not written");
-                coalescer.hold(&key, progress);
-            }
-        }
-    }
-    written
+        })
+        .await;
 }
 
 fn sweep_idle(entries: &mut HashMap<ProgressKey, Entry>, now: Instant, idle_ttl: Duration) {
