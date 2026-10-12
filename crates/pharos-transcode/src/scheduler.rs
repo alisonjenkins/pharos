@@ -890,6 +890,12 @@ struct JobCtx {
     /// `None` while queued. Re-stamped on each (re)dispatch so a retry's wait
     /// is counted in the queue, not the encode.
     dispatched: Option<Instant>,
+    /// The VAAPI pipeline the latest dispatch ran.
+    pipeline: crate::VaapiPipeline,
+    /// A resident run of this job died or failed transiently. Every later
+    /// placement runs hybrid: the pipeline decision is otherwise recomputed
+    /// from config and options alone, with no memory of the failed attempt.
+    resident_failed: bool,
     /// The submitter's handle on this job, if it kept one. Latched at dispatch
     /// so the submitter can tell the capacity it can still get back from the
     /// capacity it cannot — see [`JobSlot::is_dispatched`]. `None` for callers
@@ -1719,6 +1725,8 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 // Replaced at dispatch, once the device is known.
                 span: tracing::Span::none(),
                 filler,
+                pipeline: crate::VaapiPipeline::Hybrid,
+                resident_failed: false,
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -1988,6 +1996,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         .increment(1);
                     }
                     ctx.span.record("outcome", "transient_retry");
+                    ctx.resident_failed |= ctx.pipeline == crate::VaapiPipeline::Resident;
                     ctx.retries += 1;
                     ctx.last_error = Some(err);
                     retry_or_fail(state, job_id, ctx, self_tx);
@@ -2000,6 +2009,18 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     ctx.span.in_scope(|| {
                         tracing::warn!(%job_id, %device, "transcode worker died mid-job; retrying");
                     });
+                    // A hung GPU or an ffmpeg that takes the worker down is as
+                    // likely the resident pipeline's as anything's: re-place
+                    // on the proven one, and count it.
+                    if ctx.pipeline == crate::VaapiPipeline::Resident {
+                        ctx.resident_failed = true;
+                        metrics::counter!(
+                            "pharos_transcode_vaapi_resident_fallback_total",
+                            "reason" => "worker_died",
+                            "stage" => "run",
+                        )
+                        .increment(1);
+                    }
                     ctx.retries += 1;
                     ctx.last_error = Some(WorkerError::Other("worker died".into()));
                     retry_or_fail(state, job_id, ctx, self_tx);
@@ -2806,6 +2827,7 @@ fn vaapi_pipeline_for(
         ctx.filler.is_some(),
         matches!(ctx.sink, SinkRequest::FileDirect { .. }),
     );
+    let earlier_failure = ctx.resident_failed && verdict == crate::ResidentVerdict::Resident;
     if matches!(
         dev,
         DeviceId::Hw {
@@ -2815,11 +2837,26 @@ fn vaapi_pipeline_for(
     ) {
         metrics::counter!(
             "pharos_transcode_vaapi_pipeline_total",
-            "verdict" => verdict.label(),
+            "verdict" => if earlier_failure { "earlier_attempt_failed" } else { verdict.label() },
         )
         .increment(1);
     }
-    verdict.pipeline()
+    if earlier_failure {
+        crate::VaapiPipeline::Hybrid
+    } else {
+        verdict.pipeline()
+    }
+}
+
+/// A resident run that failed in a way the hybrid pipeline might not share.
+/// A corrupt or unsupported source fails identically on both, so retrying it
+/// would run ffmpeg twice for nothing and bury the fallback metric in faults
+/// that are not the resident pipeline's.
+fn resident_attributable(err: &WorkerError) -> bool {
+    matches!(
+        err,
+        WorkerError::DeviceBusy(_) | WorkerError::DecodeFailed(_) | WorkerError::Other(_)
+    )
 }
 
 fn record_placement(
@@ -3113,6 +3150,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             // was and where it landed.
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
+            ctx.pipeline = vaapi_pipeline;
             // Told to the SUBMITTER, not just recorded here: from this line the
             // permit and the worker are the detached run task's, and no caller
             // can hand them back by walking away. See `JobSlot::is_dispatched`.
@@ -3459,6 +3497,7 @@ fn try_place_no_queue(
             // was and where it landed.
             span.in_scope(|| warn_if_long_wait(state, job_id, dev, &ctx, dispatched_at));
             ctx.dispatched = Some(dispatched_at);
+            ctx.pipeline = vaapi_pipeline;
             // Same as `place`, and needed at BOTH: a job that waited in the
             // queue and then drained onto a permit is exactly as unreclaimable
             // as one dispatched on arrival, and the queue is where speculative
@@ -3539,6 +3578,7 @@ fn spawn_run_task(
                 metrics::counter!(
                     "pharos_transcode_vaapi_resident_fallback_total",
                     "reason" => block.label(),
+                    "stage" => "preflight",
                 )
                 .increment(1);
                 spec.vaapi_pipeline = crate::VaapiPipeline::Hybrid;
@@ -3586,6 +3626,9 @@ fn spawn_run_task(
             // could have produced. If the device itself is at fault the retry
             // fails the same way and the normal classification (cooldown,
             // re-placement) takes over from there.
+            let retry_spec = retry_spec.filter(
+                |_| matches!(&result, WorkerRunResult::Failed(e) if resident_attributable(e)),
+            );
             if let (WorkerRunResult::Failed(err), Some(retry)) = (&result, retry_spec) {
                 tracing::warn!(
                     %job_id,
@@ -3597,6 +3640,7 @@ fn spawn_run_task(
                 metrics::counter!(
                     "pharos_transcode_vaapi_resident_fallback_total",
                     "reason" => err.label(),
+                    "stage" => "run",
                 )
                 .increment(1);
                 result = worker.run(retry).await;
@@ -3885,7 +3929,7 @@ mod tests {
     /// Submit one plain-8-bit H.264 job to a lone VAAPI device.
     fn run_on_vaapi(
         resident_enabled: bool,
-        fail_resident: bool,
+        resident_result: Option<fn() -> WorkerRunResult>,
         block: Option<crate::resident_preflight::ResidentBlock>,
     ) -> VaapiRun {
         use metrics_util::debugging::DebuggingRecorder;
@@ -3903,12 +3947,11 @@ mod tests {
                 let gpu = DeviceId::hw(HwAccel::Vaapi, 0);
                 let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
                     log.lock().unwrap().push(spec.vaapi_pipeline);
-                    if fail_resident && spec.vaapi_pipeline == crate::VaapiPipeline::Resident {
-                        WorkerRunResult::Failed(WorkerError::Other(
-                            "vaapi: failed to create surface".into(),
-                        ))
-                    } else {
-                        WorkerRunResult::Done { out_bytes: 1 }
+                    match resident_result {
+                        Some(fail) if spec.vaapi_pipeline == crate::VaapiPipeline::Resident => {
+                            fail()
+                        }
+                        _ => WorkerRunResult::Done { out_bytes: 1 },
                     }
                 });
                 let mut table = DeviceTable::from_probe(&[(gpu, 2)], 1);
@@ -3967,7 +4010,7 @@ mod tests {
 
     #[test]
     fn resident_is_off_unless_configured() {
-        let r = run_on_vaapi(false, false, None);
+        let r = run_on_vaapi(false, None, None);
         assert!(r.result.is_ok());
         assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid]);
         assert!(
@@ -3980,7 +4023,7 @@ mod tests {
 
     #[test]
     fn an_eligible_vaapi_job_runs_resident_when_enabled() {
-        let r = run_on_vaapi(true, false, None);
+        let r = run_on_vaapi(true, None, None);
         assert!(r.result.is_ok());
         assert_eq!(r.pipelines, [crate::VaapiPipeline::Resident]);
         assert!(
@@ -4000,7 +4043,7 @@ mod tests {
     /// succeeds, and the fallback is counted with the failure's class.
     #[test]
     fn a_failed_resident_run_is_retried_once_on_the_hybrid_path() {
-        let r = run_on_vaapi(true, true, None);
+        let r = run_on_vaapi(true, Some(other_failure), None);
         assert!(r.result.is_ok(), "{:?}", r.result);
         assert_eq!(
             r.pipelines,
@@ -4016,6 +4059,61 @@ mod tests {
         );
     }
 
+    fn other_failure() -> WorkerRunResult {
+        WorkerRunResult::Failed(WorkerError::Other("vaapi: failed to create surface".into()))
+    }
+
+    /// A worker that dies (crash, or the 20 s heartbeat timeout on a hung GPU)
+    /// during a resident run is re-placed by `retry_or_fail`, which recomputes
+    /// the pipeline from config alone. It must remember the failed attempt.
+    #[test]
+    fn a_worker_that_dies_in_a_resident_run_is_replaced_on_the_hybrid_path() {
+        let r = run_on_vaapi(true, Some(|| WorkerRunResult::Died), None);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(
+            r.pipelines,
+            [crate::VaapiPipeline::Resident, crate::VaapiPipeline::Hybrid]
+        );
+        assert!(
+            r.rows.contains(&row(
+                "pharos_transcode_vaapi_resident_fallback_total",
+                "worker_died"
+            )),
+            "{:?}",
+            r.rows
+        );
+        assert!(
+            r.rows.contains(&row(
+                "pharos_transcode_vaapi_pipeline_total",
+                "earlier_attempt_failed"
+            )),
+            "{:?}",
+            r.rows
+        );
+    }
+
+    /// A source that fails identically on both pipelines is not retried, and
+    /// the fallback metric stays free of faults that are not the resident
+    /// pipeline's.
+    #[test]
+    fn failures_the_hybrid_path_would_share_are_not_retried() {
+        for fail in [
+            (|| WorkerRunResult::Failed(WorkerError::BadInput("corrupt".into())))
+                as fn() -> WorkerRunResult,
+            || WorkerRunResult::Failed(WorkerError::Io("disk full".into())),
+            || WorkerRunResult::Failed(WorkerError::UnsupportedCodec("x".into())),
+        ] {
+            let r = run_on_vaapi(true, Some(fail), None);
+            assert_eq!(r.pipelines, [crate::VaapiPipeline::Resident]);
+            assert!(r.result.is_err());
+            assert!(
+                !r.rows.iter().any(|(n, _)| n.ends_with("fallback_total")),
+                "{:?}",
+                r.rows
+            );
+        }
+    }
+
     /// A rotated or interlaced source never reaches the resident ffmpeg: the
     /// resident pipeline would write it sideways with exit status 0, so there
     /// would be nothing to retry on.
@@ -4027,7 +4125,7 @@ mod tests {
             (ResidentBlock::Interlaced, "interlaced"),
             (ResidentBlock::Unreadable, "inspect_failed"),
         ] {
-            let r = run_on_vaapi(true, false, Some(block));
+            let r = run_on_vaapi(true, None, Some(block));
             assert!(r.result.is_ok());
             assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid], "{label}");
             assert!(
