@@ -391,3 +391,141 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
     .unwrap_or(false);
     assert!(got, "reconnected socket receives the group's live commands");
 }
+
+// --- Persisted member kind (spec 009) --------------------------------------
+
+/// Shared single-slot snapshot store: persistence writes it, hydration reads it.
+#[derive(Clone, Default)]
+struct Slot(Arc<std::sync::Mutex<Option<(u64, String)>>>);
+
+impl pharos_sync::GroupPersistence for Slot {
+    fn persist(&self, _g: pharos_sync::GroupId, epoch: u64, json: String) {
+        *self.0.lock().unwrap() = Some((epoch, json));
+    }
+    fn remove(&self, _g: pharos_sync::GroupId) {}
+}
+
+impl pharos_sync::HydrationSource for Slot {
+    fn load(&self, _g: pharos_sync::GroupId) -> pharos_sync::distributed::LoadFuture<'_> {
+        let got = self.0.lock().unwrap().clone();
+        Box::pin(async move { got })
+    }
+}
+
+struct AlwaysOwn;
+impl pharos_sync::OwnershipSource for AlwaysOwn {
+    fn try_own(&self, _g: pharos_sync::GroupId) -> pharos_sync::distributed::OwnFuture<'_> {
+        Box::pin(async { true })
+    }
+    fn release(&self, _g: pharos_sync::GroupId) {}
+}
+
+struct NoCommands;
+impl pharos_sync::CommandSink for NoCommands {
+    fn submit(&self, _g: pharos_sync::GroupId, _c: pharos_sync::group::RemoteCommand) {}
+}
+
+fn registry_over(slot: &Slot) -> GroupRegistry {
+    GroupRegistry::spawn_distributed(
+        Arc::new(LocalDelivery::new(MemberSinks::new())),
+        pharos_sync::Distributed {
+            ownership: Arc::new(AlwaysOwn),
+            hydration: Arc::new(slot.clone()),
+            commands: Arc::new(NoCommands),
+            persistence: Arc::new(slot.clone()),
+        },
+    )
+}
+
+async fn add(h: &GroupHandle, member: MemberId, name: &str) {
+    let (tx, rx) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: member,
+        name: name.into(),
+        reply: tx,
+    })
+    .await
+    .unwrap();
+    let _ = rx.await;
+}
+
+/// Force a persist and return the member entries of the latest snapshot.
+async fn persisted_members(h: &GroupHandle, slot: &Slot, tag: &str) -> Vec<serde_json::Value> {
+    h.tx.send(GroupMsg::SetGroupName { name: tag.into() })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let json = slot.0.lock().unwrap().clone().map(|(_, j)| j);
+        if let Some(json) = json.filter(|j| j.contains(tag)) {
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            return v["members"].as_array().cloned().unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("snapshot with group name {tag} was never persisted");
+}
+
+#[tokio::test]
+async fn persisted_snapshot_without_kind_loads_as_player() {
+    let slot = Slot::default();
+    let a = registry_over(&slot);
+    let h = a.create().await.unwrap();
+    let gid = h.group_id;
+    add(&h, MemberId::new(), "ali").await;
+    let _ = persisted_members(&h, &slot, "before").await;
+
+    // Strip the new fields: this is the shape an older replica wrote.
+    let (epoch, json) = slot.0.lock().unwrap().clone().unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for m in v["members"].as_array_mut().unwrap() {
+        let o = m.as_object_mut().unwrap();
+        o.remove("kind");
+        o.remove("cast");
+    }
+    *slot.0.lock().unwrap() = Some((epoch, v.to_string()));
+
+    let b = registry_over(&slot);
+    let hb = b.get_or_create(gid).await.unwrap();
+    let members = persisted_members(&hb, &slot, "after").await;
+    assert_eq!(members.len(), 1, "old snapshot must still hydrate");
+    assert_eq!(
+        members[0]["kind"], "Player",
+        "missing kind defaults to Player"
+    );
+}
+
+#[tokio::test]
+async fn cast_seat_kind_round_trips_through_a_snapshot() {
+    use pharos_sync::group::{CastBinding, MemberKind};
+    let slot = Slot::default();
+    let a = registry_over(&slot);
+    let h = a.create().await.unwrap();
+    let gid = h.group_id;
+    let seat = MemberId::new();
+    add(&h, MemberId::new(), "ali").await;
+    add(&h, seat, "Living Room").await;
+    h.tx.send(GroupMsg::SetMemberKind {
+        member: seat,
+        kind: MemberKind::CastSeat,
+        cast: Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: "ali".into(),
+        }),
+    })
+    .await
+    .unwrap();
+    let _ = persisted_members(&h, &slot, "before").await;
+
+    let b = registry_over(&slot);
+    let hb = b.get_or_create(gid).await.unwrap();
+    let members = persisted_members(&hb, &slot, "after").await;
+    let seats: Vec<_> = members.iter().filter(|m| m["kind"] == "CastSeat").collect();
+    assert_eq!(
+        seats.len(),
+        1,
+        "the seat must survive hydration: {members:?}"
+    );
+    assert_eq!(seats[0]["cast"]["tv"], "Living Room");
+    assert_eq!(seats[0]["cast"]["owner"], "ali");
+    assert!(members.iter().any(|m| m["kind"] == "Player"));
+}
