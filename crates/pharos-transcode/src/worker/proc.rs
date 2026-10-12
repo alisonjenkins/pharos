@@ -40,6 +40,7 @@ pub struct ProcSpawner {
     worker_bin: PathBuf,
     handshake_timeout: Duration,
     heartbeat_timeout: Duration,
+    inspector: std::sync::Arc<crate::resident_preflight::SourceInspector>,
 }
 
 impl Default for ProcSpawner {
@@ -53,12 +54,7 @@ impl ProcSpawner {
     /// sibling of the current executable, then bare `transcode-worker`
     /// on `PATH`.
     pub fn new() -> Self {
-        let worker_bin = discover_worker_bin();
-        Self {
-            worker_bin,
-            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
-            heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
-        }
+        Self::with_worker_bin(discover_worker_bin())
     }
 
     pub fn with_worker_bin(p: impl Into<PathBuf>) -> Self {
@@ -66,6 +62,9 @@ impl ProcSpawner {
             worker_bin: p.into(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
+            inspector: std::sync::Arc::new(crate::resident_preflight::SourceInspector::new(
+                super::exec::ffmpeg_bin(),
+            )),
         }
     }
 
@@ -172,6 +171,12 @@ pub(crate) async fn spawn_worker_proc(
 }
 
 impl WorkerSpawner for ProcSpawner {
+    fn inspect_source(&self, input: &std::path::Path) -> crate::scheduler::InspectFuture {
+        let inspector = self.inspector.clone();
+        let input = input.to_path_buf();
+        Box::pin(async move { inspector.inspect(&input).await })
+    }
+
     fn spawn(&self, id: WorkerId) -> SpawnFuture {
         let worker_bin = self.worker_bin.clone();
         let handshake_timeout = self.handshake_timeout;

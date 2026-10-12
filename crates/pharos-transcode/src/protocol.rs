@@ -143,6 +143,10 @@ pub struct JobSpec {
     /// previous behaviour of deciding from the device alone is what sent a
     /// 10-bit AV1 source to a card with no AV1 decode block.
     pub decode_offload: crate::DecodeOffload,
+    /// Which VAAPI pipeline to build the argv for. Decided by the scheduler
+    /// (config flag, source pixels, burn-in) for the same reason as
+    /// `decode_offload`; `Hybrid` for every non-VAAPI job.
+    pub vaapi_pipeline: crate::VaapiPipeline,
     pub sink: OutputSink,
     /// B228 — when set, the worker builds a synthetic `lavfi` input (black
     /// video, plus silence for a muxed audio rendition) instead of decoding
@@ -485,6 +489,7 @@ mod tests {
     fn sample_job() -> JobSpec {
         JobSpec {
             decode_offload: crate::DecodeOffload::Allowed,
+            vaapi_pipeline: crate::VaapiPipeline::Hybrid,
             job_id: JobId(7),
             input: PathBuf::from("/m/in.mkv"),
             opts: TranscodeOptions {

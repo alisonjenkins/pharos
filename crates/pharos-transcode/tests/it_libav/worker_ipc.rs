@@ -59,6 +59,7 @@ async fn worker_transcodes_file_direct() {
 
     let spec = JobSpec {
         decode_offload: pharos_transcode::DecodeOffload::Allowed,
+        vaapi_pipeline: pharos_transcode::VaapiPipeline::Hybrid,
         job_id: JobId(1),
         input: input.clone(),
         opts: TranscodeOptions {
@@ -117,6 +118,7 @@ async fn worker_reports_bad_input() {
 
     let spec = JobSpec {
         decode_offload: pharos_transcode::DecodeOffload::Allowed,
+        vaapi_pipeline: pharos_transcode::VaapiPipeline::Hybrid,
         job_id: JobId(2),
         input: dir.path().join("does-not-exist.mkv"),
         opts: TranscodeOptions {
@@ -170,6 +172,7 @@ async fn worker_streams_live_to_stdout() {
     let spawner = ProcSpawner::with_worker_bin(WORKER_BIN);
     let spec = JobSpec {
         decode_offload: pharos_transcode::DecodeOffload::Allowed,
+        vaapi_pipeline: pharos_transcode::VaapiPipeline::Hybrid,
         job_id: JobId(9),
         input,
         opts: TranscodeOptions {
