@@ -1,0 +1,18 @@
+[libx264 @ 0x55555566a8c0] using SAR=1/1
+bench:        0 user        2 sys        4 real decode_audio 0:1
+bench:     4286 user     2462 sys     5791 real decode_video 0:0
+bench:        1 user        0 sys       13 real decode_audio 0:1
+bench:        5 user        2 sys        2 real encode_audio 0.1
+bench:        0 user     1790 sys      817 real encode_video 0.0
+bench:        2 user        0 sys        3 real decode_video 0:0
+bench:     3816 user     3113 sys     2215 real encode_video 0.0
+    Last message repeated 2 times
+bench:      146 user       48 sys      109 real encode_audio 0.1
+bench:     1789 user        0 sys      393 real flush_video 0.0
+bench:        4 user        2 sys        5 real flush_video 0.0
+[out#0/mpegts @ 0x55555561cc40] video:952KiB audio:51KiB subtitle:0KiB other streams:0KiB global headers:0KiB
+frame=  144 fps=0.0 q=-1.0 Lsize=    1065KiB time=00:00:06.00 bitrate=1454.6kbits/s speed=7.32x elapsed=0:00:00.81
+[libx264 @ 0x55555566a8c0] kb/s:1300.36
+[aac @ 0x5555558aef00] Qavg: 120.080
+bench: utime=2.016s stime=1.099s rtime=0.820s
+bench: maxrss=438580KiB
