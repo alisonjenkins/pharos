@@ -1,0 +1,12 @@
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'phone.mp4':
+  Metadata:
+    major_brand     : mp42
+  Duration: 00:00:03.00, start: 0.000000, bitrate: 6755 kb/s
+    Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, bt709), 1920x1080, 6637 kb/s, 29.97 fps, 29.97 tbr, 90k tbn, 180k tbc (default)
+    Metadata:
+      rotate          : 90
+      handler_name    : VideoHandle
+    Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp, 69 kb/s (default)
+    Metadata:
+      handler_name    : SoundHandle
+At least one output file must be specified

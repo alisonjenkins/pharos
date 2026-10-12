@@ -70,15 +70,19 @@ pub fn parse_stream_info(banner: &str) -> Option<ResidentBlock> {
                 return Some(ResidentBlock::Interlaced);
             }
         } else if in_video {
-            if let Some(rest) = t.split("rotation of ").nth(1) {
-                let degrees: f64 = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|d| d.parse().ok())
-                    .unwrap_or(0.0);
-                if degrees != 0.0 {
-                    return Some(ResidentBlock::Rotated);
-                }
+            // Newer ffmpeg: `Display Matrix: rotation of 90.00 degrees`.
+            let matrix = t
+                .split("rotation of ")
+                .nth(1)
+                .and_then(|r| r.split_whitespace().next());
+            // ffmpeg 4.x and earlier: a `rotate : 90` stream metadata tag.
+            let tag = t
+                .split_once(':')
+                .filter(|(k, _)| k.trim() == "rotate")
+                .map(|(_, v)| v.trim());
+            let degrees: f64 = matrix.or(tag).and_then(|d| d.parse().ok()).unwrap_or(0.0);
+            if degrees % 360.0 != 0.0 {
+                return Some(ResidentBlock::Rotated);
             }
         }
     }
@@ -165,6 +169,22 @@ mod tests {
     #[test]
     fn a_display_matrix_rotation_blocks_the_resident_pipeline() {
         assert_eq!(parse_stream_info(ROTATED), Some(ResidentBlock::Rotated));
+    }
+
+    /// ffmpeg 4.x prints rotation as a `rotate` metadata tag, not side data. The
+    /// fixture is that banner shape (written from the old format, not captured:
+    /// this tree ships ffmpeg 9).
+    #[test]
+    fn an_older_ffmpegs_rotate_tag_blocks_the_resident_pipeline() {
+        const OLD: &str = include_str!("../tests/fixtures/ffmpeg_info/rotated_metadata_tag.txt");
+        assert_eq!(parse_stream_info(OLD), Some(ResidentBlock::Rotated));
+        let zero = OLD.replace("rotate          : 90", "rotate          : 0");
+        assert_eq!(parse_stream_info(&zero), None);
+        let upside_down = OLD.replace("rotate          : 90", "rotate          : 180");
+        assert_eq!(
+            parse_stream_info(&upside_down),
+            Some(ResidentBlock::Rotated)
+        );
     }
 
     #[test]
