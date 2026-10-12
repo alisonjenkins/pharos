@@ -73,7 +73,11 @@ hwaccel = {{ $s.hwaccel | quote }}
 transcode_hw_session_cap = {{ $s.transcodeHwSessionCap | int64 }}
 transcode_probe_caps = {{ $s.transcodeProbeCaps }}
 transcode_vaapi_gpu_resident = {{ $s.transcodeVaapiGpuResident | default false }}
-transcode_stage_timing = {{ $s.transcodeStageTiming | default "basic" | quote }}
+{{- $stageTiming := $s.transcodeStageTiming | default "basic" }}
+{{- if not (has $stageTiming (list "basic" "detailed" "off")) }}
+{{- fail (printf "server.transcodeStageTiming must be basic, detailed or off, got %q" $stageTiming) }}
+{{- end }}
+transcode_stage_timing = {{ $stageTiming | quote }}
 subtitle_cache_max_bytes = {{ $s.subtitleCacheMaxBytes | int64 }}
 subtitle_cache_max_entries = {{ $s.subtitleCacheMaxEntries | int64 }}
 {{- if $s.liveTvM3u }}
