@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::cast::{mint_tv_token, revoke_tv_token, DEFAULT_TV_TOKEN_LIFETIME};
+use crate::cast::{mint_tv_token, revoke_tv_token, TvToken, DEFAULT_TV_TOKEN_LIFETIME};
 use crate::cast_adapter::{command_for, intent_for, playing_entry, ClockPair, GroupCommandRequest};
 use crate::config::{CastAddress, CastConfig, ConfiguredTv};
 use crate::state::Stores;
@@ -276,7 +276,8 @@ struct ActiveCast {
     tv: String,
     owner: UserId,
     owner_name: String,
-    owner_key: String,
+    /// `None` for a resumed cast, whose owner's device is not known.
+    owner_key: Option<String>,
     sender_device: String,
     group: GroupHandle,
     owner_member: MemberId,
@@ -611,68 +612,20 @@ impl<F: TransportFactory> Actor<F> {
             }
         };
 
-        let (events_tx, events_rx) = mpsc::channel(64);
-        let driver = Arc::new(driver::spawn(
+        let mut cast = self.assemble(
             transport,
-            DriverConfig {
-                planner: PlannerConfig {
-                    threshold_ms: self.cfg.drift_threshold_ms,
-                    cooldown_ms: self.cfg.correction_cooldown_ms,
-                    ..PlannerConfig::default()
-                },
-                reconnect_grace: Duration::from_secs(self.cfg.reconnect_grace_secs),
-                server_url: self.cfg.server_url.clone().unwrap_or_default(),
-                receiver_name: tv.name.clone(),
-                access_token: AccessToken::new(token.secret().expose()),
-                latency_estimate: LATENCY_ESTIMATE,
-                max_load_wait: MAX_LOAD_WAIT,
+            &token,
+            Assembly {
+                tv: &tv,
+                owner: req.user_id,
+                owner_name: &req.user_name,
+                owner_key: Some(req.owner_sync_key.clone()),
+                sender_device: device_of(&req.owner_sync_key).to_owned(),
+                group: &group,
+                owner_member,
             },
-            events_tx,
-        ));
-
-        self.next_id = self.next_id.wrapping_add(1);
-        let id = self.next_id;
-        let seat_member =
-            member_id_for_device(&format!("{}:cast:{}", req.user_id.0.simple(), tv.name));
-        let seat_rx =
-            self.deps
-                .sinks
-                .attach_channel(seat_member, SEAT_SINK_GEN, SEAT_SINK_CAPACITY);
-        let forwarder = tokio::spawn(forward(
-            seat_rx,
-            Arc::clone(&driver),
-            group.epoch_unix_ms,
-            tv.name.clone(),
-        ));
-        let pump = tokio::spawn(pump_events(
-            events_rx,
-            self.internal_tx.clone(),
-            tv.name.clone(),
-            id,
-        ));
-        let watcher = tokio::spawn(watch_group(
-            group.tx.clone(),
-            self.internal_tx.clone(),
-            tv.name.clone(),
-            id,
-        ));
-        let mut cast = ActiveCast {
-            id,
-            tv: tv.name.clone(),
-            owner: req.user_id,
-            owner_name: req.user_name.clone(),
-            owner_key: req.owner_sync_key.clone(),
-            sender_device: device_of(&req.owner_sync_key).to_owned(),
-            group: group.clone(),
-            owner_member,
-            seat_member,
-            token_id: token.id.clone(),
-            driver,
-            state: ConnState::Connecting,
-            forwarder,
-            pump,
-            watcher,
-        };
+        );
+        let seat_member = cast.seat_member;
 
         let binding = CastBinding {
             tv: tv.name.clone(),
@@ -801,7 +754,7 @@ impl<F: TransportFactory> Actor<F> {
             &self.deps.hub,
             &self.deps.registry,
             &self.deps.stores,
-            Some(cast.owner_key.clone()),
+            cast.owner_key.clone(),
             label,
             move |sender| match command {
                 GroupCommandRequest::Pause => GroupMsg::PauseShared { sender },
@@ -903,6 +856,92 @@ impl<F: TransportFactory> Actor<F> {
         }
         if !cast.driver.is_finished() {
             cast.driver.abort();
+        }
+    }
+}
+
+/// What [`Actor::assemble`] needs to wire a cast together, whether it was just
+/// started or is being resumed.
+struct Assembly<'a> {
+    tv: &'a ConfiguredTv,
+    owner: UserId,
+    owner_name: &'a str,
+    owner_key: Option<String>,
+    sender_device: String,
+    group: &'a GroupHandle,
+    owner_member: MemberId,
+}
+
+impl<F: TransportFactory> Actor<F> {
+    /// Spawn the driver, attach the seat's sink and start the three owned
+    /// tasks. The group is not touched: the caller decides how the seat joins.
+    fn assemble(
+        &mut self,
+        transport: F::Transport,
+        token: &TvToken,
+        a: Assembly<'_>,
+    ) -> ActiveCast {
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let driver = Arc::new(driver::spawn(
+            transport,
+            DriverConfig {
+                planner: PlannerConfig {
+                    threshold_ms: self.cfg.drift_threshold_ms,
+                    cooldown_ms: self.cfg.correction_cooldown_ms,
+                    ..PlannerConfig::default()
+                },
+                reconnect_grace: Duration::from_secs(self.cfg.reconnect_grace_secs),
+                server_url: self.cfg.server_url.clone().unwrap_or_default(),
+                receiver_name: a.tv.name.clone(),
+                access_token: AccessToken::new(token.secret().expose()),
+                latency_estimate: LATENCY_ESTIMATE,
+                max_load_wait: MAX_LOAD_WAIT,
+            },
+            events_tx,
+        ));
+
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        let seat_member =
+            member_id_for_device(&format!("{}:cast:{}", a.owner.0.simple(), a.tv.name));
+        let seat_rx =
+            self.deps
+                .sinks
+                .attach_channel(seat_member, SEAT_SINK_GEN, SEAT_SINK_CAPACITY);
+        let forwarder = tokio::spawn(forward(
+            seat_rx,
+            Arc::clone(&driver),
+            a.group.epoch_unix_ms,
+            a.tv.name.clone(),
+        ));
+        let pump = tokio::spawn(pump_events(
+            events_rx,
+            self.internal_tx.clone(),
+            a.tv.name.clone(),
+            id,
+        ));
+        let watcher = tokio::spawn(watch_group(
+            a.group.tx.clone(),
+            self.internal_tx.clone(),
+            a.tv.name.clone(),
+            id,
+        ));
+        ActiveCast {
+            id,
+            tv: a.tv.name.clone(),
+            owner: a.owner,
+            owner_name: a.owner_name.to_owned(),
+            owner_key: a.owner_key,
+            sender_device: a.sender_device,
+            group: a.group.clone(),
+            owner_member: a.owner_member,
+            seat_member,
+            token_id: token.id.clone(),
+            driver,
+            state: ConnState::Connecting,
+            forwarder,
+            pump,
+            watcher,
         }
     }
 }
