@@ -8,6 +8,9 @@ pub mod sqlite;
 #[cfg(feature = "sqlite")]
 mod sqlite_put;
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod put_batch;
+
 #[cfg(feature = "sqlite")]
 mod auth_sqlite;
 
