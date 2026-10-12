@@ -1835,6 +1835,18 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let per_address_limits = !trusted_proxies.is_empty();
     state = state.with_login_throttle(cfg.server.login_throttle, trusted_proxies);
     state.login_throttle.record_state();
+    // 009 — the TV sessions `/Sessions` lists. Absent unless `[[cast.tvs]]` is
+    // configured, which leaves `/Sessions` exactly as it was.
+    let cast_directory = (!cfg.cast.tvs.is_empty()).then(|| {
+        pharos_server::cast_directory::RuntimeCastDirectory::new(
+            cfg.cast.clone(),
+            state.cast.clone(),
+            state.stores.clone(),
+        )
+    });
+    if let Some(directory) = &cast_directory {
+        state.cast_directory = Some(directory.clone());
+    }
     let app_state = web::Data::new(state);
     // Off the startup path: one argon2 verify per account (B271).
     let empty_check_state = app_state.clone();
@@ -2020,6 +2032,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         },
         &cfg.cast,
     );
+    if let Some(directory) = &cast_directory {
+        directory.bind_registry(group_registry.get_ref().clone());
+        directory.spawn_refresher(app_state.bus.clone());
+    }
     let member_sinks_data = web::Data::new(member_sinks);
     let token_resolver_data = web::Data::new(token_resolver);
 
