@@ -1084,6 +1084,11 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             command,
             arg,
         } => translate_session_command(session_id, controlling_user_id, command, arg),
+        SocketBroadcast::CastChanged => None,
+        SocketBroadcast::SessionsChanged => Some(Outbound::new(
+            "Sessions",
+            serde_json::Value::Array(Vec::new()),
+        )),
         // P10 — minimal Sessions payload carrying just the session
         // that changed. jellyfin-web's Currently Watching sidebar +
         // remote-control screens listen for this MessageType and
@@ -1595,6 +1600,14 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert!(v["Data"][0]["NowPlayingItem"].is_null());
+    }
+
+    #[test]
+    fn sessions_changed_is_an_empty_sessions_patch_and_cast_changed_is_internal() {
+        let out = translate_broadcast(SocketBroadcast::SessionsChanged).unwrap();
+        assert_eq!(out.message_type, "Sessions");
+        assert_eq!(out.data, serde_json::json!([]));
+        assert!(translate_broadcast(SocketBroadcast::CastChanged).is_none());
     }
 
     #[test]
