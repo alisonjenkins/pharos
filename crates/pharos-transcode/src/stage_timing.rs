@@ -256,6 +256,92 @@ pub fn strip_bench_lines(stderr: &str) -> String {
         .join("\n")
 }
 
+/// Bytes of non-bench stderr kept from the start of a job: where ffmpeg says
+/// what it could not open.
+const STDERR_KEEP_HEAD: usize = 32 * 1024;
+/// Bytes kept from the end: where it says why it stopped.
+const STDERR_KEEP_TAIL: usize = 32 * 1024;
+/// A line longer than this is cut; ffmpeg's are far shorter, and the split on
+/// `\r` and `\n` would otherwise let one unterminated run grow without limit.
+const STDERR_MAX_LINE: usize = 8 * 1024;
+
+/// Drains a job's stderr in constant memory.
+///
+/// `bench:` lines (when collecting) are folded into a [`BenchReport`] as they
+/// arrive; everything else keeps its first and last 32 KiB for failure
+/// classification and the echoed tail, and the middle is dropped. The caller
+/// still reads the pipe to EOF, so ffmpeg never blocks on a full pipe.
+#[derive(Debug)]
+pub struct StderrDigest {
+    bench: Option<BenchReport>,
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+    partial: Vec<u8>,
+}
+
+impl StderrDigest {
+    pub fn new(collect_bench: bool) -> Self {
+        Self {
+            bench: collect_bench.then(BenchReport::default),
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            dropped: 0,
+            partial: Vec::new(),
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            if b == b'\n' || b == b'\r' {
+                self.end_line();
+            } else if self.partial.len() < STDERR_MAX_LINE {
+                self.partial.push(b);
+            }
+        }
+    }
+
+    fn end_line(&mut self) {
+        if self.partial.is_empty() {
+            return;
+        }
+        let line = String::from_utf8_lossy(&self.partial).into_owned();
+        self.partial.clear();
+        if line.starts_with("bench:") {
+            if let Some(b) = self.bench.as_mut() {
+                b.absorb(&line);
+            }
+            return;
+        }
+        if self.head.len() < STDERR_KEEP_HEAD {
+            self.head.extend_from_slice(line.as_bytes());
+            self.head.push(b'\n');
+            return;
+        }
+        self.tail.extend(line.as_bytes());
+        self.tail.push_back(b'\n');
+        while self.tail.len() > STDERR_KEEP_TAIL {
+            self.tail.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+    }
+
+    /// The bench report (when collecting) and the retained text.
+    pub fn finish(mut self) -> (Option<BenchReport>, String) {
+        self.end_line();
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if self.dropped > 0 {
+            text.push_str(&format!(
+                "[... {} bytes of stderr dropped ...]\n",
+                self.dropped
+            ));
+        }
+        let tail: Vec<u8> = self.tail.into_iter().collect();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        (self.bench, text)
+    }
+}
+
 /// Global ffmpeg options a mode adds in front of the job's argv.
 ///
 /// `-stats_period` only matters for a file sink, where the argv already
@@ -275,12 +361,15 @@ pub fn apply_mode_args(args: Vec<String>, mode: StageTimingMode, file_sink: bool
     if file_sink {
         a.extend(["-stats_period".into(), "0.1".into()]);
     }
-    if mode == StageTimingMode::Detailed {
+    // A live (stdout) job reports no timing, so the extra stderr and the lifted
+    // loglevel would be pure cost over a stream that can run for hours.
+    let detailed = mode == StageTimingMode::Detailed && file_sink;
+    if detailed {
         a.extend(["-benchmark".into(), "-benchmark_all".into()]);
     }
     let mut after_loglevel = false;
     for arg in args {
-        if after_loglevel && mode == StageTimingMode::Detailed && arg == "error" {
+        if after_loglevel && detailed && arg == "error" {
             a.push("info".into());
         } else {
             a.push(arg.clone());
@@ -503,6 +592,46 @@ mod tests {
         assert!(kept.contains("frame=  100"), "{kept:?}");
     }
 
+    /// A live stream can run for hours at ~13 KB/s of stderr; the digest keeps
+    /// a fixed head and tail whatever arrives.
+    #[test]
+    fn a_huge_stderr_stream_is_retained_in_bounded_memory() {
+        let mut d = StderrDigest::new(false);
+        d.feed(b"[h264 @ 0x1] first line, says what failed to open\n");
+        let filler = b"[aac @ 0x2] Queue input is backward in time\n";
+        for _ in 0..(50 * 1024 * 1024 / filler.len()) {
+            d.feed(filler);
+        }
+        d.feed(b"[out#0 @ 0x3] last line, says why it stopped\n");
+        assert!(
+            d.head.len() + d.tail.len() <= STDERR_KEEP_HEAD + STDERR_KEEP_TAIL + STDERR_MAX_LINE
+        );
+        let (bench, text) = d.finish();
+        assert!(bench.is_none());
+        assert!(text.len() < 70 * 1024, "kept {} bytes", text.len());
+        assert!(text.starts_with("[h264 @ 0x1] first line"), "head lost");
+        assert!(
+            text.trim_end().ends_with("last line, says why it stopped"),
+            "tail lost"
+        );
+        assert!(text.contains("bytes of stderr dropped"));
+    }
+
+    #[test]
+    fn the_digest_folds_bench_lines_into_a_report_and_keeps_the_rest() {
+        let mut d = StderrDigest::new(true);
+        d.feed(b"[libx264 @ 0x1] using SAR=1/1\nbench:        3 user        1 sys     2000 real encode_video 0.0 \n");
+        d.feed(b"frame=  1 fps=0.0\rbench:      900 user        0 sys     1000 real decode_video 0:0 \n");
+        d.feed(b"bench: utime=1.0s stime=0.1s rtime=0.5s");
+        let (bench, text) = d.finish();
+        assert!(bench.is_some(), "collecting was requested");
+        let b = bench.unwrap_or_default();
+        assert!((b.encode_video - 0.002).abs() < 1e-9 && (b.decode_video - 0.001).abs() < 1e-9);
+        assert_eq!(b.rtime, Some(0.5));
+        assert!(text.contains("using SAR") && text.contains("frame=  1"));
+        assert!(!text.contains("bench:"));
+    }
+
     #[test]
     fn benchmark_parser_ignores_everything_that_is_not_a_bench_line() {
         let b = parse_benchmark_all("[libx264 @ 0x1] kb/s:1300\nframe=  144 fps=0.0\n");
@@ -589,17 +718,18 @@ mod tests {
             ]
         );
         assert_eq!(with(StageTimingMode::Basic, false), base());
+        // A live (stdout) job reports no timing: no benchmark flags, no
+        // loglevel lift, whatever the mode.
+        assert_eq!(with(StageTimingMode::Detailed, false), base());
         assert_eq!(
-            with(StageTimingMode::Detailed, false),
+            with(StageTimingMode::Detailed, true)[..6],
             [
+                "-stats_period",
+                "0.1",
                 "-benchmark",
                 "-benchmark_all",
                 "-hide_banner",
-                "-loglevel",
-                "info",
-                "-i",
-                "in.mkv",
-                "out.ts"
+                "-loglevel"
             ]
         );
         assert_eq!(

@@ -107,8 +107,7 @@ async fn run_job(
 ) {
     use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
     use pharos_transcode::stage_timing::{
-        apply_mode_args, parse_benchmark_all, parse_progress, strip_bench_lines, StageTiming,
-        StageTimingMode,
+        apply_mode_args, parse_progress, StageTiming, StageTimingMode, StderrDigest,
     };
     use pharos_transcode::worker::exec;
     use std::time::Duration;
@@ -172,13 +171,22 @@ async fn run_job(
     // Drain stderr concurrently so a chatty ffmpeg can't deadlock on a
     // full pipe buffer.
     let stderr = child.stderr.take();
+    // Retained bounded: a live stream can run for hours, and an unbounded
+    // buffer here is worker RSS that never comes back.
+    let collect_bench = mode == StageTimingMode::Detailed && !stdout_passthrough;
     let stderr_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
+        let mut digest = StderrDigest::new(collect_bench);
         if let Some(mut e) = stderr {
-            let _ = e.read_to_end(&mut buf).await;
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = e.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                digest.feed(chunk.get(..n).unwrap_or_default());
+            }
         }
-        String::from_utf8_lossy(&buf).into_owned()
+        digest.finish()
     });
 
     // Heartbeat + progress: while ffmpeg runs, periodically report
@@ -226,15 +234,9 @@ async fn run_job(
     };
 
     let total_secs = started.elapsed().as_secs_f64();
-    let raw_stderr = stderr_task.await.unwrap_or_default();
-    // `-benchmark_all` writes thousands of lines; keep them out of the text
-    // failure classification and the echoed tail read.
-    let bench = (mode == StageTimingMode::Detailed).then(|| parse_benchmark_all(&raw_stderr));
-    let stderr_text = if bench.is_some() {
-        strip_bench_lines(&raw_stderr)
-    } else {
-        raw_stderr
-    };
+    // `-benchmark_all` lines went into the report; the text kept for failure
+    // classification and the echoed tail is everything else, head and tail only.
+    let (bench, stderr_text) = stderr_task.await.unwrap_or_default();
     match status {
         Ok(s) if s.success() => {
             // A live job's control socket is never drained, so only segment
