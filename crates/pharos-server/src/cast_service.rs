@@ -583,12 +583,27 @@ impl<F: TransportFactory> Actor<F> {
             watcher,
         };
 
+        let binding = CastBinding {
+            tv: tv.name.clone(),
+            owner: req.user_id.0.simple().to_string(),
+        };
+        // The owner becomes the Controller first so the seat is paired, and so
+        // hidden, from the moment it joins.
+        let _ = group
+            .tx
+            .send(GroupMsg::SetMemberKind {
+                member: owner_member,
+                kind: MemberKind::Controller,
+                cast: Some(binding.clone()),
+            })
+            .await;
         let (join_tx, join_rx) = oneshot::channel();
         let joined = group
             .tx
-            .send(GroupMsg::AddMember {
+            .send(GroupMsg::AddCastSeat {
                 member_id: seat_member,
                 name: req.user_name.clone(),
+                cast: binding,
                 reply: join_tx,
             })
             .await
@@ -614,24 +629,6 @@ impl<F: TransportFactory> Actor<F> {
                 reason: CastRejectReason::Unavailable,
                 message,
             });
-        }
-
-        let binding = CastBinding {
-            tv: tv.name.clone(),
-            owner: req.user_id.0.simple().to_string(),
-        };
-        for (member, kind) in [
-            (owner_member, MemberKind::Controller),
-            (seat_member, MemberKind::CastSeat),
-        ] {
-            let _ = group
-                .tx
-                .send(GroupMsg::SetMemberKind {
-                    member,
-                    kind,
-                    cast: Some(binding.clone()),
-                })
-                .await;
         }
 
         obs::record_cast_event(

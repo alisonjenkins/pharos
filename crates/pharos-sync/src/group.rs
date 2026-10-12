@@ -225,6 +225,15 @@ pub enum GroupMsg {
         name: String,
         reply: oneshot::Sender<Joined>,
     },
+    /// Register a cast seat already classified and bound to its cast. When the
+    /// owner's Controller carries the same binding the seat is hidden from the
+    /// first instant, so other members are never told it joined.
+    AddCastSeat {
+        member_id: MemberId,
+        name: String,
+        cast: CastBinding,
+        reply: oneshot::Sender<Joined>,
+    },
     RemoveMember {
         member_id: MemberId,
     },
@@ -443,6 +452,11 @@ pub enum RemoteCommand {
         member_id: MemberId,
         name: String,
     },
+    AddCastSeat {
+        member_id: MemberId,
+        name: String,
+        cast: CastBinding,
+    },
     RemoveMember {
         member_id: MemberId,
     },
@@ -576,6 +590,19 @@ impl RemoteCommand {
                 GroupMsg::AddMember {
                     member_id,
                     name,
+                    reply,
+                }
+            }
+            RemoteCommand::AddCastSeat {
+                member_id,
+                name,
+                cast,
+            } => {
+                let (reply, _rx) = oneshot::channel();
+                GroupMsg::AddCastSeat {
+                    member_id,
+                    name,
+                    cast,
                     reply,
                 }
             }
@@ -3140,9 +3167,10 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
         | GroupMsg::SetShuffleMode { sender, .. } => Some(*sender),
-        GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
-            None
-        }
+        GroupMsg::AddMember { .. }
+        | GroupMsg::AddCastSeat { .. }
+        | GroupMsg::RemoveMember { .. }
+        | GroupMsg::Snapshot { .. } => None,
         // A socket loss is the OPPOSITE of a sign of life — never refresh
         // last_seen for it (that would keep a ghost alive past its TTL).
         GroupMsg::SetGroupName { .. }
@@ -3173,6 +3201,127 @@ fn controls_existing_queue(msg: &GroupMsg) -> bool {
     )
 }
 
+/// Admit a member to the roster, or treat a duplicate as a reconnect (B57).
+/// `kind`/`cast` let a cast seat arrive already classified, so a seat paired
+/// with its Controller is never announced to the others.
+fn add_member(
+    state: &mut GroupState,
+    member_id: MemberId,
+    name: String,
+    kind: MemberKind,
+    cast: Option<CastBinding>,
+    reply: oneshot::Sender<Joined>,
+) {
+    // B57 — idempotent re-add: a duplicate New/Join for a member already
+    // in the roster (client retry, or the New/Join churn a socket race
+    // can trigger) must NOT reset the member's buffering/ignore_wait
+    // flags or fire a spurious "user joined" toast to everyone. Treat it
+    // as a reconnect: refresh name + liveness, re-send this member's own
+    // Joined + catch-up (so its fresh client re-syncs), and reply — but
+    // skip the roster-wide MemberJoined broadcast.
+    if let Some(rec) = state.members.get_mut(&member_id) {
+        rec.name = name.clone();
+        rec.last_seen = tokio::time::Instant::now();
+        // The socket is back — the member is a gate follower again.
+        rec.connected = true;
+        let outage_secs = record_socket_return(rec);
+        let summaries = state.member_summaries();
+        let leader = state.leader.unwrap_or(member_id);
+        let _ = reply.send(Joined {
+            group_id: state.id,
+            leader,
+            members: summaries.clone(),
+        });
+        state.send_one(
+            member_id,
+            ServerMsg::Joined {
+                group_id: state.id,
+                leader,
+                members: summaries,
+            },
+        );
+        state.send_catch_up(member_id);
+        if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
+            state.force_reseek_one(member_id, secs);
+        }
+        yield_leadership_to_player(state);
+        return;
+    }
+    let was_empty = state.members.is_empty();
+    state.members.insert(
+        member_id,
+        MemberRec {
+            name: name.clone(),
+            offset: ClockOffset::default(),
+            buffering: false,
+            ignore_wait: false,
+            kind,
+            cast,
+            connected: true,
+            last_seen: tokio::time::Instant::now(),
+            socket_gone_since: None,
+        },
+    );
+    if was_empty {
+        state.elect_leader();
+    }
+    let summaries = state.member_summaries();
+    let leader = state.leader.unwrap_or(member_id); // Always Some after election above.
+    let _ = reply.send(Joined {
+        group_id: state.id,
+        leader,
+        members: summaries.clone(),
+    });
+    // Notify the joiner over its own sink too (not just the oneshot
+    // reply), so the HTTP-driven join path — where the reply goes to the
+    // HTTP handler, not the socket — still delivers `GroupJoined` to the
+    // client. The WS path's socket receives the same message.
+    state.send_one(
+        member_id,
+        ServerMsg::Joined {
+            group_id: state.id,
+            leader,
+            members: summaries.clone(),
+        },
+    );
+    // Tell existing members someone joined (not the joiner itself).
+    let me = MemberSummary {
+        member_id,
+        name,
+        is_leader: Some(member_id) == state.leader,
+        device: None,
+    };
+    if !state.is_hidden_seat(member_id) {
+        state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
+    }
+    yield_leadership_to_player(state);
+    // B183 — a queue that was only SEEDED has never been sent to anyone,
+    // so no client holds its `playlist_item_id` and the group is not
+    // startable: the joiner below would get a catch-up nobody else can
+    // follow, and the creator would remain unbound (the seed logs
+    // exactly that, `creator_bound = false`). Promote it to a real
+    // broadcast the moment a SECOND member arrives — which is the first
+    // moment the seed's whole reason for existing, "do not disturb the
+    // creator", stops being free.
+    //
+    // This reproduces by hand what the operator had to do manually
+    // during the 2026-08-01 session: recreate the group and re-start
+    // playback inside it. The creator's player reloads once, at the
+    // instant it invited somebody, and lands at the position it was
+    // already playing.
+    //
+    // No readiness gate: a gate here would be opened on members that
+    // may have nothing to transition through, which is the wedge B182
+    // is about. The playback state below resumes everyone directly.
+    if state.promote_seed_only_queue("join") {
+        return;
+    }
+    // Queue + playback catch-up so the new member loads the SAME item at
+    // the group's current position. Adding a member NEVER mutates
+    // `playing_index` (A6: a join must not advance the group).
+    state.send_catch_up(member_id);
+}
+
 async fn handle(state: &mut GroupState, msg: GroupMsg) {
     // T83 — any attributed message is a sign of life.
     if let Some(id) = msg_member(&msg) {
@@ -3201,114 +3350,20 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             member_id,
             name,
             reply,
-        } => {
-            // B57 — idempotent re-add: a duplicate New/Join for a member already
-            // in the roster (client retry, or the New/Join churn a socket race
-            // can trigger) must NOT reset the member's buffering/ignore_wait
-            // flags or fire a spurious "user joined" toast to everyone. Treat it
-            // as a reconnect: refresh name + liveness, re-send this member's own
-            // Joined + catch-up (so its fresh client re-syncs), and reply — but
-            // skip the roster-wide MemberJoined broadcast.
-            if let Some(rec) = state.members.get_mut(&member_id) {
-                rec.name = name.clone();
-                rec.last_seen = tokio::time::Instant::now();
-                // The socket is back — the member is a gate follower again.
-                rec.connected = true;
-                let outage_secs = record_socket_return(rec);
-                let summaries = state.member_summaries();
-                let leader = state.leader.unwrap_or(member_id);
-                let _ = reply.send(Joined {
-                    group_id: state.id,
-                    leader,
-                    members: summaries.clone(),
-                });
-                state.send_one(
-                    member_id,
-                    ServerMsg::Joined {
-                        group_id: state.id,
-                        leader,
-                        members: summaries,
-                    },
-                );
-                state.send_catch_up(member_id);
-                if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
-                    state.force_reseek_one(member_id, secs);
-                }
-                yield_leadership_to_player(state);
-                return;
-            }
-            let was_empty = state.members.is_empty();
-            state.members.insert(
-                member_id,
-                MemberRec {
-                    name: name.clone(),
-                    offset: ClockOffset::default(),
-                    buffering: false,
-                    ignore_wait: false,
-                    kind: MemberKind::Player,
-                    cast: None,
-                    connected: true,
-                    last_seen: tokio::time::Instant::now(),
-                    socket_gone_since: None,
-                },
-            );
-            if was_empty {
-                state.elect_leader();
-            }
-            let summaries = state.member_summaries();
-            let leader = state.leader.unwrap_or(member_id); // Always Some after election above.
-            let _ = reply.send(Joined {
-                group_id: state.id,
-                leader,
-                members: summaries.clone(),
-            });
-            // Notify the joiner over its own sink too (not just the oneshot
-            // reply), so the HTTP-driven join path — where the reply goes to the
-            // HTTP handler, not the socket — still delivers `GroupJoined` to the
-            // client. The WS path's socket receives the same message.
-            state.send_one(
-                member_id,
-                ServerMsg::Joined {
-                    group_id: state.id,
-                    leader,
-                    members: summaries.clone(),
-                },
-            );
-            // Tell existing members someone joined (not the joiner itself).
-            let me = MemberSummary {
-                member_id,
-                name,
-                is_leader: Some(member_id) == state.leader,
-                device: None,
-            };
-            state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
-            yield_leadership_to_player(state);
-            // B183 — a queue that was only SEEDED has never been sent to anyone,
-            // so no client holds its `playlist_item_id` and the group is not
-            // startable: the joiner below would get a catch-up nobody else can
-            // follow, and the creator would remain unbound (the seed logs
-            // exactly that, `creator_bound = false`). Promote it to a real
-            // broadcast the moment a SECOND member arrives — which is the first
-            // moment the seed's whole reason for existing, "do not disturb the
-            // creator", stops being free.
-            //
-            // This reproduces by hand what the operator had to do manually
-            // during the 2026-08-01 session: recreate the group and re-start
-            // playback inside it. The creator's player reloads once, at the
-            // instant it invited somebody, and lands at the position it was
-            // already playing.
-            //
-            // No readiness gate: a gate here would be opened on members that
-            // may have nothing to transition through, which is the wedge B182
-            // is about. The playback state below resumes everyone directly.
-            if state.promote_seed_only_queue("join") {
-                return;
-            }
-            // Queue + playback catch-up so the new member loads the SAME item at
-            // the group's current position. Adding a member NEVER mutates
-            // `playing_index` (A6: a join must not advance the group).
-            state.send_catch_up(member_id);
-        }
+        } => add_member(state, member_id, name, MemberKind::Player, None, reply),
+        GroupMsg::AddCastSeat {
+            member_id,
+            name,
+            cast,
+            reply,
+        } => add_member(
+            state,
+            member_id,
+            name,
+            MemberKind::CastSeat,
+            Some(cast),
+            reply,
+        ),
         GroupMsg::ResyncMember { member_id } => {
             // A reconnected socket for an existing member (its fresh sink is
             // already in the replica's MemberSinks): re-send the catch-up so it
@@ -3919,12 +3974,6 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::SetMemberKind { member, kind, cast } => {
-            let hidden_before: HashSet<MemberId> = state
-                .members
-                .keys()
-                .copied()
-                .filter(|id| state.is_hidden_seat(*id))
-                .collect();
             if let Some(rec) = state.members.get_mut(&member) {
                 rec.kind = kind;
                 rec.cast = cast;
@@ -3932,18 +3981,6 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     rec.buffering = false;
                     release_gate_holds_for(state, member);
                 }
-            }
-            // A seat is announced as a Player when it joins. Once pairing hides
-            // it the others would keep that entry, so retract it.
-            let mut newly_hidden: Vec<(MemberId, String)> = state
-                .members
-                .iter()
-                .filter(|(id, _)| !hidden_before.contains(id) && state.is_hidden_seat(**id))
-                .map(|(id, m)| (*id, m.name.clone()))
-                .collect();
-            newly_hidden.sort_by_key(|(id, _)| *id);
-            for (member_id, name) in newly_hidden {
-                state.broadcast(ServerMsg::MemberLeft { member_id, name });
             }
             yield_leadership_to_player(state);
         }

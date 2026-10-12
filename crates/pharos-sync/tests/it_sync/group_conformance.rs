@@ -773,7 +773,7 @@ async fn removing_a_paired_seat_sends_no_member_left() {
     let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
     set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
     set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
-    // Let the pairing (and its retraction of the seat, T059) land first.
+    // Let the pairing land first.
     let _ = snapshot(&h).await;
     drain(&mut w_rx).await;
 
@@ -843,64 +843,82 @@ async fn an_all_non_player_group_still_has_a_leader() {
     assert_eq!(snapshot(&h).await.leader, Some(a));
 }
 
-/// T059 — a seat is announced as a Player when it joins; once re-classified and
-/// paired with its Controller the roster hides it, so the others must be told
-/// it left or they keep a stale second entry for the casting user.
+async fn add_cast_seat(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    id: MemberId,
+    name: &str,
+    cast: CastBinding,
+) -> mpsc::Receiver<ServerMsg> {
+    let (tx, rx) = mpsc::channel(64);
+    sinks.insert(id, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddCastSeat {
+        member_id: id,
+        name: name.into(),
+        cast,
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    rx
+}
+
+fn announcements(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<ServerMsg> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if matches!(
+            m,
+            ServerMsg::MemberJoined { .. } | ServerMsg::MemberLeft { .. }
+        ) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// T061 — a seat added already paired with its Controller is hidden from the
+/// start, so nobody is told a second member joined or left for a cast.
 #[tokio::test]
-async fn pairing_a_freshly_joined_seat_retracts_its_join_announcement() {
+async fn a_cast_seat_paired_with_its_controller_is_never_announced() {
     let (h, sinks) = spawn_group();
     let ctrl = ordered_id(70);
+    let seat = ordered_id(71);
     let watcher = ordered_id(72);
     let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
     let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    let _ = snapshot(&h).await;
     drain(&mut w_rx).await;
 
-    let seat = ordered_id(71);
-    let _s = add_member_with_id(&h, &sinks, seat, "ali").await;
-    let announced = wait_for(
-        &mut w_rx,
-        Duration::from_millis(500),
-        |m| matches!(m, ServerMsg::MemberJoined { member } if member.member_id == seat),
-    )
-    .await;
-    assert!(announced.is_some(), "the seat joins as a Player first");
+    let _s = add_cast_seat(&h, &sinks, seat, "ali", tv_cast().unwrap()).await;
+    let _ = snapshot(&h).await;
+    assert_eq!(announcements(&mut w_rx).len(), 0, "seat join is silent");
 
-    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
-    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
-    let retracted = wait_for(
-        &mut w_rx,
-        Duration::from_millis(500),
-        |m| matches!(m, ServerMsg::MemberLeft { member_id, .. } if *member_id == seat),
-    )
-    .await;
-    assert!(
-        retracted.is_some(),
-        "the now-hidden seat must be retracted from other members' rosters"
-    );
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    set_kind(&h, ctrl, MemberKind::Player, None).await;
+    let _ = snapshot(&h).await;
+    assert_eq!(announcements(&mut w_rx).len(), 0, "seat leave is silent");
 }
 
-/// T059 — the retraction happens once, at the moment the pair completes.
+/// T061 — a seat with no Controller is the only roster entry for it, so its
+/// arrival is announced like any member's.
 #[tokio::test]
-async fn only_the_newly_hidden_seat_is_retracted() {
+async fn an_unpaired_cast_seat_is_announced() {
     let (h, sinks) = spawn_group();
-    let ctrl = ordered_id(80);
-    let seat = ordered_id(81);
-    let watcher = ordered_id(82);
-    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
-    let _s = add_member_with_id(&h, &sinks, seat, "ali").await;
+    let seat = ordered_id(73);
+    let watcher = ordered_id(74);
     let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
-    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
     drain(&mut w_rx).await;
 
-    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
-    // Re-asserting the same kind changes nothing and must say nothing.
-    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    let _s = add_cast_seat(&h, &sinks, seat, "Living Room", tv_cast().unwrap()).await;
     let _ = snapshot(&h).await;
-    let mut lefts = Vec::new();
-    while let Ok(m) = w_rx.try_recv() {
-        if let ServerMsg::MemberLeft { member_id, .. } = m {
-            lefts.push(member_id);
-        }
-    }
-    assert_eq!(lefts, vec![seat], "exactly one retraction, for the seat");
+    let seen = announcements(&mut w_rx);
+    assert!(
+        matches!(seen.as_slice(), [ServerMsg::MemberJoined { member }] if member.member_id == seat),
+        "{seen:?}"
+    );
 }
