@@ -59,6 +59,13 @@ const DRIVER_STOP_WAIT: Duration = Duration::from_secs(2);
 /// ghost, so it is pinged well inside that.
 const SEAT_PING_INTERVAL: Duration = Duration::from_secs(30);
 const COMMAND_QUEUE: usize = 32;
+/// Namespace of the lease keys; a v5 id under it is never a group's id.
+const TV_LEASE_NS: uuid::Uuid = uuid::Uuid::from_u128(0x5c0d_91a4_3e7b_4f12_b6a8_20d4_7e19_c3b5);
+
+/// The cross-replica lease that gives one replica a TV's Cast connection.
+pub fn tv_lease_key(tv_name: &str) -> GroupId {
+    GroupId(uuid::Uuid::new_v5(&TV_LEASE_NS, tv_name.as_bytes()))
+}
 
 /// What a user asks for when they pick a TV.
 #[derive(Debug, Clone)]
@@ -81,10 +88,12 @@ pub enum CastRejectReason {
     TokenFailed,
     /// The group could not take the seat, or the service is not running.
     Unavailable,
+    /// The group runs on another replica, which alone may hold its TV.
+    NotGroupOwner,
 }
 
 impl CastRejectReason {
-    pub const ALL: [CastRejectReason; 7] = [
+    pub const ALL: [CastRejectReason; 8] = [
         Self::NotInGroup,
         Self::TvBusy,
         Self::TvUnreachable,
@@ -92,6 +101,7 @@ impl CastRejectReason {
         Self::NotPermitted,
         Self::TokenFailed,
         Self::Unavailable,
+        Self::NotGroupOwner,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -103,6 +113,7 @@ impl CastRejectReason {
             Self::NotPermitted => "not_permitted",
             Self::TokenFailed => "token_failed",
             Self::Unavailable => "unavailable",
+            Self::NotGroupOwner => "not_group_owner",
         }
     }
 }
@@ -366,6 +377,7 @@ fn reason_of(reject: CastRejectReason) -> CastReason {
         CastRejectReason::NotPermitted => CastReason::NotPermitted,
         CastRejectReason::TokenFailed => CastReason::TokenFailed,
         CastRejectReason::Unavailable => CastReason::GroupGone,
+        CastRejectReason::NotGroupOwner => CastReason::NotGroupOwner,
     }
 }
 
@@ -392,26 +404,34 @@ impl<F: TransportFactory> Actor<F> {
                 _ = ping.tick() => self.ping_seats(),
             }
         }
-        self.release_all();
+        self.release_all().await;
     }
 
     /// The service is going away with the process. The group keeps its seats so
     /// the next process (or replica) can resume them from the snapshot, and the
     /// tokens are revoked by that resume: only the tasks and the sinks go.
-    fn release_all(&mut self) {
+    async fn release_all(&mut self) {
         for (_, cast) in self.casts.drain() {
             cast.forwarder.abort();
             cast.pump.abort();
             cast.watcher.abort();
             cast.driver.abort();
             self.deps.sinks.remove(cast.seat_member, SEAT_SINK_GEN);
+            if let Err(e) = self
+                .deps
+                .registry
+                .release_lease(tv_lease_key(&cast.tv))
+                .await
+            {
+                tracing::warn!(tv = %cast.tv, error = %e, "cast: the TV lease could not be released");
+            }
         }
         self.by_user.clear();
     }
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Start { req, reply } => self.begin_start(req, reply),
+            Command::Start { req, reply } => self.begin_start(req, reply).await,
             Command::Stop { user, reason, done } => {
                 self.end(user, reason, EndedBy::Service).await;
                 let _ = done.send(());
@@ -458,7 +478,11 @@ impl<F: TransportFactory> Actor<F> {
 
     /// Validate the request and reserve its TV and user; the connect itself
     /// runs in its own task so the actor stays responsive.
-    fn begin_start(&mut self, req: StartCast, reply: oneshot::Sender<Result<(), CastReject>>) {
+    async fn begin_start(
+        &mut self,
+        req: StartCast,
+        reply: oneshot::Sender<Result<(), CastReject>>,
+    ) {
         let params = match self.reserve(req) {
             Ok(params) => params,
             Err(reject) => {
@@ -466,6 +490,10 @@ impl<F: TransportFactory> Actor<F> {
                 return;
             }
         };
+        if let Err(reject) = self.claim(&params).await {
+            let _ = reply.send(Err(reject));
+            return;
+        }
         let tv = params.tv.clone();
         self.pending
             .insert(tv.name.clone(), PendingStart { params, reply });
@@ -486,7 +514,72 @@ impl<F: TransportFactory> Actor<F> {
         let Some(PendingStart { params, reply }) = self.pending.remove(&done.tv) else {
             return;
         };
-        let _ = reply.send(self.complete_start(params, done.outcome).await);
+        let result = self.complete_start(params, done.outcome).await;
+        if result.is_err() {
+            self.release_tv(&done.tv).await;
+        }
+        let _ = reply.send(result);
+    }
+
+    /// Only the replica that runs the group may hold its TV, and only one
+    /// replica may hold a TV at all; both are settled before any connection.
+    async fn claim(&self, params: &StartParams) -> Result<(), CastReject> {
+        let StartParams {
+            req,
+            tv,
+            group,
+            group_label,
+            ..
+        } = params;
+        match self.deps.registry.is_owned(group.group_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(self.reject(
+                    req,
+                    group_label,
+                    CastRejectReason::NotGroupOwner,
+                    &tv.name,
+                    format!(
+                        "group {group_label} runs on another replica, which alone may connect {:?}; \
+                         retry the request",
+                        tv.name
+                    ),
+                ));
+            }
+            Err(e) => {
+                return Err(self.reject(
+                    req,
+                    group_label,
+                    CastRejectReason::Unavailable,
+                    &tv.name,
+                    format!("cannot tell whether this replica runs group {group_label}: {e}"),
+                ));
+            }
+        }
+        match self.deps.registry.try_lease(tv_lease_key(&tv.name)).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.reject(
+                req,
+                group_label,
+                CastRejectReason::TvBusy,
+                &tv.name,
+                format!("{:?} is connected from another replica", tv.name),
+            )),
+            Err(e) => Err(self.reject(
+                req,
+                group_label,
+                CastRejectReason::Unavailable,
+                &tv.name,
+                format!("cannot lease {:?}: {e}", tv.name),
+            )),
+        }
+    }
+
+    /// Give the TV's cross-replica lease back.
+    async fn release_tv(&self, tv: &str) {
+        if let Err(e) = self.deps.registry.release_lease(tv_lease_key(tv)).await {
+            tracing::warn!(tv, error = %e, "cast: the TV lease could not be released");
+        }
     }
 
     fn reserve(&self, req: StartCast) -> Result<StartParams, CastReject> {
@@ -874,6 +967,7 @@ impl<F: TransportFactory> Actor<F> {
                 cast: None,
             })
             .await;
+        self.release_tv(&cast.tv).await;
         if let Err(e) = revoke_tv_token(&self.deps.stores, &cast.token_id).await {
             tracing::error!(
                 tv = %cast.tv, token = %cast.token_id.0, error = %e,
