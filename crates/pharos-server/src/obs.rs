@@ -108,6 +108,32 @@ const SECONDS_BUCKETS: &[f64] = &[
     0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
 ];
 
+/// Metrics whose values routinely exceed 30 s (an anchor "grows without
+/// bound", a scan runs for minutes, a transcode queues behind others): in the
+/// 30 s ladder they all land in +Inf and `histogram_quantile` caps at 30 s.
+const LONG_RUNNING_SECONDS: &[&str] = &[
+    "pharos_syncplay_hydrate_anchor_age_seconds",
+    "pharos_syncplay_socket_gone_seconds",
+    "pharos_syncplay_buffering_freeze_seconds",
+    "pharos_syncplay_gate_wait_seconds",
+    "pharos_syncplay_resume_catch_up_seconds",
+    "pharos_segment_transcode_seconds",
+    "pharos_transcode_encode_seconds",
+    "pharos_transcode_queue_wait_seconds",
+    "pharos_scan_duration_seconds",
+    "pharos_media_integrity_seconds",
+];
+
+const LONG_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+];
+
+/// Indexed key reads take 0.05-0.5 ms, below the first general bucket.
+const SUB_MS_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    5.0, 10.0,
+];
+
 static INIT: Once = Once::new();
 static RESULT: OnceLock<Result<PrometheusHandle, ObsError>> = OnceLock::new();
 /// Reads /proc (cpu, rss, fds, threads) into gauges; refreshed per scrape.
@@ -159,7 +185,19 @@ pub fn init_with_sampling(
             // silently, and the alert that reads them would go quiet without
             // the condition having cleared. Adding one means re-publishing
             // those on a timer first.
-            let handle = PrometheusBuilder::new()
+            // Exact-name matchers outrank the `_seconds` suffix fallback.
+            let mut builder = PrometheusBuilder::new();
+            for name in LONG_RUNNING_SECONDS {
+                builder = builder
+                    .set_buckets_for_metric(Matcher::Full((*name).into()), LONG_SECONDS_BUCKETS)
+                    .map_err(|e| ObsError::Prom(e.to_string()))?;
+            }
+            let handle = builder
+                .set_buckets_for_metric(
+                    Matcher::Full("pharos_store_query_seconds".into()),
+                    SUB_MS_BUCKETS,
+                )
+                .map_err(|e| ObsError::Prom(e.to_string()))?
                 .set_buckets_for_metric(Matcher::Suffix("_seconds".into()), SECONDS_BUCKETS)
                 .map_err(|e| ObsError::Prom(e.to_string()))?
                 .install_recorder()
@@ -386,6 +424,40 @@ mod tests {
             &[],
         );
         result.decision == SamplingDecision::RecordAndSample
+    }
+
+    fn bucket_bounds(body: &str, metric: &str) -> Vec<String> {
+        body.lines()
+            .filter(|l| l.starts_with(&format!("{metric}_bucket{{")))
+            .filter_map(|l| l.split("le=\"").nth(1)?.split('"').next().map(String::from))
+            .collect()
+    }
+
+    /// A 10-minute-stale anchor in the 30 s ladder lands in +Inf and
+    /// `histogram_quantile` caps at 30 s, hiding the failure. Long-running
+    /// metrics need a ladder that reaches an hour; indexed key reads need one
+    /// that resolves 0.1 ms.
+    #[test]
+    fn each_metric_family_gets_the_ladder_that_fits_it() {
+        init("info", None).unwrap();
+        metrics::histogram!("pharos_syncplay_hydrate_anchor_age_seconds").record(600.0);
+        metrics::histogram!("pharos_segment_transcode_seconds").record(90.0);
+        metrics::histogram!("pharos_store_query_seconds", "method" => "m").record(0.0002);
+        metrics::histogram!("http_request_duration_seconds", "method" => "GET", "path" => "/x")
+            .record(0.2);
+        let body = render();
+        for long in [
+            "pharos_syncplay_hydrate_anchor_age_seconds",
+            "pharos_segment_transcode_seconds",
+        ] {
+            assert!(
+                bucket_bounds(&body, long).contains(&"3600".to_string()),
+                "{long} must reach 1 h"
+            );
+        }
+        assert!(bucket_bounds(&body, "pharos_store_query_seconds").contains(&"0.0001".to_string()));
+        let http = bucket_bounds(&body, "http_request_duration_seconds");
+        assert!(http.contains(&"30".to_string()) && !http.contains(&"3600".to_string()));
     }
 
     #[test]
