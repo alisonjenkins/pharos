@@ -15,7 +15,7 @@
 use actix_web::test;
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 use common::{build_app, seed_rich};
 
 /// POST a policy body for `uid` (as the admin); return the HTTP status.

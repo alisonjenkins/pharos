@@ -17,7 +17,7 @@
 use actix_web::test;
 use serde_json::Value;
 
-mod common;
+use crate::common;
 use common::{build_app, seed_rich};
 
 async fn get_status(f: &common::Fixture, uri: &str) -> u16 {
@@ -360,7 +360,7 @@ fn matrix_doc_lists_every_ignored_test() {
     ];
     let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for file in files {
-        let src = std::fs::read_to_string(format!("{MANIFEST}/tests/{file}")).unwrap();
+        let src = std::fs::read_to_string(format!("{MANIFEST}/tests/it_feature/{file}")).unwrap();
         for line in src.lines().filter(|l| l.contains("#[ignore")) {
             // Extract the "(Txx)" backlog tag from the ignore reason.
             if let Some(open) = line.find("(T") {

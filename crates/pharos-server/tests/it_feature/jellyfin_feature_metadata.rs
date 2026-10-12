@@ -15,7 +15,7 @@
 use actix_web::test;
 use serde_json::Value;
 
-mod common;
+use crate::common;
 use common::{build_app, seed_rich};
 
 /// Fetch `/Users/{uid}/Items?…` as the admin and return the parsed body.
