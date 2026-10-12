@@ -13,6 +13,7 @@ use pharos_core::{
 use pharos_server::{
     api::jellyfin::auth_extractor::{scope_permits, PatternMatch, PLAYBACK_ALLOWLIST},
     auth::BuiltinAuth,
+    cast::{mint_tv_token, DEFAULT_TV_TOKEN_LIFETIME},
     state::{AppState, Stores},
 };
 use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
@@ -206,6 +207,19 @@ async fn a_scope_refusal_is_counted_and_an_allowed_call_is_not() {
 
     call(&s.state, "POST", "/Library/Refresh", &s.playback).await;
     assert_eq!(counted(), 1, "the refusal must be counted");
+}
+
+#[actix_web::test]
+async fn a_minted_tv_token_is_playback_scoped() {
+    let s = seed().await;
+    let tv = mint_tv_token(&s.state.stores, s.uid, "Den", DEFAULT_TV_TOKEN_LIFETIME)
+        .await
+        .unwrap();
+    let token = tv.secret().expose();
+    let (status, body) = call(&s.state, "GET", "/Users/Me", token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&s.state, "POST", "/Library/Refresh", token).await;
+    assert!(refused_for_scope(status, &body), "{status}: {body}");
 }
 
 #[actix_web::test]
