@@ -267,6 +267,7 @@ async fn playing_progress(
             at: now_unix(),
             audio_stream_index: body.audio_stream_index,
             subtitle_stream_index: body.subtitle_stream_index,
+            only_if_newer: false,
         };
         let key = ProgressKey {
             user: user.0.id,
@@ -279,7 +280,9 @@ async fn playing_progress(
             .progress_writes
             .admit(&key, Instant::now(), body.is_paused, progress);
         if let Decision::Persist(reason) = decision {
-            match progress_writes::persist(&state.stores, &key, progress, reason.label()).await {
+            match progress_writes::persist(&state.stores, &key, progress, reason.label(), false)
+                .await
+            {
                 Ok(data) => {
                     state
                         .progress_writes

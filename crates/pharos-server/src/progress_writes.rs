@@ -288,21 +288,37 @@ pub fn count_held() {
 /// `pharos_progress_writes_total{outcome,reason}` splits the reports into
 /// written (and why), held and failed; `pharos_progress_persist_seconds` is
 /// the write's latency, the tail the route's p99 came from.
+///
+/// `held` marks a report written late (the background tick, shutdown): the
+/// store then drops it when the row already holds something at least as new,
+/// and the write is counted as `dropped_stale` rather than `persisted`.
 pub async fn persist<S: UserDataStore>(
     store: &S,
     key: &ProgressKey,
     progress: PlaybackProgress,
     reason: &'static str,
+    held: bool,
 ) -> pharos_core::DomainResult<pharos_core::UserItemData> {
     let started = Instant::now();
+    let sent = PlaybackProgress {
+        only_if_newer: held,
+        ..progress
+    };
     let result = store
-        .record_playback_progress(key.user, key.item, progress)
+        .record_playback_progress(key.user, key.item, sent)
         .await;
     metrics::histogram!("pharos_progress_persist_seconds").record(started.elapsed().as_secs_f64());
-    let outcome = if result.is_ok() {
-        "persisted"
-    } else {
-        "failed"
+    let outcome = match &result {
+        Err(_) => "failed",
+        // The store returns the stored row when it drops the report.
+        Ok(row)
+            if held
+                && (row.last_played_at != progress.at
+                    || row.last_played_position_ticks != progress.position_ticks) =>
+        {
+            "dropped_stale"
+        }
+        Ok(_) => "persisted",
     };
     metrics::counter!("pharos_progress_writes_total", "outcome" => outcome, "reason" => reason)
         .increment(1);
@@ -318,7 +334,7 @@ async fn write_held<S: UserDataStore>(
 ) -> usize {
     let mut written = 0;
     for (key, progress) in held {
-        match persist(store, &key, progress, reason).await {
+        match persist(store, &key, progress, reason, true).await {
             Ok(_) => {
                 coalescer.persisted(&key, now, &progress);
                 written += 1;
@@ -381,6 +397,7 @@ mod tests {
             at,
             audio_stream_index: None,
             subtitle_stream_index: None,
+            only_if_newer: false,
         }
     }
 

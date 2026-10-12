@@ -3240,7 +3240,7 @@ impl UserDataStore for PostgresStore {
                  COALESCE(EXCLUDED.audio_stream_index, user_data.audio_stream_index),
                subtitle_stream_index =
                  COALESCE(EXCLUDED.subtitle_stream_index, user_data.subtitle_stream_index)
-             WHERE user_data.last_played_at <= EXCLUDED.last_played_at
+             WHERE NOT $7 OR user_data.last_played_at < EXCLUDED.last_played_at
              RETURNING played, play_count, last_played_position_ticks, is_favorite,
                        last_played_at, audio_stream_index, subtitle_stream_index",
         )
@@ -3250,6 +3250,7 @@ impl UserDataStore for PostgresStore {
         .bind(progress.at)
         .bind(progress.audio_stream_index)
         .bind(progress.subtitle_stream_index)
+        .bind(progress.only_if_newer)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;

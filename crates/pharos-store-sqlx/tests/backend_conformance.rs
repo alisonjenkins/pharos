@@ -552,6 +552,7 @@ where
             at: 1_700_000_900,
             audio_stream_index: Some(4),
             subtitle_stream_index: None,
+            only_if_newer: false,
         },
     )
     .await
@@ -571,7 +572,7 @@ where
             .unwrap(),
         after_progress
     );
-    // A report older than the stored row changes nothing.
+    // A held report older than the stored row changes nothing.
     let stale = UserDataStore::record_playback_progress(
         &store,
         uid,
@@ -581,11 +582,28 @@ where
             at: 1_700_000_100,
             audio_stream_index: Some(9),
             subtitle_stream_index: None,
+            only_if_newer: true,
         },
     )
     .await
     .unwrap();
     assert_eq!(stale, after_progress);
+    // The same second is not newer either.
+    let same_second = UserDataStore::record_playback_progress(
+        &store,
+        uid,
+        item_id,
+        pharos_core::PlaybackProgress {
+            position_ticks: 2,
+            at: 1_700_000_900,
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            only_if_newer: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(same_second, after_progress);
     assert_eq!(
         UserDataStore::get_user_data(&store, uid, item_id)
             .await
