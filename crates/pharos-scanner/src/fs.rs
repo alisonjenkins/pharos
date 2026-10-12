@@ -1196,13 +1196,28 @@ impl<P: Prober> FsScanner<P> {
         if items.is_empty() {
             return Ok(());
         }
-        store.put_batch(items).await?;
+        let batch_err = store.put_batch(items).await.err();
+        // `put_batch` writes every item it can but reports only the first
+        // error, so ask per item which rows exist now: the ones that landed
+        // still get their follow-ups and are counted before the error ends
+        // the scan, exactly as they were when each item was put on its own.
+        let landed = if batch_err.is_some() {
+            let mut landed = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                landed.push(store.put(item.clone()).await.is_ok());
+            }
+            landed
+        } else {
+            vec![true; items.len()]
+        };
         items.clear();
-        for written in followups.drain(..) {
-            self.finish_written_item(store, scan_id, written, outcome, seen)
-                .await?;
+        for (written, landed) in followups.drain(..).zip(landed) {
+            if landed {
+                self.finish_written_item(store, scan_id, written, outcome, seen)
+                    .await?;
+            }
         }
-        Ok(())
+        batch_err.map_or(Ok(()), Err)
     }
 
     /// Everything a probed item needs once its row exists.
@@ -2335,16 +2350,24 @@ mod tests {
         item_tags: Mutex<HashMap<MediaId, Vec<String>>>,
         // Size of every `put_batch` call, in order; single `put`s are not here.
         put_batches: Mutex<Vec<usize>>,
+        // Ids whose writes are refused, like a row the database rejects.
+        reject_ids: Mutex<HashSet<MediaId>>,
     }
 
     impl MediaStore for MemStore {
         async fn put_batch(&self, items: &[MediaItem]) -> DomainResult<()> {
             self.put_batches.lock().unwrap().push(items.len());
+            let reject = self.reject_ids.lock().unwrap().clone();
             let mut inner = self.inner.lock().unwrap();
+            let mut first_err = None;
             for item in items {
-                inner.insert(item.id, item.clone());
+                if reject.contains(&item.id) {
+                    first_err.get_or_insert(DomainError::Backend(format!("rejected {}", item.id)));
+                } else {
+                    inner.insert(item.id, item.clone());
+                }
             }
-            Ok(())
+            first_err.map_or(Ok(()), Err)
         }
         async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
             self.inner
@@ -2355,6 +2378,9 @@ mod tests {
                 .ok_or(DomainError::NotFound(id))
         }
         async fn put(&self, item: MediaItem) -> DomainResult<()> {
+            if self.reject_ids.lock().unwrap().contains(&item.id) {
+                return Err(DomainError::Backend(format!("rejected {}", item.id)));
+            }
             self.inner
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?
@@ -4241,6 +4267,29 @@ mod tests {
             assert!(
                 store.scan_state(r.id).await.unwrap().is_some(),
                 "mark_seen ran for {}",
+                r.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_row_does_not_strand_the_rest_of_its_batch() {
+        let td = many_files(6).await;
+        let store = MemStore::default();
+        let bad = stable_id(&td.path().join("m002.mkv"));
+        store.reject_ids.lock().unwrap().insert(bad);
+        let err = FsScanner::new(FakeProber::default())
+            .with_probe_concurrency(1)
+            .with_put_batch_size(6)
+            .scan_into(td.path(), &store)
+            .await;
+        assert!(err.is_err(), "the rejected row still fails the scan");
+        let rows = store.list().await.unwrap();
+        assert_eq!(rows.len(), 5, "every other row landed");
+        for r in &rows {
+            assert!(
+                store.scan_state(r.id).await.unwrap().is_some(),
+                "follow-ups (mark_seen) ran for {}",
                 r.id
             );
         }
