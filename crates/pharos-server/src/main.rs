@@ -1427,7 +1427,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // enricher on demand; mirrors the keys the T9 backfill spawn below
         // already reads off `cfg`.
         .with_metadata_provider_keys(cfg.tmdb.api_key.clone(), cfg.tvdb.api_key.clone())
-        .with_metadata_config(cfg.metadata.clone());
+        .with_metadata_config(cfg.metadata.clone())
+        .with_cast_runtime(pharos_server::cast_service::CastRuntime::start(
+            &cfg.cast.tvs,
+        ));
     // T68 — resolve the parental-rating score table (config override, else the
     // built-in US default) backing per-user MaxParentalRating enforcement.
     state.parental_ratings =
@@ -1981,10 +1984,21 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         app_state.stores.clone(),
         group_registry.get_ref().clone(),
     );
-    let member_sinks_data = web::Data::new(member_sinks);
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.
     let session_hub = web::Data::new(pharos_sync::SessionHub::new());
+    // 009 — cast seats. Inert (no task) unless `[[cast.tvs]]` is configured.
+    pharos_server::cast_service::start_service(
+        &app_state.cast,
+        pharos_server::cast_service::CastDeps {
+            hub: session_hub.get_ref().clone(),
+            registry: group_registry.get_ref().clone(),
+            sinks: member_sinks.clone(),
+            stores: app_state.stores.clone(),
+        },
+        &cfg.cast,
+    );
+    let member_sinks_data = web::Data::new(member_sinks);
     let token_resolver_data = web::Data::new(token_resolver);
 
     // Probes whose readiness must flip true before /readyz returns 200.

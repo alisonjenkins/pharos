@@ -229,6 +229,9 @@ pub struct AppState {
     /// 009 — what the cast service knows, so configured TVs can be listed as
     /// sessions. `None` (the default) keeps `/Sessions` exactly as it was.
     pub cast_directory: Option<Arc<dyn crate::cast_sessions::CastDirectory>>,
+    /// 009 — cast seats: TV reachability and the service handle. Inert unless
+    /// `[[cast.tvs]]` is configured.
+    pub cast: crate::cast_service::CastRuntime,
     /// T87 — the last segment-transcode options each PlaySessionId used,
     /// keyed by play session. Lets the SyncPlay seek handler PREWARM the
     /// target segments for every group member's exact variant (audio pick,
@@ -616,6 +619,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             cast_directory: None,
+            cast: crate::cast_service::CastRuntime::inert(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
@@ -647,6 +651,17 @@ impl AppState {
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
         }
+    }
+
+    /// Builder: attach the cast runtime (TV reachability + service slot).
+    pub fn with_cast_runtime(mut self, cast: crate::cast_service::CastRuntime) -> Self {
+        self.cast = cast;
+        self
+    }
+
+    /// TV name -> reachable at the last probe, for the virtual-session projection.
+    pub fn reachable_tvs(&self) -> crate::cast_service::Reachability {
+        self.cast.reachable_tvs()
     }
 
     /// Builder: attach the log-files directory the
@@ -713,6 +728,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION"),
             bus,
             cast_directory: None,
+            cast: crate::cast_service::CastRuntime::inert(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),

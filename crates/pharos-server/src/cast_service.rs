@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use pharos_cast::castv2::{CastV2Transport, Occupancy, TlsPolicy};
@@ -23,13 +23,13 @@ use pharos_sync::group::{CastBinding, GroupHandle, GroupMsg, MemberKind};
 use pharos_sync::hub::member_id_for_device;
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::cast::{mint_tv_token, revoke_tv_token, DEFAULT_TV_TOKEN_LIFETIME};
 use crate::cast_adapter::{command_for, intent_for, playing_entry, ClockPair, GroupCommandRequest};
-use crate::config::{CastConfig, ConfiguredTv};
+use crate::config::{CastAddress, CastConfig, ConfiguredTv};
 use crate::state::Stores;
 
 /// The Jellyfin cast receiver's app id; asked about before launching so a
@@ -881,6 +881,105 @@ async fn watch_group(
     let _ = to_actor.send(Internal::GroupGone { tv, id }).await;
 }
 
+/// TV name -> whether it accepted a TCP connection on its last probe.
+pub type Reachability = HashMap<String, bool>;
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn probe(address: &CastAddress) -> bool {
+    matches!(
+        tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect((address.host.as_str(), address.port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// Probe every configured TV every 30 s and publish who answered. With no TVs
+/// configured nothing is spawned and the receiver holds an empty map.
+pub fn spawn_reachability_prober(tvs: &[ConfiguredTv]) -> watch::Receiver<Reachability> {
+    let (tx, rx) = watch::channel(Reachability::new());
+    if tvs.is_empty() {
+        return rx;
+    }
+    let tvs: Vec<(String, CastAddress)> = tvs
+        .iter()
+        .map(|t| (t.name.clone(), t.address.clone()))
+        .collect();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PROBE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let results = futures_util::future::join_all(
+                tvs.iter()
+                    .map(|(name, addr)| async move { (name.clone(), probe(addr).await) }),
+            )
+            .await;
+            let map: Reachability = results.into_iter().collect();
+            for (name, up) in &map {
+                tracing::debug!(tv = %name, reachable = up, "cast: TV reachability probed");
+            }
+            if tx.send(map).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// What `AppState` holds for casting: the reachability of each configured TV
+/// and, once the group machinery exists, the service handle. Inert (no task, no
+/// service) when no TV is configured.
+#[derive(Clone)]
+pub struct CastRuntime {
+    service: Arc<OnceLock<CastServiceHandle>>,
+    reachable: watch::Receiver<Reachability>,
+}
+
+impl CastRuntime {
+    /// No TVs, no service, an empty reachability map.
+    pub fn inert() -> Self {
+        Self::start(&[])
+    }
+
+    /// Begin probing `tvs`. Needs a running tokio runtime when `tvs` is non-empty.
+    pub fn start(tvs: &[ConfiguredTv]) -> Self {
+        Self {
+            service: Arc::new(OnceLock::new()),
+            reachable: spawn_reachability_prober(tvs),
+        }
+    }
+
+    /// Attach the running service; the first install wins.
+    pub fn install(&self, handle: CastServiceHandle) {
+        let _ = self.service.set(handle);
+    }
+
+    /// The service, if casting is configured and started.
+    pub fn service(&self) -> Option<CastServiceHandle> {
+        self.service.get().cloned()
+    }
+
+    /// TV name -> reachable at the last probe. A TV not yet probed is absent.
+    pub fn reachable_tvs(&self) -> Reachability {
+        self.reachable.borrow().clone()
+    }
+}
+
+/// Start the cast service for `cfg` and install it into `runtime`. A no-op with
+/// no `[[cast.tvs]]`, so an unconfigured server pays nothing.
+pub fn start_service(runtime: &CastRuntime, deps: CastDeps, cfg: &CastConfig) {
+    if cfg.tvs.is_empty() {
+        return;
+    }
+    runtime.install(spawn(deps, cfg.clone(), CastV2Factory));
+    tracing::info!(tvs = cfg.tvs.len(), "cast: service started");
+}
+
 /// Test support: hands out pre-built [`FakeReceiver`]s per TV name.
 #[derive(Clone, Default)]
 pub struct FakeTransportFactory {
@@ -959,5 +1058,78 @@ impl TransportFactory for FakeTransportFactory {
             .take()
             .ok_or_else(|| refused("fake receiver already handed out"))?;
         Ok((receiver, slot.occupancy.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn tv(name: &str, addr: std::net::SocketAddr) -> ConfiguredTv {
+        ConfiguredTv {
+            name: name.into(),
+            address: CastAddress {
+                host: addr.ip().to_string(),
+                port: addr.port(),
+            },
+            allowed_users: Vec::new(),
+        }
+    }
+
+    async fn closed_port() -> std::net::SocketAddr {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_tells_a_listening_port_from_a_closed_one() {
+        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open_addr = open.local_addr().unwrap();
+        assert!(probe(&tv("a", open_addr).address).await);
+        let gone = closed_port().await;
+        assert!(!probe(&tv("b", gone).address).await);
+    }
+
+    #[tokio::test]
+    async fn the_prober_publishes_who_answered() {
+        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tvs = [
+            tv("Up", open.local_addr().unwrap()),
+            tv("Down", closed_port().await),
+        ];
+        let mut rx = spawn_reachability_prober(&tvs);
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("a first probe result")
+            .unwrap();
+        let seen = rx.borrow().clone();
+        assert_eq!(seen.get("Up"), Some(&true), "{seen:?}");
+        assert_eq!(seen.get("Down"), Some(&false), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn with_no_tvs_the_runtime_is_inert() {
+        let runtime = CastRuntime::start(&[]);
+        assert!(runtime.service().is_none());
+        assert!(runtime.reachable_tvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_runtime_exposes_reachability_and_the_installed_service() {
+        let open = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime = CastRuntime::start(&[tv("Up", open.local_addr().unwrap())]);
+        for _ in 0..250 {
+            if runtime.reachable_tvs().get("Up") == Some(&true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(runtime.reachable_tvs().get("Up"), Some(&true));
+        assert!(runtime.service().is_none(), "no service until installed");
+        let (tx, _rx) = mpsc::channel(1);
+        runtime.install(CastServiceHandle { tx });
+        assert!(runtime.service().is_some());
     }
 }
