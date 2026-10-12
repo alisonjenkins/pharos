@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 pharos-cache = { path = "../pharos-cache", default-features = false }
 pharos-api = { path = "../pharos-api" }
+pharos-cast = { path = "../pharos-cast" }
 pharos-core = { path = "../pharos-core" }
 pharos-discovery = { path = "../pharos-discovery" }
 pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
