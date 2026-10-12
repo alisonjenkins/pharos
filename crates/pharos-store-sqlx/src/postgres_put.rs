@@ -29,6 +29,10 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
 
 pub(crate) const PUT_COLUMN_COUNT: usize = 62;
 
+/// Rows per `INSERT`. Postgres caps bound parameters at 65535 per statement.
+pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 1000;
+const _: () = assert!(MAX_ROWS_PER_STATEMENT * PUT_COLUMN_COUNT <= 65_535);
+
 /// `created_at` keeps the value already stored (rows that predate migration
 /// 0010 have none, hence the COALESCE).
 pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = EXCLUDED.path,
