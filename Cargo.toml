@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pharos-cache",
+    "crates/pharos-cast",
     "crates/pharos-core",
     "crates/pharos-discovery",
     "crates/pharos-jellyfin-api",

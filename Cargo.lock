@@ -3167,6 +3167,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-cast"
+version = "0.0.0"
+dependencies = [
+ "workspace-hack",
+]
+
+[[package]]
 name = "pharos-core"
 version = "0.0.0"
 dependencies = [
