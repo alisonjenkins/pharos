@@ -683,6 +683,10 @@ async fn handle_connection<S>(
     let hub2 = hub.clone();
     let dev2 = device_key.clone();
     let sinks2 = sinks.clone();
+    let state2 = state.clone();
+    let owner = uuid::Uuid::parse_str(&bound_user_id)
+        .ok()
+        .map(pharos_core::UserId);
     actix_web::rt::spawn(async move {
         tokio::time::sleep(RECONNECT_GRACE).await;
         // B26 — re-check at fire time: a drain that began during the grace
@@ -690,12 +694,41 @@ async fn handle_connection<S>(
         if crate::state::is_shutting_down() {
             return;
         }
-        if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
-            let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
-            sinks2.remove(member_id, conn_gen);
-        }
+        expire_membership(&state2, &hub2, &sinks2, &dev2, conn_gen, member_id, owner).await;
     });
     let _ = session.clone().close(None).await;
+}
+
+/// The reconnect grace ran out with no newer socket: remove the member. A
+/// member whose seat is cast to a TV takes the cast with it (`owner_left`),
+/// since the seat must not outlive the member it stands for.
+pub async fn expire_membership(
+    state: &AppState,
+    hub: &SessionHub,
+    sinks: &MemberSinks,
+    device_key: &str,
+    conn_gen: u64,
+    member_id: MemberId,
+    user: Option<pharos_core::UserId>,
+) {
+    let Some(group) = hub.remove_if_current_gen(device_key, conn_gen) else {
+        return;
+    };
+    if let (Some(service), Some(user)) = (state.cast.service(), user) {
+        let casting = service
+            .snapshot()
+            .await
+            .iter()
+            .any(|c| c.owner == user && c.owner_member == member_id);
+        if casting {
+            service
+                .stop(user, pharos_cast::events::CastReason::OwnerLeft)
+                .await;
+            let _ = state.bus.send(SocketBroadcast::CastChanged);
+        }
+    }
+    let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+    sinks.remove(member_id, conn_gen);
 }
 
 async fn handle_inbound(

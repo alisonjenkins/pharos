@@ -328,3 +328,102 @@ async fn an_owner_who_leaves_is_not_caught_up_into_the_group_it_is_leaving() {
         Vec::<&str>::new()
     );
 }
+
+async fn roster_seen_by_bob(rig: &mut CastRig) -> Vec<pharos_sync::messages::MemberSummary> {
+    drain(&mut rig.bob.rx);
+    rig.group
+        .tx
+        .send(GroupMsg::ResyncMember {
+            member_id: rig.bob.member,
+        })
+        .await
+        .unwrap();
+    match wait_msg(&mut rig.bob.rx, "Joined", |m| {
+        matches!(m, ServerMsg::Joined { .. })
+    })
+    .await
+    {
+        ServerMsg::Joined { members, .. } => members,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[actix_web::test]
+async fn the_owners_socket_dropping_leaves_the_cast_following_and_the_owner_listed() {
+    let (mut rig, _token) = rig_casting().await;
+    rig.group
+        .tx
+        .send(GroupMsg::MemberSocketLost {
+            member_id: rig.alice.member,
+        })
+        .await
+        .unwrap();
+
+    // The seat still follows the group without its owner.
+    let (status, body) = rig
+        .post(
+            &rig.bob,
+            &format!("/Sessions/{}/Playing/Pause", rig.tv_id),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    eventually("TV paused by bob while the owner's socket is down", || {
+        rig.receiver.state().paused
+    })
+    .await;
+    assert_eq!(rig.service.snapshot().await.len(), 1);
+
+    let roster = roster_seen_by_bob(&mut rig).await;
+    let alice: Vec<_> = roster.iter().filter(|m| m.name == "alice").collect();
+    assert_eq!(alice.len(), 1, "{roster:?}");
+    assert_eq!(alice[0].device.as_deref(), Some(cast_rig::TV));
+
+    // The owner's page reloads: a resync is a reconnect, not a new cast.
+    rig.group
+        .tx
+        .send(GroupMsg::ResyncMember {
+            member_id: rig.alice.member,
+        })
+        .await
+        .unwrap();
+    wait_msg(&mut rig.alice.rx, "Joined for the returning owner", |m| {
+        matches!(m, ServerMsg::Joined { .. })
+    })
+    .await;
+    let casts = rig.service.snapshot().await;
+    assert_eq!(casts.len(), 1);
+    assert_eq!(casts[0].owner, rig.alice.id);
+}
+
+#[actix_web::test]
+async fn an_owner_pruned_after_its_socket_grace_takes_the_cast_with_it() {
+    let (mut rig, token) = rig_casting().await;
+    let before = seat_total("ended", "owner_left");
+    rig.group
+        .tx
+        .send(GroupMsg::MemberSocketLost {
+            member_id: rig.alice.member,
+        })
+        .await
+        .unwrap();
+
+    // The socket's grace teardown, once nobody came back.
+    let gen = rig.hub.conn_gen(&rig.alice.key).unwrap();
+    pharos_server::api::jellyfin::socket::expire_membership(
+        &rig.state,
+        &rig.hub,
+        &rig.sinks,
+        &rig.alice.key,
+        gen,
+        rig.alice.member,
+        Some(rig.alice.id),
+    )
+    .await;
+
+    rig.wait_cast_gone().await;
+    assert_eq!(seat_total("ended", "owner_left"), before + 1);
+    assert_eq!(rig.token_status(&token).await, 401);
+    let roster = roster_seen_by_bob(&mut rig).await;
+    assert_eq!(roster.len(), 1, "only bob remains: {roster:?}");
+}
