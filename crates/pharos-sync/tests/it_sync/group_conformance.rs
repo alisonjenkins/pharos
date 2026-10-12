@@ -1022,3 +1022,29 @@ async fn cast_seat_channel_sink_gets_the_group_commands_and_never_extends_a_gate
         "the seat extended the gate"
     );
 }
+
+/// T042 — a service that adopts a hydrated group needs to find the seats and
+/// each seat's paired Controller from the snapshot alone.
+#[tokio::test]
+async fn the_snapshot_lists_each_cast_seat_with_its_controller() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(80);
+    let seat = ordered_id(81);
+    let other = ordered_id(82);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let _o = add_member_with_id(&h, &sinks, other, "bob").await;
+    assert!(
+        snapshot(&h).await.cast_seats.is_empty(),
+        "no cast, no seats"
+    );
+
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    let _s = add_cast_seat(&h, &sinks, seat, "ali", tv_cast().unwrap()).await;
+
+    let seats = snapshot(&h).await.cast_seats;
+    assert_eq!(seats.len(), 1, "{seats:?}");
+    assert_eq!(seats[0].seat, seat);
+    assert_eq!(seats[0].name, "ali");
+    assert_eq!(seats[0].cast, tv_cast().unwrap());
+    assert_eq!(seats[0].controller, Some(ctrl));
+}
