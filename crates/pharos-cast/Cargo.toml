@@ -18,7 +18,7 @@ tokio-util = { workspace = true, features = ["codec"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time", "net", "io-util", "sync"] }
+tokio = { workspace = true, features = ["time", "net", "io-util", "sync", "macros", "rt"] }
 tracing.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
