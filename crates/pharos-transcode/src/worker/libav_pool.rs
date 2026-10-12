@@ -431,10 +431,14 @@ impl LibavWorkerPool {
         if let Some(w) = self.inner.idle.lock().await.pop() {
             return Ok(w);
         }
-        let (child, rd, wr, _handshake) =
-            spawn_worker_proc(&self.inner.worker_bin, self.inner.handshake_timeout, false)
-                .await
-                .map_err(|e| PoolError::Spawn(e.to_string()))?;
+        let (child, rd, wr, _handshake) = spawn_worker_proc(
+            &self.inner.worker_bin,
+            self.inner.handshake_timeout,
+            false,
+            crate::stage_timing::StageTimingMode::Off,
+        )
+        .await
+        .map_err(|e| PoolError::Spawn(e.to_string()))?;
         Ok(PooledWorker {
             rd,
             wr,
