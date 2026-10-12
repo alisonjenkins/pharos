@@ -14,9 +14,7 @@ use pharos_server::{
 };
 use tracing_subscriber::prelude::*;
 
-#[path = "common/store_calls.rs"]
-mod store_calls;
-use store_calls::StoreCallLog;
+use crate::store_calls::StoreCallLog;
 
 fn rejected(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
     snapshotter
