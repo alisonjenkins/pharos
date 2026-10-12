@@ -1062,6 +1062,8 @@ async fn build_transcode_scheduler(
     queue_background: bool,
     // `[server] transcode_vaapi_gpu_resident`: see `SchedConfig::vaapi_gpu_resident`.
     vaapi_gpu_resident: bool,
+    // How much per-segment timing the workers collect.
+    stage_timing: pharos_transcode::stage_timing::StageTimingMode,
     // Where the probe result is persisted — the transcode cache directory, so
     // the measurement that decided a placement ages out with the segments that
     // placement produced. `None` disables persistence (no cache dir
@@ -1349,7 +1351,7 @@ async fn build_transcode_scheduler(
     Some((
         TranscodeScheduler::spawn(
             table,
-            std::sync::Arc::new(ProcSpawner::new()),
+            std::sync::Arc::new(ProcSpawner::new().with_stage_timing(stage_timing)),
             SchedConfig {
                 queue_background,
                 vaapi_gpu_resident,
@@ -1458,6 +1460,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 cfg.server.transcode_probe_caps,
                 cfg.server.transcode_queue_background,
                 cfg.server.transcode_vaapi_gpu_resident,
+                cfg.server.transcode_stage_timing,
                 cfg.server.transcode_cache_dir.clone(),
             )
             .await

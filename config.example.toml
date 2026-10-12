@@ -25,6 +25,14 @@ name = "pharos"
 # pharos_transcode_vaapi_pipeline_total{verdict} and
 # pharos_transcode_vaapi_resident_fallback_total{reason}. Default false.
 # transcode_vaapi_gpu_resident = false
+# Per-segment encode timing, exported as
+# pharos_transcode_stage_seconds{device_kind,codec,stage} and as one
+# "transcode stage timing" event on the transcode_job span.
+#   "basic"    (default) spawn, time to first frame, total, frames, fps, speed
+#   "detailed" adds ffmpeg -benchmark_all decode/encode/flush seconds; runs
+#              ffmpeg at -loglevel info, so use it to diagnose, not always
+#   "off"      records nothing
+# transcode_stage_timing = "basic"
 
 [obs]
 log_level = "info"

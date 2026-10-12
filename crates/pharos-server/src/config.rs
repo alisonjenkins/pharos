@@ -404,6 +404,13 @@ pub struct ServerConfig {
     /// once on that pipeline. See `pharos_transcode::ResidentVerdict`.
     #[serde(default)]
     pub transcode_vaapi_gpu_resident: bool,
+    /// Per-segment encode timing: `"basic"` (default) records process spawn,
+    /// time to first frame, total wall, frames, effective fps and speed as
+    /// `pharos_transcode_stage_seconds{device_kind,codec,stage}`; `"detailed"`
+    /// adds ffmpeg's `-benchmark_all` decode/encode/flush split (extra stderr
+    /// per segment, diagnostic use); `"off"` records nothing.
+    #[serde(default)]
+    pub transcode_stage_timing: pharos_transcode::stage_timing::StageTimingMode,
     /// In-process subtitle cache cap in bytes. P5 — keeps WebVTT
     /// extraction results so subsequent fetches skip the ffmpeg
     /// spawn. Default 64 MiB.
@@ -896,6 +903,26 @@ mod tests {
                 .expect("parses")
                 .transcode_vaapi_gpu_resident
         );
+    }
+
+    #[test]
+    fn stage_timing_defaults_to_basic_and_accepts_its_other_spellings() {
+        use pharos_transcode::stage_timing::StageTimingMode;
+        let parse =
+            |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
+        assert_eq!(
+            parse("").expect("parses").transcode_stage_timing,
+            StageTimingMode::Basic
+        );
+        for (spelling, want) in [
+            ("off", StageTimingMode::Off),
+            ("basic", StageTimingMode::Basic),
+            ("detailed", StageTimingMode::Detailed),
+        ] {
+            let c = parse(&format!("transcode_stage_timing = \"{spelling}\"")).expect("parses");
+            assert_eq!(c.transcode_stage_timing, want);
+        }
+        assert!(parse("transcode_stage_timing = \"loud\"").is_err());
     }
 
     /// 008 — the feature is off unless somebody says otherwise, and the rest of
