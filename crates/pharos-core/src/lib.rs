@@ -3297,6 +3297,13 @@ pub struct PlaybackProgress {
     pub at: i64,
     pub audio_stream_index: Option<i32>,
     pub subtitle_stream_index: Option<i32>,
+    /// Apply the report only when the stored `last_played_at` is strictly
+    /// older than `at`. Set for a report that was held back and is written
+    /// late: anything stored since (a stop, on this replica or another) is
+    /// newer than the moment the report was taken and must win. A live report
+    /// leaves it unset and is always applied, so a replica whose clock runs
+    /// behind another's is never silenced.
+    pub only_if_newer: bool,
 }
 
 pub trait UserDataStore: Send + Sync {
@@ -3310,10 +3317,10 @@ pub trait UserDataStore: Send + Sync {
     /// Touches only the resume position, `last_played_at` and the tracks the
     /// report names; `played`, `play_count` and `is_favorite` are left exactly
     /// as they are, so a concurrent change to them is never overwritten by a
-    /// stale read-modify-write. A report older than the stored
-    /// `last_played_at` is dropped and the stored row returned: a report held
-    /// back for a while must not overwrite what a later event (a stop, on this
-    /// replica or another) already wrote.
+    /// stale read-modify-write. With `only_if_newer` set, a report not
+    /// strictly newer than the stored `last_played_at` is dropped and the
+    /// stored row returned: a report held back for a while must not overwrite
+    /// what a later event (a stop, on this replica or another) already wrote.
     fn record_playback_progress(
         &self,
         user: UserId,

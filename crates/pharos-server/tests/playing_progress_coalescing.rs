@@ -138,6 +138,15 @@ async fn stored(state: &web::Data<AppState>, uid: UserId) -> pharos_core::UserIt
     state.stores.get_user_data(uid, 1).await.unwrap()
 }
 
+/// Make the stored row look written long ago. A held report is applied only
+/// when strictly newer than the row, and a test runs inside one wall-clock
+/// second, so without this the real clock decides whether the flush lands.
+async fn age_row(state: &web::Data<AppState>, uid: UserId) {
+    let mut data = stored(state, uid).await;
+    data.last_played_at = 1;
+    state.stores.set_user_data(uid, 1, data).await.unwrap();
+}
+
 #[actix_web::test]
 async fn two_quick_ticks_write_once_but_the_registry_sees_both() {
     let (state, token, uid) = seed().await;
@@ -335,13 +344,57 @@ async fn writes_are_counted_by_outcome_and_reason_and_timed() {
         "one sample per write"
     );
 
+    // The reports above ran inside one wall-clock second, so a held write
+    // may find the row no older than itself and be dropped: either outcome
+    // counts as the tick or shutdown having handled the report.
+    let handled = |reason: &str| {
+        counter(&snapshotter, "persisted", reason) + counter(&snapshotter, "dropped_stale", reason)
+    };
     progress!(app, token, 13u64, true);
     flush_due(&state.progress_writes, &state.stores, later(20)).await;
-    assert_eq!(counter(&snapshotter, "persisted", "tick"), 1);
+    assert_eq!(handled("tick"), 1);
     progress!(app, token, 13u64, true);
     flush_all(&state.progress_writes, &state.stores).await;
-    assert_eq!(counter(&snapshotter, "persisted", "shutdown"), 1);
+    assert_eq!(handled("shutdown"), 1);
     assert_eq!(counter(&snapshotter, "failed", "tick"), 0);
+}
+
+#[actix_web::test]
+async fn a_held_write_the_store_drops_is_counted_as_dropped_not_persisted() {
+    let (state, token, uid) = seed().await;
+    let app = app!(state);
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    progress!(app, token, 10u64);
+    progress!(app, token, 11u64);
+    // Something far newer reached the row first (a stop on another replica).
+    let far_future = i64::MAX / 2;
+    state
+        .stores
+        .set_user_data(
+            uid,
+            1,
+            pharos_core::UserItemData {
+                last_played_at: far_future,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        flush_due(&state.progress_writes, &state.stores, later(20)).await,
+        1
+    );
+    assert_eq!(counter(&snapshotter, "dropped_stale", "tick"), 1);
+    assert_eq!(counter(&snapshotter, "persisted", "tick"), 0);
+    assert_eq!(
+        stored(&state, uid).await.last_played_position_ticks,
+        0,
+        "the newer row was kept"
+    );
 }
 
 fn later(secs: u64) -> std::time::Instant {
@@ -359,6 +412,7 @@ async fn a_silent_session_has_its_held_position_written_by_the_tick() {
         10 * SEC
     );
 
+    age_row(&state, uid).await;
     let none_yet = flush_due(&state.progress_writes, &state.stores, later(1)).await;
     assert_eq!(none_yet, 0, "a report younger than the interval stays held");
     let written = flush_due(&state.progress_writes, &state.stores, later(20)).await;
@@ -386,6 +440,7 @@ async fn shutdown_writes_every_held_report() {
         10 * SEC
     );
 
+    age_row(&state, uid).await;
     assert_eq!(flush_all(&state.progress_writes, &state.stores).await, 1);
     assert_eq!(
         stored(&state, uid).await.last_played_position_ticks,
@@ -403,14 +458,19 @@ async fn nothing_flushed_after_the_stop_undoes_it() {
     // A tick already took the held report and is mid-write when the stop lands.
     let in_flight = state.progress_writes.take_due(later(20));
     assert_eq!(in_flight.len(), 1);
-    // The row's clock is whole seconds; make the stop strictly newer.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // No pause for a new second: the stop usually lands in the same whole
+    // second as the report it follows, and must still win.
     stopped!(app, token, 57u64);
 
     for (key, progress) in in_flight {
+        // What the flush writes: a held report, applied only if newer.
+        let held = pharos_core::PlaybackProgress {
+            only_if_newer: true,
+            ..progress
+        };
         state
             .stores
-            .record_playback_progress(key.user, key.item, progress)
+            .record_playback_progress(key.user, key.item, held)
             .await
             .unwrap();
     }

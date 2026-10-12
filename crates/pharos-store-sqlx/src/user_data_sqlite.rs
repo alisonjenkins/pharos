@@ -62,7 +62,7 @@ impl UserDataStore for SqliteStore {
                last_played_at = excluded.last_played_at,
                audio_stream_index = COALESCE(excluded.audio_stream_index, user_data.audio_stream_index),
                subtitle_stream_index = COALESCE(excluded.subtitle_stream_index, user_data.subtitle_stream_index)
-             WHERE user_data.last_played_at <= excluded.last_played_at
+             WHERE ? = 0 OR user_data.last_played_at < excluded.last_played_at
              RETURNING played, play_count, last_played_position_ticks, is_favorite,
                        last_played_at, audio_stream_index, subtitle_stream_index",
         )
@@ -72,6 +72,7 @@ impl UserDataStore for SqliteStore {
         .bind(progress.at)
         .bind(progress.audio_stream_index.map(i64::from))
         .bind(progress.subtitle_stream_index.map(i64::from))
+        .bind(i64::from(progress.only_if_newer))
         .fetch_optional(self.pool())
         .await
         .map_err(map_err)?;
@@ -289,6 +290,7 @@ mod tests {
             at,
             audio_stream_index: None,
             subtitle_stream_index: None,
+            only_if_newer: false,
         }
     }
 
@@ -344,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_report_older_than_the_stored_row_is_dropped() {
+    async fn a_held_report_not_newer_than_the_stored_row_is_dropped() {
         let (s, uid, id) = fixture().await;
         let finished = UserItemData {
             played: true,
@@ -354,17 +356,50 @@ mod tests {
             ..Default::default()
         };
         s.set_user_data(uid, id, finished).await.unwrap();
-        let got = s
-            .record_playback_progress(uid, id, progress(9_000, 1_999))
+        let held = |position, at| PlaybackProgress {
+            only_if_newer: true,
+            ..progress(position, at)
+        };
+        let older = s
+            .record_playback_progress(uid, id, held(9_000, 1_999))
             .await
             .unwrap();
-        assert_eq!(got, finished, "a stale report returns the stored row");
-        assert_eq!(s.get_user_data(uid, id).await.unwrap(), finished);
+        assert_eq!(older, finished, "a stale report returns the stored row");
+        // The same second is not newer: a stop landing in the second the held
+        // report was taken must still win.
         let same_second = s
-            .record_playback_progress(uid, id, progress(9_000, 2_000))
+            .record_playback_progress(uid, id, held(9_000, 2_000))
             .await
             .unwrap();
-        assert_eq!(same_second.last_played_position_ticks, 9_000);
+        assert_eq!(same_second, finished);
+        assert_eq!(s.get_user_data(uid, id).await.unwrap(), finished);
+        let newer = s
+            .record_playback_progress(uid, id, held(9_000, 2_001))
+            .await
+            .unwrap();
+        assert_eq!(newer.last_played_position_ticks, 9_000);
+    }
+
+    #[tokio::test]
+    async fn a_live_report_is_applied_whatever_the_stored_timestamp() {
+        let (s, uid, id) = fixture().await;
+        s.set_user_data(
+            uid,
+            id,
+            UserItemData {
+                last_played_at: 5_000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A replica whose clock is behind the one that wrote the row.
+        let got = s
+            .record_playback_progress(uid, id, progress(700, 4_000))
+            .await
+            .unwrap();
+        assert_eq!(got.last_played_position_ticks, 700);
+        assert_eq!(got.last_played_at, 4_000);
     }
 
     #[tokio::test]
