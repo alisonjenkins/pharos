@@ -8429,6 +8429,56 @@ mod tests {
         }
     }
 
+    /// `FAILURE_REASONS` hand-mirrors `failure_reason`; a reason added there
+    /// but not pre-registered would silently lose its first `increase()`. The
+    /// exhaustive match makes a new `HlsCacheError` variant a compile error
+    /// here until it is given a sample.
+    #[test]
+    fn every_failure_reason_is_pre_registered() {
+        let samples = [
+            HlsCacheError::Io(std::io::ErrorKind::NotFound.into()),
+            HlsCacheError::Io(std::io::ErrorKind::PermissionDenied.into()),
+            HlsCacheError::Io(std::io::ErrorKind::Other.into()),
+            HlsCacheError::Transcode(String::new()),
+            HlsCacheError::NonUtf8Path,
+            HlsCacheError::SchedulerBusy,
+            HlsCacheError::SourceUnreadable {
+                reason: "missing",
+                detail: String::new(),
+            },
+            HlsCacheError::AudioNotReady {
+                name: String::new(),
+                reason: AudioWaitGiveUp::NeverStarted,
+                waited_ms: 0,
+                last_progress: None,
+            },
+        ];
+        for e in &samples {
+            match e {
+                HlsCacheError::Io(_)
+                | HlsCacheError::Transcode(_)
+                | HlsCacheError::NonUtf8Path
+                | HlsCacheError::SchedulerBusy
+                | HlsCacheError::SourceUnreadable { .. }
+                | HlsCacheError::AudioNotReady { .. } => {}
+            }
+            let reason = failure_reason(e);
+            assert!(
+                FAILURE_REASONS.contains(&reason),
+                "{reason} is emitted but not pre-registered"
+            );
+        }
+        assert_eq!(
+            FAILURE_REASONS.len(),
+            samples
+                .iter()
+                .map(failure_reason)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "FAILURE_REASONS lists a reason no error produces"
+        );
+    }
+
     #[test]
     fn segment_outcome_labels_are_stable_and_distinct() {
         // Dashboards and alerts key on these strings, so a rename breaks them
