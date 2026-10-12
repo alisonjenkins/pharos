@@ -693,9 +693,15 @@ fn push_residual_clauses(
         ));
     }
 
-    push_language_clause("audio_tracks_json", &f.audio_languages, clauses, params, ph);
     push_language_clause(
-        "subtitle_tracks_json",
+        crate::language_index::AUDIO,
+        &f.audio_languages,
+        clauses,
+        params,
+        ph,
+    );
+    push_language_clause(
+        crate::language_index::SUBTITLE,
         &f.subtitle_languages,
         clauses,
         params,
@@ -760,38 +766,35 @@ fn kind_str(k: MediaKind) -> &'static str {
     k.as_str()
 }
 
-/// `AudioLanguages` / `SubtitleLanguages`: the track columns are JSON text on
-/// both backends, so membership is a `LIKE` over the compact serde output
-/// (`"language":"eng"`) -- the one form that works on SQLite and Postgres
-/// alike. ORs within one list; the caller ANDs the two lists by pushing two
-/// clauses. A language value is JSON-encoded first, so a quote or backslash
-/// in it cannot break out of the pattern.
+/// `AudioLanguages` / `SubtitleLanguages`, ORing within one list; the caller
+/// ANDs the two lists by pushing two clauses.
+///
+/// A semi-join on `media_item_languages`, which holds each item's canonical
+/// ISO 639-2/B tags (migration 0056), so the `(kind, lang)` key drives the
+/// plan and the request side is folded to the same form (`fre`, `fra` and `fr`
+/// are one language). Placeholders are pushed in the order they appear in the
+/// SQL, which the positional SQLite `?` needs.
 fn push_language_clause(
-    column: &str,
+    kind: &str,
     langs: &[String],
     clauses: &mut Vec<String>,
     params: &mut Vec<Param>,
     ph: &mut impl FnMut(usize) -> String,
 ) {
-    let mut ors = Vec::with_capacity(langs.len());
-    // Tags are stored as the muxer wrote them (`fre`, `fra`, `fr`), so each
-    // requested language expands to every spelling of it.
-    let spellings = langs
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .flat_map(|l| pharos_core::language::language_variants(l));
-    for lang in spellings {
-        let quoted = serde_json::to_string(&lang).unwrap_or_default();
-        params.push(Param::Text(format!(
-            "%\"language\":{}%",
-            like_escape(&quoted)
-        )));
-        let p = ph(params.len());
-        ors.push(format!("LOWER({column}) LIKE {p} ESCAPE '\\'"));
+    let wanted = crate::language_index::requested(langs);
+    if wanted.is_empty() {
+        return;
     }
-    if !ors.is_empty() {
-        clauses.push(format!("({})", ors.join(" OR ")));
+    let mut holes = Vec::with_capacity(wanted.len());
+    for lang in wanted {
+        params.push(Param::Text(lang));
+        holes.push(ph(params.len()));
     }
+    clauses.push(format!(
+        "media_items.id IN (SELECT item_id FROM media_item_languages \
+         WHERE kind = '{kind}' AND lang IN ({}))",
+        holes.join(", ")
+    ));
 }
 
 /// Distinct track languages across `(*_tracks_json blob, item count)` rows, as

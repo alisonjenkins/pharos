@@ -58,6 +58,9 @@ pub mod chapter_json;
 // JSON adapter for MediaProbe.audio_tracks (P16). Same pattern.
 pub mod audio_track_json;
 
+// How a language filter maps onto media_item_languages (migration 0056).
+mod language_index;
+
 // JSON adapter for MediaMetadata.provider_ids (LIB-C9). Same pattern.
 pub mod provider_ids_json;
 
