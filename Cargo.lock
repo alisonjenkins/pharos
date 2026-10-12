@@ -3173,6 +3173,8 @@ dependencies = [
  "metrics",
  "metrics-util",
  "proptest",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
  "workspace-hack",
