@@ -212,8 +212,35 @@ pub trait UserStore: Send + Sync {
     ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 }
 
+/// Stable handle for a stored token, safe to log and keep: it is the
+/// at-rest SHA-256 hash, which cannot be turned back into the secret.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TokenId(pub String);
+
+/// A freshly issued token: the secret (shown once) and its [`TokenId`].
+#[derive(Debug, Clone)]
+pub struct IssuedToken {
+    pub id: TokenId,
+    pub secret: AuthToken,
+}
+
 /// Persistence of session tokens.
 pub trait TokenStore: Send + Sync {
+    /// Like [`TokenStore::issue`] but with a caller-chosen lifetime in
+    /// seconds and the token's id returned beside the secret.
+    fn issue_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+    ) -> impl std::future::Future<Output = AuthResult<IssuedToken>> + Send;
+
+    /// Revoke by [`TokenId`]. Idempotent: an unknown id is `Ok`.
+    fn revoke_by_id(
+        &self,
+        id: &TokenId,
+    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
     fn issue(
         &self,
         user_id: UserId,

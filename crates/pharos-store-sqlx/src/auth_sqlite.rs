@@ -2,8 +2,8 @@
 
 use crate::sqlite::SqliteStore;
 use pharos_core::{
-    AuthError, AuthResult, AuthToken, SecretString, TokenStore, UserId, UserPolicy, UserRecord,
-    UserStore,
+    AuthError, AuthResult, AuthToken, IssuedToken, SecretString, TokenId, TokenStore, UserId,
+    UserPolicy, UserRecord, UserStore,
 };
 use uuid::Uuid;
 
@@ -175,27 +175,53 @@ fn record_from_row(row: UserRow) -> AuthResult<UserRecord> {
 }
 
 impl TokenStore for SqliteStore {
-    #[tracing::instrument(skip(self), fields(user.id = %user_id, device = %device_id))]
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
+        Ok(self
+            .issue_with_ttl(user_id, device_id, crate::auth_token::TTL_SECS)
+            .await?
+            .secret)
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user_id, device = %device_id))]
+    async fn issue_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+    ) -> AuthResult<IssuedToken> {
         // The raw token is returned to the client but never stored — only
         // its SHA-256 hash is persisted (a DB leak must not yield usable
         // tokens). `expires_at` bounds the token's lifetime.
         let token = Uuid::new_v4().simple().to_string();
+        let id = crate::auth_token::hash(&token);
         let now = now_unix_secs();
         let user_bytes = user_id.0.as_bytes().to_vec();
         sqlx::query(
             "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at) \
              VALUES (?, ?, ?, ?, ?)",
         )
-        .bind(crate::auth_token::hash(&token))
+        .bind(&id)
         .bind(user_bytes)
         .bind(device_id)
         .bind(now)
-        .bind(now + crate::auth_token::TTL_SECS)
+        .bind(now.saturating_add(ttl_secs))
         .execute(self.pool())
         .await
         .map_err(map_sqlx)?;
-        Ok(AuthToken(SecretString::new(token)))
+        Ok(IssuedToken {
+            id: TokenId(id),
+            secret: AuthToken(SecretString::new(token)),
+        })
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn revoke_by_id(&self, id: &TokenId) -> AuthResult<()> {
+        sqlx::query("DELETE FROM auth_tokens WHERE token_hash = ?")
+            .bind(&id.0)
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, token))]

@@ -158,3 +158,51 @@ async fn cascade_delete_on_user_drop() {
         other => panic!("expected InvalidToken, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn issue_with_ttl_bounds_lifetime_and_id_is_the_stored_hash() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let issued = s.issue_with_ttl(uid, "cast:Den", 3600).await.unwrap();
+    let (stored, created, expires): (String, i64, i64) =
+        sqlx::query_as("SELECT token_hash, created_at, expires_at FROM auth_tokens")
+            .fetch_one(s.pool())
+            .await
+            .unwrap();
+    assert_eq!(issued.id.0, stored);
+    assert_ne!(issued.id.0, issued.secret.0.expose());
+    assert_eq!(expires - created, 3600);
+    assert_eq!(s.resolve(issued.secret.0.expose()).await.unwrap(), uid);
+}
+
+#[tokio::test]
+async fn zero_ttl_token_is_already_expired() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let issued = s.issue_with_ttl(uid, "cast:Den", 0).await.unwrap();
+    match s.resolve(issued.secret.0.expose()).await {
+        Err(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn revoke_by_id_invalidates_and_is_idempotent() {
+    let s = fresh().await;
+    let r = record("ali", "h", false);
+    let uid = r.id;
+    s.create(r).await.unwrap();
+    let issued = s.issue_with_ttl(uid, "cast:Den", 3600).await.unwrap();
+    let other = s.issue(uid, "dev").await.unwrap();
+    s.revoke_by_id(&issued.id).await.unwrap();
+    s.revoke_by_id(&issued.id).await.unwrap();
+    assert!(matches!(
+        s.resolve(issued.secret.0.expose()).await,
+        Err(AuthError::InvalidToken)
+    ));
+    assert_eq!(s.resolve(other.0.expose()).await.unwrap(), uid);
+}
