@@ -106,6 +106,14 @@ fn default_probe_concurrency() -> usize {
         .clamp(1, DEFAULT_PROBE_CONCURRENCY)
 }
 
+/// Probed items written per `put_batch`. Big enough that a commit's fsync is
+/// amortised over a few hundred rows, small enough that the write lock is
+/// held for tens of milliseconds, not seconds, and a crash loses little work.
+const DEFAULT_PUT_BATCH_SIZE: usize = 256;
+
+/// How long a partly filled batch may wait for company before it is written.
+const DEFAULT_PUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// LIB-A8 — outcome of a single-path incremental update (one watch event).
 /// The watcher maps this onto the same `added`/`updated`/`removed` delta
 /// broadcast `scan_into` produces over a whole tree (A4).
@@ -165,6 +173,12 @@ pub struct FsScanner<P: Prober> {
     /// sqlite single-writer), but the per-file probe (the expensive,
     /// IO/CPU-bound step) runs concurrently with this degree.
     probe_concurrency: usize,
+    /// Probed items are written with one `put_batch` per this many (one
+    /// transaction instead of a commit per file). `1` keeps per-item writes.
+    put_batch_size: usize,
+    /// A partly filled batch is written once its oldest item has waited this
+    /// long, so new files appear and progress moves on a slow-probing scan.
+    put_flush_interval: std::time::Duration,
     /// LIB-D7 — local-first metadata resolution. Consulted in the parallel
     /// probe phase (its NFO read + sidecar `stat` are FS IO, off the async
     /// reactor — V5) and the merged [`MetadataResult`] is written alongside
@@ -244,6 +258,7 @@ impl<P: Prober> std::fmt::Debug for FsScanner<P> {
             .field("extensions", &self.extensions.len())
             .field("rate_limit", &self.rate_limit)
             .field("probe_concurrency", &self.probe_concurrency)
+            .field("put_batch_size", &self.put_batch_size)
             .field("metadata_providers", &self.resolver.provider_count())
             .finish_non_exhaustive()
     }
@@ -277,6 +292,8 @@ impl<P: Prober> FsScanner<P> {
                 .collect(),
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
+            put_batch_size: DEFAULT_PUT_BATCH_SIZE,
+            put_flush_interval: DEFAULT_PUT_FLUSH_INTERVAL,
             resolver: Arc::new(default_resolver()),
             force: false,
             io_gate: None,
@@ -293,6 +310,8 @@ impl<P: Prober> FsScanner<P> {
             extensions: exts.into_iter().collect(),
             rate_limit: std::time::Duration::ZERO,
             probe_concurrency: default_probe_concurrency(),
+            put_batch_size: DEFAULT_PUT_BATCH_SIZE,
+            put_flush_interval: DEFAULT_PUT_FLUSH_INTERVAL,
             resolver: Arc::new(default_resolver()),
             force: false,
             io_gate: None,
@@ -466,6 +485,19 @@ impl<P: Prober> FsScanner<P> {
         self
     }
 
+    /// Write probed items in batches of up to `size` (clamped to at least 1;
+    /// `1` writes each item on its own).
+    pub fn with_put_batch_size(mut self, size: usize) -> Self {
+        self.put_batch_size = size.max(1);
+        self
+    }
+
+    /// Longest a partly filled batch waits before it is written.
+    pub fn with_put_flush_interval(mut self, interval: std::time::Duration) -> Self {
+        self.put_flush_interval = interval;
+        self
+    }
+
     /// Scan and push items into the given store. Streaming variant — avoids
     /// holding the entire library in memory. V10 atomicity holds per `put`.
     ///
@@ -507,7 +539,10 @@ impl<P: Prober> FsScanner<P> {
         store: &S,
     ) -> DomainResult<ScanOutcome> {
         let started = std::time::Instant::now();
-        let result = self.scan_run(root, store).await;
+        // Boxed: `scan_run`'s future is a deep stack of store futures, and
+        // inlining it into every caller's async block pushes the server's
+        // release-build layout computation past the recursion limit.
+        let result = Box::pin(self.scan_run(root, store)).await;
         let cancelled = self
             .cancel
             .as_ref()
@@ -840,18 +875,62 @@ impl<P: Prober> FsScanner<P> {
             })
             .buffer_unordered(self.probe_concurrency);
 
+        // Probed items wait here so `put_batch` can write them in one
+        // transaction; the per-item follow-up writes (joins, artwork, mark_seen)
+        // need the row to exist, so they run right after each flush.
+        let mut batch_items: Vec<MediaItem> = Vec::new();
+        let mut batch_followups: Vec<WrittenItem> = Vec::new();
+        let mut batch_started: Option<tokio::time::Instant> = None;
         async {
-            while let Some((probed_id, sig, existed, fp, item, meta)) = stream.next().await {
-                // Cancellation: stop draining the probe stream. Already-written rows
-                // stay (each `put` is atomic); the sweep below is skipped so nothing
-                // is pruned. Remaining in-flight probes are dropped with the stream.
+            loop {
+                // A partly filled batch waits at most `put_flush_interval` for
+                // company, so a slow-probing scan still lands its files.
+                let next = match batch_started {
+                    None => stream.next().await,
+                    Some(started) => {
+                        match tokio::time::timeout_at(
+                            started + self.put_flush_interval,
+                            stream.next(),
+                        )
+                        .await
+                        {
+                            Ok(next) => next,
+                            Err(_) => {
+                                self.flush_probe_writes(
+                                    store,
+                                    scan_id,
+                                    &mut batch_items,
+                                    &mut batch_followups,
+                                    &mut outcome,
+                                    &mut seen,
+                                )
+                                .await?;
+                                batch_started = None;
+                                emit(phase1_done + probed_done);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let Some((probed_id, sig, existed, fp, item, meta)) = next else {
+                    break;
+                };
+                // Cancellation: stop draining the probe stream. Rows already
+                // probed are flushed below (the sweep is skipped, so nothing is
+                // pruned). Remaining in-flight probes are dropped with the stream.
                 if is_cancelled() {
                     break;
                 }
                 // Count every probe result (hit or miss) so progress reaches 100%
                 // even when a file fails to probe (V6 — a miss writes nothing).
+                // Progress only counts items that are written, so a buffered
+                // item is not reported until its batch lands.
                 probed_done += 1;
-                emit(phase1_done + probed_done);
+                emit(
+                    phase1_done + probed_done
+                        - batch_items.len() as u64
+                        - u64::from(item.is_some()),
+                );
                 // Record the outcome either way, so the next pass can skip a file
                 // that cannot be probed and re-try one that has been replaced. This
                 // is the only place a probe MISS leaves any trace — a miss writes
@@ -880,63 +959,48 @@ impl<P: Prober> FsScanner<P> {
                 // Captured before `put` consumes the item; the cover write below
                 // needs them and must run AFTER the row exists.
                 let (item_kind, item_path) = (item.kind, item.path.clone());
-                store.put(item).await?;
-                // 004-books — a book's cover lives inside the file, so it has no
-                // sidecar path to record and is extracted + cached here instead.
-                self.store_book_cover(store, item_id, item_kind, &item_path)
-                    .await;
-                // LIB-C4 — populate the item_genres join. UNION of the probe's
-                // (possibly comma/pipe-separated) `genre` column with the NFO
-                // `<genre>` tags resolved above; `link_item_genres` is idempotent
-                // (de-dupes), so the union never double-inserts.
-                store.link_item_genres(item_id, &genres).await?;
-                // LIB-C2 — populate the item_people join from the NFO cast/crew
-                // the resolver parsed. `link_item_people` upserts each person row
-                // (carrying its headshot / provider ids) then replaces the item's
-                // credits wholesale, so a rescan keeps the join current.
-                store.link_item_people(item_id, &people).await?;
-                // LIB-C3 — populate the item_studios join from the NFO <studio>
-                // tags the resolver parsed. `link_item_studios` upserts each
-                // studio row then replaces the item's studios wholesale, so a
-                // rescan keeps the join current.
-                store.link_item_studios(item_id, &studios).await?;
-                // LIB-C5 — populate the collection_items membership join from the
-                // NFO <set>/<collection> tags the resolver parsed. Each named box
-                // set is upserted and the item appended (idempotent), so a rescan
-                // keeps NFO-driven box-set membership current alongside any manual
-                // CRUD additions.
-                store.link_item_collections(item_id, &collections).await?;
-                // LIB-C6 — populate the item_tags join from the NFO <tag>
-                // elements + the filename provider's quality/source tokens the
-                // resolver parsed. `link_item_tags` upserts each tag row then
-                // replaces the item's tags wholesale, so a rescan keeps the join
-                // current (a dropped <tag> clears its stale link).
-                store.link_item_tags(item_id, &tags).await?;
-                // LIB-D7 — persist discovered artwork (local sidecars from D4 +
-                // any NFO thumb/fanart URLs) keyed by item id + role. One row per
-                // role; the resolver fed refs in priority order so the first per
-                // role is the winner. `set_artwork` upserts.
-                persist_artwork(store, item_id, &artwork).await?;
-                // Persist the freshly-stat'd signature so the next scan can
-                // skip this file. mark_seen is an UPDATE — the put() above
-                // guarantees the row exists first.
-                if let Some((mtime, size)) = sig {
-                    store.mark_seen(item_id, scan_id, mtime, size).await?;
+                batch_items.push(item);
+                batch_followups.push(WrittenItem {
+                    item_id,
+                    item_kind,
+                    item_path,
+                    genres,
+                    artwork,
+                    people,
+                    studios,
+                    collections,
+                    tags,
+                    sig,
+                    fp,
+                    existed,
+                });
+                if batch_items.len() >= self.put_batch_size {
+                    self.flush_probe_writes(
+                        store,
+                        scan_id,
+                        &mut batch_items,
+                        &mut batch_followups,
+                        &mut outcome,
+                        &mut seen,
+                    )
+                    .await?;
+                    batch_started = None;
+                } else if batch_started.is_none() {
+                    batch_started = Some(tokio::time::Instant::now());
                 }
-                // LIB-A7 — stamp the content fingerprint so a later move of this
-                // file is recognised by content rather than swept + re-inserted.
-                if let Some(fp) = fp {
-                    store.set_fingerprint(item_id, fp).await?;
-                }
-                // A pre-existing row (signature changed) is an update; a row
-                // with no prior state is a fresh insert.
-                if existed {
-                    outcome.updated.push(item_id);
-                } else {
-                    outcome.added.push(item_id);
-                }
-                seen += 1;
+                emit(phase1_done + probed_done - batch_items.len() as u64);
             }
+            // The stream is drained (or the run was cancelled): write what is
+            // still buffered, so a cancelled run keeps the files it probed.
+            self.flush_probe_writes(
+                store,
+                scan_id,
+                &mut batch_items,
+                &mut batch_followups,
+                &mut outcome,
+                &mut seen,
+            )
+            .await?;
             Ok::<(), DomainError>(())
         }
         .instrument(tracing::info_span!("scan.probe_write"))
@@ -1114,6 +1178,114 @@ impl<P: Prober> FsScanner<P> {
                     .await
             }
         }
+    }
+
+    /// Write the buffered probe results with one `put_batch`, then run each
+    /// item's follow-up writes (their rows exist now).
+    async fn flush_probe_writes<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
+        &self,
+        store: &S,
+        scan_id: i64,
+        items: &mut Vec<MediaItem>,
+        followups: &mut Vec<WrittenItem>,
+        outcome: &mut ScanOutcome,
+        seen: &mut i64,
+    ) -> DomainResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        store.put_batch(items).await?;
+        items.clear();
+        for written in followups.drain(..) {
+            self.finish_written_item(store, scan_id, written, outcome, seen)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Everything a probed item needs once its row exists.
+    async fn finish_written_item<
+        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+    >(
+        &self,
+        store: &S,
+        scan_id: i64,
+        written: WrittenItem,
+        outcome: &mut ScanOutcome,
+        seen: &mut i64,
+    ) -> DomainResult<()> {
+        let WrittenItem {
+            item_id,
+            item_kind,
+            item_path,
+            genres,
+            artwork,
+            people,
+            studios,
+            collections,
+            tags,
+            sig,
+            fp,
+            existed,
+        } = written;
+        // 004-books — a book's cover lives inside the file, so it has no
+        // sidecar path to record and is extracted + cached here instead.
+        self.store_book_cover(store, item_id, item_kind, &item_path)
+            .await;
+        // LIB-C4 — populate the item_genres join. UNION of the probe's
+        // (possibly comma/pipe-separated) `genre` column with the NFO
+        // `<genre>` tags resolved above; `link_item_genres` is idempotent
+        // (de-dupes), so the union never double-inserts.
+        store.link_item_genres(item_id, &genres).await?;
+        // LIB-C2 — populate the item_people join from the NFO cast/crew
+        // the resolver parsed. `link_item_people` upserts each person row
+        // (carrying its headshot / provider ids) then replaces the item's
+        // credits wholesale, so a rescan keeps the join current.
+        store.link_item_people(item_id, &people).await?;
+        // LIB-C3 — populate the item_studios join from the NFO <studio>
+        // tags the resolver parsed. `link_item_studios` upserts each
+        // studio row then replaces the item's studios wholesale, so a
+        // rescan keeps the join current.
+        store.link_item_studios(item_id, &studios).await?;
+        // LIB-C5 — populate the collection_items membership join from the
+        // NFO <set>/<collection> tags the resolver parsed. Each named box
+        // set is upserted and the item appended (idempotent), so a rescan
+        // keeps NFO-driven box-set membership current alongside any manual
+        // CRUD additions.
+        store.link_item_collections(item_id, &collections).await?;
+        // LIB-C6 — populate the item_tags join from the NFO <tag>
+        // elements + the filename provider's quality/source tokens the
+        // resolver parsed. `link_item_tags` upserts each tag row then
+        // replaces the item's tags wholesale, so a rescan keeps the join
+        // current (a dropped <tag> clears its stale link).
+        store.link_item_tags(item_id, &tags).await?;
+        // LIB-D7 — persist discovered artwork (local sidecars from D4 +
+        // any NFO thumb/fanart URLs) keyed by item id + role. One row per
+        // role; the resolver fed refs in priority order so the first per
+        // role is the winner. `set_artwork` upserts.
+        persist_artwork(store, item_id, &artwork).await?;
+        // Persist the freshly-stat'd signature so the next scan can
+        // skip this file. mark_seen is an UPDATE — the put() above
+        // guarantees the row exists first.
+        if let Some((mtime, size)) = sig {
+            store.mark_seen(item_id, scan_id, mtime, size).await?;
+        }
+        // LIB-A7 — stamp the content fingerprint so a later move of this
+        // file is recognised by content rather than swept + re-inserted.
+        if let Some(fp) = fp {
+            store.set_fingerprint(item_id, fp).await?;
+        }
+        // A pre-existing row (signature changed) is an update; a row
+        // with no prior state is a fresh insert.
+        if existed {
+            outcome.updated.push(item_id);
+        } else {
+            outcome.added.push(item_id);
+        }
+        *seen += 1;
+        Ok(())
     }
 
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
@@ -1403,6 +1575,23 @@ impl<P: Prober> FsScanner<P> {
 /// back for the caller to link once the media row exists (the joins carry
 /// FKs on the item id, so they must follow `store.put`). Each `Vec` is the
 /// resolved-and-deduped set for one entity kind.
+/// What follows a probed item's row write: the entity joins, artwork, the
+/// seen-stamp and fingerprint, and the added-vs-updated bookkeeping.
+struct WrittenItem {
+    item_id: MediaId,
+    item_kind: MediaKind,
+    item_path: PathBuf,
+    genres: Vec<String>,
+    artwork: Vec<pharos_core::ArtworkRef>,
+    people: Vec<pharos_core::PersonRef>,
+    studios: Vec<String>,
+    collections: Vec<String>,
+    tags: Vec<String>,
+    sig: Option<(i64, u64)>,
+    fp: Option<Fingerprint>,
+    existed: bool,
+}
+
 struct MergedEntities {
     /// Genre names — UNION of the probe `genre` column + NFO `<genre>`.
     genres: Vec<String>,
@@ -2144,9 +2333,19 @@ mod tests {
         collections: Mutex<HashMap<String, Vec<MediaId>>>,
         // LIB-C6 — item_tags mirror: item id → its linked tag names.
         item_tags: Mutex<HashMap<MediaId, Vec<String>>>,
+        // Size of every `put_batch` call, in order; single `put`s are not here.
+        put_batches: Mutex<Vec<usize>>,
     }
 
     impl MediaStore for MemStore {
+        async fn put_batch(&self, items: &[MediaItem]) -> DomainResult<()> {
+            self.put_batches.lock().unwrap().push(items.len());
+            let mut inner = self.inner.lock().unwrap();
+            for item in items {
+                inner.insert(item.id, item.clone());
+            }
+            Ok(())
+        }
         async fn get(&self, id: MediaId) -> DomainResult<MediaItem> {
             self.inner
                 .lock()
@@ -3188,11 +3387,23 @@ mod tests {
         // B90 — when set, every probe carries this embedded synopsis so the
         // embedded-tag provider → Overview wiring can be asserted.
         synopsis: Option<String>,
+        // Every probe takes this long, to model a slow disk.
+        delay: Option<std::time::Duration>,
+        // Raise the flag during the Nth probe call (1-based).
+        cancel_during: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
     }
 
     impl Prober for FakeProber {
         async fn probe(&self, path: &Path) -> DomainResult<ProbeInfo> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            let nth = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some((n, flag)) = &self.cancel_during {
+                if nth == *n {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
             if let Some(needle) = &self.force_fail_for {
                 if path.to_string_lossy().contains(needle.as_str()) {
                     return Err(DomainError::Backend("forced fail".into()));
@@ -3942,6 +4153,123 @@ mod tests {
             2,
             "both rows survive a cancelled scan even though a.mkv is gone"
         );
+    }
+
+    async fn many_files(n: usize) -> TempDir {
+        let td = TempDir::new().unwrap();
+        for i in 0..n {
+            write_file(td.path(), &format!("m{i:03}.mkv"), b"x").await;
+        }
+        td
+    }
+
+    #[tokio::test]
+    async fn probed_items_are_written_in_batches_of_the_configured_size() {
+        let td = many_files(25).await;
+        let store = MemStore::default();
+        let out = FsScanner::new(FakeProber::default())
+            .with_probe_concurrency(1)
+            .with_put_batch_size(10)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(out.added.len(), 25);
+        assert_eq!(store.list().await.unwrap().len(), 25);
+        assert_eq!(*store.put_batches.lock().unwrap(), [10, 10, 5]);
+    }
+
+    #[tokio::test]
+    async fn batch_size_one_writes_each_item_alone() {
+        let td = many_files(4).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .with_put_batch_size(1)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(*store.put_batches.lock().unwrap(), [1, 1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_batch_is_written_once_its_interval_elapses() {
+        // Slow disk: 10 files at ~25 ms each, batches far bigger than the
+        // scan, a 60 ms flush interval. Without the interval nothing would be
+        // written until the very end.
+        let td = many_files(10).await;
+        let store = MemStore::default();
+        let prober = FakeProber {
+            delay: Some(std::time::Duration::from_millis(25)),
+            ..Default::default()
+        };
+        FsScanner::new(prober)
+            .with_probe_concurrency(1)
+            .with_put_batch_size(1_000)
+            .with_put_flush_interval(std::time::Duration::from_millis(60))
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let batches = store.put_batches.lock().unwrap().clone();
+        assert_eq!(batches.iter().sum::<usize>(), 10, "{batches:?}");
+        assert!(
+            batches.len() >= 2 && batches.iter().all(|n| *n < 10),
+            "expected several interval flushes, got {batches:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_scan_still_writes_what_it_already_probed() {
+        use std::sync::atomic::AtomicBool;
+        let td = many_files(10).await;
+        let store = MemStore::default();
+        let flag = Arc::new(AtomicBool::new(false));
+        let prober = FakeProber {
+            cancel_during: Some((4, flag.clone())),
+            ..Default::default()
+        };
+        FsScanner::new(prober)
+            .with_probe_concurrency(1)
+            .with_put_batch_size(100)
+            .with_cancel(flag)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        // Probes 1-3 were buffered when the 4th raised the flag; they must
+        // reach the store, and the follow-up writes must have run for them.
+        let rows = store.list().await.unwrap();
+        assert_eq!(rows.len(), 3, "probed-before-cancel items are kept");
+        for r in &rows {
+            assert!(
+                store.scan_state(r.id).await.unwrap().is_some(),
+                "mark_seen ran for {}",
+                r.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_never_runs_ahead_of_what_is_written() {
+        let td = many_files(12).await;
+        let store = Arc::new(MemStore::default());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let (s, r) = (store.clone(), reports.clone());
+        FsScanner::new(FakeProber::default())
+            .with_probe_concurrency(1)
+            .with_put_batch_size(5)
+            .with_progress(Arc::new(move |p: ScanProgress| {
+                let written = s.inner.lock().unwrap().len() as u64;
+                r.lock().unwrap().push((p.processed, written));
+            }))
+            .scan_into(td.path(), &*store)
+            .await
+            .unwrap();
+        let reports = reports.lock().unwrap();
+        for (processed, written) in reports.iter() {
+            assert!(
+                processed <= written,
+                "reported {processed} done with only {written} rows written: {reports:?}"
+            );
+        }
+        assert_eq!(reports.last().map(|r| r.0), Some(12));
     }
 
     #[tokio::test]
