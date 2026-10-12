@@ -797,6 +797,18 @@ pub struct GroupSnapshot {
     /// Wire item id of every queue entry, in order: who may see the group
     /// depends on who may see all of them.
     pub queue_item_ids: Vec<String>,
+    /// Every cast seat in the roster, with the Controller it is paired with.
+    pub cast_seats: Vec<CastSeatInfo>,
+}
+
+/// One cast seat as the roster holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastSeatInfo {
+    pub seat: MemberId,
+    pub name: String,
+    pub cast: CastBinding,
+    /// The Controller carrying the same binding, i.e. the owner's player.
+    pub controller: Option<MemberId>,
 }
 
 /// What a roster entry is. Closed enum, not a bool pair, so a "controller that
@@ -2461,6 +2473,32 @@ impl GroupState {
             .collect();
         out.sort_by_key(|s| s.member_id);
         out
+    }
+
+    fn cast_seats(&self) -> Vec<CastSeatInfo> {
+        let mut seats: Vec<CastSeatInfo> = self
+            .members
+            .iter()
+            .filter(|(_, m)| m.kind == MemberKind::CastSeat)
+            .filter_map(|(id, m)| {
+                let cast = m.cast.clone()?;
+                let controller = self
+                    .members
+                    .iter()
+                    .find(|(_, c)| {
+                        c.kind == MemberKind::Controller && c.cast.as_ref() == Some(&cast)
+                    })
+                    .map(|(cid, _)| *cid);
+                Some(CastSeatInfo {
+                    seat: *id,
+                    name: m.name.clone(),
+                    cast,
+                    controller,
+                })
+            })
+            .collect();
+        seats.sort_by_key(|s| s.seat);
+        seats
     }
 
     /// Serialize the whole coordination state to the opaque blob the store
@@ -4455,6 +4493,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .iter()
                     .map(|e| e.item_id.clone())
                     .collect(),
+                cast_seats: state.cast_seats(),
             };
             let _ = reply.send(snap);
         }
