@@ -21,7 +21,7 @@ use pharos_core::{
 use pharos_store_sqlx::RuntimeConfig;
 
 /// A minimal-but-valid MediaItem satisfying every NOT NULL column, mirroring
-/// the helper shape used by `tests/media_query.rs`.
+/// the helper shape used by `tests/it_sqlite/media_query.rs`.
 fn media_item(id: MediaId, title: &str) -> MediaItem {
     MediaItem {
         id,
