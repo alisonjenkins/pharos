@@ -72,7 +72,7 @@ description: "Task list for SyncPlay Cast Target"
 
 ### Tests first
 
-- [ ] T020 [P] [US1] Failing test `crates/pharos-server/tests/cast_virtual_session.rs`: `GET /Sessions` lists a configured, reachable, permitted TV with `SupportsRemoteControl: true`, `Client: "Chromecast"`; not listed for a non-permitted user (V9) or an unreachable TV; same values on the socket `Sessions` broadcast
+- [X] T020 [P] [US1] Failing test `crates/pharos-server/tests/cast_virtual_session.rs`: `GET /Sessions` lists a configured, reachable, permitted TV with `SupportsRemoteControl: true`, `Client: "Chromecast"`; not listed for a non-permitted user (V9) or an unreachable TV; same values on the socket `Sessions` broadcast
 - [ ] T021 [P] [US1] Failing test `crates/pharos-server/tests/cast_start.rs`: `POST /Sessions/{tv}/Playing` by a group member creates a seat, the emulator receives `PlayNow` at the group position, the owner's member becomes `Controller`, the roster shows the owner once with the TV as device; non-virtual ids behave exactly as before
 - [ ] T022 [P] [US1] Failing test in `crates/pharos-sync/tests/group_conformance.rs`: group pause/unpause/seek reach the cast sink as the expected cast commands, and a TV that never acks does not extend any gate
 - [X] T023 [P] [US1] Failing test in `crates/pharos-cast/src/driver.rs` (module tests): `CastDriver` applies a group Seek to the emulator, then corrects injected drift via the planner, records `pharos_cast_correction_total`
@@ -85,7 +85,7 @@ description: "Task list for SyncPlay Cast Target"
 
 - [X] T024 [US1] Implement `CastDriver` actor (state machine from `data-model.md`: Connecting → Loading → Following) in `crates/pharos-cast/src/driver.rs`: owns one `CastTransport`, consumes group commands from the cast sink, feeds receiver reports to the planner, emits `record_cast_event`
 - [ ] T025 [US1] Implement the seat registry and hand-off in `crates/pharos-server/src/cast.rs`: validate caller is a group member and not already a seat owner and TV not busy (rejections recorded with reasons), mint token, spawn `CastDriver`, `SetMemberKind` (owner → `Controller`, new seat member `CastSeat` keyed `UUIDv5("{user}:cast:{tv}")`), launch + `PlayNow` at the group's current position and item
-- [ ] T026 [US1] Project virtual TV sessions into `GET /Sessions` and the socket `Sessions` broadcast in `crates/pharos-server/src/api/jellyfin/sessions.rs` and `crates/pharos-server/src/api/jellyfin/socket.rs` as a typed DTO (V38), same values both places
+- [X] T026 [US1] Project virtual TV sessions into `GET /Sessions` and the socket `Sessions` broadcast in `crates/pharos-server/src/api/jellyfin/sessions.rs` and `crates/pharos-server/src/api/jellyfin/socket.rs` as a typed DTO (V38), same values both places
 - [ ] T027 [US1] Intercept `POST /Sessions/{id}/Playing` for virtual TV ids in `crates/pharos-server/src/api/jellyfin/sessions.rs`: start via T025, reject with the Jellyfin error shape and stable reason string otherwise
 - [ ] T028 [US1] Send the owner's socket a `PlayState` `Stop` on hand-off in `crates/pharos-server/src/cast.rs` (behaviour per spike S3; if S3 shows it is ignored, implement the fallback in research R8 and update the test in T021)
 - [ ] T029 [US1] Wire the `CastDriver` registry into `main`/`AppState` startup in `crates/pharos-server/src/state.rs` and `lib.rs` (registry as an actor handle, no `Mutex<State>` on the request path, V18)
