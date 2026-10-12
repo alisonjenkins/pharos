@@ -241,6 +241,17 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .await
         .expect("connect in-memory sqlite");
     let (uid1, uid2, item1) = seed(&sqlite).await;
+    // Tagged tracks, to check the target's language index afterwards.
+    let mut tagged = media_item(9_001, "Tagged Movie", MediaKind::Movie);
+    tagged.probe.audio_tracks = vec![pharos_core::AudioTrack {
+        language: Some("fra".into()),
+        ..Default::default()
+    }];
+    tagged.probe.subtitle_tracks = vec![pharos_core::SubtitleTrack {
+        language: Some("eng".into()),
+        ..Default::default()
+    }];
+    pharos_core::MediaStore::put(&sqlite, tagged).await.unwrap();
 
     // A stored sort name that differs from sort_name(title) must be carried
     // verbatim; a NULL one (not yet backfilled) is derived from the title.
@@ -330,6 +341,27 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         pg_item.metadata.overview.as_deref(),
         Some("A movie about migrating.")
     );
+
+    // media_item_languages is derived, not copied: the insert trigger indexes
+    // the copied rows, and the language filter finds them.
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_item_languages WHERE item_id = 9001")
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+    assert_eq!(rows, 2, "the migrated item must be language-indexed");
+    let by_language = pharos_core::MediaQuery {
+        filters: pharos_core::MediaFilters {
+            audio_languages: vec!["fre".into()],
+            subtitle_languages: vec!["eng".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (found, _) = pharos_core::MediaStore::query(&postgres, &by_language)
+        .await
+        .unwrap();
+    assert_eq!(found.iter().map(|i| i.id).collect::<Vec<_>>(), [9_001]);
 
     let pg_sort_names: Vec<(i64, Option<String>)> =
         sqlx::query_as("SELECT id, sort_name FROM media_items WHERE id IN (1, 2) ORDER BY id")
