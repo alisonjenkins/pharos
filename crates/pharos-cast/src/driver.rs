@@ -1,6 +1,8 @@
 //! Actor that drives ONE cast TV from group intents. It owns every piece of
 //! state; nothing is shared and nothing is locked.
 
+use std::collections::VecDeque;
+use std::future::pending;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -119,6 +121,7 @@ pub fn spawn<T: CastTransport + 'static>(
         planner: PlannerState::new(),
         last_command_at: None,
         expected_paused: false,
+        held: VecDeque::new(),
     };
     let task = tokio::spawn(driver.run());
     CastDriverHandle { intents, task }
@@ -174,6 +177,23 @@ impl Snapshot {
     }
 }
 
+/// A timed group intent waiting for `send_at` (its apply time less the cast latency).
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    send_at: Instant,
+    apply_at: Instant,
+    position_ms: i64,
+    playing: bool,
+    force_seek: bool,
+}
+
+async fn sleep_until_opt(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => pending().await,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
     Ended(CastReason),
@@ -193,6 +213,7 @@ struct Driver<T> {
     planner: PlannerState,
     last_command_at: Option<Instant>,
     expected_paused: bool,
+    held: VecDeque<Held>,
 }
 
 impl<T: CastTransport> Driver<T> {
@@ -210,12 +231,14 @@ impl<T: CastTransport> Driver<T> {
             return self.failed("launch", &e);
         }
         loop {
+            let due = self.next_due();
             let exit = tokio::select! {
                 intent = self.intents.recv() => match intent {
                     Some(intent) => self.on_intent(intent).await,
                     None => Some(Exit::Ended(CastReason::UserStop)),
                 },
                 event = self.transport.recv() => self.on_transport(event).await,
+                () = sleep_until_opt(due) => self.flush_due(Instant::now()).await,
             };
             if let Some(exit) = exit {
                 return exit;
@@ -317,19 +340,77 @@ impl<T: CastTransport> Driver<T> {
                 playing,
             } => self.load(item_id, item_type, position_ms, playing).await,
             GroupIntent::Stop => {
+                self.held.clear();
                 if let Err(e) = self.send(CommandBody::Stop).await {
                     tracing::warn!(tv = %self.cfg.receiver_name, error = %e, "cast Stop command failed while ending");
                 }
                 Some(Exit::Ended(CastReason::UserStop))
             }
-            GroupIntent::Play { position_ms, .. } => self.apply(position_ms, true, false).await,
-            GroupIntent::Pause { position_ms, .. } => self.apply(position_ms, false, false).await,
+            GroupIntent::Play {
+                position_ms,
+                apply_at,
+            } => self.hold(position_ms, true, false, apply_at).await,
+            GroupIntent::Pause {
+                position_ms,
+                apply_at,
+            } => self.hold(position_ms, false, false, apply_at).await,
             GroupIntent::Seek {
                 position_ms,
                 playing,
-                ..
-            } => self.apply(position_ms, playing, true).await,
+                apply_at,
+            } => self.hold(position_ms, playing, true, apply_at).await,
         }
+    }
+
+    /// Queue a timed intent in apply order and send whatever is already due.
+    async fn hold(
+        &mut self,
+        position_ms: i64,
+        playing: bool,
+        force_seek: bool,
+        apply_at: Instant,
+    ) -> Option<Exit> {
+        let send_at = apply_at
+            .checked_sub(self.cfg.latency_estimate)
+            .unwrap_or(apply_at);
+        let idx = self
+            .held
+            .iter()
+            .position(|h| h.send_at > send_at)
+            .unwrap_or(self.held.len());
+        self.held.insert(
+            idx,
+            Held {
+                send_at,
+                apply_at,
+                position_ms,
+                playing,
+                force_seek,
+            },
+        );
+        self.flush_due(Instant::now()).await
+    }
+
+    /// Timed intents wait for the receiver to be Following: commands sent
+    /// mid-load would land on the previous item.
+    fn next_due(&self) -> Option<Instant> {
+        if self.state != ConnState::Following {
+            return None;
+        }
+        self.held.front().map(|h| h.send_at)
+    }
+
+    async fn flush_due(&mut self, now: Instant) -> Option<Exit> {
+        while self.next_due().is_some_and(|at| at <= now) {
+            let h = self.held.pop_front()?;
+            if let Some(exit) = self
+                .apply(h.position_ms, h.playing, h.force_seek, h.apply_at)
+                .await
+            {
+                return Some(exit);
+            }
+        }
+        None
     }
 
     async fn load(
@@ -353,6 +434,7 @@ impl<T: CastTransport> Driver<T> {
         if let Some(exit) = self.send_or_exit(body).await {
             return Some(exit);
         }
+        self.held.clear();
         self.clock = Some(GroupClock {
             position_ms,
             at: Instant::now(),
@@ -367,20 +449,25 @@ impl<T: CastTransport> Driver<T> {
     }
 
     /// Bring the receiver to the group's new position and play state.
-    async fn apply(&mut self, position_ms: i64, playing: bool, force_seek: bool) -> Option<Exit> {
-        let now = Instant::now();
+    async fn apply(
+        &mut self,
+        position_ms: i64,
+        playing: bool,
+        force_seek: bool,
+        at: Instant,
+    ) -> Option<Exit> {
         if self.loaded.is_none() {
             tracing::debug!(tv = %self.cfg.receiver_name, position_ms, "cast intent before any Load ignored");
             return None;
         }
         let threshold = i64::try_from(self.cfg.planner.threshold_ms).unwrap_or(i64::MAX);
         let off = match &self.last_report {
-            Some(s) => s.position_at(now).saturating_sub(position_ms).abs() > threshold,
+            Some(s) => s.position_at(at).saturating_sub(position_ms).abs() > threshold,
             None => true,
         };
         self.clock = Some(GroupClock {
             position_ms,
-            at: now,
+            at,
             playing,
         });
         if playing && self.expected_paused {
@@ -440,9 +527,11 @@ impl<T: CastTransport> Driver<T> {
                 let playing = self.clock.map_or(true, |c| c.playing);
                 if !playing {
                     self.expected_paused = true;
-                    return self.send_or_exit(CommandBody::Pause).await;
+                    if let Some(exit) = self.send_or_exit(CommandBody::Pause).await {
+                        return Some(exit);
+                    }
                 }
-                None
+                self.flush_due(now).await
             }
             ConnState::Following if matches!(report, ReceiverReport::PlaybackProgress(_)) => {
                 self.correct(now, snapshot).await
@@ -769,5 +858,95 @@ mod tests {
                 reason: CastReason::TvUnreachable
             }
         );
+    }
+
+    fn names(rig: &Rig) -> Vec<&'static str> {
+        rig.fake.commands().iter().map(|c| c.body.name()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_future_intent_is_held_and_lands_on_the_receiver_at_its_apply_time() {
+        let fake_cfg = FakeReceiverConfig {
+            command_latency_ms: 200,
+            ..Default::default()
+        };
+        let cfg = DriverConfig {
+            latency_estimate: Duration::from_millis(200),
+            ..driver_cfg()
+        };
+        let mut rig = start(fake_cfg, cfg);
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        let apply_at = Instant::now() + Duration::from_secs(5);
+        rig.handle
+            .send(GroupIntent::Pause {
+                position_ms: 5_000,
+                apply_at,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep_until(apply_at - Duration::from_millis(250)).await;
+        assert_eq!(names(&rig), ["PlayNow"], "held until apply_at - latency");
+        assert!(!rig.fake.state().paused);
+
+        tokio::time::sleep_until(apply_at - Duration::from_millis(50)).await;
+        assert_eq!(
+            names(&rig),
+            ["PlayNow", "Pause"],
+            "sent early by the latency"
+        );
+        assert!(
+            !rig.fake.state().paused,
+            "receiver applies only at apply_at"
+        );
+
+        tokio::time::sleep_until(apply_at + Duration::from_millis(10)).await;
+        assert!(rig.fake.state().paused);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_intent_already_past_its_apply_time_is_sent_immediately() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let sent_at = Instant::now();
+        rig.handle
+            .send(GroupIntent::Pause {
+                position_ms: 900,
+                apply_at: sent_at - Duration::from_millis(100),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(names(&rig), ["PlayNow", "Pause"]);
+        assert_eq!(Instant::now(), sent_at, "no waiting for a past apply_at");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_intents_are_sent_in_apply_order_not_arrival_order() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        let t0 = Instant::now();
+        rig.handle
+            .send(GroupIntent::Seek {
+                position_ms: 30_000,
+                playing: true,
+                apply_at: t0 + Duration::from_secs(2),
+            })
+            .await
+            .unwrap();
+        rig.handle
+            .send(GroupIntent::Pause {
+                position_ms: 1_000,
+                apply_at: t0 + Duration::from_secs(1),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2_100)).await;
+        assert_eq!(names(&rig), ["PlayNow", "Pause", "Unpause", "Seek"]);
     }
 }
