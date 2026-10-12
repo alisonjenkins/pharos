@@ -122,6 +122,7 @@ pub fn spawn<T: CastTransport + 'static>(
         last_command_at: None,
         expected_paused: false,
         held: VecDeque::new(),
+        load_deadline: None,
     };
     let task = tokio::spawn(driver.run());
     CastDriverHandle { intents, task }
@@ -214,6 +215,7 @@ struct Driver<T> {
     last_command_at: Option<Instant>,
     expected_paused: bool,
     held: VecDeque<Held>,
+    load_deadline: Option<Instant>,
 }
 
 impl<T: CastTransport> Driver<T> {
@@ -232,6 +234,7 @@ impl<T: CastTransport> Driver<T> {
         }
         loop {
             let due = self.next_due();
+            let load_deadline = self.load_deadline;
             let exit = tokio::select! {
                 intent = self.intents.recv() => match intent {
                     Some(intent) => self.on_intent(intent).await,
@@ -239,6 +242,7 @@ impl<T: CastTransport> Driver<T> {
                 },
                 event = self.transport.recv() => self.on_transport(event).await,
                 () = sleep_until_opt(due) => self.flush_due(Instant::now()).await,
+                () = sleep_until_opt(load_deadline) => Some(self.load_timed_out()),
             };
             if let Some(exit) = exit {
                 return exit;
@@ -316,6 +320,20 @@ impl<T: CastTransport> Driver<T> {
             Ok(()) => None,
             Err(e) => Some(self.lost(&format!("sending {name}: {e}"))),
         }
+    }
+
+    fn load_timed_out(&mut self) -> Exit {
+        self.load_deadline = None;
+        let item = self.loaded.as_ref().map_or("none", |l| l.item_id.as_str());
+        self.record(
+            CastEvent::Lost,
+            CastReason::TvUnreachable,
+            &format!(
+                "no report for item {item} within {:?} of PlayNow",
+                self.cfg.max_load_wait
+            ),
+        );
+        Exit::Failed(CastReason::TvUnreachable)
     }
 
     fn lost(&self, detail: &str) -> Exit {
@@ -444,6 +462,7 @@ impl<T: CastTransport> Driver<T> {
         self.last_report = None;
         self.planner = PlannerState::new();
         self.expected_paused = false;
+        self.load_deadline = Some(Instant::now() + self.cfg.max_load_wait);
         self.enter(ConnState::Loading).await;
         None
     }
@@ -523,6 +542,7 @@ impl<T: CastTransport> Driver<T> {
         self.last_report = Some(snapshot);
         match self.state {
             ConnState::Loading => {
+                self.load_deadline = None;
                 self.enter(ConnState::Following).await;
                 let playing = self.clock.map_or(true, |c| c.playing);
                 if !playing {
@@ -948,5 +968,89 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(2_100)).await;
         assert_eq!(names(&rig), ["PlayNow", "Pause", "Unpause", "Seek"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_item_while_following_reloads_and_follows_the_new_item() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        rig.handle
+            .send(GroupIntent::Load {
+                item_id: "item-2".into(),
+                item_type: "Episode".into(),
+                position_ms: 42_000,
+                playing: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.until_state(ConnState::Following).await,
+            [
+                DriverEvent::State(ConnState::Loading),
+                DriverEvent::State(ConnState::Following)
+            ]
+        );
+        let cmds = rig.fake.commands();
+        assert_eq!(cmds.len(), 2, "{cmds:?}");
+        match &cmds.get(1).unwrap().body {
+            CommandBody::PlayNow(o) => {
+                assert_eq!(o.items.first().unwrap().id, "item-2");
+                assert_eq!(o.items.first().unwrap().kind, "Episode");
+                assert_eq!(o.start_position_ticks, 420_000_000);
+            }
+            other => panic!("expected PlayNow, got {other:?}"),
+        }
+        assert_eq!(rig.fake.state().item_id.as_deref(), Some("item-2"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_load_within_the_bound_still_reaches_following() {
+        let fake_cfg = FakeReceiverConfig {
+            command_latency_ms: 9_000,
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        let t0 = Instant::now();
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Following).await;
+        assert_eq!(t0.elapsed(), Duration::from_secs(9));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_report_within_max_load_wait_ends_the_cast_and_records_why() {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let fake_cfg = FakeReceiverConfig {
+            command_latency_ms: 60_000,
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        let t0 = Instant::now();
+        rig.load(0, true).await;
+        let seen = rig.until_state(ConnState::Failed).await;
+        assert!(
+            seen.contains(&DriverEvent::State(ConnState::Loading)),
+            "{seen:?}"
+        );
+        assert_eq!(
+            rig.next().await,
+            DriverEvent::Ended {
+                reason: CastReason::TvUnreachable
+            }
+        );
+        assert_eq!(t0.elapsed(), Duration::from_secs(10));
+        let all = series(&snap);
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "lost")),
+            1
+        );
+        assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("reason", "tv_unreachable")),
+            1
+        );
     }
 }
