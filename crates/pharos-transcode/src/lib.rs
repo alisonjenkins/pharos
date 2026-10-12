@@ -647,6 +647,7 @@ fn resident_argv_applies(
         }
     ) && matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265))
         && !has_filler
+        && !crate::device::shared_init_fmp4(opts)
         && opts.burn_subtitle_stream_index.is_none()
         && !opts.burn_intent
         && matches!(
@@ -670,6 +671,8 @@ pub enum ResidentVerdict {
     BurnSubtitles,
     /// Synthetic filler window: nothing to decode.
     Filler,
+    /// Shared-init fMP4 rendition: one encoder must produce every segment.
+    SharedInitFmp4,
     /// Source decode is not offloaded to this VAAPI device.
     DecodeNotOffloaded,
     /// Not plain 8-bit SDR with even dimensions, or not known to be.
@@ -707,6 +710,14 @@ impl ResidentVerdict {
         if has_filler {
             return Self::Filler;
         }
+        // Every segment of a shared-init fMP4 rendition decodes under seg0's
+        // avcC, so one encoder must produce all of them (spec 003). Resident
+        // and hybrid are different ffmpeg pipelines, and a runtime fallback or
+        // a config flip would mix them mid-rendition. Until a real-VAAPI test
+        // proves their parameter sets interchangeable, fMP4 stays hybrid.
+        if crate::device::shared_init_fmp4(opts) {
+            return Self::SharedInitFmp4;
+        }
         if opts.burn_subtitle_stream_index.is_some() || opts.burn_intent {
             return Self::BurnSubtitles;
         }
@@ -738,6 +749,7 @@ impl ResidentVerdict {
             Self::TargetCodec => "target_codec",
             Self::BurnSubtitles => "burn_subtitles",
             Self::Filler => "filler",
+            Self::SharedInitFmp4 => "shared_init_fmp4",
             Self::DecodeNotOffloaded => "decode_not_offloaded",
             Self::SourceNotPlain => "source_not_plain",
             Self::LiveStream => "live_stream",
@@ -2827,6 +2839,34 @@ mod tests {
         );
     }
 
+    /// Every segment of an fMP4 rendition decodes under seg0's avcC, so a
+    /// rendition cannot be split across the two pipelines. Both the verdict and
+    /// the argv builder refuse, whatever the flag or the retry path asks.
+    #[test]
+    fn a_shared_init_fmp4_rendition_never_goes_resident() {
+        let mut o = resident_opts();
+        o.container = Container::Fmp4;
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            o.video = Some(codec);
+            assert_eq!(
+                verdict(true, &o, DecodeOffload::Allowed),
+                ResidentVerdict::SharedInitFmp4
+            );
+            let vaapi = crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0);
+            assert_eq!(
+                pipeline_argv(&o, vaapi, DecodeOffload::Allowed, VaapiPipeline::Resident),
+                pipeline_argv(&o, vaapi, DecodeOffload::Allowed, VaapiPipeline::Hybrid),
+            );
+        }
+        // mpegts repeats parameter sets per segment and is exempt.
+        o.container = Container::Mpegts;
+        o.video = Some(VideoCodec::H264);
+        assert_eq!(
+            verdict(true, &o, DecodeOffload::Allowed),
+            ResidentVerdict::Resident
+        );
+    }
+
     #[test]
     fn resident_verdict_labels_are_distinct_and_stable() {
         let all = [
@@ -2836,6 +2876,7 @@ mod tests {
             (ResidentVerdict::TargetCodec, "target_codec"),
             (ResidentVerdict::BurnSubtitles, "burn_subtitles"),
             (ResidentVerdict::Filler, "filler"),
+            (ResidentVerdict::SharedInitFmp4, "shared_init_fmp4"),
             (ResidentVerdict::DecodeNotOffloaded, "decode_not_offloaded"),
             (ResidentVerdict::SourceNotPlain, "source_not_plain"),
             (ResidentVerdict::LiveStream, "live_stream"),
