@@ -21,9 +21,7 @@ use pharos_server::{
 };
 use tracing_subscriber::prelude::*;
 
-#[path = "common/store_calls.rs"]
-mod store_calls;
-use store_calls::StoreCallLog;
+use crate::store_calls::StoreCallLog;
 
 const SEC: u64 = 10_000_000;
 /// 60 s of media, so the 90% played threshold sits at 54 s.
