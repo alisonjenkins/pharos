@@ -33,7 +33,14 @@ pub(super) struct ResumeParams {
 /// A resume's connect task reporting back to the actor.
 pub(super) struct Resumed<T> {
     tv: String,
-    outcome: OpenOutcome<T>,
+    outcome: Connected<T>,
+}
+
+/// How a resume's attempt to reach its TV ended.
+pub(super) enum Connected<T> {
+    /// Another replica holds the TV, so nothing was opened.
+    LeaseHeld,
+    Open(OpenOutcome<T>),
 }
 
 /// Tell the actor about every cast seat in each group this replica hydrates,
@@ -172,15 +179,31 @@ impl<F: TransportFactory> Actor<F> {
         };
         self.resuming.insert(tv_name.clone(), params);
         let factory = Arc::clone(&self.factory);
+        let registry = self.deps.registry.clone();
         let resumed_tx = self.resumed_tx.clone();
         let grace = Duration::from_secs(self.cfg.reconnect_grace_secs);
         tokio::spawn(async move {
             let deadline = Instant::now() + grace;
             let mut pause = RESUME_RETRY_START;
+            // The previous owner may still be letting go of the TV (a draining
+            // replica), so both the lease and the connection are retried for
+            // the reconnect grace.
             let outcome = loop {
-                let outcome = tokio::time::timeout(OPEN_TIMEOUT, factory.open(&tv)).await;
-                if matches!(outcome, Ok(Ok(_))) || Instant::now() + pause > deadline {
-                    break outcome;
+                let leased = registry
+                    .try_lease(tv_lease_key(&tv.name))
+                    .await
+                    .unwrap_or(false);
+                let attempt = if leased {
+                    Some(tokio::time::timeout(OPEN_TIMEOUT, factory.open(&tv)).await)
+                } else {
+                    None
+                };
+                let done = matches!(attempt, Some(Ok(Ok(_))));
+                if done || Instant::now() + pause > deadline {
+                    break match attempt {
+                        Some(open) => Connected::Open(open),
+                        None => Connected::LeaseHeld,
+                    };
                 }
                 tokio::time::sleep(pause).await;
                 pause = (pause * 2).min(RESUME_RETRY_CAP);
@@ -198,6 +221,40 @@ impl<F: TransportFactory> Actor<F> {
         let Some(params) = self.resuming.remove(&done.tv) else {
             return;
         };
+        let failure = match done.outcome {
+            Connected::LeaseHeld => Some((
+                CastReason::TvBusy,
+                format!(
+                    "{:?} is connected from another replica; ending the seat in group {}",
+                    params.tv.name, params.group.group_id
+                ),
+            )),
+            Connected::Open(open) => {
+                let failure = self.resume_connected(&params, open).await.err();
+                if failure.is_some() {
+                    self.release_tv(&params.tv.name).await;
+                }
+                failure
+            }
+        };
+        if let Some((reason, detail)) = failure {
+            self.drop_seat(
+                &params.group,
+                &params.seat,
+                Some(params.owner),
+                reason,
+                &detail,
+            )
+            .await;
+        }
+    }
+
+    /// Bring the cast back on an opened connection, or say why it cannot be.
+    async fn resume_connected(
+        &mut self,
+        params: &ResumeParams,
+        opened: OpenOutcome<F::Transport>,
+    ) -> Result<(), (CastReason, String)> {
         let ResumeParams {
             group,
             seat,
@@ -205,35 +262,22 @@ impl<F: TransportFactory> Actor<F> {
             owner,
             owner_member,
         } = params;
-        let group_label = group.group_id.to_string();
-        let (transport, occupancy) = match done.outcome {
+        let (transport, occupancy) = match opened {
             Ok(Ok(opened)) => opened,
             Ok(Err(e)) => {
-                let detail = format!("cannot reach {:?} at {}: {e}", tv.name, tv.address);
-                return self
-                    .drop_seat(
-                        &group,
-                        &seat,
-                        Some(owner),
-                        CastReason::TvUnreachable,
-                        &detail,
-                    )
-                    .await;
+                return Err((
+                    CastReason::TvUnreachable,
+                    format!("cannot reach {:?} at {}: {e}", tv.name, tv.address),
+                ));
             }
             Err(_) => {
-                let detail = format!(
-                    "{:?} at {} did not answer within {OPEN_TIMEOUT:?}",
-                    tv.name, tv.address
-                );
-                return self
-                    .drop_seat(
-                        &group,
-                        &seat,
-                        Some(owner),
-                        CastReason::TvUnreachable,
-                        &detail,
-                    )
-                    .await;
+                return Err((
+                    CastReason::TvUnreachable,
+                    format!(
+                        "{:?} at {} did not answer within {OPEN_TIMEOUT:?}",
+                        tv.name, tv.address
+                    ),
+                ));
             }
         };
         if let Occupancy::ForeignApp {
@@ -241,45 +285,42 @@ impl<F: TransportFactory> Actor<F> {
             display_name,
         } = occupancy
         {
-            let detail = format!(
-                "{:?} is running another app: {app_id} ({})",
-                tv.name,
-                display_name.as_deref().unwrap_or("unnamed")
-            );
-            return self
-                .drop_seat(&group, &seat, Some(owner), CastReason::TvBusy, &detail)
-                .await;
+            return Err((
+                CastReason::TvBusy,
+                format!(
+                    "{:?} is running another app: {app_id} ({})",
+                    tv.name,
+                    display_name.as_deref().unwrap_or("unnamed")
+                ),
+            ));
         }
 
-        self.revoke_stale_tokens(owner, &tv.name).await;
-        let token = match mint_tv_token(
+        self.revoke_stale_tokens(*owner, &tv.name).await;
+        let token = mint_tv_token(
             &self.deps.stores,
-            owner,
+            *owner,
             &tv.name,
             DEFAULT_TV_TOKEN_LIFETIME,
         )
         .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                let detail = format!("cannot mint a TV token: {e}");
-                return self
-                    .drop_seat(&group, &seat, Some(owner), CastReason::TokenFailed, &detail)
-                    .await;
-            }
-        };
+        .map_err(|e| {
+            (
+                CastReason::TokenFailed,
+                format!("cannot mint a TV token: {e}"),
+            )
+        })?;
 
         let cast = self.assemble(
             transport,
             &token,
             Assembly {
-                tv: &tv,
-                owner,
+                tv,
+                owner: *owner,
                 owner_name: &seat.name,
                 owner_key: None,
                 sender_device: String::new(),
-                group: &group,
-                owner_member,
+                group,
+                owner_member: *owner_member,
             },
         );
         if cast.seat_member != seat.seat {
@@ -302,11 +343,12 @@ impl<F: TransportFactory> Actor<F> {
             &seat.name,
             "",
             &tv.name,
-            &group_label,
+            &group.group_id.to_string(),
             &format!("seat {} on {}", cast.seat_member, tv.address),
         );
-        self.by_user.insert(owner, tv.name.clone());
+        self.by_user.insert(*owner, tv.name.clone());
         self.casts.insert(tv.name.clone(), cast);
+        Ok(())
     }
 
     /// Revoke every TV token `owner` holds for `tv`: the process that minted

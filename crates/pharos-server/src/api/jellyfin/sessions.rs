@@ -840,6 +840,7 @@ const fn reject_status(reason: CastRejectReason) -> StatusCode {
         CastRejectReason::TvBusy | CastRejectReason::UserHasSeat => StatusCode::CONFLICT,
         CastRejectReason::TvUnreachable
         | CastRejectReason::TokenFailed
+        | CastRejectReason::NotGroupOwner
         | CastRejectReason::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -955,6 +956,7 @@ mod tests {
                 reason,
                 CastRejectReason::TvUnreachable
                     | CastRejectReason::TokenFailed
+                    | CastRejectReason::NotGroupOwner
                     | CastRejectReason::Unavailable
             );
             assert_eq!(

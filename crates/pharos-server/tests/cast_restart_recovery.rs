@@ -16,7 +16,7 @@ use pharos_cast::obs::ConnState;
 use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::auth::BuiltinAuth;
 use pharos_server::cast_service::{
-    self, CastDeps, CastServiceHandle, FakeTransportFactory, StartCast,
+    self, CastDeps, CastRejectReason, CastServiceHandle, FakeTransportFactory, StartCast,
 };
 use pharos_server::config::CastConfig;
 use pharos_server::state::{AppState, Stores};
@@ -574,4 +574,204 @@ async fn shutting_the_service_down_leaves_the_seat_in_the_snapshot() {
         json.contains("CastSeat"),
         "a restart must not erase the seat it is about to resume: {json}"
     );
+}
+
+// --- T043: one Cast connection per TV across replicas ------------------------
+
+/// Put `who` on `process` as a member of `group`, the way a socket landing on
+/// that replica does.
+async fn join_on(process: &Process, group: &GroupHandle, who: &str) -> Owner {
+    let id = new_user(&process.stores, who).await;
+    let key = format!("{}:dev-{who}", id.0.simple());
+    let (tx, rx) = mpsc::channel(256);
+    let reg = process.hub.register(key.clone(), who.into(), tx.clone());
+    process.hub.attach_group(&key, group.clone());
+    process.sinks.insert(reg.member_id, reg.gen, tx);
+    let (reply, joined) = oneshot::channel();
+    group
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: reg.member_id,
+            name: who.into(),
+            reply,
+        })
+        .await
+        .unwrap();
+    let _ = joined.await;
+    Owner {
+        id,
+        key,
+        member: reg.member_id,
+        _rx: rx,
+    }
+}
+
+fn start_request(who: &Owner, name: &str, tv: &str) -> StartCast {
+    StartCast {
+        user_id: who.id,
+        user_name: name.into(),
+        owner_sync_key: who.key.clone(),
+        tv_name: tv.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_start_on_a_replica_that_does_not_own_the_group_is_refused() {
+    let (snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let locks = Locks::default();
+    let a = Process::boot(&stores, &snapshots, &locks, 1, config(&[TV]), &[TV]);
+    let b = Process::boot(&stores, &snapshots, &locks, 2, config(&[TV]), &[TV]);
+    let group_a = a.registry.create().await.unwrap();
+    let remote = b.registry.get_or_create(group_a.group_id).await.unwrap();
+    let bob = join_on(&b, &remote, "bob").await;
+
+    let err = b
+        .service
+        .start(start_request(&bob, "bob", TV))
+        .await
+        .expect_err("replica 2 does not own the group");
+
+    assert_eq!(err.reason, CastRejectReason::NotGroupOwner, "{err}");
+    assert!(err.message.contains(TV), "names the TV: {err}");
+    assert!(
+        err.message.contains(&group_a.group_id.to_string()),
+        "names the group: {err}"
+    );
+    assert_eq!(seat_total(&snap, "rejected", "not_group_owner"), 1);
+    assert!(b.service.snapshot().await.is_empty());
+    assert!(
+        b.tv.commands().is_empty(),
+        "the refusing replica never talks to the TV"
+    );
+    // The refusal took nothing: the TV is still free for the owning replica.
+    let owner_on_a = join_on(&a, &group_a, "ali").await;
+    a.service
+        .start(start_request(&owner_on_a, "ali", TV))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn two_replicas_never_hold_one_tv() {
+    let (snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let locks = Locks::default();
+    let a = Process::boot(&stores, &snapshots, &locks, 1, config(&[TV]), &[TV]);
+    let b = Process::boot(&stores, &snapshots, &locks, 2, config(&[TV]), &[TV]);
+    let (_group_a, _ali) = running_cast(&stores, &snapshots, &a).await;
+
+    // Another group, owned by replica 2, wants the TV replica 1 already holds.
+    let group_b = b.registry.create().await.unwrap();
+    let bob = join_on(&b, &group_b, "bob").await;
+    let err = b
+        .service
+        .start(start_request(&bob, "bob", TV))
+        .await
+        .expect_err("the TV is connected from replica 1");
+
+    assert_eq!(err.reason, CastRejectReason::TvBusy, "{err}");
+    assert!(err.message.contains("another replica"), "{err}");
+    assert_eq!(seat_total(&snap, "rejected", "tv_busy"), 1);
+    assert!(
+        b.tv.commands().is_empty(),
+        "replica 2 never connected the TV"
+    );
+    assert!(b.service.snapshot().await.is_empty());
+    assert_eq!(a.service.snapshot().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_start_gives_the_tv_back_to_other_replicas() {
+    let (_snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let locks = Locks::default();
+    let a = Process::boot(&stores, &snapshots, &locks, 1, config(&[TV]), &[TV]);
+    let b = Process::boot(&stores, &snapshots, &locks, 2, config(&[TV]), &[TV]);
+    a.factory.set_unreachable(TV, true);
+    let group_a = a.registry.create().await.unwrap();
+    let ali = join_on(&a, &group_a, "ali").await;
+    let err = a
+        .service
+        .start(start_request(&ali, "ali", TV))
+        .await
+        .expect_err("the TV is off");
+    assert_eq!(err.reason, CastRejectReason::TvUnreachable, "{err}");
+
+    let group_b = b.registry.create().await.unwrap();
+    let bob = join_on(&b, &group_b, "bob").await;
+    b.service
+        .start(start_request(&bob, "bob", TV))
+        .await
+        .expect("the failed start must not keep the TV");
+}
+
+#[tokio::test]
+async fn a_cast_follows_its_group_to_the_replica_that_takes_it_over() {
+    let (_snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let locks = Locks::default();
+    let a = Process::boot(&stores, &snapshots, &locks, 1, config(&[TV]), &[TV]);
+    let (group_a, owner) = running_cast(&stores, &snapshots, &a).await;
+    let group_id = group_a.group_id;
+    let old_token = tv_token(&a.tv);
+
+    // Replica 1 drains: its service lets go of the TV and the group lock frees.
+    let a_tv = a.tv.clone();
+    drop(a.service);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    lock(&locks.0).remove(&group_id);
+
+    let b_snapshots = restart_snapshots(&snapshots, group_id);
+    let b = Process::boot(&stores, &b_snapshots, &locks, 2, config(&[TV]), &[TV]);
+    let group_b = b.registry.get_or_create(group_id).await.unwrap();
+    eventually("PlayNow on replica 2's connection", || {
+        has_command(&b.tv, "PlayNow")
+    })
+    .await;
+    wait_following(&b.service).await;
+
+    let sent_by_old = a_tv.commands().len();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        a_tv.commands().len(),
+        sent_by_old,
+        "the old replica no longer drives the TV"
+    );
+    let info = b.service.snapshot().await;
+    assert_eq!(info.len(), 1, "{info:?}");
+    assert_eq!(info[0].owner, owner.id);
+    assert_eq!(snapshot_of(&group_b).await.cast_seats.len(), 1);
+    assert_eq!(
+        token_status(&stores, &old_token).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn a_resume_is_refused_while_another_replica_holds_the_tv() {
+    let (snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let locks = Locks::default();
+    let a = Process::boot(&stores, &snapshots, &locks, 1, config(&[TV]), &[TV]);
+    let (group_a, _owner) = running_cast(&stores, &snapshots, &a).await;
+
+    // Replica 1 stays connected to the TV but loses the group.
+    lock(&locks.0).remove(&group_a.group_id);
+    let b_snapshots = restart_snapshots(&snapshots, group_a.group_id);
+    let b = Process::boot(&stores, &b_snapshots, &locks, 2, config(&[TV]), &[TV]);
+    let group_b = b.registry.get_or_create(group_a.group_id).await.unwrap();
+
+    eventually("the seat given up", || {
+        seat_total(&snap, "ended", "tv_busy") == 1
+    })
+    .await;
+    assert!(b.tv.commands().is_empty(), "replica 2 never connected");
+    assert!(b.service.snapshot().await.is_empty());
+    assert!(snapshot_of(&group_b).await.cast_seats.is_empty());
 }
