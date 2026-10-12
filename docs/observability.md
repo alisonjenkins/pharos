@@ -18,8 +18,10 @@ Three pillars wired from T1, deepened in T23. Behaviour is governed by SPEC §V 
 - Recorder: `metrics-exporter-prometheus`. Cached handle behind `OnceLock`; render path is lock-free (V18).
 - Request-level RED via `pharos_server::middleware::RedMetrics`:
   - `http_requests_total{method,path,status}` — counter
-  - `http_request_duration_seconds{method,path}` — histogram (seconds, default criterion buckets)
-- Path label is the route match pattern (e.g. `/Items/{id}`), not the concrete URI. Keeps label cardinality bounded — guarded by an integration test.
+  - `http_request_duration_seconds{method,path}` — histogram, 1 ms to 30 s buckets
+- Path label is the route match pattern (e.g. `/Items/{id}`), not the concrete URI; a request matching no route is `path="unmatched"` and a non-standard method is `method="OTHER"`, so scanner traffic cannot mint series. Guarded by unit tests in `middleware/red_metrics.rs` (`unmatched_paths_and_odd_methods_share_one_series`, `middleware_labels_use_route_pattern_not_concrete_uri`).
+- Every `*_seconds` metric is a real histogram (summaries cannot be aggregated across pods). Bucket ladders live in `obs.rs`: 1 ms to 30 s by default, up to 1 h for long-running timings (`LONG_RUNNING_SECONDS`: syncplay, transcode, scan), 0.1 ms to 10 s for `pharos_store_query_seconds`. A new timing metric that can exceed 30 s must be added to `LONG_RUNNING_SECONDS`, or `histogram_quantile` caps at 30 s.
+- Other series: `pharos_db_pool_*` (pool saturation, with a timed acquire probe), `pharos_store_query_seconds{method,outcome}`, `pharos_scan_*`, `process_*`, and every `pharos_segment_produced_total` series pre-registered at zero so `rate()` works from the first scrape.
 - Subsystems may emit their own counters/histograms freely; they land in the same registry and surface at `/metrics`.
 
 ## Health (V14)
@@ -40,7 +42,7 @@ Two-layer strategy:
 
 ## Tracing → OTLP
 
-When `[obs].otlp_endpoint` is set, spans are additionally exported over **OTLP/gRPC** (`opentelemetry-otlp` + `tonic`, batch processor) to a collector — Tempo in the home cluster, and the Tilt dev stack wires one up automatically (see `docs/kubernetes.md`). The tracer provider lives in a `OnceLock` for the process lifetime so the batch exporter keeps flushing. When the endpoint is unset the OTLP layer is a no-op and deploys emit JSON logs to stdout only. Note: Tempo needs multiple Gi of memory — it OOM-crashlooped at a 512Mi limit (ADR-0013).
+When `[obs].otlp_endpoint` is set, spans are additionally exported over **OTLP/gRPC** (`opentelemetry-otlp` + `tonic`, batch processor) to a collector — Tempo in the home cluster, and the Tilt dev stack wires one up automatically (see `docs/kubernetes.md`). The tracer provider lives in a `OnceLock` for the process lifetime so the batch exporter keeps flushing. When the endpoint is unset the OTLP layer is a no-op and deploys emit JSON logs to stdout only. `[obs].sampling_ratio` (default 1.0) thins traces STARTED here; a request carrying a sampled W3C `traceparent` is continued and always kept (parent-based). Image requests and scans open a span per phase (`image.*`, `scan.*`). Note: Tempo needs multiple Gi of memory — it OOM-crashlooped at a 512Mi limit (ADR-0013).
 
 ## Where each invariant lives
 
