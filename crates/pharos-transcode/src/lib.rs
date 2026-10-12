@@ -599,6 +599,152 @@ pub enum DecodeOffload {
     Denied,
 }
 
+/// Which ffmpeg pipeline a VAAPI job runs.
+///
+/// `Hybrid` is the shipped one: decode on the GPU, download frames to system
+/// memory, run CPU filters, `hwupload`, encode on the GPU. `Resident` keeps
+/// decoded frames on the GPU as VAAPI surfaces from decoder to encoder. Like
+/// [`DecodeOffload`] it is decided by the scheduler and travels on
+/// [`protocol::JobSpec`], because the worker cannot re-derive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum VaapiPipeline {
+    #[default]
+    Hybrid,
+    Resident,
+}
+
+impl VaapiPipeline {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Resident => "resident",
+        }
+    }
+}
+
+/// GPU-side filter the resident pipeline puts between decoder and encoder.
+/// `None`: a plain 8-bit 4:2:0 source decodes to NV12 surfaces, which
+/// `h264_vaapi`/`hevc_vaapi` take as they are.
+const RESIDENT_VAAPI_FILTER: Option<&str> = None;
+
+/// The part of the resident decision that depends only on the job's shape, not
+/// on config or the source's pixels. Shared by the verdict and by the argv
+/// builder, which re-checks it so a caller cannot ask for a resident argv the
+/// job cannot run: burn-in needs CPU filters (libass, `overlay`), and a
+/// software decode has no VAAPI surfaces to keep.
+fn resident_argv_applies(
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    offload: DecodeOffload,
+    has_filler: bool,
+) -> bool {
+    use crate::protocol::DeviceId;
+    matches!(
+        device,
+        DeviceId::Hw {
+            accel: HwAccel::Vaapi,
+            ..
+        }
+    ) && matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265))
+        && !has_filler
+        && opts.burn_subtitle_stream_index.is_none()
+        && !opts.burn_intent
+        && matches!(
+            DecodeAccel::of(opts, device, offload),
+            DecodeAccel::Gpu { name: "vaapi" }
+        )
+}
+
+/// Why a job did or did not take the resident pipeline. The labels are bounded
+/// and stable (`pharos_transcode_vaapi_pipeline_total{verdict}`): a dashboard
+/// answering "why is nothing running resident" keys on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentVerdict {
+    Resident,
+    /// `server.transcode_vaapi_gpu_resident` is off.
+    Disabled,
+    NotVaapi,
+    /// Target is not H.264/HEVC, or this is a stream copy.
+    TargetCodec,
+    /// A subtitle is burned in, or the rendition burns (CPU filters).
+    BurnSubtitles,
+    /// Synthetic filler window: nothing to decode.
+    Filler,
+    /// Source decode is not offloaded to this VAAPI device.
+    DecodeNotOffloaded,
+    /// Not plain 8-bit SDR with even dimensions, or not known to be.
+    SourceNotPlain,
+    /// A live stream: it has no retry, so it keeps the proven path.
+    LiveStream,
+}
+
+impl ResidentVerdict {
+    #[allow(clippy::too_many_arguments)]
+    pub fn of(
+        enabled: bool,
+        opts: &TranscodeOptions,
+        device: crate::protocol::DeviceId,
+        offload: DecodeOffload,
+        has_filler: bool,
+        file_sink: bool,
+    ) -> Self {
+        use crate::protocol::DeviceId;
+        if !enabled {
+            return Self::Disabled;
+        }
+        if !matches!(
+            device,
+            DeviceId::Hw {
+                accel: HwAccel::Vaapi,
+                ..
+            }
+        ) {
+            return Self::NotVaapi;
+        }
+        if !matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265)) {
+            return Self::TargetCodec;
+        }
+        if has_filler {
+            return Self::Filler;
+        }
+        if opts.burn_subtitle_stream_index.is_some() || opts.burn_intent {
+            return Self::BurnSubtitles;
+        }
+        if !resident_argv_applies(opts, device, offload, has_filler) {
+            return Self::DecodeNotOffloaded;
+        }
+        if opts.source_video_kind != options::SourceVideoKind::Plain8BitSdr {
+            return Self::SourceNotPlain;
+        }
+        if !file_sink {
+            return Self::LiveStream;
+        }
+        Self::Resident
+    }
+
+    pub fn pipeline(self) -> VaapiPipeline {
+        if self == Self::Resident {
+            VaapiPipeline::Resident
+        } else {
+            VaapiPipeline::Hybrid
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Disabled => "disabled",
+            Self::NotVaapi => "not_vaapi",
+            Self::TargetCodec => "target_codec",
+            Self::BurnSubtitles => "burn_subtitles",
+            Self::Filler => "filler",
+            Self::DecodeNotOffloaded => "decode_not_offloaded",
+            Self::SourceNotPlain => "source_not_plain",
+            Self::LiveStream => "live_stream",
+        }
+    }
+}
+
 impl std::fmt::Display for DecodeAccel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -624,11 +770,54 @@ pub fn ffmpeg_transcode_args(
     offload: DecodeOffload,
     filler: Option<options::FillerSpec>,
 ) -> Vec<String> {
-    build_args_for_device(input, opts, device, output, offload, filler)
+    ffmpeg_transcode_args_pipeline(
+        input,
+        opts,
+        device,
+        output,
+        offload,
+        filler,
+        VaapiPipeline::Hybrid,
+    )
+}
+
+/// [`ffmpeg_transcode_args`] with an explicit VAAPI pipeline. `pipeline` only
+/// matters for a job that [`ResidentVerdict`] would let take the resident path;
+/// for every other job the argv is identical whatever it says.
+#[allow(clippy::too_many_arguments)]
+pub fn ffmpeg_transcode_args_pipeline(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+    offload: DecodeOffload,
+    filler: Option<options::FillerSpec>,
+    pipeline: VaapiPipeline,
+) -> Vec<String> {
+    build_args_for_pipeline(input, opts, device, output, offload, filler, pipeline)
+}
+
+fn build_args_for_device(
+    input: &str,
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    output: &str,
+    offload: DecodeOffload,
+    filler: Option<options::FillerSpec>,
+) -> Vec<String> {
+    build_args_for_pipeline(
+        input,
+        opts,
+        device,
+        output,
+        offload,
+        filler,
+        VaapiPipeline::Hybrid,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_args_for_device(
+fn build_args_for_pipeline(
     input: &str,
     opts: &TranscodeOptions,
     device: crate::protocol::DeviceId,
@@ -641,6 +830,7 @@ fn build_args_for_device(
     // convenience before that hand-off — see its doc comment for why it must
     // never be read here instead of this parameter).
     filler: Option<options::FillerSpec>,
+    pipeline: VaapiPipeline,
 ) -> Vec<String> {
     use crate::protocol::DeviceId;
     let preroll_seconds = opts
@@ -678,11 +868,16 @@ fn build_args_for_device(
         "error".into(),
         "-nostdin".into(),
     ];
+    let resident = pipeline == VaapiPipeline::Resident
+        && resident_argv_applies(opts, device, offload, filler.is_some());
     // VAAPI: select the render node BEFORE `-i` so the `hwupload` filter
-    // resolves the default device. Each GPU is a distinct render node.
-    if let Some(node) = device.vaapi_render_node() {
-        a.push("-vaapi_device".into());
-        a.push(node);
+    // resolves the default device. Each GPU is a distinct render node. The
+    // resident pipeline has no `hwupload`: `-hwaccel_device` below names it.
+    if !resident {
+        if let Some(node) = device.vaapi_render_node() {
+            a.push("-vaapi_device".into());
+            a.push(node);
+        }
     }
     // A real decode: `-c:v copy` decodes nothing and an audio-only job has no
     // video decoder. Shares its definition with `DecodeAccel::of`, which is
@@ -702,6 +897,17 @@ fn build_args_for_device(
         if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device, offload) {
             a.push("-hwaccel".into());
             a.push(name.into());
+            if resident {
+                // Keep decoded frames on the GPU as VAAPI surfaces; the
+                // encoder reads them there, so nothing is downloaded or
+                // re-uploaded.
+                a.push("-hwaccel_output_format".into());
+                a.push("vaapi".into());
+                if let Some(node) = device.vaapi_render_node() {
+                    a.push("-hwaccel_device".into());
+                    a.push(node);
+                }
+            }
             // Decode on the SAME GPU that will encode. Without this a multi-GPU
             // box decodes on device 0 and encodes on device N, adding a
             // cross-device copy of every frame.
@@ -916,22 +1122,29 @@ fn build_args_for_device(
             if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
                 // VAAPI: upload frames to the GPU, then encode. The
                 // upload filter chains after any software filters.
-                vf_parts.push("format=nv12".into());
-                vf_parts.push("hwupload".into());
-                push_video_filters(
-                    &mut a,
-                    &vf_parts,
-                    opts.burn_subtitle_stream_index,
-                    opts.burn_subtitle_is_text,
-                    input,
-                    // The point ffmpeg actually seeked to — the filter sees
-                    // PTS re-based to THERE, not to the segment start.
-                    Some(input_seek),
-                    opts.audio_source_stream_index,
-                    opts.burn_subtitle_ass_path.as_deref(),
-                    opts.burn_fonts_dir.as_deref(),
-                    opts.muxed_audio_source.is_some(),
-                );
+                if resident {
+                    if let Some(vf) = RESIDENT_VAAPI_FILTER {
+                        a.push("-vf".into());
+                        a.push(vf.into());
+                    }
+                } else {
+                    vf_parts.push("format=nv12".into());
+                    vf_parts.push("hwupload".into());
+                    push_video_filters(
+                        &mut a,
+                        &vf_parts,
+                        opts.burn_subtitle_stream_index,
+                        opts.burn_subtitle_is_text,
+                        input,
+                        // The point ffmpeg actually seeked to — the filter sees
+                        // PTS re-based to THERE, not to the segment start.
+                        Some(input_seek),
+                        opts.audio_source_stream_index,
+                        opts.burn_subtitle_ass_path.as_deref(),
+                        opts.burn_fonts_dir.as_deref(),
+                        opts.muxed_audio_source.is_some(),
+                    );
+                }
                 a.push("-c:v".into());
                 a.push(
                     if matches!(c, VideoCodec::H265) {
@@ -2311,6 +2524,325 @@ mod tests {
         // VAAPI sets the format via the filter (nv12 in GPU memory), not a
         // software `-pix_fmt` (which would clash with the hw frames).
         assert!(!joined.contains("-pix_fmt"), "{joined}");
+    }
+
+    fn resident_opts() -> TranscodeOptions {
+        let mut o = opts();
+        o.container = Container::Mpegts;
+        o.audio = None;
+        o.source_frame_rate = pharos_core::FrameRate::from_mille(24_000);
+        o.source_video_kind = crate::options::SourceVideoKind::Plain8BitSdr;
+        o.source_video_codec = Some(SourceCodec::H264);
+        // Segment 3 of a 6 s grid: seek 3 s in, trim the 15 s preroll.
+        o.start_position_ticks = 180_000_000;
+        o.duration_ticks = Some(60_000_000);
+        o
+    }
+
+    fn pipeline_argv(
+        o: &TranscodeOptions,
+        dev: crate::protocol::DeviceId,
+        offload: DecodeOffload,
+        pipeline: VaapiPipeline,
+    ) -> Vec<String> {
+        build_args_for_pipeline("/m/x.mkv", o, dev, "out.ts", offload, None, pipeline)
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The shipped hybrid argv, frozen. The resident work must not move it.
+    #[test]
+    fn golden_hybrid_vaapi_argv_is_unchanged() {
+        let a = pipeline_argv(
+            &resident_opts(),
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            DecodeOffload::Allowed,
+            VaapiPipeline::Hybrid,
+        );
+        let threads = sw_encode_threads().to_string();
+        let mut want = strs(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-vaapi_device",
+            "/dev/dri/renderD128",
+            "-hwaccel",
+            "vaapi",
+            "-threads",
+        ]);
+        want.push(threads);
+        want.extend(strs(&[
+            "-ss",
+            "3.000000",
+            "-i",
+            "/m/x.mkv",
+            "-ss",
+            "15.000000",
+            "-t",
+            "6.000000",
+            "-vf",
+            "format=nv12,hwupload",
+            "-c:v",
+            "h264_vaapi",
+            "-b:v",
+            "2000000",
+            "-an",
+            "-sn",
+            "-map_chapters",
+            "-1",
+            "-r",
+            "24/1",
+            "-f",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-output_ts_offset",
+            "18.000000",
+            "-y",
+            "-progress",
+            "out.ts.progress",
+            "out.ts",
+        ]));
+        assert_eq!(a, want);
+    }
+
+    /// Resident: decoded frames stay on the GPU. No `-vaapi_device`/`hwupload`,
+    /// `-hwaccel_output_format vaapi`, and the render node named for the decoder.
+    #[test]
+    fn golden_resident_vaapi_argv_keeps_frames_on_the_gpu() {
+        let a = pipeline_argv(
+            &resident_opts(),
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 1),
+            DecodeOffload::Allowed,
+            VaapiPipeline::Resident,
+        );
+        let threads = sw_encode_threads().to_string();
+        let mut want = strs(&[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD129",
+            "-threads",
+        ]);
+        want.push(threads);
+        want.extend(strs(&[
+            "-ss",
+            "3.000000",
+            "-i",
+            "/m/x.mkv",
+            "-ss",
+            "15.000000",
+            "-t",
+            "6.000000",
+            "-c:v",
+            "h264_vaapi",
+            "-b:v",
+            "2000000",
+            "-an",
+            "-sn",
+            "-map_chapters",
+            "-1",
+            "-r",
+            "24/1",
+            "-f",
+            "mpegts",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            "-output_ts_offset",
+            "18.000000",
+            "-y",
+            "-progress",
+            "out.ts.progress",
+            "out.ts",
+        ]));
+        assert_eq!(a, want);
+    }
+
+    #[test]
+    fn resident_hevc_uses_the_hevc_vaapi_encoder() {
+        let mut o = resident_opts();
+        o.video = Some(VideoCodec::H265);
+        o.source_video_codec = Some(SourceCodec::Hevc);
+        let a = pipeline_argv(
+            &o,
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            DecodeOffload::Allowed,
+            VaapiPipeline::Resident,
+        );
+        let j = a.join(" ");
+        assert!(j.contains("-hwaccel_output_format vaapi"), "{j}");
+        assert!(j.contains("-c:v hevc_vaapi"), "{j}");
+        assert!(!j.contains("hwupload"), "{j}");
+    }
+
+    /// The builder re-checks the job's shape, so asking for a resident argv for
+    /// a job that cannot run one yields the hybrid argv rather than a command
+    /// that fails: burn-in needs CPU filters, a denied decode has no surfaces.
+    #[test]
+    fn a_resident_request_the_job_cannot_honour_builds_the_hybrid_argv() {
+        let vaapi = crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0);
+        let hybrid =
+            |o: &TranscodeOptions, off| pipeline_argv(o, vaapi, off, VaapiPipeline::Hybrid);
+        let resident =
+            |o: &TranscodeOptions, off| pipeline_argv(o, vaapi, off, VaapiPipeline::Resident);
+
+        let mut burn = resident_opts();
+        burn.burn_subtitle_stream_index = Some(0);
+        assert_eq!(
+            resident(&burn, DecodeOffload::Allowed),
+            hybrid(&burn, DecodeOffload::Allowed)
+        );
+
+        let plain = resident_opts();
+        assert_eq!(
+            resident(&plain, DecodeOffload::Denied),
+            hybrid(&plain, DecodeOffload::Denied)
+        );
+
+        let mut copy = resident_opts();
+        copy.video = Some(VideoCodec::Copy);
+        assert_eq!(
+            resident(&copy, DecodeOffload::Allowed),
+            hybrid(&copy, DecodeOffload::Allowed)
+        );
+
+        let mut vp9 = resident_opts();
+        vp9.video = Some(VideoCodec::Vp9);
+        assert_eq!(
+            resident(&vp9, DecodeOffload::Allowed),
+            hybrid(&vp9, DecodeOffload::Allowed)
+        );
+    }
+
+    #[test]
+    fn a_non_vaapi_device_ignores_the_resident_request() {
+        use crate::protocol::DeviceId;
+        for dev in [DeviceId::Cpu, DeviceId::hw(HwAccel::Nvenc, 0)] {
+            let o = resident_opts();
+            assert_eq!(
+                pipeline_argv(&o, dev, DecodeOffload::Allowed, VaapiPipeline::Resident),
+                pipeline_argv(&o, dev, DecodeOffload::Allowed, VaapiPipeline::Hybrid),
+                "{dev}"
+            );
+        }
+    }
+
+    fn verdict(enabled: bool, o: &TranscodeOptions, off: DecodeOffload) -> ResidentVerdict {
+        ResidentVerdict::of(
+            enabled,
+            o,
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            off,
+            false,
+            true,
+        )
+    }
+
+    #[test]
+    fn the_resident_verdict_names_why_each_job_does_not_qualify() {
+        let ok = resident_opts();
+        assert_eq!(
+            verdict(true, &ok, DecodeOffload::Allowed),
+            ResidentVerdict::Resident
+        );
+        assert_eq!(
+            verdict(false, &ok, DecodeOffload::Allowed),
+            ResidentVerdict::Disabled
+        );
+        assert_eq!(
+            verdict(true, &ok, DecodeOffload::Denied),
+            ResidentVerdict::DecodeNotOffloaded
+        );
+
+        let mut burn = resident_opts();
+        burn.burn_subtitle_stream_index = Some(2);
+        assert_eq!(
+            verdict(true, &burn, DecodeOffload::Allowed),
+            ResidentVerdict::BurnSubtitles
+        );
+        // A rendition that burns elsewhere stays hybrid even for a segment
+        // with no subtitle event, or one rendition would mix two pipelines.
+        let mut intent = resident_opts();
+        intent.burn_intent = true;
+        assert_eq!(
+            verdict(true, &intent, DecodeOffload::Allowed),
+            ResidentVerdict::BurnSubtitles
+        );
+
+        // 10-bit, HDR, odd-sized and unprobed sources fall back.
+        for kind in [
+            crate::options::SourceVideoKind::Other,
+            crate::options::SourceVideoKind::Unknown,
+        ] {
+            let mut o = resident_opts();
+            o.source_video_kind = kind;
+            assert_eq!(
+                verdict(true, &o, DecodeOffload::Allowed),
+                ResidentVerdict::SourceNotPlain
+            );
+        }
+
+        let mut vp9 = resident_opts();
+        vp9.video = Some(VideoCodec::Vp9);
+        assert_eq!(
+            verdict(true, &vp9, DecodeOffload::Allowed),
+            ResidentVerdict::TargetCodec
+        );
+
+        let not_vaapi = ResidentVerdict::of(
+            true,
+            &ok,
+            crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0),
+            DecodeOffload::Allowed,
+            false,
+            true,
+        );
+        assert_eq!(not_vaapi, ResidentVerdict::NotVaapi);
+        let live = ResidentVerdict::of(
+            true,
+            &ok,
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            DecodeOffload::Allowed,
+            false,
+            false,
+        );
+        assert_eq!(live, ResidentVerdict::LiveStream);
+        assert_eq!(live.pipeline(), VaapiPipeline::Hybrid);
+        assert_eq!(
+            ResidentVerdict::Resident.pipeline(),
+            VaapiPipeline::Resident
+        );
+    }
+
+    #[test]
+    fn resident_verdict_labels_are_distinct_and_stable() {
+        let all = [
+            (ResidentVerdict::Resident, "resident"),
+            (ResidentVerdict::Disabled, "disabled"),
+            (ResidentVerdict::NotVaapi, "not_vaapi"),
+            (ResidentVerdict::TargetCodec, "target_codec"),
+            (ResidentVerdict::BurnSubtitles, "burn_subtitles"),
+            (ResidentVerdict::Filler, "filler"),
+            (ResidentVerdict::DecodeNotOffloaded, "decode_not_offloaded"),
+            (ResidentVerdict::SourceNotPlain, "source_not_plain"),
+            (ResidentVerdict::LiveStream, "live_stream"),
+        ];
+        for (v, l) in all {
+            assert_eq!(v.label(), l);
+        }
     }
 
     #[test]
