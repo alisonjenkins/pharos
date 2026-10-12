@@ -165,7 +165,7 @@ impl ProgressCoalescer {
                     last_seen: now,
                     last_position_ticks: progress.position_ticks,
                     last_paused: is_paused,
-                    pending: Some(progress),
+                    pending: None,
                 },
             );
             return Decision::Persist(PersistReason::First);
@@ -183,12 +183,19 @@ impl ProgressCoalescer {
         entry.last_seen = now;
         entry.last_position_ticks = progress.position_ticks;
         entry.last_paused = is_paused;
-        // Held until `persisted` confirms the write, so a failed write is
-        // still picked up by the background tick.
-        entry.pending = Some(progress);
         match reason {
-            Some(r) => Decision::Persist(r),
-            None => Decision::Coalesce,
+            Some(r) => {
+                // The caller writes this one now. Holding it too would let
+                // the background tick write it a second time; a caller whose
+                // write fails hands it back with `hold`. It also supersedes
+                // anything older that was held.
+                entry.pending = None;
+                Decision::Persist(r)
+            }
+            None => {
+                entry.pending = Some(progress);
+                Decision::Coalesce
+            }
         }
     }
 
@@ -552,6 +559,40 @@ mod tests {
         c.admit(&k, at(t0, 21), false, report(121, 121));
         c.hold(&k, report(110, 110));
         assert_eq!(c.take_all(), vec![(k, report(121, 121))]);
+    }
+
+    #[test]
+    fn a_report_written_now_is_not_also_left_for_the_tick() {
+        let (c, t0) = coalescer();
+        let k = key("s");
+        tick(&c, &k, t0, 100, false);
+        // Held, then the interval elapses: this report is written by its
+        // request and supersedes the held one.
+        c.admit(&k, at(t0, 10), false, report(110, 110));
+        assert_eq!(
+            c.admit(&k, at(t0, 20), false, report(120, 120)),
+            Decision::Persist(PersistReason::Interval)
+        );
+        assert!(
+            c.take_due(at(t0, 40)).is_empty(),
+            "the tick must not write the same report again"
+        );
+        assert!(c.take_all().is_empty());
+    }
+
+    #[test]
+    fn a_report_whose_write_failed_is_held_for_the_tick() {
+        let (c, t0) = coalescer();
+        let k = key("s");
+        tick(&c, &k, t0, 100, false);
+        let p = report(120, 120);
+        assert_eq!(
+            c.admit(&k, at(t0, 20), false, p),
+            Decision::Persist(PersistReason::Interval)
+        );
+        // The write failed: nothing was confirmed, the caller hands it back.
+        c.hold(&k, p);
+        assert_eq!(c.take_due(at(t0, 40)), vec![(k, p)]);
     }
 
     #[test]
