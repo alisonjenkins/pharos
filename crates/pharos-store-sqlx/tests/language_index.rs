@@ -8,8 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pharos_core::{
-    AudioTrack, MediaFilters, MediaItem, MediaKind, MediaProbe, MediaQuery, MediaStore,
-    SubtitleTrack,
+    AudioTrack, FacetRequest, MediaFilters, MediaItem, MediaKind, MediaProbe, MediaQuery,
+    MediaStore, SubtitleTrack,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -400,6 +400,69 @@ async fn filter_reads_the_table<S: MediaStore + Inspect>(s: &S, base: u64) {
     assert_eq!(matching(s, &root, base, &["ger"], &[]).await, [0]);
 }
 
+/// `(audio, subtitle)` language facets over the items under `root` that pass
+/// `audio_filter`, as `(tag, item count)` in the order the API serves them.
+async fn language_facets<S: MediaStore>(
+    s: &S,
+    root: &str,
+    audio_filter: &[&str],
+) -> (Vec<(String, u32)>, Vec<(String, u32)>) {
+    let base = MediaQuery {
+        filters: MediaFilters {
+            path_prefix: Some(root.to_string()),
+            audio_languages: audio_filter.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let req = FacetRequest {
+        genres: false,
+        studios: false,
+        tags: false,
+        years: false,
+        official_ratings: false,
+        people: false,
+        audio_languages: true,
+        subtitle_languages: true,
+    };
+    let f = s.facets(&base, &req).await.unwrap();
+    let pairs = |v: Vec<pharos_core::FacetValue>| {
+        v.into_iter()
+            .map(|f| {
+                assert_eq!(f.wire_id, f.value, "the chip sends the canonical tag");
+                (f.value, f.count)
+            })
+            .collect::<Vec<_>>()
+    };
+    (pairs(f.audio_languages), pairs(f.subtitle_languages))
+}
+
+fn counts(v: &[(&str, u32)]) -> Vec<(String, u32)> {
+    v.iter().map(|(l, c)| (l.to_string(), *c)).collect()
+}
+
+/// The facets count each item once per language, fre/fra/fr one bucket, most
+/// common first, scoped by the base query, and follow a re-put.
+async fn facets_are_correct<S: MediaStore>(s: &S, base: u64) {
+    let root = format!("/lang-facet-{base}");
+    seed_five(s, base, &root).await;
+
+    let (audio_f, subs) = language_facets(s, &root, &[]).await;
+    assert_eq!(audio_f, counts(&[("fre", 3), ("eng", 1), ("jpn", 1)]));
+    assert_eq!(subs, counts(&[("eng", 2), ("fre", 1), ("ger", 1)]));
+    // Scoped by the base query: only E is Japanese-audio.
+    let (audio_f, subs) = language_facets(s, &root, &["jpn"]).await;
+    assert_eq!(audio_f, counts(&[("jpn", 1)]));
+    assert_eq!(subs, counts(&[("eng", 1)]));
+
+    let mut changed = movie(base, vec![audio("eng")], vec![]);
+    changed.path = format!("{root}/0.mkv").into();
+    s.put(changed).await.unwrap();
+    let (audio_f, subs) = language_facets(s, &root, &[]).await;
+    assert_eq!(audio_f, counts(&[("eng", 2), ("fre", 2), ("jpn", 1)]));
+    assert_eq!(subs, counts(&[("eng", 1), ("fre", 1), ("ger", 1)]));
+}
+
 /// A writer that does not go through `put()` (a replica on an older binary
 /// during a rolling deploy, a hand-run statement) keeps the rows right too:
 /// the triggers derive them from the blobs.
@@ -417,6 +480,10 @@ async fn any_writer_keeps_the_rows_right<S: MediaStore + Inspect>(s: &S, base: u
     assert_eq!(
         matching(s, &root, base, &["eng"], &[]).await,
         Vec::<u64>::new()
+    );
+    assert_eq!(
+        language_facets(s, &root, &[]).await.0,
+        counts(&[("fre", 1)])
     );
 
     // A blob that is not a track list is "no tracks", not an error.
@@ -527,6 +594,14 @@ async fn sqlite_filter_reads_the_table() {
 }
 
 #[tokio::test]
+async fn sqlite_facets_are_correct() {
+    let s = SqliteStore::connect_without_backfill("sqlite::memory:")
+        .await
+        .unwrap();
+    facets_are_correct(&s, 300).await;
+}
+
+#[tokio::test]
 async fn sqlite_any_writer_keeps_the_rows_right() {
     let s = SqliteStore::connect_without_backfill("sqlite::memory:")
         .await
@@ -569,6 +644,7 @@ async fn postgres_language_index() {
     put_and_sweep_keep_rows_in_step(&s, 920_056).await;
     filters_are_correct(&s, 940_100).await;
     filter_reads_the_table(&s, 940_200).await;
+    facets_are_correct(&s, 940_300).await;
     any_writer_keeps_the_rows_right(&s, 940_400).await;
     rescans_of_unchanged_items_write_no_index_rows(&s, 940_500).await;
     stamping_items_seen_writes_no_index_rows(&s, 940_600).await;

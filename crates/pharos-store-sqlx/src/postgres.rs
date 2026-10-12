@@ -436,34 +436,21 @@ impl PostgresStore {
             );
             out.official_ratings = run_facet(&self.pool, &sql, user, &built.params).await?;
         }
-        for (want, col, decode, slot) in [
-            (
-                req.audio_languages,
-                "audio_tracks_json",
-                media_query::audio_track_languages as fn(&str) -> Vec<Option<String>>,
-                0,
-            ),
-            (
-                req.subtitle_languages,
-                "subtitle_tracks_json",
-                media_query::subtitle_track_languages,
-                1,
-            ),
+        for (want, kind, slot) in [
+            (req.audio_languages, crate::language_index::AUDIO, 0),
+            (req.subtitle_languages, crate::language_index::SUBTITLE, 1),
         ] {
             if !want {
                 continue;
             }
+            // The rows hold canonical tags, one per item and language, so
+            // the count is items carrying the language.
             let sql = format!(
-                "SELECT {col}, CAST('' AS TEXT), COUNT(*) FROM media_items \
-                 WHERE {col} IS NOT NULL AND id IN ({matched}) GROUP BY {col}"
+                "SELECT lang, lang, COUNT(*) FROM media_item_languages \
+                 WHERE kind = '{kind}' AND item_id IN ({matched}) \
+                 GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC"
             );
-            // Grouping by the blob collapses items sharing a track layout
-            // (every episode of a show), so only distinct layouts are decoded.
-            let blobs = run_facet(&self.pool, &sql, user, &built.params)
-                .await?
-                .into_iter()
-                .map(|f| (f.value, f.count));
-            let vals = media_query::language_facets(blobs, decode);
+            let vals = run_facet(&self.pool, &sql, user, &built.params).await?;
             if slot == 0 {
                 out.audio_languages = vals;
             } else {
