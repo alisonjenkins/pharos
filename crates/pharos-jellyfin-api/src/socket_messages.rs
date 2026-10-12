@@ -161,9 +161,9 @@ pub struct SessionPlayStateLite {
 /// `Id`). The kotlin `SessionInfoDto` REQUIRES the capability/timestamp/list
 /// fields below (no defaults) in addition to `UserId` — a native client crashes
 /// on any missing one (B78). Lists are emitted (possibly empty); DateTimes are
-/// real ISO-8601. The capability booleans are conservative defaults — a
-/// progress patch doesn't carry the session's registered capabilities (the
-/// registry does); false never over-advertises control pharos can't route.
+/// real ISO-8601. `SupportsRemoteControl` matches `GET /Sessions` (true): the
+/// patch replaces the list entry by `Id`, so a differing value would drop the
+/// session out of the remote-control picker.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionsBroadcastEntry {
