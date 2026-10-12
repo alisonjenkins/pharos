@@ -9,7 +9,7 @@ mod cast_rig;
 use cast_rig::{counter, drain, eventually, wait_msg, CastRig};
 use pharos_cast::obs::ConnState;
 use pharos_sync::group::GroupMsg;
-use pharos_sync::messages::{GroupPlayState, MemberId, ServerMsg};
+use pharos_sync::messages::ServerMsg;
 use std::time::Duration;
 
 fn seat_total(event: &str, reason: &str) -> u64 {
@@ -88,38 +88,6 @@ async fn the_owner_can_leave_rejoin_and_cast_again() {
     assert_eq!(rig.service.snapshot().await.len(), 1);
 }
 
-/// A Seek by Bob opens its gate as soon as every Player in `players` has
-/// acked: nothing waits on the TV, whether its seat is lost or gone.
-async fn assert_players_not_frozen(rig: &CastRig, players: &[MemberId]) {
-    rig.group
-        .tx
-        .send(GroupMsg::SeekTo {
-            sender: rig.bob.member,
-            position_ms: 300_000,
-        })
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    for member_id in players {
-        rig.group
-            .tx
-            .send(GroupMsg::MemberReady {
-                member_id: *member_id,
-                position_ms: 300_000,
-                playlist_item_id: None,
-                is_playing: false,
-            })
-            .await
-            .unwrap();
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_ne!(
-        rig.group_play_state().await,
-        GroupPlayState::Waiting,
-        "a gate is still held after the only Player acked"
-    );
-}
-
 async fn rig_casting() -> (CastRig, String) {
     let rig = CastRig::new().await;
     let (status, body) = rig.play_on_tv(&rig.alice).await;
@@ -158,7 +126,8 @@ async fn the_owner_stopping_on_the_tv_session_ends_the_cast_and_revokes_the_toke
             .any(|c| c.body.name() == "Stop")
     })
     .await;
-    assert_players_not_frozen(&rig, &[rig.bob.member, rig.alice.member]).await;
+    rig.assert_players_not_frozen(&[rig.bob.member, rig.alice.member])
+        .await;
 }
 
 #[actix_web::test]
@@ -175,7 +144,7 @@ async fn a_tv_that_drops_off_the_network_past_the_grace_ends_the_cast() {
     })
     .await;
     // While lost, the Player is not held by a seat that cannot ack.
-    assert_players_not_frozen(&rig, &[rig.bob.member]).await;
+    rig.assert_players_not_frozen(&[rig.bob.member]).await;
 
     rig.wait_cast_gone().await;
     assert!(
@@ -184,7 +153,8 @@ async fn a_tv_that_drops_off_the_network_past_the_grace_ends_the_cast() {
     );
     assert_eq!(seat_total("ended", "grace_expired"), ended + 1);
     assert_eq!(rig.token_status(&token).await, 401, "V171");
-    assert_players_not_frozen(&rig, &[rig.bob.member, rig.alice.member]).await;
+    rig.assert_players_not_frozen(&[rig.bob.member, rig.alice.member])
+        .await;
 }
 
 #[actix_web::test]
@@ -205,7 +175,7 @@ async fn a_tv_that_comes_back_inside_the_grace_keeps_its_seat_and_token() {
     assert_eq!(rig.service.snapshot().await.len(), 1);
     assert_eq!(seat_total("ended", "grace_expired"), ended);
     assert_eq!(rig.token_status(&token).await, 200, "token survives a blip");
-    assert_players_not_frozen(&rig, &[rig.bob.member]).await;
+    rig.assert_players_not_frozen(&[rig.bob.member]).await;
 }
 
 #[actix_web::test]
@@ -285,8 +255,7 @@ async fn ending_a_cast_catches_the_owner_up_so_its_local_player_restarts() {
             );
             assert!(is_playing);
             assert!(
-                start_position_ms >= cast_rig::START_MS
-                    && start_position_ms < cast_rig::START_MS + 30_000,
+                (cast_rig::START_MS..cast_rig::START_MS + 30_000).contains(&start_position_ms),
                 "restarts at the group position, got {start_position_ms}"
             );
         }

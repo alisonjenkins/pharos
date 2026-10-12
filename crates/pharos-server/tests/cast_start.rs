@@ -186,3 +186,98 @@ async fn the_owner_alone_is_told_to_stop_its_local_player() {
         "a refused start leaves the caller's player alone"
     );
 }
+
+fn seat_total(event: &str, reason: &str) -> u64 {
+    cast_rig::counter(
+        "pharos_cast_seat_total",
+        &[("event", event), ("reason", reason)],
+    )
+}
+
+#[actix_web::test]
+async fn a_tv_running_another_app_is_refused_with_tv_busy_naming_the_app() {
+    let rig = CastRig::new().await;
+    rig.factory.set_occupancy(
+        TV,
+        pharos_cast::castv2::Occupancy::ForeignApp {
+            app_id: "CC1AD845".into(),
+            display_name: Some("Default Media Receiver".into()),
+        },
+    );
+    let before = seat_total("rejected", "tv_busy");
+
+    let (status, body) = rig.play_on_tv(&rig.alice).await;
+
+    assert_eq!(status, 409, "{body}");
+    assert!(body.starts_with("tv_busy"), "{body}");
+    assert!(
+        body.contains("CC1AD845"),
+        "the reason names the app: {body}"
+    );
+    assert_eq!(seat_total("rejected", "tv_busy"), before + 1);
+    assert!(rig.service.snapshot().await.is_empty());
+    assert!(rig.receiver.commands().is_empty(), "the TV was left alone");
+}
+
+#[actix_web::test]
+async fn a_tv_that_is_slow_to_load_gets_its_seat_without_holding_the_group() {
+    let rig = CastRig::new().await;
+    rig.receiver.configure(|c| c.command_latency_ms = 1_500);
+
+    let started = std::time::Instant::now();
+    let (status, body) = rig.play_on_tv(&rig.alice).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the request does not wait for the TV to load"
+    );
+
+    // While the TV is still loading, the Player's seek is not held by it.
+    rig.assert_players_not_frozen(&[rig.bob.member]).await;
+    rig.wait_cast_state(pharos_cast::obs::ConnState::Following)
+        .await;
+    assert_eq!(rig.service.snapshot().await.len(), 1);
+}
+
+#[actix_web::test]
+async fn a_tv_that_never_reports_the_item_ends_the_cast_with_a_reason() {
+    let mut rig = CastRig::new().await;
+    rig.receiver.configure(|c| c.command_latency_ms = 3_600_000);
+    let (lost, ended) = (
+        seat_total("lost", "tv_unreachable"),
+        seat_total("ended", "tv_unreachable"),
+    );
+    assert_eq!(rig.play_on_tv(&rig.alice).await.0, 204);
+    let token = rig.tv_token();
+    cast_rig::drain(&mut rig.alice.rx);
+
+    // The driver's load bound (30 s) is the only way out: real time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    while !rig.service.snapshot().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cast never gave up on a TV that does not load"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert_eq!(seat_total("lost", "tv_unreachable"), lost + 1);
+    assert_eq!(seat_total("ended", "tv_unreachable"), ended + 1);
+    assert_eq!(rig.token_status(&token).await, 401);
+    cast_rig::wait_msg(&mut rig.alice.rx, "owner caught up", |m| {
+        matches!(m, pharos_sync::messages::ServerMsg::PlayQueue { .. })
+    })
+    .await;
+}
+
+#[actix_web::test]
+async fn the_tv_session_id_is_the_same_after_a_restart() {
+    let first = CastRig::new().await;
+    let before = first.tv_session(&first.bob).await["Id"].clone();
+    drop(first);
+
+    let second = CastRig::new().await;
+    let after = second.tv_session(&second.bob).await["Id"].clone();
+    assert_eq!(before, after, "a new AppState from the same config");
+    assert_eq!(after, second.tv_id.as_str());
+}

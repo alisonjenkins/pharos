@@ -347,6 +347,38 @@ impl CastRig {
         panic!("the cast never reached {want:?}");
     }
 
+    /// A Seek by Bob opens its gate as soon as every Player in `players` has
+    /// acked: nothing waits on the TV, whether its seat is lost or gone.
+    pub async fn assert_players_not_frozen(&self, players: &[MemberId]) {
+        self.group
+            .tx
+            .send(GroupMsg::SeekTo {
+                sender: self.bob.member,
+                position_ms: 300_000,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        for member_id in players {
+            self.group
+                .tx
+                .send(GroupMsg::MemberReady {
+                    member_id: *member_id,
+                    position_ms: 300_000,
+                    playlist_item_id: None,
+                    is_playing: false,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_ne!(
+            self.group_play_state().await,
+            pharos_sync::messages::GroupPlayState::Waiting,
+            "a gate is still held after the only Player acked"
+        );
+    }
+
     /// Wait until the cast service holds no seat.
     pub async fn wait_cast_gone(&self) {
         for _ in 0..400 {
