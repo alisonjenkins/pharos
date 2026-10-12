@@ -6,10 +6,10 @@
 #[path = "common/cast_rig.rs"]
 mod cast_rig;
 
-use cast_rig::{counter, eventually, CastRig};
+use cast_rig::{counter, drain, eventually, wait_msg, CastRig};
 use pharos_cast::obs::ConnState;
 use pharos_sync::group::GroupMsg;
-use pharos_sync::messages::{GroupPlayState, MemberId};
+use pharos_sync::messages::{GroupPlayState, MemberId, ServerMsg};
 use std::time::Duration;
 
 fn seat_total(event: &str, reason: &str) -> u64 {
@@ -230,4 +230,101 @@ async fn a_dissolved_group_ends_the_cast_with_group_gone_and_revokes_the_token()
 
     assert_eq!(seat_total("ended", "group_gone"), before + 1);
     assert_eq!(rig.token_status(&token).await, 401, "V171");
+}
+
+fn restart_messages(msgs: &[ServerMsg]) -> Vec<&'static str> {
+    msgs.iter()
+        .filter(|m| {
+            matches!(
+                m,
+                ServerMsg::Joined { .. } | ServerMsg::PlayQueue { .. } | ServerMsg::Play { .. }
+            )
+        })
+        .map(ServerMsg::kind)
+        .collect()
+}
+
+#[actix_web::test]
+async fn ending_a_cast_catches_the_owner_up_so_its_local_player_restarts() {
+    let (mut rig, _token) = rig_casting().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain(&mut rig.alice.rx);
+    drain(&mut rig.bob.rx);
+
+    let (status, body) = rig
+        .post(
+            &rig.alice,
+            &format!("/Sessions/{}/Playing/Stop", rig.tv_id),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+
+    // The late-joiner catch-up is what jellyfin-web needs after its player was
+    // stopped at hand-off: group state, the queue at the live position, Play.
+    wait_msg(&mut rig.alice.rx, "Joined", |m| {
+        matches!(m, ServerMsg::Joined { .. })
+    })
+    .await;
+    let queue = wait_msg(&mut rig.alice.rx, "PlayQueue", |m| {
+        matches!(m, ServerMsg::PlayQueue { .. })
+    })
+    .await;
+    match queue {
+        ServerMsg::PlayQueue {
+            reason,
+            items,
+            start_position_ms,
+            is_playing,
+            ..
+        } => {
+            assert_eq!(reason, "user_joined");
+            assert_eq!(
+                items.first().map(|i| i.item_id.as_str()),
+                Some(cast_rig::ITEM)
+            );
+            assert!(is_playing);
+            assert!(
+                start_position_ms >= cast_rig::START_MS
+                    && start_position_ms < cast_rig::START_MS + 30_000,
+                "restarts at the group position, got {start_position_ms}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    wait_msg(&mut rig.alice.rx, "Play", |m| {
+        matches!(m, ServerMsg::Play { .. })
+    })
+    .await;
+
+    eventually("the TV session is closed in an orderly way", || {
+        rig.receiver
+            .commands()
+            .iter()
+            .any(|c| c.body.name() == "Stop")
+    })
+    .await;
+    assert_eq!(
+        restart_messages(&drain(&mut rig.bob.rx)),
+        Vec::<&str>::new(),
+        "other members are not re-synced"
+    );
+}
+
+#[actix_web::test]
+async fn an_owner_who_leaves_is_not_caught_up_into_the_group_it_is_leaving() {
+    let (mut rig, _token) = rig_casting().await;
+    drain(&mut rig.alice.rx);
+
+    let (status, body) = rig.post(&rig.alice, "/SyncPlay/Leave", None).await;
+    assert_eq!(status, 204, "{body}");
+
+    wait_msg(&mut rig.alice.rx, "GroupLeft", |m| {
+        matches!(m, ServerMsg::GroupLeft)
+    })
+    .await;
+    assert_eq!(
+        restart_messages(&drain(&mut rig.alice.rx)),
+        Vec::<&str>::new()
+    );
 }

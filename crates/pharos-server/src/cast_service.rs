@@ -839,6 +839,18 @@ impl<F: TransportFactory> Actor<F> {
             return;
         };
         self.teardown(&mut cast, by, reason).await;
+        // The owner's local player was stopped at hand-off; the late-joiner
+        // catch-up restarts it at the group's position. A leaving owner is
+        // about to be removed, so catching it up would only contradict GroupLeft.
+        if reason != CastReason::OwnerLeft {
+            let _ = cast
+                .group
+                .tx
+                .send(GroupMsg::ResyncMember {
+                    member_id: cast.owner_member,
+                })
+                .await;
+        }
         tracing::info!(
             tv = %cast.tv, owner = %cast.owner_name, group = %cast.group.group_id,
             reason = reason.label(), "cast ended"
