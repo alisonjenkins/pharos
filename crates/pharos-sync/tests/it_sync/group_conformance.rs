@@ -658,3 +658,120 @@ async fn roster_keeps_members_of_different_casts_apart() {
     let (_c, roster) = join_roster(&h, &sinks, "carol").await;
     assert_eq!(roster.len(), 3, "roster: {roster:?}");
 }
+
+fn ordered_id(n: u128) -> MemberId {
+    MemberId(uuid::Uuid::from_u128(n))
+}
+
+async fn add_member_with_id(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    id: MemberId,
+    name: &str,
+) -> mpsc::Receiver<ServerMsg> {
+    let (tx, rx) = mpsc::channel(64);
+    sinks.insert(id, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: id,
+        name: name.into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    rx
+}
+
+fn tv_cast() -> Option<CastBinding> {
+    Some(CastBinding {
+        tv: "Living Room".into(),
+        owner: "ali".into(),
+    })
+}
+
+/// T057 — a CastSeat with a lower id than a Player must lose the election:
+/// when the leader leaves, the Player takes over, never the seat.
+#[tokio::test]
+async fn leader_removed_hands_over_to_a_player_not_a_lower_id_seat() {
+    let (h, sinks) = spawn_group();
+    let leader = ordered_id(10);
+    let seat = ordered_id(11);
+    let player = ordered_id(12);
+    let _l = add_member_with_id(&h, &sinks, leader, "leader").await;
+    let _s = add_member_with_id(&h, &sinks, seat, "tv").await;
+    let mut p_rx = add_member_with_id(&h, &sinks, player, "player").await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: leader })
+        .await
+        .unwrap();
+    let change = wait_for(&mut p_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::LeaderChange { .. })
+    })
+    .await;
+    assert!(
+        matches!(change, Some(ServerMsg::LeaderChange { leader }) if leader == player),
+        "expected LeaderChange to the Player, got {change:?}"
+    );
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+/// T057 — re-classifying the current leader as a non-Player moves leadership
+/// to a connected Player and announces it.
+#[tokio::test]
+async fn reclassifying_the_leader_as_a_seat_re_elects_a_player() {
+    let (h, sinks) = spawn_group();
+    let seat = ordered_id(20);
+    let player = ordered_id(21);
+    let _s = add_member_with_id(&h, &sinks, seat, "tv").await;
+    let mut p_rx = add_member_with_id(&h, &sinks, player, "player").await;
+    assert_eq!(snapshot(&h).await.leader, Some(seat));
+    drain(&mut p_rx).await;
+
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    let change = wait_for(&mut p_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::LeaderChange { .. })
+    })
+    .await;
+    assert!(
+        matches!(change, Some(ServerMsg::LeaderChange { leader }) if leader == player),
+        "expected LeaderChange to the Player, got {change:?}"
+    );
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+/// T057 — a non-Player that leads (no Player was around) yields as soon as a
+/// Player joins.
+#[tokio::test]
+async fn a_joining_player_takes_leadership_from_a_non_player() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(30);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "phone").await;
+    set_kind(&h, ctrl, MemberKind::Controller, None).await;
+    assert_eq!(snapshot(&h).await.leader, Some(ctrl));
+
+    let player = ordered_id(31);
+    let _p = add_member_with_id(&h, &sinks, player, "player").await;
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+/// T057 — with no Player at all the group still has a leader.
+#[tokio::test]
+async fn an_all_non_player_group_still_has_a_leader() {
+    let (h, sinks) = spawn_group();
+    let a = ordered_id(40);
+    let b = ordered_id(41);
+    let _a = add_member_with_id(&h, &sinks, a, "phone").await;
+    let _b = add_member_with_id(&h, &sinks, b, "tv").await;
+    set_kind(&h, a, MemberKind::Controller, None).await;
+    set_kind(&h, b, MemberKind::CastSeat, None).await;
+    // `a` yielded to the still-Player `b` first; `b` then became a seat with
+    // nobody left to yield to, so it keeps the lead.
+    assert_eq!(snapshot(&h).await.leader, Some(b));
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: b })
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&h).await.leader, Some(a));
+}

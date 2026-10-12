@@ -2268,8 +2268,22 @@ impl GroupState {
         self.enter_waiting(pending, resume, position_ms, GateReason::Seek, at_server_ms);
     }
 
-    /// Lowest-MemberId-wins election. Deterministic, no voting needed.
+    /// Lowest-MemberId-wins election among Players. Deterministic, no voting
+    /// needed.
     fn elect_leader(&mut self) {
+        // A Controller or CastSeat never acks and has no player to command, so
+        // while any Player is connected only Players are candidates. With no
+        // connected Player the pool is the whole roster, so a group of only
+        // non-players still has a leader.
+        let any_player = self
+            .members
+            .values()
+            .any(|m| m.kind == MemberKind::Player && m.connected);
+        let candidates = || {
+            self.members
+                .iter()
+                .filter(move |(_, m)| !any_player || (m.kind == MemberKind::Player && m.connected))
+        };
         // Prefer the lowest-id member that is still LIVE (seen within
         // MEMBER_TTL_MS). A dead-socket ghost lingers in the roster for up to
         // ~150s before the T83 prune removes it; electing it as leader would
@@ -2278,15 +2292,26 @@ impl GroupState {
         // to plain lowest-id when none look live (e.g. right after a deploy,
         // before anyone has re-pinged) so the group is never leaderless.
         let now = tokio::time::Instant::now();
-        let live_min = self
-            .members
-            .iter()
+        let live_min = candidates()
             .filter(|(_, m)| {
                 now.saturating_duration_since(m.last_seen).as_millis() as u64 <= MEMBER_TTL_MS
             })
             .map(|(id, _)| *id)
             .min();
-        self.leader = live_min.or_else(|| self.members.keys().min().copied());
+        self.leader = live_min.or_else(|| candidates().map(|(id, _)| *id).min());
+    }
+
+    /// True when a non-Player leads while a connected Player could.
+    fn leader_should_yield_to_player(&self) -> bool {
+        let leads_non_player = self
+            .leader
+            .and_then(|id| self.members.get(&id))
+            .is_some_and(|m| m.kind != MemberKind::Player);
+        leads_non_player
+            && self
+                .members
+                .values()
+                .any(|m| m.kind == MemberKind::Player && m.connected)
     }
 
     fn lead_time_ms(&self) -> u64 {
@@ -2999,6 +3024,19 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
     release_gate_holds_for(state, member_id);
 }
 
+/// Move leadership off a non-Player once a connected Player exists, announcing
+/// the change the same way `remove_member` does (one `LeaderChange`, no
+/// playback command).
+fn yield_leadership_to_player(state: &mut GroupState) {
+    if !state.leader_should_yield_to_player() {
+        return;
+    }
+    state.elect_leader();
+    if let Some(new_leader) = state.leader {
+        state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
+    }
+}
+
 /// Free any readiness gate / buffering freeze that is only still waiting on
 /// `member_id` because it can no longer ack — because it LEFT (roster already
 /// dropped it) or its SOCKET dropped (still in the roster for the reconnect
@@ -3181,6 +3219,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
                     state.force_reseek_one(member_id, secs);
                 }
+                yield_leadership_to_player(state);
                 return;
             }
             let was_empty = state.members.is_empty();
@@ -3228,6 +3267,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 device: None,
             };
             state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
+            yield_leadership_to_player(state);
             // B183 — a queue that was only SEEDED has never been sent to anyone,
             // so no client holds its `playlist_item_id` and the group is not
             // startable: the joiner below would get a catch-up nobody else can
@@ -3265,6 +3305,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     rec.connected = true;
                     record_socket_return(rec)
                 });
+                yield_leadership_to_player(state);
                 // A reconnect (page reload / deploy rollover) hands a FRESH
                 // jellyfin-web Manager whose `groupInfo` is null and whose
                 // SyncPlay is not enabled. Lead the catch-up with `Joined`
@@ -3871,6 +3912,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     release_gate_holds_for(state, member);
                 }
             }
+            yield_leadership_to_player(state);
         }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             if let Some(rec) = state.members.get_mut(&member_id) {
