@@ -163,6 +163,69 @@ fn resident_and_hybrid_encode_the_same_segment_on_real_vaapi() {
     assert!(text.trim().starts_with("h264,1280,720,yuv420p"), "{text}");
 }
 
+fn start_time(path: &Path) -> f64 {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .arg("packet=pts_time")
+        .args(["-read_intervals", "%+#1", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("ffprobe");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines()
+        .next()
+        .and_then(|l| l.trim().trim_end_matches(',').parse().ok())
+        .unwrap_or_else(|| panic!("first pts_time not found in {text:?}"))
+}
+
+/// A mid-file segment lands on the same place on the shared timeline whichever
+/// pipeline produced it: the seek, the preroll trim and `-output_ts_offset`
+/// all have to agree, or consecutive segments gap or overlap at the join.
+#[test]
+fn a_mid_file_segment_has_the_same_frames_and_start_time_on_both_pipelines() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let Some(dev) = usable_vaapi_device() else {
+        eprintln!("skipping: no usable VAAPI render node (vainfo)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.mp4");
+    synth(&input, "yuv420p", 30);
+    let mut o = opts(SourceVideoKind::Plain8BitSdr, SourceCodec::H264);
+    // Segment 3 of a 6 s grid; the 15 s preroll puts the decoder seek at 3 s.
+    o.start_position_ticks = 180_000_000;
+    o.duration_ticks = Some(60_000_000);
+
+    let run = |pipeline: VaapiPipeline| {
+        let out = dir.path().join(format!("mid_{}.ts", pipeline.label()));
+        let args = ffmpeg_transcode_args_pipeline(
+            input.to_str().unwrap(),
+            &o,
+            dev,
+            out.to_str().unwrap(),
+            DecodeOffload::Allowed,
+            None,
+            pipeline,
+        );
+        (run_frames(&args, &out), start_time(&out))
+    };
+    let (hybrid_frames, hybrid_start) = run(VaapiPipeline::Hybrid);
+    let (resident_frames, resident_start) = run(VaapiPipeline::Resident);
+    assert_eq!(hybrid_frames, 144);
+    assert_eq!(resident_frames, hybrid_frames);
+    assert!(
+        (hybrid_start - 18.0).abs() < 0.1,
+        "hybrid should start at the segment's timeline position: {hybrid_start}"
+    );
+    assert!(
+        (resident_start - hybrid_start).abs() < 1e-3,
+        "start_time differs: hybrid {hybrid_start} resident {resident_start}"
+    );
+}
+
 #[test]
 fn a_ten_bit_source_is_not_resident_and_still_encodes_on_the_hybrid_path() {
     if !ffmpeg_available() {
