@@ -1,6 +1,7 @@
 //! CASTV2 wire format and transport: one protobuf message, 4-byte big-endian
 //! length framing, TLS to port 8009.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_util::codec::{Decoder, Encoder, Framed, LengthDelimitedCodec};
 
-use crate::messages::ReceiverCommand;
+use crate::messages::{ReceiverCommand, ReceiverReport};
 use crate::transport::{AppSession, CastError, CastTransport, TransportEvent};
 
 /// Chromium's own receiver rejects frames above 64 KiB; 1 MiB leaves room for
@@ -273,6 +274,8 @@ const RECEIVER_ID: &str = "receiver-0";
 /// The Chromecast home screen; it is reported as a running application.
 const BACKDROP_APP_ID: &str = "E8C28D3C";
 pub const DEFAULT_PORT: u16 = 8009;
+/// `recv` re-arms after this much silence; liveness is the heartbeat's job.
+const IDLE_WAIT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningApp {
@@ -413,6 +416,10 @@ pub struct CastV2Config {
     pub connect_timeout: Duration,
     /// Bound on LAUNCH to a usable transportId, and on GET_STATUS.
     pub request_timeout: Duration,
+    /// How often we PING the receiver.
+    pub ping_interval: Duration,
+    /// Silence from the device for this long means the link is dead.
+    pub heartbeat_timeout: Duration,
 }
 
 impl Default for CastV2Config {
@@ -421,6 +428,27 @@ impl Default for CastV2Config {
             connect_timeout: Duration::from_secs(5),
             // A cold Default Media Receiver launch takes a few seconds.
             request_timeout: Duration::from_secs(15),
+            // Chromecast senders ping about every 5 s and give up after 3 misses.
+            ping_interval: Duration::from_secs(5),
+            heartbeat_timeout: Duration::from_secs(15),
+        }
+    }
+}
+
+enum Next {
+    Frame(CastMessage),
+    /// Consumed internally (a report went to the backlog, or the link ended).
+    Buffered,
+    Timeout,
+}
+
+fn decode_report(msg: &CastMessage) -> Option<ReceiverReport> {
+    let payload = msg.payload_utf8.as_deref()?;
+    match serde_json::from_str(payload) {
+        Ok(report) => Some(report),
+        Err(e) => {
+            tracing::warn!(error = %e, payload = %truncate(payload), "undecodable cast receiver report");
+            None
         }
     }
 }
@@ -433,6 +461,7 @@ enum Cmd {
 
 enum Inbound {
     Frame(CastMessage),
+    HeartbeatLost,
     Closed(String),
 }
 
@@ -448,24 +477,60 @@ impl Drop for Conn {
     }
 }
 
+fn heartbeat_message(destination: &str, kind: &str) -> CastMessage {
+    CastMessage::string(
+        SENDER_ID,
+        destination,
+        NS_HEARTBEAT,
+        serde_json::json!({"type": kind}).to_string(),
+    )
+}
+
+/// Owns the socket. Heartbeats are answered here, not in `recv`, so the link
+/// stays alive while the caller is busy elsewhere. Any inbound frame counts as
+/// proof of life, not only PONG: a busy device may delay its PONG behind other
+/// traffic but cannot send anything at all once the link is dead.
 async fn io_task<S>(
     mut framed: Framed<S, CastCodec>,
     mut out: mpsc::Receiver<Cmd>,
     inbound: mpsc::UnboundedSender<Inbound>,
+    ping_interval: Duration,
+    heartbeat_timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut ping = tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_rx = Instant::now();
     let reason = loop {
         tokio::select! {
             frame = framed.next() => match frame {
                 Some(Ok(msg)) => {
-                    if inbound.send(Inbound::Frame(msg)).is_err() {
+                    last_rx = Instant::now();
+                    if msg.namespace == NS_HEARTBEAT {
+                        let is_ping = parse_receiver(&msg).is_some_and(|e| e.kind == "PING");
+                        if is_ping {
+                            if let Err(e) = framed.send(heartbeat_message(&msg.source_id, "PONG")).await {
+                                break format!("writing to the cast device failed: {e}");
+                            }
+                        }
+                    } else if inbound.send(Inbound::Frame(msg)).is_err() {
                         return;
                     }
                 }
                 Some(Err(e)) => break format!("reading from the cast device failed: {e}"),
                 None => break "the cast device closed the connection".to_owned(),
             },
+            _ = ping.tick() => {
+                if let Err(e) = framed.send(heartbeat_message(RECEIVER_ID, "PING")).await {
+                    break format!("writing to the cast device failed: {e}");
+                }
+            }
+            () = tokio::time::sleep_until(last_rx + heartbeat_timeout) => {
+                tracing::warn!(silent_for = ?last_rx.elapsed(), "cast heartbeat lost");
+                let _ = inbound.send(Inbound::HeartbeatLost);
+                return;
+            }
             cmd = out.recv() => match cmd {
                 Some(Cmd::Send(msg)) => {
                     if let Err(e) = framed.send(msg).await {
@@ -495,6 +560,8 @@ pub struct CastV2Transport {
     request_id: u32,
     app: Option<AppSession>,
     terminal: Option<TransportEvent>,
+    /// Reports that arrived while a request (launch, status) was waiting.
+    backlog: VecDeque<TransportEvent>,
 }
 
 impl std::fmt::Debug for CastV2Transport {
@@ -532,6 +599,7 @@ impl CastV2Transport {
             request_id: 0,
             app: None,
             terminal: None,
+            backlog: VecDeque::new(),
         }
     }
 
@@ -583,25 +651,62 @@ impl CastV2Transport {
         .await
     }
 
-    /// Next frame from the device, or why the connection ended.
-    async fn next_frame(&mut self, deadline: Instant) -> Result<Option<CastMessage>, CastError> {
+    /// Next thing from the device, or why the connection ended. Cancel-safe:
+    /// the channel receive is the only await and state changes follow it
+    /// synchronously.
+    async fn next_frame(&mut self, deadline: Instant) -> Result<Next, CastError> {
         if self.terminal.is_some() {
             return Err(CastError::Closed);
         }
         let conn = self.conn.as_mut().ok_or(CastError::Closed)?;
-        match tokio::time::timeout_at(deadline, conn.inbound.recv()).await {
-            Err(_) => Ok(None),
-            Ok(Some(Inbound::Frame(msg))) => Ok(Some(msg)),
-            Ok(Some(Inbound::Closed(reason))) => {
+        let inbound = match tokio::time::timeout_at(deadline, conn.inbound.recv()).await {
+            Err(_) => return Ok(Next::Timeout),
+            Ok(inbound) => inbound,
+        };
+        match inbound {
+            Some(Inbound::Frame(msg)) => Ok(self.route(msg)),
+            Some(Inbound::HeartbeatLost) => {
+                self.terminal = Some(TransportEvent::HeartbeatLost);
+                Err(CastError::Closed)
+            }
+            Some(Inbound::Closed(reason)) => {
                 self.terminal = Some(TransportEvent::Closed { reason });
                 Err(CastError::Closed)
             }
-            Ok(None) => {
+            None => {
                 self.terminal = Some(TransportEvent::Closed {
                     reason: "the connection task ended".to_owned(),
                 });
                 Err(CastError::Closed)
             }
+        }
+    }
+
+    fn route(&mut self, msg: CastMessage) -> Next {
+        match msg.namespace.as_str() {
+            NS_CONNECTSDK => {
+                if let Some(report) = decode_report(&msg) {
+                    self.backlog.push_back(TransportEvent::Report(report));
+                }
+                Next::Buffered
+            }
+            NS_CONNECTION => {
+                let closed = parse_receiver(&msg).is_some_and(|e| e.kind == "CLOSE");
+                if closed {
+                    self.terminal = Some(TransportEvent::Closed {
+                        reason: format!(
+                            "{} closed the virtual connection",
+                            if msg.source_id == RECEIVER_ID {
+                                "the receiver".to_owned()
+                            } else {
+                                format!("app {}", msg.source_id)
+                            }
+                        ),
+                    });
+                }
+                Next::Buffered
+            }
+            _ => Next::Frame(msg),
         }
     }
 
@@ -616,11 +721,15 @@ impl CastV2Transport {
         .await?;
         let deadline = Instant::now() + self.config.request_timeout;
         loop {
-            let Some(msg) = self.next_frame(deadline).await? else {
-                return Err(CastError::Protocol(format!(
-                    "no RECEIVER_STATUS for GET_STATUS {request_id} within {:?}",
-                    self.config.request_timeout
-                )));
+            let msg = match self.next_frame(deadline).await? {
+                Next::Frame(msg) => msg,
+                Next::Buffered => continue,
+                Next::Timeout => {
+                    return Err(CastError::Protocol(format!(
+                        "no RECEIVER_STATUS for GET_STATUS {request_id} within {:?}",
+                        self.config.request_timeout
+                    )));
+                }
             };
             if msg.namespace != NS_RECEIVER {
                 continue;
@@ -650,6 +759,7 @@ impl CastTransport for CastV2Transport {
         self.conn = None;
         self.app = None;
         self.terminal = None;
+        self.backlog.clear();
 
         let timeout_error = |what: &str, after: Duration| {
             io::Error::new(
@@ -684,6 +794,8 @@ impl CastTransport for CastV2Transport {
             Framed::new(tls, CastCodec::default()),
             out_rx,
             in_tx,
+            self.config.ping_interval,
+            self.config.heartbeat_timeout,
         ));
         self.conn = Some(Conn {
             out: out_tx,
@@ -712,11 +824,15 @@ impl CastTransport for CastV2Transport {
         let deadline = Instant::now() + self.config.request_timeout;
         let mut last_status = String::from("none received");
         let session = loop {
-            let Some(msg) = self.next_frame(deadline).await? else {
-                return Err(launch_error(format!(
-                    "timed out after {:?} waiting for RECEIVER_STATUS with a transportId; last status: {last_status}",
-                    self.config.request_timeout
-                )));
+            let msg = match self.next_frame(deadline).await? {
+                Next::Frame(msg) => msg,
+                Next::Buffered => continue,
+                Next::Timeout => {
+                    return Err(launch_error(format!(
+                        "timed out after {:?} waiting for RECEIVER_STATUS with a transportId; last status: {last_status}",
+                        self.config.request_timeout
+                    )));
+                }
             };
             if msg.namespace != NS_RECEIVER {
                 continue;
@@ -780,20 +896,18 @@ impl CastTransport for CastV2Transport {
     }
 
     async fn recv(&mut self) -> TransportEvent {
-        if let Some(event) = &self.terminal {
-            return event.clone();
-        }
         loop {
-            match self
-                .next_frame(Instant::now() + Duration::from_secs(3600))
-                .await
-            {
-                Ok(_) => {}
-                Err(_) => {
-                    return self.terminal.clone().unwrap_or(TransportEvent::Closed {
-                        reason: "not connected".to_owned(),
-                    });
-                }
+            if let Some(event) = self.backlog.pop_front() {
+                return event;
+            }
+            if let Some(event) = &self.terminal {
+                return event.clone();
+            }
+            let deadline = Instant::now() + IDLE_WAIT;
+            if self.next_frame(deadline).await.is_err() {
+                return self.terminal.clone().unwrap_or(TransportEvent::Closed {
+                    reason: "not connected".to_owned(),
+                });
             }
         }
     }
@@ -904,7 +1018,7 @@ mod transport_tests {
     use tokio_rustls::TlsAcceptor;
 
     use super::*;
-    use crate::messages::{AccessToken, CommandBody};
+    use crate::messages::{AccessToken, CommandBody, PlayItem, PlayNowOptions};
 
     const APP: &str = "F007D354";
     const TRANSPORT: &str = "transport-1";
@@ -912,14 +1026,27 @@ mod transport_tests {
     /// What the in-process receiver does; the defaults are a healthy device.
     #[derive(Clone)]
     struct Script {
+        answer_ping: bool,
+        ping_client: bool,
+        on_play_now: OnPlayNow,
         launch_error: bool,
         /// Status for GET_STATUS.
         applications: Value,
     }
 
+    #[derive(Clone, Copy)]
+    enum OnPlayNow {
+        Progress,
+        ProgressThenHangUp,
+        CloseAppConnection,
+    }
+
     impl Default for Script {
         fn default() -> Self {
             Self {
+                answer_ping: true,
+                ping_client: false,
+                on_play_now: OnPlayNow::Progress,
                 launch_error: false,
                 applications: json!([]),
             }
@@ -932,8 +1059,9 @@ mod transport_tests {
         /// `"<type> -> <destination>"` for every tp.connection message.
         connections: Arc<Mutex<Vec<String>>>,
         /// connectsdk payloads received.
-        #[allow(dead_code)]
         commands: Arc<Mutex<Vec<Value>>>,
+        /// `PING`/`PONG` received from the client.
+        heartbeats: Arc<Mutex<Vec<String>>>,
         _task: JoinHandle<()>,
     }
 
@@ -965,13 +1093,25 @@ mod transport_tests {
         let port = listener.local_addr().unwrap().port();
         let connections = Arc::new(Mutex::new(Vec::new()));
         let commands = Arc::new(Mutex::new(Vec::new()));
-        let (conns, cmds) = (Arc::clone(&connections), Arc::clone(&commands));
+        let heartbeats = Arc::new(Mutex::new(Vec::new()));
+        let (conns, cmds, beats) = (
+            Arc::clone(&connections),
+            Arc::clone(&commands),
+            Arc::clone(&heartbeats),
+        );
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     continue;
                 };
-                serve(tls, script.clone(), Arc::clone(&conns), Arc::clone(&cmds)).await;
+                serve(
+                    tls,
+                    script.clone(),
+                    Arc::clone(&conns),
+                    Arc::clone(&cmds),
+                    Arc::clone(&beats),
+                )
+                .await;
             }
         });
         FakeDevice {
@@ -979,6 +1119,7 @@ mod transport_tests {
             fingerprint,
             connections,
             commands,
+            heartbeats,
             _task: task,
         }
     }
@@ -988,8 +1129,20 @@ mod transport_tests {
         script: Script,
         connections: Arc<Mutex<Vec<String>>>,
         commands: Arc<Mutex<Vec<Value>>>,
+        heartbeats: Arc<Mutex<Vec<String>>>,
     ) {
         let mut framed = Framed::new(stream, CastCodec::default());
+        if script.ping_client {
+            framed
+                .send(CastMessage::string(
+                    RECEIVER_ID,
+                    SENDER_ID,
+                    NS_HEARTBEAT,
+                    r#"{"type":"PING"}"#,
+                ))
+                .await
+                .unwrap();
+        }
         while let Some(Ok(msg)) = framed.next().await {
             let body: Value =
                 serde_json::from_str(msg.payload_utf8.as_deref().unwrap_or("{}")).unwrap();
@@ -1034,8 +1187,39 @@ mod transport_tests {
                         framed.send(m).await.unwrap();
                     }
                 }
+                (NS_HEARTBEAT, _) => {
+                    heartbeats.lock().unwrap().push(kind.clone());
+                    if kind == "PING" && script.answer_ping {
+                        let m = answer(NS_HEARTBEAT, RECEIVER_ID, r#"{"type":"PONG"}"#.to_owned());
+                        framed.send(m).await.unwrap();
+                    }
+                }
                 (NS_CONNECTSDK, _) => {
+                    let is_play_now = body["command"] == "PlayNow";
                     commands.lock().unwrap().push(body);
+                    if is_play_now {
+                        let progress = json!({
+                            "type": "playbackprogress",
+                            "data": {"PlayState": {"PositionTicks": 15_000_000, "IsPaused": false, "ItemId": "abc"}}
+                        });
+                        match script.on_play_now {
+                            OnPlayNow::Progress | OnPlayNow::ProgressThenHangUp => {
+                                let m = answer(NS_CONNECTSDK, TRANSPORT, progress.to_string());
+                                framed.send(m).await.unwrap();
+                                if matches!(script.on_play_now, OnPlayNow::ProgressThenHangUp) {
+                                    return;
+                                }
+                            }
+                            OnPlayNow::CloseAppConnection => {
+                                let m = answer(
+                                    NS_CONNECTION,
+                                    TRANSPORT,
+                                    r#"{"type":"CLOSE"}"#.to_owned(),
+                                );
+                                framed.send(m).await.unwrap();
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1059,6 +1243,8 @@ mod transport_tests {
         CastV2Config {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_millis(600),
+            ping_interval: Duration::from_millis(30),
+            heartbeat_timeout: Duration::from_millis(250),
         }
     }
 
@@ -1180,6 +1366,150 @@ mod transport_tests {
                 session_id: Some("sess-1".into())
             }
         );
+    }
+
+    fn play_now() -> ReceiverCommand {
+        ReceiverCommand {
+            body: CommandBody::PlayNow(PlayNowOptions {
+                items: vec![PlayItem {
+                    id: "abc".into(),
+                    kind: "Movie".into(),
+                }],
+                start_index: 0,
+                start_position_ticks: 0,
+                media_source_id: None,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+            }),
+            server_address: "http://pharos:8096".into(),
+            access_token: AccessToken::new("tok-123"),
+            receiver_name: Some("Living Room TV".into()),
+            user_id: None,
+            device_id: None,
+            server_id: None,
+            server_version: None,
+            max_bitrate: None,
+        }
+    }
+
+    async fn launched(device: &FakeDevice) -> CastV2Transport {
+        let mut t = transport(device, TlsPolicy::AcceptAny);
+        t.connect().await.unwrap();
+        t.launch(APP).await.unwrap();
+        t
+    }
+
+    #[tokio::test]
+    async fn play_now_round_trips_to_a_decoded_progress_report() {
+        let device = start_device(Script::default()).await;
+        let mut t = launched(&device).await;
+        t.send(&play_now()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), t.recv())
+            .await
+            .unwrap();
+        let TransportEvent::Report(report) = event else {
+            panic!("expected a report, got {event:?}");
+        };
+        assert!(matches!(report, ReceiverReport::PlaybackProgress(_)));
+        assert_eq!(
+            report.play_state().unwrap().position_ticks,
+            Some(15_000_000)
+        );
+
+        let sent = wait_for_len(&device.commands, 1).await;
+        assert_eq!(sent[0]["command"], "PlayNow");
+        assert_eq!(sent[0]["options"]["items"][0]["Id"], "abc");
+        assert_eq!(sent[0]["serverAddress"], "http://pharos:8096");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_keeps_the_link_alive_and_recv_is_cancel_safe() {
+        let device = start_device(Script::default()).await;
+        let mut t = launched(&device).await;
+        // Several times the heartbeat timeout, with recv dropped each round.
+        for _ in 0..10 {
+            let r = tokio::time::timeout(Duration::from_millis(80), t.recv()).await;
+            assert!(r.is_err(), "unexpected event {r:?}");
+        }
+        assert!(wait_for_len(&device.heartbeats, 3)
+            .await
+            .iter()
+            .all(|k| k == "PING"));
+        t.send(&play_now()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), t.recv())
+            .await
+            .unwrap();
+        assert!(matches!(event, TransportEvent::Report(_)), "{event:?}");
+    }
+
+    #[tokio::test]
+    async fn device_ping_is_answered_with_pong() {
+        let device = start_device(Script {
+            ping_client: true,
+            ..Script::default()
+        })
+        .await;
+        let _t = launched(&device).await;
+        let mut beats = Vec::new();
+        for _ in 0..200 {
+            beats = device.heartbeats.lock().unwrap().clone();
+            if beats.iter().any(|k| k == "PONG") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no PONG answered the device PING: {beats:?}");
+    }
+
+    #[tokio::test]
+    async fn silent_device_is_reported_as_heartbeat_lost() {
+        let device = start_device(Script {
+            answer_ping: false,
+            applications: json!([]),
+            ..Script::default()
+        })
+        .await;
+        let mut t = transport(&device, TlsPolicy::AcceptAny);
+        t.connect().await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(3), t.recv())
+            .await
+            .unwrap();
+        assert_eq!(event, TransportEvent::HeartbeatLost);
+        // Sticky, and sends now fail instead of vanishing.
+        assert_eq!(t.recv().await, TransportEvent::HeartbeatLost);
+    }
+
+    #[tokio::test]
+    async fn server_hangup_is_closed_with_a_reason() {
+        let device = start_device(Script {
+            on_play_now: OnPlayNow::ProgressThenHangUp,
+            ..Script::default()
+        })
+        .await;
+        let mut t = launched(&device).await;
+        t.send(&play_now()).await.unwrap();
+        assert!(matches!(t.recv().await, TransportEvent::Report(_)));
+        let TransportEvent::Closed { reason } = t.recv().await else {
+            panic!("expected Closed");
+        };
+        assert!(!reason.is_empty());
+        assert!(matches!(t.recv().await, TransportEvent::Closed { .. }));
+        assert!(matches!(t.send(&play_now()).await, Err(CastError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn app_closing_its_virtual_connection_is_closed() {
+        let device = start_device(Script {
+            on_play_now: OnPlayNow::CloseAppConnection,
+            ..Script::default()
+        })
+        .await;
+        let mut t = launched(&device).await;
+        t.send(&play_now()).await.unwrap();
+        let TransportEvent::Closed { reason } = t.recv().await else {
+            panic!("expected Closed");
+        };
+        assert!(reason.contains(TRANSPORT), "{reason}");
     }
 
     #[tokio::test]
