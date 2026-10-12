@@ -1193,6 +1193,38 @@ impl<P: Prober> FsScanner<P> {
         outcome: &mut ScanOutcome,
         seen: &mut i64,
     ) -> DomainResult<()> {
+        // A probe can wait here for up to `put_flush_interval`, and the
+        // watcher and other scans write the same rows without coordinating
+        // with this buffer. If the file changed since it was stat'd, this
+        // probe describes bytes that are gone and may be older than what a
+        // concurrent writer already stored: do not write it. Stamp the row as
+        // seen with the OLD signature instead, so the sweep keeps it and the
+        // next scan sees the mismatch and probes again.
+        let mut fresh_items = Vec::with_capacity(items.len());
+        let mut fresh_followups = Vec::with_capacity(followups.len());
+        for (item, written) in items.drain(..).zip(followups.drain(..)) {
+            if let Some((mtime, size)) = written.sig {
+                let now = tokio::fs::metadata(&written.item_path)
+                    .await
+                    .ok()
+                    .map(|m| (mtime_secs(&m), m.len()));
+                if now != Some((mtime, size)) {
+                    tracing::info!(
+                        path = %written.item_path.display(),
+                        "file changed while its probe was buffered; not writing the stale probe"
+                    );
+                    store
+                        .mark_seen(written.item_id, scan_id, mtime, size)
+                        .await?;
+                    outcome.skipped += 1;
+                    continue;
+                }
+            }
+            fresh_items.push(item);
+            fresh_followups.push(written);
+        }
+        *items = fresh_items;
+        *followups = fresh_followups;
         if items.is_empty() {
             return Ok(());
         }
@@ -3417,6 +3449,9 @@ mod tests {
         delay: Option<std::time::Duration>,
         // Raise the flag during the Nth probe call (1-based).
         cancel_during: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
+        // Overwrite the file with these bytes while it is being probed, as a
+        // concurrent writer would.
+        rewrite_during: Option<(String, Vec<u8>)>,
     }
 
     impl Prober for FakeProber {
@@ -3428,6 +3463,11 @@ mod tests {
             if let Some((n, flag)) = &self.cancel_during {
                 if nth == *n {
                     flag.store(true, Ordering::SeqCst);
+                }
+            }
+            if let Some((needle, bytes)) = &self.rewrite_during {
+                if path.to_string_lossy().contains(needle.as_str()) {
+                    std::fs::write(path, bytes).unwrap();
                 }
             }
             if let Some(needle) = &self.force_fail_for {
@@ -4293,6 +4333,69 @@ mod tests {
                 r.id
             );
         }
+    }
+
+    fn rewriting(needle: &str) -> FakeProber {
+        FakeProber {
+            rewrite_during: Some((needle.into(), b"changed while probing".to_vec())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_of_a_file_that_changed_while_buffered_is_not_written() {
+        let td = many_files(6).await;
+        let store = MemStore::default();
+        let out = FsScanner::new(rewriting("m002"))
+            .with_probe_concurrency(1)
+            .with_put_batch_size(6)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let ids: HashSet<_> = store.list().await.unwrap().iter().map(|i| i.id).collect();
+        assert!(!ids.contains(&stable_id(&td.path().join("m002.mkv"))));
+        assert_eq!((ids.len(), out.added.len(), out.skipped), (5, 5, 1));
+
+        // The next scan sees the file as it is now and picks it up.
+        let again = FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(again.added.len(), 1);
+        assert_eq!(store.list().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_stale_probe_leaves_the_existing_row_alone_and_unswept() {
+        let td = many_files(6).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let id = stable_id(&td.path().join("m002.mkv"));
+        let before = store.get(id).await.unwrap();
+        write_file(td.path(), "m002.mkv", b"a different size").await;
+
+        let out = FsScanner::new(rewriting("m002"))
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert!(
+            out.removed.is_empty(),
+            "the sweep must not drop it: {out:?}"
+        );
+        assert_eq!(
+            store.get(id).await.unwrap(),
+            before,
+            "stale probe not stored"
+        );
+        // And it is re-probed next time rather than treated as up to date.
+        let next = FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        assert_eq!(next.updated, vec![id]);
     }
 
     #[tokio::test]
