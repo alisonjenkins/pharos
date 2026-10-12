@@ -1571,10 +1571,6 @@ impl<P: Prober> FsScanner<P> {
     }
 }
 
-/// LIB-D7 — the entity side-effects [`merge_metadata_into_item`] hands
-/// back for the caller to link once the media row exists (the joins carry
-/// FKs on the item id, so they must follow `store.put`). Each `Vec` is the
-/// resolved-and-deduped set for one entity kind.
 /// What follows a probed item's row write: the entity joins, artwork, the
 /// seen-stamp and fingerprint, and the added-vs-updated bookkeeping.
 struct WrittenItem {
@@ -1592,6 +1588,10 @@ struct WrittenItem {
     existed: bool,
 }
 
+/// LIB-D7 — the entity side-effects [`merge_metadata_into_item`] hands
+/// back for the caller to link once the media row exists (the joins carry
+/// FKs on the item id, so they must follow `store.put`). Each `Vec` is the
+/// resolved-and-deduped set for one entity kind.
 struct MergedEntities {
     /// Genre names — UNION of the probe `genre` column + NFO `<genre>`.
     genres: Vec<String>,
