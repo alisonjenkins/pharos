@@ -922,3 +922,103 @@ async fn an_unpaired_cast_seat_is_announced() {
         "{seen:?}"
     );
 }
+
+/// T022 — what a Cast seat's channel sink is handed for group pause / unpause /
+/// seek, with the positions the adapter turns into TV commands, and a seat that
+/// never acks (nobody drains or answers on its channel) holds no gate.
+#[tokio::test]
+async fn cast_seat_channel_sink_gets_the_group_commands_and_never_extends_a_gate() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, _p2_rx) = add_member(&h, &sinks, "p2").await;
+    let seat = MemberId::new();
+    let mut seat_rx = sinks.attach_channel(seat, 1, 64);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: seat,
+        name: "tv".into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut seat_rx, Duration::from_millis(500), |m| matches!(
+            m,
+            ServerMsg::Play { position_ms, .. } if (5_000..6_000).contains(position_ms)
+        ))
+        .await
+        .is_some(),
+        "Play at the group position"
+    );
+
+    h.tx.send(GroupMsg::PauseShared { sender: leader })
+        .await
+        .unwrap();
+    let paused_at = match wait_for(&mut seat_rx, Duration::from_millis(500), is_pause).await {
+        Some(ServerMsg::Pause { position_ms, .. }) => position_ms,
+        other => panic!("expected Pause, got {other:?}"),
+    };
+    assert!((5_000..7_000).contains(&paused_at), "{paused_at}");
+
+    h.tx.send(GroupMsg::Unpause { sender: leader })
+        .await
+        .unwrap();
+    match wait_for(&mut seat_rx, Duration::from_millis(500), is_play).await {
+        Some(ServerMsg::Play { position_ms, .. }) => {
+            assert!(
+                (paused_at..paused_at + 1_000).contains(&position_ms),
+                "unpause resumes from the paused position {paused_at}, got {position_ms}"
+            );
+        }
+        other => panic!("expected Play, got {other:?}"),
+    }
+
+    // The seat answers nothing from here on. The Players' acks alone must
+    // release the Seek gate, promptly.
+    drain(&mut leader_rx).await;
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 20_000,
+    })
+    .await
+    .unwrap();
+    match wait_for(&mut seat_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::Seek { .. })
+    })
+    .await
+    {
+        Some(ServerMsg::Seek { position_ms, .. }) => assert_eq!(position_ms, 20_000),
+        other => panic!("expected Seek, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let acked = tokio::time::Instant::now();
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 20_000,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "the gate must open on the Players' acks without the seat"
+    );
+    assert!(
+        acked.elapsed() < Duration::from_millis(800),
+        "the seat extended the gate"
+    );
+}
