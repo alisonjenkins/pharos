@@ -3919,6 +3919,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::SetMemberKind { member, kind, cast } => {
+            let hidden_before: HashSet<MemberId> = state
+                .members
+                .keys()
+                .copied()
+                .filter(|id| state.is_hidden_seat(*id))
+                .collect();
             if let Some(rec) = state.members.get_mut(&member) {
                 rec.kind = kind;
                 rec.cast = cast;
@@ -3926,6 +3932,18 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     rec.buffering = false;
                     release_gate_holds_for(state, member);
                 }
+            }
+            // A seat is announced as a Player when it joins. Once pairing hides
+            // it the others would keep that entry, so retract it.
+            let mut newly_hidden: Vec<(MemberId, String)> = state
+                .members
+                .iter()
+                .filter(|(id, _)| !hidden_before.contains(id) && state.is_hidden_seat(**id))
+                .map(|(id, m)| (*id, m.name.clone()))
+                .collect();
+            newly_hidden.sort_by_key(|(id, _)| *id);
+            for (member_id, name) in newly_hidden {
+                state.broadcast(ServerMsg::MemberLeft { member_id, name });
             }
             yield_leadership_to_player(state);
         }

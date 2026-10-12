@@ -773,6 +773,8 @@ async fn removing_a_paired_seat_sends_no_member_left() {
     let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
     set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
     set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    // Let the pairing (and its retraction of the seat, T059) land first.
+    let _ = snapshot(&h).await;
     drain(&mut w_rx).await;
 
     h.tx.send(GroupMsg::RemoveMember { member_id: seat })
@@ -839,4 +841,66 @@ async fn an_all_non_player_group_still_has_a_leader() {
         .await
         .unwrap();
     assert_eq!(snapshot(&h).await.leader, Some(a));
+}
+
+/// T059 — a seat is announced as a Player when it joins; once re-classified and
+/// paired with its Controller the roster hides it, so the others must be told
+/// it left or they keep a stale second entry for the casting user.
+#[tokio::test]
+async fn pairing_a_freshly_joined_seat_retracts_its_join_announcement() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(70);
+    let watcher = ordered_id(72);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    drain(&mut w_rx).await;
+
+    let seat = ordered_id(71);
+    let _s = add_member_with_id(&h, &sinks, seat, "ali").await;
+    let announced = wait_for(
+        &mut w_rx,
+        Duration::from_millis(500),
+        |m| matches!(m, ServerMsg::MemberJoined { member } if member.member_id == seat),
+    )
+    .await;
+    assert!(announced.is_some(), "the seat joins as a Player first");
+
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    let retracted = wait_for(
+        &mut w_rx,
+        Duration::from_millis(500),
+        |m| matches!(m, ServerMsg::MemberLeft { member_id, .. } if *member_id == seat),
+    )
+    .await;
+    assert!(
+        retracted.is_some(),
+        "the now-hidden seat must be retracted from other members' rosters"
+    );
+}
+
+/// T059 — the retraction happens once, at the moment the pair completes.
+#[tokio::test]
+async fn only_the_newly_hidden_seat_is_retracted() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(80);
+    let seat = ordered_id(81);
+    let watcher = ordered_id(82);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let _s = add_member_with_id(&h, &sinks, seat, "ali").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    drain(&mut w_rx).await;
+
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    // Re-asserting the same kind changes nothing and must say nothing.
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    let _ = snapshot(&h).await;
+    let mut lefts = Vec::new();
+    while let Ok(m) = w_rx.try_recv() {
+        if let ServerMsg::MemberLeft { member_id, .. } = m {
+            lefts.push(member_id);
+        }
+    }
+    assert_eq!(lefts, vec![seat], "exactly one retraction, for the seat");
 }
