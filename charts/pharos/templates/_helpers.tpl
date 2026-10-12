@@ -105,7 +105,11 @@ log_level = {{ .Values.config.obs.logLevel | quote }}
 {{- if .Values.config.obs.otlpEndpoint }}
 otlp_endpoint = {{ .Values.config.obs.otlpEndpoint | quote }}
 {{- end }}
+{{- if hasKey .Values.config.obs "samplingRatio" }}
+{{- if not (kindIs "invalid" .Values.config.obs.samplingRatio) }}
 sampling_ratio = {{ .Values.config.obs.samplingRatio }}
+{{- end }}
+{{- end }}
 {{- if .Values.config.obs.logDir }}
 log_dir = {{ .Values.config.obs.logDir | quote }}
 {{- end }}
