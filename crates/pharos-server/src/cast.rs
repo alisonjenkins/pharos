@@ -88,9 +88,8 @@ impl CastTokenError {
 }
 
 /// Mint an access token for `user`, bound to the synthetic device
-/// `cast:<tv_name>`, that expires after `lifetime`.
-// T052: the token store has no scope field, so this token carries the owner's
-// full permissions until a playback-only scope exists.
+/// `cast:<tv_name>`, that expires after `lifetime`. The token is playback-scoped:
+/// the auth extractors refuse it outside the receiver's routes.
 pub async fn mint_tv_token<S: TokenStore>(
     store: &S,
     user: UserId,
@@ -108,7 +107,7 @@ pub async fn mint_tv_token<S: TokenStore>(
             lifetime,
         })?;
     match store
-        .issue_with_ttl(user, &tv_device_id(tv_name), ttl_secs, TokenScope::Full)
+        .issue_with_ttl(user, &tv_device_id(tv_name), ttl_secs, TokenScope::Playback)
         .await
     {
         Ok(issued) => Ok(TvToken {
