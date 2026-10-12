@@ -8,6 +8,7 @@
 - Interactive: `nix develop` (or `direnv allow` if `.envrc` is set up).
 - Do not invoke `cargo`, `rustc`, `clippy`, `ffmpeg`, etc. from the host shell — versions may drift from the flake.
 - Tests run via **`cargo nextest run --workspace`** (config in `.config/nextest.toml`). Faster + better output than the built-in runner. Use `cargo test --doc --workspace` separately for doctests.
+- Integration tests are grouped: `crates/<crate>/tests/it_<area>/main.rs` declares one `mod` per file, so each area links once (a standalone `tests/*.rs` links a ~190 MB binary of its own). Add a new test file to the matching `it_<area>` group, not as a new top-level `tests/*.rs`. Stay standalone only when the file installs a process-global tracing/metrics subscriber (`redaction.rs`), is named by a recipe (`client_compat`), or has a postgres arm. Helpers shared across a group come in with `#[path = "../common/mod.rs"] mod common;` in `main.rs`.
 - Fast-feedback recipes via `just`:
   - `just test-fast` — workspace `--lib` only, skips heavy `tests/*.rs` binaries.
   - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
