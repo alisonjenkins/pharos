@@ -98,6 +98,9 @@ trait Inspect: MediaStore {
     async fn language_rows(&self, id: MediaId) -> Vec<(String, String)>;
     async fn delete_item(&self, id: MediaId);
     async fn count_between(&self, lo: MediaId, hi: MediaId) -> i64;
+    /// How many separate transactions wrote the rows in `[lo, hi)`, where the
+    /// backend can say (Postgres `xmin`). `None` otherwise.
+    async fn writer_transactions(&self, lo: MediaId, hi: MediaId) -> Option<i64>;
 }
 
 async fn snap<S: Inspect>(s: &S, ids: &[MediaId]) -> Vec<Snap> {
@@ -200,6 +203,9 @@ async fn run<S: Inspect>(s: &S) {
     )
     .await;
     assert_eq!(s.get(BASE + 200).await.unwrap().title, "Zebra last");
+    if let Some(txs) = s.writer_transactions(BASE + 200, BASE + 202).await {
+        assert_eq!(txs, 1, "a repeated id is collapsed, not retried per item");
+    }
 
     // Upsert over an existing row: created_at is kept, the language index is
     // rebuilt from the new tracks.
@@ -218,6 +224,9 @@ async fn run<S: Inspect>(s: &S) {
         .map(|n| rich(BASE + 10_000 + n as u64, n))
         .collect();
     let mut with_dup = big.clone();
+    let mut middle = rich(BASE + 10_000, 0);
+    middle.title = "Zebra middle".into();
+    with_dup.insert(3, middle);
     let mut again = rich(BASE + 10_000, 0);
     again.title = "Zebra again".into();
     with_dup.push(again);
@@ -228,6 +237,9 @@ async fn run<S: Inspect>(s: &S) {
         "every row of a multi-statement batch is written exactly once"
     );
     assert_eq!(s.get(BASE + 10_000).await.unwrap().title, "Zebra again");
+    if let Some(txs) = s.writer_transactions(BASE + 10_000, BASE + 12_300).await {
+        assert_eq!(txs, 1, "the batch is one transaction, not a per-item retry");
+    }
     for n in [1_usize, 499, 500, 1_000, 1_001, 2_299] {
         let id = BASE + 10_000 + n as u64;
         assert_eq!(s.get(id).await.unwrap(), big[n], "row {n}");
@@ -308,6 +320,10 @@ mod sqlite {
                 .await
                 .unwrap()
         }
+
+        async fn writer_transactions(&self, _lo: MediaId, _hi: MediaId) -> Option<i64> {
+            None
+        }
     }
 
     #[tokio::test]
@@ -356,6 +372,21 @@ mod postgres {
                 .fetch_one(self.pool())
                 .await
                 .unwrap()
+        }
+
+        async fn writer_transactions(&self, lo: MediaId, hi: MediaId) -> Option<i64> {
+            // xmin is the inserting/updating transaction of the row version.
+            // The rows were deleted first, so every version here is new.
+            Some(
+                sqlx::query_scalar(
+                    "SELECT COUNT(DISTINCT xmin::text) FROM media_items WHERE id >= $1 AND id < $2",
+                )
+                .bind(lo as i64)
+                .bind(hi as i64)
+                .fetch_one(self.pool())
+                .await
+                .unwrap(),
+            )
         }
     }
 
