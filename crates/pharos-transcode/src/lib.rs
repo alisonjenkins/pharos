@@ -622,11 +622,6 @@ impl VaapiPipeline {
     }
 }
 
-/// GPU-side filter the resident pipeline puts between decoder and encoder.
-/// `None`: a plain 8-bit 4:2:0 source decodes to NV12 surfaces, which
-/// `h264_vaapi`/`hevc_vaapi` take as they are.
-const RESIDENT_VAAPI_FILTER: Option<&str> = None;
-
 /// The part of the resident decision that depends only on the job's shape, not
 /// on config or the source's pixels. Shared by the verdict and by the argv
 /// builder, which re-checks it so a caller cannot ask for a resident argv the
@@ -1134,12 +1129,10 @@ fn build_args_for_pipeline(
             if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
                 // VAAPI: upload frames to the GPU, then encode. The
                 // upload filter chains after any software filters.
-                if resident {
-                    if let Some(vf) = RESIDENT_VAAPI_FILTER {
-                        a.push("-vf".into());
-                        a.push(vf.into());
-                    }
-                } else {
+                // The resident pipeline runs no filter: a plain 8-bit 4:2:0
+                // source decodes to NV12 surfaces, which h264_vaapi/hevc_vaapi
+                // take as they are.
+                if !resident {
                     vf_parts.push("format=nv12".into());
                     vf_parts.push("hwupload".into());
                     push_video_filters(

@@ -3905,7 +3905,7 @@ mod tests {
                     log.lock().unwrap().push(spec.vaapi_pipeline);
                     if fail_resident && spec.vaapi_pipeline == crate::VaapiPipeline::Resident {
                         WorkerRunResult::Failed(WorkerError::Other(
-                            "scale_vaapi: no surface".into(),
+                            "vaapi: failed to create surface".into(),
                         ))
                     } else {
                         WorkerRunResult::Done { out_bytes: 1 }
