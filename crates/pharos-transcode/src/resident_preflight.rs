@@ -10,14 +10,16 @@
 //! be served sideways without any error to retry on.
 //!
 //! So a job headed for the resident pipeline first gets one `ffmpeg -i` of its
-//! source, parsed here. The answer is memoised per path; a failed inspection is
-//! not, because it says nothing about the file.
+//! source, parsed here. Concurrent first-play segments of one file share a
+//! single run; the answer is memoised against the file's size and mtime, and an
+//! unreadable file is only remembered for a short while.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
 
 /// Why a source must take the CPU-filter pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,49 +95,150 @@ pub fn parse_stream_info(banner: &str) -> Option<ResidentBlock> {
 /// bounds a stalled network mount, after which the job takes the safe pipeline.
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Memo size cap. Past it the memo is cleared rather than evicted entry by
-/// entry: it is a cache of a cheap question, not state.
+/// Memo size cap. Past it the oldest entry is evicted: it is a cache of a
+/// cheap question, not state.
 const MEMO_CAP: usize = 4096;
+
+/// How long an `Unreadable` answer is believed. A stalled mount costs up to
+/// `INSPECT_TIMEOUT` per attempt, and N parallel first-play segments would each
+/// pay it; a good answer is kept until the file changes, a bad one only briefly.
+const NEGATIVE_TTL: Duration = Duration::from_secs(45);
+
+/// A file is the same file while its path, size and mtime are: a source
+/// replaced in place must not keep the old verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SourceKey {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+struct Entry {
+    /// Shared by every concurrent caller for the same file: the first to arrive
+    /// runs ffmpeg, the rest wait for its answer.
+    cell: Arc<OnceCell<Option<ResidentBlock>>>,
+    created: Instant,
+    seq: u64,
+}
+
+#[derive(Default)]
+struct Memo {
+    entries: HashMap<SourceKey, Entry>,
+    next_seq: u64,
+}
 
 /// Runs and memoises the per-source inspection.
 pub struct SourceInspector {
     ffmpeg: PathBuf,
-    memo: Mutex<HashMap<PathBuf, Option<ResidentBlock>>>,
+    memo: Mutex<Memo>,
+    negative_ttl: Duration,
+    timeout: Duration,
+    prefix: Vec<std::ffi::OsString>,
+    cap: usize,
 }
 
 impl SourceInspector {
     pub fn new(ffmpeg: impl Into<PathBuf>) -> Self {
         Self {
             ffmpeg: ffmpeg.into(),
-            memo: Mutex::new(HashMap::new()),
+            memo: Mutex::new(Memo::default()),
+            negative_ttl: NEGATIVE_TTL,
+            timeout: INSPECT_TIMEOUT,
+            prefix: ["-hide_banner", "-nostdin", "-i"].map(Into::into).to_vec(),
+            cap: MEMO_CAP,
         }
     }
 
+    /// Run `program prefix.. <path>` instead of ffmpeg, so a test can count and
+    /// delay spawns without writing an executable.
+    #[cfg(test)]
+    fn with_command(
+        mut self,
+        program: impl Into<PathBuf>,
+        prefix: Vec<std::ffi::OsString>,
+    ) -> Self {
+        self.ffmpeg = program.into();
+        self.prefix = prefix;
+        self
+    }
+
+    /// Override the unreadable-answer TTL and the ffmpeg timeout (tests).
+    pub fn with_limits(mut self, negative_ttl: Duration, timeout: Duration) -> Self {
+        self.negative_ttl = negative_ttl;
+        self.timeout = timeout;
+        self
+    }
+
     /// `None`: fine for the resident pipeline. `Some(why)`: use the other one.
+    ///
+    /// Concurrent calls for one file share a single ffmpeg run; a clean or
+    /// blocked answer lasts until the file's size or mtime changes; an
+    /// unreadable one lasts `negative_ttl`.
     pub async fn inspect(&self, input: &Path) -> Option<ResidentBlock> {
-        if let Some(hit) = self.memo.lock().ok().and_then(|m| m.get(input).copied()) {
-            return hit;
-        }
-        // No `Stream #` line means ffmpeg could not open the file at all, so
-        // "no rotation seen" would be an absence of evidence, not a clean bill.
-        let verdict = match self.run(input).await {
-            Some(banner) if banner.contains("Stream #") => parse_stream_info(&banner),
-            _ => return Some(ResidentBlock::Unreadable),
+        let key = match tokio::fs::metadata(input).await {
+            Ok(m) => SourceKey {
+                path: input.to_path_buf(),
+                len: m.len(),
+                modified: m.modified().ok(),
+            },
+            // Cannot even stat it: ffmpeg will not do better, and a key built
+            // from nothing would alias every unreadable file.
+            Err(_) => return Some(ResidentBlock::Unreadable),
         };
-        if let Ok(mut m) = self.memo.lock() {
-            if m.len() >= MEMO_CAP {
-                m.clear();
+        let cell = self.cell_for(key);
+        *cell
+            .get_or_init(|| async {
+                // No `Stream #` line means ffmpeg could not open the file at
+                // all, so "no rotation seen" would be an absence of evidence,
+                // not a clean bill.
+                match self.run(input).await {
+                    Some(banner) if banner.contains("Stream #") => parse_stream_info(&banner),
+                    _ => Some(ResidentBlock::Unreadable),
+                }
+            })
+            .await
+    }
+
+    fn cell_for(&self, key: SourceKey) -> Arc<OnceCell<Option<ResidentBlock>>> {
+        let Ok(mut memo) = self.memo.lock() else {
+            return Arc::new(OnceCell::new());
+        };
+        if let Some(e) = memo.entries.get(&key) {
+            let stale = e.cell.get() == Some(&Some(ResidentBlock::Unreadable))
+                && e.created.elapsed() >= self.negative_ttl;
+            if !stale {
+                return e.cell.clone();
             }
-            m.insert(input.to_path_buf(), verdict);
         }
-        verdict
+        if memo.entries.len() >= self.cap && !memo.entries.contains_key(&key) {
+            let oldest = memo
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.seq)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                memo.entries.remove(&k);
+            }
+        }
+        let seq = memo.next_seq;
+        memo.next_seq = seq.wrapping_add(1);
+        let cell = Arc::new(OnceCell::new());
+        memo.entries.insert(
+            key,
+            Entry {
+                cell: cell.clone(),
+                created: Instant::now(),
+                seq,
+            },
+        );
+        cell
     }
 
     /// ffmpeg's stderr for `-i input`, or `None` if it could not be run. ffmpeg
     /// exits 1 here (no output file); the banner is what matters.
     async fn run(&self, input: &Path) -> Option<String> {
         let child = tokio::process::Command::new(&self.ffmpeg)
-            .args(["-hide_banner", "-nostdin", "-i"])
+            .args(&self.prefix)
             .arg(input)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -143,7 +246,7 @@ impl SourceInspector {
             .kill_on_drop(true)
             .spawn()
             .ok()?;
-        let out = tokio::time::timeout(INSPECT_TIMEOUT, child.wait_with_output())
+        let out = tokio::time::timeout(self.timeout, child.wait_with_output())
             .await
             .ok()?
             .ok()?;
@@ -208,12 +311,119 @@ mod tests {
         assert_eq!(parse_stream_info(banner), None);
     }
 
+    /// An inspector whose "ffmpeg" is `sh -c <script>`: it appends a line to a
+    /// counter file per spawn, waits `delay`, then prints `banner`.
+    fn counting(dir: &Path, delay: &str, banner: &str) -> (SourceInspector, PathBuf) {
+        let counter = dir.join("spawns");
+        let script = format!(
+            "echo x >> '{}'; sleep {delay}; printf '%s\\n' '{banner}' >&2",
+            counter.display()
+        );
+        let i = SourceInspector::new("unused")
+            .with_command("/bin/sh", vec!["-c".into(), script.into(), "sh".into()]);
+        (i, counter)
+    }
+
+    fn spawns(counter: &Path) -> usize {
+        std::fs::read_to_string(counter).map_or(0, |s| s.lines().count())
+    }
+
+    const BANNER: &str = "  Stream #0:0: Video: h264, yuv420p(progressive), 1920x1080";
+
+    fn source(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
     #[tokio::test]
-    async fn an_unrunnable_ffmpeg_reads_as_unreadable_and_is_not_memoised() {
+    async fn a_file_that_cannot_be_statted_reads_as_unreadable() {
         let i = SourceInspector::new("/nonexistent/ffmpeg");
-        let p = Path::new("/m/x.mkv");
+        let p = Path::new("/m/does-not-exist.mkv");
         assert_eq!(i.inspect(p).await, Some(ResidentBlock::Unreadable));
-        assert!(i.memo.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unrunnable_ffmpeg_reads_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = source(dir.path(), "a.mkv", b"x");
+        let i = SourceInspector::new("/nonexistent/ffmpeg");
+        assert_eq!(i.inspect(&p).await, Some(ResidentBlock::Unreadable));
+    }
+
+    /// N segments of one file arriving together are one `ffmpeg -i`, not N.
+    #[tokio::test]
+    async fn concurrent_callers_for_one_file_share_a_single_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = source(dir.path(), "a.mkv", b"x");
+        let (i, counter) = counting(dir.path(), "0.3", BANNER);
+        let i = Arc::new(i);
+        let calls = (0..8).map(|_| {
+            let i = i.clone();
+            let p = p.clone();
+            tokio::spawn(async move { i.inspect(&p).await })
+        });
+        for c in calls {
+            assert_eq!(c.await.unwrap(), None);
+        }
+        assert_eq!(spawns(&counter), 1);
+        // And the answer is remembered.
+        assert_eq!(i.inspect(&p).await, None);
+        assert_eq!(spawns(&counter), 1);
+    }
+
+    /// A file replaced in place (new size or mtime) is inspected again.
+    #[tokio::test]
+    async fn a_changed_file_is_inspected_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = source(dir.path(), "a.mkv", b"x");
+        let (i, counter) = counting(dir.path(), "0", BANNER);
+        i.inspect(&p).await;
+        i.inspect(&p).await;
+        assert_eq!(spawns(&counter), 1);
+        std::fs::write(&p, b"a different, longer file").unwrap();
+        i.inspect(&p).await;
+        assert_eq!(spawns(&counter), 2);
+    }
+
+    /// A stalled file costs the timeout once, not once per segment; the answer
+    /// is believed only for the TTL.
+    #[tokio::test]
+    async fn an_unreadable_file_is_remembered_briefly() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = source(dir.path(), "a.mkv", b"x");
+        let (i, counter) = counting(dir.path(), "5", BANNER);
+        let i = i.with_limits(Duration::from_millis(300), Duration::from_millis(100));
+        let t = Instant::now();
+        assert_eq!(i.inspect(&p).await, Some(ResidentBlock::Unreadable));
+        assert!(t.elapsed() < Duration::from_secs(2), "timeout not applied");
+        let t = Instant::now();
+        assert_eq!(i.inspect(&p).await, Some(ResidentBlock::Unreadable));
+        assert!(
+            t.elapsed() < Duration::from_millis(50),
+            "second call paid again"
+        );
+        assert_eq!(spawns(&counter), 1);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        i.inspect(&p).await;
+        assert_eq!(spawns(&counter), 2, "TTL expired, ask again");
+    }
+
+    #[tokio::test]
+    async fn the_memo_evicts_the_oldest_entry_when_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut i, _) = counting(dir.path(), "0", BANNER);
+        i.cap = 4;
+        for n in 0..9 {
+            let p = source(dir.path(), &format!("{n}.mkv"), b"x");
+            i.inspect(&p).await;
+        }
+        let memo = i.memo.lock().unwrap();
+        assert_eq!(memo.entries.len(), 4);
+        assert!(
+            !memo.entries.keys().any(|k| k.path.ends_with("0.mkv")),
+            "oldest entry should be gone"
+        );
     }
 
     #[test]
