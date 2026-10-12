@@ -3170,13 +3170,16 @@ dependencies = [
 name = "pharos-cast"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "metrics",
  "metrics-util",
  "proptest",
+ "prost",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "workspace-hack",
