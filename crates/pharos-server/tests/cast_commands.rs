@@ -173,3 +173,170 @@ async fn commands_for_an_ordinary_session_are_still_relayed() {
     assert_eq!(status, 204);
     assert_eq!(raw_session_commands(&rig.bus_events()), 2);
 }
+
+/// `(item id, start position ms)` of every `PlayNow` the TV has received.
+fn play_nows(rig: &CastRig) -> Vec<(String, i64)> {
+    rig.receiver
+        .commands()
+        .into_iter()
+        .filter_map(|c| match c.body {
+            pharos_cast::messages::CommandBody::PlayNow(o) => {
+                Some((o.items.first()?.id.clone(), o.start_position_ticks / 10_000))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[actix_web::test]
+async fn a_queue_change_by_another_member_loads_the_new_item_on_the_tv() {
+    let rig = rig_with_cast().await;
+    assert_eq!(play_nows(&rig).len(), 1, "only the hand-off load so far");
+
+    let (status, body) = rig
+        .post(
+            &rig.bob,
+            "/SyncPlay/SetNewQueue",
+            Some(serde_json::json!({
+                "PlayingQueue": ["item-2", "item-3"],
+                "PlayingItemPosition": 0,
+                "StartPositionTicks": 6_000_000_000u64,
+            })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    eventually("PlayNow for the new queue's first item", || {
+        play_nows(&rig).iter().any(|(id, _)| id == "item-2")
+    })
+    .await;
+    let (_, pos) = play_nows(&rig)
+        .into_iter()
+        .find(|(id, _)| id == "item-2")
+        .unwrap();
+    assert!(
+        (pos - 600_000).abs() < 15_000,
+        "loaded at the requested position, got {pos} ms"
+    );
+
+    // NextItem advances the group, and the TV follows to the third item from 0.
+    let (status, body) = rig.post(&rig.bob, "/SyncPlay/NextItem", None).await;
+    assert_eq!(status, 204, "{body}");
+    eventually("PlayNow for the next item", || {
+        play_nows(&rig).iter().any(|(id, _)| id == "item-3")
+    })
+    .await;
+    let (_, pos) = play_nows(&rig)
+        .into_iter()
+        .find(|(id, _)| id == "item-3")
+        .unwrap();
+    assert!(
+        pos < 15_000,
+        "next item starts near its beginning, got {pos} ms"
+    );
+    assert_eq!(rig.service.snapshot().await.len(), 1, "still one seat");
+}
+
+/// Past the driver's settle window, which ignores reports echoing our own PlayNow.
+async fn settled_cast() -> CastRig {
+    let mut rig = rig_with_cast().await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+    cast_rig::drain(&mut rig.bob.rx);
+    rig
+}
+
+fn count(msgs: &[pharos_sync::messages::ServerMsg], kind: &str) -> usize {
+    msgs.iter().filter(|m| m.kind() == kind).count()
+}
+
+fn tv_commands_named(rig: &CastRig, name: &str) -> usize {
+    rig.receiver
+        .commands()
+        .iter()
+        .filter(|c| c.body.name() == name)
+        .count()
+}
+
+#[actix_web::test]
+async fn a_pause_on_the_tv_pauses_the_group_once_and_the_planner_leaves_it_alone() {
+    let mut rig = settled_cast().await;
+    let before = command_total("pause", "dispatched");
+    let tv_pauses = tv_commands_named(&rig, "Pause");
+
+    rig.receiver.user_pause();
+    cast_rig::wait_msg(&mut rig.bob.rx, "group Pause", |m| m.kind() == "pause").await;
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+
+    let seen = cast_rig::drain(&mut rig.bob.rx);
+    assert_eq!(count(&seen, "pause"), 0, "no second group Pause: {seen:?}");
+    assert_eq!(
+        count(&seen, "play"),
+        0,
+        "the group is not resumed: {seen:?}"
+    );
+    assert_eq!(command_total("pause", "dispatched"), before + 1);
+    assert!(rig.receiver.state().paused, "the TV stays paused");
+    assert_eq!(tv_commands_named(&rig, "Unpause"), 0);
+    assert!(
+        tv_commands_named(&rig, "Pause") <= tv_pauses + 1,
+        "at most the group's echo reaches the TV"
+    );
+
+    let before = command_total("unpause", "dispatched");
+    rig.receiver.user_unpause();
+    cast_rig::wait_msg(&mut rig.bob.rx, "group Play", |m| m.kind() == "play").await;
+    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+    assert_eq!(command_total("unpause", "dispatched"), before + 1);
+    assert!(!rig.receiver.state().paused);
+    let seen = cast_rig::drain(&mut rig.bob.rx);
+    assert_eq!(count(&seen, "pause"), 0, "{seen:?}");
+}
+
+#[actix_web::test]
+async fn a_seek_on_the_tv_seeks_the_group_once_and_the_planner_leaves_it_alone() {
+    let mut rig = settled_cast().await;
+    let before = command_total("seek", "dispatched");
+    let tv_seeks = tv_commands_named(&rig, "Seek");
+
+    rig.receiver
+        .user_seek(std::time::Duration::from_secs(1_800));
+    cast_rig::wait_msg(&mut rig.bob.rx, "group Seek", |m| m.kind() == "seek").await;
+    tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+
+    let seen = cast_rig::drain(&mut rig.bob.rx);
+    assert_eq!(count(&seen, "seek"), 0, "no second group Seek: {seen:?}");
+    assert_eq!(command_total("seek", "dispatched"), before + 1);
+    assert!(
+        (rig.receiver.state().position_ms - 1_800_000).abs() < 15_000,
+        "the TV is where the user put it"
+    );
+    assert!(
+        tv_commands_named(&rig, "Seek") <= tv_seeks + 1,
+        "the planner does not drag the TV back"
+    );
+}
+
+#[actix_web::test]
+async fn a_stop_on_the_tv_ends_the_cast_once_and_leaves_the_group_playing() {
+    let rig = settled_cast().await;
+    let before = cast_rig::counter(
+        "pharos_cast_seat_total",
+        &[("event", "ended"), ("reason", "user_stop")],
+    );
+
+    rig.receiver.user_stop();
+    rig.wait_cast_gone().await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        cast_rig::counter(
+            "pharos_cast_seat_total",
+            &[("event", "ended"), ("reason", "user_stop")]
+        ),
+        before + 1
+    );
+    assert_ne!(
+        rig.group_play_state().await,
+        pharos_sync::messages::GroupPlayState::Paused,
+        "stopping the TV does not pause the others"
+    );
+}
