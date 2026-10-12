@@ -8,11 +8,12 @@
 //!   2. variant → VOD playlist with an `EXT-X-MAP` init + `.m4s` segments.
 //!   3. init.mp4 → `ftyp`+`moov`, NO `moof` (a valid shared init segment).
 //!   4. `{seg}.m4s` → `moof`+`mdat`, NO `moov`/`ftyp` (moof-only media).
-//!   5. segment N's `tfdt` is SOURCE-anchored (≈ N·6 s, off by at most the
-//!      first-frame offset / opus preskip) and consecutive segments TILE:
-//!      tfdt(N+1) ≈ tfdt(N) + content(N) per track. Forcing tfdt onto an
-//!      exact 6.0 grid instead re-times video against audio by a few ms
-//!      every segment (real content is ~6.012 s video / ~6.006 s audio) and
+//!   5. the segments carry video only (audio is the separate continuous
+//!      rendition, covered by `vp9_audio_rendition`), segment N's `tfdt` is
+//!      SOURCE-anchored (≈ N·6 s, off by at most the first-frame offset) and
+//!      consecutive segments TILE: tfdt(N+1) ≈ tfdt(N) + content(N). Forcing
+//!      tfdt onto an exact 6.0 grid instead drifts the video against the
+//!      audio by a few ms every segment (real content is ~6.012 s) and
 //!      accumulates into audible A/V drift over a long title. Verified
 //!      through real ffmpeg output.
 //!
@@ -352,29 +353,28 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
     assert!(!has_box(&seg0, b"mfra"), "stale mfra must be stripped");
     // A 6 s segment can hold >1 fragment; tfdts interleave [video, audio, …]
     // per fragment (moov track order). The FIRST fragment sits at the origin.
+    // A 6 s segment can hold >1 fragment; the FIRST one sits at the origin.
     let seg0_tfdts = tfdt_values(&seg0);
-    assert!(
-        seg0_tfdts.len() >= 2,
-        "seg0 needs ≥1 fragment: {seg0_tfdts:?}"
-    );
+    assert!(!seg0_tfdts.is_empty(), "seg0 needs ≥1 fragment");
     assert_eq!(
-        (seg0_tfdts[0], seg0_tfdts[1]),
-        (0, 0),
+        seg0_tfdts[0], 0,
         "seg0's first fragment starts at tfdt 0: {seg0_tfdts:?}"
     );
 
-    // 5. Segments are SOURCE-anchored and tile per track. This is the A/V
-    //    drift regression guard: an exact-6.0-grid tfdt would pass a naive
-    //    "seg2 starts at 12 s" check while re-timing video against audio by
+    // 5. Segments are SOURCE-anchored and tile. Audio is NOT in these
+    //    segments: it is the continuous audio rendition (see
+    //    `vp9_audio_rendition`), so the init and every segment carry exactly
+    //    the video track. An exact-6.0-grid tfdt would pass a naive "seg2
+    //    starts at 12 s" check while drifting against the audio rendition by
     //    a few ms per segment; asserting butt-joins on the true source
     //    timeline pins the correct behaviour.
     let timescales = init_timescales(&init);
     assert_eq!(
         timescales.len(),
-        2,
-        "expect video+audio tracks: {timescales:?}"
+        1,
+        "video segments are audio-free (one track): {timescales:?}"
     );
-    let (vts, ats) = (timescales[0] as f64, timescales[1] as f64);
+    let vts = timescales[0] as f64;
     let mut segs = Vec::new();
     for n in 0..3u32 {
         let body = test::call_and_read_body(
@@ -385,11 +385,11 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
         )
         .await;
         let timing = frag_timing(&body);
-        assert_eq!(timing.len(), 2, "seg{n} needs video+audio: {timing:?}");
+        assert_eq!(timing.len(), 1, "seg{n} must be video-only: {timing:?}");
         segs.push(timing);
     }
     for (n, timing) in segs.iter().enumerate() {
-        let (v_start, a_start) = (timing[0].0 as f64 / vts, timing[1].0 as f64 / ats);
+        let v_start = timing[0].0 as f64 / vts;
         let want = n as f64 * 6.0;
         // Video anchors at the first source frame ≥ the boundary — within
         // one frame duration (24 fps ⇒ ~42 ms) of N·6, never before it.
@@ -397,30 +397,15 @@ async fn vp9_fmp4_path_serves_seekable_hls() {
             (want - 0.001..want + 0.1).contains(&v_start),
             "seg{n} video start {v_start:.4} not source-anchored near {want}"
         );
-        // Audio anchors at the boundary minus the opus preskip (312/48000 ≈
-        // 6.5 ms); segment 0 is clamped to exactly 0.
-        assert!(
-            (want - 0.01..want + 0.001).contains(&a_start),
-            "seg{n} audio start {a_start:.4} not source-anchored near {want}"
-        );
     }
     for n in 0..2usize {
         let v_gap = (segs[n + 1][0].0 as f64 - (segs[n][0].0 + segs[n][0].1) as f64) / vts * 1000.0;
-        let a_gap = (segs[n + 1][1].0 as f64 - (segs[n][1].0 + segs[n][1].1) as f64) / ats * 1000.0;
         // Video must butt-join: no dropped boundary frame (gap ≤ ~half a
         // frame) and no more than one duplicated frame of overlap.
         assert!(
             (-45.0..=20.0).contains(&v_gap),
             "seg{n}→{}: video tiling gap {v_gap:.1} ms (want ≈0: >0 drops frames → stutter, \
              <-45 duplicates >1 frame)",
-            n + 1
-        );
-        // Audio overlaps by exactly the opus preskip (constant, never grows).
-        // The 0→1 boundary carries one extra preskip: segment 0's clamped
-        // tfdt (-6.5 ms → 0) pushes its end 6.5 ms late, so ≈ -13 ms there.
-        assert!(
-            (-15.0..=1.0).contains(&a_gap),
-            "seg{n}→{}: audio tiling gap {a_gap:.1} ms (want ≈-6.5 preskip overlap)",
             n + 1
         );
     }
