@@ -2357,19 +2357,31 @@ impl GroupState {
         self.delivery.deliver(to, msg);
     }
 
+    /// A Controller and a CastSeat share this cast binding.
+    fn cast_is_paired(&self, cast: &CastBinding) -> bool {
+        let has = |kind: MemberKind| {
+            self.members
+                .values()
+                .any(|m| m.kind == kind && m.cast.as_ref() == Some(cast))
+        };
+        has(MemberKind::Controller) && has(MemberKind::CastSeat)
+    }
+
+    /// A CastSeat whose Controller exists is folded into the Controller's
+    /// roster entry, so join and leave broadcasts must not name it.
+    fn is_hidden_seat(&self, member_id: MemberId) -> bool {
+        self.members.get(&member_id).is_some_and(|m| {
+            m.kind == MemberKind::CastSeat
+                && m.cast.as_ref().is_some_and(|c| self.cast_is_paired(c))
+        })
+    }
+
     /// The roster as clients see it. A user casting to a TV has a Controller
     /// and a CastSeat bound to the same cast (same TV, same owner); they show as
     /// ONE entry, the Controller's, with the TV as `device`. Derived on every
     /// call and never stored, so the underlying members are untouched.
     fn member_summaries(&self) -> Vec<MemberSummary> {
-        let has = |kind: MemberKind, cast: &CastBinding| {
-            self.members
-                .values()
-                .any(|m| m.kind == kind && m.cast.as_ref() == Some(cast))
-        };
-        let paired = |cast: &CastBinding| {
-            has(MemberKind::Controller, cast) && has(MemberKind::CastSeat, cast)
-        };
+        let paired = |cast: &CastBinding| self.cast_is_paired(cast);
         let mut out: Vec<_> = self
             .members
             .iter()
@@ -3005,6 +3017,7 @@ impl GroupHandle {
 /// T83 ghost prune.
 fn remove_member(state: &mut GroupState, member_id: MemberId) {
     let was_leader = state.leader == Some(member_id);
+    let hidden = state.is_hidden_seat(member_id);
     // Capture the display name BEFORE the roster drop — the wire `UserLeft`
     // toast renders this string verbatim (B37: a uuid here reached users).
     let name = state
@@ -3020,7 +3033,9 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
             state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
         }
     }
-    state.broadcast(ServerMsg::MemberLeft { member_id, name });
+    if !hidden {
+        state.broadcast(ServerMsg::MemberLeft { member_id, name });
+    }
     release_gate_holds_for(state, member_id);
 }
 

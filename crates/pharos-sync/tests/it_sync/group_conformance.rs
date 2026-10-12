@@ -756,6 +756,71 @@ async fn a_joining_player_takes_leadership_from_a_non_player() {
     assert_eq!(snapshot(&h).await.leader, Some(player));
 }
 
+fn is_member_left(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::MemberLeft { .. })
+}
+
+/// T058 — the roster shows a casting user once, so removing the paired seat
+/// must not tell anyone a separate member left.
+#[tokio::test]
+async fn removing_a_paired_seat_sends_no_member_left() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(50);
+    let seat = ordered_id(51);
+    let watcher = ordered_id(52);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let _s = add_member_with_id(&h, &sinks, seat, "Living Room").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    drain(&mut w_rx).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    let _ = snapshot(&h).await;
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(300), is_member_left)
+            .await
+            .is_none(),
+        "a paired seat leaving must not be announced"
+    );
+
+    // An ordinary member still is.
+    h.tx.send(GroupMsg::RemoveMember { member_id: ctrl })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(500), is_member_left)
+            .await
+            .is_some(),
+        "a Controller leaving is a member leaving"
+    );
+}
+
+/// T058 — a seat with no Controller is the only entry the roster shows for it,
+/// so its departure is announced.
+#[tokio::test]
+async fn removing_an_unpaired_seat_sends_member_left() {
+    let (h, sinks) = spawn_group();
+    let seat = ordered_id(60);
+    let watcher = ordered_id(61);
+    let _s = add_member_with_id(&h, &sinks, seat, "Living Room").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    drain(&mut w_rx).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(500), is_member_left)
+            .await
+            .is_some(),
+        "an unpaired seat leaving must be announced"
+    );
+}
+
 /// T057 — with no Player at all the group still has a leader.
 #[tokio::test]
 async fn an_all_non_player_group_still_has_a_leader() {
