@@ -12,6 +12,7 @@ struct MemStore {
     fps: Mutex<HashMap<MediaId, Fingerprint>>,
     next_scan_id: std::sync::atomic::AtomicI64,
     artwork: Mutex<HashMap<(MediaId, String), (String, String)>>,
+    fail_put_ids: Mutex<std::collections::HashSet<MediaId>>,
 }
 
 impl MediaStore for MemStore {
@@ -24,6 +25,14 @@ impl MediaStore for MemStore {
             .ok_or(DomainError::NotFound(id))
     }
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
+        if self
+            .fail_put_ids
+            .lock()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+            .contains(&item.id)
+        {
+            return Err(DomainError::Backend(format!("put {} refused", item.id)));
+        }
         self.inner
             .lock()
             .map_err(|e| DomainError::Backend(e.to_string()))?
@@ -496,6 +505,43 @@ async fn store_get_missing_is_not_found() {
         Err(DomainError::NotFound(99)) => {}
         other => panic!("expected NotFound, got {other:?}"),
     }
+}
+
+fn titled(id: MediaId, title: &str) -> MediaItem {
+    MediaItem {
+        id,
+        title: title.into(),
+        ..sample()
+    }
+}
+
+#[tokio::test]
+async fn default_put_batch_writes_in_order_and_last_duplicate_wins() {
+    let s = MemStore::default();
+    s.put_batch(&[titled(1, "first"), titled(2, "two"), titled(1, "last")])
+        .await
+        .unwrap();
+    assert_eq!(s.get(1).await.unwrap().title, "last");
+    assert_eq!(s.get(2).await.unwrap().title, "two");
+    s.put_batch(&[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn default_put_batch_writes_the_rest_and_reports_the_first_error() {
+    let s = MemStore::default();
+    s.fail_put_ids.lock().unwrap().extend([2, 4]);
+    let err = s
+        .put_batch(&[
+            titled(1, "a"),
+            titled(2, "b"),
+            titled(3, "c"),
+            titled(4, "d"),
+        ])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Backend(m) if m == "put 2 refused"));
+    assert!(s.get(1).await.is_ok() && s.get(3).await.is_ok());
+    assert!(s.get(2).await.is_err() && s.get(4).await.is_err());
 }
 
 #[tokio::test]

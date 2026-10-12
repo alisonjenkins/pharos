@@ -3001,6 +3001,30 @@ pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
     fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Upsert many items. Equivalent to calling [`put`](Self::put) on each in
+    /// order: when an id repeats, the last occurrence wins. A backend may
+    /// commit the batch as a unit (one transaction instead of one commit per
+    /// item); the default just loops over `put`.
+    ///
+    /// If an item cannot be written, every other item is still written and
+    /// the first error is returned, so one bad row never discards its
+    /// neighbours.
+    fn put_batch(
+        &self,
+        items: &[MediaItem],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        async move {
+            let mut first_err = None;
+            for item in items {
+                if let Err(e) = self.put(item.clone()).await {
+                    first_err.get_or_insert(e);
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        }
+    }
+
     fn list(&self) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send;
 
     /// LIB-B1 — resolve a [`MediaQuery`] as ONE parameterised statement,
