@@ -6,16 +6,19 @@ pub enum CastEvent {
     Lost,
     Reconnected,
     HandoffFailed,
+    /// A persisted seat was re-created after a restart or a change of group owner.
+    Resumed,
 }
 
 impl CastEvent {
-    pub const ALL: [CastEvent; 6] = [
+    pub const ALL: [CastEvent; 7] = [
         CastEvent::Started,
         CastEvent::Rejected,
         CastEvent::Ended,
         CastEvent::Lost,
         CastEvent::Reconnected,
         CastEvent::HandoffFailed,
+        CastEvent::Resumed,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -26,6 +29,7 @@ impl CastEvent {
             CastEvent::Lost => "lost",
             CastEvent::Reconnected => "reconnected",
             CastEvent::HandoffFailed => "handoff_failed",
+            CastEvent::Resumed => "resumed",
         }
     }
 }
@@ -42,10 +46,12 @@ pub enum CastReason {
     GraceExpired,
     UserStop,
     TokenFailed,
+    /// The TV a persisted seat points at is no longer configured.
+    TvRemoved,
 }
 
 impl CastReason {
-    pub const ALL: [CastReason; 10] = [
+    pub const ALL: [CastReason; 11] = [
         CastReason::NotInGroup,
         CastReason::TvBusy,
         CastReason::TvUnreachable,
@@ -56,6 +62,7 @@ impl CastReason {
         CastReason::GraceExpired,
         CastReason::UserStop,
         CastReason::TokenFailed,
+        CastReason::TvRemoved,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -70,6 +77,7 @@ impl CastReason {
             CastReason::GraceExpired => "grace_expired",
             CastReason::UserStop => "user_stop",
             CastReason::TokenFailed => "token_failed",
+            CastReason::TvRemoved => "tv_removed",
         }
     }
 }
@@ -110,7 +118,8 @@ mod tests {
                 "ended",
                 "lost",
                 "reconnected",
-                "handoff_failed"
+                "handoff_failed",
+                "resumed"
             ]
         );
         assert_labels_bounded(&labels);
@@ -131,7 +140,8 @@ mod tests {
                 "group_gone",
                 "grace_expired",
                 "user_stop",
-                "token_failed"
+                "token_failed",
+                "tv_removed"
             ]
         );
         assert_labels_bounded(&labels);
