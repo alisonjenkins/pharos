@@ -298,6 +298,63 @@ impl CastRig {
         .await
     }
 
+    /// The token the TV was handed in its first command.
+    pub fn tv_token(&self) -> String {
+        self.receiver
+            .commands()
+            .first()
+            .map(|c| c.access_token.expose().to_owned())
+            .expect("the TV was sent a command carrying its token")
+    }
+
+    /// HTTP status of an authenticated request made with `token` as the TV does.
+    pub async fn token_status(&self, token: &str) -> u16 {
+        let resp = awc::Client::default()
+            .get(self.srv.url("/Users/Me"))
+            .insert_header((
+                "Authorization",
+                format!(
+                    "MediaBrowser Client=\"Chromecast\", Device=\"Chromecast\", \
+                     DeviceId=\"dGlr\", Version=\"3.0\", Token=\"{token}\""
+                ),
+            ))
+            .send()
+            .await
+            .unwrap();
+        resp.status().as_u16()
+    }
+
+    pub async fn group_play_state(&self) -> pharos_sync::messages::GroupPlayState {
+        let (tx, rx) = oneshot::channel();
+        self.group
+            .tx
+            .send(GroupMsg::Snapshot { reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap().play_state
+    }
+
+    pub async fn wait_cast_state(&self, want: pharos_cast::obs::ConnState) {
+        for _ in 0..250 {
+            if self.service.snapshot().await.first().map(|c| c.state) == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the cast never reached {want:?}");
+    }
+
+    /// Wait until the cast service holds no seat.
+    pub async fn wait_cast_gone(&self) {
+        for _ in 0..400 {
+            if self.service.snapshot().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the cast never ended");
+    }
+
     /// Drain the bus and return everything sent since the last call.
     pub fn bus_events(&mut self) -> Vec<SocketBroadcast> {
         let mut out = Vec::new();
@@ -316,4 +373,29 @@ pub async fn eventually<F: FnMut() -> bool>(what: &str, mut f: F) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("timed out waiting for: {what}");
+}
+
+/// Next message on `rx` satisfying `pred`, skipping the rest; panics after 5 s.
+pub async fn wait_msg(
+    rx: &mut mpsc::Receiver<ServerMsg>,
+    what: &str,
+    pred: impl Fn(&ServerMsg) -> bool,
+) -> ServerMsg {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, rx.recv()).await {
+            Ok(Some(m)) if pred(&m) => return m,
+            Ok(Some(_)) => {}
+            _ => panic!("timed out waiting for: {what}"),
+        }
+    }
+}
+
+pub fn drain(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<ServerMsg> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        out.push(m);
+    }
+    out
 }
