@@ -295,20 +295,17 @@ async fn ping(
 /// the HTTP handler by tens of ms. A single resolve then misses, the member is
 /// never added, the fresh group dies member-less, the client never receives
 /// GroupJoined, and its `enableSyncPlay → SetNewQueue → play` flow stalls with
-/// nothing ever playing (B54, live-observed). Poll for up to ~2 s; normally
-/// resolves on the first try.
+/// nothing ever playing (B54, live-observed). Waits for the registration up to
+/// [`SOCKET_REGISTRATION_WAIT`]; normally resolves on the first try.
 async fn resolve_with_retry(
     hub: &SessionHub,
     device_id: &str,
 ) -> Option<pharos_sync::hub::ResolvedSession> {
-    for _ in 0..40 {
-        if let Some(s) = hub.resolve(device_id) {
-            return Some(s);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    None
+    hub.resolve_wait(device_id, SOCKET_REGISTRATION_WAIT).await
 }
+
+/// How long an HTTP SyncPlay call waits for its device's `/socket` to register.
+const SOCKET_REGISTRATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn add_caller_to_group(
     hub: &SessionHub,
@@ -1532,30 +1529,41 @@ mod tests {
         // after.
         use pharos_sync::SessionHub;
         use tokio::sync::mpsc;
-        // Paused clock auto-advances while every task is idle, so the 150ms
+        // Paused clock auto-advances while every task is idle, so the 130ms
         // registration delay and the 2s bounded wait cost no real time.
         tokio::time::pause();
         let hub = SessionHub::new();
         let dev = "user:dev-race";
-        // Register ~150ms late, as the socket task would.
+        // Register ~130ms late, as the socket task would.
         let hub2 = hub.clone();
         let dev2 = dev.to_string();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(130)).await;
             let (tx, _rx) = mpsc::channel(4);
             hub2.register(dev2, "alison".into(), tx);
         });
         // Immediately (before registration) — a plain resolve misses…
         assert!(hub.resolve(dev).is_none());
         // …but the retry waits it out and succeeds.
+        let t0 = tokio::time::Instant::now();
         let sess = resolve_with_retry(&hub, dev).await;
         assert!(
             sess.is_some(),
             "retry must catch the late socket registration"
         );
         assert_eq!(sess.unwrap().name, "alison");
-        // A device that never registers still resolves to None (bounded wait).
+        // Woken by the registration (130ms), not by a poll tick or the deadline.
+        // Paused time rounds up to the next ms; a 50ms poll would land on 150.
+        assert!(t0.elapsed() <= std::time::Duration::from_millis(135));
+        // A device that never registers still resolves to None, at the deadline.
+        let t1 = tokio::time::Instant::now();
         assert!(resolve_with_retry(&hub, "user:never").await.is_none());
+        let waited = t1.elapsed();
+        assert!(
+            waited >= SOCKET_REGISTRATION_WAIT
+                && waited <= SOCKET_REGISTRATION_WAIT + std::time::Duration::from_millis(10),
+            "gave up at the deadline, not before or long after: {waited:?}"
+        );
     }
 
     #[actix_web::test]
