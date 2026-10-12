@@ -85,6 +85,7 @@ ssdp_enabled = {{ $s.ssdpEnabled }}
 ssdp_advertise_url = {{ $s.ssdpAdvertiseUrl | quote }}
 {{- end }}
 played_threshold_pct = {{ $s.playedThresholdPct | int64 }}
+playback_progress_persist_secs = {{ $s.playbackProgressPersistSecs | int64 }}
 scan_rate_limit_ms = {{ $s.scanRateLimitMs | int64 }}
 scan_probe_concurrency = {{ $s.scanProbeConcurrency | int64 }}
 library_watch_enabled = {{ $s.libraryWatchEnabled }}
