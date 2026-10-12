@@ -259,3 +259,113 @@ async fn synth_fixture(path: &Path) {
         .expect("spawn ffmpeg fixture");
     assert!(status.success(), "fixture generation failed");
 }
+
+fn timing_spec(input: &Path, out: &Path) -> JobSpec {
+    JobSpec {
+        decode_offload: pharos_transcode::DecodeOffload::Allowed,
+        vaapi_pipeline: pharos_transcode::VaapiPipeline::Hybrid,
+        job_id: JobId(7),
+        input: input.to_path_buf(),
+        opts: TranscodeOptions {
+            source_video_codec: None,
+            source_video_kind: Default::default(),
+            source_frame_rate: None,
+            container: Container::Mpegts,
+            video: Some(VideoCodec::H264),
+            audio: Some(AudioCodec::Aac),
+            video_bitrate_bps: None,
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_intent: false,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            decode_preroll_seconds: None,
+            muxed_audio_source: None,
+            filler: None,
+        },
+        device: DeviceId::Cpu,
+        sink: OutputSink::FileDirect {
+            path: out.to_path_buf(),
+        },
+        filler: None,
+    }
+}
+
+/// Run one real ffmpeg job through a real worker and hand back its timing.
+async fn run_for_timing(
+    mode: pharos_transcode::stage_timing::StageTimingMode,
+) -> Option<pharos_transcode::stage_timing::StageTiming> {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.webm");
+    synth_fixture(&input).await;
+    let out = dir.path().join("0.tmp");
+    let spawner = ProcSpawner::with_worker_bin(WORKER_BIN).with_stage_timing(mode);
+    let mut worker = spawner
+        .spawn(pharos_transcode::protocol::WorkerId(2))
+        .await
+        .expect("spawn worker");
+    let res = tokio::time::timeout(
+        Duration::from_secs(60),
+        worker.run(timing_spec(&input, &out)),
+    )
+    .await
+    .expect("worker run timed out");
+    assert!(matches!(res, WorkerRunResult::Done { .. }), "got {res:?}");
+    worker.take_stage_timing()
+}
+
+#[tokio::test]
+async fn basic_mode_records_spawn_total_and_frames_from_a_real_encode() {
+    use pharos_transcode::stage_timing::{Stage, StageTimingMode};
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let t = run_for_timing(StageTimingMode::Basic)
+        .await
+        .expect("basic mode reports timing");
+    let stages: Vec<Stage> = t.stages().into_iter().map(|(s, _)| s).collect();
+    assert!(stages.contains(&Stage::Spawn) && stages.contains(&Stage::Total));
+    assert!(t.spawn_secs > 0.0 && t.total_secs > t.spawn_secs, "{t:?}");
+    if let Some(ff) = t.first_frame_secs {
+        assert!(ff <= t.total_secs, "{t:?}");
+    }
+    let p = t.progress.expect("sidecar progress");
+    assert!(p.ended, "{p:?}");
+    assert_eq!(p.frames, 20, "2 s at 10 fps");
+    assert!(t.effective_fps().unwrap_or(0.0) > 0.0);
+    assert!(t.bench.is_none(), "benchmark is a diagnostic-mode cost");
+}
+
+#[tokio::test]
+async fn detailed_mode_adds_decode_encode_and_other_stages() {
+    use pharos_transcode::stage_timing::{Stage, StageTimingMode};
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let t = run_for_timing(StageTimingMode::Detailed)
+        .await
+        .expect("detailed mode reports timing");
+    let get = |want: Stage| t.stages().into_iter().find(|(s, _)| *s == want);
+    for stage in [Stage::DecodeVideo, Stage::EncodeVideo, Stage::Other] {
+        let (_, secs) = get(stage).unwrap_or_else(|| panic!("{stage:?} missing: {t:?}"));
+        assert!(secs > 0.0, "{stage:?} should be positive: {t:?}");
+    }
+    let b = t.bench.as_ref().expect("bench report");
+    assert!(b.rtime.is_some() && b.utime.is_some(), "{b:?}");
+}
+
+#[tokio::test]
+async fn off_mode_reports_nothing_and_still_encodes() {
+    use pharos_transcode::stage_timing::StageTimingMode;
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    assert!(run_for_timing(StageTimingMode::Off).await.is_none());
+}

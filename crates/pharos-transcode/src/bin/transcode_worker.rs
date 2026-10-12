@@ -106,8 +106,15 @@ async fn run_job(
     spec: pharos_transcode::protocol::JobSpec,
 ) {
     use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
+    use pharos_transcode::stage_timing::{
+        apply_mode_args, parse_benchmark_all, parse_progress, strip_bench_lines, StageTiming,
+        StageTimingMode,
+    };
     use pharos_transcode::worker::exec;
     use std::time::Duration;
+
+    // 25 ms keeps the first-frame error well under the 100 ms stats period.
+    const FIRST_FRAME_POLL: Duration = Duration::from_millis(25);
 
     use pharos_transcode::protocol::DeviceId;
     let job_id = spec.job_id;
@@ -123,8 +130,17 @@ async fn run_job(
     };
     let stdout_passthrough = matches!(target, exec::SpawnTarget::Stdout);
 
+    let mode = StageTimingMode::from_env();
+    let sidecar = match &target {
+        exec::SpawnTarget::File(p) if mode != StageTimingMode::Off => {
+            Some(pharos_transcode::progress_sidecar_path(p))
+        }
+        _ => None,
+    };
+    let full_args = apply_mode_args(args, mode, !stdout_passthrough);
+
     let mut cmd = tokio::process::Command::new(exec::ffmpeg_bin());
-    cmd.args(&args)
+    cmd.args(&full_args)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -136,6 +152,7 @@ async fn run_job(
     } else {
         cmd.stdout(std::process::Stdio::null());
     }
+    let started = std::time::Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -150,6 +167,7 @@ async fn run_job(
             return;
         }
     };
+    let spawn_secs = started.elapsed().as_secs_f64();
 
     // Drain stderr concurrently so a chatty ffmpeg can't deadlock on a
     // full pipe buffer.
@@ -172,14 +190,28 @@ async fn run_job(
         exec::SpawnTarget::File(p) => Some(p.clone()),
         exec::SpawnTarget::Stdout => None,
     };
+    let mut first_frame_secs: Option<f64> = None;
     let status = if let Some(out_path) = file_out.clone() {
         // File sink: emit periodic size-based progress so the scheduler's
         // heartbeat window stays open on long encodes.
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Polls the progress sidecar until ffmpeg reports a first frame. The
+        // sidecar is written every `-stats_period`, so the answer is good to
+        // about that plus one poll interval.
+        let mut first_frame_poll = tokio::time::interval(FIRST_FRAME_POLL);
+        first_frame_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 s = child.wait() => break s,
+                _ = first_frame_poll.tick(), if sidecar.is_some() && first_frame_secs.is_none() => {
+                    if let Some(sc) = &sidecar {
+                        let seen = tokio::fs::read_to_string(sc).await.map(|t| parse_progress(&t).frames > 0);
+                        if matches!(seen, Ok(true)) {
+                            first_frame_secs = Some(started.elapsed().as_secs_f64());
+                        }
+                    }
+                }
                 _ = ticker.tick() => {
                     let sz = tokio::fs::metadata(&out_path).await.map(|m| m.len()).unwrap_or(0);
                     let _ = write_frame(wr, &WorkerEvent::Progress { job_id, out_bytes: sz, frames: 0 }).await;
@@ -193,9 +225,37 @@ async fn run_job(
         child.wait().await
     };
 
-    let stderr_text = stderr_task.await.unwrap_or_default();
+    let total_secs = started.elapsed().as_secs_f64();
+    let raw_stderr = stderr_task.await.unwrap_or_default();
+    // `-benchmark_all` writes thousands of lines; keep them out of the text
+    // failure classification and the echoed tail read.
+    let bench = (mode == StageTimingMode::Detailed).then(|| parse_benchmark_all(&raw_stderr));
+    let stderr_text = if bench.is_some() {
+        strip_bench_lines(&raw_stderr)
+    } else {
+        raw_stderr
+    };
     match status {
         Ok(s) if s.success() => {
+            // A live job's control socket is never drained, so only segment
+            // (file) jobs report timing.
+            if mode != StageTimingMode::Off && !stdout_passthrough {
+                let progress = match &sidecar {
+                    Some(sc) => tokio::fs::read_to_string(sc)
+                        .await
+                        .ok()
+                        .map(|t| parse_progress(&t)),
+                    None => None,
+                };
+                let timing = StageTiming {
+                    spawn_secs,
+                    first_frame_secs,
+                    total_secs,
+                    progress,
+                    bench,
+                };
+                let _ = write_frame(wr, &WorkerEvent::Timing { job_id, timing }).await;
+            }
             let out_bytes = match &file_out {
                 Some(p) => tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0),
                 None => 0,

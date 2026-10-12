@@ -211,7 +211,14 @@ pub fn parse_benchmark_all(stderr: &str) -> BenchReport {
             let Ok(real) = real.parse::<u64>() else {
                 continue;
             };
-            let secs = micros_to_secs(real);
+            // ffmpeg prints an unsigned diff of two timestamps, so a clock
+            // step backwards arrives as a number near u64::MAX. It is a
+            // negative duration, not 5 hours: count it as zero.
+            let secs = if i64::try_from(real).is_ok() {
+                micros_to_secs(real)
+            } else {
+                0.0
+            };
             match *label {
                 "decode_video" => b.decode_video += secs,
                 "decode_audio" => b.decode_audio += secs,
@@ -233,6 +240,40 @@ pub fn strip_bench_lines(stderr: &str) -> String {
         .filter(|l| !l.starts_with("bench:"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Global ffmpeg options a mode adds in front of the job's argv.
+///
+/// `-stats_period` only matters for a file sink, where the argv already
+/// writes a `-progress` sidecar; it makes the first-frame poll resolve to
+/// ~100 ms instead of ffmpeg's default 500 ms. `-benchmark_all` writes about
+/// 1.7k stderr lines per 6 s segment, which is why it is diagnostic only.
+///
+/// `-benchmark` lines are logged at info level and the segment argv runs at
+/// `-loglevel error`, so detailed mode lifts that to `info` as well. The extra
+/// chatter is stderr only; [`strip_bench_lines`] keeps the bench lines out of
+/// failure classification.
+pub fn apply_mode_args(args: Vec<String>, mode: StageTimingMode, file_sink: bool) -> Vec<String> {
+    if mode == StageTimingMode::Off {
+        return args;
+    }
+    let mut a: Vec<String> = Vec::with_capacity(args.len() + 4);
+    if file_sink {
+        a.extend(["-stats_period".into(), "0.1".into()]);
+    }
+    if mode == StageTimingMode::Detailed {
+        a.extend(["-benchmark".into(), "-benchmark_all".into()]);
+    }
+    let mut after_loglevel = false;
+    for arg in args {
+        if after_loglevel && mode == StageTimingMode::Detailed && arg == "error" {
+            a.push("info".into());
+        } else {
+            a.push(arg.clone());
+        }
+        after_loglevel = arg == "-loglevel";
+    }
+    a
 }
 
 /// One job's collected timing, sent worker to scheduler.
@@ -424,6 +465,17 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_negative_duration_counts_as_zero() {
+        // Seen in a real run: one encode_audio call summed to ~1.8e13 s, i.e.
+        // a value a few microseconds below u64::MAX.
+        let b = parse_benchmark_all(
+            "bench:        3 user        1 sys 18446744073709551600 real encode_audio 0.1 \n\
+             bench:        3 user        1 sys             2000 real encode_audio 0.1 \n",
+        );
+        assert!((b.encode_audio - 0.002).abs() < 1e-9, "{b:?}");
+    }
+
+    #[test]
     fn benchmark_parser_ignores_everything_that_is_not_a_bench_line() {
         let b = parse_benchmark_all("[libx264 @ 0x1] kb/s:1300\nframe=  144 fps=0.0\n");
         assert_eq!(b, BenchReport::default());
@@ -477,6 +529,58 @@ mod tests {
             .unwrap_or(-1.0);
         // rtime 0.820 minus the ~0.0094 s of benchmarked calls in the fixture.
         assert!((other - (0.820 - 0.009_352)).abs() < 1e-6, "{other}");
+    }
+
+    #[test]
+    fn each_mode_adds_exactly_its_own_ffmpeg_flags() {
+        let base = || -> Vec<String> {
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "in.mkv",
+                "out.ts",
+            ]
+            .map(String::from)
+            .to_vec()
+        };
+        let with = |mode, file| apply_mode_args(base(), mode, file);
+        assert_eq!(with(StageTimingMode::Off, true), base());
+        assert_eq!(
+            with(StageTimingMode::Basic, true),
+            [
+                "-stats_period",
+                "0.1",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                "in.mkv",
+                "out.ts"
+            ]
+        );
+        assert_eq!(with(StageTimingMode::Basic, false), base());
+        assert_eq!(
+            with(StageTimingMode::Detailed, false),
+            [
+                "-benchmark",
+                "-benchmark_all",
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-i",
+                "in.mkv",
+                "out.ts"
+            ]
+        );
+        assert_eq!(
+            with(StageTimingMode::Detailed, true)
+                .iter()
+                .filter(|a| a.as_str() == "info")
+                .count(),
+            1
+        );
     }
 
     #[test]
