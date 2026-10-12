@@ -162,6 +162,7 @@ mod tests {
                     .await
                     .unwrap();
                 store.mark_seen_batch(&[], 1).await.unwrap();
+                store.put_batch(&[]).await.unwrap();
             });
         });
         for method in [
@@ -170,6 +171,7 @@ mod tests {
             "get_user_data",
             "user_data_bulk",
             "mark_seen_batch",
+            "put_batch",
         ] {
             assert_eq!(observations(&snapshotter, method), 1, "{method}");
         }
