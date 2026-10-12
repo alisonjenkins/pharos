@@ -667,6 +667,7 @@ async fn stream_transcoded_webm(
             .video_codec
             .as_deref()
             .and_then(pharos_transcode::SourceCodec::from_name),
+        source_video_kind: Default::default(),
         audio: Some(AudioCodec::Opus),
         video_bitrate_bps: Some(cap),
         audio_bitrate_bps: Some(128_000),

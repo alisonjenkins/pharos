@@ -180,6 +180,7 @@ fn encode_segment(src: &Path, audio: &MuxedAudio, dir: &Path, seg: u32) -> PathB
     let (_start, _dur) = pharos_core::segment_range(seg, Some(frame_rate()));
     let opts = SegmentOpts {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Muxed(ContinuousAudio {

@@ -149,6 +149,7 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
     let rate = pharos_core::FrameRate::from_mille(FPS_MILLE);
     let opts = SegmentOpts {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
         audio: AudioDelivery::Muxed(ContinuousAudio {

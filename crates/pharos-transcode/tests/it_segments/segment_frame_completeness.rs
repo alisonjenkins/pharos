@@ -94,6 +94,7 @@ fn encode_segment(src: &Path, dir: &Path, seg: u32) -> (PathBuf, f64, f64) {
     let (start, dur) = pharos_core::segment_range(seg, Some(frame_rate()));
     let opts = SegmentOpts {
         source_video_codec: None,
+        source_video_kind: Default::default(),
         container: SegmentContainer::Mpegts,
         video: Some(SegmentVideo::H264),
         // Video-only: this test counts VIDEO frames, and it never had a

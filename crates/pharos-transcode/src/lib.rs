@@ -1301,6 +1301,7 @@ mod tests {
     fn opts() -> TranscodeOptions {
         TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::H264),
@@ -1775,6 +1776,7 @@ mod tests {
     fn vp9_webm_args_are_realtime_and_skip_movflags() {
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::WebM,
             video: Some(VideoCodec::Vp9),
@@ -1837,6 +1839,7 @@ mod tests {
         // - `+frag_discont`: per-segment runs are discontinuous by design.
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::Vp9),
@@ -1876,6 +1879,7 @@ mod tests {
         // tile on one timeline.
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Fmp4,
             video: Some(VideoCodec::H264),
@@ -1981,6 +1985,7 @@ mod tests {
     fn copy_codecs_skip_bitrate() {
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mp4,
             video: Some(VideoCodec::Copy),
@@ -2011,6 +2016,7 @@ mod tests {
     fn no_video_emits_vn() {
         let o = TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mp3,
             video: None,

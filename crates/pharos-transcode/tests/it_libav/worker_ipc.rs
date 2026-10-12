@@ -63,6 +63,7 @@ async fn worker_transcodes_file_direct() {
         input: input.clone(),
         opts: TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -120,6 +121,7 @@ async fn worker_reports_bad_input() {
         input: dir.path().join("does-not-exist.mkv"),
         opts: TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),
@@ -172,6 +174,7 @@ async fn worker_streams_live_to_stdout() {
         input,
         opts: TranscodeOptions {
             source_video_codec: None,
+            source_video_kind: Default::default(),
             source_frame_rate: None,
             container: Container::Mpegts,
             video: Some(VideoCodec::H264),

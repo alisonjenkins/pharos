@@ -1433,6 +1433,19 @@ fn source_video_codec(probe: &pharos_core::MediaProbe) -> Option<pharos_transcod
         .and_then(pharos_transcode::SourceCodec::from_name)
 }
 
+/// Whether the source is plain 8-bit SDR, which is what the GPU-resident VAAPI
+/// path needs. Unknown fields read as not plain.
+fn source_video_kind(
+    probe: &pharos_core::MediaProbe,
+) -> pharos_transcode::options::SourceVideoKind {
+    pharos_transcode::options::SourceVideoKind::classify(
+        probe.pixel_format.as_deref(),
+        probe.color_transfer.as_deref(),
+        probe.width,
+        probe.height,
+    )
+}
+
 fn build_segment_opts(
     session: Option<crate::transcode_sessions::TranscodeSession>,
     item: &pharos_core::MediaItem,
@@ -1579,6 +1592,7 @@ fn build_segment_opts(
                     )),
                     window,
                     source_video_codec: source_video_codec(&item.probe),
+                    source_video_kind: source_video_kind(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
 
@@ -1612,6 +1626,7 @@ fn build_segment_opts(
                     video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
                     window,
                     source_video_codec: source_video_codec(&item.probe),
+                    source_video_kind: source_video_kind(&item.probe),
                     audio_source_stream_index: audio_stream_index,
                     burn_subtitle_stream_index: subtitle_stream_index,
 
@@ -1645,6 +1660,7 @@ fn build_segment_opts(
         video_bitrate_bps: Some(target_video_bitrate(item.probe.bitrate_bps)),
         window,
         source_video_codec: source_video_codec(&item.probe),
+        source_video_kind: source_video_kind(&item.probe),
         audio_source_stream_index: audio_stream_index,
         burn_subtitle_stream_index: subtitle_stream_index,
 
@@ -3422,6 +3438,7 @@ fn fmp4_segment_opts_resolved(
         video_bitrate_bps: Some(bitrate),
         window,
         source_video_codec: source_video_codec(&item.probe),
+        source_video_kind: source_video_kind(&item.probe),
         audio_source_stream_index: None,
         burn_subtitle_stream_index: sub_rel,
 
