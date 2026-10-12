@@ -737,3 +737,66 @@ async fn a_service_ended_cast_is_recorded_once_with_its_true_reason() {
         assert_eq!(rig.event_total("ended"), 1, "{label}: one Ended per end");
     }
 }
+
+const WAIT: Duration = Duration::from_secs(3);
+
+#[tokio::test]
+async fn a_tv_that_is_slow_to_answer_does_not_delay_other_tvs() {
+    let rig = Rig::new().await;
+    let release = rig.factory.hold_open("Den");
+    let service = rig.service.clone();
+    let bob_start = tokio::spawn({
+        let req = Rig::request(&rig.bob, "Den");
+        async move { service.start(req).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    tokio::time::timeout(WAIT, rig.start_owner())
+        .await
+        .expect("a start for another TV completes while Den is still connecting");
+    tokio::time::timeout(WAIT, rig.service.stop(rig.owner.id, CastReason::UserStop))
+        .await
+        .expect("a stop completes while Den is still connecting");
+    tokio::time::timeout(WAIT, rig.service.snapshot())
+        .await
+        .expect("a snapshot completes while Den is still connecting");
+
+    release.notify_one();
+    bob_start
+        .await
+        .unwrap()
+        .expect("Den starts once it answers");
+}
+
+#[tokio::test]
+async fn a_start_in_flight_reserves_its_tv_and_its_user() {
+    let rig = Rig::new().await;
+    let release = rig.factory.hold_open(TV);
+    let service = rig.service.clone();
+    let first = tokio::spawn({
+        let req = Rig::request(&rig.bob, TV);
+        async move { service.start(req).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tv_busy = tokio::time::timeout(WAIT, rig.service.start(Rig::request(&rig.owner, TV)))
+        .await
+        .expect("the second start for the same TV is answered while the first is in flight")
+        .expect_err("only one start may win a TV");
+    assert_eq!(tv_busy.reason, CastRejectReason::TvBusy, "{tv_busy}");
+
+    let user_has_seat =
+        tokio::time::timeout(WAIT, rig.service.start(Rig::request(&rig.bob, "Den")))
+            .await
+            .expect("the same user's second start is answered while the first is in flight")
+            .expect_err("one seat per user");
+    assert_eq!(
+        user_has_seat.reason,
+        CastRejectReason::UserHasSeat,
+        "{user_has_seat}"
+    );
+
+    release.notify_one();
+    first.await.unwrap().expect("the first start wins");
+    assert_eq!(rig.service.snapshot().await.len(), 1);
+}

@@ -23,7 +23,7 @@ use pharos_sync::group::{CastBinding, GroupHandle, GroupMsg, MemberKind};
 use pharos_sync::hub::member_id_for_device;
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -234,16 +234,19 @@ pub fn spawn<F: TransportFactory>(
 ) -> CastServiceHandle {
     let (tx, rx) = mpsc::channel(COMMAND_QUEUE);
     let (internal_tx, internal_rx) = mpsc::channel(COMMAND_QUEUE);
+    let (opened_tx, opened_rx) = mpsc::channel(COMMAND_QUEUE);
     let actor = Actor {
         deps,
         cfg,
-        factory,
+        factory: Arc::new(factory),
         casts: HashMap::new(),
         by_user: HashMap::new(),
+        pending: HashMap::new(),
         next_id: 0,
         internal_tx,
+        opened_tx,
     };
-    tokio::spawn(actor.run(rx, internal_rx));
+    tokio::spawn(actor.run(rx, internal_rx, opened_rx));
     CastServiceHandle { tx }
 }
 
@@ -286,14 +289,41 @@ struct ActiveCast {
     watcher: JoinHandle<()>,
 }
 
+/// What `TransportFactory::open` produced within `OPEN_TIMEOUT`.
+type OpenOutcome<T> = Result<Result<(T, Occupancy), CastError>, tokio::time::error::Elapsed>;
+
+/// A connect task reporting back to the actor.
+struct Opened<T> {
+    tv: String,
+    outcome: OpenOutcome<T>,
+}
+
+/// Everything a start needs once the TV has answered.
+struct StartParams {
+    req: StartCast,
+    tv: ConfiguredTv,
+    owner_member: MemberId,
+    group: GroupHandle,
+    group_label: String,
+}
+
+/// A start whose TV connect is in flight. Holding it reserves the TV and the
+/// user, so a concurrent start is refused instead of racing.
+struct PendingStart {
+    params: StartParams,
+    reply: oneshot::Sender<Result<(), CastReject>>,
+}
+
 struct Actor<F: TransportFactory> {
     deps: CastDeps,
     cfg: CastConfig,
-    factory: F,
+    factory: Arc<F>,
     casts: HashMap<String, ActiveCast>,
     by_user: HashMap<UserId, String>,
+    pending: HashMap<String, PendingStart>,
     next_id: u64,
     internal_tx: mpsc::Sender<Internal>,
+    opened_tx: mpsc::Sender<Opened<F::Transport>>,
 }
 
 fn unix_now_ms() -> u64 {
@@ -329,6 +359,7 @@ impl<F: TransportFactory> Actor<F> {
         mut self,
         mut commands: mpsc::Receiver<Command>,
         mut internal: mpsc::Receiver<Internal>,
+        mut opened: mpsc::Receiver<Opened<F::Transport>>,
     ) {
         let mut ping = tokio::time::interval(SEAT_PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -340,6 +371,7 @@ impl<F: TransportFactory> Actor<F> {
                     None => break,
                 },
                 Some(msg) = internal.recv() => self.on_internal(msg).await,
+                Some(done) = opened.recv() => self.on_opened(done).await,
                 _ = ping.tick() => self.ping_seats(),
             }
         }
@@ -351,9 +383,7 @@ impl<F: TransportFactory> Actor<F> {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Start { req, reply } => {
-                let _ = reply.send(self.start(req).await);
-            }
+            Command::Start { req, reply } => self.begin_start(req, reply),
             Command::Stop { user, reason, done } => {
                 self.end(user, reason, EndedBy::Service).await;
                 let _ = done.send(());
@@ -397,7 +427,40 @@ impl<F: TransportFactory> Actor<F> {
         CastReject { reason, message }
     }
 
-    async fn start(&mut self, req: StartCast) -> Result<(), CastReject> {
+    /// Validate the request and reserve its TV and user; the connect itself
+    /// runs in its own task so the actor stays responsive.
+    fn begin_start(&mut self, req: StartCast, reply: oneshot::Sender<Result<(), CastReject>>) {
+        let params = match self.reserve(req) {
+            Ok(params) => params,
+            Err(reject) => {
+                let _ = reply.send(Err(reject));
+                return;
+            }
+        };
+        let tv = params.tv.clone();
+        self.pending
+            .insert(tv.name.clone(), PendingStart { params, reply });
+        let factory = Arc::clone(&self.factory);
+        let opened_tx = self.opened_tx.clone();
+        tokio::spawn(async move {
+            let outcome = tokio::time::timeout(OPEN_TIMEOUT, factory.open(&tv)).await;
+            let _ = opened_tx
+                .send(Opened {
+                    tv: tv.name,
+                    outcome,
+                })
+                .await;
+        });
+    }
+
+    async fn on_opened(&mut self, done: Opened<F::Transport>) {
+        let Some(PendingStart { params, reply }) = self.pending.remove(&done.tv) else {
+            return;
+        };
+        let _ = reply.send(self.complete_start(params, done.outcome).await);
+    }
+
+    fn reserve(&self, req: StartCast) -> Result<StartParams, CastReject> {
         let Some(tv) = self.cfg.tv(&req.tv_name).cloned() else {
             return Err(self.reject(
                 &req,
@@ -435,7 +498,15 @@ impl<F: TransportFactory> Actor<F> {
         };
         let group_label = group.group_id.to_string();
 
-        if let Some(existing) = self.by_user.get(&req.user_id) {
+        let in_flight = self
+            .pending
+            .values()
+            .find(|p| p.params.req.user_id == req.user_id);
+        if let Some(existing) = self
+            .by_user
+            .get(&req.user_id)
+            .or_else(|| in_flight.map(|p| &p.params.tv.name))
+        {
             return Err(self.reject(
                 &req,
                 &group_label,
@@ -447,7 +518,7 @@ impl<F: TransportFactory> Actor<F> {
                 ),
             ));
         }
-        if self.casts.contains_key(&tv.name) {
+        if self.casts.contains_key(&tv.name) || self.pending.contains_key(&tv.name) {
             return Err(self.reject(
                 &req,
                 &group_label,
@@ -457,7 +528,27 @@ impl<F: TransportFactory> Actor<F> {
             ));
         }
 
-        let opened = tokio::time::timeout(OPEN_TIMEOUT, self.factory.open(&tv)).await;
+        Ok(StartParams {
+            req,
+            tv,
+            owner_member,
+            group,
+            group_label,
+        })
+    }
+
+    async fn complete_start(
+        &mut self,
+        params: StartParams,
+        opened: OpenOutcome<F::Transport>,
+    ) -> Result<(), CastReject> {
+        let StartParams {
+            req,
+            tv,
+            owner_member,
+            group,
+            group_label,
+        } = params;
         let (transport, occupancy) = match opened {
             Ok(Ok(opened)) => opened,
             Ok(Err(e)) => {
@@ -975,6 +1066,8 @@ struct FakeSlot {
     receiver: Option<FakeReceiver>,
     occupancy: Occupancy,
     unreachable: bool,
+    /// While set, `open` waits for one notification before answering.
+    gate: Option<Arc<Notify>>,
 }
 
 impl FakeTransportFactory {
@@ -995,6 +1088,7 @@ impl FakeTransportFactory {
                     receiver: Some(receiver),
                     occupancy: Occupancy::Idle,
                     unreachable: false,
+                    gate: None,
                 },
             );
         handle
@@ -1009,6 +1103,21 @@ impl FakeTransportFactory {
         {
             s.occupancy = occupancy;
         }
+    }
+
+    /// Make `open` for this TV hang until the returned handle is notified
+    /// (`notify_one`), to stand in for a TV that is slow to answer.
+    pub fn hold_open(&self, name: &str) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        if let Some(s) = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(name)
+        {
+            s.gate = Some(Arc::clone(&gate));
+        }
+        gate
     }
 
     pub fn set_unreachable(&self, name: &str, unreachable: bool) {
@@ -1027,6 +1136,15 @@ impl TransportFactory for FakeTransportFactory {
     type Transport = FakeReceiver;
 
     async fn open(&self, tv: &ConfiguredTv) -> Result<(FakeReceiver, Occupancy), CastError> {
+        let gate = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&tv.name)
+            .and_then(|s| s.gate.clone());
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let refused = |why: &str| CastError::Connect {
             addr: tv.address.to_string(),
