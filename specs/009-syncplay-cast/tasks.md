@@ -18,10 +18,10 @@ description: "Task list for SyncPlay Cast Target"
 
 **Purpose**: ship the signal before the behaviour so it can be read in production.
 
-- [ ] T001 Scaffold crate `crates/pharos-cast` (`Cargo.toml` with workspace lints, `src/lib.rs`), add to workspace `members` in `Cargo.toml`, run `just hakari-regen`
-- [ ] T002 [P] Add `CastEvent` and `CastReason` enums with stable `label()` methods in `crates/pharos-cast/src/events.rs` (events: `started|rejected|ended|lost|reconnected|handoff_failed`; reasons: `not_in_group|tv_busy|tv_unreachable|user_has_seat|not_permitted|owner_left|group_gone|grace_expired|user_stop|token_failed`) plus a test asserting every label is distinct and bounded
-- [ ] T003 Add `record_cast_event(event, reason, user, sender_device, tv, group)` in `crates/pharos-cast/src/obs.rs` emitting `pharos_cast_seat_total{event,reason}` and a `tracing` event `cast seat` carrying user, sender device, TV, group and the offending value (never a bare class), on the failure path as well as the success path (test both, analyze F13); register `pharos_cast_drift_seconds` (histogram), `pharos_cast_correction_total{kind}`, `pharos_cast_connection{state}`; test asserts each series via the `metrics` test recorder
-- [ ] T004 Disarm check: comment out each record call from T003 once, confirm its test fails, restore; note result in the commit body
+- [X] T001 Scaffold crate `crates/pharos-cast` (`Cargo.toml` with workspace lints, `src/lib.rs`), add to workspace `members` in `Cargo.toml`, run `just hakari-regen`
+- [X] T002 [P] Add `CastEvent` and `CastReason` enums with stable `label()` methods in `crates/pharos-cast/src/events.rs` (events: `started|rejected|ended|lost|reconnected|handoff_failed`; reasons: `not_in_group|tv_busy|tv_unreachable|user_has_seat|not_permitted|owner_left|group_gone|grace_expired|user_stop|token_failed`) plus a test asserting every label is distinct and bounded
+- [X] T003 Add `record_cast_event(event, reason, user, sender_device, tv, group)` in `crates/pharos-cast/src/obs.rs` emitting `pharos_cast_seat_total{event,reason}` and a `tracing` event `cast seat` carrying user, sender device, TV, group and the offending value (never a bare class), on the failure path as well as the success path (test both, analyze F13); register `pharos_cast_drift_seconds` (histogram), `pharos_cast_correction_total{kind}`, `pharos_cast_connection{state}`; test asserts each series via the `metrics` test recorder
+- [X] T004 Disarm check: comment out each record call from T003 once, confirm its test fails, restore; note result in the commit body
 
 **Checkpoint**: instrumentation merged on its own commit(s); `cargo nextest run -p pharos-cast` green.
 
@@ -39,11 +39,11 @@ description: "Task list for SyncPlay Cast Target"
 
 ### Group membership kinds (`pharos-sync`)
 
-- [ ] T008 Write failing tests in `crates/pharos-sync/tests/group_conformance.rs`: a `CastSeat` member and a `Controller` member never appear in `follower_ids`, never extend a Seek/BufferingUnpause/QueueChange gate, and never receive a buffering freeze aimed at "everyone else" as a wait target (V139, V161); roster lists them
-- [ ] T009 Add closed enum `MemberKind { Player, Controller, CastSeat }` and optional `cast: {tv, owner}` to the member record in `crates/pharos-sync/src/group.rs`; exclude non-`Player` kinds in `follower_ids` (`group.rs ~1536`) and gate-hold release paths; make T008 green
-- [ ] T010 [P] Write failing test in `crates/pharos-sync/tests/hub_integration.rs` that a snapshot without `kind` (old format) loads as `Player`, and a snapshot with `CastSeat` round-trips; then add `kind`/`cast` to `PersistMember` with `#[serde(default)]` in `crates/pharos-sync/src/group.rs` (`~2160`)
-- [ ] T011 Add `GroupMsg::SetMemberKind { member, kind, cast }` handled in the actor, with a `RemoteCommand` variant in `crates/pharos-sync/src/distributed.rs` and bus (de)serialization test in `crates/pharos-sync/tests/distributed_sync.rs`
-- [ ] T012 Add a non-websocket sink variant in `crates/pharos-sync/src/delivery.rs` (a trait object or enum arm that forwards the group's outgoing `SendCommand`/group updates to a channel); test it receives the same command stream a websocket sink would
+- [X] T008 Write failing tests in `crates/pharos-sync/tests/group_conformance.rs`: a `CastSeat` member and a `Controller` member never appear in `follower_ids`, never extend a Seek/BufferingUnpause/QueueChange gate, and never receive a buffering freeze aimed at "everyone else" as a wait target (V139, V161); roster lists them
+- [X] T009 Add closed enum `MemberKind { Player, Controller, CastSeat }` and optional `cast: {tv, owner}` to the member record in `crates/pharos-sync/src/group.rs`; exclude non-`Player` kinds in `follower_ids` (`group.rs ~1536`) and gate-hold release paths; make T008 green
+- [X] T010 [P] Write failing test in `crates/pharos-sync/tests/hub_integration.rs` that a snapshot without `kind` (old format) loads as `Player`, and a snapshot with `CastSeat` round-trips; then add `kind`/`cast` to `PersistMember` with `#[serde(default)]` in `crates/pharos-sync/src/group.rs` (`~2160`)
+- [X] T011 Add `GroupMsg::SetMemberKind { member, kind, cast }` handled in the actor, with a `RemoteCommand` variant in `crates/pharos-sync/src/distributed.rs` and bus (de)serialization test in `crates/pharos-sync/tests/distributed_sync.rs`
+- [X] T012 Add a non-websocket sink variant in `crates/pharos-sync/src/delivery.rs` (a trait object or enum arm that forwards the group's outgoing `SendCommand`/group updates to a channel); test it receives the same command stream a websocket sink would
 
 ### Cast building blocks (`pharos-cast`)
 
@@ -76,8 +76,8 @@ description: "Task list for SyncPlay Cast Target"
 - [ ] T022 [P] [US1] Failing test in `crates/pharos-sync/tests/group_conformance.rs`: group pause/unpause/seek reach the cast sink as the expected cast commands, and a TV that never acks does not extend any gate
 - [ ] T023 [P] [US1] Failing test in `crates/pharos-cast/src/driver.rs` (module tests): `CastDriver` applies a group Seek to the emulator, then corrects injected drift via the planner, records `pharos_cast_correction_total`
 
-- [ ] T050 [P] [US1] Failing tests: the roster shows a casting user once (TV as device) in `crates/pharos-sync/tests/group_conformance.rs`; a `tv_busy` rejection, a slow-Loading start within the freeze bound, and a decode-failure end with a reason in `crates/pharos-server/tests/cast_start.rs`; virtual session id is stable across restart in `cast_virtual_session.rs` (analyze F1, F6, F11)
-- [ ] T051 [US1] Implement the one-entry roster projection in `crates/pharos-sync/src/group.rs` (group-update/roster builder) so T050 passes
+- [ ] T050 [P] [US1] (roster test done in 26e279d2; `tv_busy`, slow-Loading and stable-session-id tests remain) Failing tests: the roster shows a casting user once (TV as device) in `crates/pharos-sync/tests/group_conformance.rs`; a `tv_busy` rejection, a slow-Loading start within the freeze bound, and a decode-failure end with a reason in `crates/pharos-server/tests/cast_start.rs`; virtual session id is stable across restart in `cast_virtual_session.rs` (analyze F1, F6, F11)
+- [X] T051 [US1] Implement the one-entry roster projection in `crates/pharos-sync/src/group.rs` (group-update/roster builder) so T050 passes
 - [ ] T052 [US1] Scope the TV token to playback endpoints only in `crates/pharos-server/src/cast.rs` and add a test that it is refused on admin and library-mutation routes (analyze F8)
 
 ### Implementation
