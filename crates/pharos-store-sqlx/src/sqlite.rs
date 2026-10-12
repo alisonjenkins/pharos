@@ -702,7 +702,7 @@ impl MediaStore for SqliteStore {
     /// does not cost its neighbours.
     #[tracing::instrument(skip(self, items), fields(batch.len = items.len()))]
     async fn put_batch(&self, items: &[MediaItem]) -> DomainResult<()> {
-        let rows = crate::put_batch::dedupe_last_wins(items);
+        let rows = crate::put_batch::rows_for_batch(items);
         match rows.as_slice() {
             [] => return Ok(()),
             [one] => return self.put((*one).clone()).await,

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// survivors in their original relative order. This is what N sequential
 /// `put`s leave behind, and it keeps one multi-row `ON CONFLICT DO UPDATE`
 /// from touching the same row twice (Postgres rejects that outright).
-pub(crate) fn dedupe_last_wins(items: &[MediaItem]) -> Vec<&MediaItem> {
+fn dedupe_last_wins(items: &[MediaItem]) -> Vec<&MediaItem> {
     let mut last: HashMap<MediaId, usize> = HashMap::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
         last.insert(item.id, i);
@@ -18,6 +18,16 @@ pub(crate) fn dedupe_last_wins(items: &[MediaItem]) -> Vec<&MediaItem> {
         .filter(|(i, item)| last.get(&item.id) == Some(i))
         .map(|(_, item)| item)
         .collect()
+}
+
+/// The rows a backend writes for `items`: deduped (last wins), then ordered by
+/// id. Every transaction then locks and writes its rows in the same order, so
+/// two overlapping batches over the same ids cannot deadlock each other (each
+/// row's language-index trigger deletes and re-inserts index rows).
+pub(crate) fn rows_for_batch(items: &[MediaItem]) -> Vec<&MediaItem> {
+    let mut rows = dedupe_last_wins(items);
+    rows.sort_unstable_by_key(|item| item.id);
+    rows
 }
 
 /// Write `rows` one `put` at a time after a batched write failed. Every item
@@ -59,6 +69,16 @@ mod tests {
             .map(|i| (i.id, i.title.as_str()))
             .collect();
         assert_eq!(kept, [(2, "b"), (1, "a2"), (3, "c")]);
+    }
+
+    #[test]
+    fn batch_rows_are_ordered_by_id_and_the_last_duplicate_wins() {
+        let items = [item(3, "c"), item(1, "a1"), item(2, "b"), item(1, "a2")];
+        let rows: Vec<_> = rows_for_batch(&items)
+            .iter()
+            .map(|i| (i.id, i.title.as_str()))
+            .collect();
+        assert_eq!(rows, [(1, "a2"), (2, "b"), (3, "c")]);
     }
 
     #[test]
