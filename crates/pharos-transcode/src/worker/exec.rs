@@ -4,7 +4,7 @@
 //! the in-process FFI path (added in a later step) but reuses the same
 //! device→hwaccel mapping + failure classification.
 
-use crate::ffmpeg_transcode_args;
+use crate::ffmpeg_transcode_args_pipeline;
 use crate::hwaccel::detect_available;
 use crate::protocol::{DeviceId, JobSpec, OutputSink, WorkerError};
 use smallvec::SmallVec;
@@ -160,24 +160,26 @@ pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), Work
             let out_str = path
                 .to_str()
                 .ok_or_else(|| WorkerError::BadInput(format!("non-utf8 output path: {path:?}")))?;
-            let args = ffmpeg_transcode_args(
+            let args = ffmpeg_transcode_args_pipeline(
                 input,
                 &spec.opts,
                 spec.device,
                 out_str,
                 spec.decode_offload,
                 spec.filler,
+                spec.vaapi_pipeline,
             );
             Ok((args, SpawnTarget::File(path.clone())))
         }
         OutputSink::Stdout => {
-            let args = ffmpeg_transcode_args(
+            let args = ffmpeg_transcode_args_pipeline(
                 input,
                 &spec.opts,
                 spec.device,
                 "pipe:1",
                 spec.decode_offload,
                 spec.filler,
+                spec.vaapi_pipeline,
             );
             Ok((args, SpawnTarget::Stdout))
         }

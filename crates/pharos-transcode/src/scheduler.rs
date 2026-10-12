@@ -24,6 +24,7 @@
 
 use crate::admission::{AdmissionConfig, AdmissionController, Observation};
 use crate::device::DeviceTable;
+use crate::hwaccel::HwAccel;
 use crate::options::TranscodeOptions;
 use crate::protocol::{DeviceId, JobId, JobSpec, OutputSink, WorkerError, WorkerId};
 use bytes::Bytes;
@@ -578,7 +579,19 @@ pub trait WorkerSpawner: Send + Sync + 'static {
             ))
         })
     }
+
+    /// Whether `input` has a property the GPU-resident VAAPI pipeline cannot
+    /// handle (rotation, interlacing). Asked once per resident job, before it
+    /// runs. The default says "nothing blocks it", which is right for a spawner
+    /// that runs no real ffmpeg; `ProcSpawner` actually looks.
+    fn inspect_source(&self, _input: &Path) -> InspectFuture {
+        Box::pin(async { None })
+    }
 }
+
+/// Boxed future a [`WorkerSpawner::inspect_source`] call returns.
+pub type InspectFuture =
+    Pin<Box<dyn Future<Output = Option<crate::resident_preflight::ResidentBlock>> + Send>>;
 
 /// Where the caller wants output to land.
 #[derive(Debug, Clone)]
@@ -773,6 +786,13 @@ pub struct SchedConfig {
     /// is dropped with it, so a device flapping under this switch reads as load
     /// shedding rather than as the hardware fault it is.
     pub queue_background: bool,
+    /// May a VAAPI segment keep its frames on the GPU from decoder to encoder?
+    /// Off by default: it is a different ffmpeg pipeline, and it only applies to
+    /// a job with no burn-in and a plain 8-bit SDR source (see
+    /// [`crate::ResidentVerdict`]). A failed resident run is retried once on the
+    /// proven path, so turning this on cannot fail a segment the old path could
+    /// have produced.
+    pub vaapi_gpu_resident: bool,
 }
 
 impl Default for SchedConfig {
@@ -785,6 +805,7 @@ impl Default for SchedConfig {
             background_headroom: 1,
             admission: AdmissionConfig::default(),
             queue_background: true,
+            vaapi_gpu_resident: false,
         }
     }
 }
@@ -1771,6 +1792,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 opts,
                 device,
                 decode_offload,
+                vaapi_pipeline: crate::VaapiPipeline::Hybrid,
                 sink: OutputSink::Stdout,
                 // The live progressive path has no retry ladder to exhaust —
                 // B228 filler is an HLS-segment concept.
@@ -2767,6 +2789,39 @@ fn decode_offload_for(
     verdict
 }
 
+/// The VAAPI pipeline for this placement, and the reason it is not `Resident`
+/// when it is not. Counted for VAAPI placements only: a CPU or NVENC job has no
+/// such choice, and counting it would bury the one that does.
+fn vaapi_pipeline_for(
+    state: &SchedState,
+    dev: DeviceId,
+    ctx: &JobCtx,
+    offload: crate::DecodeOffload,
+) -> crate::VaapiPipeline {
+    let verdict = crate::ResidentVerdict::of(
+        state.cfg.vaapi_gpu_resident,
+        &ctx.opts,
+        dev,
+        offload,
+        ctx.filler.is_some(),
+        matches!(ctx.sink, SinkRequest::FileDirect { .. }),
+    );
+    if matches!(
+        dev,
+        DeviceId::Hw {
+            accel: HwAccel::Vaapi,
+            ..
+        }
+    ) {
+        metrics::counter!(
+            "pharos_transcode_vaapi_pipeline_total",
+            "verdict" => verdict.label(),
+        )
+        .increment(1);
+    }
+    verdict.pipeline()
+}
+
 fn record_placement(
     job_id: JobId,
     dev: DeviceId,
@@ -2794,6 +2849,7 @@ fn record_placement(
         retries = ctx.retries,
         peer_jobs = tracing::field::Empty,
         background_peers = tracing::field::Empty,
+        vaapi_pipeline = tracing::field::Empty,
         queue_wait_ms = tracing::field::Empty,
         encode_ms = tracing::field::Empty,
         out_bytes = tracing::field::Empty,
@@ -3035,7 +3091,9 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             }
             record_dispatch(state, &ctx);
             let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
+            let vaapi_pipeline = vaapi_pipeline_for(state, dev, &ctx, decode_offload);
             let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
+            span.record("vaapi_pipeline", vaapi_pipeline.label());
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -3045,6 +3103,7 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
                 opts: ctx.opts.clone(),
                 device: dev,
                 decode_offload,
+                vaapi_pipeline,
                 sink: to_output_sink(&ctx.sink),
                 filler: ctx.filler,
             };
@@ -3378,7 +3437,9 @@ fn try_place_no_queue(
             }
             record_dispatch(state, &ctx);
             let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
+            let vaapi_pipeline = vaapi_pipeline_for(state, dev, &ctx, decode_offload);
             let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
+            span.record("vaapi_pipeline", vaapi_pipeline.label());
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
             state.next_worker += 1;
@@ -3388,6 +3449,7 @@ fn try_place_no_queue(
                 opts: ctx.opts.clone(),
                 device: dev,
                 decode_offload,
+                vaapi_pipeline,
                 sink: to_output_sink(&ctx.sink),
                 filler: ctx.filler,
             };
@@ -3460,8 +3522,28 @@ fn spawn_run_task(
     span: tracing::Span,
 ) {
     let job_id = spec.job_id;
+    let mut spec = spec;
     tokio::spawn(async move {
         let _guard = span.enter();
+        // The probe does not record rotation or field order, and the resident
+        // pipeline silently mis-handles both (see `resident_preflight`). Look
+        // at the source before committing to it.
+        if spec.vaapi_pipeline == crate::VaapiPipeline::Resident {
+            if let Some(block) = spawner.inspect_source(&spec.input).await {
+                tracing::info!(
+                    %job_id,
+                    %device,
+                    reason = block.label(),
+                    "source cannot take the GPU-resident VAAPI path; using the hybrid path"
+                );
+                metrics::counter!(
+                    "pharos_transcode_vaapi_resident_fallback_total",
+                    "reason" => block.label(),
+                )
+                .increment(1);
+                spec.vaapi_pipeline = crate::VaapiPipeline::Hybrid;
+            }
+        }
         let worker = match worker {
             Some(w) => w,
             None => match spawner.spawn(worker_id).await {
@@ -3492,7 +3574,33 @@ fn spawn_run_task(
         // once" invariant depends on this.
         let run_handle = tokio::spawn(async move {
             let mut worker = worker;
-            let result = worker.run(spec).await;
+            let resident = spec.vaapi_pipeline == crate::VaapiPipeline::Resident;
+            let retry_spec = resident.then(|| JobSpec {
+                vaapi_pipeline: crate::VaapiPipeline::Hybrid,
+                ..spec.clone()
+            });
+            let mut result = worker.run(spec).await;
+            // A resident run that fails is retried once on the proven hybrid
+            // path, on the same worker and device, before anyone sees the
+            // failure: the flag must not be able to fail a segment the old path
+            // could have produced. If the device itself is at fault the retry
+            // fails the same way and the normal classification (cooldown,
+            // re-placement) takes over from there.
+            if let (WorkerRunResult::Failed(err), Some(retry)) = (&result, retry_spec) {
+                tracing::warn!(
+                    %job_id,
+                    %device,
+                    reason = err.label(),
+                    error = %err,
+                    "GPU-resident VAAPI run failed; retrying once on the hybrid path"
+                );
+                metrics::counter!(
+                    "pharos_transcode_vaapi_resident_fallback_total",
+                    "reason" => err.label(),
+                )
+                .increment(1);
+                result = worker.run(retry).await;
+            }
             (worker, result)
         });
         let (returned, result) = match run_handle.await {
@@ -3747,6 +3855,189 @@ mod tests {
                 }
                 f(id, &job)
             })
+        }
+    }
+
+    /// A scripted spawner that also answers the resident preflight.
+    struct InspectingSpawner {
+        inner: Arc<ScriptedSpawner>,
+        block: Option<crate::resident_preflight::ResidentBlock>,
+    }
+
+    impl WorkerSpawner for InspectingSpawner {
+        fn spawn(&self, id: WorkerId) -> SpawnFuture {
+            self.inner.spawn(id)
+        }
+        fn inspect_source(&self, _input: &Path) -> InspectFuture {
+            let block = self.block;
+            Box::pin(async move { block })
+        }
+    }
+
+    struct VaapiRun {
+        /// The pipeline each run of the job was handed, in order.
+        pipelines: Vec<crate::VaapiPipeline>,
+        result: Result<JobDone, SchedError>,
+        /// (metric name, first label value) for the resident metrics.
+        rows: Vec<(String, String)>,
+    }
+
+    /// Submit one plain-8-bit H.264 job to a lone VAAPI device.
+    fn run_on_vaapi(
+        resident_enabled: bool,
+        fail_resident: bool,
+        block: Option<crate::resident_preflight::ResidentBlock>,
+    ) -> VaapiRun {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let seen: Arc<Mutex<Vec<crate::VaapiPipeline>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let log = seen.clone();
+        let result = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Vaapi, 0);
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+                    log.lock().unwrap().push(spec.vaapi_pipeline);
+                    if fail_resident && spec.vaapi_pipeline == crate::VaapiPipeline::Resident {
+                        WorkerRunResult::Failed(WorkerError::Other(
+                            "scale_vaapi: no surface".into(),
+                        ))
+                    } else {
+                        WorkerRunResult::Done { out_bytes: 1 }
+                    }
+                });
+                let mut table = DeviceTable::from_probe(&[(gpu, 2)], 1);
+                table.set_decodable(gpu, &[crate::SourceCodec::H264]);
+                let s = TranscodeScheduler::spawn(
+                    table,
+                    Arc::new(InspectingSpawner {
+                        inner: spawner,
+                        block,
+                    }),
+                    SchedConfig {
+                        vaapi_gpu_resident: resident_enabled,
+                        ..SchedConfig::default()
+                    },
+                );
+                let mut o = h264();
+                o.source_video_codec = Some(crate::SourceCodec::H264);
+                o.source_video_kind = crate::options::SourceVideoKind::Plain8BitSdr;
+                s.submit(
+                    PathBuf::from("/m/a.mkv"),
+                    o,
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint::default(),
+                )
+                .await
+            })
+        });
+        let rows = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .filter(|(k, ..)| {
+                matches!(
+                    k.key().name(),
+                    "pharos_transcode_vaapi_resident_fallback_total"
+                        | "pharos_transcode_vaapi_pipeline_total"
+                )
+            })
+            .map(|(k, ..)| {
+                let label = k.key().labels().next().map(|l| l.value().to_string());
+                (k.key().name().to_string(), label.unwrap_or_default())
+            })
+            .collect();
+        let pipelines = seen.lock().unwrap().clone();
+        VaapiRun {
+            pipelines,
+            result,
+            rows,
+        }
+    }
+
+    fn row(name: &str, label: &str) -> (String, String) {
+        (name.to_string(), label.to_string())
+    }
+
+    #[test]
+    fn resident_is_off_unless_configured() {
+        let r = run_on_vaapi(false, false, None);
+        assert!(r.result.is_ok());
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid]);
+        assert!(
+            r.rows
+                .contains(&row("pharos_transcode_vaapi_pipeline_total", "disabled")),
+            "{:?}",
+            r.rows
+        );
+    }
+
+    #[test]
+    fn an_eligible_vaapi_job_runs_resident_when_enabled() {
+        let r = run_on_vaapi(true, false, None);
+        assert!(r.result.is_ok());
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::Resident]);
+        assert!(
+            r.rows
+                .contains(&row("pharos_transcode_vaapi_pipeline_total", "resident")),
+            "{:?}",
+            r.rows
+        );
+        assert!(
+            !r.rows.iter().any(|(n, _)| n.ends_with("fallback_total")),
+            "no fallback expected: {:?}",
+            r.rows
+        );
+    }
+
+    /// A failed resident run is retried once on the hybrid path, the job
+    /// succeeds, and the fallback is counted with the failure's class.
+    #[test]
+    fn a_failed_resident_run_is_retried_once_on_the_hybrid_path() {
+        let r = run_on_vaapi(true, true, None);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(
+            r.pipelines,
+            [crate::VaapiPipeline::Resident, crate::VaapiPipeline::Hybrid]
+        );
+        assert!(
+            r.rows.contains(&row(
+                "pharos_transcode_vaapi_resident_fallback_total",
+                "other"
+            )),
+            "{:?}",
+            r.rows
+        );
+    }
+
+    /// A rotated or interlaced source never reaches the resident ffmpeg: the
+    /// resident pipeline would write it sideways with exit status 0, so there
+    /// would be nothing to retry on.
+    #[test]
+    fn a_source_the_preflight_blocks_runs_hybrid_first_time() {
+        use crate::resident_preflight::ResidentBlock;
+        for (block, label) in [
+            (ResidentBlock::Rotated, "rotated"),
+            (ResidentBlock::Interlaced, "interlaced"),
+            (ResidentBlock::Unreadable, "inspect_failed"),
+        ] {
+            let r = run_on_vaapi(true, false, Some(block));
+            assert!(r.result.is_ok());
+            assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid], "{label}");
+            assert!(
+                r.rows.contains(&row(
+                    "pharos_transcode_vaapi_resident_fallback_total",
+                    label
+                )),
+                "{label}: {:?}",
+                r.rows
+            );
         }
     }
 
