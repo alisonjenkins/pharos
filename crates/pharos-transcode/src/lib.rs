@@ -28,6 +28,7 @@ pub mod rate_store;
 pub mod resident_preflight;
 pub mod scheduler;
 pub mod segment;
+pub mod stage_timing;
 pub mod subwin;
 #[cfg(unix)]
 pub mod worker;
