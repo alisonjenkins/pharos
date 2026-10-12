@@ -507,3 +507,66 @@ async fn non_player_buffering_is_not_a_freeze_wait_target() {
         "the freeze must lift without waiting on the CastSeat"
     );
 }
+
+/// A channel-attached adapter sink (what a Cast seat uses) must see exactly
+/// the message stream a websocket-style sink sees for pause / unpause / seek.
+#[tokio::test]
+async fn channel_attached_sink_receives_the_same_stream_as_a_socket_sink() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (ws, mut ws_rx) = add_member(&h, &sinks, "socket").await;
+    let adapter = MemberId::new();
+    let mut adapter_rx = sinks.attach_channel(adapter, 1, 64);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: adapter,
+        name: "tv".into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    set_kind(&h, adapter, MemberKind::CastSeat, None).await;
+    let _ = ws;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    h.tx.send(GroupMsg::PauseShared { sender: leader })
+        .await
+        .unwrap();
+    h.tx.send(GroupMsg::Unpause { sender: leader })
+        .await
+        .unwrap();
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 20_000,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    fn kinds(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if matches!(
+                m,
+                ServerMsg::Play { .. } | ServerMsg::Pause { .. } | ServerMsg::Seek { .. }
+            ) {
+                out.push(m.kind());
+            }
+        }
+        out
+    }
+    let socket = kinds(&mut ws_rx);
+    let adapter = kinds(&mut adapter_rx);
+    let _ = kinds(&mut leader_rx);
+    assert!(
+        socket.contains(&"pause") && socket.contains(&"seek"),
+        "scenario must produce commands: {socket:?}"
+    );
+    assert_eq!(adapter, socket, "adapter and socket sinks diverged");
+}
