@@ -6,6 +6,9 @@
 pub mod sqlite;
 
 #[cfg(feature = "sqlite")]
+mod sqlite_put;
+
+#[cfg(feature = "sqlite")]
 mod auth_sqlite;
 
 #[cfg(feature = "sqlite")]
