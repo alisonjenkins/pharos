@@ -33,7 +33,7 @@ description: "Task list for SyncPlay Cast Target"
 
 ### Spikes (record each outcome in `research.md`; they may change later tasks)
 
-- [ ] T005 Spike S1: choose CASTV2 crate vs `rustls`+`prost` (licence vs AGPL-3.0-or-later, async, maintenance); capture the real `PlayNow` / `Seek` / `Pause` / `Unpause` / `Stop` message shapes and receiver progress messages from `jellyfin/jellyfin-chromecast`; confirm TV-token mint path in `crates/pharos-server/src/api/jellyfin/auth_extractor.rs` and the token store
+- [ ] T005 Spike S1: choose CASTV2 crate vs `rustls`+`prost` (licence vs AGPL-3.0-or-later, async, maintenance); capture the real `PlayNow` / `Seek` / `Pause` / `Unpause` / `Stop` message shapes and receiver progress messages from `jellyfin/jellyfin-chromecast`; confirm TV-token mint path in `crates/pharos-server/src/api/jellyfin/auth_extractor.rs` and the token store, and whether the token store supports per-token scopes (if not, size the smallest addition and give it its own task before T052)
 - [ ] T006 [P] Spike S4: in `compat-playwright/`, confirm jellyfin-web 10.11.x lists a server-supplied `GET /Sessions` entry in its device picker; record the minimal field set and fix `supports_remote_control` inconsistency between REST (`sessions.rs:167`) and socket broadcast (`socket.rs ~895-915`) as a failing test in `crates/pharos-server/tests/jellyfin_sessions.rs`
 - [ ] T007 [P] Spike S3: in `compat-playwright/`, with two jellyfin-web contexts in a SyncPlay group, send the first context a `PlayState` `Stop` over its socket and record whether it stops locally or turns it into a SyncPlay request
 
@@ -48,7 +48,7 @@ description: "Task list for SyncPlay Cast Target"
 ### Cast building blocks (`pharos-cast`)
 
 - [ ] T013 [P] Define typed connectsdk DTOs from spike S1 in `crates/pharos-cast/src/messages.rs` (command out, report in) with serde round-trip tests against captured fixtures
-- [ ] T014 [P] Write failing tests then implement the pure planner `plan(target, observed, now, state) -> Action {None|Seek|Pause|Resume}` in `crates/pharos-cast/src/drift.rs` with dead-band, hysteresis and report-age interpolation; add proptests (never two corrections inside the cooldown; never seeks when within threshold; paused target never seeks forward)
+- [ ] T014 [P] Write failing tests then implement the pure planner `plan(target, observed, now, state) -> Action {None|Seek|Pause|Resume}` in `crates/pharos-cast/src/drift.rs` with dead-band, hysteresis and report-age interpolation (the 1500 ms threshold and 5000 ms cooldown are provisional until T048 re-tunes them from the real-TV measurement); add proptests (never two corrections inside the cooldown; never seeks when within threshold; paused target never seeks forward)
 - [ ] T015 Define `trait CastTransport` (connect, launch, send, recv, close; native `async fn`, no `async_trait`) in `crates/pharos-cast/src/transport.rs`
 - [ ] T016 Implement the receiver emulator `FakeReceiver` in `crates/pharos-cast/src/fake.rs`: handles the stock command set, mirrors `playbackstart/progress/stop` every 1.5 s, injectable latency, drift, drop-connection and seek-inaccuracy; unit tests for each knob
 - [ ] T017 Implement the real CASTV2 `CastTransport` in `crates/pharos-cast/src/transport.rs` per spike S1 (TLS 8009, heartbeat, launch `F007D354`), with connect timeout and retry with backoff; integration test against the emulator exposed over a local TLS socket if the chosen crate allows, else gated behind a `real-tv` feature
@@ -72,7 +72,7 @@ description: "Task list for SyncPlay Cast Target"
 - [ ] T020 [P] [US1] Failing test `crates/pharos-server/tests/cast_virtual_session.rs`: `GET /Sessions` lists a configured, reachable, permitted TV with `SupportsRemoteControl: true`, `Client: "Chromecast"`; not listed for a non-permitted user (V9) or an unreachable TV; same values on the socket `Sessions` broadcast
 - [ ] T021 [P] [US1] Failing test `crates/pharos-server/tests/cast_start.rs`: `POST /Sessions/{tv}/Playing` by a group member creates a seat, the emulator receives `PlayNow` at the group position, the owner's member becomes `Controller`, the roster shows the owner once with the TV as device; non-virtual ids behave exactly as before
 - [ ] T022 [P] [US1] Failing test in `crates/pharos-sync/tests/group_conformance.rs`: group pause/unpause/seek reach the cast sink as the expected cast commands, and a TV that never acks does not extend any gate
-- [ ] T023 [P] [US1] Failing test in `crates/pharos-cast/src/driver.rs` (module tests): `CastSeat` applies a group Seek to the emulator, then corrects injected drift via the planner, records `pharos_cast_correction_total`
+- [ ] T023 [P] [US1] Failing test in `crates/pharos-cast/src/driver.rs` (module tests): `CastDriver` applies a group Seek to the emulator, then corrects injected drift via the planner, records `pharos_cast_correction_total`
 
 - [ ] T050 [P] [US1] Failing tests: the roster shows a casting user once (TV as device) in `crates/pharos-sync/tests/group_conformance.rs`; a `tv_busy` rejection, a slow-Loading start within the freeze bound, and a decode-failure end with a reason in `crates/pharos-server/tests/cast_start.rs`; virtual session id is stable across restart in `cast_virtual_session.rs` (analyze F1, F6, F11)
 - [ ] T051 [US1] Implement the one-entry roster projection in `crates/pharos-sync/src/group.rs` (group-update/roster builder) so T050 passes
@@ -81,11 +81,11 @@ description: "Task list for SyncPlay Cast Target"
 ### Implementation
 
 - [ ] T024 [US1] Implement `CastDriver` actor (state machine from `data-model.md`: Connecting → Loading → Following) in `crates/pharos-cast/src/driver.rs`: owns one `CastTransport`, consumes group commands from the cast sink, feeds receiver reports to the planner, emits `record_cast_event`
-- [ ] T025 [US1] Implement the seat registry and hand-off in `crates/pharos-server/src/cast.rs`: validate caller is a group member and not already a seat owner and TV not busy (rejections recorded with reasons), mint token, spawn `CastSeat`, `SetMemberKind` (owner → `Controller`, new seat member `CastSeat` keyed `UUIDv5("{user}:cast:{tv}")`), launch + `PlayNow` at the group's current position and item
+- [ ] T025 [US1] Implement the seat registry and hand-off in `crates/pharos-server/src/cast.rs`: validate caller is a group member and not already a seat owner and TV not busy (rejections recorded with reasons), mint token, spawn `CastDriver`, `SetMemberKind` (owner → `Controller`, new seat member `CastSeat` keyed `UUIDv5("{user}:cast:{tv}")`), launch + `PlayNow` at the group's current position and item
 - [ ] T026 [US1] Project virtual TV sessions into `GET /Sessions` and the socket `Sessions` broadcast in `crates/pharos-server/src/api/jellyfin/sessions.rs` and `crates/pharos-server/src/api/jellyfin/socket.rs` as a typed DTO (V38), same values both places
 - [ ] T027 [US1] Intercept `POST /Sessions/{id}/Playing` for virtual TV ids in `crates/pharos-server/src/api/jellyfin/sessions.rs`: start via T025, reject with the Jellyfin error shape and stable reason string otherwise
 - [ ] T028 [US1] Send the owner's socket a `PlayState` `Stop` on hand-off in `crates/pharos-server/src/cast.rs` (behaviour per spike S3; if S3 shows it is ignored, implement the fallback in research R8 and update the test in T021)
-- [ ] T029 [US1] Wire `CastSeat` into `main`/`AppState` startup in `crates/pharos-server/src/state.rs` and `lib.rs` (registry as an actor handle, no `Mutex<State>` on the request path, V18)
+- [ ] T029 [US1] Wire the `CastDriver` registry into `main`/`AppState` startup in `crates/pharos-server/src/state.rs` and `lib.rs` (registry as an actor handle, no `Mutex<State>` on the request path, V18)
 
 **Checkpoint**: US1 works against the emulator; MVP.
 
@@ -98,9 +98,9 @@ description: "Task list for SyncPlay Cast Target"
 **Independent Test**: from the owner's client send Pause/Seek/Next addressed to the TV session; every member including the TV follows; nothing is applied to the TV alone.
 
 - [ ] T030 [P] [US2] Failing test `crates/pharos-server/tests/cast_commands.rs`: `POST /Sessions/{tv}/Playing/Pause|Unpause|Seek|NextTrack|PreviousTrack` produce the matching group command and no raw `PlayState` broadcast to the TV; `Stop` from the owner ends the cast (V169)
-- [ ] T031 [P] [US2] Failing test in the same file: a queue change by another member (`SetNewQueue`/`NextItem`) makes the TV load the new item at the right position via `CastSeat`
+- [ ] T031 [P] [US2] Failing test in the same file: a queue change by another member (`SetNewQueue`/`NextItem`) makes the TV load the new item at the right position via `CastDriver`
 - [ ] T032 [US2] Intercept `POST /Sessions/{id}/Playing/{command}` for virtual TV ids in `crates/pharos-server/src/api/jellyfin/sessions.rs`, translating to the existing SyncPlay dispatch in `crates/pharos-server/src/api/jellyfin/syncplay.rs` (`dispatch`) as the owner; ignore volume/display `Command/{command}` for TV ids with a debug log
-- [ ] T033 [US2] Handle queue/item change in `CastSeat` (`crates/pharos-cast/src/driver.rs`): load the new item via the connectsdk command from spike S1 and re-enter Loading, bounded by the same freeze bound as any member
+- [ ] T033 [US2] Handle queue/item change in `CastDriver` (`crates/pharos-cast/src/driver.rs`): load the new item via the connectsdk command from spike S1 and re-enter Loading, bounded by the same freeze bound as any member
 - [ ] T034 [US2] Per-member trace: every command routed through a virtual TV id records `pharos_syncplay_command_total` with its own outcome (V160) — add test
 
 - [ ] T053 [P] [US2] Failing test then implementation: a pause/seek/stop reported by the receiver itself (emulator-injected, not caused by our command) is applied to the group as an owner command, and our own corrections are not echoed back (debounce by command id), in `crates/pharos-cast/src/driver.rs` and `crates/pharos-server/tests/cast_commands.rs` (analyze F2)
@@ -118,7 +118,7 @@ description: "Task list for SyncPlay Cast Target"
 
 - [ ] T035 [P] [US3] Failing tests `crates/pharos-server/tests/cast_end.rs` for (a)–(d) above, each asserting the `pharos_cast_seat_total{event,reason}` row, token revoked (V171), and other members never frozen beyond the existing bound
 - [ ] T036 [P] [US3] Failing test: `POST /SyncPlay/Leave` by a seat owner ends the seat first (reason `owner_left`); a second cast start by a user who already owns a seat is rejected `user_has_seat`
-- [ ] T037 [US3] Implement Lost/reconnect/Ended in `CastSeat` (`crates/pharos-cast/src/driver.rs`): connection loss marks the seat disconnected (reusing `MemberSocketLost` semantics so gate holds release), reconnect with backoff inside `reconnect_grace_secs`, then Ended (`grace_expired`)
+- [ ] T037 [US3] Implement Lost/reconnect/Ended in `CastDriver` (`crates/pharos-cast/src/driver.rs`): connection loss marks the seat disconnected (reusing `MemberSocketLost` semantics so gate holds release), reconnect with backoff inside `reconnect_grace_secs`, then Ended (`grace_expired`)
 - [ ] T038 [US3] Implement end/restore in `crates/pharos-server/src/cast.rs`: revoke token, remove the seat member, restore the owner to `Player`, resync the owner through the existing late-joiner path (`ResyncMember`), stop the Cast session on the TV, record the event
 - [ ] T039 [US3] Hook `leave_group` and group dissolve in `crates/pharos-server/src/api/jellyfin/syncplay.rs` and `crates/pharos-sync/src/registry.rs` to call end/restore
 
@@ -148,15 +148,17 @@ description: "Task list for SyncPlay Cast Target"
 - [ ] T045 [P] Playwright spec `compat-playwright/` + `just compat-syncplay` wiring: two jellyfin-web contexts + `FakeReceiver` as the TV (picker lists TV, hand-off, pause/seek follow)
 - [ ] T046 Append invariants V168–V171 to `specs/001-pharos-baseline/invariants.md`; add baseline `T129` (cast seat) to `specs/001-pharos-baseline/tasks.md`; update spec 009 Status and `research.md` with spike results
 - [ ] T047 Run `just hakari-check`, clippy (`cargo clippy --workspace --all-targets -- -D warnings` in the devShell) and the full `just test`
-- [ ] T048 Manual real-TV run per `quickstart.md` §3; run the §4 queries and paste the output into `quickstart.md`. Until done, SC-001/SC-002 are reported as **unwitnessed**. If S2 shows 2 s is infeasible, restate SC-002 from the measurement in `spec.md`
+- [ ] T048 Manual real-TV run per `quickstart.md` §3; run the §4 queries and paste the output into `quickstart.md`. Measurement: SC-001 is command-to-apply on the emulator (CI) and, on the real TV, position error against the group clock from interpolated receiver reports; SC-002 is that position error sampled over a full item. Re-tune the `[cast]` threshold/cooldown defaults from the result. Until done, SC-001/SC-002 are reported as **unwitnessed**. If S2 shows 2 s is infeasible, restate SC-002 from the measurement in `spec.md`
 
 ---
 
 ## Dependencies & Execution Order
 
+- Task ids are append-only: T049–T056 were added after analysis and sit inside their phases; execution order is the file order, not id order (T050–T052 run before T024).
+
 - Phase 1 → Phase 2 → stories. Spikes T005–T007 gate T013, T017, T028 and may reshape T021/T033.
 - Within Phase 2: T008→T009; T010 and T011 after T009; T012 after T009; T013–T016, T018 parallel; T017 after T005, T015; T019 after T005.
-- US1 (Phase 3) is the MVP and gates US2/US3/US4. US2 and US3 can proceed in parallel once US1 is green (different files: `sessions.rs` command arm vs `seat.rs` Lost/Ended + `cast.rs` end path), though both touch `cast.rs` so merge sequentially. US4 needs only US1.
+- US1 (Phase 3) is the MVP and gates US2/US3/US4. US2 and US3 can proceed in parallel once US1 is green (different files: `sessions.rs` command arm vs `driver.rs` Lost/Ended + `cast.rs` end path), though both touch `cast.rs` so merge sequentially. US4 needs only US1.
 - Phase 7 after the stories; T048 last.
 
 ### Parallel examples
