@@ -248,7 +248,7 @@ where
 /// argument — `:si=N` included — while dropping the quote character itself
 /// (verified live: the file `it's a.mkv` opened as `its a.mkv:si=0`). So each
 /// special is escaped twice: once for the option-value layer, then again for
-/// the filtergraph layer. Verified empirically in `tests/subtitle_burn_ass.rs`
+/// the filtergraph layer. Verified empirically in `tests/it_analysis/subtitle_burn_ass.rs`
 /// / the Task-7 spike against a path holding a space, `[`, `]`, `,`, and `'`
 /// (which produces e.g. `it\\\'s` and `\[x\]\,1`, both of which ffmpeg 8.1
 /// accepts and opens correctly).
@@ -292,7 +292,7 @@ fn ffmpeg_filter_escape(path: &str) -> String {
 ///   brackets the filter so it sees absolute PTS (correct cue) while the OUTPUT
 ///   stays zero-based — leaving `-t DUR` and the muxer's `-output_ts_offset`
 ///   timing untouched (`-copyts` instead would make output PTS absolute and
-///   collapse `-t` to ~0 frames — verified in `tests/subtitle_burn_ass.rs`). A
+///   collapse `-t` to ~0 frames — verified in `tests/it_analysis/subtitle_burn_ass.rs`). A
 ///   plain `-vf` (single input) keeps ffmpeg default stream selection, so NO
 ///   maps are emitted here; the caller's normal audio-map path handles an
 ///   explicit audio track.
@@ -2111,7 +2111,7 @@ mod tests {
         // `-filter_complex`, no `-map [vout]`. Because the filter renders by
         // frame PTS off a from-zero demuxer, a mid-file segment brackets it with
         // `setpts` so it sees ABSOLUTE time (right cue) while output stays
-        // zero-based (verified in tests/subtitle_burn_ass.rs).
+        // zero-based (verified in tests/it_analysis/subtitle_burn_ass.rs).
         //
         // The lift is the point ffmpeg SEEKED to, which the decode preroll puts
         // `DECODE_PREROLL_SECONDS` before the segment start (27 − 15 = 12): the
