@@ -331,6 +331,11 @@ impl<T: CastTransport> Driver<T> {
             }
             Exit::Failed(reason) => {
                 self.enter(ConnState::Failed).await;
+                self.record(
+                    CastEvent::Ended,
+                    reason,
+                    "the driver failed; see the preceding event",
+                );
                 self.emit(DriverEvent::Ended { reason }).await;
             }
         }
@@ -1418,8 +1423,14 @@ mod tests {
             1
         );
         assert_eq!(
+            counter(&all, "pharos_cast_seat_total", ("event", "ended")),
+            1,
+            "a failed cast still ends exactly once: {all:?}"
+        );
+        assert_eq!(
             counter(&all, "pharos_cast_seat_total", ("reason", "tv_unreachable")),
-            1
+            2,
+            "lost and ended both carry the reason: {all:?}"
         );
     }
 
