@@ -192,6 +192,9 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             RemoteCommand::SetIgnoreWait { member_id, ignore }
         }
+        GroupMsg::SetMemberKind { member, kind, cast } => {
+            RemoteCommand::SetMemberKind { member, kind, cast }
+        }
         // Answered locally on the remote replica, never forwarded. `SeedQueue`
         // is issued only from `/SyncPlay/New`, whose caller's replica created
         // and therefore OWNS the group — so it is always applied locally and
@@ -201,7 +204,6 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::AddMember { .. }
         | GroupMsg::Snapshot { .. }
         | GroupMsg::SeedQueue { .. }
-        | GroupMsg::SetMemberKind { .. }
         | GroupMsg::MemberSocketLost { .. } => return None,
     })
 }

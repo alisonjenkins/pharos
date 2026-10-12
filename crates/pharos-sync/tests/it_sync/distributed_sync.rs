@@ -251,6 +251,106 @@ async fn command_from_non_owner_reaches_members_on_both_replicas() {
     );
 }
 
+/// A kind change issued on a non-owner replica must reach the owner, which
+/// holds the gates: the seat's replica never acks, so if the owner still
+/// counted it as a Player the group would stall on the anti-wedge.
+#[tokio::test]
+async fn set_member_kind_from_non_owner_reaches_the_owner() {
+    use pharos_sync::group::{CastBinding, MemberKind};
+    let bus = Arc::new(LocalSyncBus::new());
+    let owners = FakeOwnerMap::default();
+    let store = FakeStore::default();
+    let a = spawn_replica(bus.clone(), owners.clone(), store.clone(), 1);
+    let b = spawn_replica(bus.clone(), owners.clone(), store.clone(), 2);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let handle_a = a.registry.create().await.unwrap();
+    let gid = handle_a.group_id;
+    let m_a = MemberId::new();
+    let mut rx_a = join(&handle_a, &a.sinks, m_a, "ali").await;
+    let handle_b = b.registry.get_or_create(gid).await.unwrap();
+    let m_b = MemberId::new();
+    let _rx_b = join(&handle_b, &b.sinks, m_b, "tv").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    handle_b
+        .tx
+        .send(GroupMsg::SetMemberKind {
+            member: m_b,
+            kind: MemberKind::CastSeat,
+            cast: Some(CastBinding {
+                tv: "Living Room".into(),
+                owner: "ali".into(),
+            }),
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    handle_a
+        .tx
+        .send(GroupMsg::SetNewQueue {
+            sender: m_a,
+            item_ids: vec!["ep1".into()],
+            item_runtimes_ms: Vec::new(),
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+    handle_a
+        .tx
+        .send(GroupMsg::MemberReady {
+            member_id: m_a,
+            position_ms: 0,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    let play = recv_matching(&mut rx_a, |m| matches!(m, ServerMsg::Play { .. })).await;
+    assert!(
+        play.is_some(),
+        "the owner must stop waiting on a member a remote replica made a CastSeat"
+    );
+}
+
+/// The wire form of the kind change survives a bus round trip.
+#[test]
+fn set_member_kind_command_round_trips_over_the_bus() {
+    use pharos_sync::group::{CastBinding, MemberKind};
+    let gid = GroupId::new();
+    let member = MemberId::new();
+    let cmd = RemoteCommand::SetMemberKind {
+        member,
+        kind: MemberKind::Controller,
+        cast: Some(CastBinding {
+            tv: "Den".into(),
+            owner: "ali".into(),
+        }),
+    };
+    let wire = serde_json::to_string(&BusMsg::Command {
+        group_id: gid,
+        cmd: cmd.clone(),
+    })
+    .unwrap();
+    let Ok(BusMsg::Command { cmd: back, .. }) = serde_json::from_str(&wire) else {
+        panic!("not a Command: {wire}");
+    };
+    match back.into_group_msg() {
+        GroupMsg::SetMemberKind {
+            member: m,
+            kind,
+            cast,
+        } => {
+            assert_eq!(m, member);
+            assert_eq!(kind, MemberKind::Controller);
+            assert_eq!(cast.map(|c| c.tv), Some("Den".to_string()));
+        }
+        other => panic!("expected SetMemberKind, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn group_survives_owner_drain_via_takeover() {
     let bus = Arc::new(LocalSyncBus::new());

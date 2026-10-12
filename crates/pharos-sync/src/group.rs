@@ -557,6 +557,11 @@ pub enum RemoteCommand {
         member_id: MemberId,
         ignore: bool,
     },
+    SetMemberKind {
+        member: MemberId,
+        kind: MemberKind,
+        cast: Option<CastBinding>,
+    },
 }
 
 impl RemoteCommand {
@@ -709,6 +714,9 @@ impl RemoteCommand {
             RemoteCommand::SetGroupName { name } => GroupMsg::SetGroupName { name },
             RemoteCommand::SetIgnoreWait { member_id, ignore } => {
                 GroupMsg::SetIgnoreWait { member_id, ignore }
+            }
+            RemoteCommand::SetMemberKind { member, kind, cast } => {
+                GroupMsg::SetMemberKind { member, kind, cast }
             }
         }
     }
