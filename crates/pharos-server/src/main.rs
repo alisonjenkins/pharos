@@ -1823,6 +1823,18 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
+    // 009 — the TV sessions `/Sessions` lists. Absent unless `[[cast.tvs]]` is
+    // configured, which leaves `/Sessions` exactly as it was.
+    let cast_directory = (!cfg.cast.tvs.is_empty()).then(|| {
+        pharos_server::cast_directory::RuntimeCastDirectory::new(
+            cfg.cast.clone(),
+            state.cast.clone(),
+            state.stores.clone(),
+        )
+    });
+    if let Some(directory) = &cast_directory {
+        state.cast_directory = Some(directory.clone());
+    }
     let app_state = web::Data::new(state);
 
     // Phase B2 — elect the background-work singleton. Under Postgres this
@@ -1998,6 +2010,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         },
         &cfg.cast,
     );
+    if let Some(directory) = &cast_directory {
+        directory.bind_registry(group_registry.get_ref().clone());
+        directory.spawn_refresher(app_state.bus.clone());
+    }
     let member_sinks_data = web::Data::new(member_sinks);
     let token_resolver_data = web::Data::new(token_resolver);
 
