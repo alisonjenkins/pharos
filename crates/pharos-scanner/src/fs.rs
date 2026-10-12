@@ -4258,19 +4258,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_partial_batch_is_written_once_its_interval_elapses() {
-        // Slow disk: 10 files at ~25 ms each, batches far bigger than the
-        // scan, a 60 ms flush interval. Without the interval nothing would be
-        // written until the very end.
+        // Slow disk: 10 files at ~150 ms each, batches far bigger than the
+        // scan, a 400 ms flush interval (about 3 files per flush, so a stall of
+        // a few hundred ms on a busy runner cannot merge them into one).
         let td = many_files(10).await;
         let store = MemStore::default();
         let prober = FakeProber {
-            delay: Some(std::time::Duration::from_millis(25)),
+            delay: Some(std::time::Duration::from_millis(150)),
             ..Default::default()
         };
         FsScanner::new(prober)
             .with_probe_concurrency(1)
             .with_put_batch_size(1_000)
-            .with_put_flush_interval(std::time::Duration::from_millis(60))
+            .with_put_flush_interval(std::time::Duration::from_millis(400))
             .scan_into(td.path(), &store)
             .await
             .unwrap();
