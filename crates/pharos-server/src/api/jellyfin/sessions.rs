@@ -7,13 +7,20 @@
 use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::{
     api::jellyfin::auth_extractor::{auth_header_from_request, AuthSession, AuthUser},
+    api::jellyfin::syncplay::dispatch,
     cast_service::{CastReject, CastRejectReason, StartCast},
     cast_sessions::tv_session_id,
     sessions::{SessionEvent, SessionRecord},
     state::{AppState, SocketBroadcast},
 };
 use actix_web::{error, http::StatusCode, web, HttpRequest, HttpResponse, Responder};
+use pharos_cast::events::CastReason;
 use pharos_core::{MediaStore, PlaybackProgress, UserDataStore};
+use pharos_sync::{
+    group::GroupMsg,
+    messages::{GroupPlayState, MemberId},
+    GroupRegistry, SessionHub,
+};
 use serde::Deserialize;
 use std::time::Instant;
 use uuid::Uuid;
@@ -525,24 +532,231 @@ async fn capabilities(
 /// Body may carry a `SeekPositionTicks` (Seek) or `Volume` (SetVolume)
 /// payload; we forward everything via the SessionCommand broadcast so
 /// the receiving WS handler decides how to interpret it.
+///
+/// A configured TV's id is applied to the caller's SyncPlay group instead
+/// ([`tv_transport`]); nothing is relayed to a player (V169).
 async fn session_playstate_command(
     state: web::Data<AppState>,
-    user: AuthUser,
+    auth: AuthSession,
+    req: HttpRequest,
     path: web::Path<(String, String)>,
     body: Option<web::Json<serde_json::Value>>,
-) -> impl Responder {
+    hub: Option<web::Data<SessionHub>>,
+    registry: Option<web::Data<GroupRegistry>>,
+) -> HttpResponse {
     let (session_id, command) = path.into_inner();
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
-    let controlling = user.0.id.0.simple().to_string();
+    if let Some(tv_name) = virtual_tv_name(&state, &session_id) {
+        let ticks = seek_ticks(req.query_string(), &arg);
+        let group = hub.zip(registry);
+        return tv_transport(
+            &state,
+            &auth,
+            group.as_ref().map(|(h, r)| (h.get_ref(), r.get_ref())),
+            &tv_name,
+            TvTransport::parse(&canonical_command(&command), ticks),
+        )
+        .await;
+    }
+    let controlling = auth.user.id.0.simple().to_string();
     state.notify_session_command(&session_id, &controlling, &canonical_command(&command), arg);
     HttpResponse::NoContent().finish()
 }
 
+/// What a PlayState command aimed at a TV session means for the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TvTransport {
+    Pause,
+    Unpause,
+    PlayPause,
+    /// `None` when the request named no position.
+    Seek(Option<u64>),
+    Next,
+    Previous,
+    Stop,
+    /// A PlayState command with no group equivalent (volume, rewind, ...).
+    Unsupported,
+}
+
+impl TvTransport {
+    fn parse(canonical: &str, seek_ticks: Option<u64>) -> Self {
+        match canonical {
+            "Pause" => Self::Pause,
+            "Unpause" => Self::Unpause,
+            "PlayPause" => Self::PlayPause,
+            "Seek" => Self::Seek(seek_ticks),
+            "NextTrack" => Self::Next,
+            "PreviousTrack" => Self::Previous,
+            "Stop" => Self::Stop,
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+/// `SeekPositionTicks` from the query (where Jellyfin clients put it) or the
+/// body, whichever is present.
+fn seek_ticks(query: &str, body: &serde_json::Value) -> Option<u64> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("seekPositionTicks"))
+        .and_then(|(_, v)| v.parse().ok())
+        .or_else(|| {
+            body.get("SeekPositionTicks")
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
+fn refuse(status: StatusCode, reason: &str, message: String) -> HttpResponse {
+    HttpResponse::build(status).body(format!("{reason}: {message}"))
+}
+
+/// Apply a transport command aimed at a TV session to the group the TV's cast
+/// belongs to, as the caller, through the same `dispatch` the SyncPlay routes
+/// use so every command is counted (V160). `Stop` from the cast's owner ends
+/// the cast; from anyone else it is refused. A caller outside the cast's group
+/// is refused: they hold no seat on that TV.
+async fn tv_transport(
+    state: &AppState,
+    auth: &AuthSession,
+    group: Option<(&SessionHub, &GroupRegistry)>,
+    tv_name: &str,
+    command: TvTransport,
+) -> HttpResponse {
+    let (Some(service), Some((hub, registry))) = (state.cast.service(), group) else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            CastRejectReason::Unavailable.label(),
+            format!("controlling {tv_name:?} is not running on this server"),
+        );
+    };
+    if command == TvTransport::Unsupported {
+        tracing::debug!(tv = %tv_name, "cast: PlayState command with no group equivalent ignored");
+        return HttpResponse::NoContent().finish();
+    }
+    let Some(cast) = service
+        .snapshot()
+        .await
+        .into_iter()
+        .find(|c| c.tv.eq_ignore_ascii_case(tv_name))
+    else {
+        return refuse(
+            StatusCode::CONFLICT,
+            "no_cast",
+            format!("nothing is casting to {tv_name:?}"),
+        );
+    };
+    let Some(sync_key) = auth.sync_key() else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            CastRejectReason::NotInGroup.label(),
+            "the request carried no deviceId, so it cannot be tied to a SyncPlay group".into(),
+        );
+    };
+    let group = hub.resolve(&sync_key).and_then(|s| s.group);
+    let Some(group) = group.filter(|g| g.group_id == cast.group) else {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            CastRejectReason::NotInGroup.label(),
+            format!(
+                "user {:?} is not in the SyncPlay group casting to {tv_name:?}",
+                auth.user.name
+            ),
+        );
+    };
+
+    let send = |label: &'static str, make: GroupMsgMaker| {
+        dispatch(
+            hub,
+            registry,
+            &state.stores,
+            Some(sync_key.clone()),
+            label,
+            make,
+        )
+    };
+    match command {
+        TvTransport::Pause => send("pause", |mid| GroupMsg::PauseShared { sender: mid }).await,
+        TvTransport::Unpause => send("unpause", |mid| GroupMsg::Unpause { sender: mid }).await,
+        TvTransport::PlayPause => {
+            // Waiting is a gate on the way to playing: the group intends to play.
+            let playing = group.snapshot().await.is_some_and(|s| {
+                matches!(
+                    s.play_state,
+                    GroupPlayState::Playing | GroupPlayState::Waiting
+                )
+            });
+            if playing {
+                send("pause", |mid| GroupMsg::PauseShared { sender: mid }).await
+            } else {
+                send("unpause", |mid| GroupMsg::Unpause { sender: mid }).await
+            }
+        }
+        TvTransport::Seek(None) => refuse(
+            StatusCode::BAD_REQUEST,
+            "missing_position",
+            "Seek needs a SeekPositionTicks value".into(),
+        ),
+        TvTransport::Seek(Some(ticks)) => {
+            let position_ms = ticks / TICKS_PER_MS;
+            dispatch(
+                hub,
+                registry,
+                &state.stores,
+                Some(sync_key.clone()),
+                "seek",
+                move |mid| GroupMsg::SeekTo {
+                    sender: mid,
+                    position_ms,
+                },
+            )
+            .await
+        }
+        TvTransport::Next => {
+            send("nextitem", |mid| GroupMsg::NextItem {
+                sender: mid,
+                playlist_item_id: None,
+            })
+            .await
+        }
+        TvTransport::Previous => {
+            send("previousitem", |mid| GroupMsg::PreviousItem {
+                sender: mid,
+                playlist_item_id: None,
+            })
+            .await
+        }
+        TvTransport::Stop => {
+            if cast.owner != auth.user.id {
+                return refuse(
+                    StatusCode::FORBIDDEN,
+                    "not_owner",
+                    format!(
+                        "only the user who cast to {tv_name:?} can stop it; {:?} can pause or seek the group",
+                        auth.user.name
+                    ),
+                );
+            }
+            service.stop(auth.user.id, CastReason::UserStop).await;
+            let _ = state.bus.send(SocketBroadcast::CastChanged);
+            HttpResponse::NoContent().finish()
+        }
+        TvTransport::Unsupported => HttpResponse::NoContent().finish(),
+    }
+}
+
+const TICKS_PER_MS: u64 = 10_000;
+
+type GroupMsgMaker = fn(MemberId) -> GroupMsg;
+
 /// `POST /Sessions/{id}/Command/{command}` — general commands
 /// (DisplayContent, ToggleMute, ToggleFullscreen, ...). Same wire
 /// shape as PlayState; the target client filters on the command name.
+///
+/// A TV's id is not a player to relay to, and a TV's volume and display belong
+/// to the TV: the command is ignored (spec 009).
 async fn session_general_command(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -550,6 +764,10 @@ async fn session_general_command(
     body: Option<web::Json<serde_json::Value>>,
 ) -> impl Responder {
     let (session_id, command) = path.into_inner();
+    if let Some(tv_name) = virtual_tv_name(&state, &session_id) {
+        tracing::debug!(tv = %tv_name, %command, "cast: general command for a TV session ignored");
+        return HttpResponse::NoContent().finish();
+    }
     let arg = body
         .map(|b| b.into_inner())
         .unwrap_or(serde_json::json!({}));
@@ -706,6 +924,28 @@ async fn session_play_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seek_ticks_come_from_the_query_or_the_body_and_commands_map_to_the_group() {
+        let none = serde_json::json!({});
+        assert_eq!(seek_ticks("seekPositionTicks=90", &none), Some(90));
+        assert_eq!(seek_ticks("SeekPositionTicks=90&x=1", &none), Some(90));
+        assert_eq!(
+            seek_ticks("", &serde_json::json!({"SeekPositionTicks": 7})),
+            Some(7)
+        );
+        assert_eq!(seek_ticks("seekPositionTicks=abc", &none), None);
+        assert_eq!(
+            TvTransport::parse("Seek", Some(5)),
+            TvTransport::Seek(Some(5))
+        );
+        assert_eq!(TvTransport::parse("NextTrack", None), TvTransport::Next);
+        assert_eq!(
+            TvTransport::parse("SetVolume", None),
+            TvTransport::Unsupported
+        );
+        assert_eq!(TvTransport::parse("Rewind", None), TvTransport::Unsupported);
+    }
 
     #[test]
     fn every_reject_reason_has_a_status_and_only_dependency_failures_are_5xx() {
