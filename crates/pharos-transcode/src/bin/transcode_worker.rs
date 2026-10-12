@@ -136,6 +136,12 @@ async fn run_job(
         }
         _ => None,
     };
+    // A retry reuses the output path, so a sidecar left by the previous
+    // attempt would show frames at the first poll, before ffmpeg has opened
+    // (and truncated) its own, and first-frame would read as a few ms.
+    if let Some(sc) = &sidecar {
+        let _ = tokio::fs::remove_file(sc).await;
+    }
     let full_args = apply_mode_args(args, mode, !stdout_passthrough);
 
     let mut cmd = tokio::process::Command::new(exec::ffmpeg_bin());
@@ -214,7 +220,12 @@ async fn run_job(
                 s = child.wait() => break s,
                 _ = first_frame_poll.tick(), if sidecar.is_some() && first_frame_secs.is_none() => {
                     if let Some(sc) = &sidecar {
-                        let seen = tokio::fs::read_to_string(sc).await.map(|t| parse_progress(&t).frames > 0);
+                        // An audio-only job never reports a frame; its first
+                        // output is the timeline moving. Either ends the poll.
+                        let seen = tokio::fs::read_to_string(sc).await.map(|t| {
+                            let p = parse_progress(&t);
+                            p.frames > 0 || p.out_time_us > 0 || p.ended
+                        });
                         if matches!(seen, Ok(true)) {
                             first_frame_secs = Some(started.elapsed().as_secs_f64());
                         }
