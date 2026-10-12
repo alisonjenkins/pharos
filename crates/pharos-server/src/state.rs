@@ -83,6 +83,16 @@ pub enum SocketBroadcast {
         command: String,
         arg: serde_json::Value,
     },
+    /// A command for ONE device's socket, addressed by its SyncPlay key
+    /// (`"{user}:{device}"`, the key `/socket` registers under). Unlike
+    /// [`Self::SessionCommand`], which every socket receives, only the named
+    /// device's socket sees this; used to stop a player whose seat moved to a TV.
+    DeviceCommand {
+        device_key: String,
+        controlling_user_id: String,
+        command: String,
+        arg: serde_json::Value,
+    },
     /// A cast started or ended through a route. Not a wire message: the cast
     /// directory refreshes its cache on it and then sends [`Self::SessionsChanged`].
     CastChanged,
@@ -1099,6 +1109,22 @@ impl AppState {
     ) {
         let _ = self.bus.send(SocketBroadcast::SessionCommand {
             session_id: session_id.to_string(),
+            controlling_user_id: controlling_user_id.to_string(),
+            command: command.to_string(),
+            arg,
+        });
+    }
+
+    /// Send a `DeviceCommand` to the socket registered under `device_key`.
+    pub fn notify_device_command(
+        &self,
+        device_key: &str,
+        controlling_user_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) {
+        let _ = self.bus.send(SocketBroadcast::DeviceCommand {
+            device_key: device_key.to_string(),
             controlling_user_id: controlling_user_id.to_string(),
             command: command.to_string(),
             arg,

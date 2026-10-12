@@ -474,6 +474,9 @@ async fn handle_connection<S>(
                         continue;
                     }
                 }
+                if is_for_another_device(&b, &device_key) {
+                    continue;
+                }
                 if let Some(mut out) = translate_broadcast(b) {
                     if let Some(directory) = &state.cast_directory {
                         append_virtual_sessions(&mut out, directory.as_ref(), &viewer);
@@ -1040,6 +1043,12 @@ fn append_virtual_sessions(
     }
 }
 
+/// A `DeviceCommand` addressed to some other device's socket; every other
+/// broadcast is for everyone.
+fn is_for_another_device(b: &SocketBroadcast, device_key: &str) -> bool {
+    matches!(b, SocketBroadcast::DeviceCommand { device_key: to, .. } if to != device_key)
+}
+
 pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     match b {
         SocketBroadcast::LibraryChanged { added, removed } => {
@@ -1084,6 +1093,18 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             command,
             arg,
         } => translate_session_command(session_id, controlling_user_id, command, arg),
+        SocketBroadcast::DeviceCommand {
+            device_key,
+            controlling_user_id,
+            command,
+            arg,
+        } => {
+            let session_id = device_key
+                .split_once(':')
+                .map_or(device_key.as_str(), |(_, device)| device)
+                .to_string();
+            translate_session_command(session_id, controlling_user_id, command, arg)
+        }
         SocketBroadcast::CastChanged => None,
         SocketBroadcast::SessionsChanged => Some(Outbound::new(
             "Sessions",
@@ -1600,6 +1621,27 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert!(v["Data"][0]["NowPlayingItem"].is_null());
+    }
+
+    #[test]
+    fn a_device_command_is_a_playstate_message_that_only_its_device_accepts() {
+        let b = SocketBroadcast::DeviceCommand {
+            device_key: "u1:dev-a".into(),
+            controlling_user_id: "u1".into(),
+            command: "Stop".into(),
+            arg: serde_json::json!({}),
+        };
+        assert!(!is_for_another_device(&b, "u1:dev-a"));
+        assert!(is_for_another_device(&b, "u1:dev-b"));
+        assert!(is_for_another_device(&b, "u2:dev-a"));
+        let out = translate_broadcast(b).unwrap();
+        assert_eq!(out.message_type, "PlayState");
+        assert_eq!(out.data["Command"], "Stop");
+        assert_eq!(out.data["SessionId"], "dev-a");
+        assert!(!is_for_another_device(
+            &SocketBroadcast::SessionsChanged,
+            "u1:dev-a"
+        ));
     }
 
     #[test]

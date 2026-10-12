@@ -655,12 +655,20 @@ async fn start_cast(state: &AppState, auth: &AuthSession, tv_name: String) -> Ht
         .start(StartCast {
             user_id: auth.user.id,
             user_name: auth.user.name.clone(),
-            owner_sync_key,
+            owner_sync_key: owner_sync_key.clone(),
             tv_name,
         })
         .await;
     match started {
         Ok(()) => {
+            // The TV now plays in this player's place; stop the local player or
+            // the owner hears the item twice. Addressed to this device alone.
+            state.notify_device_command(
+                &owner_sync_key,
+                &auth.user.id.0.simple().to_string(),
+                "Stop",
+                serde_json::json!({}),
+            );
             let _ = state.bus.send(SocketBroadcast::CastChanged);
             HttpResponse::NoContent().finish()
         }
