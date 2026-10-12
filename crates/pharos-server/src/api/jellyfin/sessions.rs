@@ -306,6 +306,8 @@ async fn playing_progress(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, item = item_id, "playback progress not persisted");
+                    // Keep it for the background tick to retry.
+                    state.progress_writes.hold(&key, progress);
                 }
             }
         } else {
