@@ -6,6 +6,17 @@ name = "pharos"
 # Then point this at the resulting `web/public/` directory and the
 # server will serve it at /ui/*.
 # ui_dir = "/srv/pharos/ui/public"
+# Seconds between database writes of one play session's resume position.
+# Clients report every ~10 s and writing each report made the progress
+# route the busiest and slowest in the server, so reports in between are held
+# in memory (roughly one write per 15-20 s per active session at the
+# default). Written at once, never held: the first report of a session, a
+# pause or unpause, a seek, and Stopped. Held reports of sessions that go
+# quiet are written within ~1.3 intervals, and all of them on a graceful
+# shutdown. Trade-off: a crash or SIGKILL loses the held report of each live
+# session, i.e. at most this many seconds of resume position. 0 writes every
+# report (the old behaviour).
+# playback_progress_persist_secs = 15
 
 [obs]
 log_level = "info"
