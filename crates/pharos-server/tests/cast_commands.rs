@@ -8,43 +8,16 @@
 mod cast_rig;
 
 use cast_rig::{eventually, CastRig, Person};
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use pharos_server::state::SocketBroadcast;
-use std::sync::OnceLock;
-
-/// One process-wide recorder: the handlers run on the HTTP server's thread, so
-/// a thread-local recorder would never see their counters.
-fn snapshotter() -> &'static Snapshotter {
-    static SNAP: OnceLock<Snapshotter> = OnceLock::new();
-    SNAP.get_or_init(|| {
-        let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
-        recorder
-            .install()
-            .expect("no other recorder in this binary");
-        snap
-    })
-}
 
 fn command_total(command: &str, outcome: &str) -> u64 {
-    snapshotter()
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .filter(|(ck, _, _, _)| ck.key().name() == "pharos_syncplay_command_total")
-        .filter(|(ck, _, _, _)| {
-            let has = |k: &str, v: &str| ck.key().labels().any(|l| l.key() == k && l.value() == v);
-            has("command", command) && has("outcome", outcome)
-        })
-        .map(|(_, _, _, v)| match v {
-            DebugValue::Counter(c) => c,
-            _ => 0,
-        })
-        .sum()
+    cast_rig::counter(
+        "pharos_syncplay_command_total",
+        &[("command", command), ("outcome", outcome)],
+    )
 }
 
 async fn rig_with_cast() -> CastRig {
-    snapshotter();
     let rig = CastRig::new().await;
     let (status, body) = rig.play_on_tv(&rig.alice).await;
     assert_eq!(status, 204, "{body}");

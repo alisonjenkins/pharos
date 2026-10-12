@@ -5,6 +5,7 @@
 
 use actix_test::TestServer;
 use actix_web::{web, App};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use pharos_cast::fake::FakeReceiverHandle;
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::auth::BuiltinAuth;
@@ -19,7 +20,7 @@ use pharos_server::state::{AppState, SocketBroadcast, Stores};
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::{MemberId, ServerMsg};
 use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -53,6 +54,39 @@ pub struct CastRig {
     pub carol: Person,
     pub tv_id: String,
     _tv_listener: std::net::TcpListener,
+}
+
+/// One process-wide recorder: handlers and the cast actor run on other
+/// threads than the test, so a thread-local recorder would never see them.
+pub fn snapshotter() -> &'static Snapshotter {
+    static SNAP: OnceLock<Snapshotter> = OnceLock::new();
+    SNAP.get_or_init(|| {
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        recorder
+            .install()
+            .expect("no other recorder in this binary");
+        snap
+    })
+}
+
+/// Current value of `name`, summed over the series whose labels include all of `labels`.
+pub fn counter(name: &str, labels: &[(&str, &str)]) -> u64 {
+    snapshotter()
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(ck, _, _, _)| ck.key().name() == name)
+        .filter(|(ck, _, _, _)| {
+            labels
+                .iter()
+                .all(|(k, v)| ck.key().labels().any(|l| l.key() == *k && l.value() == *v))
+        })
+        .map(|(_, _, _, v)| match v {
+            DebugValue::Counter(c) => c,
+            _ => 0,
+        })
+        .sum()
 }
 
 async fn new_user(stores: &Stores, name: &str) -> (UserId, String) {
@@ -112,6 +146,7 @@ async fn person(
 
 impl CastRig {
     pub async fn new() -> Self {
+        snapshotter();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let cfg: CastConfig = toml::from_str(&format!(
