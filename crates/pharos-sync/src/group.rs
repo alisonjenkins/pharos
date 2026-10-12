@@ -2378,6 +2378,8 @@ impl GroupState {
                     name: m.name.clone(),
                     user: m.user,
                     ignore_wait: m.ignore_wait,
+                    kind: m.kind,
+                    cast: m.cast.clone(),
                 })
                 .collect(),
             leader: self.leader,
@@ -2446,8 +2448,8 @@ impl GroupState {
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
-                        kind: MemberKind::Player,
-                        cast: None,
+                        kind: m.kind,
+                        cast: m.cast,
                         connected: false,
                         last_seen: now,
                         socket_gone_since: Some((now, SocketGoneCause::Hydrated)),
@@ -2532,6 +2534,11 @@ struct PersistMember {
     /// `default` keeps older snapshots deserializable.
     #[serde(default)]
     ignore_wait: bool,
+    /// `default` (Player) keeps pre-cast snapshots loading unchanged.
+    #[serde(default)]
+    kind: MemberKind,
+    #[serde(default)]
+    cast: Option<CastBinding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -6215,6 +6222,8 @@ mod tests {
                 id: member,
                 name: "one".into(),
                 ignore_wait: false,
+                kind: MemberKind::Player,
+                cast: None,
             }],
             leader: Some(member),
             group_paused_due_to_buffering: false,
