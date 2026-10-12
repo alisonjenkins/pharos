@@ -185,9 +185,25 @@ fn parse_secs(v: &str) -> Option<f64> {
 /// and `bench: maxrss=…KiB`.
 pub fn parse_benchmark_all(stderr: &str) -> BenchReport {
     let mut b = BenchReport::default();
-    for line in stderr.lines() {
+    for line in stderr_lines(stderr) {
+        b.absorb(line);
+    }
+    b
+}
+
+/// ffmpeg ends its `frame=` stats lines with `\r`, not `\n`, so a `bench:` call
+/// line that follows one is glued onto it on the same terminal line. Split on
+/// both or about 2 % of the calls go uncounted.
+fn stderr_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split(['\r', '\n'])
+}
+
+impl BenchReport {
+    /// Fold one stderr line in. Anything that is not a `bench:` line is ignored.
+    pub fn absorb(&mut self, line: &str) {
+        let b = self;
         let Some(rest) = line.strip_prefix("bench:") else {
-            continue;
+            return;
         };
         let rest = rest.trim();
         if rest.starts_with("utime=") {
@@ -199,17 +215,17 @@ pub fn parse_benchmark_all(stderr: &str) -> BenchReport {
                     _ => {}
                 }
             }
-            continue;
+            return;
         }
         if let Some(kib) = rest.strip_prefix("maxrss=") {
             b.maxrss_kib = kib.trim_end_matches("KiB").trim().parse().ok();
-            continue;
+            return;
         }
         let f: Vec<&str> = rest.split_whitespace().collect();
         // <u> user <s> sys <r> real <label> [idx]
         if let (Some(real), Some(label), Some(&"real")) = (f.get(4), f.get(6), f.get(5)) {
             let Ok(real) = real.parse::<u64>() else {
-                continue;
+                return;
             };
             // ffmpeg prints an unsigned diff of two timestamps, so a clock
             // step backwards arrives as a number near u64::MAX. It is a
@@ -229,14 +245,12 @@ pub fn parse_benchmark_all(stderr: &str) -> BenchReport {
             }
         }
     }
-    b
 }
 
 /// `stderr` without `bench:` lines, so failure classification and the echoed
 /// stderr tail are not buried under thousands of per-call lines.
 pub fn strip_bench_lines(stderr: &str) -> String {
-    stderr
-        .lines()
+    stderr_lines(stderr)
         .filter(|l| !l.starts_with("bench:"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -473,6 +487,20 @@ mod tests {
              bench:        3 user        1 sys             2000 real encode_audio 0.1 \n",
         );
         assert!((b.encode_audio - 0.002).abs() < 1e-9, "{b:?}");
+    }
+
+    /// The stats line ends in `\r`, so the next `bench:` call line shares its
+    /// terminal line. Counted: 12 of 723 bench lines in a real 6 s 1080p run.
+    #[test]
+    fn a_bench_line_glued_onto_a_stats_line_is_still_counted() {
+        let glued = "frame=  100 fps=0.0 q=-1.0 size=N/A speed=3x    \rbench:      900 user        0 sys     2000 real encode_video 0.0 \n\
+                     bench:        1 user        0 sys     1000 real decode_video 0:0 \n";
+        let b = parse_benchmark_all(glued);
+        assert!((b.encode_video - 0.002).abs() < 1e-9, "{b:?}");
+        assert!((b.decode_video - 0.001).abs() < 1e-9, "{b:?}");
+        let kept = strip_bench_lines(glued);
+        assert!(!kept.contains("bench:"), "{kept:?}");
+        assert!(kept.contains("frame=  100"), "{kept:?}");
     }
 
     #[test]
