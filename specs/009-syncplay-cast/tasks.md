@@ -151,9 +151,9 @@ description: "Task list for SyncPlay Cast Target"
 
 ## Phase 7: Persistence, deploy resilience, polish
 
-- [ ] T042 [P] Failing test `crates/pharos-server/tests/cast_restart_recovery.rs` (template: `syncplay_restart_recovery.rs`): a persisted `CastSeat` member is re-created after restart, the connection is re-established, the TV returns to `Following` within the V25 bound; then implement hydrate in `crates/pharos-server/src/sync_recovery.rs` and `crates/pharos-server/src/cast.rs`
-- [ ] T043 Single-owner TV connection under multi-replica: only the group-owning replica holds the Cast connection; failover hands it over (`crates/pharos-sync/src/distributed.rs`, `crates/pharos-server/src/sync_distributed.rs`); test in `crates/pharos-sync/tests/distributed_sync.rs`
-- [ ] T044 [P] Extend `crates/pharos-jellyfin-test-client/src/lib.rs` with socket, SyncPlay and session-command helpers needed by T021/T030/T035 (if not already added)
+- [X] T042 [P] Failing test `crates/pharos-server/tests/cast_restart_recovery.rs` (template: `syncplay_restart_recovery.rs`): a persisted `CastSeat` member is re-created after restart, the connection is re-established, the TV returns to `Following` within the V25 bound; then implement hydrate in `crates/pharos-server/src/sync_recovery.rs` and `crates/pharos-server/src/cast.rs`
+- [X] T043 Single-owner TV connection under multi-replica: only the group-owning replica holds the Cast connection; failover hands it over (`crates/pharos-sync/src/distributed.rs`, `crates/pharos-server/src/sync_distributed.rs`); test in `crates/pharos-sync/tests/distributed_sync.rs`
+- [X] T044 [P] (satisfied differently: the cast suites use the shared HTTP rig in `crates/pharos-server/tests/common/cast_rig.rs`, so the jellyfin test client needed no helpers; reopen only if T045 wants them) Extend `crates/pharos-jellyfin-test-client/src/lib.rs` with socket, SyncPlay and session-command helpers needed by T021/T030/T035 (if not already added)
 - [ ] T045 [P] Playwright spec `compat-playwright/` + `just compat-syncplay` wiring: two jellyfin-web contexts + `FakeReceiver` as the TV (picker lists TV, hand-off, pause/seek follow)
 - [X] T046 Append invariants V168–V171 to `specs/001-pharos-baseline/invariants.md`; add baseline `T129` (cast seat) to `specs/001-pharos-baseline/tasks.md`; update spec 009 Status and `research.md` with spike results
 - [ ] T047 Run `just hakari-check`, clippy (`cargo clippy --workspace --all-targets -- -D warnings` in the devShell) and the full `just test`
