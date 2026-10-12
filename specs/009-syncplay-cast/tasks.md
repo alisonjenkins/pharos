@@ -55,6 +55,8 @@ description: "Task list for SyncPlay Cast Target"
 - [ ] T018 [P] Add `[cast]` / `[[cast.tvs]]` config in `crates/pharos-server/src/config.rs` per `contracts/cast-surface.md` with validation errors naming the entry and value; test valid, duplicate-name and bad-address cases
 - [ ] T019 Add TV-token mint and revoke in `crates/pharos-server/src/cast.rs` (device-bound, bounded lifetime, hashed at rest, id returned separately from secret); tests: bounded lifetime, revoked token fails auth, secret absent from `Debug` and logs (V8)
 
+- [ ] T057 [P] Failing test then fix: leader election in `crates/pharos-sync/src/group.rs` (`elect_leader`, `remove_member`) never picks a `Controller` or `CastSeat` while a `Player` is connected, so leader-only commands and handoff Pause stay answerable (found in review of T009)
+- [ ] T058 [P] Failing test then fix: `MemberJoined`/`MemberLeft` broadcasts do not announce a hidden `CastSeat` as a separate member when its paired `Controller` exists, consistent with the collapsed roster (`crates/pharos-sync/src/group.rs`, review of T051)
 - [ ] T049 Checkpoint after T005–T007: re-read plan.md, tasks.md and `contracts/cast-surface.md` against the spike outcomes, amend them, and re-run `/speckit-analyze` before T013/T017/T026/T028 proceed (analyze F10)
 
 **Checkpoint**: group kinds, planner, transport trait, emulator, config and token mint exist and are tested; no behaviour exposed yet.
