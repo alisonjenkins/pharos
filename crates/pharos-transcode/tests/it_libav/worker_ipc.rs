@@ -369,3 +369,95 @@ async fn off_mode_reports_nothing_and_still_encodes() {
     }
     assert!(run_for_timing(StageTimingMode::Off).await.is_none());
 }
+
+/// Run `spec` through a real worker in basic mode, after `before` has had a
+/// chance to plant files next to the output.
+async fn run_spec_basic(
+    spec: JobSpec,
+    out: &Path,
+) -> Option<pharos_transcode::stage_timing::StageTiming> {
+    let spawner = ProcSpawner::with_worker_bin(WORKER_BIN)
+        .with_stage_timing(pharos_transcode::stage_timing::StageTimingMode::Basic);
+    let mut worker = spawner
+        .spawn(pharos_transcode::protocol::WorkerId(3))
+        .await
+        .expect("spawn worker");
+    let res = tokio::time::timeout(Duration::from_secs(120), worker.run(spec))
+        .await
+        .expect("worker run timed out");
+    assert!(matches!(res, WorkerRunResult::Done { .. }), "got {res:?}");
+    assert!(out.exists());
+    worker.take_stage_timing()
+}
+
+/// An audio-only job never writes a `frame=` line, so the first-frame poll used
+/// to run for the whole job. Its first output is the timeline moving, and that
+/// must end the poll and be recorded.
+#[tokio::test]
+async fn an_audio_only_job_records_a_first_output() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("tone.flac");
+    // Long enough that the encode outlives several stats periods.
+    let status = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("sine=frequency=440:duration=300")
+        .arg(&input)
+        .status()
+        .await
+        .expect("spawn ffmpeg");
+    assert!(status.success());
+    let out = dir.path().join("0.tmp");
+    let mut spec = timing_spec(&input, &out);
+    spec.opts.video = None;
+    spec.opts.container = Container::Adts;
+    let t = run_spec_basic(spec, &out).await.expect("timing");
+    assert!(t.progress.is_some_and(|p| p.frames == 0), "{t:?}");
+    let first = t
+        .first_frame_secs
+        .expect("first output recorded for audio-only");
+    assert!(first < t.total_secs, "{t:?}");
+}
+
+/// A retry reuses the output path. A sidecar left by the previous attempt must
+/// not be mistaken for this attempt's first frame.
+#[tokio::test]
+async fn a_stale_progress_sidecar_is_not_read_as_a_first_frame() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.webm");
+    synth_fixture(&input).await;
+    let out = dir.path().join("0.tmp");
+    std::fs::write(
+        pharos_transcode::progress_sidecar_path(&out),
+        "frame=999\nout_time_us=99000000\nprogress=end\n",
+    )
+    .unwrap();
+    let t = run_spec_basic(timing_spec(&input, &out), &out)
+        .await
+        .expect("timing");
+    assert_eq!(
+        t.progress.map(|p| p.frames),
+        Some(20),
+        "final report is this attempt's"
+    );
+    // ffmpeg cannot produce a frame within 20 ms of being spawned.
+    assert!(
+        t.first_frame_secs.is_none_or(|f| f >= 0.02),
+        "stale sidecar read as first frame: {t:?}"
+    );
+}
