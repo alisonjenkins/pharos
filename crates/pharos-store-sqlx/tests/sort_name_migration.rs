@@ -7,49 +7,17 @@
 
 use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_store_sqlx::sqlite::SqliteStore;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
-use std::borrow::Cow;
-use std::str::FromStr;
+
+mod common;
+
+use common::{migrated_to, scratch_db_path};
 
 /// The last migration before `sort_name` was added.
 const BEFORE_SORT_NAME: i64 = 53;
 
-fn scratch_db_path() -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "pharos-sort-name-migration-{}-{nanos}.db",
-        std::process::id()
-    ))
-}
-
 /// A database at schema 0053 holding `titles` as movies with ids 0..n.
 async fn populated_old_db(url: &str, titles: &[&str]) {
-    let opts = SqliteConnectOptions::from_str(url)
-        .unwrap()
-        .create_if_missing(true)
-        .foreign_keys(true)
-        // The fixture is throwaway: skip the fsync every one of the 53
-        // migrations would otherwise pay (a 2-row test did 440 fsyncs, which
-        // took ~100 s on the CI runner's disk).
-        .synchronous(SqliteSynchronous::Off);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(opts)
-        .await
-        .unwrap();
-    let mut migrator = sqlx::migrate!("./migrations/sqlite");
-    migrator.migrations = Cow::Owned(
-        migrator
-            .migrations
-            .iter()
-            .filter(|m| m.version <= BEFORE_SORT_NAME)
-            .cloned()
-            .collect(),
-    );
-    migrator.run(&pool).await.unwrap();
+    let pool = migrated_to(url, BEFORE_SORT_NAME).await;
     // One transaction: a file-backed autocommit insert per row costs an fsync
     // each, which took over a minute for 1,200 rows on a loaded CI disk.
     let mut tx = pool.begin().await.unwrap();
@@ -75,7 +43,7 @@ async fn sort_names(store: &SqliteStore) -> Vec<(i64, Option<String>)> {
 
 #[tokio::test]
 async fn migration_backfills_existing_rows_and_is_idempotent() {
-    let path = scratch_db_path();
+    let path = scratch_db_path("sort-name-migration");
     let url = format!("sqlite://{}", path.display());
     // More rows than one backfill batch (500) so the keyset paging runs.
     let mut titles: Vec<String> = (0..1_203).map(|i| format!("Filler {i}")).collect();
@@ -113,7 +81,7 @@ async fn migration_backfills_existing_rows_and_is_idempotent() {
 
 #[tokio::test]
 async fn connect_fills_old_rows_in_the_background() {
-    let path = scratch_db_path();
+    let path = scratch_db_path("sort-name-migration");
     let url = format!("sqlite://{}", path.display());
     populated_old_db(&url, &["The Matrix", "Ep 2"]).await;
 
