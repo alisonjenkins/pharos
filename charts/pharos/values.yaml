@@ -95,6 +95,10 @@ config:
     # jobs keep the CPU-filter pipeline and a failed resident run is retried on
     # it. Needs `gpu` below to expose the render node. Off by default.
     transcodeVaapiGpuResident: false
+    # basic | detailed | off. Per-segment encode timing exported as
+    # pharos_transcode_stage_seconds; "detailed" adds ffmpeg -benchmark_all
+    # decode/encode/flush seconds (diagnostic, extra stderr per segment).
+    transcodeStageTiming: "basic"
     subtitleCacheMaxBytes: 67108864         # 64 MiB
     subtitleCacheMaxEntries: 1024
     liveTvM3u: null
