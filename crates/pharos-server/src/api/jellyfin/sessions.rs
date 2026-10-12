@@ -269,11 +269,7 @@ async fn playing_progress(
             subtitle_stream_index: body.subtitle_stream_index,
             only_if_newer: false,
         };
-        let key = ProgressKey {
-            user: user.0.id,
-            item: item_id,
-            session: body.play_session_id.clone().unwrap_or_default(),
-        };
+        let key = ProgressKey::new(user.0.id, item_id, body.play_session_id.as_deref());
         // Only the database write is deferred: the session registry and the
         // socket fan-out above already ran for this report.
         let decision = state
@@ -331,7 +327,7 @@ async fn playing_stopped(
     body: web::Json<StoppedBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
-    let progress_session = body.play_session_id.clone().unwrap_or_default();
+    let progress_session = body.play_session_id.clone();
     if let Some(session_id) = body.play_session_id {
         state
             .sessions
@@ -354,11 +350,11 @@ async fn playing_stopped(
             let position = body.position_ticks.unwrap_or(0);
             // The stop below is this session's final write; a report still
             // held for it is older and must not follow it into the database.
-            state.progress_writes.forget(&ProgressKey {
-                user: user.0.id,
-                item: item_id,
-                session: progress_session,
-            });
+            state.progress_writes.forget(&ProgressKey::new(
+                user.0.id,
+                item_id,
+                progress_session.as_deref(),
+            ));
             let runtime = state
                 .stores
                 .get(item_id)

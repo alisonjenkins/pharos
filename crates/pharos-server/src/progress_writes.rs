@@ -48,6 +48,12 @@ const BACKWARD_SLACK: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
 /// A session with nothing held and no report for this long is forgotten.
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// A full table is swept for idle sessions at most this often.
+const MIN_SWEEP_GAP: Duration = Duration::from_secs(1);
+/// Longest `PlaySessionId` kept verbatim in a tracking key. The id is chosen
+/// by the client; a longer one is replaced by a fixed-size digest so the
+/// table's memory is bounded by its entry count, not by request content.
+const MAX_SESSION_KEY_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProgressKey {
@@ -55,6 +61,29 @@ pub struct ProgressKey {
     pub item: MediaId,
     /// The client's `PlaySessionId`; empty when it sent none.
     pub session: String,
+}
+
+impl ProgressKey {
+    /// Build a key from the client's `PlaySessionId` (`None` when absent). An
+    /// id over `MAX_SESSION_KEY_BYTES` becomes `#` and a 64-bit digest of it.
+    /// A collision only merges the coalescing of two sessions of one user and
+    /// item, which costs at most an extra or a missed early write.
+    pub fn new(user: UserId, item: MediaId, session: Option<&str>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let session = session.unwrap_or_default();
+        let session = if session.len() > MAX_SESSION_KEY_BYTES {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            session.hash(&mut h);
+            format!("#{:016x}", h.finish())
+        } else {
+            session.to_owned()
+        };
+        Self {
+            user,
+            item,
+            session,
+        }
+    }
 }
 
 /// Why a report is being written now. A bounded label set for metrics.
@@ -107,6 +136,9 @@ pub struct ProgressCoalescer {
     max_entries: usize,
     idle_ttl: Duration,
     entries: Mutex<HashMap<ProgressKey, Entry>>,
+    /// When the table was last swept for idle sessions. Only touched while
+    /// `entries` is locked.
+    last_sweep: Mutex<Option<Instant>>,
 }
 
 impl ProgressCoalescer {
@@ -121,7 +153,29 @@ impl ProgressCoalescer {
             max_entries,
             idle_ttl,
             entries: Mutex::new(HashMap::new()),
+            last_sweep: Mutex::new(None),
         }
+    }
+
+    /// Forget idle sessions. `rate_limited` skips the pass when one ran in
+    /// the last `MIN_SWEEP_GAP`, so a full table does not cost every new
+    /// session an O(n) scan under the lock. Returns whether it swept.
+    fn sweep(
+        &self,
+        entries: &mut HashMap<ProgressKey, Entry>,
+        now: Instant,
+        rate_limited: bool,
+    ) -> bool {
+        let mut last = self
+            .last_sweep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if rate_limited && last.is_some_and(|t| now.saturating_duration_since(t) < MIN_SWEEP_GAP) {
+            return false;
+        }
+        *last = Some(now);
+        sweep_idle(entries, now, self.idle_ttl);
+        true
     }
 
     /// How often [`flush_due`] should run, or `None` when nothing is ever
@@ -153,7 +207,7 @@ impl ProgressCoalescer {
         let mut entries = self.lock();
         let Some(entry) = entries.get_mut(key) else {
             if entries.len() >= self.max_entries {
-                sweep_idle(&mut entries, now, self.idle_ttl);
+                self.sweep(&mut entries, now, true);
                 if entries.len() >= self.max_entries {
                     return Decision::Persist(PersistReason::Uncoalesced);
                 }
@@ -232,7 +286,7 @@ impl ProgressCoalescer {
                 }
             }
         }
-        sweep_idle(&mut entries, now, self.idle_ttl);
+        self.sweep(&mut entries, now, false);
         due
     }
 
@@ -672,6 +726,51 @@ mod tests {
             Decision::Persist(PersistReason::First)
         );
         assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_session_id_is_replaced_by_a_fixed_size_digest() {
+        let user = UserId(uuid::Uuid::from_u128(1));
+        let long_a = "a".repeat(100_000);
+        let long_b = "b".repeat(100_000);
+        let ka = ProgressKey::new(user, 7, Some(&long_a));
+        assert!(ka.session.len() <= 17, "bounded, got {}", ka.session.len());
+        assert_eq!(ka, ProgressKey::new(user, 7, Some(&long_a)), "stable");
+        assert_ne!(ka, ProgressKey::new(user, 7, Some(&long_b)));
+        let at_limit = "c".repeat(MAX_SESSION_KEY_BYTES);
+        assert_eq!(
+            ProgressKey::new(user, 7, Some(&at_limit)).session,
+            at_limit,
+            "an id within the limit is kept verbatim"
+        );
+        assert_eq!(ProgressKey::new(user, 7, None).session, "");
+    }
+
+    #[test]
+    fn a_full_table_is_swept_at_most_once_a_second() {
+        // Idle after 100 ms, so a session can be idle again right after a sweep.
+        let c =
+            ProgressCoalescer::with_limits(Duration::from_secs(15), 1, Duration::from_millis(100));
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        tick(&c, &key("a"), t0, 100, false);
+        // The first full-table admit sweeps: a is idle, so x gets its room.
+        assert_eq!(
+            tick(&c, &key("x"), ms(200), 100, false),
+            Decision::Persist(PersistReason::First)
+        );
+        // x is idle by now, but a sweep ran 300 ms ago: no second scan, the
+        // new session is written through untracked.
+        assert_eq!(
+            c.admit(&key("y"), ms(500), false, report(1, 1)),
+            Decision::Persist(PersistReason::Uncoalesced)
+        );
+        assert_eq!(c.len(), 1);
+        // Once the gap has passed the sweep runs again and frees x.
+        assert_eq!(
+            tick(&c, &key("z"), ms(1_300), 100, false),
+            Decision::Persist(PersistReason::First)
+        );
     }
 
     #[test]
