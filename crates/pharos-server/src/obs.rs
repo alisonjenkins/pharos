@@ -21,7 +21,14 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
         request
             .extensions_mut()
             .insert(RequestStart(Instant::now()));
-        tracing_actix_web::root_span!(request)
+        let span = tracing_actix_web::root_span!(request);
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let parent = parent_context(request.headers());
+        if parent.span().span_context().is_valid() {
+            let _ = span.set_parent(parent);
+        }
+        span
     }
 
     fn on_request_end<B: actix_web::body::MessageBody>(
@@ -247,6 +254,26 @@ fn install_panic_hook() {
     }));
 }
 
+struct HeaderExtractor<'a>(&'a actix_web::http::header::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// The remote parent named by a W3C `traceparent` header, or an empty context
+/// when there is none (or it is malformed). Without this the parent-based
+/// sampler never sees a parent and every request starts a fresh trace.
+fn parent_context(headers: &actix_web::http::header::HeaderMap) -> opentelemetry::Context {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&HeaderExtractor(headers))
+}
+
 /// Parent-based sampler: an incoming sampled `traceparent` is honoured so a
 /// distributed trace is never cut in half; only root spans started here are
 /// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
@@ -458,6 +485,37 @@ mod tests {
         assert!(bucket_bounds(&body, "pharos_store_query_seconds").contains(&"0.0001".to_string()));
         let http = bucket_bounds(&body, "http_request_duration_seconds");
         assert!(http.contains(&"30".to_string()) && !http.contains(&"3600".to_string()));
+    }
+
+    #[test]
+    fn a_w3c_traceparent_header_becomes_the_remote_parent() {
+        use opentelemetry::trace::TraceContextExt;
+        let mut headers = actix_web::http::header::HeaderMap::new();
+        headers.insert(
+            actix_web::http::header::HeaderName::from_static("traceparent"),
+            actix_web::http::header::HeaderValue::from_static(
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            ),
+        );
+        let cx = parent_context(&headers);
+        let sc = cx.span().span_context().clone();
+        assert!(sc.is_valid() && sc.is_sampled() && sc.is_remote());
+        assert_eq!(
+            sc.trace_id().to_string(),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+    }
+
+    #[test]
+    fn no_or_garbage_traceparent_yields_no_parent() {
+        use opentelemetry::trace::TraceContextExt;
+        let mut headers = actix_web::http::header::HeaderMap::new();
+        assert!(!parent_context(&headers).span().span_context().is_valid());
+        headers.insert(
+            actix_web::http::header::HeaderName::from_static("traceparent"),
+            actix_web::http::header::HeaderValue::from_static("not-a-traceparent"),
+        );
+        assert!(!parent_context(&headers).span().span_context().is_valid());
     }
 
     #[test]
