@@ -189,7 +189,7 @@ async fn a_scope_refusal_is_counted_and_an_allowed_call_is_not() {
     use metrics_util::debugging::DebuggingRecorder;
 
     let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _guard = metrics::set_default_local_recorder(&recorder);
     let s = seed().await;
     let counted = || {

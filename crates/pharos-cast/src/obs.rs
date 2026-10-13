@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn seat_counter_carries_event_and_reason_labels_on_success_and_failure() {
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         metrics::with_local_recorder(&recorder, || {
             record_cast_event(
                 CastEvent::Ended,
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn drift_correction_and_connection_series_are_recorded_with_bounded_labels() {
         let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         metrics::with_local_recorder(&recorder, || {
             record_drift(0.25);
             record_correction(CorrectionKind::Seek);
