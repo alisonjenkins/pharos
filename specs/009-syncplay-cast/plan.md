@@ -101,9 +101,9 @@ compat-playwright/                    # cast spec using the emulator
 | New crate `pharos-cast` | Protocol + emulator + planner are testable with no DB or network (V12) and have their own dependency set | Putting it in `pharos-server` would drag the protocol dep into every server build and mix IO into group logic |
 | Server speaks Cast | Stock receiver has no other control channel (R1) | Patching jellyfin-web breaks V1 and needs the sender tab open; "degrade only" misses the goal |
 
-## New invariants to append (proposed ids V168+)
+## New invariants to append (proposed ids V168+; landed as V172-V175 because main took V168-V171 first)
 
-- V168: a cast seat never contributes to a readiness gate or buffering freeze; the group never waits on an ack the TV cannot produce.
-- V169: a command addressed to a virtual TV session is applied to the group, never to the TV alone.
-- V170: every cast-into-group decision (started, rejected, ended, lost, reconnected) records user, sender device, TV and the offending reason value, success and failure alike.
-- V171: a TV-bound token is revoked on every exit from a cast session.
+- V172 (proposed V168): a cast seat never contributes to a readiness gate or buffering freeze; the group never waits on an ack the TV cannot produce.
+- V173 (proposed V169): a command addressed to a virtual TV session is applied to the group, never to the TV alone.
+- V174 (proposed V170): every cast-into-group decision (started, rejected, ended, lost, reconnected) records user, sender device, TV and the offending reason value, success and failure alike.
+- V175 (proposed V171): a TV-bound token is revoked on every exit from a cast session.

@@ -1,5 +1,5 @@
 //! 009 US2 over HTTP: transport commands aimed at the TV session are applied
-//! to the SyncPlay group as the caller, never relayed to a player (V169), and
+//! to the SyncPlay group as the caller, never relayed to a player (V173), and
 //! each is counted like any other SyncPlay command (V160).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -95,7 +95,7 @@ async fn transport_commands_reach_the_group_and_the_tv_and_are_counted() {
     assert_eq!(
         raw_session_commands(&rig.bus_events()),
         0,
-        "no raw PlayState is broadcast for a virtual TV id (V169)"
+        "no raw PlayState is broadcast for a virtual TV id (V173)"
     );
 }
 
