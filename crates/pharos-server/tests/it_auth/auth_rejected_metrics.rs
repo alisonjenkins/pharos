@@ -76,7 +76,11 @@ async fn rejections_are_counted_by_reason_and_stay_cheap() {
     assert_eq!(progress_with!(app, None::<&str>), 401);
     assert_eq!(calls.take(), Vec::<String>::new(), "no token, no lookup");
     assert_eq!(progress_with!(app, Some("stale-token")), 401);
-    assert_eq!(calls.take(), ["resolve"], "an unknown token is one lookup");
+    assert_eq!(
+        calls.take(),
+        ["resolve_scoped"],
+        "an unknown token is one lookup"
+    );
     assert_eq!(progress_with!(app, Some("stale-token")), 401);
 
     assert_eq!(rejected(&snapshotter, "missing_token"), 1);
