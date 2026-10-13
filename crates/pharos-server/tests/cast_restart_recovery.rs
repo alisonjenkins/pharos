@@ -9,7 +9,7 @@
 mod common;
 
 use actix_web::{http::StatusCode, test, web};
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use pharos_cast::fake::FakeReceiverHandle;
 use pharos_cast::messages::CommandBody;
 use pharos_cast::obs::ConnState;
@@ -27,6 +27,7 @@ use pharos_sync::group::{GroupHandle, GroupMsg, GroupSnapshot, RemoteCommand};
 use pharos_sync::messages::{GroupId, GroupPlayState, MemberId, ServerMsg};
 use pharos_sync::persistence::GroupPersistence;
 use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
+use pharos_test_metrics::CumulativeSnapshotter;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -336,7 +337,7 @@ async fn snapshot_of(group: &GroupHandle) -> GroupSnapshot {
     group.snapshot().await.expect("a local group actor")
 }
 
-fn seat_total(snap: &Snapshotter, event: &str, reason: &str) -> u64 {
+fn seat_total(snap: &CumulativeSnapshotter, event: &str, reason: &str) -> u64 {
     snap.snapshot()
         .into_vec()
         .into_iter()
@@ -353,9 +354,9 @@ fn seat_total(snap: &Snapshotter, event: &str, reason: &str) -> u64 {
         .sum()
 }
 
-fn recorder() -> (Snapshotter, metrics::LocalRecorderGuard<'static>) {
+fn recorder() -> (CumulativeSnapshotter, metrics::LocalRecorderGuard<'static>) {
     let recorder = DebuggingRecorder::new();
-    let snap = recorder.snapshotter();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
     let recorder: &'static DebuggingRecorder = Box::leak(Box::new(recorder));
     (snap, metrics::set_default_local_recorder(recorder))
 }

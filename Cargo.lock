@@ -3255,6 +3255,7 @@ dependencies = [
  "futures-util",
  "metrics",
  "metrics-util",
+ "pharos-test-metrics",
  "proptest",
  "prost",
  "rcgen",

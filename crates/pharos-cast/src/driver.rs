@@ -959,7 +959,8 @@ mod tests {
     use super::*;
     use crate::fake::{FakeReceiver, FakeReceiverConfig, FakeReceiverHandle};
     use crate::messages::CommandBody;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use pharos_test_metrics::CumulativeSnapshotter;
 
     const WAIT: Duration = Duration::from_secs(60);
 
@@ -1027,7 +1028,7 @@ mod tests {
 
     type Series = Vec<(String, Vec<(String, String)>, DebugValue)>;
 
-    fn series(snap: &Snapshotter) -> Series {
+    fn series(snap: &CumulativeSnapshotter) -> Series {
         snap.snapshot()
             .into_vec()
             .into_iter()
@@ -1089,7 +1090,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn group_seek_is_applied_then_injected_drift_is_corrected_and_recorded() {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let fake_cfg = FakeReceiverConfig {
@@ -1187,7 +1188,7 @@ mod tests {
             CastReason::OwnerLeft,
         ] {
             let recorder = DebuggingRecorder::new();
-            let snap = recorder.snapshotter();
+            let snap = pharos_test_metrics::snapshotter(&recorder);
             let _guard = metrics::set_default_local_recorder(&recorder);
 
             let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
@@ -1395,7 +1396,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn no_report_within_max_load_wait_ends_the_cast_and_records_why() {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let fake_cfg = FakeReceiverConfig {
@@ -1608,7 +1609,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dropped_connection_is_retried_with_backoff_and_resumes_at_the_group_position() {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
@@ -1653,7 +1654,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_tv_that_stays_away_ends_the_cast_when_the_grace_expires() {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let mut rig = start(FakeReceiverConfig::default(), driver_cfg());

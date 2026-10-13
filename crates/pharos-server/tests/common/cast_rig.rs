@@ -5,7 +5,7 @@
 
 use actix_test::TestServer;
 use actix_web::{web, App};
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use pharos_cast::fake::FakeReceiverHandle;
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::auth::BuiltinAuth;
@@ -20,6 +20,7 @@ use pharos_server::state::{AppState, SocketBroadcast, Stores};
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::{MemberId, ServerMsg};
 use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
+use pharos_test_metrics::CumulativeSnapshotter;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -59,11 +60,11 @@ pub struct CastRig {
 
 /// One process-wide recorder: handlers and the cast actor run on other
 /// threads than the test, so a thread-local recorder would never see them.
-pub fn snapshotter() -> &'static Snapshotter {
-    static SNAP: OnceLock<Snapshotter> = OnceLock::new();
+pub fn snapshotter() -> &'static CumulativeSnapshotter {
+    static SNAP: OnceLock<CumulativeSnapshotter> = OnceLock::new();
     SNAP.get_or_init(|| {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         recorder
             .install()
             .expect("no other recorder in this binary");

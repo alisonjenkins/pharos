@@ -6,7 +6,7 @@
 mod common;
 
 use actix_web::{http::StatusCode, test, web};
-use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use pharos_cast::castv2::Occupancy;
 use pharos_cast::events::CastReason;
 use pharos_cast::fake::FakeReceiverHandle;
@@ -23,6 +23,7 @@ use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::hub::member_id_for_device;
 use pharos_sync::messages::{GroupPlayState, MemberId, MemberSummary, ServerMsg};
 use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
+use pharos_test_metrics::CumulativeSnapshotter;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -68,7 +69,7 @@ struct Rig {
     service: CastServiceHandle,
     factory: FakeTransportFactory,
     living_room: FakeReceiverHandle,
-    snap: Snapshotter,
+    snap: CumulativeSnapshotter,
     owner: Person,
     bob: Person,
     _recorder_guard: metrics::LocalRecorderGuard<'static>,
@@ -124,7 +125,7 @@ async fn join(
 impl Rig {
     async fn new() -> Self {
         let recorder = DebuggingRecorder::new();
-        let snap = recorder.snapshotter();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
         // Leaked so the guard can be 'static; one small recorder per test.
         let recorder: &'static DebuggingRecorder = Box::leak(Box::new(recorder));
         let guard = metrics::set_default_local_recorder(recorder);
