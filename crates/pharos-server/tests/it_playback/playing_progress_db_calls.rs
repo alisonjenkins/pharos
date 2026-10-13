@@ -81,13 +81,13 @@ async fn a_progress_report_store_call_count() {
     assert_eq!(report(100_000_000).await.status().as_u16(), 204);
     assert_eq!(
         log.take(),
-        ["resolve", "get", "get", "record_playback_progress"],
+        ["resolve_scoped", "get", "get", "record_playback_progress"],
         "first report: token, user, item (kind and runtime), one user-data upsert"
     );
     assert_eq!(report(110_000_000).await.status().as_u16(), 204);
     assert_eq!(
         log.take(),
-        ["resolve", "get", "get"],
+        ["resolve_scoped", "get", "get"],
         "a held report costs no user-data call"
     );
 }
