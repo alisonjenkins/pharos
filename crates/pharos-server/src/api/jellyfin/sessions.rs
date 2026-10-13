@@ -534,7 +534,7 @@ async fn capabilities(
 /// the receiving WS handler decides how to interpret it.
 ///
 /// A configured TV's id is applied to the caller's SyncPlay group instead
-/// ([`tv_transport`]); nothing is relayed to a player (V169).
+/// ([`tv_transport`]); nothing is relayed to a player (V173).
 async fn session_playstate_command(
     state: web::Data<AppState>,
     auth: AuthSession,
