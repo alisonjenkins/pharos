@@ -452,3 +452,32 @@ async fn a_tv_answering_after_its_owner_left_is_not_given_a_seat() {
     assert_eq!(cast_tokens(&rig).await, 0, "the minted TV token is revoked");
     assert_eq!(seat_total("rejected", "not_in_group"), before + 1);
 }
+
+#[actix_web::test]
+async fn leaving_the_group_while_the_tv_connects_cancels_the_start() {
+    let rig = CastRig::new().await;
+    let release = rig.factory.hold_open(cast_rig::TV);
+    let before = seat_total("ended", "owner_left");
+
+    let start = rig.play_on_tv(&rig.alice);
+    let leave = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let left = rig.post(&rig.alice, "/SyncPlay/Leave", None).await;
+        release.notify_one();
+        left
+    };
+    let ((start_status, start_body), (leave_status, _)) =
+        futures_util::future::join(start, leave).await;
+
+    assert_eq!(leave_status, 204);
+    assert_ne!(start_status, 204, "the cast must not start: {start_body}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rig.service.snapshot().await.is_empty(), "no seat is left");
+    assert_eq!(cast_seat_count(&rig).await, 0, "no seat in the group");
+    assert!(
+        rig.receiver.commands().is_empty(),
+        "the TV was never driven"
+    );
+    assert_eq!(cast_tokens(&rig).await, 0, "no TV token is left");
+    assert_eq!(seat_total("ended", "owner_left"), before + 1);
+}
