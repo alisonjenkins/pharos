@@ -9,10 +9,10 @@
 //! started the cast (owner leave, TV drop, group gone).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
-use pharos_core::UserStore;
+use pharos_core::{UserId, UserStore};
 use pharos_sync::messages::GroupPlayState;
 use pharos_sync::GroupRegistry;
 use tokio::sync::broadcast;
@@ -27,12 +27,45 @@ use crate::state::{SocketBroadcast, Stores};
 /// would otherwise show a stale owner until the next viewer event.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Owner display names by user, so the refresh tick reads a user once rather
+/// than every tick for the life of a cast. Only successful reads are kept (a
+/// failed one is retried next tick) and entries for owners with no active cast
+/// are dropped, which bounds the map by the number of casts.
+#[derive(Default)]
+struct OwnerNames {
+    names: Mutex<HashMap<UserId, String>>,
+}
+
+impl OwnerNames {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<UserId, String>> {
+        self.names.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    async fn name_of<F, Fut>(&self, owner: UserId, lookup: F) -> Option<String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        if let Some(name) = self.lock().get(&owner) {
+            return Some(name.clone());
+        }
+        let name = lookup().await?;
+        self.lock().insert(owner, name.clone());
+        Some(name)
+    }
+
+    fn retain_only(&self, owners: &[UserId]) {
+        self.lock().retain(|owner, _| owners.contains(owner));
+    }
+}
+
 pub struct RuntimeCastDirectory {
     cfg: CastConfig,
     runtime: CastRuntime,
     stores: Stores,
     /// Bound once the group registry exists (it is built after `AppState`).
     registry: OnceLock<GroupRegistry>,
+    owner_names: OwnerNames,
     active: RwLock<Vec<ActiveCastInfo>>,
 }
 
@@ -43,6 +76,7 @@ impl RuntimeCastDirectory {
             runtime,
             stores,
             registry: OnceLock::new(),
+            owner_names: OwnerNames::default(),
             active: RwLock::new(Vec::new()),
         })
     }
@@ -58,17 +92,25 @@ impl RuntimeCastDirectory {
             return false;
         };
         let mut next = Vec::new();
+        let mut live_owners = Vec::new();
         for cast in service.snapshot().await {
-            let owner_user_name = match self.stores.get(cast.owner).await {
-                Ok(user) => user.name,
-                Err(e) => {
-                    tracing::warn!(
-                        tv = %cast.tv, owner = %cast.owner.0, error = %e,
-                        "cast: owner not readable; listing the cast without a name"
-                    );
-                    String::new()
-                }
-            };
+            live_owners.push(cast.owner);
+            let owner_user_name = self
+                .owner_names
+                .name_of(cast.owner, || async {
+                    match self.stores.get(cast.owner).await {
+                        Ok(user) => Some(user.name),
+                        Err(e) => {
+                            tracing::warn!(
+                                tv = %cast.tv, owner = %cast.owner.0, error = %e,
+                                "cast: owner not readable; listing the cast without a name"
+                            );
+                            None
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_default();
             let (now_playing_item_id, is_paused) = self.group_view(cast.group).await;
             next.push(ActiveCastInfo {
                 tv: cast.tv,
@@ -79,6 +121,7 @@ impl RuntimeCastDirectory {
                 is_paused,
             });
         }
+        self.owner_names.retain_only(&live_owners);
         let mut guard = self.active.write().unwrap_or_else(PoisonError::into_inner);
         if *guard == next {
             return false;
@@ -149,5 +192,60 @@ impl CastDirectory for RuntimeCastDirectory {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn tick(names: &OwnerNames, owners: &[UserId], reads: &AtomicUsize) -> Vec<String> {
+        let mut out = Vec::new();
+        for owner in owners {
+            let name = names
+                .name_of(*owner, || async {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Some("alice".to_owned())
+                })
+                .await
+                .unwrap_or_default();
+            out.push(name);
+        }
+        names.retain_only(owners);
+        out
+    }
+
+    /// The refresh tick must not read the user store for a cast it already knows.
+    #[tokio::test]
+    async fn repeated_ticks_read_each_owner_once() {
+        let names = OwnerNames::default();
+        let reads = AtomicUsize::new(0);
+        let owner = UserId::new();
+        for _ in 0..10 {
+            assert_eq!(tick(&names, &[owner], &reads).await, ["alice"]);
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_is_retried_and_a_departed_owner_is_forgotten() {
+        let names = OwnerNames::default();
+        let owner = UserId::new();
+        let failing = names.name_of(owner, || async { None }).await;
+        assert_eq!(failing, None);
+        let reads = AtomicUsize::new(0);
+        tick(&names, &[owner], &reads).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "a failure is not cached");
+
+        tick(&names, &[], &reads).await;
+        tick(&names, &[owner], &reads).await;
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "an owner with no cast is evicted"
+        );
     }
 }
