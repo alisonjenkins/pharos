@@ -183,19 +183,16 @@ async fn a_dissolved_group_ends_the_cast_with_group_gone_and_revokes_the_token()
     let (rig, token) = rig_casting().await;
     let before = seat_total("ended", "group_gone");
 
-    for m in [rig.bob.member, rig.alice.member] {
+    // The seat goes before the owner: an owner removed while the seat is still
+    // listening ends the cast as `owner_left`, not `group_gone`.
+    let seat = rig.service.snapshot().await[0].seat_member;
+    for m in [rig.bob.member, seat, rig.alice.member] {
         rig.group
             .tx
             .send(GroupMsg::RemoveMember { member_id: m })
             .await
             .unwrap();
     }
-    let seat = rig.service.snapshot().await[0].seat_member;
-    rig.group
-        .tx
-        .send(GroupMsg::RemoveMember { member_id: seat })
-        .await
-        .unwrap();
     rig.wait_cast_gone().await;
 
     assert_eq!(seat_total("ended", "group_gone"), before + 1);
@@ -507,4 +504,24 @@ async fn a_leave_from_another_device_of_the_owner_leaves_the_cast_untouched() {
     assert_eq!(rig.service.snapshot().await.len(), 1, "the cast survives");
     assert_eq!(seat_total("ended", "owner_left"), before);
     assert_eq!(rig.token_status(&token).await, 200);
+}
+
+/// What the owning replica sees when `/SyncPlay/Leave` landed on another one:
+/// only the forwarded `RemoveMember`, never the HTTP request.
+#[actix_web::test]
+async fn the_owner_removed_by_another_replica_ends_the_cast_with_owner_left() {
+    let (rig, token) = rig_casting().await;
+    let before = seat_total("ended", "owner_left");
+
+    rig.group
+        .tx
+        .send(GroupMsg::RemoveMember {
+            member_id: rig.alice.member,
+        })
+        .await
+        .unwrap();
+
+    rig.wait_cast_gone().await;
+    assert_eq!(seat_total("ended", "owner_left"), before + 1);
+    assert_eq!(rig.token_status(&token).await, 401, "V175");
 }
