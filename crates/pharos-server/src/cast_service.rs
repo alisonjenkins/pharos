@@ -1273,6 +1273,7 @@ impl<F: TransportFactory> Actor<F> {
             Arc::clone(&driver),
             a.group.epoch_unix_ms,
             a.tv.name.clone(),
+            self.deps.stores.clone(),
             OwnerWatch {
                 member: a.owner_member,
                 id,
@@ -1341,6 +1342,7 @@ async fn forward(
     driver: Arc<CastDriverHandle>,
     epoch_unix_ms: u64,
     tv: String,
+    stores: Stores,
     owner: OwnerWatch,
 ) {
     let mut last_entry: Option<String> = None;
@@ -1366,9 +1368,13 @@ async fn forward(
             now_server_ms: unix_now_ms().saturating_sub(epoch_unix_ms),
             now: Instant::now(),
         };
-        let Some(intent) = intent_for(&msg, clock) else {
+        let Some(mut intent) = intent_for(&msg, clock) else {
             continue;
         };
+        if let GroupIntent::Load { item_id, .. } = &intent {
+            let item_type = crate::cast_adapter::item_type_of(&stores, item_id).await;
+            intent = crate::cast_adapter::with_item_type(intent, item_type);
+        }
         if driver.send(intent).await.is_err() {
             break;
         }
