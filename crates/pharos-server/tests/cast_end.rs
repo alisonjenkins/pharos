@@ -396,3 +396,59 @@ async fn an_owner_pruned_after_its_socket_grace_takes_the_cast_with_it() {
     let roster = roster_seen_by_bob(&mut rig).await;
     assert_eq!(roster.len(), 1, "only bob remains: {roster:?}");
 }
+
+async fn cast_seat_count(rig: &CastRig) -> usize {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    rig.group
+        .tx
+        .send(GroupMsg::Snapshot { reply: tx })
+        .await
+        .unwrap();
+    rx.await.unwrap().cast_seats.len()
+}
+
+async fn cast_tokens(rig: &CastRig) -> usize {
+    use pharos_core::TokenStore;
+    rig.state
+        .stores
+        .tokens_for(rig.alice.id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|t| t.device_id.starts_with("cast:"))
+        .count()
+}
+
+#[actix_web::test]
+async fn a_tv_answering_after_its_owner_left_is_not_given_a_seat() {
+    let rig = CastRig::new().await;
+    let release = rig.factory.hold_open(cast_rig::TV);
+    let before = seat_total("rejected", "not_in_group");
+
+    let start = rig.play_on_tv(&rig.alice);
+    let vanish = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The owner is gone from the group without the service being told.
+        let handle = rig.hub.detach_group(&rig.alice.key).unwrap();
+        handle
+            .tx
+            .send(GroupMsg::RemoveMember {
+                member_id: rig.alice.member,
+            })
+            .await
+            .unwrap();
+        release.notify_one();
+    };
+    let ((start_status, start_body), ()) = futures_util::future::join(start, vanish).await;
+
+    assert_ne!(start_status, 204, "the cast must not start: {start_body}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rig.service.snapshot().await.is_empty(), "no seat is left");
+    assert_eq!(cast_seat_count(&rig).await, 0, "no seat in the group");
+    assert!(
+        rig.receiver.commands().is_empty(),
+        "the TV was never driven"
+    );
+    assert_eq!(cast_tokens(&rig).await, 0, "the minted TV token is revoked");
+    assert_eq!(seat_total("rejected", "not_in_group"), before + 1);
+}

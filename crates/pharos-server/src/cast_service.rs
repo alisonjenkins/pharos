@@ -662,6 +662,19 @@ impl<F: TransportFactory> Actor<F> {
         })
     }
 
+    fn owner_still_in_group(
+        &self,
+        req: &StartCast,
+        owner_member: MemberId,
+        group: &GroupHandle,
+    ) -> bool {
+        self.deps.hub.resolve(&req.owner_sync_key).is_some_and(|s| {
+            s.member_id == owner_member
+                && s.group
+                    .is_some_and(|g| g.group_id == group.group_id && !g.tx.is_closed())
+        })
+    }
+
     async fn complete_start(
         &mut self,
         params: StartParams,
@@ -735,6 +748,26 @@ impl<F: TransportFactory> Actor<F> {
                 ));
             }
         };
+
+        // The connect and the mint both awaited; the owner may have left since.
+        if !self.owner_still_in_group(&req, owner_member, &group) {
+            if let Err(e) = revoke_tv_token(&self.deps.stores, &token.id).await {
+                tracing::error!(
+                    tv = %tv.name, token = %token.id.0, error = %e,
+                    "cast: the TV token of an abandoned start could not be revoked; it expires on its own"
+                );
+            }
+            return Err(self.reject(
+                &req,
+                &group_label,
+                CastRejectReason::NotInGroup,
+                &tv.name,
+                format!(
+                    "user {:?} left group {group_label} while {:?} was connecting; no seat was added",
+                    req.user_name, tv.name
+                ),
+            ));
+        }
 
         let mut cast = self.assemble(
             transport,
