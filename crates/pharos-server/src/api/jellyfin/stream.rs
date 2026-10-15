@@ -616,6 +616,26 @@ async fn capability_holder_allowed(
     }
 }
 
+/// Whether `token` is a live credential allowed to call `method` on the matched
+/// `pattern`. A token the store does not know is `false` (fall through to the
+/// capability check); a known token whose scope forbids the route is a 403.
+#[cfg(test)]
+async fn credential_permits(
+    stores: &crate::state::Stores,
+    token: &str,
+    method: &str,
+    pattern: Option<&str>,
+) -> Result<bool, actix_web::Error> {
+    use crate::api::jellyfin::auth_extractor::scope_refusal;
+    let Ok(resolved) = stores.resolve_scoped(token).await else {
+        return Ok(false);
+    };
+    match scope_refusal(resolved.scope, resolved.user, method, pattern) {
+        Some(refused) => Err(refused),
+        None => Ok(true),
+    }
+}
+
 fn parse_max_audio_channels(qs: &str) -> Option<u32> {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
