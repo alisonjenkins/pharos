@@ -70,7 +70,7 @@ pub fn describe() {
     );
     metrics::describe_gauge!(
         "pharos_cast_connection",
-        "Cast TV connection state; 1 for the current state"
+        "Cast TV connection state per configured TV; 1 for the current state"
     );
 }
 
@@ -129,8 +129,9 @@ pub fn record_correction(kind: CorrectionKind) {
     metrics::counter!("pharos_cast_correction_total", "kind" => kind.label()).increment(1);
 }
 
-pub fn set_connection(state: ConnState, value: f64) {
-    metrics::gauge!("pharos_cast_connection", "state" => state.label()).set(value);
+pub fn set_connection(tv: &str, state: ConnState, value: f64) {
+    metrics::gauge!("pharos_cast_connection", "tv" => tv.to_owned(), "state" => state.label())
+        .set(value);
 }
 
 #[cfg(test)]
@@ -228,8 +229,8 @@ mod tests {
             record_correction(CorrectionKind::Seek);
             record_correction(CorrectionKind::Seek);
             record_correction(CorrectionKind::Pause);
-            set_connection(ConnState::Following, 1.0);
-            set_connection(ConnState::Lost, 0.0);
+            set_connection("living-room", ConnState::Following, 1.0);
+            set_connection("living-room", ConnState::Lost, 0.0);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -265,12 +266,18 @@ mod tests {
         assert_eq!(connection.len(), 2, "{connection:?}");
         assert_eq!(
             connection[0].0,
-            vec![("state".to_string(), "following".to_string())]
+            vec![
+                ("tv".to_string(), "living-room".to_string()),
+                ("state".to_string(), "following".to_string())
+            ]
         );
         assert!(matches!(connection[0].1, DebugValue::Gauge(g) if g.into_inner() == 1.0));
         assert_eq!(
             connection[1].0,
-            vec![("state".to_string(), "lost".to_string())]
+            vec![
+                ("tv".to_string(), "living-room".to_string()),
+                ("state".to_string(), "lost".to_string())
+            ]
         );
         assert!(matches!(connection[1].1, DebugValue::Gauge(g) if g.into_inner() == 0.0));
     }
