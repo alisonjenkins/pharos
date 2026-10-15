@@ -335,6 +335,8 @@ struct StartParams {
 struct PendingStart {
     params: StartParams,
     reply: oneshot::Sender<Result<(), CastReject>>,
+    /// The task opening the TV; aborted when the start is cancelled.
+    connect: JoinHandle<()>,
 }
 
 struct Actor<F: TransportFactory> {
@@ -450,6 +452,27 @@ impl<F: TransportFactory> Actor<F> {
                         state: c.state,
                     })
                     .collect();
+                all.extend(self.pending.values().map(|p| {
+                    let StartParams {
+                        req,
+                        tv,
+                        owner_member,
+                        group,
+                        ..
+                    } = &p.params;
+                    CastInfo {
+                        tv: tv.name.clone(),
+                        owner: req.user_id,
+                        group: group.group_id,
+                        seat_member: member_id_for_device(&format!(
+                            "{}:cast:{}",
+                            req.user_id.0.simple(),
+                            tv.name
+                        )),
+                        owner_member: *owner_member,
+                        state: ConnState::Connecting,
+                    }
+                }));
                 all.sort_by(|a, b| a.tv.cmp(&b.tv));
                 let _ = reply.send(all);
             }
@@ -495,11 +518,10 @@ impl<F: TransportFactory> Actor<F> {
             return;
         }
         let tv = params.tv.clone();
-        self.pending
-            .insert(tv.name.clone(), PendingStart { params, reply });
         let factory = Arc::clone(&self.factory);
         let opened_tx = self.opened_tx.clone();
-        tokio::spawn(async move {
+        let tv_name = tv.name.clone();
+        let connect = tokio::spawn(async move {
             let outcome = tokio::time::timeout(OPEN_TIMEOUT, factory.open(&tv)).await;
             let _ = opened_tx
                 .send(Opened {
@@ -508,10 +530,64 @@ impl<F: TransportFactory> Actor<F> {
                 })
                 .await;
         });
+        self.pending.insert(
+            tv_name,
+            PendingStart {
+                params,
+                reply,
+                connect,
+            },
+        );
+    }
+
+    /// Cancel the start `user` has in flight, if any: stop connecting, give the
+    /// TV lease back and answer the waiting request. Nothing has touched the
+    /// group yet, so there is nothing else to undo.
+    async fn cancel_pending(&mut self, user: UserId, reason: CastReason) {
+        let Some(tv) = self
+            .pending
+            .iter()
+            .find(|(_, p)| p.params.req.user_id == user)
+            .map(|(tv, _)| tv.clone())
+        else {
+            return;
+        };
+        let Some(PendingStart {
+            params,
+            reply,
+            connect,
+        }) = self.pending.remove(&tv)
+        else {
+            return;
+        };
+        connect.abort();
+        self.release_tv(&tv).await;
+        let message = format!(
+            "the start for {:?} was cancelled ({}) while the TV was connecting",
+            tv,
+            reason.label()
+        );
+        obs::record_cast_event(
+            CastEvent::Ended,
+            reason,
+            &params.req.user_name,
+            device_of(&params.req.owner_sync_key),
+            &tv,
+            &params.group_label,
+            &message,
+        );
+        let rejected = match reason {
+            CastReason::OwnerLeft => CastRejectReason::NotInGroup,
+            _ => CastRejectReason::Unavailable,
+        };
+        let _ = reply.send(Err(CastReject {
+            reason: rejected,
+            message,
+        }));
     }
 
     async fn on_opened(&mut self, done: Opened<F::Transport>) {
-        let Some(PendingStart { params, reply }) = self.pending.remove(&done.tv) else {
+        let Some(PendingStart { params, reply, .. }) = self.pending.remove(&done.tv) else {
             return;
         };
         let result = self.complete_start(params, done.outcome).await;
@@ -947,6 +1023,7 @@ impl<F: TransportFactory> Actor<F> {
     /// End `user`'s cast. Idempotent.
     async fn end(&mut self, user: UserId, reason: CastReason, by: EndedBy) {
         let Some(tv) = self.by_user.remove(&user) else {
+            self.cancel_pending(user, reason).await;
             return;
         };
         let Some(mut cast) = self.casts.remove(&tv) else {
