@@ -279,6 +279,15 @@ impl FakeReceiverHandle {
         });
     }
 
+    /// Move the position by `delta_ms` with no report, as a TV does when it
+    /// stalls or skips: only the next progress report reveals it.
+    pub fn inject_drift(&self, delta_ms: i64) {
+        self.remote(|g, at| {
+            let moved = g.position_at(at).saturating_add(delta_ms);
+            g.rebase(at, moved);
+        });
+    }
+
     pub fn user_stop(&self) {
         self.remote(|g, at| {
             if g.playing {
@@ -670,6 +679,18 @@ mod tests {
         assert_eq!(r.play_state().unwrap().is_paused, Some(true));
         assert!(h.state().paused);
         assert_eq!(h.commands().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn injected_drift_is_silent_until_the_next_progress_report() {
+        let (mut rx, h) = connected(FakeReceiverConfig::default()).await;
+        rx.send(&play_now(0)).await.unwrap();
+        drain_start(&mut rx).await;
+        h.inject_drift(20_000);
+        assert_eq!(h.state().position_ms, 20_000);
+        let r = next_report(&mut rx).await;
+        assert!(matches!(r, ReceiverReport::PlaybackProgress(_)), "{r:?}");
+        assert_eq!(ticks(&r), 21_500 * TICKS_PER_MS);
     }
 
     #[tokio::test(start_paused = true)]
