@@ -7,11 +7,12 @@ use actix_test::TestServer;
 use actix_web::{web, App};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use pharos_cast::fake::FakeReceiverHandle;
+use pharos_cast::mock_tv::MockTv;
 use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::auth::BuiltinAuth;
 use pharos_server::cast_directory::RuntimeCastDirectory;
 use pharos_server::cast_service::{
-    self, CastDeps, CastRuntime, CastServiceHandle, FakeTransportFactory,
+    self, CastDeps, CastRuntime, CastServiceHandle, CastV2Factory, FakeTransportFactory,
 };
 use pharos_server::cast_sessions::tv_session_id;
 use pharos_server::config::CastConfig;
@@ -55,6 +56,9 @@ pub struct CastRig {
     pub bob: Person,
     pub carol: Person,
     pub tv_id: String,
+    /// Set by `CastRig::with_mock_tv`: the TV is this CASTV2 server and the
+    /// service reaches it through the real `CastV2Transport`.
+    pub mock: Option<MockTv>,
     _tv_listener: std::net::TcpListener,
 }
 
@@ -153,20 +157,35 @@ impl CastRig {
 
     /// `settings` are extra top-level `[cast]` keys, as TOML lines.
     pub async fn with_cast_settings(settings: &str) -> Self {
-        Self::build(settings, None).await
+        Self::build(settings, None, None).await
     }
 
     /// A rig whose group queue holds a stored item of `kind`; returns its wire id too.
     pub async fn with_stored_item(kind: pharos_core::MediaKind) -> (Self, String) {
         let id = 7;
         let wire = pharos_jellyfin_api::dto::wire_item_id(id);
-        (Self::build("", Some((id, kind))).await, wire)
+        (Self::build("", None, Some((id, kind))).await, wire)
     }
 
-    async fn build(settings: &str, stored: Option<(u64, pharos_core::MediaKind)>) -> Self {
+    /// Like `with_cast_settings`, but the configured TV is a `MockTv` on a real
+    /// TLS socket and the real `CastV2Factory` connects to it. `receiver` is
+    /// the mock's playback model.
+    pub async fn with_mock_tv(settings: &str) -> Self {
+        let mock = MockTv::start().await.unwrap();
+        Self::build(settings, Some(mock), None).await
+    }
+
+    async fn build(
+        settings: &str,
+        mock: Option<MockTv>,
+        stored: Option<(u64, pharos_core::MediaKind)>,
+    ) -> Self {
         snapshotter();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let port = mock.as_ref().map_or_else(
+            || listener.local_addr().unwrap().port(),
+            |m| m.addr().port(),
+        );
         let cfg: CastConfig = toml::from_str(&format!(
             r#"
             server_url = "http://pharos.lan:8096"
@@ -216,18 +235,22 @@ impl CastRig {
         let carol = person(&stores, &hub, &sinks, None, "carol").await;
 
         let factory = FakeTransportFactory::new();
-        let receiver = factory.add_tv(TV);
+        let receiver = match &mock {
+            Some(m) => m.receiver().clone(),
+            None => factory.add_tv(TV),
+        };
         let runtime = CastRuntime::start(&cfg.tvs);
-        let service = cast_service::spawn(
-            CastDeps {
-                hub: hub.clone(),
-                registry: registry.clone(),
-                sinks: sinks.clone(),
-                stores: stores.clone(),
-            },
-            cfg.clone(),
-            factory.clone(),
-        );
+        let deps = CastDeps {
+            hub: hub.clone(),
+            registry: registry.clone(),
+            sinks: sinks.clone(),
+            stores: stores.clone(),
+        };
+        let service = if mock.is_some() {
+            cast_service::spawn(deps, cfg.clone(), CastV2Factory)
+        } else {
+            cast_service::spawn(deps, cfg.clone(), factory.clone())
+        };
         runtime.install(service.clone());
 
         let directory = RuntimeCastDirectory::new(cfg, runtime.clone(), stores.clone());
@@ -271,6 +294,7 @@ impl CastRig {
             bob,
             carol,
             tv_id: tv_session_id(TV),
+            mock,
             _tv_listener: listener,
         };
         rig.wait_until_listed().await;
