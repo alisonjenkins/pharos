@@ -282,6 +282,12 @@ enum Internal {
         tv: String,
         id: u64,
     },
+    /// The group announced the cast owner's member left it, whichever replica
+    /// took the Leave.
+    OwnerRemoved {
+        tv: String,
+        id: u64,
+    },
 }
 
 /// Who finished the cast, which decides who has already recorded it.
@@ -936,6 +942,12 @@ impl<F: TransportFactory> Actor<F> {
                         .await;
                 }
             }
+            Internal::OwnerRemoved { tv, id } => {
+                if let Some(owner) = self.owner_of(&tv, id) {
+                    self.end(owner, CastReason::OwnerLeft, EndedBy::Service)
+                        .await;
+                }
+            }
             Internal::Driver { tv, id, event } => {
                 let Some(owner) = self.owner_of(&tv, id) else {
                     return;
@@ -1261,6 +1273,11 @@ impl<F: TransportFactory> Actor<F> {
             Arc::clone(&driver),
             a.group.epoch_unix_ms,
             a.tv.name.clone(),
+            OwnerWatch {
+                member: a.owner_member,
+                id,
+                to_actor: self.internal_tx.clone(),
+            },
         ));
         let pump = tokio::spawn(pump_events(
             events_rx,
@@ -1311,15 +1328,33 @@ fn device_of(sync_key: &str) -> &str {
     sync_key.split_once(':').map_or(sync_key, |(_, d)| d)
 }
 
+/// What the seat's forwarder needs to report the owner's member leaving.
+struct OwnerWatch {
+    member: MemberId,
+    id: u64,
+    to_actor: mpsc::Sender<Internal>,
+}
+
 /// Group messages for the seat, turned into driver intents.
 async fn forward(
     mut rx: mpsc::Receiver<ServerMsg>,
     driver: Arc<CastDriverHandle>,
     epoch_unix_ms: u64,
     tv: String,
+    owner: OwnerWatch,
 ) {
     let mut last_entry: Option<String> = None;
     while let Some(msg) = rx.recv().await {
+        if matches!(&msg, ServerMsg::MemberLeft { member_id, .. } if *member_id == owner.member) {
+            tracing::info!(tv, owner_member = %owner.member, "cast: the group removed the owner's member");
+            let _ = owner
+                .to_actor
+                .send(Internal::OwnerRemoved {
+                    tv: tv.clone(),
+                    id: owner.id,
+                })
+                .await;
+        }
         if let Some(entry) = playing_entry(&msg) {
             if last_entry.as_deref() == Some(entry) {
                 tracing::debug!(tv, entry, "cast: queue re-sent for the item already loaded");

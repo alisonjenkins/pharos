@@ -702,7 +702,9 @@ async fn a_dissolved_group_ends_the_cast_with_group_gone() {
     eventually("PlayNow", || has_command(&rig.living_room, "PlayNow")).await;
     let token = rig.tv_token();
 
-    for m in [rig.bob.member, rig.owner.member, rig.seat_member()] {
+    // The seat goes before the owner: an owner removed while the seat is still
+    // listening ends the cast as `owner_left`, not `group_gone`.
+    for m in [rig.bob.member, rig.seat_member(), rig.owner.member] {
         rig.group
             .tx
             .send(GroupMsg::RemoveMember { member_id: m })
