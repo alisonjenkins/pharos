@@ -153,6 +153,17 @@ impl CastRig {
 
     /// `settings` are extra top-level `[cast]` keys, as TOML lines.
     pub async fn with_cast_settings(settings: &str) -> Self {
+        Self::build(settings, None).await
+    }
+
+    /// A rig whose group queue holds a stored item of `kind`; returns its wire id too.
+    pub async fn with_stored_item(kind: pharos_core::MediaKind) -> (Self, String) {
+        let id = 7;
+        let wire = pharos_jellyfin_api::dto::wire_item_id(id);
+        (Self::build("", Some((id, kind))).await, wire)
+    }
+
+    async fn build(settings: &str, stored: Option<(u64, pharos_core::MediaKind)>) -> Self {
         snapshotter();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -169,6 +180,22 @@ impl CastRig {
         .unwrap();
 
         let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let queue_item = match stored {
+            Some((id, kind)) => {
+                use pharos_core::MediaStore;
+                stores
+                    .put(pharos_core::MediaItem {
+                        id,
+                        path: format!("/media/{id}").into(),
+                        kind,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                pharos_jellyfin_api::dto::wire_item_id(id)
+            }
+            None => ITEM.to_string(),
+        };
         let sinks = MemberSinks::new();
         let hub = SessionHub::new();
         let registry = GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone())));
@@ -178,7 +205,7 @@ impl CastRig {
         group
             .tx
             .send(GroupMsg::SeedQueue {
-                item_id: ITEM.into(),
+                item_id: queue_item,
                 runtime_ms: Some(3_600_000),
                 position_ms: START_MS,
                 is_paused: false,
