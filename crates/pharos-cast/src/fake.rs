@@ -14,7 +14,7 @@ use crate::messages::{
 use crate::transport::{AppSession, CastError, CastTransport, TransportEvent};
 
 const TICKS_PER_MS: i64 = 10_000;
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(1_500);
+const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_millis(1_500);
 
 #[derive(Debug, Clone, Default)]
 pub struct FakeReceiverConfig {
@@ -25,6 +25,8 @@ pub struct FakeReceiverConfig {
     /// Error added to the landing position of every `Seek` command.
     pub seek_error_ms: i64,
     pub refuse_connect: bool,
+    /// Gap between progress reports; `None` is the stock receiver's 1.5 s.
+    pub progress_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,12 @@ struct Inner {
 }
 
 impl Inner {
+    fn progress_interval(&self) -> Duration {
+        self.config
+            .progress_interval_ms
+            .map_or(DEFAULT_PROGRESS_INTERVAL, Duration::from_millis)
+    }
+
     fn position_at(&self, at: Instant) -> i64 {
         if self.playing && !self.paused {
             let elapsed = at.saturating_duration_since(self.anchor).as_millis();
@@ -101,7 +109,7 @@ impl Inner {
         self.playing = true;
         self.paused = false;
         self.rebase(at, start_ms);
-        self.next_progress = Some(at + PROGRESS_INTERVAL);
+        self.next_progress = Some(at + self.progress_interval());
         let r = self.report_at(at);
         self.out.push_back(ReceiverReport::PlaybackStart(r));
         self.emit_change(at);
@@ -147,7 +155,7 @@ impl Inner {
                     self.paused = false;
                     let base = self.base_ms;
                     self.rebase(at, base);
-                    self.next_progress = Some(at + PROGRESS_INTERVAL);
+                    self.next_progress = Some(at + self.progress_interval());
                 }
                 self.emit_change(at);
             }
@@ -185,7 +193,7 @@ impl Inner {
             } else {
                 let r = self.report_at(due);
                 self.out.push_back(ReceiverReport::PlaybackProgress(r));
-                self.next_progress = Some(due + PROGRESS_INTERVAL);
+                self.next_progress = Some(due + self.progress_interval());
             }
         }
     }
@@ -257,7 +265,7 @@ impl FakeReceiverHandle {
                 g.paused = false;
                 let base = g.base_ms;
                 g.rebase(at, base);
-                g.next_progress = Some(at + PROGRESS_INTERVAL);
+                g.next_progress = Some(at + g.progress_interval());
             }
             g.emit_change(at);
         });
@@ -492,6 +500,21 @@ mod tests {
             assert_eq!(t0.elapsed(), Duration::from_millis(1_500) * n);
             assert_eq!(ticks(&r), i64::from(n) * 1_500 * TICKS_PER_MS);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_interval_is_configurable() {
+        let cfg = FakeReceiverConfig {
+            progress_interval_ms: Some(400),
+            ..Default::default()
+        };
+        let (mut rx, _h) = connected(cfg).await;
+        rx.send(&play_now(0)).await.unwrap();
+        drain_start(&mut rx).await;
+        let t0 = Instant::now();
+        let r = next_report(&mut rx).await;
+        assert!(matches!(r, ReceiverReport::PlaybackProgress(_)));
+        assert_eq!(t0.elapsed(), Duration::from_millis(400));
     }
 
     #[tokio::test(start_paused = true)]
