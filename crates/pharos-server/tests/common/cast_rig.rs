@@ -148,6 +148,11 @@ async fn person(
 
 impl CastRig {
     pub async fn new() -> Self {
+        Self::with_cast_settings("").await
+    }
+
+    /// `settings` are extra top-level `[cast]` keys, as TOML lines.
+    pub async fn with_cast_settings(settings: &str) -> Self {
         snapshotter();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -155,6 +160,7 @@ impl CastRig {
             r#"
             server_url = "http://pharos.lan:8096"
             reconnect_grace_secs = 1
+            {settings}
             [[tvs]]
             name = "{TV}"
             address = "127.0.0.1:{port}"

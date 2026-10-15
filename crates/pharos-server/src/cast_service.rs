@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::cast::{mint_tv_token, revoke_tv_token, TvToken, DEFAULT_TV_TOKEN_LIFETIME};
+use crate::cast::{mint_tv_token, revoke_tv_token, TvToken};
 use crate::cast_adapter::{command_for, intent_for, playing_entry, ClockPair, GroupCommandRequest};
 use crate::config::{CastAddress, CastConfig, ConfiguredTv};
 use crate::state::Stores;
@@ -305,6 +305,8 @@ struct ActiveCast {
     owner_member: MemberId,
     seat_member: MemberId,
     token_id: TokenId,
+    /// When the token is replaced: half its lifetime after it was minted.
+    renew_at: Instant,
     driver: Arc<CastDriverHandle>,
     state: ConnState,
     forwarder: JoinHandle<()>,
@@ -394,6 +396,9 @@ impl<F: TransportFactory> Actor<F> {
         let mut ping = tokio::time::interval(SEAT_PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ping.tick().await;
+        let mut renew = tokio::time::interval(self.renew_check_interval());
+        renew.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        renew.tick().await;
         loop {
             tokio::select! {
                 cmd = commands.recv() => match cmd {
@@ -404,6 +409,7 @@ impl<F: TransportFactory> Actor<F> {
                 Some(done) = opened.recv() => self.on_opened(done).await,
                 Some(done) = resumed.recv() => self.on_resumed(done).await,
                 _ = ping.tick() => self.ping_seats(),
+                _ = renew.tick() => self.renew_due_tokens().await,
             }
         }
         self.release_all().await;
@@ -809,7 +815,7 @@ impl<F: TransportFactory> Actor<F> {
             &self.deps.stores,
             req.user_id,
             &tv.name,
-            DEFAULT_TV_TOKEN_LIFETIME,
+            self.token_lifetime(),
         )
         .await
         {
@@ -1012,6 +1018,109 @@ impl<F: TransportFactory> Actor<F> {
         }
     }
 
+    fn token_lifetime(&self) -> Duration {
+        Duration::from_secs(self.cfg.tv_token_lifetime_secs)
+    }
+
+    /// Often enough that a renewal lands within an eighth of the lifetime of
+    /// its due time, rarely enough to cost nothing.
+    fn renew_check_interval(&self) -> Duration {
+        (self.token_lifetime() / 8).clamp(Duration::from_millis(100), Duration::from_secs(60))
+    }
+
+    async fn renew_due_tokens(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .casts
+            .values()
+            .filter(|c| c.renew_at <= now)
+            .map(|c| c.tv.clone())
+            .collect();
+        for tv in due {
+            self.renew_token(&tv).await;
+        }
+    }
+
+    /// Replace the cast's TV token before it expires: mint, hand it to the
+    /// driver (which tells the TV), then revoke the old one. A failure leaves
+    /// the old token in place and is retried at the next check.
+    async fn renew_token(&mut self, tv: &str) {
+        let Some(cast) = self.casts.get(tv) else {
+            return;
+        };
+        let (owner, owner_name, device, group) = (
+            cast.owner,
+            cast.owner_name.clone(),
+            cast.sender_device.clone(),
+            cast.group.group_id.to_string(),
+        );
+        let lifetime = self.token_lifetime();
+        let retry_at = Instant::now() + self.renew_check_interval();
+        let token = match mint_tv_token(&self.deps.stores, owner, tv, lifetime).await {
+            Ok(token) => token,
+            Err(e) => {
+                let detail = format!("cannot mint a replacement TV token: {e}");
+                tracing::warn!(tv, owner = %owner_name, error = %e, "cast: TV token renewal failed; the current token stands until it expires");
+                obs::record_cast_event(
+                    CastEvent::TokenRenewFailed,
+                    CastReason::TokenFailed,
+                    &owner_name,
+                    &device,
+                    tv,
+                    &group,
+                    &detail,
+                );
+                if let Some(cast) = self.casts.get_mut(tv) {
+                    cast.renew_at = retry_at;
+                }
+                return;
+            }
+        };
+        let Some(cast) = self.casts.get_mut(tv) else {
+            self.revoke_quietly(&token.id).await;
+            return;
+        };
+        let intent = GroupIntent::RefreshToken {
+            token: AccessToken::new(token.secret().expose()),
+        };
+        if cast.driver.send(intent).await.is_err() {
+            cast.renew_at = retry_at;
+            self.revoke_quietly(&token.id).await;
+            let detail = "the driver is gone; the replacement TV token was discarded".to_owned();
+            obs::record_cast_event(
+                CastEvent::TokenRenewFailed,
+                CastReason::GroupGone,
+                &owner_name,
+                &device,
+                tv,
+                &group,
+                &detail,
+            );
+            return;
+        }
+        let old = std::mem::replace(&mut cast.token_id, token.id.clone());
+        cast.renew_at = Instant::now() + lifetime / 2;
+        self.revoke_quietly(&old).await;
+        obs::record_cast_event(
+            CastEvent::TokenRenewed,
+            CastReason::UserStop,
+            &owner_name,
+            &device,
+            tv,
+            &group,
+            &format!("replaced token {} with {}", old.0, token.id.0),
+        );
+    }
+
+    async fn revoke_quietly(&self, id: &TokenId) {
+        if let Err(e) = revoke_tv_token(&self.deps.stores, id).await {
+            tracing::error!(
+                token = %id.0, error = %e,
+                "cast: a TV token could not be revoked; it expires on its own"
+            );
+        }
+    }
+
     fn ping_seats(&self) {
         for cast in self.casts.values() {
             let _ = cast.group.tx.try_send(GroupMsg::MemberPing {
@@ -1176,6 +1285,7 @@ impl<F: TransportFactory> Actor<F> {
             owner_member: a.owner_member,
             seat_member,
             token_id: token.id.clone(),
+            renew_at: Instant::now() + self.token_lifetime() / 2,
             driver,
             state: ConnState::Connecting,
             forwarder,

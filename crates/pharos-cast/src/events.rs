@@ -8,10 +8,14 @@ pub enum CastEvent {
     HandoffFailed,
     /// A persisted seat was re-created after a restart or a change of group owner.
     Resumed,
+    /// The seat's TV token was replaced before it expired.
+    TokenRenewed,
+    /// A replacement TV token could not be minted; the old one still stands.
+    TokenRenewFailed,
 }
 
 impl CastEvent {
-    pub const ALL: [CastEvent; 7] = [
+    pub const ALL: [CastEvent; 9] = [
         CastEvent::Started,
         CastEvent::Rejected,
         CastEvent::Ended,
@@ -19,6 +23,8 @@ impl CastEvent {
         CastEvent::Reconnected,
         CastEvent::HandoffFailed,
         CastEvent::Resumed,
+        CastEvent::TokenRenewed,
+        CastEvent::TokenRenewFailed,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -30,6 +36,8 @@ impl CastEvent {
             CastEvent::Reconnected => "reconnected",
             CastEvent::HandoffFailed => "handoff_failed",
             CastEvent::Resumed => "resumed",
+            CastEvent::TokenRenewed => "token_renewed",
+            CastEvent::TokenRenewFailed => "token_renew_failed",
         }
     }
 }
@@ -123,7 +131,9 @@ mod tests {
                 "lost",
                 "reconnected",
                 "handoff_failed",
-                "resumed"
+                "resumed",
+                "token_renewed",
+                "token_renew_failed"
             ]
         );
         assert_labels_bounded(&labels);
