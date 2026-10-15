@@ -13,6 +13,14 @@ Covers: the receiver emulator (speaks the stock receiver's command set and mirro
 
 Disarm check (constitution III): comment out each `pharos_cast_*` record call once and confirm its test goes red, then restore.
 
+## 1b. Mock TV on a real socket (CI)
+
+```
+cargo nextest run -p pharos-server -E 'test(/cast_mock_tv/)'
+```
+
+`pharos_cast::mock_tv::MockTv` (cargo feature `testing`) is a CASTV2 receiver on `127.0.0.1:0`: TLS with a self-signed certificate, length-framed protobuf, heartbeat, `LAUNCH`, and the connectsdk commands, with `FakeReceiver` as its playback model. `tests/cast_mock_tv.rs` runs a real HTTP server whose `[[cast.tvs]]` address is the mock, reached by the production `CastV2Factory`/`CastV2Transport`, with three occupants holding sockets in one group. It covers: start (PlayNow at the group position, working token), pause/seek/unpause by other occupants, a late joiner and a buffering occupant never holding the TV (V172), injected drift corrected (`pharos_cast_correction_total`), a dropped connection inside the grace reconnecting, and a stop on the TV ending the cast as `user_stop` with the token revoked.
+
 ## 2. Real client, emulated TV (`just compat-syncplay` extension)
 
 Two `jellyfin-web` contexts in one group plus the emulator as the TV. Steps: member A opens the device picker, selects the TV, the emulator receives `PlayNow` at the group position, member B pauses/seeks, the emulator applies them. Asserts S3 (stop on hand-off) and S4 (picker lists the TV).
