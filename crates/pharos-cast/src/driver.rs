@@ -45,6 +45,11 @@ pub enum GroupIntent {
     Stop {
         reason: CastReason,
     },
+    /// Use `token` from now on and tell the TV, which only learns a token from
+    /// a command.
+    RefreshToken {
+        token: AccessToken,
+    },
 }
 
 /// What the server must hear.
@@ -540,6 +545,10 @@ impl<T: CastTransport> Driver<T> {
                 self.enqueue(position_ms, playing, true, apply_at);
                 None
             }
+            GroupIntent::RefreshToken { token } => {
+                self.cfg.access_token = token;
+                None
+            }
         }
     }
 
@@ -586,6 +595,20 @@ impl<T: CastTransport> Driver<T> {
                 playing,
                 apply_at,
             } => self.hold(position_ms, playing, true, apply_at).await,
+            GroupIntent::RefreshToken { token } => {
+                self.cfg.access_token = token;
+                // Repeat the state the TV is already in: the command is a carrier.
+                let carrier = if self.expected_paused {
+                    CommandBody::Pause
+                } else {
+                    CommandBody::Unpause
+                };
+                if self.loaded.is_some() {
+                    settle(self.send_cmd(carrier).await)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1053,6 +1076,36 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refreshed_token_reaches_a_paused_tv_in_the_next_envelope() {
+        let mut rig = start(FakeReceiverConfig::default(), driver_cfg());
+        rig.load(5_000, false).await;
+        rig.until_state(ConnState::Following).await;
+        let sent_before = rig.fake.commands().len();
+
+        rig.handle
+            .send(GroupIntent::RefreshToken {
+                token: AccessToken::new("renewed"),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let cmds = rig.fake.commands();
+        let fresh = cmds.get(sent_before..).unwrap_or_default();
+        assert!(
+            fresh.iter().any(|c| c.access_token.expose() == "renewed"),
+            "no command carried the renewed token: {fresh:?}"
+        );
+        assert!(
+            fresh
+                .iter()
+                .all(|c| matches!(c.body, CommandBody::Pause | CommandBody::Unpause)),
+            "a refresh must only repeat the current play state: {fresh:?}"
+        );
+        assert!(rig.fake.state().paused, "the paused TV stayed paused");
     }
 
     #[tokio::test(start_paused = true)]
