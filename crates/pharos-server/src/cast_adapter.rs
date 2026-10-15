@@ -6,12 +6,94 @@
 use std::time::Duration;
 
 use pharos_cast::driver::{DriverEvent, GroupIntent};
+use pharos_core::{MediaKind, MediaStore};
 use pharos_sync::messages::ServerMsg;
 use tokio::time::Instant;
 
 /// Item type sent to the receiver when the queue does not carry one: a group
-/// queue holds only item ids, and the receiver treats anything playable as video.
+/// queue holds only item ids, so `intent_for` starts from this and the caller
+/// replaces it with [`item_type_of`] once the item's kind is known.
 pub const DEFAULT_ITEM_TYPE: &str = "Video";
+
+/// The receiver's media type for an item kind: the TV advertises `Audio` and
+/// `Video` only, so music is `Audio` and everything else plays as `Video`.
+pub const fn item_type_for(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Audio => "Audio",
+        MediaKind::Movie | MediaKind::Episode | MediaKind::Book => DEFAULT_ITEM_TYPE,
+    }
+}
+
+/// How a `Load`'s item type was decided; the `source` of `pharos_cast_item_type_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemTypeSource {
+    /// The item's kind was read from the media store.
+    Kind,
+    /// The item could not be read; the default type was sent.
+    Fallback,
+}
+
+impl ItemTypeSource {
+    pub const ALL: [ItemTypeSource; 2] = [ItemTypeSource::Kind, ItemTypeSource::Fallback];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            ItemTypeSource::Kind => "kind",
+            ItemTypeSource::Fallback => "fallback",
+        }
+    }
+}
+
+/// The receiver type for the queue entry `item_id`, read from its stored kind.
+/// An id that does not parse or an item the store cannot return falls back to
+/// [`DEFAULT_ITEM_TYPE`]; both the verdict and the offending value are recorded.
+pub async fn item_type_of<S: MediaStore>(store: &S, item_id: &str) -> &'static str {
+    let looked_up = match pharos_jellyfin_api::dto::parse_item_id(item_id) {
+        Some(id) => store
+            .get(id)
+            .await
+            .map(|item| item.kind)
+            .map_err(|e| e.to_string()),
+        None => Err("not a media id".to_owned()),
+    };
+    let (item_type, source) = match looked_up {
+        Ok(kind) => (item_type_for(kind), ItemTypeSource::Kind),
+        Err(cause) => {
+            tracing::warn!(
+                item_id,
+                cause = %cause,
+                item_type = DEFAULT_ITEM_TYPE,
+                "cast: could not read the item's kind; loading it as the default type"
+            );
+            (DEFAULT_ITEM_TYPE, ItemTypeSource::Fallback)
+        }
+    };
+    metrics::counter!(
+        "pharos_cast_item_type_total",
+        "item_type" => item_type,
+        "source" => source.label()
+    )
+    .increment(1);
+    item_type
+}
+
+/// `intent` with a `Load`'s item type replaced; any other intent is unchanged.
+pub fn with_item_type(intent: GroupIntent, item_type: &str) -> GroupIntent {
+    match intent {
+        GroupIntent::Load {
+            item_id,
+            position_ms,
+            playing,
+            ..
+        } => GroupIntent::Load {
+            item_id,
+            item_type: item_type.to_owned(),
+            position_ms,
+            playing,
+        },
+        other => other,
+    }
+}
 
 /// A point on the group's `server_ms` clock paired with the local instant it
 /// was read at, so a future `at_server_ms` becomes a local `Instant`.
@@ -377,5 +459,76 @@ mod tests {
         ];
         let labels: std::collections::HashSet<_> = all.iter().map(|c| c.label()).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn item_type_source_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            ItemTypeSource::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), ItemTypeSource::ALL.len());
+    }
+
+    fn media(id: u64, kind: MediaKind) -> pharos_core::MediaItem {
+        pharos_core::MediaItem {
+            id,
+            path: format!("/media/{id}").into(),
+            kind,
+            ..Default::default()
+        }
+    }
+
+    fn counter(snap: &pharos_test_metrics::CumulativeSnapshotter, source: &str, ty: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_cast_item_type_total")
+            .filter(|(ck, _, _, _)| {
+                let l: Vec<_> = ck.key().labels().map(|l| (l.key(), l.value())).collect();
+                l.contains(&("source", source)) && l.contains(&("item_type", ty))
+            })
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// A music item must reach the TV as `Audio`, a film as `Video`, and an
+    /// unreadable item as the default with the fallback recorded.
+    #[tokio::test]
+    async fn a_load_carries_the_items_real_type() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        stores.put(media(7, MediaKind::Audio)).await.unwrap();
+        stores.put(media(8, MediaKind::Movie)).await.unwrap();
+        let song = pharos_jellyfin_api::dto::wire_item_id(7);
+        let film = pharos_jellyfin_api::dto::wire_item_id(8);
+        let missing = pharos_jellyfin_api::dto::wire_item_id(99);
+
+        let q = queue(0, &[(song.as_str(), "p")], 0, true);
+        let intent = intent_for(&q, clock()).unwrap();
+        let retyped = with_item_type(intent, item_type_of(&stores, &song).await);
+        assert_eq!(
+            retyped,
+            GroupIntent::Load {
+                item_id: song.clone(),
+                item_type: "Audio".into(),
+                position_ms: 0,
+                playing: true,
+            }
+        );
+        assert_eq!(item_type_of(&stores, &film).await, "Video");
+        assert_eq!(item_type_of(&stores, &missing).await, "Video");
+        assert_eq!(item_type_of(&stores, "not-an-id").await, "Video");
+
+        assert_eq!(counter(&snap, "kind", "Audio"), 1);
+        assert_eq!(counter(&snap, "kind", "Video"), 1);
+        assert_eq!(counter(&snap, "fallback", "Video"), 2);
     }
 }
