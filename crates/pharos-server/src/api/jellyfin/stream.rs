@@ -604,7 +604,6 @@ async fn credential_permits(
     pattern: Option<&str>,
 ) -> Result<bool, actix_web::Error> {
     use crate::api::jellyfin::auth_extractor::scope_refusal;
-    use pharos_core::TokenStore;
     let Ok(resolved) = stores.resolve_scoped(token).await else {
         return Ok(false);
     };
