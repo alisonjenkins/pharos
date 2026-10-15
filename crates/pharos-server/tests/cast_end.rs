@@ -525,3 +525,34 @@ async fn the_owner_removed_by_another_replica_ends_the_cast_with_owner_left() {
     assert_eq!(seat_total("ended", "owner_left"), before + 1);
     assert_eq!(rig.token_status(&token).await, 401, "V175");
 }
+
+#[actix_web::test]
+async fn a_transport_command_for_a_cast_held_by_another_replica_is_503_not_no_cast() {
+    let rig = CastRig::new().await;
+    // A group this replica does not run: its handle takes commands, never answers.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let remote = pharos_sync::group::GroupHandle {
+        group_id: pharos_sync::messages::GroupId(uuid::Uuid::new_v4()),
+        tx,
+        epoch_unix_ms: 0,
+    };
+    rig.hub.attach_group(&rig.carol.key, remote);
+    let labels = [("reason", "cast_on_other_replica")];
+    let before = counter("pharos_cast_transport_refused_total", &labels);
+
+    let (status, body) = rig
+        .post(
+            &rig.carol,
+            &format!("/Sessions/{}/Playing/Pause", rig.tv_id),
+            None,
+        )
+        .await;
+
+    assert_eq!(status, 503, "{body}");
+    assert!(body.starts_with("cast_on_other_replica"), "{body}");
+    assert_eq!(
+        counter("pharos_cast_transport_refused_total", &labels),
+        before + 1
+    );
+}

@@ -609,8 +609,23 @@ fn seek_ticks(query: &str, body: &serde_json::Value) -> Option<u64> {
         })
 }
 
-fn refuse(status: StatusCode, reason: &str, message: String) -> HttpResponse {
+fn refuse(status: StatusCode, reason: &'static str, message: String) -> HttpResponse {
+    metrics::counter!("pharos_cast_transport_refused_total", "reason" => reason).increment(1);
     HttpResponse::build(status).body(format!("{reason}: {message}"))
+}
+
+/// Whether the caller's SyncPlay group is run by another replica. Only the
+/// replica running a group holds its casts, and a remote handle never answers
+/// a snapshot, so an empty local cast list proves nothing for such a caller.
+async fn caller_group_is_remote(hub: &SessionHub, auth: &AuthSession) -> bool {
+    let Some(group) = auth
+        .sync_key()
+        .and_then(|key| hub.resolve(&key))
+        .and_then(|s| s.group)
+    else {
+        return false;
+    };
+    group.snapshot().await.is_none()
 }
 
 /// Apply a transport command aimed at a TV session to the group the TV's cast
@@ -642,6 +657,13 @@ async fn tv_transport(
         .into_iter()
         .find(|c| c.tv.eq_ignore_ascii_case(tv_name))
     else {
+        if caller_group_is_remote(hub, auth).await {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cast_on_other_replica",
+                format!("the group casting to {tv_name:?} is run by another replica"),
+            );
+        }
         return refuse(
             StatusCode::CONFLICT,
             "no_cast",
