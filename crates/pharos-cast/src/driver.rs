@@ -357,8 +357,8 @@ impl<T: CastTransport> Driver<T> {
     }
 
     async fn enter(&mut self, next: ConnState) {
-        obs::set_connection(self.state, 0.0);
-        obs::set_connection(next, 1.0);
+        obs::set_connection(&self.cfg.receiver_name, self.state, 0.0);
+        obs::set_connection(&self.cfg.receiver_name, next, 1.0);
         self.state = next;
         self.emit(DriverEvent::State(next)).await;
     }
@@ -1749,6 +1749,44 @@ mod tests {
             counter(&all, "pharos_cast_seat_total", ("event", "reconnected")),
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_connection_gauge_is_kept_per_tv_so_concurrent_casts_do_not_overwrite_each_other() {
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut living = start(FakeReceiverConfig::default(), driver_cfg());
+        let bedroom_cfg = DriverConfig {
+            receiver_name: "Bedroom TV".into(),
+            ..driver_cfg()
+        };
+        let mut bedroom = start(FakeReceiverConfig::default(), bedroom_cfg);
+        living.load(0, true).await;
+        bedroom.load(0, true).await;
+        living.until_state(ConnState::Following).await;
+        bedroom.until_state(ConnState::Following).await;
+        living.fake.configure(|c| c.refuse_connect = true);
+        living.fake.drop_connection();
+        living.until_state(ConnState::Lost).await;
+
+        let gauge = |tv: &str, state: &str| -> Option<f64> {
+            series(&snap)
+                .into_iter()
+                .filter(|(n, labels, _)| {
+                    n == "pharos_cast_connection"
+                        && labels.contains(&("tv".to_owned(), tv.to_owned()))
+                        && labels.contains(&("state".to_owned(), state.to_owned()))
+                })
+                .find_map(|(_, _, v)| match v {
+                    DebugValue::Gauge(g) => Some(g.into_inner()),
+                    _ => None,
+                })
+        };
+        assert_eq!(gauge("Living Room TV", "lost"), Some(1.0));
+        assert_eq!(gauge("Living Room TV", "following"), Some(0.0));
+        assert_eq!(gauge("Bedroom TV", "following"), Some(1.0));
     }
 
     #[tokio::test(start_paused = true)]
