@@ -481,3 +481,30 @@ async fn leaving_the_group_while_the_tv_connects_cancels_the_start() {
     assert_eq!(cast_tokens(&rig).await, 0, "no TV token is left");
     assert_eq!(seat_total("ended", "owner_left"), before + 1);
 }
+
+fn second_device(rig: &CastRig, device: &str) -> cast_rig::Person {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    cast_rig::Person {
+        id: rig.alice.id,
+        name: rig.alice.name.clone(),
+        token: rig.alice.token.clone(),
+        device: device.into(),
+        key: format!("{}:{device}", rig.alice.id.0.simple()),
+        member: rig.alice.member,
+        rx,
+    }
+}
+
+#[actix_web::test]
+async fn a_leave_from_another_device_of_the_owner_leaves_the_cast_untouched() {
+    let (rig, token) = rig_casting().await;
+    let laptop = second_device(&rig, "dev-laptop");
+    let before = seat_total("ended", "owner_left");
+
+    let (status, body) = rig.post(&laptop, "/SyncPlay/Leave", None).await;
+    assert_eq!(status, 204, "{body}");
+
+    assert_eq!(rig.service.snapshot().await.len(), 1, "the cast survives");
+    assert_eq!(seat_total("ended", "owner_left"), before);
+    assert_eq!(rig.token_status(&token).await, 200);
+}

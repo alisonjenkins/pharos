@@ -670,7 +670,13 @@ async fn leave_group(
     hub: web::Data<SessionHub>,
     state: web::Data<crate::state::AppState>,
 ) -> HttpResponse {
-    end_owned_cast(&state, &auth).await;
+    if let Some(member) = auth
+        .sync_key()
+        .and_then(|dev| hub.resolve(&dev))
+        .map(|s| s.member_id)
+    {
+        end_owned_cast(&state, &auth, member).await;
+    }
     if let Some(dev) = auth.sync_key() {
         if let Some(sess) = hub.resolve(&dev) {
             if let Some(h) = hub.detach_group(&dev) {
@@ -699,13 +705,20 @@ async fn leave_group(
 /// A user who owns a cast seat cannot leave the group and keep it: the seat
 /// would outlive the member it stands for. Ending it first (reason
 /// `owner_left`) also restores the owner and retracts the seat from the roster
-/// before the owner's own removal is announced. Idempotent: no seat, no-op.
-async fn end_owned_cast(state: &crate::state::AppState, auth: &AuthSession) {
+/// before the owner's own removal is announced. Only the member that cast
+/// counts: the same user leaving from another device (jellyfin-web sends Leave
+/// on page unload) is not the seat's owner. Idempotent: no seat, no-op.
+async fn end_owned_cast(state: &crate::state::AppState, auth: &AuthSession, member: MemberId) {
     let Some(service) = state.cast.service() else {
         return;
     };
     let user = auth.user.id;
-    if !service.snapshot().await.iter().any(|c| c.owner == user) {
+    if !service
+        .snapshot()
+        .await
+        .iter()
+        .any(|c| c.owner == user && c.owner_member == member)
+    {
         return;
     }
     service
