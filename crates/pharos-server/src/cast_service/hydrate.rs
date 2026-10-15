@@ -296,19 +296,14 @@ impl<F: TransportFactory> Actor<F> {
         }
 
         self.revoke_stale_tokens(*owner, &tv.name).await;
-        let token = mint_tv_token(
-            &self.deps.stores,
-            *owner,
-            &tv.name,
-            DEFAULT_TV_TOKEN_LIFETIME,
-        )
-        .await
-        .map_err(|e| {
-            (
-                CastReason::TokenFailed,
-                format!("cannot mint a TV token: {e}"),
-            )
-        })?;
+        let token = mint_tv_token(&self.deps.stores, *owner, &tv.name, self.token_lifetime())
+            .await
+            .map_err(|e| {
+                (
+                    CastReason::TokenFailed,
+                    format!("cannot mint a TV token: {e}"),
+                )
+            })?;
 
         let cast = self.assemble(
             transport,

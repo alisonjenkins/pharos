@@ -798,6 +798,10 @@ fn default_cast_correction_cooldown_ms() -> u64 {
     5000
 }
 
+fn default_cast_tv_token_lifetime_secs() -> u64 {
+    crate::cast::DEFAULT_TV_TOKEN_LIFETIME.as_secs()
+}
+
 /// `[cast]` — Chromecast-style TV seats (009). Inert unless `[[cast.tvs]]` is
 /// configured. Validation runs at parse time; address resolution stays lazy.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -812,6 +816,9 @@ pub struct CastConfig {
     pub drift_threshold_ms: u64,
     /// Hysteresis between corrections.
     pub correction_cooldown_ms: u64,
+    /// How long a TV's access token lives; a running cast replaces it at half
+    /// that, so a cast is never cut off by expiry.
+    pub tv_token_lifetime_secs: u64,
     pub tvs: Vec<ConfiguredTv>,
 }
 
@@ -822,6 +829,7 @@ impl Default for CastConfig {
             reconnect_grace_secs: default_cast_reconnect_grace_secs(),
             drift_threshold_ms: default_cast_drift_threshold_ms(),
             correction_cooldown_ms: default_cast_correction_cooldown_ms(),
+            tv_token_lifetime_secs: default_cast_tv_token_lifetime_secs(),
             tvs: Vec::new(),
         }
     }
@@ -962,6 +970,8 @@ struct RawCastConfig {
     drift_threshold_ms: u64,
     #[serde(default = "default_cast_correction_cooldown_ms")]
     correction_cooldown_ms: u64,
+    #[serde(default = "default_cast_tv_token_lifetime_secs")]
+    tv_token_lifetime_secs: u64,
     #[serde(default)]
     tvs: Vec<RawConfiguredTv>,
 }
@@ -1030,6 +1040,13 @@ impl TryFrom<RawCastConfig> for CastConfig {
                 rule: "greater than 0",
             });
         }
+        if !(2..=30 * 24 * 60 * 60).contains(&raw.tv_token_lifetime_secs) {
+            return Err(CastConfigError::Scalar {
+                key: "tv_token_lifetime_secs",
+                value: raw.tv_token_lifetime_secs,
+                rule: "between 2 and 2592000 (30 days)",
+            });
+        }
         let server_url = raw
             .server_url
             .as_deref()
@@ -1081,6 +1098,7 @@ impl TryFrom<RawCastConfig> for CastConfig {
             reconnect_grace_secs: raw.reconnect_grace_secs,
             drift_threshold_ms: raw.drift_threshold_ms,
             correction_cooldown_ms: raw.correction_cooldown_ms,
+            tv_token_lifetime_secs: raw.tv_token_lifetime_secs,
             tvs,
         })
     }
@@ -1859,6 +1877,22 @@ mod cast_config_tests {
         assert!(
             err.contains("correction_cooldown_ms"),
             "names the key: {err}"
+        );
+    }
+
+    #[test]
+    fn tv_token_lifetime_too_short_to_renew_is_rejected_naming_the_value() {
+        let err = cast_error("tv_token_lifetime_secs = 1\n");
+        assert!(
+            err.contains("tv_token_lifetime_secs"),
+            "names the key: {err}"
+        );
+        assert!(err.contains('1'), "names the value: {err}");
+        assert_eq!(
+            Config::from_toml_str(&with_cast("tv_token_lifetime_secs = 4\n"))
+                .map(|c| c.cast.tv_token_lifetime_secs)
+                .ok(),
+            Some(4)
         );
     }
 
