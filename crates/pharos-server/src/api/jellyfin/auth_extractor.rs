@@ -151,6 +151,35 @@ pub fn scope_permits(scope: TokenScope, method: &str, pattern: Option<&str>) -> 
     }
 }
 
+/// The 403 for a token whose scope does not permit the route, with the refusal
+/// counted and logged; `None` when the scope permits it. Every credential check
+/// that honours a token routes through here so none can skip the allowlist.
+pub(crate) fn scope_refusal(
+    scope: TokenScope,
+    user: pharos_core::UserId,
+    method: &str,
+    pattern: Option<&str>,
+) -> Option<actix_web::Error> {
+    if scope_permits(scope, method, pattern) {
+        return None;
+    }
+    let pattern = pattern.unwrap_or("<unmatched>");
+    metrics::counter!("pharos_token_scope_refused_total", "scope" => scope.label()).increment(1);
+    tracing::warn!(
+        scope = scope.label(),
+        method,
+        route = pattern,
+        user.id = %user,
+        "token scope does not permit this route; answering 403"
+    );
+    Some(ErrorForbidden(format!(
+        "{} token may not call {} {}",
+        scope.label(),
+        method,
+        pattern
+    )))
+}
+
 /// Token to [`User`]: the one place a request is accepted or turned away, so
 /// every rejection is counted with its reason. A missing token costs no
 /// database call; a token the store does not know costs exactly one.
@@ -169,23 +198,13 @@ async fn authenticate(
         .resolve_scoped(&token)
         .await
         .map_err(|e| auth_failure(e, Rejected::InvalidToken))?;
-    if !scope_permits(resolved.scope, &route.method, route.pattern.as_deref()) {
-        let pattern = route.pattern.as_deref().unwrap_or("<unmatched>");
-        metrics::counter!("pharos_token_scope_refused_total", "scope" => resolved.scope.label())
-            .increment(1);
-        tracing::warn!(
-            scope = resolved.scope.label(),
-            method = %route.method,
-            route = pattern,
-            user.id = %resolved.user,
-            "token scope does not permit this route; answering 403"
-        );
-        return Err(ErrorForbidden(format!(
-            "{} token may not call {} {}",
-            resolved.scope.label(),
-            route.method,
-            pattern
-        )));
+    if let Some(refused) = scope_refusal(
+        resolved.scope,
+        resolved.user,
+        &route.method,
+        route.pattern.as_deref(),
+    ) {
+        return Err(refused);
     }
     let record = state
         .stores

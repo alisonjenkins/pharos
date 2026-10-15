@@ -569,7 +569,14 @@ async fn authorize_media(
 ) -> Result<(), actix_web::Error> {
     // 1. Normal credential.
     if let Some(token) = crate::api::jellyfin::auth_extractor::extract_token(req) {
-        if state.stores.resolve(&token).await.is_ok() {
+        if credential_permits(
+            &state.stores,
+            &token,
+            req.method().as_str(),
+            req.match_pattern().as_deref(),
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -585,6 +592,26 @@ async fn authorize_media(
         }
     }
     Err(error::ErrorUnauthorized("missing token"))
+}
+
+/// Whether `token` is a live credential allowed to call `method` on the matched
+/// `pattern`. A token the store does not know is `false` (fall through to the
+/// capability check); a known token whose scope forbids the route is a 403.
+async fn credential_permits(
+    stores: &crate::state::Stores,
+    token: &str,
+    method: &str,
+    pattern: Option<&str>,
+) -> Result<bool, actix_web::Error> {
+    use crate::api::jellyfin::auth_extractor::scope_refusal;
+    use pharos_core::TokenStore;
+    let Ok(resolved) = stores.resolve_scoped(token).await else {
+        return Ok(false);
+    };
+    match scope_refusal(resolved.scope, resolved.user, method, pattern) {
+        Some(refused) => Err(refused),
+        None => Ok(true),
+    }
 }
 
 fn parse_max_audio_channels(qs: &str) -> Option<u32> {
@@ -1795,5 +1822,76 @@ mod tests {
         // always sends one.
         let bare = actix_web::test::TestRequest::get().to_http_request();
         assert_eq!(DirectPlayClient::of(&bare), DirectPlayClient::Native);
+    }
+
+    async fn tokens() -> (crate::state::Stores, String, String) {
+        use pharos_core::{
+            SecretString, TokenScope, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
+        };
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let auth = crate::auth::BuiltinAuth::new(stores.clone());
+        let uid = UserId::new();
+        stores
+            .create(UserRecord {
+                id: uid,
+                name: "owner".into(),
+                password_hash: auth.hash_password(&SecretString::new("p")).unwrap(),
+                policy: UserPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let full = stores
+            .issue(uid, "web")
+            .await
+            .unwrap()
+            .0
+            .expose()
+            .to_string();
+        let playback = stores
+            .issue_with_ttl(uid, "cast:Den", 3600, TokenScope::Playback)
+            .await
+            .unwrap()
+            .secret
+            .0
+            .expose()
+            .to_string();
+        (stores, full, playback)
+    }
+
+    /// Media routes honour the same allowlist as `AuthUser`: a playback token
+    /// is accepted on the media routes and refused with a 403 anywhere else,
+    /// while a full token and an unknown token are unaffected by scope.
+    #[actix_web::test]
+    async fn media_credentials_honour_the_playback_allowlist() {
+        let (stores, full, playback) = tokens().await;
+        for (method, pattern) in [
+            ("GET", "/videos/{id}/stream"),
+            ("HEAD", "/videos/{id}/stream.{ext}"),
+            ("GET", "/audio/{id}/universal"),
+            ("HEAD", "/audio/{id}/stream"),
+        ] {
+            assert!(
+                credential_permits(&stores, &playback, method, Some(pattern))
+                    .await
+                    .unwrap(),
+                "{method} {pattern} must accept a playback token"
+            );
+        }
+        let err = credential_permits(&stores, &playback, "GET", Some("/brand/new/route"))
+            .await
+            .expect_err("a route off the allowlist must refuse a playback token");
+        assert_eq!(err.as_response_error().status_code(), 403);
+        assert!(
+            credential_permits(&stores, &full, "GET", Some("/brand/new/route"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !credential_permits(&stores, "no-such-token", "GET", Some("/videos/{id}/stream"))
+                .await
+                .unwrap()
+        );
     }
 }
