@@ -476,6 +476,16 @@ impl<T: CastTransport> Driver<T> {
         self.transport.launch(RECEIVER_APP_ID).await?;
         let Some(item) = self.loaded.clone() else {
             self.enter(ConnState::Connecting).await;
+            if let Some(since) = self.loss_since.take() {
+                self.record(
+                    CastEvent::Reconnected,
+                    CastReason::TvUnreachable,
+                    &format!(
+                        "connected again {:?} after the connection was lost, nothing loaded yet",
+                        Instant::now().saturating_duration_since(since)
+                    ),
+                );
+            }
             return Ok(());
         };
         let target = self
@@ -1739,6 +1749,39 @@ mod tests {
             counter(&all, "pharos_cast_seat_total", ("event", "reconnected")),
             0
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_outage_after_a_pre_load_reconnect_gets_a_full_grace_window() {
+        let fake_cfg = FakeReceiverConfig {
+            command_latency_ms: 9_000,
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        rig.until_state(ConnState::Connecting).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        rig.fake.drop_connection();
+        rig.until_state(ConnState::Lost).await;
+        rig.until_state(ConnState::Connecting).await;
+
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        rig.load(0, true).await;
+        rig.until_state(ConnState::Loading).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        rig.fake.configure(|c| c.refuse_connect = true);
+        rig.fake.drop_connection();
+        lift_refusal_after(&rig.fake, Duration::from_secs(5));
+
+        rig.until_state(ConnState::Lost).await;
+        loop {
+            match rig.next().await {
+                DriverEvent::State(ConnState::Following) => break,
+                ended @ DriverEvent::Ended { .. } => {
+                    panic!("second outage must get its own grace window: {ended:?}")
+                }
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
