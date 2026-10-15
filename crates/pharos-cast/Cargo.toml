@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Test support: the MockTv CASTV2 server (needs a certificate generator).
+testing = ["dep:rcgen"]
+
 [dependencies]
 bytes.workspace = true
 metrics.workspace = true
@@ -20,6 +24,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time", "net", "io-util", "sync", "macros", "rt"] }
 tracing.workspace = true
+rcgen = { workspace = true, optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
@@ -29,6 +34,10 @@ pharos-test-metrics = { path = "../pharos-test-metrics" }
 proptest = "1"
 rcgen.workspace = true
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "mock_tv"
+required-features = ["testing"]
 
 [lints]
 workspace = true
