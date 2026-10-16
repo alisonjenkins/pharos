@@ -161,14 +161,25 @@ pub struct SessionPlayStateLite {
 /// `Id`). The kotlin `SessionInfoDto` REQUIRES the capability/timestamp/list
 /// fields below (no defaults) in addition to `UserId` — a native client crashes
 /// on any missing one (B78). Lists are emitted (possibly empty); DateTimes are
-/// real ISO-8601. The capability booleans are conservative defaults — a
-/// progress patch doesn't carry the session's registered capabilities (the
-/// registry does); false never over-advertises control pharos can't route.
+/// real ISO-8601. `SupportsRemoteControl` matches `GET /Sessions` (true): the
+/// patch replaces the list entry by `Id`, so a differing value would drop the
+/// session out of the remote-control picker.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionsBroadcastEntry {
     pub id: String,
     pub user_id: String,
+    /// Identity of the device behind the session. Progress patches omit these
+    /// (the client already holds them); a session the client has never seen,
+    /// such as a configured Cast TV, needs them to be listed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     pub playable_media_types: Vec<&'static str>,
     pub last_activity_date: String,
     pub last_playback_check_in: String,

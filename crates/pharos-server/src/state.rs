@@ -83,6 +83,23 @@ pub enum SocketBroadcast {
         command: String,
         arg: serde_json::Value,
     },
+    /// A command for ONE device's socket, addressed by its SyncPlay key
+    /// (`"{user}:{device}"`, the key `/socket` registers under). Unlike
+    /// [`Self::SessionCommand`], which every socket receives, only the named
+    /// device's socket sees this; used to stop a player whose seat moved to a TV.
+    DeviceCommand {
+        device_key: String,
+        controlling_user_id: String,
+        command: String,
+        arg: serde_json::Value,
+    },
+    /// A cast started or ended through a route. Not a wire message: the cast
+    /// directory refreshes its cache on it and then sends [`Self::SessionsChanged`].
+    CastChanged,
+    /// The set of sessions changed with no playback event behind it (a cast
+    /// started or ended). Each socket answers with a `Sessions` patch carrying
+    /// the virtual TV sessions its viewer may see, so the picker refreshes.
+    SessionsChanged,
     /// P10 — playback progress update fans out so jellyfin-web's
     /// "Currently Watching" sidebar + remote-control UIs reflect the
     /// active position without polling. Fired by
@@ -226,6 +243,12 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// 009 — what the cast service knows, so configured TVs can be listed as
+    /// sessions. `None` (the default) keeps `/Sessions` exactly as it was.
+    pub cast_directory: Option<Arc<dyn crate::cast_sessions::CastDirectory>>,
+    /// 009 — cast seats: TV reachability and the service handle. Inert unless
+    /// `[[cast.tvs]]` is configured.
+    pub cast: crate::cast_service::CastRuntime,
     /// T87 — the last segment-transcode options each PlaySessionId used,
     /// keyed by play session. Lets the SyncPlay seek handler PREWARM the
     /// target segments for every group member's exact variant (audio pick,
@@ -612,6 +635,8 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            cast_directory: None,
+            cast: crate::cast_service::CastRuntime::inert(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
@@ -643,6 +668,17 @@ impl AppState {
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
         }
+    }
+
+    /// Builder: attach the cast runtime (TV reachability + service slot).
+    pub fn with_cast_runtime(mut self, cast: crate::cast_service::CastRuntime) -> Self {
+        self.cast = cast;
+        self
+    }
+
+    /// TV name -> reachable at the last probe, for the virtual-session projection.
+    pub fn reachable_tvs(&self) -> crate::cast_service::Reachability {
+        self.cast.reachable_tvs()
     }
 
     /// Builder: attach the log-files directory the
@@ -708,6 +744,8 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            cast_directory: None,
+            cast: crate::cast_service::CastRuntime::inert(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
@@ -1071,6 +1109,22 @@ impl AppState {
     ) {
         let _ = self.bus.send(SocketBroadcast::SessionCommand {
             session_id: session_id.to_string(),
+            controlling_user_id: controlling_user_id.to_string(),
+            command: command.to_string(),
+            arg,
+        });
+    }
+
+    /// Send a `DeviceCommand` to the socket registered under `device_key`.
+    pub fn notify_device_command(
+        &self,
+        device_key: &str,
+        controlling_user_id: &str,
+        command: &str,
+        arg: serde_json::Value,
+    ) {
+        let _ = self.bus.send(SocketBroadcast::DeviceCommand {
+            device_key: device_key.to_string(),
             controlling_user_id: controlling_user_id.to_string(),
             command: command.to_string(),
             arg,

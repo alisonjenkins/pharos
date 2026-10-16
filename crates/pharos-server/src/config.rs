@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -38,6 +39,9 @@ pub struct Config {
     /// leaves the feature entirely off.
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// Cast-to-TV seats (009). Absent / no `[[cast.tvs]]` → the feature is inert.
+    #[serde(default)]
+    pub cast: CastConfig,
 }
 
 /// `[remote]` — URL-backed media sources (008).
@@ -780,6 +784,326 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+const DEFAULT_CAST_PORT: u16 = 8009;
+
+fn default_cast_reconnect_grace_secs() -> u64 {
+    20
+}
+
+fn default_cast_drift_threshold_ms() -> u64 {
+    1500
+}
+
+fn default_cast_correction_cooldown_ms() -> u64 {
+    5000
+}
+
+fn default_cast_tv_token_lifetime_secs() -> u64 {
+    crate::cast::DEFAULT_TV_TOKEN_LIFETIME.as_secs()
+}
+
+/// `[cast]` — Chromecast-style TV seats (009). Inert unless `[[cast.tvs]]` is
+/// configured. Validation runs at parse time; address resolution stays lazy.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(try_from = "RawCastConfig")]
+pub struct CastConfig {
+    /// Base URL the TV uses to reach pharos (`http://` on a LAN is fine).
+    /// Stored without a trailing slash. Required when any TV is configured.
+    pub server_url: Option<String>,
+    /// Lost → Ended bound for a seat whose TV stops answering.
+    pub reconnect_grace_secs: u64,
+    /// Dead-band before a drifting TV is corrected.
+    pub drift_threshold_ms: u64,
+    /// Hysteresis between corrections.
+    pub correction_cooldown_ms: u64,
+    /// How long a TV's access token lives; a running cast replaces it at half
+    /// that, so a cast is never cut off by expiry.
+    pub tv_token_lifetime_secs: u64,
+    pub tvs: Vec<ConfiguredTv>,
+}
+
+impl Default for CastConfig {
+    fn default() -> Self {
+        Self {
+            server_url: None,
+            reconnect_grace_secs: default_cast_reconnect_grace_secs(),
+            drift_threshold_ms: default_cast_drift_threshold_ms(),
+            correction_cooldown_ms: default_cast_correction_cooldown_ms(),
+            tv_token_lifetime_secs: default_cast_tv_token_lifetime_secs(),
+            tvs: Vec::new(),
+        }
+    }
+}
+
+impl CastConfig {
+    /// Case-insensitive lookup by the TV's configured name.
+    pub fn tv(&self, name: &str) -> Option<&ConfiguredTv> {
+        let wanted = name.to_lowercase();
+        self.tvs.iter().find(|t| t.name.to_lowercase() == wanted)
+    }
+}
+
+/// One `[[cast.tvs]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredTv {
+    /// Unique (case-insensitively), 1-64 characters.
+    pub name: String,
+    pub address: CastAddress,
+    /// User ids allowed to start a seat on this TV. Empty = all users.
+    pub allowed_users: Vec<String>,
+}
+
+/// A TV's control endpoint as written in config. Not resolved to IPs at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastAddress {
+    /// Hostname, IPv4 literal, or IPv6 literal without brackets.
+    pub host: String,
+    pub port: u16,
+}
+
+impl CastAddress {
+    /// Parse `host`, `host:port`, `[v6]` or `[v6]:port`; the port defaults to 8009.
+    fn parse(raw: &str) -> Result<Self, &'static str> {
+        if let Some(rest) = raw.strip_prefix('[') {
+            let (inner, after) = rest
+                .split_once(']')
+                .ok_or("missing ']' closing the IPv6 address")?;
+            if inner.parse::<Ipv6Addr>().is_err() {
+                return Err("the bracketed host is not an IPv6 address");
+            }
+            let port = match after {
+                "" => None,
+                p => Some(
+                    p.strip_prefix(':')
+                        .ok_or("unexpected text after ']' (expected ':port' or nothing)")?,
+                ),
+            };
+            return Ok(Self {
+                host: inner.to_string(),
+                port: parse_cast_port(port)?,
+            });
+        }
+        if raw.matches(':').count() > 1 {
+            return Err("an IPv6 address must be in brackets, e.g. [fe80::1]:8009");
+        }
+        let (host, port) = match raw.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (raw, None),
+        };
+        Ok(Self {
+            host: validate_cast_host(host)?.to_string(),
+            port: parse_cast_port(port)?,
+        })
+    }
+}
+
+impl std::fmt::Display for CastAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+fn parse_cast_port(port: Option<&str>) -> Result<u16, &'static str> {
+    match port {
+        None => Ok(DEFAULT_CAST_PORT),
+        Some(p) => p
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or("the port must be a number from 1 to 65535"),
+    }
+}
+
+fn validate_cast_host(host: &str) -> Result<&str, &'static str> {
+    if host.is_empty() {
+        return Err("the host is empty");
+    }
+    if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return match host.parse::<Ipv4Addr>() {
+            Ok(_) => Ok(host),
+            Err(_) => Err("not a valid IPv4 address"),
+        };
+    }
+    let labels_ok = host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    if labels_ok {
+        Ok(host)
+    } else {
+        Err("not a valid host name, IPv4 address or bracketed IPv6 address")
+    }
+}
+
+/// Strip trailing slashes and require a plain `http://` or `https://` URL with a host.
+fn normalise_cast_server_url(raw: &str) -> Result<String, CastConfigError> {
+    let trimmed = raw.trim_end_matches('/');
+    let authority = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next());
+    match authority {
+        Some(a) if !a.is_empty() && !a.chars().any(char::is_whitespace) => Ok(trimmed.to_string()),
+        _ => Err(CastConfigError::ServerUrl {
+            value: raw.to_string(),
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCastConfig {
+    #[serde(default)]
+    server_url: Option<String>,
+    #[serde(default = "default_cast_reconnect_grace_secs")]
+    reconnect_grace_secs: u64,
+    #[serde(default = "default_cast_drift_threshold_ms")]
+    drift_threshold_ms: u64,
+    #[serde(default = "default_cast_correction_cooldown_ms")]
+    correction_cooldown_ms: u64,
+    #[serde(default = "default_cast_tv_token_lifetime_secs")]
+    tv_token_lifetime_secs: u64,
+    #[serde(default)]
+    tvs: Vec<RawConfiguredTv>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConfiguredTv {
+    name: String,
+    address: String,
+    #[serde(default)]
+    allowed_users: Vec<String>,
+}
+
+/// Every way a `[cast]` block can be rejected. Each message names the entry
+/// or key and the offending value.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CastConfigError {
+    #[error("cast.tvs[{index}] name {name:?} must be 1-64 characters")]
+    TvNameLength { index: usize, name: String },
+    #[error("cast.tvs[{index}] name {name:?} duplicates {first:?} (names are unique, case-insensitively)")]
+    DuplicateTvName {
+        index: usize,
+        name: String,
+        first: String,
+    },
+    #[error("cast.tvs[{index}] {name:?} has address {address:?}: {reason}")]
+    TvAddress {
+        index: usize,
+        name: String,
+        address: String,
+        reason: &'static str,
+    },
+    #[error("cast.server_url is required because cast.tvs configures {names}; set it to a URL the TV can reach, e.g. \"http://pharos.lan:8096\"")]
+    ServerUrlMissing { names: String },
+    #[error("cast.server_url {value:?} must be an http:// or https:// URL with a host")]
+    ServerUrl { value: String },
+    #[error("cast.{key} {value} must be {rule}")]
+    Scalar {
+        key: &'static str,
+        value: u64,
+        rule: &'static str,
+    },
+}
+
+impl TryFrom<RawCastConfig> for CastConfig {
+    type Error = CastConfigError;
+
+    fn try_from(raw: RawCastConfig) -> Result<Self, Self::Error> {
+        if !(1..=600).contains(&raw.reconnect_grace_secs) {
+            return Err(CastConfigError::Scalar {
+                key: "reconnect_grace_secs",
+                value: raw.reconnect_grace_secs,
+                rule: "between 1 and 600",
+            });
+        }
+        if raw.drift_threshold_ms == 0 {
+            return Err(CastConfigError::Scalar {
+                key: "drift_threshold_ms",
+                value: raw.drift_threshold_ms,
+                rule: "greater than 0",
+            });
+        }
+        if raw.correction_cooldown_ms == 0 {
+            return Err(CastConfigError::Scalar {
+                key: "correction_cooldown_ms",
+                value: raw.correction_cooldown_ms,
+                rule: "greater than 0",
+            });
+        }
+        if !(2..=30 * 24 * 60 * 60).contains(&raw.tv_token_lifetime_secs) {
+            return Err(CastConfigError::Scalar {
+                key: "tv_token_lifetime_secs",
+                value: raw.tv_token_lifetime_secs,
+                rule: "between 2 and 2592000 (30 days)",
+            });
+        }
+        let server_url = raw
+            .server_url
+            .as_deref()
+            .map(normalise_cast_server_url)
+            .transpose()?;
+
+        let mut tvs: Vec<ConfiguredTv> = Vec::with_capacity(raw.tvs.len());
+        for (index, tv) in raw.tvs.into_iter().enumerate() {
+            let len = tv.name.chars().count();
+            if !(1..=64).contains(&len) {
+                return Err(CastConfigError::TvNameLength {
+                    index,
+                    name: tv.name,
+                });
+            }
+            let lowered = tv.name.to_lowercase();
+            if let Some(first) = tvs.iter().find(|t| t.name.to_lowercase() == lowered) {
+                return Err(CastConfigError::DuplicateTvName {
+                    index,
+                    name: tv.name,
+                    first: first.name.clone(),
+                });
+            }
+            let address =
+                CastAddress::parse(&tv.address).map_err(|reason| CastConfigError::TvAddress {
+                    index,
+                    name: tv.name.clone(),
+                    address: tv.address.clone(),
+                    reason,
+                })?;
+            tvs.push(ConfiguredTv {
+                name: tv.name,
+                address,
+                allowed_users: tv.allowed_users,
+            });
+        }
+
+        if server_url.is_none() && !tvs.is_empty() {
+            let names = tvs
+                .iter()
+                .map(|t| format!("{:?}", t.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(CastConfigError::ServerUrlMissing { names });
+        }
+
+        Ok(Self {
+            server_url,
+            reconnect_grace_secs: raw.reconnect_grace_secs,
+            drift_threshold_ms: raw.drift_threshold_ms,
+            correction_cooldown_ms: raw.correction_cooldown_ms,
+            tv_token_lifetime_secs: raw.tv_token_lifetime_secs,
+            tvs,
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read {path}: {source}")]
@@ -1271,5 +1595,318 @@ mod dsn_redaction_tests {
         ] {
             assert_eq!(redact_dsn(url), url, "should be untouched: {url}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cast_config_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    const CAST_BASE: &str = r#"
+        [server]
+        bind = "0.0.0.0:8096"
+        name = "pharos-test"
+
+        [obs]
+        log_level = "debug"
+
+        [media]
+        roots = ["/srv/media"]
+
+        [database]
+        url = "sqlite::memory:"
+    "#;
+
+    fn with_cast(cast: &str) -> String {
+        format!("{CAST_BASE}\n[cast]\n{cast}")
+    }
+
+    fn cast_error(cast: &str) -> String {
+        match Config::from_toml_str(&with_cast(cast)) {
+            Ok(c) => panic!("expected a startup error, got {:?}", c.cast),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn full_cast_block_parses_and_normalises_server_url() {
+        let c = Config::from_toml_str(&with_cast(
+            r#"
+            server_url = "http://pharos.lan:8096/"
+            reconnect_grace_secs = 30
+            drift_threshold_ms = 1200
+            correction_cooldown_ms = 4000
+
+            [[cast.tvs]]
+            name = "Living room"
+            address = "192.168.1.60:8009"
+            allowed_users = ["u1", "u2"]
+
+            [[cast.tvs]]
+            name = "Bedroom"
+            address = "bedroom.lan:9000"
+            "#,
+        ))
+        .unwrap();
+        assert_eq!(
+            c.cast.server_url.as_deref(),
+            Some("http://pharos.lan:8096"),
+            "trailing slash must be stripped"
+        );
+        assert_eq!(c.cast.reconnect_grace_secs, 30);
+        assert_eq!(c.cast.drift_threshold_ms, 1200);
+        assert_eq!(c.cast.correction_cooldown_ms, 4000);
+        assert_eq!(c.cast.tvs.len(), 2);
+        let living = &c.cast.tvs[0];
+        assert_eq!(living.name, "Living room");
+        assert_eq!(
+            living.address,
+            CastAddress {
+                host: "192.168.1.60".into(),
+                port: 8009
+            }
+        );
+        assert_eq!(
+            living.allowed_users,
+            vec!["u1".to_string(), "u2".to_string()]
+        );
+        assert_eq!(
+            c.cast.tvs[1].address,
+            CastAddress {
+                host: "bedroom.lan".into(),
+                port: 9000
+            }
+        );
+        assert!(c.cast.tvs[1].allowed_users.is_empty(), "empty = all users");
+    }
+
+    #[test]
+    fn tv_lookup_is_case_insensitive() {
+        let c = Config::from_toml_str(&with_cast(
+            r#"
+            server_url = "http://pharos.lan:8096"
+
+            [[cast.tvs]]
+            name = "Living room"
+            address = "192.168.1.60"
+            "#,
+        ))
+        .unwrap();
+        assert_eq!(
+            c.cast.tv("LIVING ROOM").map(|t| t.name.as_str()),
+            Some("Living room")
+        );
+        assert!(c.cast.tv("Kitchen").is_none());
+    }
+
+    #[test]
+    fn port_defaults_to_8009() {
+        let c = Config::from_toml_str(&with_cast(
+            r#"
+            server_url = "http://pharos.lan:8096"
+            [[cast.tvs]]
+            name = "TV"
+            address = "192.168.1.60"
+            "#,
+        ))
+        .unwrap();
+        assert_eq!(c.cast.tvs[0].address.port, 8009);
+        assert_eq!(c.cast.tvs[0].address.to_string(), "192.168.1.60:8009");
+    }
+
+    #[test]
+    fn ipv6_and_hostname_addresses_parse() {
+        let c = Config::from_toml_str(&with_cast(
+            r#"
+            server_url = "https://pharos.lan"
+            [[cast.tvs]]
+            name = "V6"
+            address = "[fe80::1]:8009"
+            [[cast.tvs]]
+            name = "V6 default port"
+            address = "[fe80::2]"
+            [[cast.tvs]]
+            name = "Host"
+            address = "tv.lan"
+            "#,
+        ))
+        .unwrap();
+        assert_eq!(
+            c.cast.tvs[0].address,
+            CastAddress {
+                host: "fe80::1".into(),
+                port: 8009
+            }
+        );
+        assert_eq!(c.cast.tvs[0].address.to_string(), "[fe80::1]:8009");
+        assert_eq!(c.cast.tvs[1].address.port, 8009);
+        assert_eq!(c.cast.tvs[2].address.host, "tv.lan");
+    }
+
+    #[test]
+    fn no_cast_section_is_inert_with_defaults() {
+        let c = Config::from_toml_str(CAST_BASE).unwrap();
+        assert!(c.cast.tvs.is_empty());
+        assert!(c.cast.server_url.is_none());
+        assert_eq!(c.cast, CastConfig::default());
+        assert_eq!(c.cast.reconnect_grace_secs, 20);
+        assert_eq!(c.cast.drift_threshold_ms, 1500);
+        assert_eq!(c.cast.correction_cooldown_ms, 5000);
+        assert!(c.cast.tv("anything").is_none());
+    }
+
+    #[test]
+    fn cast_section_without_tvs_needs_no_server_url() {
+        let c = Config::from_toml_str(&with_cast("reconnect_grace_secs = 60\n")).unwrap();
+        assert!(c.cast.tvs.is_empty());
+        assert_eq!(c.cast.reconnect_grace_secs, 60);
+    }
+
+    #[test]
+    fn duplicate_tv_names_are_rejected_case_insensitively() {
+        let err = cast_error(
+            r#"
+            server_url = "http://pharos.lan:8096"
+            [[cast.tvs]]
+            name = "Den"
+            address = "192.168.1.60"
+            [[cast.tvs]]
+            name = "den"
+            address = "192.168.1.61"
+            "#,
+        );
+        assert!(err.contains("\"den\""), "names the duplicate: {err}");
+        assert!(err.contains("\"Den\""), "names the first entry: {err}");
+    }
+
+    #[test]
+    fn empty_tv_name_is_rejected_naming_the_entry() {
+        let err = cast_error(
+            r#"
+            server_url = "http://pharos.lan:8096"
+            [[cast.tvs]]
+            name = ""
+            address = "192.168.1.60"
+            "#,
+        );
+        assert!(err.contains("cast.tvs[0]"), "names the entry: {err}");
+        assert!(err.contains("\"\""), "names the value: {err}");
+    }
+
+    #[test]
+    fn over_long_tv_name_is_rejected_naming_the_value() {
+        let long = "x".repeat(65);
+        let err = cast_error(&format!(
+            r#"
+            server_url = "http://pharos.lan:8096"
+            [[cast.tvs]]
+            name = "{long}"
+            address = "192.168.1.60"
+            "#
+        ));
+        assert!(err.contains("cast.tvs[0]"), "names the entry: {err}");
+        assert!(err.contains(&long), "names the value: {err}");
+    }
+
+    #[test]
+    fn bad_tv_addresses_are_rejected_naming_the_value() {
+        for bad in [
+            "192.168.1.300:8009",
+            "tv.lan:0",
+            "tv.lan:70000",
+            "tv.lan:",
+            "[fe80::1:8009",
+            "fe80::1:8009",
+            "bad host.lan",
+            "",
+        ] {
+            let err = cast_error(&format!(
+                r#"
+                server_url = "http://pharos.lan:8096"
+                [[cast.tvs]]
+                name = "Living room"
+                address = "{bad}"
+                "#
+            ));
+            assert!(
+                err.contains("Living room"),
+                "names the entry for {bad:?}: {err}"
+            );
+            assert!(err.contains(bad), "names the value {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn tvs_without_server_url_are_rejected_naming_the_tvs() {
+        let err = cast_error(
+            r#"
+            [[cast.tvs]]
+            name = "Living room"
+            address = "192.168.1.60"
+            "#,
+        );
+        assert!(err.contains("server_url"), "names the key: {err}");
+        assert!(err.contains("Living room"), "names the tv: {err}");
+    }
+
+    #[test]
+    fn server_url_must_be_an_http_or_https_url_with_a_host() {
+        for bad in [
+            "ftp://pharos.lan:8096",
+            "http://",
+            "pharos.lan:8096",
+            "http://pharos lan",
+        ] {
+            let err = cast_error(&format!("server_url = \"{bad}\"\n"));
+            assert!(err.contains(bad), "names the value {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn zero_drift_threshold_is_rejected() {
+        let err = cast_error("drift_threshold_ms = 0\n");
+        assert!(err.contains("drift_threshold_ms"), "names the key: {err}");
+        assert!(err.contains('0'), "names the value: {err}");
+    }
+
+    #[test]
+    fn zero_correction_cooldown_is_rejected() {
+        let err = cast_error("correction_cooldown_ms = 0\n");
+        assert!(
+            err.contains("correction_cooldown_ms"),
+            "names the key: {err}"
+        );
+    }
+
+    #[test]
+    fn tv_token_lifetime_too_short_to_renew_is_rejected_naming_the_value() {
+        let err = cast_error("tv_token_lifetime_secs = 1\n");
+        assert!(
+            err.contains("tv_token_lifetime_secs"),
+            "names the key: {err}"
+        );
+        assert!(err.contains('1'), "names the value: {err}");
+        assert_eq!(
+            Config::from_toml_str(&with_cast("tv_token_lifetime_secs = 4\n"))
+                .map(|c| c.cast.tv_token_lifetime_secs)
+                .ok(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reconnect_grace_out_of_range_is_rejected_naming_the_value() {
+        for bad in [0u64, 601] {
+            let err = cast_error(&format!("reconnect_grace_secs = {bad}\n"));
+            assert!(err.contains("reconnect_grace_secs"), "names the key: {err}");
+            assert!(
+                err.contains(&bad.to_string()),
+                "names the value {bad}: {err}"
+            );
+        }
+        let ok = Config::from_toml_str(&with_cast("reconnect_grace_secs = 600\n")).unwrap();
+        assert_eq!(ok.cast.reconnect_grace_secs, 600);
     }
 }

@@ -254,6 +254,10 @@ async fn handle_connection<S>(
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
     let started = Instant::now();
+    let viewer = crate::cast_sessions::ViewerInfo {
+        user_id: bound_user_id.clone(),
+        is_admin,
+    };
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
     // Register this socket so HTTP SyncPlay handlers can reach it by deviceId.
@@ -395,10 +399,13 @@ async fn handle_connection<S>(
                     &state, &bound_user_id, is_admin,
                 ).await {
                     Ok(list) => {
-                        let out = Outbound::new(
+                        let mut out = Outbound::new(
                             "Sessions",
                             serde_json::to_value(&list).unwrap_or_else(|_| serde_json::json!([])),
                         );
+                        if let Some(directory) = &state.cast_directory {
+                            append_virtual_sessions(&mut out, directory.as_ref(), &viewer);
+                        }
                         if send_outbound(&mut session, &out).await.is_err() {
                             break 'pump SocketCloseCause::SendFailed;
                         }
@@ -467,7 +474,13 @@ async fn handle_connection<S>(
                         continue;
                     }
                 }
-                if let Some(out) = translate_broadcast(b) {
+                if is_for_another_device(&b, &device_key) {
+                    continue;
+                }
+                if let Some(mut out) = translate_broadcast(b) {
+                    if let Some(directory) = &state.cast_directory {
+                        append_virtual_sessions(&mut out, directory.as_ref(), &viewer);
+                    }
                     if send_outbound(&mut session, &out).await.is_err() {
                         break 'pump SocketCloseCause::SendFailed;
                     }
@@ -670,6 +683,10 @@ async fn handle_connection<S>(
     let hub2 = hub.clone();
     let dev2 = device_key.clone();
     let sinks2 = sinks.clone();
+    let state2 = state.clone();
+    let owner = uuid::Uuid::parse_str(&bound_user_id)
+        .ok()
+        .map(pharos_core::UserId);
     actix_web::rt::spawn(async move {
         tokio::time::sleep(RECONNECT_GRACE).await;
         // B26 — re-check at fire time: a drain that began during the grace
@@ -677,12 +694,41 @@ async fn handle_connection<S>(
         if crate::state::is_shutting_down() {
             return;
         }
-        if let Some(group) = hub2.remove_if_current_gen(&dev2, conn_gen) {
-            let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
-            sinks2.remove(member_id, conn_gen);
-        }
+        expire_membership(&state2, &hub2, &sinks2, &dev2, conn_gen, member_id, owner).await;
     });
     let _ = session.clone().close(None).await;
+}
+
+/// The reconnect grace ran out with no newer socket: remove the member. A
+/// member whose seat is cast to a TV takes the cast with it (`owner_left`),
+/// since the seat must not outlive the member it stands for.
+pub async fn expire_membership(
+    state: &AppState,
+    hub: &SessionHub,
+    sinks: &MemberSinks,
+    device_key: &str,
+    conn_gen: u64,
+    member_id: MemberId,
+    user: Option<pharos_core::UserId>,
+) {
+    let Some(group) = hub.remove_if_current_gen(device_key, conn_gen) else {
+        return;
+    };
+    if let (Some(service), Some(user)) = (state.cast.service(), user) {
+        let casting = service
+            .snapshot()
+            .await
+            .iter()
+            .any(|c| c.owner == user && c.owner_member == member_id);
+        if casting {
+            service
+                .stop(user, pharos_cast::events::CastReason::OwnerLeft)
+                .await;
+            let _ = state.bus.send(SocketBroadcast::CastChanged);
+        }
+    }
+    let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+    sinks.remove(member_id, conn_gen);
 }
 
 async fn handle_inbound(
@@ -1007,6 +1053,35 @@ async fn send_outbound(session: &mut Session, msg: &Outbound) -> Result<(), acti
 /// Translate a server-side `SocketBroadcast` into a Jellyfin-shaped
 /// `Outbound`. T40 phase 2 — keeps the wire format identical to what
 /// jellyfin-web expects when it subscribes via Sessions/LibraryChanged.
+/// Add the TVs `viewer` may see to a `Sessions` patch, built from the same
+/// projection `GET /Sessions` uses so both surfaces carry identical values.
+fn append_virtual_sessions(
+    out: &mut Outbound,
+    directory: &dyn crate::cast_sessions::CastDirectory,
+    viewer: &crate::cast_sessions::ViewerInfo,
+) {
+    if out.message_type != "Sessions" {
+        return;
+    }
+    let Some(entries) = out.data.as_array_mut() else {
+        return;
+    };
+    for tv in crate::cast_sessions::visible_sessions(directory, viewer) {
+        match serde_json::to_value(SessionsBroadcastEntry::from(&tv)) {
+            Ok(v) => entries.push(v),
+            Err(e) => {
+                tracing::warn!(tv = %tv.device_name, error = %e, "cast: virtual session not serialisable; omitted from Sessions patch");
+            }
+        }
+    }
+}
+
+/// A `DeviceCommand` addressed to some other device's socket; every other
+/// broadcast is for everyone.
+fn is_for_another_device(b: &SocketBroadcast, device_key: &str) -> bool {
+    matches!(b, SocketBroadcast::DeviceCommand { device_key: to, .. } if to != device_key)
+}
+
 pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     match b {
         SocketBroadcast::LibraryChanged { added, removed } => {
@@ -1051,6 +1126,23 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             command,
             arg,
         } => translate_session_command(session_id, controlling_user_id, command, arg),
+        SocketBroadcast::DeviceCommand {
+            device_key,
+            controlling_user_id,
+            command,
+            arg,
+        } => {
+            let session_id = device_key
+                .split_once(':')
+                .map_or(device_key.as_str(), |(_, device)| device)
+                .to_string();
+            translate_session_command(session_id, controlling_user_id, command, arg)
+        }
+        SocketBroadcast::CastChanged => None,
+        SocketBroadcast::SessionsChanged => Some(Outbound::new(
+            "Sessions",
+            serde_json::Value::Array(Vec::new()),
+        )),
         // P10 — minimal Sessions payload carrying just the session
         // that changed. jellyfin-web's Currently Watching sidebar +
         // remote-control screens listen for this MessageType and
@@ -1078,12 +1170,16 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
             let entry = SessionsBroadcastEntry {
                 id: session_id,
                 user_id,
+                user_name: None,
+                device_id: None,
+                device_name: None,
+                client: None,
                 playable_media_types: Vec::new(),
                 last_activity_date: now_iso.clone(),
                 last_playback_check_in: now_iso,
                 is_active: true,
                 supports_media_control: false,
-                supports_remote_control: false,
+                supports_remote_control: true,
                 has_custom_device_name: false,
                 supported_commands: Vec::new(),
                 now_playing_item,
@@ -1558,6 +1654,35 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert!(v["Data"][0]["NowPlayingItem"].is_null());
+    }
+
+    #[test]
+    fn a_device_command_is_a_playstate_message_that_only_its_device_accepts() {
+        let b = SocketBroadcast::DeviceCommand {
+            device_key: "u1:dev-a".into(),
+            controlling_user_id: "u1".into(),
+            command: "Stop".into(),
+            arg: serde_json::json!({}),
+        };
+        assert!(!is_for_another_device(&b, "u1:dev-a"));
+        assert!(is_for_another_device(&b, "u1:dev-b"));
+        assert!(is_for_another_device(&b, "u2:dev-a"));
+        let out = translate_broadcast(b).unwrap();
+        assert_eq!(out.message_type, "PlayState");
+        assert_eq!(out.data["Command"], "Stop");
+        assert_eq!(out.data["SessionId"], "dev-a");
+        assert!(!is_for_another_device(
+            &SocketBroadcast::SessionsChanged,
+            "u1:dev-a"
+        ));
+    }
+
+    #[test]
+    fn sessions_changed_is_an_empty_sessions_patch_and_cast_changed_is_internal() {
+        let out = translate_broadcast(SocketBroadcast::SessionsChanged).unwrap();
+        assert_eq!(out.message_type, "Sessions");
+        assert_eq!(out.data, serde_json::json!([]));
+        assert!(translate_broadcast(SocketBroadcast::CastChanged).is_none());
     }
 
     #[test]
