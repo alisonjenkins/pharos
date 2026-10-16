@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.4.0](https://github.com/alisonjenkins/pharos/compare/v0.3.0...v0.4.0) (2026-10-16)
+
+
+### Features
+
+* **config:** add server.transcode_stage_timing (basic|detailed|off) ([aa5b660](https://github.com/alisonjenkins/pharos/commit/aa5b6606f02a78162000d5b882e04f890aff9ce5))
+* **config:** add server.transcode_vaapi_gpu_resident (default false) ([4a09a72](https://github.com/alisonjenkins/pharos/commit/4a09a728faedbc08db039e3fbe5093542c17111f))
+* **core:** MediaStore::put_batch with a per-item default ([36e9da4](https://github.com/alisonjenkins/pharos/commit/36e9da4e9b3c827c2784b58e2b345cd6691d7dee))
+* **sync:** SessionHub::resolve_wait wakes on socket registration ([470ef18](https://github.com/alisonjenkins/pharos/commit/470ef18855aced16489786f94575b9fcb73bab2d))
+* **transcode:** build a GPU-resident VAAPI argv for eligible jobs ([c308ab7](https://github.com/alisonjenkins/pharos/commit/c308ab7e8db0c63e86ccbee17c69828279756482))
+* **transcode:** classify the source as plain 8-bit SDR for the scheduler ([25c13ec](https://github.com/alisonjenkins/pharos/commit/25c13ece66f6a3caaaf5f2d5e2ca8377cec8d796))
+* **transcode:** dispatch resident VAAPI jobs with a runtime fallback ([2d0daa2](https://github.com/alisonjenkins/pharos/commit/2d0daa2f3c70f53880e243070546e8cd25faf19c))
+* **transcode:** export a worker's stage timing from the scheduler ([c75e5a4](https://github.com/alisonjenkins/pharos/commit/c75e5a4b99d62f7e555177d8946c4e824201e2e1))
+* **transcode:** inspect a source for rotation and field order ([1a124b4](https://github.com/alisonjenkins/pharos/commit/1a124b40cfa2795f56995fb9a96532a54be289bf))
+* **transcode:** label stage timing with the pipeline that ran ([2ebf962](https://github.com/alisonjenkins/pharos/commit/2ebf9622c1765390790c319349c8ac4eaf1cd30d))
+* **transcode:** parse ffmpeg progress and benchmark output into stage timings ([c67a84c](https://github.com/alisonjenkins/pharos/commit/c67a84c42837c461b1a4afc06ed07679010a0ac5))
+* **transcode:** worker measures spawn, first frame, total and ffmpeg benchmark ([e5347a9](https://github.com/alisonjenkins/pharos/commit/e5347a9c6d763b713f4bd00c7fd99fcc4f2dccec))
+
+
+### Bug Fixes
+
+* **chart:** reject an unknown transcodeStageTiming at template time ([2432cad](https://github.com/alisonjenkins/pharos/commit/2432cad7987b741ffdb3c8b462872e79957b850d))
+* **deps:** bump rustls and quinn-proto past RUSTSEC-2026-0338..0349 ([2d2fb7f](https://github.com/alisonjenkins/pharos/commit/2d2fb7f87ae3e9ed1a41eaf0b5a5741d6ce12a93))
+* **obs:** histogram buckets for the stage timing metrics ([788eea0](https://github.com/alisonjenkins/pharos/commit/788eea0564744d24b20ac337ae34778823fdc503))
+* **pharos-scanner:** add the entity-store bounds the watcher's scan calls need ([224591c](https://github.com/alisonjenkins/pharos/commit/224591c69da7c8ee0858e0f52acda93d6d1d0621))
+* **pharos-server:** build person_image_backfill tests under the postgres feature ([e4235fa](https://github.com/alisonjenkins/pharos/commit/e4235fa64e6c5cb9a2af7d38811d1927e23430ca))
+* **scanner:** do not write a buffered probe of a file that has since changed ([64e88f9](https://github.com/alisonjenkins/pharos/commit/64e88f94d9bf334ba8542826ee34b152db7faab9))
+* **scanner:** finish the rows of a batch that landed when one is rejected ([606b743](https://github.com/alisonjenkins/pharos/commit/606b743119f30d82342d908b97fa0c30353b5000))
+* **store-sqlx:** write put_batch rows in id order ([e13b5f2](https://github.com/alisonjenkins/pharos/commit/e13b5f2bcaaaa6eaa8814470b2edbe374e6d59a7))
+* **transcode:** count bench lines glued onto a stats line ([43af184](https://github.com/alisonjenkins/pharos/commit/43af184a4fa92dbd6143c0609542ad808dec868a))
+* **transcode:** keep shared-init fMP4 renditions on the hybrid pipeline ([6840519](https://github.com/alisonjenkins/pharos/commit/68405196e26232fd8be0d36b67fbc5bebb82a3b6))
+* **transcode:** no benchmark flags on live jobs, and bound the stderr drain ([56c2198](https://github.com/alisonjenkins/pharos/commit/56c21982868e38c81e93c413c9de4e7e067b0f4a))
+* **transcode:** read an older ffmpeg's rotate tag in the source inspection ([3a422cf](https://github.com/alisonjenkins/pharos/commit/3a422cf8a641552a647e646d56b356dd024731de))
+* **transcode:** remember a failed resident run and retry only its own faults ([c23108a](https://github.com/alisonjenkins/pharos/commit/c23108acfb93364304223ada02166db731afb52c))
+* **transcode:** single-flight, expire and bound the source inspection memo ([b68d1be](https://github.com/alisonjenkins/pharos/commit/b68d1bee97c8989650e686f3ba6f4d1f504683cb))
+* **transcode:** stop the first-frame poll on audio output and ignore a stale sidecar ([a4f528b](https://github.com/alisonjenkins/pharos/commit/a4f528b6f6bf4c48393dd79876eab7f7cf7f6898))
+
+
+### Performance Improvements
+
+* **scanner:** write probed items with put_batch ([61fcdbe](https://github.com/alisonjenkins/pharos/commit/61fcdbe9f8049b41f247e8c90b84cb398838c4d0))
+* **store-postgres:** PostgresStore::put_batch in one transaction ([7aa741a](https://github.com/alisonjenkins/pharos/commit/7aa741a79ec235f47c6964cc950ae86ddc3cc19a))
+* **store-sqlx:** route AnyStore::put_batch to the backend and time it ([8a5e1cf](https://github.com/alisonjenkins/pharos/commit/8a5e1cfa8a15b30488ecc622422a9620181cb3c7))
+* **store-sqlx:** SqliteStore::put_batch in one transaction ([36bb1a2](https://github.com/alisonjenkins/pharos/commit/36bb1a2fd745c6be24b60224f225e6c56c3f62c9))
+* **syncplay:** wake resolve_with_retry on socket registration ([da21309](https://github.com/alisonjenkins/pharos/commit/da213092536fae42f7960eb7ef0b9bf4b0fc526e))
+
 ## [0.3.0](https://github.com/alisonjenkins/pharos/compare/v0.2.0...v0.3.0) (2026-10-12)
 
 
