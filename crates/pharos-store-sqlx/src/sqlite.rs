@@ -25,7 +25,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     original_language, art_version, \
     book_format, book_page_count, book_author, book_publisher, book_series, \
-    book_series_index, book_isbn, alternate_sources_json";
+    book_series_index, book_isbn, alternate_sources_json, video_3d_format";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -2986,6 +2986,7 @@ struct MediaRow {
     book_series_index: Option<i64>,
     book_isbn: Option<String>,
     alternate_sources_json: Option<String>,
+    video_3d_format: Option<String>,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3166,7 +3167,10 @@ impl MediaRow {
             alternate_sources: crate::alternate_source_json::decode(
                 self.alternate_sources_json.as_deref(),
             ),
-            video_3d_format: None,
+            video_3d_format: self
+                .video_3d_format
+                .as_deref()
+                .and_then(pharos_core::Video3DFormat::from_wire_name),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

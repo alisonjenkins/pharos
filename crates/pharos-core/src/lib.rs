@@ -2813,8 +2813,8 @@ pub struct MediaFilters {
     /// `IsHD` — `Some(true)` keeps only `1280 <= width < 3840`; `Some(false)`
     /// keeps only items whose width is present and outside that band.
     pub is_hd: Option<bool>,
-    /// `Is3D` — no detection yet, so `Some(true)` matches nothing and
-    /// `Some(false)` matches everything (parity with the in-memory stub).
+    /// `Is3D` — `Some(true)` keeps items whose primary file or any grouped
+    /// edition is 3D; `Some(false)` keeps only items with no 3D version.
     pub is_3d: Option<bool>,
     /// `MinWidth` — keep only items whose `width >= n`.
     pub min_width: Option<u32>,
