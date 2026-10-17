@@ -2330,7 +2330,11 @@ pub struct ScanState {
 // 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
 // Re-probe so those rows drop the mux date; the metadata backfill then fills
 // the real year from the provider it had already matched correctly.
-pub const PROBE_SCHEMA_VERSION: i64 = 6;
+// v7: `video_3d_format` and 3D edition grouping. A skipped (unchanged) primary
+// never reaches `probe_with_alternates`, so without a re-probe an existing 3D
+// rip is demoted to an alternate of its 2D title yet never attached to it, and
+// a lone 3D file keeps `has_3d = 0`.
+pub const PROBE_SCHEMA_VERSION: i64 = 7;
 
 /// 005-kindle-conversion — bump when the BOOK extraction changes in a way that
 /// makes already-indexed book rows stale.
