@@ -3166,6 +3166,7 @@ impl MediaRow {
             alternate_sources: crate::alternate_source_json::decode(
                 self.alternate_sources_json.as_deref(),
             ),
+            video_3d_format: None,
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,
