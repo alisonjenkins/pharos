@@ -5,7 +5,7 @@ use futures_util::stream::StreamExt;
 use pharos_core::{
     AlternateMediaSource, ArtworkSource, CollectionStore, DomainError, DomainResult, Fingerprint,
     GenreStore, MediaId, MediaItem, MediaKind, MediaStore, MetadataRequest, MetadataResult,
-    PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo, StudioStore, TagStore,
+    PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo, StudioStore, TagStore, Video3DFormat,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1423,6 +1423,7 @@ impl<P: Prober> FsScanner<P> {
         alts: Vec<(String, PathBuf)>,
     ) -> Option<MediaItem> {
         let mut item = self.probe_one(primary).await?;
+        item.probe.video_3d_format = path_3d_format(&item.path);
         for (edition, alt_path) in alts {
             match self.prober.probe(&alt_path).await {
                 Ok(info) => {
@@ -1445,8 +1446,8 @@ impl<P: Prober> FsScanner<P> {
                         bitrate_bps: probe.bitrate_bps,
                         size_bytes: probe.size_bytes,
                         duration_ms: probe.duration_ms,
-                        name: Some(edition),
-                        video_3d_format: None,
+                        name: Some(edition_display_name(&edition)),
+                        video_3d_format: parse_3d_edition(&edition),
                     });
                 }
                 Err(err) => {
@@ -1869,10 +1870,39 @@ pub(crate) const KNOWN_EDITIONS: &[&str] = &[
 pub fn split_edition_tag(stem: &str) -> Option<(&str, &str)> {
     let (left, right) = stem.rsplit_once(" - ")?;
     let edition = right.trim();
-    if !is_known_edition(edition) {
+    if !is_known_edition(edition) && parse_3d_edition(edition).is_none() {
         return None;
     }
     Some((left.trim(), edition))
+}
+
+/// Parse a 3D edition label such as `3D.HSBS` or `3D HSBS` (case-insensitive)
+/// into its packing. A bare `3D` carries no packing, so it is not recognised:
+/// the player cannot unpack a stereo file without knowing the layout.
+pub(crate) fn parse_3d_edition(label: &str) -> Option<Video3DFormat> {
+    let label = label.trim();
+    if !label.get(..2)?.eq_ignore_ascii_case("3d") {
+        return None;
+    }
+    let tag = label.get(2..)?.strip_prefix(['.', ' '])?;
+    Video3DFormat::from_short_tag(tag.trim())
+}
+
+/// `MediaSourceInfo.Name` for an edition label. 3D labels are normalised to
+/// `3D HSBS` so the version picker reads the same whichever separator the
+/// filename used; other editions keep the user's spelling.
+fn edition_display_name(edition: &str) -> String {
+    match parse_3d_edition(edition) {
+        Some(f) => format!("3D {}", f.short_tag()),
+        None => edition.to_string(),
+    }
+}
+
+/// 3D packing declared by a file's own name (`Film - 3D.HSBS.mkv`).
+fn path_3d_format(path: &Path) -> Option<Video3DFormat> {
+    let stem = path.file_stem()?.to_str()?;
+    let (_, edition) = split_edition_tag(stem)?;
+    parse_3d_edition(edition)
 }
 
 pub(crate) fn is_known_edition(s: &str) -> bool {
@@ -5398,6 +5428,94 @@ mod tests {
         assert_eq!(edition_id_slug("Director's Cut"), "director-s-cut");
         assert_eq!(edition_id_slug("IMAX"), "imax");
         assert_eq!(edition_id_slug("Extended Edition"), "extended-edition");
+    }
+
+    #[test]
+    fn parse_3d_edition_needs_a_packing_tag() {
+        assert_eq!(
+            parse_3d_edition("3D.HSBS"),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(
+            parse_3d_edition("3d ftab"),
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+        assert_eq!(parse_3d_edition("3D.MVC"), Some(Video3DFormat::Mvc));
+        // A bare "3D" says nothing about the layout.
+        assert_eq!(parse_3d_edition("3D"), None);
+        assert_eq!(parse_3d_edition("3D.XYZ"), None);
+        assert_eq!(parse_3d_edition("3DHSBS"), None);
+        assert_eq!(parse_3d_edition("Extended"), None);
+    }
+
+    #[test]
+    fn split_edition_tag_recognises_3d_labels() {
+        assert_eq!(
+            split_edition_tag("Avatar (2009) - 3D.HSBS"),
+            Some(("Avatar (2009)", "3D.HSBS"))
+        );
+        assert_eq!(
+            split_edition_tag("Foo S01E01 - 3D HTAB"),
+            Some(("Foo S01E01", "3D HTAB"))
+        );
+        assert_eq!(split_edition_tag("Avatar - 3D"), None);
+    }
+
+    #[test]
+    fn edition_display_name_normalises_3d_only() {
+        assert_eq!(edition_display_name("3d.hsbs"), "3D HSBS");
+        assert_eq!(edition_display_name("Director's Cut"), "Director's Cut");
+    }
+
+    #[tokio::test]
+    async fn a_3d_rip_groups_under_its_2d_movie_with_its_format() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Avatar (2009)/Avatar (2009).mkv").await;
+        touch(td.path(), "Avatar (2009)/Avatar (2009) - 3D.HSBS.mkv").await;
+        let items = FsScanner::new(FakeProber::default())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "3D rip must not be its own item");
+        let probe = &items[0].probe;
+        assert_eq!(probe.video_3d_format, None);
+        assert_eq!(probe.alternate_sources.len(), 1);
+        let alt = &probe.alternate_sources[0];
+        assert_eq!(alt.id, "3d-hsbs");
+        assert_eq!(alt.name.as_deref(), Some("3D HSBS"));
+        assert_eq!(alt.video_3d_format, Some(Video3DFormat::HalfSideBySide));
+    }
+
+    #[tokio::test]
+    async fn a_3d_episode_groups_under_its_2d_episode() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Foo/Season 01/Foo S01E01.mkv").await;
+        touch(td.path(), "Foo/Season 01/Foo S01E01 - 3D.FSBS.mkv").await;
+        let items = FsScanner::new(FakeProber::default())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].probe.alternate_sources[0].video_3d_format,
+            Some(Video3DFormat::FullSideBySide)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lone_3d_rip_is_its_own_item_flagged_3d() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Gravity (2013) - 3D.HTAB.mkv").await;
+        let items = FsScanner::new(FakeProber::default())
+            .scan(td.path())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert!(items[0].probe.alternate_sources.is_empty());
     }
 
     // ---- LIB-D7: resolver wired into scan_into ------------------------
