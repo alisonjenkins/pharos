@@ -25,9 +25,9 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
     production_locations_json, trailers_json, \
     synopsis, content_rating, network, release_date, original_language, \
     book_format, book_page_count, book_author, book_publisher, \
-    book_series, book_series_index, book_isbn, sort_name";
+    book_series, book_series_index, book_isbn, sort_name, alternate_sources_json";
 
-pub(crate) const PUT_COLUMN_COUNT: usize = 62;
+pub(crate) const PUT_COLUMN_COUNT: usize = 63;
 
 /// Rows per `INSERT`. Postgres caps bound parameters at 65535 per statement.
 pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 1000;
@@ -90,6 +90,7 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = EXCLUDED.path,
     book_series = EXCLUDED.book_series,
     book_series_index = EXCLUDED.book_series_index,
     book_isbn = EXCLUDED.book_isbn,
+    alternate_sources_json = EXCLUDED.alternate_sources_json,
     trailers_json = EXCLUDED.trailers_json,
     synopsis = EXCLUDED.synopsis,
     content_rating = EXCLUDED.content_rating,
@@ -226,7 +227,8 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
                 .map(|v| v as i64),
         )
         .bind(item.book.as_ref().and_then(|b| b.isbn.clone()))
-        .bind(pharos_core::sort_name(&item.title)))
+        .bind(pharos_core::sort_name(&item.title))
+        .bind(crate::alternate_source_json::encode(&p.alternate_sources)))
 }
 
 #[cfg(test)]

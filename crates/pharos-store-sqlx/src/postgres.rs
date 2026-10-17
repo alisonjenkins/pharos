@@ -41,7 +41,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     original_language, art_version, \
     book_format, book_page_count, book_author, book_publisher, book_series, \
-    book_series_index, book_isbn";
+    book_series_index, book_isbn, alternate_sources_json";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -3328,6 +3328,7 @@ struct MediaRow {
     book_series: Option<String>,
     book_series_index: Option<i64>,
     book_isbn: Option<String>,
+    alternate_sources_json: Option<String>,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3503,9 +3504,9 @@ impl MediaRow {
             network: self.network,
             release_date: self.release_date,
             chapters: crate::chapter_json::decode(self.chapters_json.as_deref()),
-            // P34 — alternate editions enrichment lives in the
-            // scanner; postgres rows today never carry them.
-            alternate_sources: Vec::new(),
+            alternate_sources: crate::alternate_source_json::decode(
+                self.alternate_sources_json.as_deref(),
+            ),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

@@ -64,6 +64,10 @@ pub use bg_lock::{BgLeadership, GroupOwnership};
 pub mod attachment_json;
 pub mod subtitle_track_json;
 
+// JSON adapter for MediaProbe.alternate_sources (edition files grouped
+// under one item). Same pattern as chapters.
+pub mod alternate_source_json;
+
 // JSON adapter for MediaProbe.chapters persistence (T54 phase 4
 // / T57 phase 2). Same pattern as subtitle_tracks.
 pub mod chapter_json;

@@ -13,7 +13,9 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo, SubtitleTrack};
+use pharos_core::{
+    AlternateMediaSource, MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo, SubtitleTrack,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -233,4 +235,40 @@ fn arbitrary_media_item_roundtrips_through_sqlite() {
             res
         })
         .unwrap();
+}
+
+#[test]
+fn alternate_sources_survive_a_reload() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let alt = AlternateMediaSource {
+            id: "directors-cut".into(),
+            path: "/m/Film (2020)/Film (2020) - Director's Cut.mkv".into(),
+            container: Some("matroska".into()),
+            video_codec: Some("hevc".into()),
+            audio_codec: Some("eac3".into()),
+            bitrate_bps: Some(8_000_000),
+            size_bytes: Some(4_000_000_000),
+            duration_ms: Some(7_500_000),
+            name: Some("Director's Cut".into()),
+        };
+        let item = MediaItem {
+            id: 7,
+            path: "/m/Film (2020)/Film (2020).mkv".into(),
+            title: "Film".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                alternate_sources: vec![alt.clone()],
+                ..MediaProbe::default()
+            },
+            ..MediaItem::default()
+        };
+        s.put(item).await.unwrap();
+        let back = s.get(7).await.unwrap();
+        assert_eq!(back.probe.alternate_sources, vec![alt]);
+    });
 }
