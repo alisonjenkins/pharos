@@ -8,6 +8,7 @@ pub mod parental_rank;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
+pub mod video_3d;
 
 pub use segment_grid::{
     frame_snapped_start, segment_range, segment_seek_bias, SegmentGrid, SegmentIndex,
@@ -20,6 +21,7 @@ pub use auth::{
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::SecretString;
+pub use video_3d::Video3DFormat;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -1901,6 +1903,10 @@ pub struct MediaProbe {
     /// PlaybackInfo single-source. A future scanner enrichment pass
     /// populates this from sibling-file convention or NFO metadata.
     pub alternate_sources: Vec<AlternateMediaSource>,
+    /// Stereoscopic packing of the primary file, when known (filename
+    /// `3D.<tag>` flag). `None` for ordinary 2D video.
+    #[serde(default)]
+    pub video_3d_format: Option<Video3DFormat>,
 }
 
 /// P34 — minimal MediaSource shape carried alongside the primary
@@ -1930,6 +1936,9 @@ pub struct AlternateMediaSource {
     /// `"Theatrical"`). Surfaces as `MediaSourceInfo.Name` so the
     /// jellyfin-web edition picker labels rows correctly.
     pub name: Option<String>,
+    /// Stereoscopic packing of this edition's file, when known.
+    #[serde(default)]
+    pub video_3d_format: Option<Video3DFormat>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe

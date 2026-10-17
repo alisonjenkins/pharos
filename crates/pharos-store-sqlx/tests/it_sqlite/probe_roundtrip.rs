@@ -138,6 +138,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 release_date,
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
+                video_3d_format: None,
             },
         )
 }
@@ -255,6 +256,7 @@ fn alternate_sources_survive_a_reload() {
             size_bytes: Some(4_000_000_000),
             duration_ms: Some(7_500_000),
             name: Some("Director's Cut".into()),
+            video_3d_format: None,
         };
         let item = MediaItem {
             id: 7,

@@ -51,6 +51,7 @@ mod tests {
             size_bytes: Some(12_345),
             duration_ms: Some(7_200_000),
             name: Some("Director's Cut".into()),
+            video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
         }];
         let s = encode(&alts).unwrap();
         assert_eq!(decode(Some(s.as_str())), alts);

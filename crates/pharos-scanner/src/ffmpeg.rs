@@ -549,6 +549,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             // or NFO metadata). FfmpegProber today only probes a
             // single file.
             alternate_sources: Vec::new(),
+            video_3d_format: None,
         },
     })
 }

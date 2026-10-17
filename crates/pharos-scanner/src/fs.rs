@@ -1446,6 +1446,7 @@ impl<P: Prober> FsScanner<P> {
                         size_bytes: probe.size_bytes,
                         duration_ms: probe.duration_ms,
                         name: Some(edition),
+                        video_3d_format: None,
                     });
                 }
                 Err(err) => {

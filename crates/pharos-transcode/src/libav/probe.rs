@@ -188,6 +188,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
                 .or_else(|| ftags.date.filter(|s| !s.trim().is_empty())),
             chapters,
             alternate_sources: Vec::new(),
+            video_3d_format: None,
         },
     })
 }
