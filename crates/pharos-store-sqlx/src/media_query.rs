@@ -608,11 +608,8 @@ fn push_residual_clauses(
         }
     }
     if let Some(want) = f.is_3d {
-        // No 3D detection: true → nothing, false → everything.
-        if want {
-            clauses.push("1 = 0".to_string());
-        }
-        // want == false adds no clause (everything passes).
+        // `has_3d` is true when the primary or any grouped edition is 3D.
+        clauses.push(format!("has_3d = {}", i32::from(want)));
     }
     if let Some(min) = f.min_width {
         params.push(Param::Int(i64::from(min)));
