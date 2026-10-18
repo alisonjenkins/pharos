@@ -524,6 +524,18 @@ fn push_exists_entity(
     ));
 }
 
+fn sql_4k_expr(params: &mut Vec<Param>, ph: &mut impl FnMut(usize) -> String) -> String {
+    params.push(Param::Int(3840));
+    let p_w = ph(params.len());
+    params.push(Param::Int(3840));
+    let p_w2 = ph(params.len());
+    params.push(Param::Int(2160));
+    let p_h = ph(params.len());
+    format!(
+        "((video_3d_format IS NULL OR video_3d_format NOT IN ('FullSideBySide', 'FullTopAndBottom')) AND width >= {p_w} OR (video_3d_format IN ('FullSideBySide', 'FullTopAndBottom') AND width >= {p_w2} AND height IS NOT NULL AND height >= {p_h}))"
+    )
+}
+
 /// LIB-B2 — emit the residual chip-filter clauses, mirroring the legacy
 /// in-memory `filter_and_sort` semantics. Every value binds as a parameter;
 /// the column names are fixed text. Width / resolution predicates treat a
@@ -583,36 +595,36 @@ fn push_residual_clauses(
 
     // Resolution / width — NULL width never matches a Some(want) (mirrors
     // `width.map(..) == Some(want)`), so each clause requires width NOT NULL.
+    // FR-006 / B229: Full-SBS (3840x1080) and Full-TAB (1920x2160) are 1080p
+    // per eye and not 4K unless both width >= 3840 and height >= 2160.
     if let Some(want) = f.is_4k {
-        params.push(Param::Int(3840));
-        let p = ph(params.len());
+        let is_4k_expr = sql_4k_expr(params, ph);
         if want {
-            clauses.push(format!("(width IS NOT NULL AND width >= {p})"));
+            clauses.push(format!("(width IS NOT NULL AND ({is_4k_expr}))"));
         } else {
-            clauses.push(format!("(width IS NOT NULL AND width < {p})"));
+            clauses.push(format!("(width IS NOT NULL AND NOT ({is_4k_expr}))"));
         }
     }
     if let Some(want) = f.is_hd {
         params.push(Param::Int(1280));
         let lo = ph(params.len());
-        params.push(Param::Int(3840));
-        let hi = ph(params.len());
+        let is_4k_expr = sql_4k_expr(params, ph);
         if want {
             clauses.push(format!(
-                "(width IS NOT NULL AND width >= {lo} AND width < {hi})"
+                "(width IS NOT NULL AND width >= {lo} AND NOT ({is_4k_expr}))"
             ));
         } else {
             clauses.push(format!(
-                "(width IS NOT NULL AND (width < {lo} OR width >= {hi}))"
+                "(width IS NOT NULL AND (width < {lo} OR ({is_4k_expr})))"
             ));
         }
     }
     if let Some(want) = f.is_3d {
-        // No 3D detection: true → nothing, false → everything.
         if want {
-            clauses.push("1 = 0".to_string());
+            clauses.push("video_3d_format IS NOT NULL".to_string());
+        } else {
+            clauses.push("video_3d_format IS NULL".to_string());
         }
-        // want == false adds no clause (everything passes).
     }
     if let Some(min) = f.min_width {
         params.push(Param::Int(i64::from(min)));

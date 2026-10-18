@@ -25,9 +25,9 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
     production_locations_json, trailers_json, \
     synopsis, content_rating, network, release_date, original_language, \
     book_format, book_page_count, book_author, book_publisher, \
-    book_series, book_series_index, book_isbn, sort_name";
+    book_series, book_series_index, book_isbn, sort_name, video_3d_format";
 
-pub(crate) const PUT_COLUMN_COUNT: usize = 62;
+pub(crate) const PUT_COLUMN_COUNT: usize = 63;
 
 /// Rows per `INSERT`. Postgres caps bound parameters at 65535 per statement.
 pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 1000;
@@ -95,6 +95,7 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = EXCLUDED.path,
     content_rating = EXCLUDED.content_rating,
     network = EXCLUDED.network,
     release_date = EXCLUDED.release_date,
+    video_3d_format = EXCLUDED.video_3d_format,
     created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)";
 
 /// `INSERT .. VALUES (..), (..) ON CONFLICT (id) DO UPDATE` for `rows` rows.
@@ -226,7 +227,8 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
                 .map(|v| v as i64),
         )
         .bind(item.book.as_ref().and_then(|b| b.isbn.clone()))
-        .bind(pharos_core::sort_name(&item.title)))
+        .bind(pharos_core::sort_name(&item.title))
+        .bind(p.video_3d_format.map(|f| f.as_str())))
 }
 
 #[cfg(test)]
