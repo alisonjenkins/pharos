@@ -38,7 +38,9 @@
 //! [`fs::split_edition_tag`]: crate::fs::split_edition_tag
 //! [`SeriesInfo`]: pharos_core::SeriesInfo
 
-use pharos_core::{DomainResult, MediaKind, MetadataProvider, MetadataRequest, MetadataResult};
+use pharos_core::{
+    DomainResult, MediaKind, MetadataProvider, MetadataRequest, MetadataResult, Video3DFormat,
+};
 
 use crate::fs;
 
@@ -107,14 +109,29 @@ impl FilenameProvider {
         let mut bare_year_val: Option<u32> = None;
         let mut title_end = words.len();
         let mut boundary_hit = false;
-        for (idx, word) in words.iter().enumerate() {
+        let mut idx = 0;
+        while idx < words.len() {
+            let Some(&word) = words.get(idx) else { break };
             if let Some(tag) = quality_source_tag(word) {
                 push_unique(&mut tags, tag);
                 if !boundary_hit {
                     title_end = idx;
                     boundary_hit = true;
                 }
+                idx = idx.saturating_add(1);
                 continue;
+            }
+            if let Some(&next_word) = words.get(idx.saturating_add(1)) {
+                let compound = format!("{word}-{next_word}");
+                if let Some(tag) = quality_source_tag(&compound) {
+                    push_unique(&mut tags, tag);
+                    if !boundary_hit {
+                        title_end = idx;
+                        boundary_hit = true;
+                    }
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
             }
             if let Some(y) = bare_year(word) {
                 // When a parenthesised year was found, ONLY the token equal
@@ -126,6 +143,7 @@ impl FilenameProvider {
                         title_end = idx;
                         boundary_hit = true;
                     }
+                    idx = idx.saturating_add(1);
                     continue;
                 }
                 // No parenthesised year: a leading year is part of the title;
@@ -135,6 +153,7 @@ impl FilenameProvider {
                     title_end = idx;
                     boundary_hit = true;
                 }
+                idx = idx.saturating_add(1);
                 continue;
             }
             // A standalone known-edition word (e.g. "Uncut", "Remastered"
@@ -144,8 +163,10 @@ impl FilenameProvider {
             if !boundary_hit && idx > 0 && is_edition_word(word) {
                 title_end = idx;
                 boundary_hit = true;
+                idx = idx.saturating_add(1);
                 continue;
             }
+            idx = idx.saturating_add(1);
         }
 
         let title = {
@@ -187,6 +208,175 @@ pub struct ParsedName {
     /// Quality/source tokens (`"1080p"`, `"BluRay"`, …), de-duplicated in
     /// first-seen order.
     pub tags: Vec<String>,
+}
+
+/// Convenience alias for [`FilenameProvider::parse_stem`].
+pub fn parse_filename(stem: &str, with_year: bool) -> ParsedName {
+    FilenameProvider::parse_stem(stem, with_year)
+}
+
+/// LIB-D6 / 018-3d-media: Parse 3D video layout and source tag from a filename or path.
+///
+/// Returns `(format, source)`:
+/// - `(Some(Video3DFormat::...), Some("filename"))` for recognized 3D layouts:
+///   `fsbs`, `f-sbs`, `full-sbs`, `full.sbs` -> `FullSideBySide`
+///   `hsbs`, `h-sbs`, `half-sbs`, `half.sbs`, or bare `sbs` (when not preceded by `full`/`f`) -> `HalfSideBySide`
+///   `ftab`, `f-tab`, `full-tab`, `full.tab`, `fou`, `f-ou`, `full-ou`, `full.ou` -> `FullTopAndBottom`
+///   `htab`, `h-tab`, `half-tab`, `half.tab`, `hou`, `h-ou`, `half-ou`, `half.ou`, or bare `tab` / `ou` (when not preceded by `full`/`f`) -> `HalfTopAndBottom`
+///   `mvc`, `3d.mvc`, `3d-mvc`, `bluray3d`, `bd3d` -> `Mvc`
+/// - `(None, Some("anaglyph"))` for anaglyph releases.
+/// - `(None, Some("unspecified_3d"))` for bare `3d` markers without a recognized layout.
+/// - `(None, None)` when no 3D indicators are present.
+pub fn parse_video_3d_format(input: &str) -> (Option<Video3DFormat>, Option<&'static str>) {
+    let tokens = tokenize_3d(input);
+    let mut detected_format = None;
+    let mut has_anaglyph = false;
+    let mut has_bare_3d = false;
+
+    for (i, t) in tokens.iter().enumerate() {
+        let prev = i
+            .checked_sub(1)
+            .and_then(|p| tokens.get(p).map(String::as_str));
+        let next = i
+            .checked_add(1)
+            .and_then(|n| tokens.get(n).map(String::as_str));
+
+        // 1. FullSideBySide: fsbs, f-sbs, full-sbs, full.sbs
+        if t == "fsbs"
+            || ((t == "full" || t == "f") && next == Some("sbs"))
+            || (t == "sbs" && (prev == Some("full") || prev == Some("f")))
+        {
+            detected_format = Some(Video3DFormat::FullSideBySide);
+            break;
+        }
+
+        // 2. HalfSideBySide: hsbs, h-sbs, half-sbs, half.sbs, or sbs (when not preceded by full/f)
+        if t == "hsbs"
+            || ((t == "half" || t == "h") && next == Some("sbs"))
+            || (t == "sbs" && prev != Some("full") && prev != Some("f"))
+        {
+            detected_format = Some(Video3DFormat::HalfSideBySide);
+            break;
+        }
+
+        // 3. FullTopAndBottom: ftab, f-tab, full-tab, full.tab, fou, f-ou, full-ou, full.ou
+        if t == "ftab"
+            || t == "fou"
+            || ((t == "full" || t == "f") && (next == Some("tab") || next == Some("ou")))
+            || ((t == "tab" || t == "ou") && (prev == Some("full") || prev == Some("f")))
+        {
+            detected_format = Some(Video3DFormat::FullTopAndBottom);
+            break;
+        }
+
+        // 4. HalfTopAndBottom: htab, h-tab, half-tab, half.tab, hou, h-ou, half-ou, half.ou, or tab / ou (when not preceded by full/f)
+        if t == "htab"
+            || t == "hou"
+            || ((t == "half" || t == "h") && (next == Some("tab") || next == Some("ou")))
+            || ((t == "tab" || t == "ou") && prev != Some("full") && prev != Some("f"))
+        {
+            detected_format = Some(Video3DFormat::HalfTopAndBottom);
+            break;
+        }
+
+        // 5. Mvc: mvc, 3d.mvc, 3d-mvc, bluray3d, bd3d
+        if t == "mvc"
+            || t == "bd3d"
+            || t == "bluray3d"
+            || (t == "3d" && next == Some("mvc"))
+            || (t == "mvc" && prev == Some("3d"))
+            || (t == "bd" && next == Some("3d"))
+            || (t == "bluray" && next == Some("3d"))
+        {
+            detected_format = Some(Video3DFormat::Mvc);
+            break;
+        }
+
+        if t == "anaglyph" {
+            has_anaglyph = true;
+        }
+
+        if t == "3d" {
+            has_bare_3d = true;
+        }
+    }
+
+    if let Some(format) = detected_format {
+        (Some(format), Some("filename"))
+    } else if has_anaglyph {
+        (None, Some("anaglyph"))
+    } else if has_bare_3d {
+        (None, Some("unspecified_3d"))
+    } else {
+        (None, None)
+    }
+}
+
+/// LIB-D6 / 018-3d-media: Check whether `input` explicitly specifies a half or full
+/// 3D layout qualifier (e.g. `FSBS`, `Full-SBS`, `HSBS`, `Half-SBS`, `FTAB`, `HTAB`,
+/// `FOU`, `HOU`), as opposed to a generic unadorned `SBS`, `TAB`, or `OU`.
+///
+/// Used by scanner probe reconciliation to refine generic 1920x1080 SBS/TAB detections.
+pub fn has_explicit_full_or_half_3d_token(input: &str) -> Option<Video3DFormat> {
+    let tokens = tokenize_3d(input);
+    for (i, t) in tokens.iter().enumerate() {
+        let prev = i
+            .checked_sub(1)
+            .and_then(|p| tokens.get(p).map(String::as_str));
+        let next = i
+            .checked_add(1)
+            .and_then(|n| tokens.get(n).map(String::as_str));
+
+        // Explicit full SBS:
+        if t == "fsbs"
+            || ((t == "full" || t == "f") && next == Some("sbs"))
+            || (t == "sbs" && (prev == Some("full") || prev == Some("f")))
+        {
+            return Some(Video3DFormat::FullSideBySide);
+        }
+
+        // Explicit half SBS:
+        if t == "hsbs"
+            || ((t == "half" || t == "h") && next == Some("sbs"))
+            || (t == "sbs" && (prev == Some("half") || prev == Some("h")))
+        {
+            return Some(Video3DFormat::HalfSideBySide);
+        }
+
+        // Explicit full TAB / OU:
+        if t == "ftab"
+            || t == "fou"
+            || ((t == "full" || t == "f") && (next == Some("tab") || next == Some("ou")))
+            || ((t == "tab" || t == "ou") && (prev == Some("full") || prev == Some("f")))
+        {
+            return Some(Video3DFormat::FullTopAndBottom);
+        }
+
+        // Explicit half TAB / OU:
+        if t == "htab"
+            || t == "hou"
+            || ((t == "half" || t == "h") && (next == Some("tab") || next == Some("ou")))
+            || ((t == "tab" || t == "ou") && (prev == Some("half") || prev == Some("h")))
+        {
+            return Some(Video3DFormat::HalfTopAndBottom);
+        }
+    }
+    None
+}
+
+/// Tokenize a filename or path into lowercase tokens on boundary characters.
+fn tokenize_3d(input: &str) -> Vec<String> {
+    let is_sep = |c: char| {
+        matches!(
+            c,
+            '.' | '_' | '-' | ' ' | '[' | ']' | '(' | ')' | '{' | '}' | '/' | '\\'
+        )
+    };
+    input
+        .split(is_sep)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
 }
 
 impl MetadataProvider for FilenameProvider {
@@ -274,6 +464,21 @@ fn quality_source_tag(word: &str) -> Option<String> {
         "dovi" | "dv" => "DolbyVision",
         "x264" | "h264" | "avc" => "H264",
         "x265" | "h265" | "hevc" => "HEVC",
+        // 3D format markers (018-3d-media / T134).
+        "3d" => "3D",
+        "sbs" => "SBS",
+        "hsbs" | "h-sbs" | "half-sbs" => "HSBS",
+        "fsbs" | "f-sbs" | "full-sbs" => "FSBS",
+        "tab" => "TAB",
+        "htab" | "h-tab" | "half-tab" => "HTAB",
+        "ftab" | "f-tab" | "full-tab" => "FTAB",
+        "ou" => "OU",
+        "hou" | "h-ou" | "half-ou" => "HOU",
+        "fou" | "f-ou" | "full-ou" => "FOU",
+        "mvc" | "3d-mvc" => "MVC",
+        "bd3d" | "bd-3d" => "BD3D",
+        "bluray3d" | "bluray-3d" => "BluRay3D",
+        "anaglyph" => "Anaglyph",
         _ => return None,
     };
     Some(canonical.to_string())
@@ -532,5 +737,460 @@ mod tests {
         .unwrap();
         assert_eq!(r.title, None);
         assert!(r.tags.iter().any(|t| t == "2160p"));
+    }
+
+    #[test]
+    fn parse_video_3d_format_movies_table() {
+        struct Case {
+            input: &'static str,
+            format: Option<Video3DFormat>,
+            source: Option<&'static str>,
+        }
+        let cases = [
+            // HSBS variants
+            Case {
+                input: "Avatar (2009) [1080p] HSBS",
+                format: Some(Video3DFormat::HalfSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.H-SBS.1080p",
+                format: Some(Video3DFormat::HalfSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) Half-SBS",
+                format: Some(Video3DFormat::HalfSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Half.SBS.1080p",
+                format: Some(Video3DFormat::HalfSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) SBS 1080p",
+                format: Some(Video3DFormat::HalfSideBySide),
+                source: Some("filename"),
+            },
+            // FSBS variants
+            Case {
+                input: "Avatar (2009) FSBS 1080p",
+                format: Some(Video3DFormat::FullSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.F-SBS.1080p",
+                format: Some(Video3DFormat::FullSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) Full-SBS 1080p",
+                format: Some(Video3DFormat::FullSideBySide),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Full.SBS.1080p",
+                format: Some(Video3DFormat::FullSideBySide),
+                source: Some("filename"),
+            },
+            // HTAB / TAB variants
+            Case {
+                input: "Avatar.2009.HTAB.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.H-TAB.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Half-TAB.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Half.TAB.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) TAB 1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            // HOU / OU variants
+            Case {
+                input: "Avatar.2009.HOU.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.H-OU.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Half-OU.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Half.OU.1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) OU 1080p",
+                format: Some(Video3DFormat::HalfTopAndBottom),
+                source: Some("filename"),
+            },
+            // FTAB variants
+            Case {
+                input: "Avatar.2009.FTAB.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.F-TAB.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) Full-TAB 1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Full.TAB.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            // FOU variants
+            Case {
+                input: "Avatar.2009.FOU.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.F-OU.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Full-OU.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.Full.OU.1080p",
+                format: Some(Video3DFormat::FullTopAndBottom),
+                source: Some("filename"),
+            },
+            // MVC / BD3D / BluRay3D variants
+            Case {
+                input: "Avatar (2009) MVC 1080p",
+                format: Some(Video3DFormat::Mvc),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.3D.MVC.1080p",
+                format: Some(Video3DFormat::Mvc),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.3D-MVC.1080p",
+                format: Some(Video3DFormat::Mvc),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar.2009.BD3D.1080p",
+                format: Some(Video3DFormat::Mvc),
+                source: Some("filename"),
+            },
+            Case {
+                input: "Avatar (2009) BluRay3D 1080p",
+                format: Some(Video3DFormat::Mvc),
+                source: Some("filename"),
+            },
+            // Anaglyph
+            Case {
+                input: "Creature from the Black Lagoon (1954) [Anaglyph] 1080p",
+                format: None,
+                source: Some("anaglyph"),
+            },
+            // Bare 3D
+            Case {
+                input: "Avatar (2009) [3D] 1080p",
+                format: None,
+                source: Some("unspecified_3d"),
+            },
+            // 2D Stems
+            Case {
+                input: "The Matrix (1999) 1080p",
+                format: None,
+                source: None,
+            },
+            Case {
+                input: "Inception.2010.1080p.BluRay.x264",
+                format: None,
+                source: None,
+            },
+        ];
+
+        for c in cases {
+            let got = parse_video_3d_format(c.input);
+            assert_eq!(
+                got,
+                (c.format, c.source),
+                "parse_video_3d_format failed for {:?}",
+                c.input
+            );
+        }
+    }
+
+    #[test]
+    fn parse_filename_strips_3d_tags_movies_table() {
+        struct Case {
+            input: &'static str,
+            title: Option<&'static str>,
+            year: Option<u32>,
+            tag: &'static str,
+        }
+        let cases = [
+            Case {
+                input: "Avatar (2009) HSBS",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HSBS",
+            },
+            Case {
+                input: "Avatar.2009.H-SBS.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HSBS",
+            },
+            Case {
+                input: "Avatar (2009) Half-SBS",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HSBS",
+            },
+            Case {
+                input: "Avatar.2009.Half.SBS.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HSBS",
+            },
+            Case {
+                input: "Avatar (2009) SBS",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "SBS",
+            },
+            Case {
+                input: "Avatar.2009.FSBS.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FSBS",
+            },
+            Case {
+                input: "Avatar (2009) Full-SBS",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FSBS",
+            },
+            Case {
+                input: "Avatar.2009.Full.SBS.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FSBS",
+            },
+            Case {
+                input: "Avatar.2009.HTAB.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HTAB",
+            },
+            Case {
+                input: "Avatar (2009) TAB",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "TAB",
+            },
+            Case {
+                input: "Avatar.2009.HOU.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "HOU",
+            },
+            Case {
+                input: "Avatar (2009) OU",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "OU",
+            },
+            Case {
+                input: "Avatar.2009.FTAB.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FTAB",
+            },
+            Case {
+                input: "Avatar (2009) Full-TAB",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FTAB",
+            },
+            Case {
+                input: "Avatar.2009.FOU.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "FOU",
+            },
+            Case {
+                input: "Avatar (2009) MVC",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "MVC",
+            },
+            Case {
+                input: "Avatar.2009.BD3D.1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "BD3D",
+            },
+            Case {
+                input: "Avatar (2009) BluRay3D",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "BluRay3D",
+            },
+            Case {
+                input: "Creature from the Black Lagoon (1954) Anaglyph 1080p",
+                title: Some("Creature from the Black Lagoon"),
+                year: Some(1954),
+                tag: "Anaglyph",
+            },
+            Case {
+                input: "Avatar (2009) 3D 1080p",
+                title: Some("Avatar"),
+                year: Some(2009),
+                tag: "3D",
+            },
+        ];
+
+        for c in cases {
+            let parsed = parse_filename(c.input, true);
+            assert_eq!(
+                parsed.title.as_deref(),
+                c.title,
+                "title mismatch for {:?}",
+                c.input
+            );
+            assert_eq!(parsed.year, c.year, "year mismatch for {:?}", c.input);
+            assert!(
+                parsed.tags.iter().any(|t| t == c.tag),
+                "expected tag {:?} in parsed.tags {:?} for {:?}",
+                c.tag,
+                parsed.tags,
+                c.input
+            );
+        }
+    }
+
+    #[test]
+    fn parse_video_3d_format_and_title_episodes() {
+        // Episode 1: Doctor Who
+        let ep1 = "Doctor Who - S07E14 - The Day of the Doctor [1080p.HTAB]";
+        let (fmt1, src1) = parse_video_3d_format(ep1);
+        assert_eq!(fmt1, Some(Video3DFormat::HalfTopAndBottom));
+        assert_eq!(src1, Some("filename"));
+
+        let parsed1 = parse_filename(ep1, false);
+        assert_eq!(
+            parsed1.title.as_deref(),
+            Some("Doctor Who - S07E14 - The Day of the Doctor")
+        );
+        assert_eq!(parsed1.year, None);
+        assert!(parsed1.tags.contains(&"1080p".to_string()));
+        assert!(parsed1.tags.contains(&"HTAB".to_string()));
+
+        // Episode 2: Show HSBS
+        let ep2 = "Show.S01E02.1080p.HSBS";
+        let (fmt2, src2) = parse_video_3d_format(ep2);
+        assert_eq!(fmt2, Some(Video3DFormat::HalfSideBySide));
+        assert_eq!(src2, Some("filename"));
+
+        let parsed2 = parse_filename(ep2, false);
+        assert_eq!(parsed2.title.as_deref(), Some("Show S01E02"));
+        assert_eq!(parsed2.year, None);
+        assert!(parsed2.tags.contains(&"1080p".to_string()));
+        assert!(parsed2.tags.contains(&"HSBS".to_string()));
+
+        // Episode 3: Show 3D MVC
+        let ep3 = "Show.S01E02.3D.MVC.1080p";
+        let (fmt3, src3) = parse_video_3d_format(ep3);
+        assert_eq!(fmt3, Some(Video3DFormat::Mvc));
+        assert_eq!(src3, Some("filename"));
+
+        let parsed3 = parse_filename(ep3, false);
+        assert_eq!(parsed3.title.as_deref(), Some("Show S01E02"));
+        assert_eq!(parsed3.year, None);
+        assert!(parsed3.tags.contains(&"3D".to_string()));
+        assert!(parsed3.tags.contains(&"MVC".to_string()));
+        assert!(parsed3.tags.contains(&"1080p".to_string()));
+    }
+
+    #[test]
+    fn test_has_explicit_full_or_half_3d_token() {
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.FSBS.1080p"),
+            Some(Video3DFormat::FullSideBySide)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.Full-SBS.1080p"),
+            Some(Video3DFormat::FullSideBySide)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.HSBS.1080p"),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.Half-SBS.1080p"),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.SBS.1080p"), None);
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.FTAB.1080p"),
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.Full-TAB.1080p"),
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.HTAB.1080p"),
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.Half-TAB.1080p"),
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.TAB.1080p"), None);
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.FOU.1080p"),
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.HOU.1080p"),
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.OU.1080p"), None);
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Avatar.3D.MVC.1080p"),
+            None
+        );
     }
 }
