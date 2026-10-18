@@ -1126,6 +1126,8 @@
             + "-isystem ${pkgs.glibc.dev}/include";
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
+            # Host LD_LIBRARY_PATH overrides ELF RUNPATH and links incompatible host glibc.
+            unset LD_LIBRARY_PATH
             # The SAME bundle the image ships (B175 epub.js patch included),
             # so the compat suite exercises what production serves rather than
             # stock upstream.
