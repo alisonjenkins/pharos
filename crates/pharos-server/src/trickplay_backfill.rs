@@ -428,7 +428,10 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
     let layouts: Vec<_> = ctx
         .widths
         .iter()
-        .filter_map(|&width| build_layout(&item.probe, width, ctx.interval_ms))
+        .filter_map(|&width| {
+            build_layout(&item.probe, width, ctx.interval_ms)
+                .map(|l| l.with_video_3d_format(item.probe.video_3d_format))
+        })
         .collect();
     let sig = file_sig(&item.path).await;
     let failed_before = ctx
@@ -546,7 +549,13 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
             // NFS-bound step). A coverless / unseekable source errors and is now
             // negatively cached — `.ok()` drops it, nothing to scale.
             None => ic
-                .primary(item.id, item.kind, &item.path, item.probe.duration_ms)
+                .primary_3d(
+                    item.id,
+                    item.kind,
+                    &item.path,
+                    item.probe.duration_ms,
+                    item.probe.video_3d_format,
+                )
                 .await
                 .ok(),
         };
@@ -577,7 +586,16 @@ async fn generate_item(item: &MediaItem, ctx: &GenCtx, bypass_gate: bool) {
                 let mut warmed = 0u32;
                 let mut failed = 0u32;
                 for (idx, start_ms) in targets {
-                    match ic.chapter(item.id, &item.path, idx, start_ms).await {
+                    match ic
+                        .chapter_3d(
+                            item.id,
+                            &item.path,
+                            idx,
+                            start_ms,
+                            item.probe.video_3d_format,
+                        )
+                        .await
+                    {
                         Ok(_) => warmed += 1,
                         Err(e) => {
                             failed += 1;
