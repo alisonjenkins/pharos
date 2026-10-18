@@ -90,6 +90,19 @@ pub trait FfmpegBackend: Send + Sync {
         out: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>>;
 
+    /// Extract a single image frame with optional packed 3D left-eye crop.
+    fn extract_image_3d<'a>(
+        &'a self,
+        src: &'a Path,
+        seek_ms: u64,
+        width: u32,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+        out: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
+        let _ = video_3d_format;
+        self.extract_image(src, seek_ms, width, out)
+    }
+
     /// Extract one embedded subtitle stream as bytes in the requested
     /// `format`. Returns `UnsupportedCodec` on image-codec streams
     /// (PGS / DVB / VobSub) before spawning ffmpeg.
@@ -147,3 +160,32 @@ pub use spawn::SpawnBackend;
 pub mod lib_backend;
 #[cfg(feature = "backend-lib")]
 pub use lib_backend::LibBackend;
+
+/// Filter prefix that crops a packed 3D frame to the left/top eye and resets
+/// SAR before scaling. For Half-SBS/Half-TAB, we also restore display aspect
+/// ratio (`scale=iw*2:ih` or `scale=iw:ih*2`) before the target-width scale
+/// `scale={w}:-2` so the thumbnail is not squeezed 2:1!
+pub fn stereo_left_eye_filter_prefix(
+    video_3d_format: Option<pharos_core::Video3DFormat>,
+) -> Option<&'static str> {
+    use pharos_core::Video3DFormat;
+    match video_3d_format? {
+        Video3DFormat::HalfSideBySide => Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1"),
+        Video3DFormat::FullSideBySide => Some("crop=iw/2:ih:0:0,setsar=1"),
+        Video3DFormat::HalfTopAndBottom => Some("crop=iw:ih/2:0:0,scale=iw:ih*2,setsar=1"),
+        Video3DFormat::FullTopAndBottom => Some("crop=iw:ih/2:0:0,setsar=1"),
+        Video3DFormat::Mvc => None,
+    }
+}
+
+/// Build the `-vf` filter spec for image/thumbnail extraction, applying
+/// left-eye cropping when `video_3d_format` is a packed stereo format.
+pub fn image_filter_spec(
+    width: u32,
+    video_3d_format: Option<pharos_core::Video3DFormat>,
+) -> String {
+    match stereo_left_eye_filter_prefix(video_3d_format) {
+        Some(prefix) => format!("{prefix},scale={width}:-2"),
+        None => format!("scale={width}:-2"),
+    }
+}

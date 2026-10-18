@@ -487,7 +487,7 @@ const MEDIA_MIGRATE_COLUMNS: &str = "id, path, title, kind, \
     audio_tracks_json, file_mtime, file_size_seen, last_scanned, last_seen_scan_id, fingerprint, \
     community_rating, critic_rating, official_rating, production_year, premiere_date, \
     overview, tagline, provider_ids, series_folder, series_year, library_id, \
-    title_fold, attachments_json, probe_schema_version";
+    title_fold, attachments_json, probe_schema_version, video_3d_format";
 
 #[derive(sqlx::FromRow)]
 struct MediaItemRow {
@@ -542,13 +542,14 @@ struct MediaItemRow {
     title_fold: Option<String>,
     attachments_json: Option<String>,
     probe_schema_version: i64,
+    video_3d_format: Option<String>,
     sort_name: Option<String>,
 }
 
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 52-placeholder statement while still batching the
+/// manageable fixed 53-placeholder statement while still batching the
 /// whole copy as a single round of prepared-statement reuse.
 async fn copy_media_items(
     sp: &SqlitePool,
@@ -568,7 +569,7 @@ async fn copy_media_items(
         "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
          $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51,$52)"
+         $45,$46,$47,$48,$49,$50,$51,$52,$53)"
     );
     for row in rows {
         let sort_name = row
@@ -626,6 +627,7 @@ async fn copy_media_items(
             .bind(row.title_fold)
             .bind(row.attachments_json)
             .bind(row.probe_schema_version)
+            .bind(row.video_3d_format)
             .bind(sort_name)
             .execute(&mut **tx)
             .await

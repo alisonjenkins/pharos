@@ -132,6 +132,7 @@ pub struct SourceMedia {
     /// play (it decodes to garbage or hard-fails). `None` = unknown →
     /// the condition evaluates permissively.
     pub video_bit_depth: Option<u32>,
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -283,7 +284,85 @@ pub fn codec_profile_passes(
                     source.video_bit_depth.map(|n| n as i64),
                     &cond.value,
                 ),
+                "Is3D" => compare_string(
+                    &cond.condition,
+                    Some(if source.video_3d_format.is_some() {
+                        "true"
+                    } else {
+                        "false"
+                    }),
+                    Some(cond.value.as_str()),
+                ),
+                "Video3DFormat" => compare_string(
+                    &cond.condition,
+                    source.video_3d_format.map(|f| f.as_str()),
+                    Some(cond.value.as_str()),
+                ),
                 _ => true, // unknown property — permissive
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Evaluates required 3D conditions (`Is3D` and `Video3DFormat`) against the
+/// source. Returns `true` if `source.video_3d_format.is_none()`.
+pub fn codec_profile_3d_passes(profiles: &[CodecProfileDto], source: &SourceMedia) -> bool {
+    if source.video_3d_format.is_none() {
+        return true;
+    }
+    for cp in profiles {
+        let is_audio_profile = cp.kind.eq_ignore_ascii_case("Audio");
+        let is_video_profile = cp.kind.eq_ignore_ascii_case("Video");
+        if source.is_video && is_audio_profile {
+            continue;
+        }
+        if !source.is_video && is_video_profile {
+            continue;
+        }
+        if !cp.codec.is_empty() {
+            let want = cp.codec.to_ascii_lowercase();
+            let compare_audio = is_audio_profile || !source.is_video;
+            let have = if compare_audio {
+                source.audio_codec.as_deref().unwrap_or("")
+            } else {
+                source.video_codec.as_deref().unwrap_or("")
+            }
+            .to_ascii_lowercase();
+            let mut codec_matches = false;
+            for token in want.split(',') {
+                if token.trim() == have {
+                    codec_matches = true;
+                    break;
+                }
+            }
+            if !codec_matches {
+                continue;
+            }
+        }
+        for cond in &cp.conditions {
+            if !cond.is_required {
+                continue;
+            }
+            let ok = match cond.property.as_str() {
+                "Is3D" => compare_string(
+                    &cond.condition,
+                    Some(if source.video_3d_format.is_some() {
+                        "true"
+                    } else {
+                        "false"
+                    }),
+                    Some(cond.value.as_str()),
+                ),
+                "Video3DFormat" => compare_string(
+                    &cond.condition,
+                    source.video_3d_format.map(|f| f.as_str()),
+                    Some(cond.value.as_str()),
+                ),
+                _ => true,
             };
             if !ok {
                 return false;
@@ -504,6 +583,11 @@ pub fn negotiate_explained(
     };
     let named = |codec: Option<&str>| codec.unwrap_or("unknown").to_string();
 
+    let profile_3d_ok = codec_profile_3d_passes(&profile.codec_profiles, source);
+    if !profile_3d_ok {
+        note(DirectPlayBlock::CodecCondition, &mut block);
+    }
+
     // Look for an exact direct-play match first.
     let mut audio_remux_candidate: Option<&DirectPlayProfile> = None;
     for p in &profile.direct_play_profiles {
@@ -558,7 +642,12 @@ pub fn negotiate_explained(
         }
         // Video matches but audio doesn't → audio-remux is viable
         // (container + video codec stay).
-        if video_ok && !audio_ok && audio_remux_candidate.is_none() && !over_bitrate {
+        if video_ok
+            && !audio_ok
+            && audio_remux_candidate.is_none()
+            && !over_bitrate
+            && profile_3d_ok
+        {
             audio_remux_candidate = Some(p);
         }
     }
@@ -578,7 +667,7 @@ pub fn negotiate_explained(
     // container differs from the source's, remux container only.
     // Skip when video bitrate exceeds the cap — full transcode is
     // forced in that case.
-    if !over_bitrate && source.is_video {
+    if !over_bitrate && source.is_video && profile_3d_ok {
         for p in &profile.direct_play_profiles {
             if !p.kind.is_empty() && !p.kind.eq_ignore_ascii_case(want_kind) {
                 continue;
@@ -1562,5 +1651,122 @@ mod tests {
             } => assert_eq!(max_video_bitrate_bps, Some(4_000_000)),
             other => panic!("over-bitrate source must transcode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn three_d_source_direct_plays_by_default() {
+        let profile = hevc_8bit_only_tv_profile();
+        let mut source_hsbs = hevc_8bit_source();
+        source_hsbs.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        assert_eq!(
+            negotiate(&profile, &source_hsbs, &ServerCodecSupport::default()),
+            Decision::DirectPlay
+        );
+
+        let mut source_mvc = hevc_8bit_source();
+        source_mvc.video_3d_format = Some(pharos_core::Video3DFormat::Mvc);
+        assert_eq!(
+            negotiate(&profile, &source_mvc, &ServerCodecSupport::default()),
+            Decision::DirectPlay
+        );
+    }
+
+    #[test]
+    fn codec_profile_rejects_3d_direct_play_and_remux() {
+        let profile: DeviceProfile = serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mkv","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"},
+                {"Container":"mp4","Type":"Video","VideoCodec":"hevc","AudioCodec":"flac"}
+              ],
+              "CodecProfiles":[
+                {"Type":"Video","Codec":"hevc","Conditions":[
+                  {"Condition":"Equals","Property":"Is3D","Value":"false","IsRequired":true}
+                ]}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        // 1. Exact match (DirectPlay candidate)
+        let mut source_direct = hevc_8bit_source();
+        source_direct.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        let (decision, block) =
+            negotiate_explained(&profile, &source_direct, &ServerCodecSupport::default());
+        assert!(
+            matches!(decision, Decision::Transcode { .. }),
+            "expected Transcode, got {decision:?}"
+        );
+        assert_eq!(block, DirectPlayBlock::CodecCondition);
+
+        // 2. Audio mismatch (AudioRemux candidate)
+        let mut source_audio_remux = hevc_8bit_source();
+        source_audio_remux.audio_codec = Some("flac".into());
+        source_audio_remux.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        let (decision, block) = negotiate_explained(
+            &profile,
+            &source_audio_remux,
+            &ServerCodecSupport::default(),
+        );
+        assert!(
+            matches!(decision, Decision::Transcode { .. }),
+            "expected Transcode for AudioRemux candidate, got {decision:?}"
+        );
+        assert_eq!(block, DirectPlayBlock::CodecCondition);
+
+        // 3. Container mismatch (VideoRemux candidate)
+        let mut source_video_remux = hevc_8bit_source();
+        source_video_remux.container = "mov".into();
+        source_video_remux.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        let (decision, block) = negotiate_explained(
+            &profile,
+            &source_video_remux,
+            &ServerCodecSupport::default(),
+        );
+        assert!(
+            matches!(decision, Decision::Transcode { .. }),
+            "expected Transcode for VideoRemux candidate, got {decision:?}"
+        );
+        assert_eq!(block, DirectPlayBlock::CodecCondition);
+    }
+
+    #[test]
+    fn codec_profile_filters_video_3d_format() {
+        let profile: DeviceProfile = serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mkv","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"}
+              ],
+              "CodecProfiles":[
+                {"Type":"Video","Codec":"hevc","Conditions":[
+                  {"Condition":"EqualsAny","Property":"Video3DFormat","Value":"HalfSideBySide|HalfTopAndBottom","IsRequired":true}
+                ]}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut source_hsbs = hevc_8bit_source();
+        source_hsbs.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        let (decision, block) =
+            negotiate_explained(&profile, &source_hsbs, &ServerCodecSupport::default());
+        assert_eq!(decision, Decision::DirectPlay);
+        assert_eq!(block, DirectPlayBlock::NotBlocked);
+
+        let mut source_fsbs = hevc_8bit_source();
+        source_fsbs.video_3d_format = Some(pharos_core::Video3DFormat::FullSideBySide);
+        let (decision, block) =
+            negotiate_explained(&profile, &source_fsbs, &ServerCodecSupport::default());
+        assert!(
+            matches!(decision, Decision::Transcode { .. }),
+            "expected Transcode, got {decision:?}"
+        );
+        assert_eq!(block, DirectPlayBlock::CodecCondition);
     }
 }

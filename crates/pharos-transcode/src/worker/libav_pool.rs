@@ -208,6 +208,20 @@ impl LibavWorkerPool {
         quality: i32,
         out: impl Into<PathBuf>,
     ) -> Result<(), PoolError> {
+        self.extract_image_3d(input, seek_ms, width, quality, None, out)
+            .await
+    }
+
+    /// Extract a single scaled JPEG frame to `out`, with optional packed 3D left-eye crop.
+    pub async fn extract_image_3d(
+        &self,
+        input: impl Into<PathBuf>,
+        seek_ms: Option<u64>,
+        width: u32,
+        quality: i32,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+        out: impl Into<PathBuf>,
+    ) -> Result<(), PoolError> {
         let ev = self
             .run(TinyOp::Image {
                 input: input.into(),
@@ -215,13 +229,13 @@ impl LibavWorkerPool {
                 width,
                 quality,
                 out: out.into(),
+                video_3d_format,
             })
             .await?;
         expect_done(ev).map(|_| ())
     }
 
     /// Generate trickplay sprite sheets; returns the sheet count produced.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn trickplay(
         &self,
@@ -234,6 +248,34 @@ impl LibavWorkerPool {
         quality: i32,
         out_dir: impl Into<PathBuf>,
     ) -> Result<u32, PoolError> {
+        self.trickplay_3d(
+            input,
+            interval_ms,
+            width,
+            grid,
+            thumb_count,
+            max_sheets,
+            quality,
+            None,
+            out_dir,
+        )
+        .await
+    }
+
+    /// Generate trickplay sprite sheets with optional packed 3D left-eye crop; returns the sheet count produced.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn trickplay_3d(
+        &self,
+        input: impl Into<PathBuf>,
+        interval_ms: u64,
+        width: u32,
+        grid: u32,
+        thumb_count: u32,
+        max_sheets: u32,
+        quality: i32,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+        out_dir: impl Into<PathBuf>,
+    ) -> Result<u32, PoolError> {
         let ev = self
             .run(TinyOp::Trickplay {
                 input: input.into(),
@@ -244,6 +286,7 @@ impl LibavWorkerPool {
                 max_sheets,
                 quality,
                 out_dir: out_dir.into(),
+                video_3d_format,
             })
             .await?;
         expect_done(ev).map(|n| n as u32)

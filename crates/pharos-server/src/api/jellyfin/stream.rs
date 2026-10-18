@@ -658,6 +658,23 @@ async fn stream_transcoded_webm(
     // subtitle is BURNED IN (only possible because VP9 re-encodes the frames).
     let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
         .and_then(|abs| codec_relative_index(&sub_abs, abs));
+    let qs_mono = qs.split('&').any(|kv| {
+        kv.split_once('=').is_some_and(|(k, v)| {
+            k.eq_ignore_ascii_case("StereoMode")
+                && (v.eq_ignore_ascii_case("mono") || v.eq_ignore_ascii_case("mono2d"))
+        })
+    });
+    let stereo_output = if qs_mono
+        || (sub_rel.is_some()
+            && item
+                .probe
+                .video_3d_format
+                .is_some_and(|f| f.is_packed_sbs_or_tab()))
+    {
+        pharos_transcode::StereoOutput::Mono2D
+    } else {
+        pharos_transcode::StereoOutput::Preserve
+    };
     let opts = TranscodeOptions {
         source_frame_rate: None,
         container: Container::WebM,
@@ -683,6 +700,8 @@ async fn stream_transcoded_webm(
         decode_preroll_seconds: None,
         muxed_audio_source: None,
         filler: None,
+        video_3d_format: item.probe.video_3d_format,
+        stereo_output,
     };
     tracing::info!(
         media.id = item.id,

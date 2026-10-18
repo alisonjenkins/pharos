@@ -376,7 +376,15 @@ fn handle_tiny(
             width,
             quality,
             out,
-        } => match libav::image::extract_image(&input, seek_ms, width, quality, &out) {
+            video_3d_format,
+        } => match libav::image::extract_image_3d(
+            &input,
+            seek_ms,
+            width,
+            quality,
+            video_3d_format,
+            &out,
+        ) {
             Ok(()) => WorkerEvent::Done {
                 job_id,
                 out_bytes: file_len(&out),
@@ -413,7 +421,8 @@ fn handle_tiny(
             max_sheets,
             quality,
             out_dir,
-        } => match libav::trickplay::trickplay_sprite(
+            video_3d_format,
+        } => match libav::trickplay::trickplay_sprite_3d(
             &input,
             interval_ms,
             width,
@@ -421,6 +430,7 @@ fn handle_tiny(
             thumb_count,
             max_sheets,
             quality,
+            video_3d_format,
             &out_dir,
         ) {
             // out_bytes carries the produced sheet count for this op.

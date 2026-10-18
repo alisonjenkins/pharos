@@ -13,10 +13,23 @@
 #![cfg(feature = "sqlite")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo, SubtitleTrack};
+use pharos_core::{
+    MediaItem, MediaKind, MediaProbe, MediaStore, SeriesInfo, SubtitleTrack, Video3DFormat,
+};
 use pharos_store_sqlx::sqlite::SqliteStore;
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
+
+fn arb_video_3d_format() -> impl Strategy<Value = Option<Video3DFormat>> {
+    prop_oneof![
+        Just(None),
+        Just(Some(Video3DFormat::HalfSideBySide)),
+        Just(Some(Video3DFormat::FullSideBySide)),
+        Just(Some(Video3DFormat::FullTopAndBottom)),
+        Just(Some(Video3DFormat::HalfTopAndBottom)),
+        Just(Some(Video3DFormat::Mvc)),
+    ]
+}
 
 fn arb_kind() -> impl Strategy<Value = MediaKind> {
     prop_oneof![
@@ -82,7 +95,10 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 proptest::option::of("[A-Za-z0-9 ]{0,40}"),
                 proptest::option::of("[A-Za-z0-9-]{0,8}"),
                 proptest::option::of("[A-Za-z0-9 ]{0,24}"),
-                proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}"),
+                (
+                    proptest::option::of("[0-9]{4}-[0-9]{2}-[0-9]{2}"),
+                    arb_video_3d_format(),
+                ),
             )
         })
         .prop_map(
@@ -98,7 +114,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 synopsis,
                 content_rating,
                 network,
-                release_date,
+                (release_date, video_3d_format),
             )| MediaProbe {
                 size_bytes: size,
                 duration_ms: dur,
@@ -136,6 +152,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 release_date,
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
+                video_3d_format,
             },
         )
 }

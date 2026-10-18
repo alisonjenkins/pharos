@@ -14,7 +14,7 @@ use pharos_core::{
     CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaFilters, MediaId, MediaItem,
     MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore, ParentFilter, PersonKind,
     PersonRef, PersonStore, SeriesInfo, SortDir, SortKey, StudioStore, SubtitleTrack, TagStore,
-    UserDataQuery, UserDataStore, UserId, UserItemData, UserRecord, UserStore,
+    UserDataQuery, UserDataStore, UserId, UserItemData, UserRecord, UserStore, Video3DFormat,
 };
 use pharos_store_sqlx::sqlite::SqliteStore;
 use pharos_store_sqlx::ServerConfigStore;
@@ -1140,4 +1140,151 @@ async fn distinct_resolvers_recover_synth_id_components() {
     let genres = s.distinct_genre_fields().await.unwrap();
     assert!(genres.iter().any(|g| g == "Action, Sci-Fi"));
     assert!(genres.iter().any(|g| g == "Drama"));
+}
+
+#[tokio::test]
+async fn residual_3d_and_full_3d_resolution_filtering() {
+    let s = fresh().await;
+
+    // 2D items:
+    // id 1: 2D 4K (3840x2160)
+    let mut item_2d_4k = item_with(1, "2D 4K", MediaKind::Movie);
+    item_2d_4k.probe.width = Some(3840);
+    item_2d_4k.probe.height = Some(2160);
+    item_2d_4k.probe.video_3d_format = None;
+    s.put(item_2d_4k).await.unwrap();
+
+    // id 2: 2D 1080p (1920x1080)
+    let mut item_2d_1080p = item_with(2, "2D 1080p", MediaKind::Movie);
+    item_2d_1080p.probe.width = Some(1920);
+    item_2d_1080p.probe.height = Some(1080);
+    item_2d_1080p.probe.video_3d_format = None;
+    s.put(item_2d_1080p).await.unwrap();
+
+    // 3D items covering all 5 variants:
+    // id 3: HalfSideBySide (1920x1080)
+    let mut item_hsbs = item_with(3, "Half-SBS", MediaKind::Movie);
+    item_hsbs.probe.width = Some(1920);
+    item_hsbs.probe.height = Some(1080);
+    item_hsbs.probe.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+    s.put(item_hsbs).await.unwrap();
+
+    // id 4: FullSideBySide (3840x1080) - 1080p per eye (B229)
+    let mut item_fsbs = item_with(4, "Full-SBS", MediaKind::Movie);
+    item_fsbs.probe.width = Some(3840);
+    item_fsbs.probe.height = Some(1080);
+    item_fsbs.probe.video_3d_format = Some(Video3DFormat::FullSideBySide);
+    s.put(item_fsbs).await.unwrap();
+
+    // id 5: FullTopAndBottom (1920x2160) - 1080p per eye (B229)
+    let mut item_ftab = item_with(5, "Full-TAB", MediaKind::Movie);
+    item_ftab.probe.width = Some(1920);
+    item_ftab.probe.height = Some(2160);
+    item_ftab.probe.video_3d_format = Some(Video3DFormat::FullTopAndBottom);
+    s.put(item_ftab).await.unwrap();
+
+    // id 6: HalfTopAndBottom (1920x1080)
+    let mut item_htab = item_with(6, "Half-TAB", MediaKind::Movie);
+    item_htab.probe.width = Some(1920);
+    item_htab.probe.height = Some(1080);
+    item_htab.probe.video_3d_format = Some(Video3DFormat::HalfTopAndBottom);
+    s.put(item_htab).await.unwrap();
+
+    // id 7: Mvc (1920x1080)
+    let mut item_mvc = item_with(7, "MVC", MediaKind::Movie);
+    item_mvc.probe.width = Some(1920);
+    item_mvc.probe.height = Some(1080);
+    item_mvc.probe.video_3d_format = Some(Video3DFormat::Mvc);
+    s.put(item_mvc).await.unwrap();
+
+    // 1. is_3d: Some(true) returns only 3D items (all 5 variants: 3, 4, 5, 6, 7)
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![3, 4, 5, 6, 7]
+    );
+
+    // 2. is_3d: Some(false) returns only items with video_3d_format: None (items 1, 2)
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(false),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![1, 2]
+    );
+
+    // 3. is_3d: None returns both 2D and 3D items (all 1..=7)
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: None,
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+
+    // 4. FullSideBySide (3840x1080) does NOT match is_4k: Some(true),
+    //    DOES match is_hd: Some(true) and is_4k: Some(false) (B229).
+    //    FullTopAndBottom (1920x2160) does NOT match is_4k: Some(true)
+    //    and DOES match is_hd: Some(true).
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_4k: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![1]
+    );
+
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_4k: Some(false),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![2, 3, 4, 5, 6, 7]
+    );
+
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_hd: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![2, 3, 4, 5, 6, 7]
+    );
+
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_hd: Some(false),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![1]
+    );
 }

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::process::Command;
 
+pub use crate::backend::{image_filter_spec, stereo_left_eye_filter_prefix};
+
 /// Default backend wrapping the real `ffmpeg` + `ffprobe` binaries.
 /// Holds the binary paths so test deployments can swap in a stub
 /// `ffmpeg` script when the real one isn't installed.
@@ -79,11 +81,22 @@ impl FfmpegBackend for SpawnBackend {
         width: u32,
         out: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
+        self.extract_image_3d(src, seek_ms, width, None, out)
+    }
+
+    fn extract_image_3d<'a>(
+        &'a self,
+        src: &'a Path,
+        seek_ms: u64,
+        width: u32,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+        out: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
         Box::pin(async move {
             let input = src.to_str().ok_or(BackendError::NonUtf8Path)?;
             let out_str = out.to_str().ok_or(BackendError::NonUtf8Path)?;
             let seek_s = format!("{}.{:03}", seek_ms / 1000, seek_ms % 1000);
-            let filter = format!("scale={width}:-2");
+            let filter = image_filter_spec(width, video_3d_format);
             let status = Command::new(&self.ffmpeg)
                 .args([
                     "-y",
@@ -294,5 +307,36 @@ impl FfmpegBackend for SpawnBackend {
                 .await
                 .map_err(|e| BackendError::Ffmpeg(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pharos_core::Video3DFormat;
+
+    #[test]
+    fn image_filter_spec_formats() {
+        assert_eq!(
+            image_filter_spec(320, Some(Video3DFormat::HalfSideBySide)),
+            "crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1,scale=320:-2"
+        );
+        assert_eq!(
+            image_filter_spec(320, Some(Video3DFormat::FullSideBySide)),
+            "crop=iw/2:ih:0:0,setsar=1,scale=320:-2"
+        );
+        assert_eq!(
+            image_filter_spec(320, Some(Video3DFormat::HalfTopAndBottom)),
+            "crop=iw:ih/2:0:0,scale=iw:ih*2,setsar=1,scale=320:-2"
+        );
+        assert_eq!(
+            image_filter_spec(320, Some(Video3DFormat::FullTopAndBottom)),
+            "crop=iw:ih/2:0:0,setsar=1,scale=320:-2"
+        );
+        assert_eq!(
+            image_filter_spec(320, Some(Video3DFormat::Mvc)),
+            "scale=320:-2"
+        );
+        assert_eq!(image_filter_spec(320, None), "scale=320:-2");
     }
 }

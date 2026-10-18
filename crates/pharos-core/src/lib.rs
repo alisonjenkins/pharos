@@ -1823,6 +1823,10 @@ pub struct MediaProbe {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub frame_rate_mille: Option<u32>,
+    /// 009-3d-media — 3D stereoscopic layout (HalfSideBySide, FullSideBySide,
+    /// HalfTopAndBottom, FullTopAndBottom, or Mvc). `None` for flat 2D video.
+    #[serde(default)]
+    pub video_3d_format: Option<Video3DFormat>,
     pub audio_channels: Option<u32>,
     pub sample_rate: Option<u32>,
     /// Embedded subtitle tracks discovered by the prober. Stored
@@ -2029,6 +2033,254 @@ impl MediaProbe {
     /// True when the probe carries HDR transfer characteristics.
     pub fn is_hdr(&self) -> bool {
         matches!(self.video_range(), "HDR")
+    }
+
+    /// 009-3d-media — true when the probe detected a 3D stereoscopic layout.
+    pub fn is_3d(&self) -> bool {
+        self.video_3d_format.is_some()
+    }
+}
+
+/// 009-3d-media — Jellyfin OpenAPI `Video3DFormat` enum.
+///
+/// Models stereoscopic packing format for 3D video. Wire values match Jellyfin's
+/// OpenAPI schema: `"HalfSideBySide"`, `"FullSideBySide"`, `"FullTopAndBottom"`,
+/// `"HalfTopAndBottom"`, and `"MVC"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Video3DFormat {
+    HalfSideBySide,
+    FullSideBySide,
+    FullTopAndBottom,
+    HalfTopAndBottom,
+    #[serde(rename = "MVC")]
+    Mvc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown 3D video format: {0:?}")]
+pub struct ParseVideo3DFormatError(pub String);
+
+impl Video3DFormat {
+    pub const ALL: [Self; 5] = [
+        Self::HalfSideBySide,
+        Self::FullSideBySide,
+        Self::FullTopAndBottom,
+        Self::HalfTopAndBottom,
+        Self::Mvc,
+    ];
+
+    /// Canonical wire / OpenAPI token for this format.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::HalfSideBySide => "HalfSideBySide",
+            Self::FullSideBySide => "FullSideBySide",
+            Self::FullTopAndBottom => "FullTopAndBottom",
+            Self::HalfTopAndBottom => "HalfTopAndBottom",
+            Self::Mvc => "MVC",
+        }
+    }
+
+    /// ODD metric label for this format (matches [`Self::as_str`]).
+    pub const fn label(&self) -> &'static str {
+        self.as_str()
+    }
+
+    /// Returns `true` for frame-packed SBS and TAB layouts requiring anamorphic
+    /// or full-frame display/downmix, and `false` for MVC.
+    pub const fn is_packed_sbs_or_tab(&self) -> bool {
+        match self {
+            Self::HalfSideBySide
+            | Self::FullSideBySide
+            | Self::FullTopAndBottom
+            | Self::HalfTopAndBottom => true,
+            Self::Mvc => false,
+        }
+    }
+
+    /// Pure classifier resolving stereoscopic layout and metric label from prober signals.
+    ///
+    /// Evaluates in order:
+    /// 1. H.264 MVC codec or profile (`"mvc"`, `"h264_mvc"`, `"Stereo High"`, `"Multiview High"`,
+    ///    `"128"`, `"118"`, or `has_mvc_substream`).
+    /// 2. Container tag `stereo_mode` (Matroska / WebM).
+    /// 3. Coded packet side data `AV_PKT_DATA_STEREO3D` (MP4/MOV).
+    ///
+    /// Returns `(format, metric_label)` where `metric_label` is one of `"probe_mvc"`,
+    /// `"probe_tag"`, `"probe_sidedata"`, or `"anaglyph"`.
+    pub fn from_probe_signals(
+        stereo_mode_tag: Option<&str>,
+        side_data_type: Option<&str>,
+        video_codec: Option<&str>,
+        video_profile: Option<&str>,
+        has_mvc_substream: bool,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> (Option<Self>, Option<&'static str>) {
+        let is_mvc = has_mvc_substream
+            || video_codec.is_some_and(|c| {
+                let trimmed = c.trim();
+                trimmed.eq_ignore_ascii_case("mvc") || trimmed.eq_ignore_ascii_case("h264_mvc")
+            })
+            || video_profile.is_some_and(|p| {
+                let trimmed = p.trim();
+                trimmed.eq_ignore_ascii_case("stereo high")
+                    || trimmed.eq_ignore_ascii_case("multiview high")
+                    || trimmed == "128"
+                    || trimmed == "118"
+            });
+
+        if is_mvc {
+            return (Some(Self::Mvc), Some(Detect3DSource::ProbeMvc.label()));
+        }
+
+        fn classify_sbs(width: Option<u32>, height: Option<u32>) -> Video3DFormat {
+            match (width, height) {
+                (Some(w), Some(h)) if h > 0 && w >= h.saturating_mul(3) => {
+                    Video3DFormat::FullSideBySide
+                }
+                _ => Video3DFormat::HalfSideBySide,
+            }
+        }
+
+        fn classify_tab(width: Option<u32>, height: Option<u32>) -> Video3DFormat {
+            match (width, height) {
+                (Some(w), Some(h)) if h > 0 && w <= h => Video3DFormat::FullTopAndBottom,
+                _ => Video3DFormat::HalfTopAndBottom,
+            }
+        }
+
+        if let Some(tag) = stereo_mode_tag {
+            let tag = tag.trim().to_ascii_lowercase();
+            match tag.as_str() {
+                "left_right" | "right_left" | "1" | "2" | "11" | "side_by_side"
+                | "side by side" | "sidebyside" => {
+                    return (
+                        Some(classify_sbs(width, height)),
+                        Some(Detect3DSource::ProbeTag.label()),
+                    );
+                }
+                "bottom_top" | "top_bottom" | "3" | "4" | "top_and_bottom" | "top and bottom"
+                | "topbottom" => {
+                    return (
+                        Some(classify_tab(width, height)),
+                        Some(Detect3DSource::ProbeTag.label()),
+                    );
+                }
+                "block_lr" | "block_rl" | "frame alternate" | "frame_alternate"
+                | "framesequence" | "13" | "14" => {
+                    return (
+                        Some(Video3DFormat::Mvc),
+                        Some(Detect3DSource::ProbeTag.label()),
+                    );
+                }
+                _ if tag.starts_with("anaglyph") => {
+                    return (None, Some("anaglyph"));
+                }
+                "mono" | "0" => {
+                    // Explicit 2D container tag; fall through to side_data_type check
+                }
+                _ => {
+                    // Unrecognized tag; fall through to side_data_type check
+                }
+            }
+        }
+
+        if let Some(side_data) = side_data_type {
+            let sd = side_data.trim().to_ascii_lowercase();
+            if sd == "side by side"
+                || sd == "side_by_side"
+                || sd == "sidebyside"
+                || sd == "side by side (quincunx)"
+                || sd.contains("side by side")
+            {
+                return (
+                    Some(classify_sbs(width, height)),
+                    Some(Detect3DSource::ProbeSideData.label()),
+                );
+            } else if sd == "top and bottom"
+                || sd == "top_and_bottom"
+                || sd == "topbottom"
+                || sd.contains("top and bottom")
+            {
+                return (
+                    Some(classify_tab(width, height)),
+                    Some(Detect3DSource::ProbeSideData.label()),
+                );
+            } else if sd == "frame alternate" || sd == "frame_alternate" || sd == "framesequence" {
+                return (
+                    Some(Video3DFormat::Mvc),
+                    Some(Detect3DSource::ProbeSideData.label()),
+                );
+            } else if sd.contains("anaglyph") {
+                return (None, Some("anaglyph"));
+            }
+        }
+
+        (None, None)
+    }
+}
+
+impl std::fmt::Display for Video3DFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Video3DFormat {
+    type Err = ParseVideo3DFormatError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        match trimmed {
+            "HalfSideBySide" => Ok(Self::HalfSideBySide),
+            "FullSideBySide" => Ok(Self::FullSideBySide),
+            "FullTopAndBottom" => Ok(Self::FullTopAndBottom),
+            "HalfTopAndBottom" => Ok(Self::HalfTopAndBottom),
+            "MVC" => Ok(Self::Mvc),
+            _ if trimmed.eq_ignore_ascii_case("mvc") => Ok(Self::Mvc),
+            _ if trimmed.eq_ignore_ascii_case("halfsidebyside") => Ok(Self::HalfSideBySide),
+            _ if trimmed.eq_ignore_ascii_case("fullsidebyside") => Ok(Self::FullSideBySide),
+            _ if trimmed.eq_ignore_ascii_case("fulltopandbottom") => Ok(Self::FullTopAndBottom),
+            _ if trimmed.eq_ignore_ascii_case("halftopandbottom") => Ok(Self::HalfTopAndBottom),
+            _ => Err(ParseVideo3DFormatError(s.to_string())),
+        }
+    }
+}
+
+/// ODD detection source label for 3D media format identification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Detect3DSource {
+    ProbeTag,
+    ProbeSideData,
+    ProbeMvc,
+    Filename,
+}
+
+impl Detect3DSource {
+    pub const ALL: [Self; 4] = [
+        Self::ProbeTag,
+        Self::ProbeSideData,
+        Self::ProbeMvc,
+        Self::Filename,
+    ];
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::ProbeTag => "probe_tag",
+            Self::ProbeSideData => "probe_sidedata",
+            Self::ProbeMvc => "probe_mvc",
+            Self::Filename => "filename",
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        self.label()
+    }
+}
+
+impl std::fmt::Display for Detect3DSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -2321,7 +2573,9 @@ pub struct ScanState {
 // 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
 // Re-probe so those rows drop the mux date; the metadata backfill then fills
 // the real year from the provider it had already matched correctly.
-pub const PROBE_SCHEMA_VERSION: i64 = 6;
+// v7 (T133): 3D layout detection (`MediaProbe::video_3d_format`). Re-probe so
+// 3D files extract stereoscopic metadata (`stereo_mode`, side data, MVC profile).
+pub const PROBE_SCHEMA_VERSION: i64 = 7;
 
 /// 005-kindle-conversion — bump when the BOOK extraction changes in a way that
 /// makes already-indexed book rows stale.
@@ -2804,8 +3058,9 @@ pub struct MediaFilters {
     /// `IsHD` — `Some(true)` keeps only `1280 <= width < 3840`; `Some(false)`
     /// keeps only items whose width is present and outside that band.
     pub is_hd: Option<bool>,
-    /// `Is3D` — no detection yet, so `Some(true)` matches nothing and
-    /// `Some(false)` matches everything (parity with the in-memory stub).
+    /// `Is3D` — filter on whether `media_items.video_3d_format` is set (`Some(true)`
+    /// keeps items where `video_3d_format IS NOT NULL`; `Some(false)` keeps
+    /// items where `video_3d_format IS NULL`).
     pub is_3d: Option<bool>,
     /// `MinWidth` — keep only items whose `width >= n`.
     pub min_width: Option<u32>,
@@ -3611,6 +3866,475 @@ pub trait TunerBackend: Send + Sync {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<EpgProgram>>> + Send;
+}
+
+#[cfg(test)]
+mod video_3d_format_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    struct VariantNameSerializer;
+
+    #[derive(Debug)]
+    struct TestSerError;
+    impl std::fmt::Display for TestSerError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ser error")
+        }
+    }
+    impl std::error::Error for TestSerError {}
+    impl serde::ser::Error for TestSerError {
+        fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+            TestSerError
+        }
+    }
+
+    impl serde::Serializer for VariantNameSerializer {
+        type Ok = &'static str;
+        type Error = TestSerError;
+        type SerializeSeq = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeTuple = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeTupleStruct = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeTupleVariant = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeMap = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeStruct = serde::ser::Impossible<&'static str, TestSerError>;
+        type SerializeStructVariant = serde::ser::Impossible<&'static str, TestSerError>;
+
+        fn serialize_unit_variant(
+            self,
+            _name: &'static str,
+            _variant_index: u32,
+            variant: &'static str,
+        ) -> Result<Self::Ok, Self::Error> {
+            Ok(variant)
+        }
+
+        fn serialize_bool(self, _v: bool) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_i8(self, _v: i8) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_i16(self, _v: i16) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_i32(self, _v: i32) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_i64(self, _v: i64) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_u8(self, _v: u8) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_u16(self, _v: u16) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_u32(self, _v: u32) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_u64(self, _v: u64) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_f32(self, _v: f32) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_f64(self, _v: f64) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_char(self, _v: char) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_str(self, _v: &str) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_bytes(self, _v: &[u8]) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_some<T: ?Sized + Serialize>(self, _v: &T) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            _v: &T,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _name: &'static str,
+            _vi: u32,
+            _v: &'static str,
+            _val: &T,
+        ) -> Result<Self::Ok, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_tuple_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleStruct, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_tuple_variant(
+            self,
+            _name: &'static str,
+            _vi: u32,
+            _v: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeTupleVariant, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_struct(
+            self,
+            _name: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStruct, Self::Error> {
+            Err(TestSerError)
+        }
+        fn serialize_struct_variant(
+            self,
+            _name: &'static str,
+            _vi: u32,
+            _v: &'static str,
+            _len: usize,
+        ) -> Result<Self::SerializeStructVariant, Self::Error> {
+            Err(TestSerError)
+        }
+    }
+
+    #[test]
+    fn video_3d_format_serde_wire_strings() {
+        use serde::de::value::StrDeserializer;
+
+        let cases = [
+            (Video3DFormat::HalfSideBySide, "HalfSideBySide"),
+            (Video3DFormat::FullSideBySide, "FullSideBySide"),
+            (Video3DFormat::FullTopAndBottom, "FullTopAndBottom"),
+            (Video3DFormat::HalfTopAndBottom, "HalfTopAndBottom"),
+            (Video3DFormat::Mvc, "MVC"),
+        ];
+        for (variant, wire) in cases {
+            let serialized = variant.serialize(VariantNameSerializer).expect("serialize");
+            assert_eq!(serialized, wire);
+            let deserialized =
+                Video3DFormat::deserialize(StrDeserializer::<serde::de::value::Error>::new(wire))
+                    .expect("deserialize");
+            assert_eq!(deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn metric_labels_are_distinct() {
+        use std::collections::HashSet;
+        let format_labels: HashSet<&'static str> =
+            Video3DFormat::ALL.iter().map(|f| f.label()).collect();
+        assert_eq!(format_labels.len(), Video3DFormat::ALL.len());
+
+        let source_labels: HashSet<&'static str> =
+            Detect3DSource::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(source_labels.len(), Detect3DSource::ALL.len());
+    }
+
+    #[test]
+    fn video_3d_format_from_str_and_display() {
+        for variant in Video3DFormat::ALL {
+            let s = variant.to_string();
+            assert_eq!(s, variant.as_str());
+            let parsed: Video3DFormat = s.parse().expect("parse canonical");
+            assert_eq!(parsed, variant);
+        }
+        // Case-insensitive "mvc" and canonical variations
+        assert_eq!(
+            "mvc".parse::<Video3DFormat>().expect("parse mvc"),
+            Video3DFormat::Mvc
+        );
+        assert_eq!(
+            "Mvc".parse::<Video3DFormat>().expect("parse Mvc"),
+            Video3DFormat::Mvc
+        );
+        assert_eq!(
+            "halfsidebyside"
+                .parse::<Video3DFormat>()
+                .expect("parse lower"),
+            Video3DFormat::HalfSideBySide
+        );
+
+        // Error carrying offending input value
+        let err = "UnknownFormat".parse::<Video3DFormat>().unwrap_err();
+        assert_eq!(err, ParseVideo3DFormatError("UnknownFormat".to_string()));
+        assert_eq!(
+            err.to_string(),
+            "unknown 3D video format: \"UnknownFormat\""
+        );
+    }
+
+    #[test]
+    fn from_probe_signals_mkv_stereo_mode() {
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("left_right"),
+                None,
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            (Some(Video3DFormat::HalfSideBySide), Some("probe_tag"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("left_right"),
+                None,
+                None,
+                None,
+                false,
+                Some(3840),
+                Some(1080)
+            ),
+            (Some(Video3DFormat::FullSideBySide), Some("probe_tag"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("top_bottom"),
+                None,
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            (Some(Video3DFormat::HalfTopAndBottom), Some("probe_tag"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("top_bottom"),
+                None,
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(2160)
+            ),
+            (Some(Video3DFormat::FullTopAndBottom), Some("probe_tag"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("block_lr"),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None
+            ),
+            (Some(Video3DFormat::Mvc), Some("probe_tag"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                Some("anaglyph_cyan_red"),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None
+            ),
+            (None, Some("anaglyph"))
+        );
+    }
+
+    #[test]
+    fn from_probe_signals_side_data_type() {
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("side by side"),
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            (Some(Video3DFormat::HalfSideBySide), Some("probe_sidedata"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("side by side"),
+                None,
+                None,
+                false,
+                Some(3840),
+                Some(1080)
+            ),
+            (Some(Video3DFormat::FullSideBySide), Some("probe_sidedata"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("top and bottom"),
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            (
+                Some(Video3DFormat::HalfTopAndBottom),
+                Some("probe_sidedata")
+            )
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("top and bottom"),
+                None,
+                None,
+                false,
+                Some(1920),
+                Some(2160)
+            ),
+            (
+                Some(Video3DFormat::FullTopAndBottom),
+                Some("probe_sidedata")
+            )
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("frame alternate"),
+                None,
+                None,
+                false,
+                None,
+                None
+            ),
+            (Some(Video3DFormat::Mvc), Some("probe_sidedata"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                Some("anaglyph"),
+                None,
+                None,
+                false,
+                None,
+                None
+            ),
+            (None, Some("anaglyph"))
+        );
+    }
+
+    #[test]
+    fn from_probe_signals_mvc_profile_and_codec() {
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                None,
+                None,
+                Some("Stereo High"),
+                false,
+                None,
+                None
+            ),
+            (Some(Video3DFormat::Mvc), Some("probe_mvc"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                None,
+                None,
+                Some("Multiview High"),
+                false,
+                None,
+                None
+            ),
+            (Some(Video3DFormat::Mvc), Some("probe_mvc"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(None, None, Some("mvc"), None, false, None, None),
+            (Some(Video3DFormat::Mvc), Some("probe_mvc"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(
+                None,
+                None,
+                Some("h264_mvc"),
+                None,
+                false,
+                None,
+                None
+            ),
+            (Some(Video3DFormat::Mvc), Some("probe_mvc"))
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(None, None, None, None, true, None, None),
+            (Some(Video3DFormat::Mvc), Some("probe_mvc"))
+        );
+    }
+
+    #[test]
+    fn from_probe_signals_2d_and_unknown() {
+        assert_eq!(
+            Video3DFormat::from_probe_signals(None, None, None, None, false, None, None),
+            (None, None)
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(Some("mono"), None, None, None, false, None, None),
+            (None, None)
+        );
+        assert_eq!(
+            Video3DFormat::from_probe_signals(Some("0"), None, None, None, false, None, None),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn probe_schema_version_is_current() {
+        assert_eq!(PROBE_SCHEMA_VERSION, 7);
+    }
+
+    #[test]
+    fn video_3d_format_is_packed_sbs_or_tab() {
+        assert!(Video3DFormat::HalfSideBySide.is_packed_sbs_or_tab());
+        assert!(Video3DFormat::FullSideBySide.is_packed_sbs_or_tab());
+        assert!(Video3DFormat::FullTopAndBottom.is_packed_sbs_or_tab());
+        assert!(Video3DFormat::HalfTopAndBottom.is_packed_sbs_or_tab());
+        assert!(!Video3DFormat::Mvc.is_packed_sbs_or_tab());
+    }
+
+    #[test]
+    fn media_probe_video_3d_format_default() {
+        let mut probe = MediaProbe::default();
+        assert_eq!(probe.video_3d_format, None);
+        assert!(!probe.is_3d());
+
+        probe.video_3d_format = Some(Video3DFormat::FullSideBySide);
+        assert_eq!(probe.video_3d_format, Some(Video3DFormat::FullSideBySide));
+        assert!(probe.is_3d());
+    }
 }
 
 #[cfg(test)]

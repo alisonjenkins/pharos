@@ -233,6 +233,7 @@ pub struct SegmentIdentity {
     /// [`SourceGen::LOCAL`] for every file-backed item, so their cache
     /// filenames are byte-identical to what they were before this existed.
     source_gen: SourceGen,
+    stereo_output: pharos_transcode::StereoOutput,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -1260,6 +1261,18 @@ impl SegmentIdentity {
             audio_bitrate_kbps: kbps(opts.audio_bitrate_bps()),
             codec_tag: codec_tag(opts.video, opts.audio_codec(), opts.container),
             source_gen,
+            stereo_output: if opts.stereo_output == pharos_transcode::StereoOutput::Mono2D
+                || ((subtitle_index.is_some()
+                    || opts.burn_subtitle_stream_index.is_some()
+                    || opts.burn_intent)
+                    && opts
+                        .video_3d_format
+                        .is_some_and(|f| f.is_packed_sbs_or_tab()))
+            {
+                pharos_transcode::StereoOutput::Mono2D
+            } else {
+                pharos_transcode::StereoOutput::Preserve
+            },
         }
     }
 
@@ -1280,6 +1293,7 @@ impl SegmentIdentity {
             audio_bitrate_kbps,
             codec_tag,
             source_gen,
+            stereo_output,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -1303,8 +1317,12 @@ impl SegmentIdentity {
                 k.to_string()
             }
         };
+        let stereo = match stereo_output {
+            pharos_transcode::StereoOutput::Preserve => "",
+            pharos_transcode::StereoOutput::Mono2D => "_mono2d",
+        };
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -3442,6 +3460,7 @@ impl HlsSegmentCache {
             audio_bitrate_kbps: 0,
             codec_tag: 0,
             source_gen: SourceGen::LOCAL,
+            stereo_output: pharos_transcode::StereoOutput::Preserve,
         })
     }
 
@@ -4842,6 +4861,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -4877,6 +4898,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -5141,6 +5164,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -8376,6 +8401,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -8618,6 +8645,63 @@ mod tests {
     }
 
     #[test]
+    fn segment_identity_stereo_output_distinguishes_cache_and_etag() {
+        let mut opts_preserve = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        opts_preserve.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        opts_preserve.stereo_output = pharos_transcode::StereoOutput::Preserve;
+
+        let key_2d = SegmentIdentity::new(
+            1,
+            5,
+            Some(1),
+            None,
+            &ident_opts(
+                Some(SegmentVideo::H264),
+                Some(SegmentAudio::Aac),
+                SegmentContainer::Mpegts,
+                Some(4_000_000),
+                Some(128_000),
+            ),
+            SourceGen::LOCAL,
+        );
+        let key_preserve =
+            SegmentIdentity::new(1, 5, Some(1), None, &opts_preserve, SourceGen::LOCAL);
+
+        // Preserve produces no suffix (identical filename and ETag to 2D)
+        assert_eq!(key_preserve.filename(), key_2d.filename());
+        assert!(!key_preserve.filename().contains("_mono2d"));
+        assert_eq!(key_preserve.etag(), key_2d.etag());
+
+        let mut opts_mono = opts_preserve.clone();
+        opts_mono.stereo_output = pharos_transcode::StereoOutput::Mono2D;
+        let key_mono = SegmentIdentity::new(1, 5, Some(1), None, &opts_mono, SourceGen::LOCAL);
+
+        // Mono2D appends _mono2d before .ts and produces distinct etag
+        assert!(key_mono.filename().ends_with("_mono2d.ts"));
+        assert_ne!(key_mono.filename(), key_preserve.filename());
+        assert_ne!(
+            key_mono.cache_relative_path(),
+            key_preserve.cache_relative_path()
+        );
+        assert_ne!(key_mono.etag(), key_preserve.etag());
+
+        // Also test implicit mono2d when burning subtitles on packed 3D
+        let mut opts_packed_burn = opts_preserve.clone();
+        opts_packed_burn.stereo_output = pharos_transcode::StereoOutput::Preserve;
+        opts_packed_burn.burn_intent = true;
+        let key_burn =
+            SegmentIdentity::new(1, 5, Some(1), None, &opts_packed_burn, SourceGen::LOCAL);
+        assert!(key_burn.filename().ends_with("_mono2d.ts"));
+        assert_eq!(key_burn.etag(), key_mono.etag());
+    }
+
+    #[test]
     fn a_continuous_audio_session_reaches_back_past_the_decode_preroll() {
         // The segment's ffmpeg seeks BOTH inputs to one preroll before the
         // segment start, because two inputs seeked to different positions are
@@ -8742,6 +8826,7 @@ mod tests {
                     audio_bitrate_kbps: 0,
                     codec_tag: 0,
                     source_gen: SourceGen::LOCAL,
+                    stereo_output: pharos_transcode::StereoOutput::Preserve,
                 },
                 body.len() as u64,
             )
@@ -8982,6 +9067,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9008,6 +9095,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9072,6 +9161,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -9113,6 +9204,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9155,6 +9248,8 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                video_3d_format: None,
+                stereo_output: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -9177,6 +9272,8 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                video_3d_format: None,
+                stereo_output: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)

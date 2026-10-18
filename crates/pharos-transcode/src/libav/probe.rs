@@ -13,6 +13,7 @@ use ffmpeg::ffi;
 use ffmpeg_the_third as ffmpeg;
 use pharos_core::{
     AudioTrack, MediaAttachment, MediaChapter, MediaKind, MediaProbe, ProbeInfo, SubtitleTrack,
+    Video3DFormat,
 };
 use std::ffi::CStr;
 use std::path::Path;
@@ -65,6 +66,18 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
     let mut subtitle_tracks: Vec<SubtitleTrack> = Vec::new();
     let mut attachments: Vec<MediaAttachment> = Vec::new();
 
+    let has_mvc_stream = ictx.streams().any(|stream| {
+        let st = unsafe { &*stream.as_ptr() };
+        let par = unsafe { &*st.codecpar };
+        par.codec_id == ffi::AVCodecID::MVC1
+            || par.codec_id == ffi::AVCodecID::MVC2
+            || codec_name(par.codec_id)
+                .is_some_and(|n| n == "mvc" || n == "h264_mvc" || n == "mvc1" || n == "mvc2")
+            || profile_name(par.codec_id, par.profile).is_some_and(|p| {
+                p.eq_ignore_ascii_case("Stereo High") || p.eq_ignore_ascii_case("Multiview High")
+            })
+    });
+
     for stream in ictx.streams() {
         // SAFETY: stream + its codecpar are valid for the iteration.
         let st = unsafe { &*stream.as_ptr() };
@@ -85,7 +98,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             ffi::AVMediaType::VIDEO
                 if video.is_none() && disp & ffi::AV_DISPOSITION_ATTACHED_PIC == 0 =>
             {
-                video = Some(extract_video(par, st));
+                video = Some(extract_video(par, st, has_mvc_stream));
             }
             ffi::AVMediaType::AUDIO => {
                 let meta = stream_tags(st);
@@ -188,6 +201,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
                 .or_else(|| ftags.date.filter(|s| !s.trim().is_empty())),
             chapters,
             alternate_sources: Vec::new(),
+            video_3d_format: v.video_3d_format,
         },
     })
 }
@@ -204,12 +218,89 @@ struct VideoFields {
     width: Option<u32>,
     height: Option<u32>,
     frame_rate_mille: Option<u32>,
+    pub video_3d_format: Option<Video3DFormat>,
 }
 
-fn extract_video(par: &ffi::AVCodecParameters, st: &ffi::AVStream) -> VideoFields {
+pub(crate) fn classify_libav_3d(
+    stereo_mode_tag: Option<&str>,
+    stereo3d_type: Option<ffi::AVStereo3DType>,
+    stereo3d_flags: u32,
+    has_mvc_stream: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Option<Video3DFormat> {
+    let side_data_str = if (stereo3d_flags & (ffi::AV_STEREO3D_FLAG_INVERT as u32)) != 0 {
+        None
+    } else {
+        match stereo3d_type {
+            Some(ffi::AVStereo3DType::SIDEBYSIDE | ffi::AVStereo3DType::SIDEBYSIDE_QUINCUNX) => {
+                Some("side by side")
+            }
+            Some(ffi::AVStereo3DType::TOPBOTTOM) => Some("top and bottom"),
+            Some(ffi::AVStereo3DType::FRAMESEQUENCE) => Some("frame alternate"),
+            _ => None,
+        }
+    };
+    Video3DFormat::from_probe_signals(
+        stereo_mode_tag,
+        side_data_str,
+        None,
+        None,
+        has_mvc_stream,
+        width,
+        height,
+    )
+    .0
+}
+
+fn extract_video(
+    par: &ffi::AVCodecParameters,
+    st: &ffi::AVStream,
+    has_mvc_stream: bool,
+) -> VideoFields {
     // avg_frame_rate preferred (VFR-correct), fall back to r_frame_rate.
     let frame_rate_mille =
         rational_mille(st.avg_frame_rate).or_else(|| rational_mille(st.r_frame_rate));
+    let stereo_mode =
+        dict_get(st.metadata, "stereo_mode").or_else(|| dict_get(st.metadata, "STEREO_MODE"));
+
+    let mut stereo3d_type: Option<ffi::AVStereo3DType> = None;
+    let mut stereo3d_flags: u32 = 0;
+    if !par.coded_side_data.is_null() && par.nb_coded_side_data > 0 {
+        for i in 0..par.nb_coded_side_data {
+            let sd = unsafe { &*par.coded_side_data.offset(i as isize) };
+            if sd.type_ == ffi::AVPacketSideDataType::STEREO3D
+                && !sd.data.is_null()
+                && sd.size >= std::mem::size_of::<ffi::AVStereo3D>()
+            {
+                let stereo3d = unsafe { &*(sd.data as *const ffi::AVStereo3D) };
+                stereo3d_type = Some(stereo3d.type_);
+                stereo3d_flags = stereo3d.flags as u32;
+                break;
+            }
+        }
+    }
+
+    let width = if par.width > 0 {
+        Some(par.width as u32)
+    } else {
+        None
+    };
+    let height = if par.height > 0 {
+        Some(par.height as u32)
+    } else {
+        None
+    };
+
+    let video_3d_format = classify_libav_3d(
+        stereo_mode.as_deref(),
+        stereo3d_type,
+        stereo3d_flags,
+        has_mvc_stream,
+        width,
+        height,
+    );
+
     VideoFields {
         codec: codec_name(par.codec_id),
         profile: profile_name(par.codec_id, par.profile),
@@ -223,17 +314,10 @@ fn extract_video(par: &ffi::AVCodecParameters, st: &ffi::AVStream) -> VideoField
         color_primaries: unsafe { cstr_owned(ffi::av_color_primaries_name(par.color_primaries)) },
         color_transfer: unsafe { cstr_owned(ffi::av_color_transfer_name(par.color_trc)) },
         color_space: unsafe { cstr_owned(ffi::av_color_space_name(par.color_space)) },
-        width: if par.width > 0 {
-            Some(par.width as u32)
-        } else {
-            None
-        },
-        height: if par.height > 0 {
-            Some(par.height as u32)
-        } else {
-            None
-        },
+        width,
+        height,
         frame_rate_mille,
+        video_3d_format,
     }
 }
 
@@ -492,5 +576,113 @@ fn parse_replaygain_centidb(s: &str) -> Option<i16> {
         Some(scaled as i16)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_libav_3d_mkv_stereo_mode() {
+        assert_eq!(
+            classify_libav_3d(Some("left_right"), None, 0, false, Some(1920), Some(1080)),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(
+            classify_libav_3d(Some("left_right"), None, 0, false, Some(3840), Some(1080)),
+            Some(Video3DFormat::FullSideBySide)
+        );
+        assert_eq!(
+            classify_libav_3d(Some("top_bottom"), None, 0, false, Some(1920), Some(1080)),
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert_eq!(
+            classify_libav_3d(Some("top_bottom"), None, 0, false, Some(1920), Some(2160)),
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+    }
+
+    #[test]
+    fn test_classify_libav_3d_side_data_stereo3d() {
+        assert_eq!(
+            classify_libav_3d(
+                None,
+                Some(ffi::AVStereo3DType::SIDEBYSIDE),
+                0,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(
+            classify_libav_3d(
+                None,
+                Some(ffi::AVStereo3DType::TOPBOTTOM),
+                0,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+        assert_eq!(
+            classify_libav_3d(
+                None,
+                Some(ffi::AVStereo3DType::FRAMESEQUENCE),
+                0,
+                false,
+                None,
+                None
+            ),
+            Some(Video3DFormat::Mvc)
+        );
+    }
+
+    #[test]
+    fn test_classify_libav_3d_invert_flag() {
+        assert_eq!(
+            classify_libav_3d(
+                None,
+                Some(ffi::AVStereo3DType::SIDEBYSIDE),
+                ffi::AV_STEREO3D_FLAG_INVERT as u32,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_libav_3d_mvc_stream() {
+        assert_eq!(
+            classify_libav_3d(None, None, 0, true, None, None),
+            Some(Video3DFormat::Mvc)
+        );
+    }
+
+    #[test]
+    fn test_classify_libav_3d_2d_stream() {
+        assert_eq!(
+            classify_libav_3d(None, None, 0, false, Some(1920), Some(1080)),
+            None
+        );
+        assert_eq!(
+            classify_libav_3d(
+                None,
+                Some(ffi::AVStereo3DType::_2D),
+                0,
+                false,
+                Some(1920),
+                Some(1080)
+            ),
+            None
+        );
+        assert_eq!(
+            classify_libav_3d(Some("mono"), None, 0, false, Some(1920), Some(1080)),
+            None
+        );
     }
 }

@@ -41,7 +41,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     original_language, art_version, \
     book_format, book_page_count, book_author, book_publisher, book_series, \
-    book_series_index, book_isbn";
+    book_series_index, book_isbn, video_3d_format";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -3299,6 +3299,7 @@ struct MediaRow {
     match_confidence: Option<f32>,
     metadata_refreshed_at: Option<i64>,
     original_language: Option<String>,
+    video_3d_format: Option<String>,
 }
 
 impl SeriesMetadataStore for PostgresStore {
@@ -3471,6 +3472,7 @@ impl MediaRow {
             // P34 — alternate editions enrichment lives in the
             // scanner; postgres rows today never carry them.
             alternate_sources: Vec::new(),
+            video_3d_format: self.video_3d_format.as_deref().and_then(|s| s.parse().ok()),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

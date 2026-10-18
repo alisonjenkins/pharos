@@ -2574,6 +2574,7 @@ async fn playback_info(
         video_bit_depth: pharos_jellyfin_api::device_profile::bit_depth_from_pix_fmt(
             probe.pixel_format.as_deref(),
         ),
+        video_3d_format: probe.video_3d_format,
     };
 
     // Consume the POST body once: the DeviceProfile drives negotiation, and
@@ -2738,6 +2739,32 @@ async fn playback_info(
         decision
     };
 
+    let qs_stereo_mode = query_param(req.query_string(), "StereoMode");
+    let explicit_mono = qs_stereo_mode
+        .is_some_and(|m| m.eq_ignore_ascii_case("mono") || m.eq_ignore_ascii_case("mono2d"));
+    let explicit_preserve = qs_stereo_mode.is_some_and(|m| m.eq_ignore_ascii_case("preserve"));
+    let profile_rejected_3d = is_video
+        && probe.video_3d_format.is_some()
+        && !pharos_jellyfin_api::device_profile::codec_profile_3d_passes(
+            &profile.codec_profiles,
+            &source,
+        );
+    let decision = if is_video
+        && probe.video_3d_format.is_some()
+        && explicit_mono
+        && !matches!(decision, Decision::Transcode { .. })
+    {
+        downgrade = Some("stereo_mode_mono");
+        Decision::Transcode {
+            target_container: "ts".into(),
+            target_video_codec: Some("h264".into()),
+            target_audio_codec: Some("aac".into()),
+            max_video_bitrate_bps: remote_ceiling,
+        }
+    } else {
+        decision
+    };
+
     // Resolve which embedded TEXT subs this client can't render externally
     // (its SubtitleProfile lacks an External/Embed/Hls entry for that
     // format) — those must advertise Encode so the client requests the burn
@@ -2824,6 +2851,22 @@ async fn playback_info(
             downgrade = Some("client_switch");
         }
         adjusted
+    };
+
+    let burning_sub_on_packed_3d = is_video
+        && probe
+            .video_3d_format
+            .is_some_and(|f| f.is_packed_sbs_or_tab())
+        && selected_sub.is_some_and(|t| {
+            is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
+                || burn_text_indices.contains(&t.stream_index)
+        });
+    let stereo_output = if !explicit_preserve
+        && (explicit_mono || profile_rejected_3d || burning_sub_on_packed_3d)
+    {
+        pharos_transcode::StereoOutput::Mono2D
+    } else {
+        pharos_transcode::StereoOutput::Preserve
     };
 
     // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
@@ -2951,6 +2994,13 @@ async fn playback_info(
                 || burn_text_indices.contains(&t.stream_index)
             {
                 push("SubtitleStreamIndex", t.stream_index.to_string());
+            }
+        }
+        if is_video && probe.video_3d_format.is_some() {
+            if stereo_output == pharos_transcode::StereoOutput::Mono2D {
+                push("StereoMode", "mono".to_string());
+            } else if explicit_preserve {
+                push("StereoMode", "preserve".to_string());
             }
         }
         s
@@ -3134,6 +3184,46 @@ async fn playback_info(
         "downgrade" => downgrade.unwrap_or("none"),
     )
     .increment(1);
+
+    if is_video {
+        if let Some(fmt) = probe.video_3d_format {
+            let decision_3d_label = if direct_play {
+                "direct_play"
+            } else if supports_direct_stream {
+                "direct_stream"
+            } else {
+                "transcode"
+            };
+            let reason_3d_label = if direct_play || supports_direct_stream {
+                "passthrough"
+            } else if explicit_mono {
+                "stereo_mode_query"
+            } else if profile_rejected_3d {
+                "profile_condition"
+            } else if burning_sub_on_packed_3d {
+                "subtitle_burn"
+            } else {
+                downgrade.unwrap_or_else(|| direct_play_block.label())
+            };
+            metrics::counter!(
+                "pharos_playback_3d_decision_total",
+                "format" => fmt.label(),
+                "decision" => decision_3d_label,
+                "stereo_output" => stereo_output.label(),
+                "reason" => reason_3d_label,
+            )
+            .increment(1);
+            tracing::info!(
+                target: "pharos::playback::3d",
+                item_id = id,
+                video_3d_format = fmt.as_str(),
+                decision = decision_3d_label,
+                stereo_output = stereo_output.label(),
+                reason = reason_3d_label,
+                "resolved 3D playback decision"
+            );
+        }
+    }
 
     // Register the negotiated Decision under this PlaySessionId. For a
     // transcode the HLS segment generator reads it back to honour the target
@@ -3499,6 +3589,11 @@ async fn playback_info(
         default_audio_stream_index,
         default_subtitle_stream_index,
         start_position_ticks: resume_ticks,
+        video_3d_format: if is_video {
+            probe.video_3d_format
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -3532,6 +3627,11 @@ async fn playback_info(
             bitrate: alt.bitrate_bps.or(probe.bitrate_bps),
             default_audio_stream_index,
             default_subtitle_stream_index,
+            video_3d_format: if is_video {
+                probe.video_3d_format
+            } else {
+                None
+            },
             ..Default::default()
         });
     }

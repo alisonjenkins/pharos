@@ -5,7 +5,7 @@
 
 use pharos_core::{
     DomainError, DomainResult, MediaChapter, MediaKind, MediaProbe, ProbeInfo, Prober,
-    SubtitleTrack,
+    SubtitleTrack, Video3DFormat,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -140,6 +140,16 @@ struct FfprobeStream {
     tags: FfprobeStreamTags,
     #[serde(default)]
     disposition: FfprobeDisposition,
+    #[serde(default)]
+    side_data_list: Vec<FfprobeSideData>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FfprobeSideData {
+    #[serde(default)]
+    side_data_type: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -148,6 +158,8 @@ struct FfprobeStreamTags {
     language: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default, alias = "STEREO_MODE")]
+    stereo_mode: Option<String>,
     /// P37 — ReplayGain track gain string ffprobe reports as
     /// `"-7.34 dB"`. Parsed at AudioTrack construction time.
     #[serde(default, rename = "replaygain_track_gain")]
@@ -361,6 +373,17 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok());
 
+    let has_mvc_stream = parsed.streams.iter().any(|s| {
+        s.codec_type == "video"
+            && (matches!(
+                s.codec_name.as_deref(),
+                Some("mvc") | Some("h264_mvc") | Some("mvc1") | Some("mvc2")
+            ) || matches!(
+                s.profile.as_deref(),
+                Some("Stereo High") | Some("Multiview High")
+            ))
+    });
+
     let video_stream = parsed.streams.iter().find(|s| is_real_video_stream(s));
     let audio_stream = parsed.streams.iter().find(|s| s.codec_type == "audio");
 
@@ -413,6 +436,32 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
     let audio_codec = audio_stream.and_then(|s| s.codec_name.clone());
     let width = video_stream.and_then(|s| s.width);
     let height = video_stream.and_then(|s| s.height);
+    let video_3d_format = if let Some(v) = video_stream {
+        let stereo_mode = v.tags.stereo_mode.as_deref();
+        let side_data_stereo_type = v
+            .side_data_list
+            .iter()
+            .find(|sd| {
+                sd.side_data_type
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("Stereo 3D"))
+            })
+            .and_then(|sd| sd.kind.as_deref());
+        Video3DFormat::from_probe_signals(
+            stereo_mode,
+            side_data_stereo_type,
+            v.codec_name.as_deref(),
+            v.profile.as_deref(),
+            has_mvc_stream,
+            v.width,
+            v.height,
+        )
+        .0
+    } else if has_mvc_stream {
+        Some(Video3DFormat::Mvc)
+    } else {
+        None
+    };
     let frame_rate_mille = video_stream.and_then(|s| {
         s.avg_frame_rate
             .as_deref()
@@ -549,6 +598,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             // or NFO metadata). FfmpegProber today only probes a
             // single file.
             alternate_sources: Vec::new(),
+            video_3d_format,
         },
     })
 }
@@ -880,5 +930,173 @@ mod tests {
     fn parse_no_chapters_section_returns_empty_vec() {
         let info = parse_ffprobe_output(VIDEO_JSON).unwrap();
         assert!(info.probe.chapters.is_empty());
+    }
+
+    #[test]
+    fn parse_3d_mkv_stereo_mode_left_right_1080p_is_half_sbs() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"stereo_mode": "left_right"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(
+            info.probe.video_3d_format,
+            Some(Video3DFormat::HalfSideBySide)
+        );
+    }
+
+    #[test]
+    fn parse_3d_mkv_stereo_mode_left_right_3840x1080_is_full_sbs() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 3840,
+                    "height": 1080,
+                    "tags": {"stereo_mode": "left_right"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(
+            info.probe.video_3d_format,
+            Some(Video3DFormat::FullSideBySide)
+        );
+    }
+
+    #[test]
+    fn parse_3d_mkv_stereo_mode_top_bottom_1080p_is_half_tab() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"stereo_mode": "top_bottom"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(
+            info.probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+    }
+
+    #[test]
+    fn parse_3d_mkv_stereo_mode_top_bottom_1920x2160_is_full_tab() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 2160,
+                    "tags": {"stereo_mode": "top_bottom"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(
+            info.probe.video_3d_format,
+            Some(Video3DFormat::FullTopAndBottom)
+        );
+    }
+
+    #[test]
+    fn parse_3d_mkv_stereo_mode_block_lr_is_mvc() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"stereo_mode": "block_lr"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(info.probe.video_3d_format, Some(Video3DFormat::Mvc));
+    }
+
+    #[test]
+    fn parse_3d_mp4_side_data_side_by_side_is_half_sbs() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "side_data_list": [
+                        {"side_data_type": "Stereo 3D", "type": "side by side"}
+                    ]
+                }
+            ],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(
+            info.probe.video_3d_format,
+            Some(Video3DFormat::HalfSideBySide)
+        );
+    }
+
+    #[test]
+    fn parse_3d_secondary_mvc_stream_is_mvc() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "profile": "High",
+                    "width": 1920,
+                    "height": 1080
+                },
+                {
+                    "codec_type": "video",
+                    "codec_name": "mvc",
+                    "profile": "Stereo High",
+                    "width": 1920,
+                    "height": 1080
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(info.probe.video_3d_format, Some(Video3DFormat::Mvc));
+    }
+
+    #[test]
+    fn parse_3d_mono_stereo_mode_is_none() {
+        let json = br#"{
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "tags": {"stereo_mode": "mono"}
+                }
+            ],
+            "format": {"format_name": "matroska,webm"}
+        }"#;
+        let info = parse_ffprobe_output(json).unwrap();
+        assert_eq!(info.probe.video_3d_format, None);
     }
 }
