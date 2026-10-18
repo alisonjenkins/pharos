@@ -73,6 +73,19 @@ ignore = [
     # no-dev` prints nothing. Re-evaluate if actix-web ever ships a release
     # off h2 0.3, or if `http2` becomes needed in production.
     "RUSTSEC-2026-0258",
+    # zip 8.6.0 (pinned by `boko` 0.5.0, whose `zip = "8"` cannot reach 9.x):
+    # yanked upstream, plus RUSTSEC-2026-0367 (SUID/SGID kept on extract),
+    # -0368 and -0369 (`extract()` follows attacker-controlled symlinks).
+    # No fixed 8.x exists, and every one of these lives in
+    # `ZipArchive::extract` / `ZipStreamReader::extract`. boko only reads
+    # entries (`ZipArchive::by_name`) and writes via `ZipWriter`; it never
+    # extracts to disk (`grep -rn "extract" boko-0.5.0/src` hits only its own
+    # KFX metadata helpers). pharos's own zip (9.0.x) is unaffected. Drop all
+    # four when boko moves to zip 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "zip@8.6.0",
 ]
 
 [licenses]
