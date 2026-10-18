@@ -3,9 +3,10 @@
 
 use futures_util::stream::StreamExt;
 use pharos_core::{
-    AlternateMediaSource, ArtworkSource, CollectionStore, DomainError, DomainResult, Fingerprint,
-    GenreStore, MediaId, MediaItem, MediaKind, MediaStore, MetadataRequest, MetadataResult,
-    PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo, StudioStore, TagStore,
+    AlternateMediaSource, ArtworkSource, CollectionStore, Detect3DSource, DomainError,
+    DomainResult, Fingerprint, GenreStore, MediaId, MediaItem, MediaKind, MediaStore,
+    MetadataRequest, MetadataResult, PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo,
+    StudioStore, TagStore, Video3DFormat,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1574,6 +1575,7 @@ impl<P: Prober> FsScanner<P> {
                 } else {
                     info.kind
                 };
+                resolve_item_3d_format(&path, kind, &mut probe);
                 let series = if matches!(kind, MediaKind::Episode) {
                     parse_series_info(&path)
                 } else {
@@ -1966,6 +1968,128 @@ pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, 
 ///
 /// Path-only — no probe required. Files in a "Movies/" tree never hit
 /// either signal and stay Movie.
+pub(crate) fn resolve_item_3d_format(
+    path: &Path,
+    kind: MediaKind,
+    probe: &mut pharos_core::MediaProbe,
+) {
+    if !matches!(kind, MediaKind::Movie | MediaKind::Episode) {
+        return;
+    }
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let mut explicit_fmt = crate::metadata::filename::has_explicit_full_or_half_3d_token(stem);
+    let (mut fn_fmt, mut fn_label) = crate::metadata::filename::parse_video_3d_format(stem);
+
+    if fn_fmt.is_none() && explicit_fmt.is_none() {
+        if let Some(parent_name) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if explicit_fmt.is_none() {
+                explicit_fmt =
+                    crate::metadata::filename::has_explicit_full_or_half_3d_token(parent_name);
+            }
+            if fn_fmt.is_none() {
+                let (p_fmt, p_label) =
+                    crate::metadata::filename::parse_video_3d_format(parent_name);
+                fn_fmt = p_fmt;
+                if fn_label.is_none() {
+                    fn_label = p_label;
+                }
+            }
+        }
+    }
+
+    let (final_fmt, source) = if let Some(probe_fmt) = probe.video_3d_format {
+        let probe_source = if probe_fmt == Video3DFormat::Mvc {
+            Detect3DSource::ProbeMvc
+        } else if probe
+            .container
+            .as_deref()
+            .is_some_and(|c| c.contains("mp4") || c.contains("mov") || c.contains("m4v"))
+            || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                e.eq_ignore_ascii_case("mp4")
+                    || e.eq_ignore_ascii_case("mov")
+                    || e.eq_ignore_ascii_case("m4v")
+            })
+        {
+            Detect3DSource::ProbeSideData
+        } else {
+            Detect3DSource::ProbeTag
+        };
+
+        if probe_fmt.is_packed_sbs_or_tab() {
+            if let Some(explicit) = explicit_fmt {
+                let is_same_axis = {
+                    let is_sbs = |f: Video3DFormat| {
+                        matches!(
+                            f,
+                            Video3DFormat::HalfSideBySide | Video3DFormat::FullSideBySide
+                        )
+                    };
+                    let is_tab = |f: Video3DFormat| {
+                        matches!(
+                            f,
+                            Video3DFormat::HalfTopAndBottom | Video3DFormat::FullTopAndBottom
+                        )
+                    };
+                    (is_sbs(probe_fmt) && is_sbs(explicit))
+                        || (is_tab(probe_fmt) && is_tab(explicit))
+                };
+                if is_same_axis && explicit != probe_fmt {
+                    (explicit, probe_source)
+                } else {
+                    (probe_fmt, probe_source)
+                }
+            } else {
+                (probe_fmt, probe_source)
+            }
+        } else {
+            (probe_fmt, probe_source)
+        }
+    } else if let Some(fn_fmt) = fn_fmt {
+        (fn_fmt, Detect3DSource::Filename)
+    } else {
+        if let Some(label) = fn_label {
+            if label == "anaglyph" || label == "unspecified_3d" {
+                metrics::counter!(
+                    "pharos_3d_detect_total",
+                    "format" => label,
+                    "source" => Detect3DSource::Filename.label(),
+                    "media_kind" => kind.as_str(),
+                )
+                .increment(1);
+            }
+        }
+        return;
+    };
+
+    probe.video_3d_format = Some(final_fmt);
+
+    metrics::counter!(
+        "pharos_3d_detect_total",
+        "format" => final_fmt.label(),
+        "source" => source.label(),
+        "media_kind" => kind.as_str(),
+    )
+    .increment(1);
+
+    tracing::info!(
+        target: "pharos::scanner::3d",
+        path = %path.display(),
+        video_3d_format = final_fmt.as_str(),
+        source = source.label(),
+        width = probe.width,
+        height = probe.height,
+        "detected 3D video format"
+    );
+}
+
 pub fn is_episode_path(path: &Path) -> bool {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if has_sxxeyy_token(name) {
@@ -5846,5 +5970,124 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn resolve_3d_format_filename_fallback_movie_and_episode() {
+        let mut movie_probe = pharos_core::MediaProbe::default();
+        let movie_path = Path::new("/movies/Avatar.2009.1080p.3D.HSBS.mkv");
+        resolve_item_3d_format(movie_path, MediaKind::Movie, &mut movie_probe);
+        assert_eq!(
+            movie_probe.video_3d_format,
+            Some(Video3DFormat::HalfSideBySide)
+        );
+
+        let mut ep_probe = pharos_core::MediaProbe::default();
+        let ep_path = Path::new("/shows/Show.S01E01.1080p.3D.HTAB.mkv");
+        resolve_item_3d_format(ep_path, MediaKind::Episode, &mut ep_probe);
+        assert_eq!(
+            ep_probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
+
+        let mut audio_probe = pharos_core::MediaProbe::default();
+        let audio_path = Path::new("/music/Track.3D.HSBS.flac");
+        resolve_item_3d_format(audio_path, MediaKind::Audio, &mut audio_probe);
+        assert_eq!(audio_probe.video_3d_format, None);
+    }
+
+    #[test]
+    fn resolve_3d_format_container_metadata_precedence_over_conflicting_filename() {
+        let mut probe = pharos_core::MediaProbe {
+            video_3d_format: Some(Video3DFormat::HalfTopAndBottom),
+            container: Some("matroska".into()),
+            ..Default::default()
+        };
+        let path = Path::new("/movies/Avatar.2009.1080p.3D.HSBS.mkv");
+        resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
+        assert_eq!(
+            probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom),
+            "container metadata (top_bottom) must win over conflicting filename token (HSBS)"
+        );
+    }
+
+    #[test]
+    fn resolve_3d_format_explicit_fsbs_overrides_heuristic_aspect_ratio() {
+        let mut probe = pharos_core::MediaProbe {
+            width: Some(1920),
+            height: Some(1080),
+            video_3d_format: Some(Video3DFormat::HalfSideBySide),
+            container: Some("matroska".into()),
+            ..Default::default()
+        };
+        let path = Path::new("/movies/Avatar.2009.1080p.3D.FSBS.mkv");
+        resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
+        assert_eq!(
+            probe.video_3d_format,
+            Some(Video3DFormat::FullSideBySide),
+            "explicit FSBS filename token must override anamorphic aspect-ratio heuristic on same axis"
+        );
+    }
+
+    #[test]
+    fn resolve_3d_format_emits_telemetry_counter() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut probe = pharos_core::MediaProbe {
+            width: Some(1920),
+            height: Some(1080),
+            video_3d_format: Some(Video3DFormat::HalfSideBySide),
+            container: Some("matroska".into()),
+            ..Default::default()
+        };
+        let path = Path::new("/movies/Avatar.2009.1080p.mkv");
+        resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
+
+        let snapshot = snapshotter.snapshot();
+        let found = snapshot.into_vec().into_iter().any(|(ck, _, _, _)| {
+            let k = ck.key();
+            if k.name() != "pharos_3d_detect_total" {
+                return false;
+            }
+            let labels: Vec<String> = k
+                .labels()
+                .map(|l| format!("{}={}", l.key(), l.value()))
+                .collect();
+            labels.contains(&"format=HalfSideBySide".to_string())
+                && labels.contains(&"source=probe_tag".to_string())
+                && labels.contains(&"media_kind=movie".to_string())
+        });
+        assert!(
+            found,
+            "pharos_3d_detect_total metric must be emitted with format, source, and media_kind labels"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_probe_one_integrates_3d_detection_for_movie_and_episode() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Avatar.2009.1080p.3D.HSBS.mkv", b"fake").await;
+        write_file(td.path(), "Show.S01E01.1080p.3D.HTAB.mkv", b"fake").await;
+
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let movie_item = item_by_path(&store, &td.path().join("Avatar.2009.1080p.3D.HSBS.mkv"));
+        assert_eq!(
+            movie_item.probe.video_3d_format,
+            Some(Video3DFormat::HalfSideBySide)
+        );
+
+        let ep_item = item_by_path(&store, &td.path().join("Show.S01E01.1080p.3D.HTAB.mkv"));
+        assert_eq!(
+            ep_item.probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom)
+        );
     }
 }
