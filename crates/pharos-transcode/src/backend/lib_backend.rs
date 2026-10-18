@@ -38,6 +38,17 @@ impl FfmpegBackend for LibBackend {
         Box::pin(async { Err(BackendError::NotImplemented) })
     }
 
+    fn extract_image_3d<'a>(
+        &'a self,
+        _src: &'a Path,
+        _seek_ms: u64,
+        _width: u32,
+        _video_3d_format: Option<pharos_core::Video3DFormat>,
+        _out: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
+        Box::pin(async { Err(BackendError::NotImplemented) })
+    }
+
     fn extract_subtitle<'a>(
         &'a self,
         _src: &'a Path,
