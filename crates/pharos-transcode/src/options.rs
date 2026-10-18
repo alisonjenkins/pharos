@@ -2,6 +2,7 @@
 //! reason in terms of containers/codecs the wire protocol exposes.
 
 use pharos_core::time::Ticks;
+use pharos_core::Video3DFormat;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,7 +325,7 @@ pub struct MuxedAudio {
     pub start_seconds: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TranscodeOptions {
     pub container: Container,
     /// The SOURCE frame rate this segment's window was snapped to, when known.
@@ -334,7 +335,6 @@ pub struct TranscodeOptions {
     /// their default 1/framerate timebase, place the first frame half a frame
     /// late and lose the last one — one dropped frame per segment. See the
     /// `-r` block in `build_args_for_device`.
-    #[serde(default)]
     pub source_frame_rate: Option<pharos_core::FrameRate>,
     pub video: Option<VideoCodec>,
     /// What the SOURCE contains, when it could be named.
@@ -361,11 +361,9 @@ pub struct TranscodeOptions {
     /// nonetheless re-place two thirds of the live fMP4 renditions on deploy —
     /// serving cached segments from the previous encoder under an init the
     /// browser holds `immutable` for a year, which is issue #114 exactly.
-    #[serde(skip)]
     pub source_video_codec: Option<SourceCodec>,
     /// Whether the source is plain 8-bit SDR; see [`SourceVideoKind`]. Read by
     /// the scheduler to decide the VAAPI pipeline, never by the worker.
-    #[serde(skip)]
     pub source_video_kind: SourceVideoKind,
     pub audio: Option<AudioCodec>,
     pub video_bitrate_bps: Option<u64>,
@@ -429,7 +427,6 @@ pub struct TranscodeOptions {
     /// frames: the container index claimed a random-access point the decoder
     /// could not actually start from, and the default preroll did not reach
     /// far enough back to find a real one.
-    #[serde(default)]
     pub decode_preroll_seconds: Option<f64>,
     /// Take this segment's audio by COPY from the title's one continuous
     /// audio encode at this path, instead of encoding audio here.
@@ -445,7 +442,6 @@ pub struct TranscodeOptions {
     /// source, because two inputs seeked to different positions are re-based
     /// by different amounts and the audio would land offset from the video by
     /// the difference.
-    #[serde(default)]
     pub muxed_audio_source: Option<MuxedAudio>,
     /// B228 — when set, this segment is a FILLER: black video (+ silence for
     /// a muxed audio rendition) generated from an ffmpeg `lavfi` source
@@ -477,8 +473,11 @@ pub struct TranscodeOptions {
     /// pulls it back out into that sibling field (see
     /// `HlsSegmentCache::write_segment`); nothing downstream reads it after
     /// that point.
-    #[serde(skip)]
     pub filler: Option<FillerSpec>,
+    /// 3D video layout if source is stereoscopic.
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
+    /// Target stereoscopic output mode (preserve or downmix to 2D mono).
+    pub stereo_output: StereoOutput,
 }
 
 /// What the spawn arg builder needs to synthesize a filler segment: the
@@ -503,6 +502,222 @@ pub struct FillerSpec {
     pub audio_codec: Option<AudioCodec>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct TranscodeOptionsBinary {
+    container: Container,
+    #[serde(default)]
+    source_frame_rate: Option<pharos_core::FrameRate>,
+    #[serde(skip)]
+    source_video_codec: Option<SourceCodec>,
+    #[serde(skip)]
+    source_video_kind: SourceVideoKind,
+    video: Option<VideoCodec>,
+    audio: Option<AudioCodec>,
+    video_bitrate_bps: Option<u64>,
+    audio_bitrate_bps: Option<u64>,
+    start_position_ticks: u64,
+    duration_ticks: Option<u64>,
+    audio_source_stream_index: Option<u32>,
+    burn_subtitle_stream_index: Option<u32>,
+    burn_intent: bool,
+    burn_subtitle_is_text: bool,
+    burn_subtitle_ass_path: Option<std::path::PathBuf>,
+    burn_fonts_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    decode_preroll_seconds: Option<f64>,
+    #[serde(default)]
+    muxed_audio_source: Option<MuxedAudio>,
+    video_3d_format: Option<pharos_core::Video3DFormat>,
+    stereo_output: StereoOutput,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TranscodeOptionsJson {
+    container: Container,
+    #[serde(default)]
+    source_frame_rate: Option<pharos_core::FrameRate>,
+    #[serde(skip)]
+    source_video_codec: Option<SourceCodec>,
+    #[serde(skip)]
+    source_video_kind: SourceVideoKind,
+    video: Option<VideoCodec>,
+    audio: Option<AudioCodec>,
+    video_bitrate_bps: Option<u64>,
+    audio_bitrate_bps: Option<u64>,
+    start_position_ticks: u64,
+    duration_ticks: Option<u64>,
+    audio_source_stream_index: Option<u32>,
+    burn_subtitle_stream_index: Option<u32>,
+    burn_intent: bool,
+    burn_subtitle_is_text: bool,
+    burn_subtitle_ass_path: Option<std::path::PathBuf>,
+    burn_fonts_dir: Option<std::path::PathBuf>,
+    #[serde(default)]
+    decode_preroll_seconds: Option<f64>,
+    #[serde(default)]
+    muxed_audio_source: Option<MuxedAudio>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video_3d_format: Option<pharos_core::Video3DFormat>,
+    #[serde(default, skip_serializing_if = "StereoOutput::is_preserve")]
+    stereo_output: StereoOutput,
+}
+
+macro_rules! impl_transcode_options_shim {
+    ($shim:ident) => {
+        impl From<&TranscodeOptions> for $shim {
+            fn from(o: &TranscodeOptions) -> Self {
+                Self {
+                    container: o.container,
+                    source_frame_rate: o.source_frame_rate,
+                    source_video_codec: o.source_video_codec,
+                    source_video_kind: o.source_video_kind,
+                    video: o.video,
+                    audio: o.audio,
+                    video_bitrate_bps: o.video_bitrate_bps,
+                    audio_bitrate_bps: o.audio_bitrate_bps,
+                    start_position_ticks: o.start_position_ticks,
+                    duration_ticks: o.duration_ticks,
+                    audio_source_stream_index: o.audio_source_stream_index,
+                    burn_subtitle_stream_index: o.burn_subtitle_stream_index,
+                    burn_intent: o.burn_intent,
+                    burn_subtitle_is_text: o.burn_subtitle_is_text,
+                    burn_subtitle_ass_path: o.burn_subtitle_ass_path.clone(),
+                    burn_fonts_dir: o.burn_fonts_dir.clone(),
+                    decode_preroll_seconds: o.decode_preroll_seconds,
+                    muxed_audio_source: o.muxed_audio_source.clone(),
+                    video_3d_format: o.video_3d_format,
+                    stereo_output: o.stereo_output,
+                }
+            }
+        }
+
+        impl From<$shim> for TranscodeOptions {
+            fn from(o: $shim) -> Self {
+                Self {
+                    container: o.container,
+                    source_frame_rate: o.source_frame_rate,
+                    source_video_codec: o.source_video_codec,
+                    source_video_kind: o.source_video_kind,
+                    video: o.video,
+                    audio: o.audio,
+                    video_bitrate_bps: o.video_bitrate_bps,
+                    audio_bitrate_bps: o.audio_bitrate_bps,
+                    start_position_ticks: o.start_position_ticks,
+                    duration_ticks: o.duration_ticks,
+                    audio_source_stream_index: o.audio_source_stream_index,
+                    burn_subtitle_stream_index: o.burn_subtitle_stream_index,
+                    burn_intent: o.burn_intent,
+                    burn_subtitle_is_text: o.burn_subtitle_is_text,
+                    burn_subtitle_ass_path: o.burn_subtitle_ass_path,
+                    burn_fonts_dir: o.burn_fonts_dir,
+                    decode_preroll_seconds: o.decode_preroll_seconds,
+                    muxed_audio_source: o.muxed_audio_source,
+                    video_3d_format: o.video_3d_format,
+                    stereo_output: o.stereo_output,
+                    filler: None,
+                }
+            }
+        }
+    };
+}
+
+impl_transcode_options_shim!(TranscodeOptionsBinary);
+impl_transcode_options_shim!(TranscodeOptionsJson);
+
+impl Serialize for TranscodeOptions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if serializer.is_human_readable() {
+            TranscodeOptionsJson::from(self).serialize(serializer)
+        } else {
+            TranscodeOptionsBinary::from(self).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TranscodeOptions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            TranscodeOptionsJson::deserialize(deserializer).map(Into::into)
+        } else {
+            TranscodeOptionsBinary::deserialize(deserializer).map(Into::into)
+        }
+    }
+}
+
+impl Default for TranscodeOptions {
+    fn default() -> Self {
+        Self {
+            container: Container::Mp4,
+            source_frame_rate: None,
+            source_video_codec: None,
+            source_video_kind: SourceVideoKind::default(),
+            video: None,
+            audio: None,
+            video_bitrate_bps: None,
+            audio_bitrate_bps: None,
+            start_position_ticks: 0,
+            duration_ticks: None,
+            audio_source_stream_index: None,
+            burn_subtitle_stream_index: None,
+            burn_intent: false,
+            burn_subtitle_is_text: false,
+            burn_subtitle_ass_path: None,
+            burn_fonts_dir: None,
+            decode_preroll_seconds: None,
+            muxed_audio_source: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
+            filler: None,
+        }
+    }
+}
+
+/// Stereoscopic downmix mode for transcoding (spec 009-3d-media).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StereoOutput {
+    #[default]
+    Preserve,
+    #[serde(rename = "mono2d")]
+    Mono2D,
+}
+
+impl StereoOutput {
+    pub const ALL: [Self; 2] = [Self::Preserve, Self::Mono2D];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Mono2D => "mono2d",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
+}
+
+/// ffmpeg video filter string to extract and display the left eye as a 2D frame.
+pub fn stereo_mono_filter(format: Video3DFormat) -> Option<&'static str> {
+    match format {
+        Video3DFormat::HalfSideBySide => Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1"),
+        Video3DFormat::FullSideBySide => Some("crop=iw/2:ih:0:0,setsar=1"),
+        Video3DFormat::HalfTopAndBottom => Some("crop=iw:ih/2:0:0,scale=iw:ih*2,setsar=1"),
+        Video3DFormat::FullTopAndBottom => Some("crop=iw:ih/2:0:0,setsar=1"),
+        Video3DFormat::Mvc => None,
+    }
+}
+
 impl TranscodeOptions {
     pub fn start_position_seconds(&self) -> Option<f64> {
         if self.start_position_ticks == 0 {
@@ -514,6 +729,33 @@ impl TranscodeOptions {
 
     pub fn duration_seconds(&self) -> Option<f64> {
         self.duration_ticks.map(|d| Ticks(d).seconds())
+    }
+
+    /// Resolves the effective stereoscopic output mode.
+    ///
+    /// Returns [`StereoOutput::Mono2D`] when requested explicitly OR when burning
+    /// subtitles onto packed SBS/TAB video (B230) so the subtitle is not split
+    /// across both eyes. Otherwise preserves stereoscopic layout.
+    pub fn effective_stereo_output(&self) -> StereoOutput {
+        if self.stereo_output == StereoOutput::Mono2D
+            || ((self.burn_subtitle_stream_index.is_some() || self.burn_intent)
+                && self
+                    .video_3d_format
+                    .is_some_and(|f| f.is_packed_sbs_or_tab()))
+        {
+            StereoOutput::Mono2D
+        } else {
+            StereoOutput::Preserve
+        }
+    }
+
+    /// Returns the ffmpeg filter chain required to downmix 3D video to 2D mono, if active.
+    pub fn active_stereo_mono_filter(&self) -> Option<&'static str> {
+        if self.effective_stereo_output() == StereoOutput::Mono2D {
+            self.video_3d_format.and_then(stereo_mono_filter)
+        } else {
+            None
+        }
     }
 }
 
@@ -571,6 +813,12 @@ impl RenditionKey {
             // is per-segment.
             m.start_seconds = 0.0;
         }
+        if o.effective_stereo_output() == StereoOutput::Preserve {
+            o.video_3d_format = None;
+            o.stereo_output = StereoOutput::Preserve;
+        } else {
+            o.stereo_output = StereoOutput::Mono2D;
+        }
         // Canonicalised through serde so a newly added option joins the key
         // automatically. Falling back to the Debug form keeps this total —
         // there is no sensible way to fail here, and a key that panicked would
@@ -623,6 +871,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -650,6 +900,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         assert_eq!(o.start_position_seconds(), None);
     }
@@ -698,6 +950,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         }
     }
 
@@ -861,6 +1115,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let mut named = base.clone();
         named.source_video_codec = Some(SourceCodec::Av1);
@@ -885,5 +1141,126 @@ mod tests {
             RenditionKey::new(path, &base),
             RenditionKey::new(std::path::Path::new("/m/y.mkv"), &base)
         );
+    }
+
+    #[test]
+    fn stereo_output_all_labels_distinct_and_non_empty() {
+        let mut labels = std::collections::HashSet::new();
+        for variant in StereoOutput::ALL {
+            assert!(!variant.label().is_empty());
+            assert_eq!(variant.label(), variant.as_str());
+            assert!(labels.insert(variant.label()));
+        }
+    }
+
+    #[test]
+    fn stereo_mono_filters_for_all_formats() {
+        assert_eq!(
+            stereo_mono_filter(Video3DFormat::HalfSideBySide),
+            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
+        );
+        assert_eq!(
+            stereo_mono_filter(Video3DFormat::FullSideBySide),
+            Some("crop=iw/2:ih:0:0,setsar=1")
+        );
+        assert_eq!(
+            stereo_mono_filter(Video3DFormat::HalfTopAndBottom),
+            Some("crop=iw:ih/2:0:0,scale=iw:ih*2,setsar=1")
+        );
+        assert_eq!(
+            stereo_mono_filter(Video3DFormat::FullTopAndBottom),
+            Some("crop=iw:ih/2:0:0,setsar=1")
+        );
+        assert_eq!(stereo_mono_filter(Video3DFormat::Mvc), None);
+    }
+
+    #[test]
+    fn preserve_vs_mono2d_rendition_keys_distinct() {
+        let path = std::path::Path::new("/m/3d.mkv");
+        let mut preserve = cmaf_opts();
+        preserve.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        preserve.stereo_output = StereoOutput::Preserve;
+
+        let mut mono = preserve.clone();
+        mono.stereo_output = StereoOutput::Mono2D;
+
+        assert_ne!(
+            RenditionKey::new(path, &preserve),
+            RenditionKey::new(path, &mono)
+        );
+    }
+
+    #[test]
+    fn effective_stereo_output_and_active_filter_burn_in() {
+        let mut o = cmaf_opts();
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o.stereo_output = StereoOutput::Preserve;
+
+        // Without subtitle burn, stays Preserve and has no filter.
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Preserve);
+        assert_eq!(o.active_stereo_mono_filter(), None);
+
+        // Explicit Mono2D activates filter even without burn.
+        o.stereo_output = StereoOutput::Mono2D;
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
+        assert_eq!(
+            o.active_stereo_mono_filter(),
+            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
+        );
+
+        // Reset to Preserve: burn_subtitle_stream_index forces Mono2D on packed 3D (B230)
+        o.stereo_output = StereoOutput::Preserve;
+        o.burn_subtitle_stream_index = Some(2);
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
+        assert_eq!(
+            o.active_stereo_mono_filter(),
+            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
+        );
+
+        // burn_intent also forces Mono2D
+        o.burn_subtitle_stream_index = None;
+        o.burn_intent = true;
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
+        assert_eq!(
+            o.active_stereo_mono_filter(),
+            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
+        );
+
+        // MVC source is NOT packed SBS or TAB, so burn does not force Mono2D
+        o.video_3d_format = Some(Video3DFormat::Mvc);
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Preserve);
+        assert_eq!(o.active_stereo_mono_filter(), None);
+    }
+
+    #[test]
+    fn bincode_and_json_dual_serialization_roundtrip() {
+        let mut o = cmaf_opts();
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o.stereo_output = StereoOutput::Mono2D;
+
+        // Bincode roundtrip (binary, non-human-readable)
+        let bytes = bincode::serialize(&o).unwrap();
+        let decoded: TranscodeOptions = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.video_3d_format, Some(Video3DFormat::HalfSideBySide));
+        assert_eq!(decoded.stereo_output, StereoOutput::Mono2D);
+
+        // JSON serialization (human-readable) preserves fields when Mono2D
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains("\"stereo_output\":\"mono2d\""));
+        assert!(json.contains("\"video_3d_format\":"));
+
+        // JSON serialization omits fields when None / Preserve
+        let mut p = cmaf_opts();
+        p.video_3d_format = None;
+        p.stereo_output = StereoOutput::Preserve;
+        let json_p = serde_json::to_string(&p).unwrap();
+        assert!(!json_p.contains("video_3d_format"));
+        assert!(!json_p.contains("stereo_output"));
+
+        // Bincode roundtrip with None / Preserve
+        let bytes_p = bincode::serialize(&p).unwrap();
+        let decoded_p: TranscodeOptions = bincode::deserialize(&bytes_p).unwrap();
+        assert_eq!(decoded_p.video_3d_format, None);
+        assert_eq!(decoded_p.stereo_output, StereoOutput::Preserve);
     }
 }

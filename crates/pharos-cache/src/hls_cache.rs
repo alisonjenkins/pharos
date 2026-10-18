@@ -4842,6 +4842,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -4877,6 +4879,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -5141,6 +5145,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -8376,6 +8382,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         }
     }
 
@@ -8982,6 +8990,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9008,6 +9018,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9072,6 +9084,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -9113,6 +9127,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: Default::default(),
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -9155,6 +9171,8 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                video_3d_format: None,
+                stereo_output: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -9177,6 +9195,8 @@ mod tests {
                 burn_subtitle_is_text: false,
                 burn_subtitle_ass_path: None,
                 burn_fonts_dir: None,
+                video_3d_format: None,
+                stereo_output: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)

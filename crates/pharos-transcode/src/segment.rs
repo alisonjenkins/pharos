@@ -196,6 +196,12 @@ pub struct SegmentOpts {
     /// Directory of extracted embedded fonts for libass (`:fontsdir=`); see
     /// [`TranscodeOptions::burn_fonts_dir`].
     pub burn_fonts_dir: Option<std::path::PathBuf>,
+    /// 3D video layout if source is stereoscopic.
+    #[serde(default)]
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
+    /// Target stereoscopic output mode (preserve or downmix to 2D mono).
+    #[serde(default)]
+    pub stereo_output: crate::options::StereoOutput,
 }
 
 /// A segment's audio once it is SETTLED.
@@ -322,6 +328,8 @@ impl ResolvedSegment {
             // exhausted (B228) — never here, so a freshly-resolved segment is
             // never accidentally born a filler.
             filler: None,
+            video_3d_format: s.video_3d_format,
+            stereo_output: s.stereo_output,
         }
     }
 }
@@ -353,6 +361,8 @@ mod tests {
             burn_subtitle_is_text: true,
             burn_subtitle_ass_path: Some(std::path::PathBuf::from("/cache/sub.ass")),
             burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
+            video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
+            stereo_output: crate::options::StereoOutput::Mono2D,
         };
         let slice = crate::options::MuxedAudio {
             path: std::path::PathBuf::from("/cache/continuous.m4a"),
@@ -365,6 +375,11 @@ mod tests {
         let t = r.to_transcode_options();
         assert_eq!(t.container, Container::Mpegts);
         assert_eq!(t.video, Some(VideoCodec::H264));
+        assert_eq!(
+            t.video_3d_format,
+            Some(pharos_core::Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(t.stereo_output, crate::options::StereoOutput::Mono2D);
         // The old assertion here was `t.audio == Some(AudioCodec::Aac)` —
         // lowering used to hand the segment an audio ENCODER. That is exactly
         // the state `AudioDelivery` now makes unrepresentable, so the
@@ -422,6 +437,8 @@ mod tests {
             burn_subtitle_is_text: false,
             burn_subtitle_ass_path: None,
             burn_fonts_dir: None,
+            video_3d_format: None,
+            stereo_output: crate::options::StereoOutput::Preserve,
         };
         let argv = |r: &ResolvedSegment| {
             crate::ffmpeg_transcode_args(
