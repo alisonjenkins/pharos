@@ -1083,6 +1083,16 @@ async fn serve_segment(
         q.audio_stream_index,
         q.subtitle_stream_index,
     );
+    if let Some(so) = qs_stereo_output(req.query_string()) {
+        opts.stereo_output = so;
+    }
+    if opts.burn_subtitle_stream_index.is_some()
+        && opts
+            .video_3d_format
+            .is_some_and(|f| f.is_packed_sbs_or_tab())
+    {
+        opts.stereo_output = pharos_transcode::StereoOutput::Mono2D;
+    }
     // W3 — variant overrides the video-bitrate cap negotiated by
     // PlaybackInfo. P2 — clamp the override against the session cap so
     // a 4 Mbps 1080p rung never outruns a 1 Mbps mobile profile.
@@ -1462,6 +1472,14 @@ fn build_segment_opts(
         source_frame_rate(item.probe.frame_rate_mille),
         item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
+    let video_3d_format = item.probe.video_3d_format;
+    let default_stereo_output = if subtitle_stream_index.is_some()
+        && video_3d_format.is_some_and(|f| f.is_packed_sbs_or_tab())
+    {
+        pharos_transcode::StereoOutput::Mono2D
+    } else {
+        pharos_transcode::StereoOutput::Preserve
+    };
     use crate::api::jellyfin::device_profile::Decision;
 
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
@@ -1600,8 +1618,8 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
-                    video_3d_format: None,
-                    stereo_output: Default::default(),
+                    video_3d_format,
+                    stereo_output: default_stereo_output,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1636,8 +1654,8 @@ fn build_segment_opts(
                     burn_subtitle_is_text: subtitle_is_text,
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
-                    video_3d_format: None,
-                    stereo_output: Default::default(),
+                    video_3d_format,
+                    stereo_output: default_stereo_output,
                 };
             }
             _ => {}
@@ -1672,8 +1690,8 @@ fn build_segment_opts(
         burn_subtitle_is_text: subtitle_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        video_3d_format: None,
-        stereo_output: Default::default(),
+        video_3d_format,
+        stereo_output: default_stereo_output,
     }
 }
 
@@ -1908,6 +1926,21 @@ fn with_source_gen(qs: String, source: &std::path::Path) -> String {
     }
 }
 
+fn qs_stereo_output(qs: &str) -> Option<pharos_transcode::StereoOutput> {
+    for kv in qs.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k.eq_ignore_ascii_case("StereoMode") {
+                if v.eq_ignore_ascii_case("mono") || v.eq_ignore_ascii_case("mono2d") {
+                    return Some(pharos_transcode::StereoOutput::Mono2D);
+                } else if v.eq_ignore_ascii_case("preserve") {
+                    return Some(pharos_transcode::StereoOutput::Preserve);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn playback_qs(req: &HttpRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(t) = extract_token(req) {
@@ -1935,6 +1968,8 @@ fn playback_qs(req: &HttpRequest) -> String {
                 // ceiling master → variant → segment so it caps the encoder even
                 // when the live session is gone or the path re-encodes a remux.
                 parts.push(format!("VideoBitrate={v}"));
+            } else if k.eq_ignore_ascii_case("StereoMode") {
+                parts.push(format!("StereoMode={v}"));
             }
         }
     }
@@ -3343,7 +3378,19 @@ async fn fmp4_segment_opts(
         qs_video_bitrate_cap(req.query_string()),
     );
     let session_burn = session_burn_indices(state, req).await;
-    fmp4_segment_opts_resolved(item, seg, video, subtitle_stream_index, cap, session_burn)
+    let mut opts =
+        fmp4_segment_opts_resolved(item, seg, video, subtitle_stream_index, cap, session_burn);
+    if let Some(so) = qs_stereo_output(req.query_string()) {
+        opts.stereo_output = so;
+    }
+    if opts.burn_subtitle_stream_index.is_some()
+        && opts
+            .video_3d_format
+            .is_some_and(|f| f.is_packed_sbs_or_tab())
+    {
+        opts.stereo_output = pharos_transcode::StereoOutput::Mono2D;
+    }
+    opts
 }
 
 /// The body of [`fmp4_segment_opts`] with its two request-derived inputs —
@@ -3452,8 +3499,17 @@ fn fmp4_segment_opts_resolved(
         burn_subtitle_is_text: sub_is_text,
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
-        video_3d_format: None,
-        stereo_output: Default::default(),
+        video_3d_format: item.probe.video_3d_format,
+        stereo_output: if sub_rel.is_some()
+            && item
+                .probe
+                .video_3d_format
+                .is_some_and(|f| f.is_packed_sbs_or_tab())
+        {
+            pharos_transcode::StereoOutput::Mono2D
+        } else {
+            pharos_transcode::StereoOutput::Preserve
+        },
     }
 }
 
