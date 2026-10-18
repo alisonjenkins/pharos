@@ -24,7 +24,7 @@ Every task carries an explicit `Parallel Group: G<N>` label. Tasks sharing the s
 - [x] **T134** [Parallel Group: G1] [US1] Add 3D filename token recognition (`3d`, `sbs`, `hsbs`, `h-sbs`, `half-sbs`, `fsbs`, `f-sbs`, `full-sbs`, `tab`, `htab`, `h-tab`, `half-tab`, `ftab`, `f-tab`, `full-tab`, `ou`, `hou`, `h-ou`, `half-ou`, `fou`, `f-ou`, `full-ou`, `mvc`, `bd3d`, `bluray3d`, `anaglyph`) to `quality_source_tag` and expose `pub fn parse_video_3d_format(input: &str) -> (Option<Video3DFormat>, Option<&'static str>)` with unit tests for movie and TV episode stems in `crates/pharos-scanner/src/metadata/filename.rs`.
   - **Files**: `crates/pharos-scanner/src/metadata/filename.rs`
 
-- [ ] **T135** [Parallel Group: G1] [US1] Create migration `0057_video_3d_format.sql` for both SQLite and PostgreSQL adding `ALTER TABLE media_items ADD COLUMN video_3d_format TEXT;` and partial index `idx_media_items_video_3d_format`.
+- [x] **T135** [Parallel Group: G1] [US1] Create migration `0057_video_3d_format.sql` for both SQLite and PostgreSQL adding `ALTER TABLE media_items ADD COLUMN video_3d_format TEXT;` and partial index `idx_media_items_video_3d_format`.
   - **Files**: `crates/pharos-store-sqlx/migrations/sqlite/0057_video_3d_format.sql`, `crates/pharos-store-sqlx/migrations/postgres/0057_video_3d_format.sql`
 
 ---
