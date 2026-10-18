@@ -10,6 +10,7 @@
 //! - `.tmp/` staging dir + atomic rename keeps the V6 invariant: a
 //!   crashed ffmpeg never leaks a partial sprite into the served set.
 
+use pharos_transcode::backend::stereo_left_eye_filter_prefix;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -43,6 +44,7 @@ pub struct Layout {
     /// Total `.jpg` tile files (each containing up to TILE_GRID²
     /// thumbnails).
     pub tile_count: u32,
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
 }
 
 /// Width × height of the sprite grid in one tile JPEG. Jellyfin
@@ -104,7 +106,16 @@ impl Layout {
             interval_ms,
             thumb_count,
             tile_count,
+            video_3d_format: None,
         })
+    }
+
+    pub fn with_video_3d_format(
+        mut self,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+    ) -> Self {
+        self.video_3d_format = video_3d_format;
+        self
     }
 }
 
@@ -675,7 +686,7 @@ impl TrickplayCache {
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
         if let Some(pool) = &self.pool {
             let produced = pool
-                .trickplay(
+                .trickplay_3d(
                     source.to_path_buf(),
                     layout.interval_ms as u64,
                     layout.width,
@@ -683,6 +694,7 @@ impl TrickplayCache {
                     layout.thumb_count,
                     layout.tile_count,
                     5,
+                    layout.video_3d_format,
                     dir.clone(),
                 )
                 .await
@@ -709,12 +721,18 @@ impl TrickplayCache {
         // `scale=W:-2` — aspect-preserved, even height. flags=fast_bilinear
         //   keeps the encode cheap; sprite quality is low-stakes.
         // `tile=10x10` — pack into 10×10 grid per output.
-        let vf = format!(
-            "fps=1/{interval_seconds},scale={w}:-2:flags=fast_bilinear,tile={g}x{g}:padding=0:margin=0",
-            interval_seconds = interval_seconds,
-            w = layout.width,
-            g = TILE_GRID,
-        );
+        let vf = match stereo_left_eye_filter_prefix(layout.video_3d_format) {
+            Some(prefix) => format!(
+                "fps=1/{interval_seconds},{prefix},scale={w}:-2:flags=fast_bilinear,tile={g}x{g}:padding=0:margin=0",
+                w = layout.width,
+                g = TILE_GRID,
+            ),
+            None => format!(
+                "fps=1/{interval_seconds},scale={w}:-2:flags=fast_bilinear,tile={g}x{g}:padding=0:margin=0",
+                w = layout.width,
+                g = TILE_GRID,
+            ),
+        };
 
         // Output pattern — ffmpeg image2 muxer starts %d at 1; we
         // rename to 0-based after the run completes.
@@ -1136,5 +1154,76 @@ mod tests {
         assert!(!tokio::fs::try_exists(td.path().join("10").join("320"))
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn layout_with_video_3d_format_includes_left_eye_crop_filter() {
+        use pharos_core::Video3DFormat;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = TempDir::new().unwrap();
+        let log_path = td.path().join("ffmpeg_args.log");
+        let script_path = td.path().join("fake_ffmpeg.sh");
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> \"{}\"\nfor last; do :; done\nout=\"$(echo \"$last\" | sed 's/%d\\.jpg/1.jpg/')\"\nprintf 'fakejpeg' > \"$out\"\nexit 0\n",
+            log_path.display()
+        );
+        tokio::fs::write(&script_path, script).await.unwrap();
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let cache =
+            TrickplayCache::new(td.path().join("cache"), 1024 * 1024).with_ffmpeg(&script_path);
+        let dummy_source = td.path().join("source.mkv");
+        tokio::fs::write(&dummy_source, b"video-data")
+            .await
+            .unwrap();
+
+        // 1. HalfSideBySide
+        let layout_hsbs = Layout::compute(90_000, 1920, 1080, 320, 10_000)
+            .unwrap()
+            .with_video_3d_format(Some(Video3DFormat::HalfSideBySide));
+        cache
+            .ensure_generated(101, layout_hsbs, &dummy_source)
+            .await
+            .unwrap();
+
+        // 2. FullTopAndBottom
+        let layout_ftab = Layout::compute(90_000, 1920, 1080, 320, 10_000)
+            .unwrap()
+            .with_video_3d_format(Some(Video3DFormat::FullTopAndBottom));
+        cache
+            .ensure_generated(102, layout_ftab, &dummy_source)
+            .await
+            .unwrap();
+
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 ffmpeg invocations");
+
+        // HSBS check
+        let hsbs_expected = "crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1";
+        let hsbs_line = lines[0];
+        assert!(
+            hsbs_line.contains(hsbs_expected),
+            "HSBS line should contain left-eye crop prefix, got: {hsbs_line}"
+        );
+        let crop_pos = hsbs_line.find(hsbs_expected).unwrap();
+        let scale_pos = hsbs_line.find("scale=320:-2").unwrap();
+        assert!(crop_pos < scale_pos, "crop filter must precede scale=");
+
+        // FTAB check
+        let ftab_expected = "crop=iw:ih/2:0:0,setsar=1";
+        let ftab_line = lines[1];
+        assert!(
+            ftab_line.contains(ftab_expected),
+            "FTAB line should contain left-eye crop prefix, got: {ftab_line}"
+        );
+        let crop_pos = ftab_line.find(ftab_expected).unwrap();
+        let scale_pos = ftab_line.find("scale=320:-2").unwrap();
+        assert!(crop_pos < scale_pos, "crop filter must precede scale=");
     }
 }

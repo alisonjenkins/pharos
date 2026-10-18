@@ -56,7 +56,7 @@ Every task carries an explicit `Parallel Group: G<N>` label. Tasks sharing the s
 - [x] **T142** [Parallel Group: G3] [US2, US3] Extend `SourceMedia` and `evaluate_condition` in `crates/pharos-server/src/api/jellyfin/device_profile.rs` to support `Is3D` and `Video3DFormat` `ProfileCondition` rules while keeping DirectPlay passthrough as the default; wire `StereoMode` (`preserve` | `mono`) query parameter and `StereoOutput` through `items.rs` (`playback_info`), `hls.rs` (`master_playlist`, `main_playlist`, `segment`), `stream.rs`, and `hls_cache.rs` (`RenditionKey` and `SegmentIdentity`, appending `_mono2d` only on `Mono2D`, `V182`); emit ODD counter `pharos_playback_3d_decision_total` and `tracing::info!(target: "pharos::playback::3d", ...)`.
   - **Files**: `crates/pharos-server/src/api/jellyfin/device_profile.rs`, `crates/pharos-server/src/api/jellyfin/items.rs`, `crates/pharos-server/src/api/jellyfin/hls.rs`, `crates/pharos-server/src/api/jellyfin/stream.rs`, `crates/pharos-server/src/hls_cache.rs`
 
-- [ ] **T143** [Parallel Group: G3] [US3] Pass `item.probe.video_3d_format` into `extract_video_frame` from `crates/pharos-server/src/api/jellyfin/images.rs` and into `generate_sprites` from `crates/pharos-server/src/trickplay.rs`.
+- [x] **T143** [Parallel Group: G3] [US3] Pass `item.probe.video_3d_format` into `extract_video_frame` from `crates/pharos-server/src/api/jellyfin/images.rs` and into `generate_sprites` from `crates/pharos-server/src/trickplay.rs`.
   - **Files**: `crates/pharos-server/src/api/jellyfin/images.rs`, `crates/pharos-server/src/trickplay.rs`
 
 ---

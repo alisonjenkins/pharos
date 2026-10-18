@@ -10,6 +10,7 @@
 //! poster.
 
 use pharos_core::MediaKind;
+use pharos_transcode::backend::stereo_left_eye_filter_prefix;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{instrument, Instrument as _};
@@ -236,8 +237,29 @@ impl ImageCache {
         source: &Path,
         duration_ms: Option<u64>,
     ) -> Result<PathBuf, ImageCacheError> {
-        self.fetch(id, ImageRole::Primary, kind, source, 0, duration_ms)
-            .await
+        self.primary_3d(id, kind, source, duration_ms, None).await
+    }
+
+    /// Extract primary artwork with optional 3D stereo packing format.
+    #[instrument(skip(self), fields(media.id = %id))]
+    pub async fn primary_3d(
+        &self,
+        id: u64,
+        kind: MediaKind,
+        source: &Path,
+        duration_ms: Option<u64>,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+    ) -> Result<PathBuf, ImageCacheError> {
+        self.fetch_3d(
+            id,
+            ImageRole::Primary,
+            kind,
+            source,
+            0,
+            duration_ms,
+            video_3d_format,
+        )
+        .await
     }
 
     /// Fetch any role + index. On extractable roles (Primary, Backdrop,
@@ -258,13 +280,38 @@ impl ImageCache {
         index: u32,
         duration_ms: Option<u64>,
     ) -> Result<PathBuf, ImageCacheError> {
+        self.fetch_3d(id, role, kind, source, index, duration_ms, None)
+            .await
+    }
+
+    /// Fetch any role + index with optional 3D stereo packing format.
+    #[instrument(skip(self), fields(media.id = %id, role = ?role, index = %index))]
+    pub async fn fetch_3d(
+        &self,
+        id: u64,
+        role: ImageRole,
+        kind: MediaKind,
+        source: &Path,
+        index: u32,
+        duration_ms: Option<u64>,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+    ) -> Result<PathBuf, ImageCacheError> {
         let out_path = image_path(&self.root, role, kind, id, index);
         if tokio::fs::try_exists(&out_path).await.unwrap_or(false) {
             // Self-heal a poster/thumb/backdrop that a previous build extracted
             // as an all-black frame (fixed-seek landed on a title card / fade).
             if role.is_extractable() {
-                self.heal_if_blank(id, role, kind, source, index, duration_ms, &out_path)
-                    .await;
+                self.heal_if_blank(
+                    id,
+                    role,
+                    kind,
+                    source,
+                    index,
+                    duration_ms,
+                    video_3d_format,
+                    &out_path,
+                )
+                .await;
             }
             return Ok(out_path);
         }
@@ -302,7 +349,7 @@ impl ImageCache {
         }
         let tmp_path = out_path.with_extension("jpg.tmp");
         match self
-            .extract(source, kind, role, duration_ms, &tmp_path)
+            .extract(source, kind, role, duration_ms, video_3d_format, &tmp_path)
             .instrument(tracing::info_span!("image.extract"))
             .await
         {
@@ -329,7 +376,7 @@ impl ImageCache {
     /// are never disturbed. Best-effort: any failure leaves the existing file
     /// in place and still marks the slot so a persistently-blank source isn't
     /// re-attempted on every library-grid render.
-    // All eight are distinct scalars threaded straight from `fetch`; bundling
+    // All nine are distinct scalars threaded straight from `fetch`; bundling
     // them into a struct would only add indirection at the one call site.
     #[allow(clippy::too_many_arguments)]
     async fn heal_if_blank(
@@ -340,6 +387,7 @@ impl ImageCache {
         source: &Path,
         index: u32,
         duration_ms: Option<u64>,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
         out_path: &Path,
     ) {
         let marker = healed_marker(out_path);
@@ -379,7 +427,7 @@ impl ImageCache {
         }
         let tmp_path = out_path.with_extension("heal.tmp");
         match self
-            .extract(source, kind, role, duration_ms, &tmp_path)
+            .extract(source, kind, role, duration_ms, video_3d_format, &tmp_path)
             .instrument(tracing::info_span!("image.extract"))
             .await
         {
@@ -828,6 +876,20 @@ impl ImageCache {
         chapter_idx: u32,
         start_ms: u64,
     ) -> Result<PathBuf, ImageCacheError> {
+        self.chapter_3d(id, source, chapter_idx, start_ms, None)
+            .await
+    }
+
+    /// Chapter thumbnail extractor with optional 3D stereo packing format.
+    #[instrument(skip(self), fields(media.id = %id, idx = %chapter_idx, start_ms = %start_ms))]
+    pub async fn chapter_3d(
+        &self,
+        id: u64,
+        source: &Path,
+        chapter_idx: u32,
+        start_ms: u64,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
+    ) -> Result<PathBuf, ImageCacheError> {
         let out_path = self
             .root
             .join(id.to_string())
@@ -839,7 +901,8 @@ impl ImageCache {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp_path = out_path.with_extension("jpg.tmp");
-        self.extract_chapter(source, start_ms, &tmp_path).await?;
+        self.extract_chapter(source, start_ms, video_3d_format, &tmp_path)
+            .await?;
         tokio::fs::rename(&tmp_path, &out_path).await?;
         Ok(out_path)
     }
@@ -848,16 +911,18 @@ impl ImageCache {
         &self,
         source: &Path,
         start_ms: u64,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
         out: &Path,
     ) -> Result<(), ImageCacheError> {
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
         if let Some(pool) = &self.pool {
             return pool
-                .extract_image(
+                .extract_image_3d(
                     source.to_path_buf(),
                     Some(start_ms),
                     480,
                     3,
+                    video_3d_format,
                     out.to_path_buf(),
                 )
                 .await
@@ -866,7 +931,11 @@ impl ImageCache {
         let source_str = source.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let out_str = out.to_str().ok_or(ImageCacheError::NonUtf8Path)?;
         let seek = format!("{}", start_ms as f64 / 1000.0);
-        let args: [&str; 17] = [
+        let vf = match stereo_left_eye_filter_prefix(video_3d_format) {
+            Some(prefix) => format!("{prefix},scale=480:-1"),
+            None => "scale=480:-1".to_string(),
+        };
+        let args = [
             "-hide_banner",
             "-loglevel",
             "error",
@@ -881,7 +950,7 @@ impl ImageCache {
             "-q:v",
             "3",
             "-vf",
-            "scale=480:-1",
+            &vf,
             // mjpeg requires a full-range (yuvj*) pixel format; the scale
             // filter emits limited-range yuv420p, which ffmpeg 8.1's mjpeg
             // encoder rejects ("Non full-range YUV is non-standard").
@@ -1012,6 +1081,7 @@ impl ImageCache {
         kind: MediaKind,
         role: ImageRole,
         duration_ms: Option<u64>,
+        video_3d_format: Option<pharos_core::Video3DFormat>,
         out: &Path,
     ) -> Result<(), ImageCacheError> {
         #[cfg(all(unix, feature = "ffmpeg-lib"))]
@@ -1026,11 +1096,12 @@ impl ImageCache {
                     _ => 480,
                 };
                 return pool
-                    .extract_image(
+                    .extract_image_3d(
                         source.to_path_buf(),
                         Some(seek as u64 * 1000),
                         width,
                         3,
+                        video_3d_format,
                         out.to_path_buf(),
                     )
                     .await
@@ -1048,10 +1119,14 @@ impl ImageCache {
         // point doesn't become an all-black poster (the libav path scans for
         // the first non-black frame explicitly; this is the spawn-path
         // equivalent). `-frames:v 1` then keeps that single representative.
-        let scale = match role {
+        let scale_filter = match role {
             ImageRole::Backdrop => "thumbnail=100,scale=1280:-1",
             ImageRole::Thumb => "thumbnail=100,scale=640:-1",
             _ => "thumbnail=100,scale=480:-1",
+        };
+        let scale = match stereo_left_eye_filter_prefix(video_3d_format) {
+            Some(prefix) => format!("{prefix},{scale_filter}"),
+            None => scale_filter.to_string(),
         };
         let args: Vec<&str> = match kind {
             // 004-books — a book is never an ffmpeg input. `extract` pulls a
@@ -1079,7 +1154,7 @@ impl ImageCache {
                 "-q:v",
                 "3",
                 "-vf",
-                scale,
+                &scale,
                 // Full-range pixel format the mjpeg encoder requires.
                 "-pix_fmt",
                 "yuvj420p",
@@ -1546,6 +1621,89 @@ mod tests {
             .primary(99, MediaKind::Movie, Path::new("/no/source"), None)
             .await;
         assert!(matches!(res, Err(ImageCacheError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn fetch_and_chapter_3d_half_sbs_passes_left_eye_crop_filter() {
+        use pharos_core::Video3DFormat;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::TempDir::new().unwrap();
+        let log_path = td.path().join("ffmpeg_args.log");
+        let script_path = td.path().join("fake_ffmpeg.sh");
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> \"{}\"\nfor last; do :; done\nprintf 'fake-jpeg' > \"$last\"\nexit 0\n",
+            log_path.display()
+        );
+        tokio::fs::write(&script_path, script).await.unwrap();
+        #[cfg(unix)]
+        tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let cache = ImageCache::new(td.path()).with_ffmpeg(&script_path);
+
+        let dummy_source = td.path().join("movie.mkv");
+        tokio::fs::write(&dummy_source, b"video-data")
+            .await
+            .unwrap();
+
+        // 1. fetch_3d with HalfSideBySide
+        cache
+            .fetch_3d(
+                101,
+                ImageRole::Primary,
+                MediaKind::Movie,
+                &dummy_source,
+                0,
+                Some(60_000),
+                Some(Video3DFormat::HalfSideBySide),
+            )
+            .await
+            .unwrap();
+
+        // 2. chapter_3d with HalfSideBySide
+        cache
+            .chapter_3d(
+                101,
+                &dummy_source,
+                0,
+                5_000,
+                Some(Video3DFormat::HalfSideBySide),
+            )
+            .await
+            .unwrap();
+
+        let logged = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let expected_filter = "crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1";
+
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 ffmpeg invocations");
+
+        let fetch_line = lines[0];
+        assert!(
+            fetch_line.contains(expected_filter),
+            "fetch ffmpeg call should include left-eye crop filter, got: {fetch_line}"
+        );
+        let crop_pos = fetch_line.find(expected_filter).unwrap();
+        let scale_pos = fetch_line.rfind("scale=480:-1").unwrap();
+        assert!(
+            crop_pos < scale_pos,
+            "crop filter must appear before scale= in fetch call"
+        );
+
+        let chapter_line = lines[1];
+        assert!(
+            chapter_line.contains(expected_filter),
+            "chapter ffmpeg call should include left-eye crop filter, got: {chapter_line}"
+        );
+        let crop_pos = chapter_line.find(expected_filter).unwrap();
+        let scale_pos = chapter_line.rfind("scale=480:-1").unwrap();
+        assert!(
+            crop_pos < scale_pos,
+            "crop filter must appear before scale= in chapter call"
+        );
     }
 }
 

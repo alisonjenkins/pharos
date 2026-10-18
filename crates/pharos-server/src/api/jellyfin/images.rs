@@ -265,7 +265,13 @@ async fn serve_chapter_image(
         .as_ref()
         .ok_or_else(|| error::ErrorNotFound("image cache not configured"))?;
     let path = cache
-        .chapter(item.id, &item.path, idx, chapter.start_ms)
+        .chapter_3d(
+            item.id,
+            &item.path,
+            idx,
+            chapter.start_ms,
+            item.probe.video_3d_format,
+        )
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("chapter image: {e}")))?;
     // B89 — chapter thumbs are the heaviest per-item image after B88 turned
@@ -594,13 +600,14 @@ async fn serve_image(
         return Ok(HttpResponse::NotFound().body(""));
     }
     let jpeg_path = match cache
-        .fetch(
+        .fetch_3d(
             id,
             role,
             item.kind,
             &item.path,
             index,
             item.probe.duration_ms,
+            item.probe.video_3d_format,
         )
         .await
     {
