@@ -31,7 +31,7 @@ Every task carries an explicit `Parallel Group: G<N>` label. Tasks sharing the s
 
 ## Phase 2: Parallel Group G2 - Probers, store persistence, Jellyfin DTOs, and transcode filters
 
-- [ ] **T136** [Parallel Group: G2] [US1] Wire `FfmpegProber` (`tags.stereo_mode`, `side_data_list` `Stereo 3D`, MVC profile/substream) in `crates/pharos-scanner/src/ffmpeg.rs`, merge probe and filename 3D detection inside `FsScanner::probe_one` for both `MediaKind::Movie` and `MediaKind::Episode` in `crates/pharos-scanner/src/fs.rs`, and emit ODD counter `pharos_3d_detect_total{format,source,media_kind}` and `tracing::info!(target: "pharos::scanner::3d", ...)` (`V181`).
+- [x] **T136** [Parallel Group: G2] [US1] Wire `FfmpegProber` (`tags.stereo_mode`, `side_data_list` `Stereo 3D`, MVC profile/substream) in `crates/pharos-scanner/src/ffmpeg.rs`, merge probe and filename 3D detection inside `FsScanner::probe_one` for both `MediaKind::Movie` and `MediaKind::Episode` in `crates/pharos-scanner/src/fs.rs`, and emit ODD counter `pharos_3d_detect_total{format,source,media_kind}` and `tracing::info!(target: "pharos::scanner::3d", ...)` (`V181`).
   - **Files**: `crates/pharos-scanner/src/ffmpeg.rs`, `crates/pharos-scanner/src/fs.rs`
 
 - [ ] **T137** [Parallel Group: G2] [US1] Wire `LibavProber::extract_video` to read stream metadata `stereo_mode`, `AV_PKT_DATA_STEREO3D` (`AVStereo3D`) coded side data, and H.264 MVC profile names via `Video3DFormat::from_probe_signals` so `ffmpeg-lib` and `ffmpeg-spawn` produce identical `MediaProbe.video_3d_format` results (`V152`, `V181`).
