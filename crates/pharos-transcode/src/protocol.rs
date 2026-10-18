@@ -181,6 +181,8 @@ pub enum TinyOp {
         width: u32,
         quality: i32,
         out: PathBuf,
+        #[serde(default)]
+        video_3d_format: Option<pharos_core::Video3DFormat>,
     },
     /// Extract an embedded attachment stream (a font) to `out` -> `Done`.
     ExtractAttachment {
@@ -206,6 +208,8 @@ pub enum TinyOp {
         max_sheets: u32,
         quality: i32,
         out_dir: PathBuf,
+        #[serde(default)]
+        video_3d_format: Option<pharos_core::Video3DFormat>,
     },
     /// Convert a SubRip sidecar to WebVTT, written to `out` → `Done`.
     SrtToWebvtt { input: PathBuf, out: PathBuf },
