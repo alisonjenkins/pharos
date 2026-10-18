@@ -136,6 +136,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 release_date,
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
+                video_3d_format: None,
             },
         )
 }

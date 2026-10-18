@@ -3471,6 +3471,7 @@ impl MediaRow {
             // P34 — alternate editions enrichment lives in the
             // scanner; postgres rows today never carry them.
             alternate_sources: Vec::new(),
+            video_3d_format: None,
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

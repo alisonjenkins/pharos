@@ -3166,6 +3166,7 @@ impl MediaRow {
             // enrichment pass. Today's persisted probes never carry
             // them so default to an empty Vec.
             alternate_sources: Vec::new(),
+            video_3d_format: None,
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,
