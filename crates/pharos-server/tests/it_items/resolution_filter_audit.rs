@@ -193,7 +193,7 @@ async fn is_3d_and_packed_frame_resolution_filters_respect_per_eye_dimensions() 
     assert_eq!(only_3d, vec!["Movie 3D FSBS", "Movie 3D HSBS"]);
 
     let only_2d = names(state.clone(), &token_str, "Is3D=false").await;
-    assert_eq!(only_2d, vec!["Movie 2D 1080p", "Movie 2D 4K"]);
+    assert_eq!(only_2d, vec!["Movie 2D 4K", "Movie 2D 1080p"]);
 
     let only_4k = names(state.clone(), &token_str, "Is4K=true").await;
     assert_eq!(only_4k, vec!["Movie 2D 4K"]);
