@@ -284,7 +284,6 @@ pub fn parse_video_3d_format(input: &str) -> (Option<Video3DFormat>, Option<&'st
             || t == "bd3d"
             || t == "bluray3d"
             || (t == "3d" && next == Some("mvc"))
-            || (t == "mvc" && prev == Some("3d"))
             || (t == "bd" && next == Some("3d"))
             || (t == "bluray" && next == Some("3d"))
         {

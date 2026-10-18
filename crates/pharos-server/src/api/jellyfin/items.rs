@@ -2741,11 +2741,8 @@ async fn playback_info(
 
     let qs_stereo_mode = query_param(req.query_string(), "StereoMode");
     let explicit_mono = qs_stereo_mode
-        .as_deref()
         .is_some_and(|m| m.eq_ignore_ascii_case("mono") || m.eq_ignore_ascii_case("mono2d"));
-    let explicit_preserve = qs_stereo_mode
-        .as_deref()
-        .is_some_and(|m| m.eq_ignore_ascii_case("preserve"));
+    let explicit_preserve = qs_stereo_mode.is_some_and(|m| m.eq_ignore_ascii_case("preserve"));
     let profile_rejected_3d = is_video
         && probe.video_3d_format.is_some()
         && !pharos_jellyfin_api::device_profile::codec_profile_3d_passes(

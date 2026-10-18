@@ -266,7 +266,7 @@ mod tests {
         let uncropped = run_filter(&sbs, &uncropped_spec);
         let uncropped_luma = mean_luma(&uncropped);
         assert!(
-            uncropped_luma >= 105 && uncropped_luma <= 115,
+            (105..=115).contains(&uncropped_luma),
             "uncropped: {uncropped_luma}"
         );
 
@@ -274,7 +274,7 @@ mod tests {
         let hsbs_out = run_filter(&sbs, &hsbs_spec);
         let hsbs_luma = mean_luma(&hsbs_out);
         assert!(
-            hsbs_luma >= 195 && hsbs_luma <= 205,
+            (195..=205).contains(&hsbs_luma),
             "expected ~200, got {hsbs_luma}"
         );
 
@@ -282,7 +282,7 @@ mod tests {
         let fsbs_out = run_filter(&sbs, &fsbs_spec);
         let fsbs_luma = mean_luma(&fsbs_out);
         assert!(
-            fsbs_luma >= 195 && fsbs_luma <= 205,
+            (195..=205).contains(&fsbs_luma),
             "expected ~200, got {fsbs_luma}"
         );
 
@@ -292,7 +292,7 @@ mod tests {
         let uncropped_tab = run_filter(&tab, &uncropped_tab_spec);
         let uncropped_tab_luma = mean_luma(&uncropped_tab);
         assert!(
-            uncropped_tab_luma >= 105 && uncropped_tab_luma <= 115,
+            (105..=115).contains(&uncropped_tab_luma),
             "uncropped tab: {uncropped_tab_luma}"
         );
 
@@ -300,7 +300,7 @@ mod tests {
         let htab_out = run_filter(&tab, &htab_spec);
         let htab_luma = mean_luma(&htab_out);
         assert!(
-            htab_luma >= 195 && htab_luma <= 205,
+            (195..=205).contains(&htab_luma),
             "expected ~200, got {htab_luma}"
         );
 
@@ -308,7 +308,7 @@ mod tests {
         let ftab_out = run_filter(&tab, &ftab_spec);
         let ftab_luma = mean_luma(&ftab_out);
         assert!(
-            ftab_luma >= 195 && ftab_luma <= 205,
+            (195..=205).contains(&ftab_luma),
             "expected ~200, got {ftab_luma}"
         );
     }

@@ -285,6 +285,7 @@ impl ImageCache {
     }
 
     /// Fetch any role + index with optional 3D stereo packing format.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self), fields(media.id = %id, role = ?role, index = %index))]
     pub async fn fetch_3d(
         &self,
