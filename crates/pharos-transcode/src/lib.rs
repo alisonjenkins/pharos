@@ -41,7 +41,8 @@ pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, Wavefo
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
 pub use options::{
-    AudioCodec, Container, FillerSpec, MuxedAudio, SourceCodec, TranscodeOptions, VideoCodec,
+    stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, RenditionKey, SourceCodec,
+    StereoOutput, TranscodeOptions, VideoCodec,
 };
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
@@ -317,6 +318,7 @@ fn push_video_filters(
     // The segment's audio is copied from a second input, so the image-burn
     // graph must map it from there rather than from the source.
     muxed_audio: bool,
+    mono_filter: Option<&str>,
 ) {
     match (burn_subtitle_stream_index, burn_is_text) {
         (Some(si), true) => {
@@ -346,6 +348,9 @@ fn push_video_filters(
                 }
             };
             let mut chain: Vec<String> = Vec::new();
+            if let Some(mf) = mono_filter {
+                chain.push(mf.to_string());
+            }
             match start_seconds {
                 Some(start) if start > 0.0 => {
                     chain.push(format!("setpts=PTS+{start:.6}/TB"));
@@ -361,7 +366,14 @@ fn push_video_filters(
             a.push(chain.join(","));
         }
         (Some(si), false) => {
-            let mut graph = format!("[0:v:0][0:s:{si}]overlay=eof_action=pass");
+            let mut graph = String::new();
+            let overlay_in = if let Some(mf) = mono_filter {
+                graph.push_str(&format!("[0:v:0]{mf}[v0];[v0]"));
+                "[0:s:"
+            } else {
+                "[0:v:0][0:s:"
+            };
+            graph.push_str(&format!("{overlay_in}{si}]overlay=eof_action=pass"));
             if !vf_parts.is_empty() {
                 graph.push(',');
                 graph.push_str(&vf_parts.join(","));
@@ -379,9 +391,14 @@ fn push_video_filters(
             });
         }
         (None, _) => {
-            if !vf_parts.is_empty() {
+            let mut chain: Vec<String> = Vec::new();
+            if let Some(mf) = mono_filter {
+                chain.push(mf.to_string());
+            }
+            chain.extend(vf_parts.iter().cloned());
+            if !chain.is_empty() {
                 a.push("-vf".into());
-                a.push(vf_parts.join(","));
+                a.push(chain.join(","));
             }
         }
     }
@@ -556,6 +573,19 @@ impl DecodeAccel {
         // this exact (source codec, device) pair.
         if matches!(offload, DecodeOffload::Denied) {
             return Self::NotProvenDecodable;
+        }
+        // CPU crop / setsar in stereo_mono_filter cannot consume GPU-resident
+        // cuda frames when hwaccel is active; fall back to software decode (B240).
+        if opts.active_stereo_mono_filter().is_some()
+            && matches!(
+                device,
+                DeviceId::Hw {
+                    accel: HwAccel::Nvenc,
+                    ..
+                }
+            )
+        {
+            return Self::NoDecoderForAccel;
         }
         match device.hwaccel().decoder_hwaccel() {
             Some(name) => Self::Gpu { name },
@@ -1149,6 +1179,7 @@ fn build_args_for_pipeline(
                         opts.burn_subtitle_ass_path.as_deref(),
                         opts.burn_fonts_dir.as_deref(),
                         opts.muxed_audio_source.is_some(),
+                        opts.active_stereo_mono_filter(),
                     );
                 }
                 a.push("-c:v".into());
@@ -1185,6 +1216,7 @@ fn build_args_for_pipeline(
                     opts.burn_subtitle_ass_path.as_deref(),
                     opts.burn_fonts_dir.as_deref(),
                     opts.muxed_audio_source.is_some(),
+                    opts.active_stereo_mono_filter(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -1490,6 +1522,14 @@ fn build_args_for_pipeline(
                 .into_owned(),
         );
     }
+    if opts.effective_stereo_output() == StereoOutput::Mono2D
+        && opts.video_3d_format.is_some()
+        && opts.video.is_some()
+        && !matches!(opts.video, Some(VideoCodec::Copy))
+    {
+        a.push("-metadata:s:v:0".into());
+        a.push("stereo_mode=".into());
+    }
     a.push(output.to_string());
     a
 }
@@ -1539,6 +1579,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         }
     }
 
@@ -2014,6 +2056,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -2077,6 +2121,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -2117,6 +2163,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let nvenc = build_args_for_device(
             "/m/x.mkv",
@@ -2223,6 +2271,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -2254,6 +2304,8 @@ mod tests {
             decode_preroll_seconds: None,
             muxed_audio_source: None,
             filler: None,
+            video_3d_format: None,
+            stereo_output: StereoOutput::Preserve,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
@@ -3317,6 +3369,161 @@ mod tests {
             seek_before_and_after_input(&a),
             (Some(30.0), None),
             "copy takes a plain input seek: {a:?}"
+        );
+    }
+
+    #[test]
+    fn mono2d_build_args_filters_and_metadata_strip_for_all_packed_formats() {
+        use pharos_core::Video3DFormat;
+
+        let cases = [
+            (
+                Video3DFormat::HalfSideBySide,
+                "crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1",
+            ),
+            (Video3DFormat::FullSideBySide, "crop=iw/2:ih:0:0,setsar=1"),
+            (
+                Video3DFormat::HalfTopAndBottom,
+                "crop=iw:ih/2:0:0,scale=iw:ih*2,setsar=1",
+            ),
+            (Video3DFormat::FullTopAndBottom, "crop=iw:ih/2:0:0,setsar=1"),
+        ];
+
+        for (fmt, expected_filter) in cases {
+            let mut o = opts();
+            o.video_3d_format = Some(fmt);
+            o.stereo_output = StereoOutput::Mono2D;
+
+            let a = build_args_for_device(
+                "/m/3d.mkv",
+                &o,
+                crate::protocol::DeviceId::Cpu,
+                "pipe:1",
+                crate::DecodeOffload::Allowed,
+                None,
+            );
+
+            // Assert exact filter string
+            let vf_pos = a.iter().position(|x| x == "-vf").expect("has -vf");
+            assert_eq!(a[vf_pos + 1], expected_filter);
+
+            // Assert presence of `-metadata:s:v:0 stereo_mode=`
+            let meta_pos = a
+                .iter()
+                .position(|x| x == "-metadata:s:v:0")
+                .expect("has -metadata:s:v:0");
+            assert_eq!(a[meta_pos + 1], "stereo_mode=");
+        }
+    }
+
+    #[test]
+    fn mono2d_nvenc_falls_back_to_software_decode() {
+        use crate::protocol::DeviceId;
+        use pharos_core::Video3DFormat;
+
+        let mut o = opts();
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o.stereo_output = StereoOutput::Mono2D;
+
+        let device = DeviceId::hw(HwAccel::Nvenc, 0);
+
+        // DecodeAccel::of must return NoDecoderForAccel
+        assert_eq!(
+            DecodeAccel::of(&o, device, DecodeOffload::Allowed),
+            DecodeAccel::NoDecoderForAccel
+        );
+
+        let a = build_args_for_device(
+            "/m/3d.mkv",
+            &o,
+            device,
+            "pipe:1",
+            DecodeOffload::Allowed,
+            None,
+        );
+
+        // Must not emit -hwaccel cuda
+        assert!(
+            !a.iter().any(|x| x == "-hwaccel"),
+            "must not emit -hwaccel: {a:?}"
+        );
+        // But encoder must still be hardware nvenc
+        assert!(
+            a.iter().any(|x| x == "h264_nvenc"),
+            "keeps hw encoder: {a:?}"
+        );
+    }
+
+    #[test]
+    fn mono2d_mvc_does_not_inject_crop_filter() {
+        use pharos_core::Video3DFormat;
+
+        let mut o = opts();
+        o.video_3d_format = Some(Video3DFormat::Mvc);
+        o.stereo_output = StereoOutput::Mono2D;
+
+        let a = build_args("/m/mvc.mkv", &o);
+
+        // No -vf crop injected (MVC base view is standard 2D)
+        if let Some(vf_pos) = a.iter().position(|x| x == "-vf") {
+            assert!(!a[vf_pos + 1].contains("crop="), "no crop for MVC: {a:?}");
+        }
+
+        // But container stereo metadata is stripped
+        let meta_pos = a
+            .iter()
+            .position(|x| x == "-metadata:s:v:0")
+            .expect("has -metadata:s:v:0");
+        assert_eq!(a[meta_pos + 1], "stereo_mode=");
+    }
+
+    #[test]
+    fn subtitle_burn_on_packed_3d_forces_mono_filter_before_subtitles() {
+        use pharos_core::Video3DFormat;
+
+        // Text subtitle burn
+        let mut o = opts();
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o.stereo_output = StereoOutput::Preserve; // Caller requested Preserve, but burn forces Mono2D
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+
+        let a = build_args("/m/3d.mkv", &o);
+        let vf = a.iter().position(|x| x == "-vf").expect("has -vf");
+        let vf_str = &a[vf + 1];
+
+        // mono_vf MUST appear before subtitles=
+        let crop_idx = vf_str.find("crop=iw/2:ih:0:0").expect("has crop filter");
+        let sub_idx = vf_str.find("subtitles=").expect("has subtitles filter");
+        assert!(
+            crop_idx < sub_idx,
+            "crop must be before subtitles: {vf_str}"
+        );
+
+        // Image subtitle burn
+        let mut o_img = opts();
+        o_img.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o_img.stereo_output = StereoOutput::Preserve;
+        o_img.burn_subtitle_stream_index = Some(3);
+        o_img.burn_subtitle_is_text = false;
+
+        let a_img = build_args("/m/3d.mkv", &o_img);
+        let fc = a_img
+            .iter()
+            .position(|x| x == "-filter_complex")
+            .expect("has -filter_complex");
+        let fc_str = &a_img[fc + 1];
+
+        // mono_vf MUST appear before overlay
+        let crop_idx = fc_str
+            .find("crop=iw/2:ih:0:0")
+            .expect("has crop in filter_complex");
+        let overlay_idx = fc_str
+            .find("overlay=")
+            .expect("has overlay in filter_complex");
+        assert!(
+            crop_idx < overlay_idx,
+            "crop must be before overlay: {fc_str}"
         );
     }
 }

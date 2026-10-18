@@ -683,6 +683,8 @@ async fn stream_transcoded_webm(
         decode_preroll_seconds: None,
         muxed_audio_source: None,
         filler: None,
+        video_3d_format: None,
+        stereo_output: Default::default(),
     };
     tracing::info!(
         media.id = item.id,

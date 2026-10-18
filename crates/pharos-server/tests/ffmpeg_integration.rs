@@ -156,6 +156,8 @@ async fn transcoder_streams_bytes_from_real_video() {
         decode_preroll_seconds: None,
         muxed_audio_source: None,
         filler: None,
+        video_3d_format: None,
+        stereo_output: Default::default(),
     };
     let mut stream = FfmpegTranscoder::new()
         .transcode(&fixture, &opts)
@@ -313,6 +315,8 @@ async fn transcoder_honours_audio_stream_index() {
         decode_preroll_seconds: None,
         muxed_audio_source: None,
         filler: None,
+        video_3d_format: None,
+        stereo_output: Default::default(),
     };
     let track0_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &common)
@@ -368,6 +372,8 @@ async fn transcoder_honours_burn_subtitle_index() {
         decode_preroll_seconds: None,
         muxed_audio_source: None,
         filler: None,
+        video_3d_format: None,
+        stereo_output: Default::default(),
     };
     let no_burn_stream = FfmpegTranscoder::new()
         .transcode(&fixture, &base)
