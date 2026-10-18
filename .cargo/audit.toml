@@ -36,4 +36,10 @@ ignore = [
     # via `cargo tree -i h2@0.3.27 -e no-dev` printing nothing. Full rationale
     # in deny.toml.
     "RUSTSEC-2026-0258",
+    # RUSTSEC-2026-0367 / -0368 / -0369 — zip 8.6.0 `extract()` advisories
+    # (SUID/SGID kept, symlink escape). zip 8.6.0 is pinned by `boko`, which
+    # never calls `extract()`; no fixed 8.x exists. Full argument in deny.toml.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
