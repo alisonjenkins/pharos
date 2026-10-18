@@ -529,6 +529,8 @@ pub struct BaseItemDto {
     /// playback paths on capable displays.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_range: Option<&'static str>,
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
     // LIB-C7/C8/C9 — descriptive metadata projected from
     // `MediaItem.metadata`. All `Option`/array fields are
     // `skip_serializing_if`-guarded so the wire shape is unchanged when
@@ -825,6 +827,8 @@ pub struct MediaSourceLiteDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_audio_stream_index: Option<u32>,
     pub video_type: &'static str,
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
     pub e_tag: String,
 }
 
@@ -877,6 +881,8 @@ pub struct MediaSourceInfoDto {
     pub analyze_duration_ms: u32,
     pub transcoding_max_audio_channels: u32,
     pub start_position_ticks: u64,
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
 }
 
 impl Default for MediaSourceInfoDto {
@@ -919,6 +925,7 @@ impl Default for MediaSourceInfoDto {
             analyze_duration_ms: 2_000_000,
             transcoding_max_audio_channels: 2,
             start_position_ticks: 0,
+            video_3d_format: None,
         }
     }
 }
@@ -1037,6 +1044,8 @@ pub struct MediaStreamDto {
     /// title + codec + channel layout (see `stream_display_title`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<pharos_core::Video3DFormat>,
 }
 
 /// Map a 2/3-letter ISO-639 language code to an English display name, falling
@@ -1817,6 +1826,11 @@ impl BaseItemDto {
                     name: item.title.clone(),
                     default_audio_stream_index,
                     video_type: "VideoFile",
+                    video_3d_format: if is_video {
+                        probe.video_3d_format
+                    } else {
+                        None
+                    },
                     e_tag: "0".into(),
                 }]
             },
@@ -1960,6 +1974,11 @@ impl BaseItemDto {
             // Audio items + SDR videos skip the field entirely.
             video_range: if is_video && item.probe.is_hdr() {
                 Some("HDR")
+            } else {
+                None
+            },
+            video_3d_format: if is_video {
+                probe.video_3d_format
             } else {
                 None
             },
@@ -2488,6 +2507,7 @@ pub fn build_media_streams_with_subtitles(
             supports_external_stream: false,
             replay_gain: None,
             display_title: None,
+            video_3d_format: probe.video_3d_format,
         });
         // P16 — multi-track audio when the probe carries the new
         // audio_tracks Vec. Falls through to the scalar
@@ -2523,6 +2543,7 @@ pub fn build_media_streams_with_subtitles(
                     supports_external_stream: false,
                     replay_gain: build_replay_gain(t),
                     display_title: None,
+                    video_3d_format: None,
                 });
             }
         } else if let Some(codec) = probe.audio_codec.clone() {
@@ -2556,6 +2577,7 @@ pub fn build_media_streams_with_subtitles(
                 supports_external_stream: false,
                 replay_gain: None,
                 display_title: None,
+                video_3d_format: None,
             });
         }
         // Subtitle tracks — embedded first, then sidecars.
@@ -2650,6 +2672,7 @@ pub fn build_media_streams_with_subtitles(
                     supports_external_stream: external,
                     replay_gain: None,
                     display_title: None,
+                    video_3d_format: None,
                 });
             }
             // Sidecars: contiguous, one past the highest real ffprobe index
@@ -2697,6 +2720,7 @@ pub fn build_media_streams_with_subtitles(
                     supports_external_stream: true,
                     replay_gain: None,
                     display_title: None,
+                    video_3d_format: None,
                 });
             }
         }
@@ -2727,6 +2751,7 @@ pub fn build_media_streams_with_subtitles(
             supports_external_stream: false,
             replay_gain: None,
             display_title: None,
+            video_3d_format: None,
         });
     }
     fill_display_titles(&mut streams);
@@ -3858,5 +3883,213 @@ mod person_image_tag_tests {
         let b = super::person_image_tag_for("https://cdn/b.jpg");
         assert_eq!(a1, a2, "same url → same tag (stable across renders)");
         assert_ne!(a1, b, "different url → different tag (cache-bust)");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod video_3d_format_tests {
+    use super::{
+        build_media_streams, build_media_streams_with_subtitles, BaseItemDto, MediaSourceInfoDto,
+        SubtitleStreamCtx,
+    };
+    use pharos_core::{AudioTrack, MediaItem, MediaKind, MediaProbe, SubtitleTrack, Video3DFormat};
+
+    fn make_3d_movie(format: Video3DFormat) -> MediaItem {
+        MediaItem {
+            id: 42,
+            kind: MediaKind::Movie,
+            title: "Avatar 3D".into(),
+            probe: MediaProbe {
+                video_codec: Some("h264".into()),
+                video_3d_format: Some(format),
+                audio_tracks: vec![AudioTrack {
+                    stream_index: 1,
+                    codec: Some("aac".into()),
+                    ..Default::default()
+                }],
+                subtitle_tracks: vec![SubtitleTrack {
+                    stream_index: 2,
+                    codec: Some("subrip".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_3d_format_serialized_across_all_variants() {
+        let cases = [
+            (Video3DFormat::HalfSideBySide, "HalfSideBySide"),
+            (Video3DFormat::FullSideBySide, "FullSideBySide"),
+            (Video3DFormat::FullTopAndBottom, "FullTopAndBottom"),
+            (Video3DFormat::HalfTopAndBottom, "HalfTopAndBottom"),
+            (Video3DFormat::Mvc, "MVC"),
+        ];
+
+        for (format, expected_str) in cases {
+            let item = make_3d_movie(format);
+            let mut dto = BaseItemDto::from_domain(&item, "srv");
+            let ctx = SubtitleStreamCtx::new(item.id);
+            dto.media_sources[0].media_streams =
+                build_media_streams_with_subtitles(&item.probe, true, Some(&ctx));
+
+            let val = serde_json::to_value(&dto).expect("serialize to value");
+
+            // Root item has Video3DFormat
+            assert_eq!(
+                val.get("Video3DFormat").and_then(|v| v.as_str()),
+                Some(expected_str),
+                "root BaseItemDto has Video3DFormat = {expected_str}"
+            );
+
+            // MediaSources[0] has Video3DFormat
+            assert_eq!(
+                val["MediaSources"][0]
+                    .get("Video3DFormat")
+                    .and_then(|v| v.as_str()),
+                Some(expected_str),
+                "MediaSources[0] has Video3DFormat = {expected_str}"
+            );
+
+            // Video MediaStreams[0] has Video3DFormat
+            assert_eq!(
+                val["MediaSources"][0]["MediaStreams"][0]
+                    .get("Video3DFormat")
+                    .and_then(|v| v.as_str()),
+                Some(expected_str),
+                "video MediaStreams[0] has Video3DFormat = {expected_str}"
+            );
+
+            // Audio MediaStreams[1] omits Video3DFormat
+            assert_eq!(
+                val["MediaSources"][0]["MediaStreams"][1].get("Video3DFormat"),
+                None,
+                "audio MediaStreams[1] omits Video3DFormat"
+            );
+
+            // Subtitle MediaStreams[2] omits Video3DFormat
+            assert_eq!(
+                val["MediaSources"][0]["MediaStreams"][2].get("Video3DFormat"),
+                None,
+                "subtitle MediaStreams[2] omits Video3DFormat"
+            );
+
+            // Serialized JSON string never contains "Video3dFormat" (lowercase d)
+            let json_str = serde_json::to_string(&dto).expect("serialize to json string");
+            assert!(
+                !json_str.contains("Video3dFormat"),
+                "serialized JSON must never contain 'Video3dFormat': {json_str}"
+            );
+            assert!(
+                json_str.contains(&format!("\"Video3DFormat\":\"{expected_str}\"")),
+                "serialized JSON must contain Video3DFormat:{expected_str}"
+            );
+
+            // Also check MediaSourceInfoDto serialization with this format
+            let info = MediaSourceInfoDto {
+                video_3d_format: Some(format),
+                ..Default::default()
+            };
+            let info_val = serde_json::to_value(&info).expect("serialize info");
+            assert_eq!(
+                info_val.get("Video3DFormat").and_then(|v| v.as_str()),
+                Some(expected_str)
+            );
+            let info_str = serde_json::to_string(&info).expect("serialize info string");
+            assert!(!info_str.contains("Video3dFormat"));
+        }
+    }
+
+    #[test]
+    fn test_2d_format_omitted_across_all_dtos() {
+        let item_2d = MediaItem {
+            id: 100,
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                video_codec: Some("h264".into()),
+                video_3d_format: None,
+                audio_tracks: vec![AudioTrack {
+                    stream_index: 1,
+                    codec: Some("aac".into()),
+                    ..Default::default()
+                }],
+                subtitle_tracks: vec![SubtitleTrack {
+                    stream_index: 2,
+                    codec: Some("subrip".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 1. BaseItemDto
+        let dto = BaseItemDto::from_domain(&item_2d, "srv");
+        let dto_val = serde_json::to_value(&dto).expect("serialize dto");
+        assert_eq!(
+            dto_val.get("Video3DFormat"),
+            None,
+            "Video3DFormat omitted on 2D BaseItemDto"
+        );
+        let dto_str = serde_json::to_string(&dto).expect("serialize dto");
+        assert!(!dto_str.contains("Video3DFormat"));
+        assert!(!dto_str.contains("Video3dFormat"));
+
+        // 2. MediaSourceLiteDto
+        let lite = &dto.media_sources[0];
+        let lite_val = serde_json::to_value(lite).expect("serialize lite");
+        assert_eq!(
+            lite_val.get("Video3DFormat"),
+            None,
+            "Video3DFormat omitted on 2D MediaSourceLiteDto"
+        );
+        let lite_str = serde_json::to_string(lite).expect("serialize lite");
+        assert!(!lite_str.contains("Video3DFormat"));
+        assert!(!lite_str.contains("Video3dFormat"));
+
+        // 3. MediaSourceInfoDto
+        let info = MediaSourceInfoDto::default();
+        let info_val = serde_json::to_value(&info).expect("serialize info");
+        assert_eq!(
+            info_val.get("Video3DFormat"),
+            None,
+            "Video3DFormat omitted on 2D MediaSourceInfoDto"
+        );
+        let info_str = serde_json::to_string(&info).expect("serialize info");
+        assert!(!info_str.contains("Video3DFormat"));
+        assert!(!info_str.contains("Video3dFormat"));
+
+        // 4. MediaStreamDto
+        let streams = build_media_streams(&item_2d.probe, true);
+        for stream in &streams {
+            let stream_val = serde_json::to_value(stream).expect("serialize stream");
+            assert_eq!(
+                stream_val.get("Video3DFormat"),
+                None,
+                "Video3DFormat omitted on 2D MediaStreamDto"
+            );
+            let stream_str = serde_json::to_string(stream).expect("serialize stream");
+            assert!(!stream_str.contains("Video3DFormat"));
+            assert!(!stream_str.contains("Video3dFormat"));
+        }
+    }
+
+    #[test]
+    fn test_non_video_item_with_3d_probe_omits_video_3d_format() {
+        let audio_item = MediaItem {
+            id: 200,
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                video_3d_format: Some(Video3DFormat::HalfSideBySide),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dto = BaseItemDto::from_domain(&audio_item, "srv");
+        let val = serde_json::to_value(&dto).expect("serialize audio dto");
+        assert_eq!(val.get("Video3DFormat"), None);
     }
 }
