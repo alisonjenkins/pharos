@@ -192,6 +192,9 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             RemoteCommand::SetIgnoreWait { member_id, ignore }
         }
+        GroupMsg::SetMemberKind { member, kind, cast } => {
+            RemoteCommand::SetMemberKind { member, kind, cast }
+        }
         // Answered locally on the remote replica, never forwarded. `SeedQueue`
         // is issued only from `/SyncPlay/New`, whose caller's replica created
         // and therefore OWNS the group — so it is always applied locally and
@@ -199,6 +202,7 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         // liveness (a member's socket lives on exactly one replica), so it is
         // meaningful only where the socket dropped and is never forwarded.
         GroupMsg::AddMember { .. }
+        | GroupMsg::AddCastSeat { .. }
         | GroupMsg::Snapshot { .. }
         | GroupMsg::SeedQueue { .. }
         | GroupMsg::MemberSocketLost { .. } => return None,
@@ -236,10 +240,39 @@ pub(crate) fn spawn_remote_handle(
                                 member_id,
                                 name: name.clone(),
                                 is_leader: true,
+                                device: None,
                             }],
                         });
                     }
                     commands.submit(group_id, RemoteCommand::AddMember { member_id, name });
+                }
+                GroupMsg::AddCastSeat { .. } => {
+                    if let GroupMsg::AddCastSeat {
+                        member_id,
+                        name,
+                        cast,
+                        reply,
+                    } = msg
+                    {
+                        let _ = reply.send(crate::group::Joined {
+                            group_id,
+                            leader: member_id,
+                            members: vec![crate::messages::MemberSummary {
+                                member_id,
+                                name: name.clone(),
+                                is_leader: true,
+                                device: None,
+                            }],
+                        });
+                        commands.submit(
+                            group_id,
+                            RemoteCommand::AddCastSeat {
+                                member_id,
+                                name,
+                                cast,
+                            },
+                        );
+                    }
                 }
                 GroupMsg::Snapshot { .. } => {
                     // A remote handle can't answer from the actor; the list

@@ -652,3 +652,78 @@ async fn resume_row_honours_the_limit_the_client_asked_for() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["Items"].as_array().map(Vec::len), Some(30));
 }
+
+/// `GET /Sessions` and the socket `Sessions` patch describe the same session;
+/// jellyfin-web replaces its list entry by `Id` with the patch, so a capability
+/// that differs between them flips the entry in and out of the remote-control
+/// picker.
+#[actix_web::test]
+async fn rest_and_socket_agree_on_remote_control_support() {
+    use futures_util::StreamExt;
+
+    let (state, token) = seed().await;
+    let member_sinks = pharos_sync::MemberSinks::new();
+    let registry = web::Data::new(pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(member_sinks.clone()),
+    )));
+    let member_sinks = web::Data::new(member_sinks);
+    let mut srv = actix_test::start(move || {
+        build_app(state.clone())
+            .app_data(registry.clone())
+            .app_data(web::Data::new(pharos_sync::SessionHub::new()))
+            .app_data(member_sinks.clone())
+    });
+    let client = awc::Client::default();
+    let mut ws = srv
+        .ws_at(&format!("/socket?api_key={token}&deviceId=d1"))
+        .await
+        .unwrap();
+
+    let started = client
+        .post(srv.url("/Sessions/Playing"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .send_json(
+            &serde_json::json!({"ItemId": "100", "PlaySessionId": "s1", "PositionTicks": 0u64}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 204);
+    let progressed = client
+        .post(srv.url("/Sessions/Playing/Progress"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .send_json(
+            &serde_json::json!({"ItemId": "100", "PlaySessionId": "s1", "PositionTicks": 5u64}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(progressed.status(), 204);
+
+    let socket_entry = loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("a Sessions frame within 5s")
+            .expect("socket open")
+            .expect("frame");
+        if let awc::ws::Frame::Text(t) = frame {
+            let v: serde_json::Value = serde_json::from_slice(&t).unwrap();
+            if v["MessageType"] == "Sessions" {
+                break v["Data"][0].clone();
+            }
+        }
+    };
+
+    let mut listed = client
+        .get(srv.url("/Sessions"))
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .send()
+        .await
+        .unwrap();
+    let rest: serde_json::Value = listed.json().await.unwrap();
+    let rest_entry = &rest[0];
+
+    assert_eq!(rest_entry["Id"], socket_entry["Id"]);
+    assert_eq!(
+        rest_entry["SupportsRemoteControl"], socket_entry["SupportsRemoteControl"],
+        "REST {rest_entry} vs socket {socket_entry}"
+    );
+}

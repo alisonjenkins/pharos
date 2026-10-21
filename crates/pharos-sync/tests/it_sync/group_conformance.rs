@@ -12,7 +12,9 @@
 //! - network-blip: a member who drops and rejoins picks up the current
 //!   playback state on rejoin.
 
-use pharos_sync::group::{GroupHandle, GroupMsg, GroupSnapshot, Joined, MIN_LEAD_MS};
+use pharos_sync::group::{
+    CastBinding, GroupHandle, GroupMsg, GroupSnapshot, Joined, MemberKind, MIN_LEAD_MS,
+};
 use pharos_sync::messages::{GroupId, MemberId, ServerMsg};
 use pharos_sync::{LocalDelivery, MemberSinks};
 use std::sync::Arc;
@@ -347,4 +349,702 @@ async fn after_handoff_old_leader_cannot_issue_play() {
         ServerMsg::Play { position_ms, .. } => assert_eq!(position_ms, 1234),
         other => panic!("expected Play, got {other:?}"),
     }
+}
+
+async fn set_kind(h: &GroupHandle, member: MemberId, kind: MemberKind, cast: Option<CastBinding>) {
+    h.tx.send(GroupMsg::SetMemberKind { member, kind, cast })
+        .await
+        .unwrap();
+}
+
+fn is_play(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::Play { .. })
+}
+
+fn is_pause(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::Pause { .. })
+}
+
+/// V139/V161 — a Controller and a CastSeat never ack, so neither may hold a
+/// queue-change or Seek gate; both stay in the roster and still hear the group.
+#[tokio::test]
+async fn non_player_members_never_hold_a_gate_but_stay_in_the_roster() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, mut p2_rx) = add_member(&h, &sinks, "p2").await;
+    let (seat, mut seat_rx) = add_member(&h, &sinks, "tv").await;
+    let (ctrl, mut ctrl_rx) = add_member(&h, &sinks, "phone").await;
+    let cast = CastBinding {
+        tv: "Living Room".into(),
+        owner: "ali".into(),
+    };
+    set_kind(&h, seat, MemberKind::CastSeat, Some(cast.clone())).await;
+    set_kind(&h, ctrl, MemberKind::Controller, Some(cast)).await;
+
+    h.tx.send(GroupMsg::SetNewQueue {
+        sender: leader,
+        item_ids: vec!["ep1".into()],
+        item_runtimes_ms: Vec::new(),
+        playing_index: 0,
+        start_position_ms: 0,
+    })
+    .await
+    .unwrap();
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 0,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "queue-change gate must complete on the Player acks alone"
+    );
+
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 30_000,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 30_000,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "seek gate must complete on the Player acks alone"
+    );
+
+    for rx in [&mut seat_rx, &mut ctrl_rx, &mut p2_rx] {
+        assert!(
+            wait_for(rx, Duration::from_millis(500), |m| matches!(
+                m,
+                ServerMsg::Seek { .. }
+            ))
+            .await
+            .is_some(),
+            "every member, whatever its kind, receives the Seek"
+        );
+    }
+    let snap = snapshot(&h).await;
+    assert_eq!(snap.member_count, 4);
+    // The phone and the TV share a cast, so they list as one name.
+    assert!(snap.participants.iter().any(|p| p == "phone"));
+    assert_eq!(snap.participants.len(), 3);
+}
+
+/// V139 — a buffering report from a non-player must neither freeze the group
+/// nor stay behind as a holdout that blocks the Player's recovery.
+#[tokio::test]
+async fn non_player_buffering_is_not_a_freeze_wait_target() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, _p2_rx) = add_member(&h, &sinks, "p2").await;
+    let (seat, _seat_rx) = add_member(&h, &sinks, "tv").await;
+    set_kind(&h, seat, MemberKind::CastSeat, None).await;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 10_000,
+    })
+    .await
+    .unwrap();
+    drain(&mut leader_rx).await;
+
+    h.tx.send(GroupMsg::BufferingStart {
+        member_id: seat,
+        position_ms: 10_000,
+        playlist_item_id: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(300), is_pause)
+            .await
+            .is_none(),
+        "a CastSeat buffering report must not freeze the group"
+    );
+
+    h.tx.send(GroupMsg::BufferingStart {
+        member_id: p2,
+        position_ms: 10_000,
+        playlist_item_id: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(500), is_pause)
+            .await
+            .is_some(),
+        "a Player buffering still freezes the group"
+    );
+    h.tx.send(GroupMsg::BufferingEnd { member_id: p2 })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "the freeze must lift without waiting on the CastSeat"
+    );
+}
+
+/// A channel-attached adapter sink (what a Cast seat uses) must see exactly
+/// the message stream a websocket-style sink sees for pause / unpause / seek.
+#[tokio::test]
+async fn channel_attached_sink_receives_the_same_stream_as_a_socket_sink() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (ws, mut ws_rx) = add_member(&h, &sinks, "socket").await;
+    let adapter = MemberId::new();
+    let mut adapter_rx = sinks.attach_channel(adapter, 1, 64);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: adapter,
+        name: "tv".into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    set_kind(&h, adapter, MemberKind::CastSeat, None).await;
+    let _ = ws;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    h.tx.send(GroupMsg::PauseShared { sender: leader })
+        .await
+        .unwrap();
+    h.tx.send(GroupMsg::Unpause { sender: leader })
+        .await
+        .unwrap();
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 20_000,
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    fn kinds(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if matches!(
+                m,
+                ServerMsg::Play { .. } | ServerMsg::Pause { .. } | ServerMsg::Seek { .. }
+            ) {
+                out.push(m.kind());
+            }
+        }
+        out
+    }
+    let socket = kinds(&mut ws_rx);
+    let adapter = kinds(&mut adapter_rx);
+    let _ = kinds(&mut leader_rx);
+    assert!(
+        socket.contains(&"pause") && socket.contains(&"seek"),
+        "scenario must produce commands: {socket:?}"
+    );
+    assert_eq!(adapter, socket, "adapter and socket sinks diverged");
+}
+
+async fn join_roster(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    name: &str,
+) -> (MemberId, Vec<pharos_sync::MemberSummary>) {
+    let (tx, _rx) = mpsc::channel(64);
+    let mid = MemberId::new();
+    sinks.insert(mid, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: mid,
+        name: name.into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let joined: Joined = joined.await.unwrap();
+    (mid, joined.members)
+}
+
+/// FR-005 — a user driving a TV has a Controller (their phone) and a CastSeat
+/// (the TV) bound to the same cast. The roster shows ONE entry: the user, with
+/// the TV as the device. It is a projection, so the raw member count is intact.
+#[tokio::test]
+async fn casting_user_appears_once_in_the_roster_with_the_tv_as_device() {
+    let (h, sinks) = spawn_group();
+    let (_bob, _) = join_roster(&h, &sinks, "bob").await;
+    let (ctrl, _) = join_roster(&h, &sinks, "ali").await;
+    let (seat, _) = join_roster(&h, &sinks, "Living Room").await;
+    let cast = |owner: &str| {
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: owner.into(),
+        })
+    };
+    set_kind(&h, ctrl, MemberKind::Controller, cast("ali")).await;
+    set_kind(&h, seat, MemberKind::CastSeat, cast("ali")).await;
+
+    let (_carol, roster) = join_roster(&h, &sinks, "carol").await;
+    let mut names: Vec<_> = roster.iter().map(|m| m.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ali", "bob", "carol"], "roster: {roster:?}");
+    let ali = roster.iter().find(|m| m.name == "ali").unwrap();
+    assert_eq!(ali.device.as_deref(), Some("Living Room"));
+    assert!(
+        roster
+            .iter()
+            .filter(|m| m.name != "ali")
+            .all(|m| m.device.is_none()),
+        "ordinary members carry no device"
+    );
+
+    let snap = snapshot(&h).await;
+    assert_eq!(
+        snap.member_count, 4,
+        "projection must not change the roster"
+    );
+    assert_eq!(snap.participants.len(), 3);
+}
+
+/// A seat whose Controller belongs to a different owner is a different cast:
+/// nothing is collapsed.
+#[tokio::test]
+async fn roster_keeps_members_of_different_casts_apart() {
+    let (h, sinks) = spawn_group();
+    let (ctrl, _) = join_roster(&h, &sinks, "ali").await;
+    let (seat, _) = join_roster(&h, &sinks, "Living Room").await;
+    set_kind(
+        &h,
+        ctrl,
+        MemberKind::Controller,
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: "ali".into(),
+        }),
+    )
+    .await;
+    set_kind(
+        &h,
+        seat,
+        MemberKind::CastSeat,
+        Some(CastBinding {
+            tv: "Living Room".into(),
+            owner: "bob".into(),
+        }),
+    )
+    .await;
+    let (_c, roster) = join_roster(&h, &sinks, "carol").await;
+    assert_eq!(roster.len(), 3, "roster: {roster:?}");
+}
+
+fn ordered_id(n: u128) -> MemberId {
+    MemberId(uuid::Uuid::from_u128(n))
+}
+
+async fn add_member_with_id(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    id: MemberId,
+    name: &str,
+) -> mpsc::Receiver<ServerMsg> {
+    let (tx, rx) = mpsc::channel(64);
+    sinks.insert(id, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: id,
+        name: name.into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    rx
+}
+
+fn tv_cast() -> Option<CastBinding> {
+    Some(CastBinding {
+        tv: "Living Room".into(),
+        owner: "ali".into(),
+    })
+}
+
+/// T057 — a CastSeat with a lower id than a Player must lose the election:
+/// when the leader leaves, the Player takes over, never the seat.
+#[tokio::test]
+async fn leader_removed_hands_over_to_a_player_not_a_lower_id_seat() {
+    let (h, sinks) = spawn_group();
+    let leader = ordered_id(10);
+    let seat = ordered_id(11);
+    let player = ordered_id(12);
+    let _l = add_member_with_id(&h, &sinks, leader, "leader").await;
+    let _s = add_member_with_id(&h, &sinks, seat, "tv").await;
+    let mut p_rx = add_member_with_id(&h, &sinks, player, "player").await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: leader })
+        .await
+        .unwrap();
+    let change = wait_for(&mut p_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::LeaderChange { .. })
+    })
+    .await;
+    assert!(
+        matches!(change, Some(ServerMsg::LeaderChange { leader }) if leader == player),
+        "expected LeaderChange to the Player, got {change:?}"
+    );
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+/// T057 — re-classifying the current leader as a non-Player moves leadership
+/// to a connected Player and announces it.
+#[tokio::test]
+async fn reclassifying_the_leader_as_a_seat_re_elects_a_player() {
+    let (h, sinks) = spawn_group();
+    let seat = ordered_id(20);
+    let player = ordered_id(21);
+    let _s = add_member_with_id(&h, &sinks, seat, "tv").await;
+    let mut p_rx = add_member_with_id(&h, &sinks, player, "player").await;
+    assert_eq!(snapshot(&h).await.leader, Some(seat));
+    drain(&mut p_rx).await;
+
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    let change = wait_for(&mut p_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::LeaderChange { .. })
+    })
+    .await;
+    assert!(
+        matches!(change, Some(ServerMsg::LeaderChange { leader }) if leader == player),
+        "expected LeaderChange to the Player, got {change:?}"
+    );
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+/// T057 — a non-Player that leads (no Player was around) yields as soon as a
+/// Player joins.
+#[tokio::test]
+async fn a_joining_player_takes_leadership_from_a_non_player() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(30);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "phone").await;
+    set_kind(&h, ctrl, MemberKind::Controller, None).await;
+    assert_eq!(snapshot(&h).await.leader, Some(ctrl));
+
+    let player = ordered_id(31);
+    let _p = add_member_with_id(&h, &sinks, player, "player").await;
+    assert_eq!(snapshot(&h).await.leader, Some(player));
+}
+
+fn is_member_left(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::MemberLeft { .. })
+}
+
+/// T058 — the roster shows a casting user once, so removing the paired seat
+/// must not tell anyone a separate member left.
+#[tokio::test]
+async fn removing_a_paired_seat_sends_no_member_left() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(50);
+    let seat = ordered_id(51);
+    let watcher = ordered_id(52);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let _s = add_member_with_id(&h, &sinks, seat, "Living Room").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    // Let the pairing land first.
+    let _ = snapshot(&h).await;
+    drain(&mut w_rx).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    let _ = snapshot(&h).await;
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(300), is_member_left)
+            .await
+            .is_none(),
+        "a paired seat leaving must not be announced"
+    );
+
+    // An ordinary member still is.
+    h.tx.send(GroupMsg::RemoveMember { member_id: ctrl })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(500), is_member_left)
+            .await
+            .is_some(),
+        "a Controller leaving is a member leaving"
+    );
+}
+
+/// T058 — a seat with no Controller is the only entry the roster shows for it,
+/// so its departure is announced.
+#[tokio::test]
+async fn removing_an_unpaired_seat_sends_member_left() {
+    let (h, sinks) = spawn_group();
+    let seat = ordered_id(60);
+    let watcher = ordered_id(61);
+    let _s = add_member_with_id(&h, &sinks, seat, "Living Room").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+    drain(&mut w_rx).await;
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    assert!(
+        wait_for(&mut w_rx, Duration::from_millis(500), is_member_left)
+            .await
+            .is_some(),
+        "an unpaired seat leaving must be announced"
+    );
+}
+
+/// T057 — with no Player at all the group still has a leader.
+#[tokio::test]
+async fn an_all_non_player_group_still_has_a_leader() {
+    let (h, sinks) = spawn_group();
+    let a = ordered_id(40);
+    let b = ordered_id(41);
+    let _a = add_member_with_id(&h, &sinks, a, "phone").await;
+    let _b = add_member_with_id(&h, &sinks, b, "tv").await;
+    set_kind(&h, a, MemberKind::Controller, None).await;
+    set_kind(&h, b, MemberKind::CastSeat, None).await;
+    // `a` yielded to the still-Player `b` first; `b` then became a seat with
+    // nobody left to yield to, so it keeps the lead.
+    assert_eq!(snapshot(&h).await.leader, Some(b));
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: b })
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&h).await.leader, Some(a));
+}
+
+async fn add_cast_seat(
+    h: &GroupHandle,
+    sinks: &MemberSinks,
+    id: MemberId,
+    name: &str,
+    cast: CastBinding,
+) -> mpsc::Receiver<ServerMsg> {
+    let (tx, rx) = mpsc::channel(64);
+    sinks.insert(id, 1, tx);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddCastSeat {
+        member_id: id,
+        name: name.into(),
+        cast,
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    rx
+}
+
+fn announcements(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<ServerMsg> {
+    let mut out = Vec::new();
+    while let Ok(m) = rx.try_recv() {
+        if matches!(
+            m,
+            ServerMsg::MemberJoined { .. } | ServerMsg::MemberLeft { .. }
+        ) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// T061 — a seat added already paired with its Controller is hidden from the
+/// start, so nobody is told a second member joined or left for a cast.
+#[tokio::test]
+async fn a_cast_seat_paired_with_its_controller_is_never_announced() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(70);
+    let seat = ordered_id(71);
+    let watcher = ordered_id(72);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    let _ = snapshot(&h).await;
+    drain(&mut w_rx).await;
+
+    let _s = add_cast_seat(&h, &sinks, seat, "ali", tv_cast().unwrap()).await;
+    let _ = snapshot(&h).await;
+    assert_eq!(announcements(&mut w_rx).len(), 0, "seat join is silent");
+
+    h.tx.send(GroupMsg::RemoveMember { member_id: seat })
+        .await
+        .unwrap();
+    set_kind(&h, ctrl, MemberKind::Player, None).await;
+    let _ = snapshot(&h).await;
+    assert_eq!(announcements(&mut w_rx).len(), 0, "seat leave is silent");
+}
+
+/// T061 — a seat with no Controller is the only roster entry for it, so its
+/// arrival is announced like any member's.
+#[tokio::test]
+async fn an_unpaired_cast_seat_is_announced() {
+    let (h, sinks) = spawn_group();
+    let seat = ordered_id(73);
+    let watcher = ordered_id(74);
+    let mut w_rx = add_member_with_id(&h, &sinks, watcher, "bob").await;
+    drain(&mut w_rx).await;
+
+    let _s = add_cast_seat(&h, &sinks, seat, "Living Room", tv_cast().unwrap()).await;
+    let _ = snapshot(&h).await;
+    let seen = announcements(&mut w_rx);
+    assert!(
+        matches!(seen.as_slice(), [ServerMsg::MemberJoined { member }] if member.member_id == seat),
+        "{seen:?}"
+    );
+}
+
+/// T022 — what a Cast seat's channel sink is handed for group pause / unpause /
+/// seek, with the positions the adapter turns into TV commands, and a seat that
+/// never acks (nobody drains or answers on its channel) holds no gate.
+#[tokio::test]
+async fn cast_seat_channel_sink_gets_the_group_commands_and_never_extends_a_gate() {
+    let (h, sinks) = spawn_group();
+    let (leader, mut leader_rx) = add_member(&h, &sinks, "leader").await;
+    let (p2, _p2_rx) = add_member(&h, &sinks, "p2").await;
+    let seat = MemberId::new();
+    let mut seat_rx = sinks.attach_channel(seat, 1, 64);
+    let (reply, joined) = oneshot::channel();
+    h.tx.send(GroupMsg::AddMember {
+        member_id: seat,
+        name: "tv".into(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let _: Joined = joined.await.unwrap();
+    set_kind(&h, seat, MemberKind::CastSeat, tv_cast()).await;
+
+    h.tx.send(GroupMsg::LeaderPlay {
+        sender: leader,
+        position_ms: 5_000,
+    })
+    .await
+    .unwrap();
+    assert!(
+        wait_for(&mut seat_rx, Duration::from_millis(500), |m| matches!(
+            m,
+            ServerMsg::Play { position_ms, .. } if (5_000..6_000).contains(position_ms)
+        ))
+        .await
+        .is_some(),
+        "Play at the group position"
+    );
+
+    h.tx.send(GroupMsg::PauseShared { sender: leader })
+        .await
+        .unwrap();
+    let paused_at = match wait_for(&mut seat_rx, Duration::from_millis(500), is_pause).await {
+        Some(ServerMsg::Pause { position_ms, .. }) => position_ms,
+        other => panic!("expected Pause, got {other:?}"),
+    };
+    assert!((5_000..7_000).contains(&paused_at), "{paused_at}");
+
+    h.tx.send(GroupMsg::Unpause { sender: leader })
+        .await
+        .unwrap();
+    match wait_for(&mut seat_rx, Duration::from_millis(500), is_play).await {
+        Some(ServerMsg::Play { position_ms, .. }) => {
+            assert!(
+                (paused_at..paused_at + 1_000).contains(&position_ms),
+                "unpause resumes from the paused position {paused_at}, got {position_ms}"
+            );
+        }
+        other => panic!("expected Play, got {other:?}"),
+    }
+
+    // The seat answers nothing from here on. The Players' acks alone must
+    // release the Seek gate, promptly.
+    drain(&mut leader_rx).await;
+    h.tx.send(GroupMsg::SeekTo {
+        sender: leader,
+        position_ms: 20_000,
+    })
+    .await
+    .unwrap();
+    match wait_for(&mut seat_rx, Duration::from_millis(500), |m| {
+        matches!(m, ServerMsg::Seek { .. })
+    })
+    .await
+    {
+        Some(ServerMsg::Seek { position_ms, .. }) => assert_eq!(position_ms, 20_000),
+        other => panic!("expected Seek, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let acked = tokio::time::Instant::now();
+    for member_id in [leader, p2] {
+        h.tx.send(GroupMsg::MemberReady {
+            member_id,
+            position_ms: 20_000,
+            playlist_item_id: None,
+            is_playing: false,
+        })
+        .await
+        .unwrap();
+    }
+    assert!(
+        wait_for(&mut leader_rx, Duration::from_millis(800), is_play)
+            .await
+            .is_some(),
+        "the gate must open on the Players' acks without the seat"
+    );
+    assert!(
+        acked.elapsed() < Duration::from_millis(800),
+        "the seat extended the gate"
+    );
+}
+
+/// T042 — a service that adopts a hydrated group needs to find the seats and
+/// each seat's paired Controller from the snapshot alone.
+#[tokio::test]
+async fn the_snapshot_lists_each_cast_seat_with_its_controller() {
+    let (h, sinks) = spawn_group();
+    let ctrl = ordered_id(80);
+    let seat = ordered_id(81);
+    let other = ordered_id(82);
+    let _c = add_member_with_id(&h, &sinks, ctrl, "ali").await;
+    let _o = add_member_with_id(&h, &sinks, other, "bob").await;
+    assert!(
+        snapshot(&h).await.cast_seats.is_empty(),
+        "no cast, no seats"
+    );
+
+    set_kind(&h, ctrl, MemberKind::Controller, tv_cast()).await;
+    let _s = add_cast_seat(&h, &sinks, seat, "ali", tv_cast().unwrap()).await;
+
+    let seats = snapshot(&h).await.cast_seats;
+    assert_eq!(seats.len(), 1, "{seats:?}");
+    assert_eq!(seats[0].seat, seat);
+    assert_eq!(seats[0].name, "ali");
+    assert_eq!(seats[0].cast, tv_cast().unwrap());
+    assert_eq!(seats[0].controller, Some(ctrl));
 }

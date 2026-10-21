@@ -15,8 +15,8 @@ pub use segment_grid::{
 };
 
 pub use auth::{
-    AccessSchedule, AuthBackend, AuthError, AuthResult, AuthToken, TokenRecord, TokenStore, User,
-    UserId, UserPolicy, UserRecord, UserStore,
+    AccessSchedule, AuthBackend, AuthError, AuthResult, AuthToken, IssuedToken, ResolvedToken,
+    TokenId, TokenRecord, TokenScope, TokenStore, User, UserId, UserPolicy, UserRecord, UserStore,
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::SecretString;

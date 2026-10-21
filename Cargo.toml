@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pharos-cache",
+    "crates/pharos-cast",
     "crates/pharos-core",
     "crates/pharos-discovery",
     "crates/pharos-jellyfin-api",
@@ -111,6 +112,13 @@ lopdf = { version = "0.45", default-features = false }
 # §13, which exists for precisely this pairing. See the scoped exception in
 # deny.toml; it is NOT a workspace-wide allow.
 boko = { version = "0.5", default-features = false }
+# 009 CASTV2 transport. `ring` matches the provider already in Cargo.lock
+# (reqwest/sqlx); `default-features = false` keeps aws-lc-rs (C build) out.
+prost = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Test-only: per-run self-signed cert for the in-process CASTV2 server.
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

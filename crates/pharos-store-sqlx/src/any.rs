@@ -8,13 +8,14 @@ use crate::sqlite::SqliteStore;
 use crate::{RuntimeConfig, ServerConfigStore, StoreError};
 use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult,
-    EntityCounts, Fingerprint, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
-    LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore, PersistedSyncGroup,
-    PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore, PlaybackProgress,
-    Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ScanState, SearchQuery, SecretString,
-    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore,
-    SyncGroupStore, Tag, TagCount, TagStore, TokenRecord, TokenStore, TranscodeSessionStore,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    EntityCounts, Fingerprint, GenreCount, GenreStore, IssuedToken, ItemPerson, Library,
+    LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
+    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore,
+    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
+    ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
+    TokenId, TokenRecord, TokenScope, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
+    UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -1166,10 +1167,30 @@ impl TokenStore for AnyStore {
         }
     }
 
-    async fn resolve(&self, token: &str) -> AuthResult<UserId> {
+    async fn issue_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+        scope: TokenScope,
+    ) -> AuthResult<IssuedToken> {
         match self {
-            AnyStore::Sqlite(s) => s.resolve(token).await,
-            AnyStore::Postgres(p) => p.resolve(token).await,
+            AnyStore::Sqlite(s) => s.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
+            AnyStore::Postgres(p) => p.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
+        }
+    }
+
+    async fn revoke_by_id(&self, id: &TokenId) -> AuthResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.revoke_by_id(id).await,
+            AnyStore::Postgres(p) => p.revoke_by_id(id).await,
+        }
+    }
+
+    async fn resolve_scoped(&self, token: &str) -> AuthResult<ResolvedToken> {
+        match self {
+            AnyStore::Sqlite(s) => s.resolve_scoped(token).await,
+            AnyStore::Postgres(p) => p.resolve_scoped(token).await,
         }
     }
 

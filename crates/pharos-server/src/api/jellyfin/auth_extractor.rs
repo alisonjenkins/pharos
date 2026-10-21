@@ -9,10 +9,11 @@
 
 use crate::state::AppState;
 use actix_web::{
-    dev::Payload, error::ErrorInternalServerError, error::ErrorUnauthorized, web, FromRequest,
-    HttpRequest,
+    dev::Payload,
+    error::{ErrorForbidden, ErrorInternalServerError, ErrorUnauthorized},
+    web, FromRequest, HttpRequest,
 };
-use pharos_core::{TokenStore, User, UserStore};
+use pharos_core::{TokenScope, TokenStore, User, UserStore};
 use std::{future::Future, pin::Pin};
 
 pub struct AuthUser(pub User);
@@ -23,9 +24,160 @@ impl FromRequest for AuthUser {
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_token(req);
+        let route = RouteKey::of(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
-        Box::pin(async move { authenticate(state, token).await.map(AuthUser) })
+        Box::pin(async move { authenticate(state, token, route).await.map(AuthUser) })
     }
+}
+
+/// The request's method and the route pattern it matched (lowercased, as
+/// registered: the path-case middleware lowercases before routing).
+struct RouteKey {
+    method: String,
+    pattern: Option<String>,
+}
+
+impl RouteKey {
+    fn of(req: &HttpRequest) -> Self {
+        Self {
+            method: req.method().as_str().to_string(),
+            pattern: req.match_pattern(),
+        }
+    }
+}
+
+/// How an [`AllowedRoute`] matches a registered route pattern.
+#[derive(Debug, Clone, Copy)]
+pub enum PatternMatch {
+    /// The whole pattern.
+    Exact(&'static str),
+    /// Every pattern that starts with this text (it ends in `/`).
+    Prefix(&'static str),
+}
+
+/// One route a [`TokenScope::Playback`] token may call.
+#[derive(Debug, Clone, Copy)]
+pub struct AllowedRoute {
+    /// Upper-case methods; `HEAD` is listed explicitly.
+    pub methods: &'static [&'static str],
+    pub pattern: PatternMatch,
+}
+
+const GET: &[&str] = &["GET", "HEAD"];
+const POST: &[&str] = &["POST"];
+
+/// The only routes a playback-scoped token (a cast receiver's) may call: what
+/// the stock Chromecast receiver needs to look up an item, negotiate playback,
+/// fetch media, subtitles and art, and report progress. Patterns are the
+/// lowercase forms the routes register with. DENY BY DEFAULT: a route not
+/// listed here is refused to a playback token, so a new route (admin,
+/// mutation, SyncPlay, session control, token issuing) is closed until it is
+/// added here on purpose. `/videos/{id}/` and `/audio/{id}/` are GET/HEAD
+/// only, which leaves `POST /videos/mergeversions` and the DELETE routes out.
+pub const PLAYBACK_ALLOWLIST: &[AllowedRoute] = &[
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Exact("/items/{id}"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Exact("/users/{user_id}/items/{item_id}"),
+    },
+    AllowedRoute {
+        methods: &["GET", "POST"],
+        pattern: PatternMatch::Exact("/items/{id}/playbackinfo"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/videos/{id}/"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/audio/{id}/"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/items/{id}/images/"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/capabilities"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/capabilities/full"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/playing"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/playing/progress"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/playing/stopped"),
+    },
+    AllowedRoute {
+        methods: POST,
+        pattern: PatternMatch::Exact("/sessions/playing/ping"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Exact("/system/info/public"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Exact("/users/me"),
+    },
+];
+
+/// Whether a token of `scope` may call `method` on the route `pattern`
+/// matched. An unmatched route (`None`) is never permitted to a restricted
+/// scope.
+pub fn scope_permits(scope: TokenScope, method: &str, pattern: Option<&str>) -> bool {
+    match scope {
+        TokenScope::Full => true,
+        TokenScope::Playback => pattern.is_some_and(|pattern| {
+            PLAYBACK_ALLOWLIST.iter().any(|r| {
+                r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+                    && match r.pattern {
+                        PatternMatch::Exact(p) => p == pattern,
+                        PatternMatch::Prefix(p) => pattern.starts_with(p),
+                    }
+            })
+        }),
+    }
+}
+
+/// The 403 for a token whose scope does not permit the route, with the refusal
+/// counted and logged; `None` when the scope permits it. Every credential check
+/// that honours a token routes through here so none can skip the allowlist.
+pub(crate) fn scope_refusal(
+    scope: TokenScope,
+    user: pharos_core::UserId,
+    method: &str,
+    pattern: Option<&str>,
+) -> Option<actix_web::Error> {
+    if scope_permits(scope, method, pattern) {
+        return None;
+    }
+    let pattern = pattern.unwrap_or("<unmatched>");
+    metrics::counter!("pharos_token_scope_refused_total", "scope" => scope.label()).increment(1);
+    tracing::warn!(
+        scope = scope.label(),
+        method,
+        route = pattern,
+        user.id = %user,
+        "token scope does not permit this route; answering 403"
+    );
+    Some(ErrorForbidden(format!(
+        "{} token may not call {} {}",
+        scope.label(),
+        method,
+        pattern
+    )))
 }
 
 /// Token to [`User`]: the one place a request is accepted or turned away, so
@@ -34,20 +186,29 @@ impl FromRequest for AuthUser {
 async fn authenticate(
     state: Option<web::Data<AppState>>,
     token: Option<String>,
+    route: RouteKey,
 ) -> Result<User, actix_web::Error> {
     let Some(token) = token else {
         count_rejection("missing_token");
         return Err(ErrorUnauthorized("missing token"));
     };
     let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
-    let uid = state
+    let resolved = state
         .stores
-        .resolve(&token)
+        .resolve_scoped(&token)
         .await
         .map_err(|e| auth_failure(e, Rejected::InvalidToken))?;
+    if let Some(refused) = scope_refusal(
+        resolved.scope,
+        resolved.user,
+        &route.method,
+        route.pattern.as_deref(),
+    ) {
+        return Err(refused);
+    }
     let record = state
         .stores
-        .get(uid)
+        .get(resolved.user)
         .await
         .map_err(|e| auth_failure(e, Rejected::UserRevoked))?;
     Ok(record.into_user())
@@ -115,9 +276,10 @@ impl FromRequest for AuthSession {
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_token(req);
         let device_id = device_id_from_request(req);
+        let route = RouteKey::of(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
         Box::pin(async move {
-            let user = authenticate(state, token).await?;
+            let user = authenticate(state, token, route).await?;
             Ok(AuthSession { user, device_id })
         })
     }

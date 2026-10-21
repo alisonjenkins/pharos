@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pharos-cache = { path = "../pharos-cache", default-features = false }
+pharos-cast = { path = "../pharos-cast" }
 pharos-core = { path = "../pharos-core" }
 pharos-discovery = { path = "../pharos-discovery" }
 pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
@@ -87,6 +88,7 @@ actix-test = "0.1"
 awc = "3"
 actix-codec = "0.5"
 metrics-util.workspace = true
+pharos-cast = { path = "../pharos-cast", features = ["testing"] }
 pharos-test-metrics = { path = "../pharos-test-metrics" }
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"

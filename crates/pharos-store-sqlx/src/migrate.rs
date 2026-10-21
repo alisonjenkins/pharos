@@ -642,23 +642,24 @@ async fn copy_auth_tokens(
     sp: &SqlitePool,
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<u64, StoreError> {
-    let rows: Vec<(String, Vec<u8>, String, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT token_hash, user_id, device_id, created_at, expires_at FROM auth_tokens",
+    let rows: Vec<(String, Vec<u8>, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT token_hash, user_id, device_id, created_at, expires_at, scope FROM auth_tokens",
     )
     .fetch_all(sp)
     .await
     .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
-    for (token_hash, user_id, device_id, created_at, expires_at) in rows {
+    for (token_hash, user_id, device_id, created_at, expires_at, scope) in rows {
         sqlx::query(
-            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(token_hash)
         .bind(user_id)
         .bind(device_id)
         .bind(created_at)
         .bind(expires_at)
+        .bind(scope)
         .execute(&mut **tx)
         .await
         .map_err(StoreError::Sqlx)?;

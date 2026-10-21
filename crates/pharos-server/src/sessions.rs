@@ -24,7 +24,7 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// dates — jellyfin-web's dashboard "Active Devices" panel formats them with
 /// date-fns, and a missing value yields `new Date(undefined)` → a fatal
 /// "Invalid time value" that crashes the whole dashboard landing page.
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

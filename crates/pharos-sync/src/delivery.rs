@@ -82,6 +82,22 @@ impl MemberSinks {
         }
     }
 
+    /// Register a non-websocket consumer (a Cast adapter) as `member_id`'s sink
+    /// and hand back the receiving end. It is the same generation-fenced channel
+    /// a socket gets, so the group delivers to it exactly what it would deliver
+    /// to a websocket member, and a full or closed adapter is dropped, counted
+    /// and named like any other slow sink.
+    pub fn attach_channel(
+        &self,
+        member_id: MemberId,
+        gen: u64,
+        capacity: usize,
+    ) -> mpsc::Receiver<ServerMsg> {
+        let (tx, rx) = mpsc::channel(capacity);
+        self.insert(member_id, gen, tx);
+        rx
+    }
+
     /// Drop a member's sink (socket closed / member left this replica), only if
     /// `gen` still owns it. A reconnect installs a higher generation, so a stale
     /// disconnect teardown from an older socket no-ops instead of wiping the

@@ -1122,6 +1122,12 @@
             + "-isystem ${pkgs.glibc.dev}/include";
           shellHook = ''
             echo "pharos devShell — rust $(rustc --version)"
+            # A host LD_LIBRARY_PATH (NixOS desktop sessions export alsa/jack)
+            # leaks libraries built against the host glibc into binaries that
+            # carry the flake's older glibc, so every test binary dies with
+            # "GLIBC_2.43 not found" before nextest can list tests. The
+            # devShell binaries all have a RUNPATH; they need none of it.
+            unset LD_LIBRARY_PATH
             # The SAME bundle the image ships (B175 epub.js patch included),
             # so the compat suite exercises what production serves rather than
             # stock upstream.
