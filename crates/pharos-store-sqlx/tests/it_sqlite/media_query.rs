@@ -1181,6 +1181,24 @@ async fn is_3d_matches_primary_or_any_edition_and_format_round_trips() {
         .await,
         vec![1]
     );
+    // Overwriting a 3D item with a 2D one must clear the denormalised flag.
+    let mut now_2d = MediaStore::get(&s, 2).await.unwrap();
+    now_2d.probe.video_3d_format = None;
+    s.put(now_2d).await.unwrap();
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![3]
+    );
+    let mut again_3d = MediaStore::get(&s, 2).await.unwrap();
+    again_3d.probe.video_3d_format = Some(Video3DFormat::FullSideBySide);
+    s.put(again_3d).await.unwrap();
     let back = MediaStore::get(&s, 2).await.unwrap();
     assert_eq!(
         back.probe.video_3d_format,
