@@ -1436,7 +1436,7 @@ impl<P: Prober> FsScanner<P> {
                     // Stable id suffix derived from the edition tag so
                     // URL paths survive re-scans the same way the
                     // primary's id does.
-                    let id = edition_id_slug(&edition);
+                    let id = unique_edition_id(&item.probe.alternate_sources, &edition);
                     item.probe.alternate_sources.push(AlternateMediaSource {
                         id,
                         path: alt_path,
@@ -1912,6 +1912,20 @@ pub(crate) fn is_known_edition(s: &str) -> bool {
 
 /// P41 — slugify an edition label into a URL-stable identifier suffix
 /// for `MediaSourceInfo.Id`. Lowercase, ascii-only, `-` separator.
+/// [`edition_id_slug`] made unique among the alternates already attached:
+/// `X - 3D.HSBS` and `X - 3D HSBS` slug alike, and a repeated id would make
+/// the second one unaddressable on PlaybackInfo.
+fn unique_edition_id(taken: &[AlternateMediaSource], edition: &str) -> String {
+    let base = edition_id_slug(edition);
+    let mut id = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|a| a.id == id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
+}
+
 fn edition_id_slug(edition: &str) -> String {
     let mut s = String::with_capacity(edition.len());
     for c in edition.chars() {
@@ -5421,6 +5435,27 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, orphan);
         assert!(groups[0].1.is_empty());
+    }
+
+    #[test]
+    fn unique_edition_id_suffixes_a_repeated_slug() {
+        let alt = |id: &str| AlternateMediaSource {
+            id: id.into(),
+            path: PathBuf::from("/x"),
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            bitrate_bps: None,
+            size_bytes: None,
+            duration_ms: None,
+            name: None,
+            video_3d_format: None,
+        };
+        assert_eq!(unique_edition_id(&[], "3D HSBS"), "3d-hsbs");
+        let one = [alt("3d-hsbs")];
+        assert_eq!(unique_edition_id(&one, "3D.HSBS"), "3d-hsbs-2");
+        let two = [alt("3d-hsbs"), alt("3d-hsbs-2")];
+        assert_eq!(unique_edition_id(&two, "3D HSBS"), "3d-hsbs-3");
     }
 
     #[test]
