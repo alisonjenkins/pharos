@@ -11,6 +11,7 @@ mod item_sort_semantics;
 mod items_audiobook_kind;
 mod items_language_filters;
 mod items_query_golden;
+mod jellyfin_3d;
 mod jellyfin_fts_facets;
 mod jellyfin_items;
 mod jellyfin_latest;
