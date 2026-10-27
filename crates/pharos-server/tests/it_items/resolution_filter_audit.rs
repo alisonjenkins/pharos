@@ -125,10 +125,13 @@ async fn min_max_width_bounds_pick_specific_class() {
 }
 
 #[actix_web::test]
-async fn is_3d_false_returns_everyone_true_returns_nothing() {
+async fn is_3d_filter_on_a_corpus_without_3d_files() {
     let (state, token) = seed_widths().await;
     let none_3d = names(state.clone(), &token, "Is3D=true").await;
-    assert!(none_3d.is_empty(), "no 3D detection yet; got {none_3d:?}");
+    assert!(
+        none_3d.is_empty(),
+        "no 3D file in this corpus; got {none_3d:?}"
+    );
     let all = names(state, &token, "Is3D=false").await;
     assert_eq!(all.len(), 5);
 }

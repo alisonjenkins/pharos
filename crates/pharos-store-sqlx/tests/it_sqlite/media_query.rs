@@ -938,7 +938,7 @@ async fn residual_has_subtitles_and_resolution() {
         .await,
         vec![2, 3]
     );
-    // 3D true → nothing (no detection).
+    // 3D true → nothing (this corpus has no 3D file).
     assert!(ids_for(
         &s,
         MediaFilters {
@@ -1140,4 +1140,73 @@ async fn distinct_resolvers_recover_synth_id_components() {
     let genres = s.distinct_genre_fields().await.unwrap();
     assert!(genres.iter().any(|g| g == "Action, Sci-Fi"));
     assert!(genres.iter().any(|g| g == "Drama"));
+}
+
+#[tokio::test]
+async fn is_3d_matches_primary_or_any_edition_and_format_round_trips() {
+    use pharos_core::{AlternateMediaSource, Video3DFormat};
+    let s = fresh().await;
+    let plain = item_with(1, "Plain", MediaKind::Movie);
+    let mut primary_3d = item_with(2, "Primary 3D", MediaKind::Movie);
+    primary_3d.probe.video_3d_format = Some(Video3DFormat::FullSideBySide);
+    let mut alt_3d = item_with(3, "Has 3D edition", MediaKind::Movie);
+    alt_3d.probe.alternate_sources.push(AlternateMediaSource {
+        id: "3d-hsbs".into(),
+        path: "/m/3.3d.hsbs.mkv".into(),
+        video_3d_format: Some(Video3DFormat::HalfSideBySide),
+        ..Default::default()
+    });
+    for it in [plain, primary_3d, alt_3d] {
+        s.put(it).await.unwrap();
+    }
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![2, 3]
+    );
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(false),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![1]
+    );
+    // Overwriting a 3D item with a 2D one must clear the denormalised flag.
+    let mut now_2d = MediaStore::get(&s, 2).await.unwrap();
+    now_2d.probe.video_3d_format = None;
+    s.put(now_2d).await.unwrap();
+    assert_eq!(
+        ids_for(
+            &s,
+            MediaFilters {
+                is_3d: Some(true),
+                ..Default::default()
+            }
+        )
+        .await,
+        vec![3]
+    );
+    let mut again_3d = MediaStore::get(&s, 2).await.unwrap();
+    again_3d.probe.video_3d_format = Some(Video3DFormat::FullSideBySide);
+    s.put(again_3d).await.unwrap();
+    let back = MediaStore::get(&s, 2).await.unwrap();
+    assert_eq!(
+        back.probe.video_3d_format,
+        Some(Video3DFormat::FullSideBySide)
+    );
+    let back = MediaStore::get(&s, 3).await.unwrap();
+    assert_eq!(
+        back.probe.alternate_sources[0].video_3d_format,
+        Some(Video3DFormat::HalfSideBySide)
+    );
 }

@@ -452,6 +452,13 @@ pub struct BaseItemDto {
     /// this field by name — `Fields=CanDownload,Path` — which is how the gap was
     /// found: nothing emitted it, so every client saw the field as absent.
     pub can_download: bool,
+    /// `Is3D` — the item has a 3D version (its own file or a grouped
+    /// edition). Omitted when false so a 2D payload does not grow.
+    #[serde(rename = "Is3D", skip_serializing_if = "std::ops::Not::not")]
+    pub is_3d: bool,
+    /// `Video3DFormat` of this item's own file; omitted for 2D.
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<&'static str>,
     pub media_sources: Vec<MediaSourceLiteDto>,
     pub play_access: &'static str,
     // Array-typed fields jellyfin-web iterates over without null
@@ -877,6 +884,9 @@ pub struct MediaSourceInfoDto {
     pub analyze_duration_ms: u32,
     pub transcoding_max_audio_channels: u32,
     pub start_position_ticks: u64,
+    /// `Video3DFormat` of this source's file; omitted for 2D.
+    #[serde(rename = "Video3DFormat", skip_serializing_if = "Option::is_none")]
+    pub video_3d_format: Option<&'static str>,
 }
 
 impl Default for MediaSourceInfoDto {
@@ -919,6 +929,7 @@ impl Default for MediaSourceInfoDto {
             analyze_duration_ms: 2_000_000,
             transcoding_max_audio_channels: 2,
             start_position_ticks: 0,
+            video_3d_format: None,
         }
     }
 }
@@ -1785,6 +1796,13 @@ impl BaseItemDto {
             location_type: "FileSystem",
             can_play: true,
             can_download: true,
+            is_3d: item.probe.video_3d_format.is_some()
+                || item
+                    .probe
+                    .alternate_sources
+                    .iter()
+                    .any(|a| a.video_3d_format.is_some()),
+            video_3d_format: item.probe.video_3d_format.map(|f| f.wire_name()),
             play_access: "Full",
             media_sources: if is_book {
                 // Empty, so nothing can construct /Videos/{id}/stream for an epub.

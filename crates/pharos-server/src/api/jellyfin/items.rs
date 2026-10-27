@@ -3499,6 +3499,7 @@ async fn playback_info(
         default_audio_stream_index,
         default_subtitle_stream_index,
         start_position_ticks: resume_ticks,
+        video_3d_format: probe.video_3d_format.map(|f| f.wire_name()),
         ..Default::default()
     };
 
@@ -3532,6 +3533,7 @@ async fn playback_info(
             bitrate: alt.bitrate_bps.or(probe.bitrate_bps),
             default_audio_stream_index,
             default_subtitle_stream_index,
+            video_3d_format: alt.video_3d_format.map(|f| f.wire_name()),
             ..Default::default()
         });
     }

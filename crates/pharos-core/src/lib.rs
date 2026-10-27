@@ -8,6 +8,7 @@ pub mod parental_rank;
 pub mod secret;
 pub mod segment_grid;
 pub mod time;
+pub mod video_3d;
 
 pub use segment_grid::{
     frame_snapped_start, segment_range, segment_seek_bias, SegmentGrid, SegmentIndex,
@@ -20,6 +21,7 @@ pub use auth::{
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::SecretString;
+pub use video_3d::Video3DFormat;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -1901,6 +1903,10 @@ pub struct MediaProbe {
     /// PlaybackInfo single-source. A future scanner enrichment pass
     /// populates this from sibling-file convention or NFO metadata.
     pub alternate_sources: Vec<AlternateMediaSource>,
+    /// Stereoscopic packing of the primary file, when known (filename
+    /// `3D.<tag>` flag). `None` for ordinary 2D video.
+    #[serde(default)]
+    pub video_3d_format: Option<Video3DFormat>,
 }
 
 /// P34 — minimal MediaSource shape carried alongside the primary
@@ -1930,6 +1936,9 @@ pub struct AlternateMediaSource {
     /// `"Theatrical"`). Surfaces as `MediaSourceInfo.Name` so the
     /// jellyfin-web edition picker labels rows correctly.
     pub name: Option<String>,
+    /// Stereoscopic packing of this edition's file, when known.
+    #[serde(default)]
+    pub video_3d_format: Option<Video3DFormat>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
@@ -2321,7 +2330,11 @@ pub struct ScanState {
 // 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
 // Re-probe so those rows drop the mux date; the metadata backfill then fills
 // the real year from the provider it had already matched correctly.
-pub const PROBE_SCHEMA_VERSION: i64 = 6;
+// v7: `video_3d_format` and 3D edition grouping. A skipped (unchanged) primary
+// never reaches `probe_with_alternates`, so without a re-probe an existing 3D
+// rip is demoted to an alternate of its 2D title yet never attached to it, and
+// a lone 3D file keeps `has_3d = 0`.
+pub const PROBE_SCHEMA_VERSION: i64 = 7;
 
 /// 005-kindle-conversion — bump when the BOOK extraction changes in a way that
 /// makes already-indexed book rows stale.
@@ -2804,8 +2817,8 @@ pub struct MediaFilters {
     /// `IsHD` — `Some(true)` keeps only `1280 <= width < 3840`; `Some(false)`
     /// keeps only items whose width is present and outside that band.
     pub is_hd: Option<bool>,
-    /// `Is3D` — no detection yet, so `Some(true)` matches nothing and
-    /// `Some(false)` matches everything (parity with the in-memory stub).
+    /// `Is3D` — `Some(true)` keeps items whose primary file or any grouped
+    /// edition is 3D; `Some(false)` keeps only items with no 3D version.
     pub is_3d: Option<bool>,
     /// `MinWidth` — keep only items whose `width >= n`.
     pub min_width: Option<u32>,

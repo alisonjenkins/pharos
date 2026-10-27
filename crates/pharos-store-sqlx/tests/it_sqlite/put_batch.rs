@@ -80,7 +80,19 @@ fn rich(id: MediaId, n: usize) -> MediaItem {
                 ..Default::default()
             });
         }
-        _ => {}
+        _ => {
+            // 3D columns: the primary's packing and an edition's, so a bind-order
+            // slip in either backend's batch path shows up as a snapshot diff.
+            item.probe.video_3d_format = Some(pharos_core::Video3DFormat::FullSideBySide);
+            item.probe
+                .alternate_sources
+                .push(pharos_core::AlternateMediaSource {
+                    id: "3d-htab".into(),
+                    path: format!("/pb/{id}.3d.htab.mkv").into(),
+                    video_3d_format: Some(pharos_core::Video3DFormat::HalfTopAndBottom),
+                    ..Default::default()
+                });
+        }
     }
     item
 }
