@@ -1361,9 +1361,6 @@ impl<P: Prober> FsScanner<P> {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
-        // A watch event names one file, so no edition grouping happens here, but
-        // the file's own `- 3D.HSBS` label still says how it is packed.
-        item.probe.video_3d_format = path_3d_format(&item.path);
         let item_id = item.id;
         // LIB-D7 — resolve local-first metadata for the (re)probed file, off
         // the reactor, and merge it onto the item before `put` (mirrors the
@@ -1426,7 +1423,6 @@ impl<P: Prober> FsScanner<P> {
         alts: Vec<(String, PathBuf)>,
     ) -> Option<MediaItem> {
         let mut item = self.probe_one(primary).await?;
-        item.probe.video_3d_format = path_3d_format(&item.path);
         for (edition, alt_path) in alts {
             match self.prober.probe(&alt_path).await {
                 Ok(info) => {
@@ -1572,6 +1568,10 @@ impl<P: Prober> FsScanner<P> {
                         probe.size_bytes = Some(meta.len());
                     }
                 }
+                // The file's own `- 3D.HSBS` label says how it is packed. Set
+                // here, the one place every probe path (full scan, edition
+                // grouping, watcher) goes through.
+                probe.video_3d_format = path_3d_format(&path);
                 // Promote video-kind items to Episode when the path
                 // looks like a TV layout. Audio stays as classified.
                 let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_path(&path) {
