@@ -1361,6 +1361,9 @@ impl<P: Prober> FsScanner<P> {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
+        // A watch event names one file, so no edition grouping happens here, but
+        // the file's own `- 3D.HSBS` label still says how it is packed.
+        item.probe.video_3d_format = path_3d_format(&item.path);
         let item_id = item.id;
         // LIB-D7 — resolve local-first metadata for the (re)probed file, off
         // the reactor, and merge it onto the item before `put` (mirrors the
@@ -1910,8 +1913,6 @@ pub(crate) fn is_known_edition(s: &str) -> bool {
     KNOWN_EDITIONS.iter().any(|e| *e == lower)
 }
 
-/// P41 — slugify an edition label into a URL-stable identifier suffix
-/// for `MediaSourceInfo.Id`. Lowercase, ascii-only, `-` separator.
 /// [`edition_id_slug`] made unique among the alternates already attached:
 /// `X - 3D.HSBS` and `X - 3D HSBS` slug alike, and a repeated id would make
 /// the second one unaddressable on PlaybackInfo.
@@ -1926,6 +1927,8 @@ fn unique_edition_id(taken: &[AlternateMediaSource], edition: &str) -> String {
     id
 }
 
+/// P41 — slugify an edition label into a URL-stable identifier suffix
+/// for `MediaSourceInfo.Id`. Lowercase, ascii-only, `-` separator.
 fn edition_id_slug(edition: &str) -> String {
     let mut s = String::with_capacity(edition.len());
     for c in edition.chars() {
@@ -5534,6 +5537,29 @@ mod tests {
         assert_eq!(
             items[0].probe.alternate_sources[0].video_3d_format,
             Some(Video3DFormat::FullSideBySide)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_watched_3d_file_is_flagged_3d() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "Gravity (2013) - 3D.HTAB.mkv").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber::default());
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        scanner
+            .update_path(
+                &td.path().join("Gravity (2013) - 3D.HTAB.mkv"),
+                &store,
+                scan_id,
+            )
+            .await
+            .unwrap();
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].probe.video_3d_format,
+            Some(Video3DFormat::HalfTopAndBottom)
         );
     }
 
