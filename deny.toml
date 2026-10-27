@@ -12,13 +12,6 @@ all-features = true
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    # RUSTSEC-2023-0071 — Marvin Attack on the `rsa` crate. Pulled in
-    # transitively by sqlx-mysql via sqlx-macros-core (the proc-macro
-    # crate hard-deps every driver). Pharos never enables the mysql
-    # feature on sqlx and never uses RSA in any code path, so this is
-    # not reachable in our compiled binary. Re-evaluate when sqlx ships
-    # a fix or moves to a non-affected RSA impl.
-    "RUSTSEC-2023-0071",
     # RUSTSEC-2025-0141 — `bincode` 1.3.3 is "unmaintained", not
     # vulnerable: the team ceased development after a harassment incident
     # and consider 1.3.3 a complete, stable release. We use it only for
@@ -74,18 +67,17 @@ ignore = [
     # off h2 0.3, or if `http2` becomes needed in production.
     "RUSTSEC-2026-0258",
     # zip 8.6.0 (pinned by `boko` 0.5.0, whose `zip = "8"` cannot reach 9.x):
-    # yanked upstream, plus RUSTSEC-2026-0367 (SUID/SGID kept on extract),
+    # RUSTSEC-2026-0367 (SUID/SGID kept on extract),
     # -0368 and -0369 (`extract()` follows attacker-controlled symlinks).
     # No fixed 8.x exists, and every one of these lives in
     # `ZipArchive::extract` / `ZipStreamReader::extract`. boko only reads
     # entries (`ZipArchive::by_name`) and writes via `ZipWriter`; it never
     # extracts to disk (`grep -rn "extract" boko-0.5.0/src` hits only its own
     # KFX metadata helpers). pharos's own zip (9.0.x) is unaffected. Drop all
-    # four when boko moves to zip 9.
+    # three when boko moves to zip 9.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
-    "zip@8.6.0",
 ]
 
 [licenses]
