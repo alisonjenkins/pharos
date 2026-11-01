@@ -99,6 +99,27 @@ pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix
     }
 }
 
+/// The bearer of an item image request, if it names one that resolves: a
+/// header, `api_key` or, on a GET or HEAD, the `JellyfinAuth` cookie. Item
+/// images stay public (B249 split), so a missing or unresolvable token is
+/// anonymous rather than 401; a resolved bearer still gets V187's 404 for an
+/// item outside their libraries.
+pub(crate) async fn optional_bearer(
+    state: &crate::state::AppState,
+    req: &actix_web::HttpRequest,
+    id: &str,
+    route: &'static str,
+) -> Result<Option<pharos_core::User>, actix_web::Error> {
+    let Some(token) = auth_extractor::extract_media_token(req) else {
+        return Ok(None);
+    };
+    match crate::services::access::authenticate(state, Some(&token), id, route).await {
+        Ok(user) => Ok(Some(user)),
+        Err(crate::services::access::ItemHidden::Unauthenticated) => Ok(None),
+        Err(other) => Err(access_error(other)),
+    }
+}
+
 /// The bearer of a request for an item's files (`id` as the path spelled
 /// it), from a header, `api_key` or, on a GET or HEAD, the `JellyfinAuth`
 /// cookie; 401 without one (V189, V191).

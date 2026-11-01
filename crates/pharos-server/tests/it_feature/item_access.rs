@@ -413,11 +413,14 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
 
     let mut failures = Vec::new();
     for uri in file_routes(f.rich_item_id) {
+        // Item images stay public; subtitles and attachments do not.
+        let public = uri.contains("/Images");
         let before = denied_total(&snapshotter, "unauthenticated");
         let req = test::TestRequest::get().uri(&uri).to_request();
         let status = test::call_service(&app, req).await.status().as_u16();
         let counted = denied_total(&snapshotter, "unauthenticated") - before;
-        if status != 401 || counted != 1 {
+        let refused = status == 401 && counted == 1;
+        if refused == public || (public && counted != 0) {
             failures.push(format!("anonymous {uri}: {status}, counted {counted}"));
         }
     }

@@ -2,10 +2,10 @@
 //! ffmpeg), Backdrop / Thumb extracted at a deeper / wider point;
 //! Logo / Banner / Art / Disc are upload-only.
 //!
-//! GET/HEAD endpoints require a signed-in user who may reach the item
-//! (V189); `<img src=…>` fetches authenticate with `api_key` or the
-//! `JellyfinAuth` cookie (V191). POST/DELETE (admin uploads) require an
-//! admin bearer (V8/V9).
+//! GET/HEAD endpoints answer anonymous requests, as Jellyfin's do; a request
+//! that names a resolvable bearer (header, `api_key` or the `JellyfinAuth`
+//! cookie, V191) gets 404 for an item outside that user's libraries (V187).
+//! POST/DELETE (admin uploads) require an admin bearer (V8/V9).
 
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, HttpRequest, HttpResponse};
@@ -177,8 +177,8 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 /// `GET /Items/{id}/Images` — the ImageInfo LIST jellyfin-web's "Edit Images"
 /// dialog fetches first. Returns the roles the item advertises (matching its
-/// `BaseItemDto` tags) so every editor thumbnail resolves. Authenticated like
-/// the other GET image routes. A non-item id (person / synthesised container)
+/// `BaseItemDto` tags) so every editor thumbnail resolves. Public like the
+/// other GET image routes. A non-item id (person / synthesised container)
 /// or an unknown item yields `[]` — an empty grid, never a hang.
 async fn get_item_images(
     state: web::Data<AppState>,
@@ -186,7 +186,7 @@ async fn get_item_images(
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_str = path.into_inner();
-    let user = crate::api::jellyfin::require_bearer(&state, &req, &id_str, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(&state, &req, &id_str, "image").await?;
     let canonical = crate::api::jellyfin::items::canonical_wire_id(&id_str);
     let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) else {
         // Person portraits / synthesised Series-Season containers don't resolve
@@ -196,7 +196,9 @@ async fn get_item_images(
             pharos_jellyfin_api::dto::ImageInfoDto,
         >::new()));
     };
-    crate::api::jellyfin::require_item_access(&state, &user, id, "image").await?;
+    if let Some(user) = &user {
+        crate::api::jellyfin::require_item_access(&state, user, id, "image").await?;
+    }
     let item = match state.stores.get(id).await {
         Ok(item) => item,
         Err(pharos_core::DomainError::NotFound(_)) => {
@@ -252,10 +254,12 @@ async fn serve_chapter_image(
     id_str: &str,
     idx: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user = crate::api::jellyfin::require_bearer(state, req, id_str, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(state, req, id_str, "image").await?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    crate::api::jellyfin::require_item_access(state, &user, id, "image").await?;
+    if let Some(user) = &user {
+        crate::api::jellyfin::require_item_access(state, user, id, "image").await?;
+    }
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -302,10 +306,10 @@ async fn get_image(
     req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
-        &user,
+        user.as_ref(),
         &path.id,
         &path.image_type,
         0,
@@ -322,10 +326,10 @@ async fn head_image(
     req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
-        &user,
+        user.as_ref(),
         &path.id,
         &path.image_type,
         0,
@@ -342,10 +346,10 @@ async fn get_image_indexed(
     req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
-        &user,
+        user.as_ref(),
         &path.id,
         &path.image_type,
         path.image_index,
@@ -362,10 +366,10 @@ async fn head_image_indexed(
     req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
+    let user = crate::api::jellyfin::optional_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
-        &user,
+        user.as_ref(),
         &path.id,
         &path.image_type,
         path.image_index,
@@ -422,7 +426,7 @@ async fn delete_image_indexed(
 #[allow(clippy::too_many_arguments)]
 async fn serve_image(
     state: &AppState,
-    user: &pharos_core::User,
+    user: Option<&pharos_core::User>,
     id_str: &str,
     image_type: &str,
     index: u32,
@@ -439,7 +443,7 @@ async fn serve_image(
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
     };
-    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+    if let (Some(user), Some(id)) = (user, pharos_jellyfin_api::dto::parse_item_id(id_str)) {
         crate::api::jellyfin::require_item_access(state, user, id, "image").await?;
     }
     // PERSON photos first — jellyfin-web's favorites tab + cast lists fetch
@@ -506,7 +510,7 @@ async fn serve_image(
     };
     let id = item.id;
     // A synth group answers through its representative member (V187).
-    if synth_id {
+    if let (true, Some(user)) = (synth_id, user) {
         crate::api::jellyfin::require_item_access(state, user, id, "image").await?;
     }
     // SEASON-specific sidecars. A synth Season id resolves to a representative
@@ -1529,14 +1533,14 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn images_require_a_token() {
+    async fn images_answer_anonymous_and_token_requests() {
         let state = seed_state().await;
         let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let uri = "/items/abc/images/primary";
 
         let anon = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
-        assert_eq!(anon.status(), 401, "anonymous GET must be rejected");
+        assert_ne!(anon.status(), 401, "anonymous GET stays public");
 
         let query = test::call_service(
             &app,

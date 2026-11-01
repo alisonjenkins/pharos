@@ -52,20 +52,22 @@ fn audit_rows() -> Vec<(Method, &'static str, Expect)> {
         (Method::GET, "/Branding/Css", Public),
         (Method::GET, "/Branding/Css.css", Public),
         (Method::POST, "/Users/AuthenticateByName", Public),
-        // Live-TV channel logos stay anonymous; item images moved to Auth below.
+        // Item image GETs stay public, as Jellyfin's are (B249 split): a
+        // native client's image loader may send no token. A resolvable
+        // bearer still gets V187's 404 for a hidden item.
+        (Method::GET, "/Items/1/Images", Public),
+        (Method::GET, "/Items/1/Images/Primary", Public),
+        (Method::GET, "/Items/1/Images/Primary/0", Public),
+        (Method::GET, "/Items/1/Images/chapter", Public),
+        (Method::GET, "/Items/1/Images/chapter/0", Public),
+        (Method::HEAD, "/Items/1/Images/Primary", Public),
+        (Method::HEAD, "/Items/1/Images/Primary/0", Public),
+        (Method::HEAD, "/Items/1/Images/chapter", Public),
+        (Method::HEAD, "/Items/1/Images/chapter/0", Public),
         (Method::GET, "/LiveTv/Channels/x/Images/Primary", Public),
         // Bitrate test ships the user the actual bytes; semi-public OK.
         (Method::GET, "/Playback/BitrateTest", Public),
         // ---- everything else: auth required ----
-        (Method::GET, "/Items/1/Images", Auth),
-        (Method::GET, "/Items/1/Images/Primary", Auth),
-        (Method::GET, "/Items/1/Images/Primary/0", Auth),
-        (Method::GET, "/Items/1/Images/chapter", Auth),
-        (Method::GET, "/Items/1/Images/chapter/0", Auth),
-        (Method::HEAD, "/Items/1/Images/Primary", Auth),
-        (Method::HEAD, "/Items/1/Images/Primary/0", Auth),
-        (Method::HEAD, "/Items/1/Images/chapter", Auth),
-        (Method::HEAD, "/Items/1/Images/chapter/0", Auth),
         (Method::GET, "/Videos/1/Subtitles/0/Stream.vtt", Auth),
         (Method::GET, "/Videos/1/Subtitles/0/Subtitles.srt", Auth),
         (Method::GET, "/Videos/1/Subtitles/0/Stream.ass", Auth),
