@@ -383,3 +383,54 @@ async fn cache_built_lists_leave_out_hidden_libraries() {
         leaks.join("\n")
     );
 }
+
+/// Routes that serve an item's files to element URLs (images, subtitles,
+/// fonts). V189: without a credential each answers 401 and counts
+/// `unauthenticated`; with one, a hidden item is 404 like any by-id route.
+fn file_routes(id: u64) -> Vec<String> {
+    vec![
+        format!("/Items/{id}/Images"),
+        format!("/Items/{id}/Images/Primary"),
+        format!("/Items/{id}/Images/Backdrop/0"),
+        format!("/Items/{id}/Images/Chapter/0"),
+        format!("/Videos/{id}/Subtitles/0/Stream.vtt"),
+        format!("/Videos/{id}/{id}/Subtitles/0/Stream.js"),
+        format!("/Videos/{id}/Subtitles/0/Subtitles.srt"),
+        format!("/Videos/{id}/Subtitles/0/Stream.ass"),
+        format!("/Videos/{id}/Attachments/0"),
+    ]
+}
+
+#[actix_web::test]
+async fn file_routes_refuse_anonymous_and_hidden_requests() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    restrict_to_library_a(&f).await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+
+    let mut failures = Vec::new();
+    for uri in file_routes(f.rich_item_id) {
+        let before = denied_total(&snapshotter, "unauthenticated");
+        let req = test::TestRequest::get().uri(&uri).to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        let counted = denied_total(&snapshotter, "unauthenticated") - before;
+        if status != 401 || counted != 1 {
+            failures.push(format!("anonymous {uri}: {status}, counted {counted}"));
+        }
+    }
+    for uri in file_routes(f.other_item_id) {
+        let before = denied_total(&snapshotter, "library_not_allowed");
+        let req = test::TestRequest::get()
+            .uri(&format!("{uri}?api_key={}", f.user_token))
+            .to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        let counted = denied_total(&snapshotter, "library_not_allowed") - before;
+        if status != 404 || counted != 1 {
+            failures.push(format!("hidden {uri}: {status}, counted {counted}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

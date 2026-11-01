@@ -26,6 +26,28 @@ const PNG_1X1: &[u8] = &[
     0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
+/// Create an unrestricted user and issue a token for it.
+async fn token_for(stores: &Stores) -> String {
+    use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+    let id = UserId::new();
+    stores
+        .create(UserRecord {
+            id,
+            name: "tester".into(),
+            password_hash: SecretString::new("x"),
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    stores
+        .issue(id, "test")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string()
+}
+
 #[actix_web::test]
 async fn a_served_image_opens_a_span_per_step() {
     let (spans, _guard) = pharos_test_metrics::spans::capture();
@@ -56,6 +78,7 @@ async fn a_served_image_opens_a_span_per_step() {
         .await
         .unwrap();
 
+    let token = token_for(&state.stores).await;
     let app = test::init_service(
         App::new()
             .app_data(state)
@@ -66,6 +89,7 @@ async fn a_served_image_opens_a_span_per_step() {
     let resp = test::call_service(
         &app,
         test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/55/images/primary")
             .to_request(),
     )

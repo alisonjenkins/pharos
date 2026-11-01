@@ -2,10 +2,10 @@
 //! ffmpeg), Backdrop / Thumb extracted at a deeper / wider point;
 //! Logo / Banner / Art / Disc are upload-only.
 //!
-//! GET endpoints are intentionally **unauthenticated** to match
-//! Jellyfin's reference behaviour — image URLs are passed around in
-//! `<img src=…>` tags where header auth isn't an option. POST/DELETE
-//! (admin uploads) **do** require an admin bearer (V8/V9).
+//! GET/HEAD endpoints require a signed-in user who may reach the item
+//! (V189); `<img src=…>` fetches authenticate with `api_key` or the
+//! `JellyfinAuth` cookie (V191). POST/DELETE (admin uploads) require an
+//! admin bearer (V8/V9).
 
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, HttpRequest, HttpResponse};
@@ -177,14 +177,16 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 /// `GET /Items/{id}/Images` — the ImageInfo LIST jellyfin-web's "Edit Images"
 /// dialog fetches first. Returns the roles the item advertises (matching its
-/// `BaseItemDto` tags) so every editor thumbnail resolves. Unauthenticated like
+/// `BaseItemDto` tags) so every editor thumbnail resolves. Authenticated like
 /// the other GET image routes. A non-item id (person / synthesised container)
 /// or an unknown item yields `[]` — an empty grid, never a hang.
 async fn get_item_images(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_str = path.into_inner();
+    let user = crate::api::jellyfin::require_bearer(&state, &req, &id_str, "image").await?;
     let canonical = crate::api::jellyfin::items::canonical_wire_id(&id_str);
     let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) else {
         // Person portraits / synthesised Series-Season containers don't resolve
@@ -194,6 +196,7 @@ async fn get_item_images(
             pharos_jellyfin_api::dto::ImageInfoDto,
         >::new()));
     };
+    crate::api::jellyfin::require_item_access(&state, &user, id, "image").await?;
     let item = match state.stores.get(id).await {
         Ok(item) => item,
         Err(pharos_core::DomainError::NotFound(_)) => {
@@ -249,8 +252,10 @@ async fn serve_chapter_image(
     id_str: &str,
     idx: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(state, req, id_str, "image").await?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(state, &user, id, "image").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -297,8 +302,10 @@ async fn get_image(
     req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
+        &user,
         &path.id,
         &path.image_type,
         0,
@@ -315,8 +322,10 @@ async fn head_image(
     req: HttpRequest,
     path: web::Path<ImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
+        &user,
         &path.id,
         &path.image_type,
         0,
@@ -333,8 +342,10 @@ async fn get_image_indexed(
     req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
+        &user,
         &path.id,
         &path.image_type,
         path.image_index,
@@ -351,8 +362,10 @@ async fn head_image_indexed(
     req: HttpRequest,
     path: web::Path<IndexedImagePath>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(&state, &req, &path.id, "image").await?;
     serve_image(
         &state,
+        &user,
         &path.id,
         &path.image_type,
         path.image_index,
@@ -409,6 +422,7 @@ async fn delete_image_indexed(
 #[allow(clippy::too_many_arguments)]
 async fn serve_image(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
     image_type: &str,
     index: u32,
@@ -425,6 +439,9 @@ async fn serve_image(
     let Some(role) = ImageRole::from_str_ci(image_type) else {
         return Ok(HttpResponse::BadRequest().body("unknown image type"));
     };
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        crate::api::jellyfin::require_item_access(state, user, id, "image").await?;
+    }
     // PERSON photos first — jellyfin-web's favorites tab + cast lists fetch
     // people via /Items/{personWireId}/Images/Primary, and the scanner
     // records a scraped `thumb_url` for most people. 302 to it — the same
@@ -488,6 +505,10 @@ async fn serve_image(
         }
     };
     let id = item.id;
+    // A synth group answers through its representative member (V187).
+    if synth_id {
+        crate::api::jellyfin::require_item_access(state, user, id, "image").await?;
+    }
     // SEASON-specific sidecars. A synth Season id resolves to a representative
     // episode above, and that episode's own artwork rows record the SERIES
     // poster (the sidecar provider probes the show folder for episodes) — so
@@ -1421,6 +1442,28 @@ mod tests {
         assert_eq!(effective_width(ImageRole::Banner, None), None);
     }
 
+    /// Create an unrestricted user and issue a token for it.
+    async fn token_for(stores: &Stores) -> String {
+        use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+        let id = UserId::new();
+        stores
+            .create(UserRecord {
+                id,
+                name: "tester".into(),
+                password_hash: SecretString::new("x"),
+                policy: UserPolicy::default(),
+            })
+            .await
+            .unwrap();
+        stores
+            .issue(id, "test")
+            .await
+            .unwrap()
+            .0
+            .expose()
+            .to_string()
+    }
+
     async fn seed_state() -> web::Data<crate::state::AppState> {
         let stores = Stores::connect("sqlite::memory:").await.unwrap();
         web::Data::new(crate::state::AppState::new(stores, "t".into()))
@@ -1429,9 +1472,11 @@ mod tests {
     #[actix_web::test]
     async fn known_type_returns_404_not_500() {
         let state = seed_state().await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         for t in ["primary", "backdrop", "thumb", "logo", "banner", "art"] {
             let req = test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri(&format!("/items/abc/images/{t}"))
                 .to_request();
             let resp = test::call_service(&app, req).await;
@@ -1442,8 +1487,10 @@ mod tests {
     #[actix_web::test]
     async fn indexed_route_404s() {
         let state = seed_state().await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/abc/images/backdrop/0")
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -1453,8 +1500,10 @@ mod tests {
     #[actix_web::test]
     async fn unknown_type_returns_400() {
         let state = seed_state().await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/abc/images/bogus")
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -1464,8 +1513,10 @@ mod tests {
     #[actix_web::test]
     async fn head_request_returns_no_body_404() {
         let state = seed_state().await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::default()
+            .insert_header(("X-Emby-Token", token.clone()))
             .method(actix_web::http::Method::HEAD)
             .uri("/items/abc/images/primary")
             .to_request();
@@ -1474,18 +1525,37 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn images_endpoint_is_public() {
-        // Important: Jellyfin clients embed image URLs in <img src=…>
-        // tags. They cannot inject auth headers and the api_key query
-        // param is not always available. Endpoint must respond to
-        // unauthenticated GETs (whether 404 or eventually 200).
+    async fn images_require_a_token() {
         let state = seed_state().await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
-        let req = test::TestRequest::get()
-            .uri("/items/abc/images/primary")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_ne!(resp.status(), 401);
+        let uri = "/items/abc/images/primary";
+
+        let anon = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        assert_eq!(anon.status(), 401, "anonymous GET must be rejected");
+
+        let query = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{uri}?api_key={token}"))
+                .to_request(),
+        )
+        .await;
+        assert_ne!(query.status(), 401, "api_key query token must authenticate");
+
+        let cookie = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("Cookie", format!("JellyfinAuth={token}")))
+                .to_request(),
+        )
+        .await;
+        assert_ne!(
+            cookie.status(),
+            401,
+            "JellyfinAuth cookie must authenticate"
+        );
     }
 
     #[actix_web::test]
@@ -1638,11 +1708,13 @@ mod tests {
             .await
             .unwrap();
 
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
 
         let get = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri("/items/77/images/primary")
                 .to_request(),
         )
@@ -1653,6 +1725,7 @@ mod tests {
         let head = test::call_service(
             &app,
             test::TestRequest::with_uri("/items/77/images/primary")
+                .insert_header(("X-Emby-Token", token.clone()))
                 .method(actix_web::http::Method::HEAD)
                 .to_request(),
         )
@@ -1689,8 +1762,10 @@ mod tests {
             .await
             .unwrap();
 
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/42/images/primary")
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -1718,10 +1793,12 @@ mod tests {
             .set_artwork(55, "Primary", "local", &poster.to_string_lossy())
             .await
             .unwrap();
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let resp = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri("/items/55/images/primary")
                 .to_request(),
         )
@@ -1755,10 +1832,12 @@ mod tests {
             .set_artwork(56, "Primary", "local", &poster.to_string_lossy())
             .await
             .unwrap();
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let first = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri("/items/56/images/primary")
                 .to_request(),
         )
@@ -1773,6 +1852,7 @@ mod tests {
         let second = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri("/items/56/images/primary")
                 .insert_header(("If-None-Match", etag.as_str()))
                 .to_request(),
@@ -1799,8 +1879,10 @@ mod tests {
             .set_artwork(7, "Logo", "local", &logo.to_string_lossy())
             .await
             .unwrap();
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/7/images/logo")
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -1817,8 +1899,10 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let state = seed_state_with_cache(cache_dir.path()).await;
         put_movie(&state, 9, &dir.path().join("missing.mkv")).await;
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/9/images/primary")
             .to_request();
         let resp = test::call_service(&app, req).await;
@@ -1869,10 +1953,12 @@ mod tests {
             .unwrap();
 
         let synth = series_id_for_key(Some("/tv/Buffy (1997)"), "Buffy");
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let resp = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri(&format!("/items/{synth}/images/primary"))
                 .to_request(),
         )
@@ -1923,10 +2009,12 @@ mod tests {
         state.stores.put(ep).await.unwrap();
 
         let synth = series_id_for_key(Some(series_key), "Dragon Ball");
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let resp = test::call_service(
             &app,
             test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
                 .uri(&format!("/items/{synth}/images/logo"))
                 .to_request(),
         )
@@ -1960,8 +2048,10 @@ mod tests {
             )
             .await
             .unwrap();
+        let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let req = test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
             .uri("/items/11/images/primary")
             .to_request();
         let resp = test::call_service(&app, req).await;
