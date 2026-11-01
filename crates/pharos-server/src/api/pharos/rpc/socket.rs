@@ -15,7 +15,9 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use futures_util::StreamExt as _;
 use pharos_api::Connection;
+use pharos_core::UserId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::broadcast;
 
 use super::limits::{ConnectionLimits, AUTH_DEADLINE};
 use super::{bootstrap_client, origin, ConnectionCtx};
@@ -34,6 +36,10 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 const IDLE_DROP: Duration = Duration::from_secs(120);
 /// Longest one token re-check may take before it counts as an outage.
 const RECHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How soon an announced re-check that could not reach the store tries
+/// again. An announcement is consumed once, so without this a stalled lookup
+/// would leave a revoked session open until the next `revalidate_secs` tick.
+const UNSURE_RETRY: Duration = Duration::from_secs(5);
 
 /// Why an upgrade was refused before it became a connection. The label is
 /// the `reason` of `pharos_rpc_refused_total`.
@@ -81,8 +87,8 @@ pub enum CloseCause {
     /// Nothing heard from the client for [`IDLE_DROP`].
     IdleTimeout,
     /// A token this connection resumed with was revoked, or its user was
-    /// disabled or deleted (T025a).
-    Revoked,
+    /// disabled or deleted (T025a, T025).
+    Revoked(Recheck),
     /// The `RpcSystem` stopped (it hit a protocol or decode error).
     RpcEnded(String),
 }
@@ -97,7 +103,7 @@ impl CloseCause {
             CloseCause::TextFrame => "text_frame",
             CloseCause::AuthDeadline => "auth_deadline",
             CloseCause::IdleTimeout => "idle_timeout",
-            CloseCause::Revoked => "revoked",
+            CloseCause::Revoked(_) => "revoked",
             CloseCause::RpcEnded(_) => "rpc_ended",
         }
     }
@@ -106,6 +112,7 @@ impl CloseCause {
         match self {
             CloseCause::PeerClose(code) => format!("{code:?}"),
             CloseCause::ReadError(e) | CloseCause::RpcEnded(e) => e.clone(),
+            CloseCause::Revoked(trigger) => trigger.label().to_owned(),
             _ => String::new(),
         }
     }
@@ -116,7 +123,7 @@ impl CloseCause {
             CloseCause::TextFrame => CloseCode::Unsupported,
             CloseCause::AuthDeadline => CloseCode::Policy,
             CloseCause::IdleTimeout => CloseCode::Away,
-            CloseCause::Revoked => CloseCode::Policy,
+            CloseCause::Revoked(_) => CloseCode::Policy,
             CloseCause::RpcEnded(_) => CloseCode::Protocol,
             _ => return None,
         };
@@ -124,6 +131,30 @@ impl CloseCause {
             code,
             description: Some(self.label().to_owned()),
         })
+    }
+}
+
+/// What made a connection re-check its tokens; the `detail` of a `revoked`
+/// close, so a query tells a revocation announced at once (T025) from one the
+/// timer caught (T025a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recheck {
+    /// The `revalidate_secs` timer.
+    Timer,
+    /// A revocation announced for one of the connection's users.
+    Announced,
+    /// The announcement channel overflowed, so the connection re-checked in
+    /// case it missed one.
+    Lagged,
+}
+
+impl Recheck {
+    pub fn label(self) -> &'static str {
+        match self {
+            Recheck::Timer => "timer",
+            Recheck::Announced => "announced",
+            Recheck::Lagged => "lagged",
+        }
     }
 }
 
@@ -147,25 +178,37 @@ pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived
 /// Each lookup is bounded by [`RECHECK_TIMEOUT`] and a timeout counts as an
 /// outage: the re-check runs in the same select as the keepalive and idle
 /// drop, so a stalled store must not hold those off.
-async fn still_valid(state: &AppState, tokens: &[String]) -> bool {
+async fn still_valid(state: &AppState, tokens: &[String]) -> Verdict {
+    let mut verdict = Verdict::Valid;
     for token in tokens {
         let lookup = tokio::time::timeout(RECHECK_TIMEOUT, user_for_token(&state.stores, token));
         let Ok(result) = lookup.await else {
             tracing::warn!("native api: token re-check timed out; keeping the connection");
+            verdict = Verdict::Unsure;
             continue;
         };
         match result {
-            Ok(_) | Err(TokenRefusal::Unavailable(_)) => {}
+            Ok(_) => {}
+            Err(TokenRefusal::Unavailable(_)) => verdict = Verdict::Unsure,
             Err(refusal) => {
                 tracing::info!(
                     reason = refusal.label(),
                     "native api: a resumed token no longer resolves"
                 );
-                return false;
+                return Verdict::Revoked;
             }
         }
     }
-    true
+    verdict
+}
+
+/// What one re-check of a connection's tokens found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Valid,
+    Revoked,
+    /// A lookup timed out or the store was down; nothing was refused.
+    Unsure,
 }
 
 /// Keeps `pharos_rpc_connections{transport}` true however the task ends.
@@ -295,6 +338,9 @@ async fn run<S>(
 
     let mut pinger = session.clone();
     let deadline = ctx.clone();
+    // Subscribed before any resume, so no announcement can slip between a
+    // resume and the first poll (T025).
+    let mut announced = state.revocations.subscribe();
     let timers = async move {
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -304,18 +350,28 @@ async fn run<S>(
         let mut recheck = tokio::time::interval(revalidate);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         recheck.reset();
+        let mut announcing = true;
+        // An announced re-check the store could not answer, retried on the
+        // timer after UNSURE_RETRY under its own trigger.
+        let mut retrying: Option<(Recheck, Option<UserId>)> = None;
         loop {
-            tokio::select! {
-                _ = recheck.tick() => {
-                    if !still_valid(&state, &deadline.resumed_tokens()).await {
-                        return CloseCause::Revoked;
+            let trigger = tokio::select! {
+                _ = recheck.tick() => Some(retrying.take().unwrap_or((Recheck::Timer, None))),
+                event = announced.recv(), if announcing => match event {
+                    Ok(user) if deadline.serves(user) => Some((Recheck::Announced, Some(user))),
+                    Ok(_) => None,
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some((Recheck::Lagged, None)),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        announcing = false;
+                        None
                     }
-                }
+                },
                 () = &mut auth_deadline, if !checked_auth => {
                     if !deadline.is_signed_in() {
                         return CloseCause::AuthDeadline;
                     }
                     checked_auth = true;
+                    None
                 }
                 _ = keepalive.tick() => {
                     if last_seen.get().elapsed() > IDLE_DROP {
@@ -324,6 +380,22 @@ async fn run<S>(
                     if pinger.ping(b"").await.is_err() {
                         return CloseCause::SendFailed;
                     }
+                    None
+                }
+            };
+            if let Some((trigger, user)) = trigger {
+                match still_valid(&state, &deadline.resumed_tokens(user)).await {
+                    Verdict::Revoked => return CloseCause::Revoked(trigger),
+                    Verdict::Unsure if trigger != Recheck::Timer => {
+                        // A pending retry for another user widens to all
+                        // tokens rather than being overwritten.
+                        retrying = Some(match retrying {
+                            Some((_, pending)) if pending != user => (trigger, None),
+                            _ => (trigger, user),
+                        });
+                        recheck.reset_after(UNSURE_RETRY);
+                    }
+                    Verdict::Valid | Verdict::Unsure => {}
                 }
             }
         }
@@ -356,11 +428,15 @@ mod tests {
             CloseCause::TextFrame,
             CloseCause::AuthDeadline,
             CloseCause::IdleTimeout,
-            CloseCause::Revoked,
+            CloseCause::Revoked(Recheck::Timer),
             CloseCause::RpcEnded(String::new()),
         ];
         let labels: std::collections::HashSet<_> = causes.iter().map(CloseCause::label).collect();
         assert_eq!(labels.len(), causes.len());
+
+        let triggers = [Recheck::Timer, Recheck::Announced, Recheck::Lagged];
+        let labels: std::collections::HashSet<_> = triggers.iter().map(|t| t.label()).collect();
+        assert_eq!(labels.len(), triggers.len());
 
         let refused = [
             Refused::Origin(origin::OriginRefusal::NotAllowed),

@@ -22,13 +22,14 @@ use actix_web::web;
 use capnp::message::ReaderOptions;
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use pharos_api::{pharos_capnp, server, Connection};
+use pharos_core::UserId;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::config::NativeApiConfig;
 use crate::state::AppState;
 
-pub use socket::{record_closed, record_refused, CloseCause, Refused, SESSION_COOKIE};
+pub use socket::{record_closed, record_refused, CloseCause, Recheck, Refused, SESSION_COOKIE};
 
 /// Routes of the native API, or none at all while
 /// `[server.native_api].enabled` is false: every push to main deploys
@@ -82,9 +83,9 @@ pub struct ConnectionCtx {
     limits: limits::ConnectionLimits,
     max_per_user: u32,
     slot: RefCell<limits::Slot>,
-    /// Every token a `resume` succeeded with, re-checked while the
-    /// connection lives so revoking one ends it (T025a).
-    resumed: RefCell<Vec<String>>,
+    /// Every token a `resume` succeeded with, and its user, re-checked while
+    /// the connection lives so revoking one ends it (T025a, T025).
+    resumed: RefCell<Vec<(String, UserId)>>,
 }
 
 impl ConnectionCtx {
@@ -105,16 +106,27 @@ impl ConnectionCtx {
         }))
     }
 
-    fn remember_token(&self, token: String) {
+    fn remember_token(&self, token: String, user: UserId) {
         let mut resumed = self.resumed.borrow_mut();
-        if !resumed.contains(&token) {
-            resumed.push(token);
+        if !resumed.iter().any(|(t, _)| *t == token) {
+            resumed.push((token, user));
         }
     }
 
-    /// The tokens this connection's sessions were resumed with.
-    pub(crate) fn resumed_tokens(&self) -> Vec<String> {
-        self.resumed.borrow().clone()
+    /// The tokens this connection's sessions were resumed with: all of
+    /// them, or only `user`'s.
+    pub(crate) fn resumed_tokens(&self, user: Option<UserId>) -> Vec<String> {
+        self.resumed
+            .borrow()
+            .iter()
+            .filter(|(_, u)| user.map_or(true, |user| *u == user))
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// Whether a session on this connection belongs to `user`.
+    pub(crate) fn serves(&self, user: UserId) -> bool {
+        self.resumed.borrow().iter().any(|(_, u)| *u == user)
     }
 
     /// Whether a `resume` has succeeded on this connection.

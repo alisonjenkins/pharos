@@ -117,7 +117,7 @@ impl server::bootstrap::Handler for Bootstrap {
             Ok(user) => {
                 if let Ok(token) = token {
                     // T025a: re-checked while the connection lives.
-                    self.ctx.remember_token(token);
+                    self.ctx.remember_token(token, user.id);
                 }
                 self.conn.set_user(&user.name);
                 let session = Session::new(self.state.clone(), user);
