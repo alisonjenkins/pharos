@@ -372,6 +372,13 @@ pub struct AppState {
     /// floor), mirrored onto state so the manual apply endpoint's immediate
     /// re-enrich shares the configured knobs instead of silently defaulting.
     pub metadata_config: crate::config::MetadataConfig,
+    /// Online-guessing throttle shared by every password check (V174). Built
+    /// with the default policy so fixtures need no wiring; boot replaces it
+    /// from `[server].login_throttle` via [`AppState::with_login_throttle`].
+    pub login_throttle: crate::auth::LoginThrottle,
+    /// Proxies whose `X-Forwarded-For` is believed when keying the throttle
+    /// (`[server].trusted_proxies`); empty means the peer address always.
+    pub trusted_proxies: crate::client_ip::TrustedProxies,
 }
 
 /// Max recent activity entries retained in memory (T73).
@@ -642,6 +649,8 @@ impl AppState {
             tmdb_api_key: None,
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
+            login_throttle: crate::auth::LoginThrottle::default(),
+            trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
 
@@ -738,6 +747,8 @@ impl AppState {
             tmdb_api_key: None,
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
+            login_throttle: crate::auth::LoginThrottle::default(),
+            trusted_proxies: crate::client_ip::TrustedProxies::default(),
         })
     }
 
@@ -799,6 +810,17 @@ impl AppState {
     ) -> Self {
         self.tmdb_api_key = tmdb_api_key.filter(|k| !k.is_empty());
         self.tvdb_api_key = tvdb_api_key.filter(|k| !k.is_empty());
+        self
+    }
+
+    /// Apply `[server].login_throttle` and `[server].trusted_proxies`.
+    pub fn with_login_throttle(
+        mut self,
+        policy: crate::config::LoginThrottleConfig,
+        trusted_proxies: crate::client_ip::TrustedProxies,
+    ) -> Self {
+        self.login_throttle = crate::auth::LoginThrottle::new(policy);
+        self.trusted_proxies = trusted_proxies;
         self
     }
 

@@ -1820,6 +1820,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
+    state = state.with_login_throttle(
+        cfg.server.login_throttle,
+        pharos_server::client_ip::TrustedProxies::parse(&cfg.server.trusted_proxies)
+            .map_err(pharos_server::config::ConfigError::TrustedProxies)?,
+    );
     let app_state = web::Data::new(state);
 
     // Phase B2 — elect the background-work singleton. Under Postgres this
