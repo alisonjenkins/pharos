@@ -726,8 +726,12 @@ pub(crate) async fn synth_primary_tag(
     // advertising one it does not have makes every grid render 404. The synth
     // path resolved a representative and stamped a tag unconditionally, which
     // is how a library with no covers still told the Google TV app to fetch one
-    // per tile.
-    if matches!(item.kind, pharos_core::MediaKind::Audio) && !item.has_primary_art {
+    // per tile. A book has no frame either (B251).
+    let has_frames = matches!(
+        item.kind,
+        pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+    );
+    if !has_frames && !item.has_primary_art {
         return None;
     }
     let mut tags = std::collections::BTreeMap::new();
@@ -1645,6 +1649,46 @@ mod tests {
             Some("2"),
             "the representative must be the track that actually has the cover"
         );
+    }
+
+    #[actix_web::test]
+    async fn a_library_of_coverless_books_advertises_no_primary() {
+        // B251 — a book has no video frame to extract, so like an audio track
+        // its only Primary is a cover. The library tile advertised its
+        // coverless representative book anyway and every client got a 404.
+        use pharos_core::{Library, LibraryKind, MediaItem, MediaKind, MediaStore};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        state.set_libraries(vec![Library {
+            id: 1,
+            name: "Books".into(),
+            root_path: "/b".into(),
+            kind: LibraryKind::Books,
+            wire_id: "b".repeat(32),
+        }]);
+        state
+            .stores
+            .put(MediaItem {
+                id: 9,
+                path: "/b/plain.epub".into(),
+                title: "Plain".into(),
+                kind: MediaKind::Book,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(synth_primary_tag(&state, &"b".repeat(32)).await.is_none());
+
+        state
+            .stores
+            .set_artwork(9, "Primary", "local", "/cache/plain.jpg")
+            .await
+            .unwrap();
+        state.note_artwork_changed();
+        let tags = synth_primary_tag(&state, &"b".repeat(32))
+            .await
+            .expect("a library whose book has a cover advertises it");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("9"));
     }
 
     #[actix_web::test]
