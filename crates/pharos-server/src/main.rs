@@ -2047,6 +2047,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     let handle_for_app = readiness.clone();
     let ui_dir = cfg.server.ui_dir.clone();
+    // Spec 017: off unless [server.native_api].enabled. The connection caps
+    // are shared by every worker, so they are built once here.
+    pharos_server::api::pharos::rpc::record_state(&cfg.server.native_api);
+    let native_api = cfg.server.native_api.clone();
+    let native_limits = pharos_server::api::pharos::rpc::limits::ConnectionLimits::default();
     let server = HttpServer::new(move || {
         // Permissive CORS so browser-hosted Jellyfin clients (jellyfin-web,
         // Dioxus UI served from a separate origin) can reach the API.
@@ -2077,7 +2082,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .wrap(RedMetrics)
             .wrap(LowercasePath)
             .wrap(cors)
-            .configure(router::configure);
+            .configure(router::configure)
+            .configure(pharos_server::api::pharos::rpc::configure(
+                native_api.clone(),
+                native_limits.clone(),
+            ));
         if let Some(path) = ui_dir.as_ref() {
             // Dioxus default-routes the SPA in hash mode unless configured
             // otherwise, so a single `Files::new` with `index_file` is

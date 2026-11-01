@@ -13,6 +13,7 @@ mod bootstrap;
 pub mod limits;
 pub mod origin;
 mod session;
+mod socket;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,7 +25,39 @@ use pharos_api::{pharos_capnp, server, Connection};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+use crate::config::NativeApiConfig;
 use crate::state::AppState;
+
+pub use socket::{record_closed, record_refused, CloseCause, Refused, SESSION_COOKIE};
+
+/// Routes of the native API, or none at all while
+/// `[server.native_api].enabled` is false: every push to main deploys
+/// (ADR-0010), so the surface ships dark until it is complete. `limits` is
+/// shared by every worker, so build it once per server.
+pub fn configure(
+    cfg: NativeApiConfig,
+    limits: limits::ConnectionLimits,
+) -> impl FnOnce(&mut web::ServiceConfig) {
+    move |sc| {
+        if !cfg.enabled {
+            return;
+        }
+        sc.app_data(web::Data::new(cfg))
+            .app_data(web::Data::new(limits))
+            .route("/pharos/rpc", web::get().to(socket::upgrade));
+    }
+}
+
+/// Logs and publishes whether the native API is served; call once at startup.
+pub fn record_state(cfg: &NativeApiConfig) {
+    metrics::gauge!("pharos_native_api_enabled").set(f64::from(u8::from(cfg.enabled)));
+    tracing::info!(
+        enabled = cfg.enabled,
+        allowed_origins = ?cfg.allowed_origins,
+        max_connections_per_user = cfg.max_connections_per_user,
+        "native api (/pharos/rpc, /pharos/session)"
+    );
+}
 
 /// Words one incoming message may make a reader traverse (8 MiB). capnp's
 /// default is 64 MiB; nothing in the schema comes near this.
@@ -100,4 +133,38 @@ where
         reader_options(),
     );
     RpcSystem::new(Box::new(network), Some(bootstrap.client)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use super::*;
+
+    /// An operator asking "is the native API on in this pod?" gets the answer
+    /// by query (`pharos_native_api_enabled`), not by reading config.
+    #[test]
+    fn startup_publishes_whether_the_native_api_is_served() {
+        for enabled in [false, true] {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+            let cfg = NativeApiConfig {
+                enabled,
+                ..NativeApiConfig::default()
+            };
+            metrics::with_local_recorder(&recorder, || record_state(&cfg));
+            let value = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(k, ..)| k.key().name() == "pharos_native_api_enabled")
+                .map(|(.., v)| v);
+            match value {
+                Some(DebugValue::Gauge(v)) => {
+                    assert_eq!(v.into_inner(), f64::from(u8::from(enabled)))
+                }
+                other => panic!("enabled={enabled}: gauge missing, got {other:?}"),
+            }
+        }
+    }
 }
