@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use actix_web::web;
 use pharos_api::pharos_capnp::{self, bootstrap as wire};
-use pharos_api::{server, Connection};
+use pharos_api::{server, Connection, Denial};
 
 use super::session::Session;
 use super::ConnectionCtx;
@@ -37,6 +37,32 @@ enum Refusal {
     TooManyConnections { held: u32, max: u32 },
 }
 
+impl Refusal {
+    /// What the refused session answers, in `status` and on every call. A
+    /// fixed reason only: a store outage's own error text stays in the
+    /// server's log and never reaches the client.
+    fn denial(&self) -> Denial {
+        match self {
+            Refusal::NoCredential => Denial::Revoked {
+                reason: "no device token and no pharos_session cookie",
+            },
+            // B216: ours and transient; the client keeps its token and
+            // resumes again.
+            Refusal::Token(TokenRefusal::Unavailable(_)) => Denial::Unavailable {
+                dependency: "token store",
+            },
+            Refusal::Token(other) => Denial::Revoked {
+                reason: other.label(),
+            },
+            Refusal::TooManyConnections { held, max } => Denial::Limit {
+                name: "connections_per_user",
+                value: u64::from(*held),
+                max: u64::from(*max),
+            },
+        }
+    }
+}
+
 impl server::bootstrap::Handler for Bootstrap {
     async fn server_info(
         self: Rc<Self>,
@@ -54,8 +80,8 @@ impl server::bootstrap::Handler for Bootstrap {
 
     /// Resolves the device token (or, when it is empty, the upgrade's
     /// cookie) on every call, so a revoked token stops working at once.
-    /// Always answers with a session: a refused one fails every call with
-    /// `revoked`, and `status` says why (research R1).
+    /// Always answers with a session: a refused one fails every call with the
+    /// same error as `status` (research R1).
     async fn resume(
         self: Rc<Self>,
         params: wire::ResumeParams,
@@ -92,39 +118,59 @@ impl server::bootstrap::Handler for Bootstrap {
                 result.init_status().set_ok(());
             }
             Err(refusal) => {
+                if let Refusal::Token(TokenRefusal::Unavailable(detail)) = &refusal {
+                    tracing::warn!(
+                        connection_id = self.conn.id(),
+                        error = %detail,
+                        "native API resume: token store unavailable"
+                    );
+                }
+                let denial = Rc::new(refusal.denial());
+                denial.write(result.reborrow().init_status().init_error());
                 result.set_session(server::session::client(
-                    server::session::Revoked(Rc::clone(&self.conn)),
+                    server::session::Refused(Rc::clone(&self.conn), denial),
                     &self.conn,
                 ));
-                let mut err = result.init_status().init_error();
-                match refusal {
-                    Refusal::NoCredential => {
-                        err.set_reason("no device token and no pharos_session cookie");
-                        err.get_kind().set_revoked(());
-                    }
-                    Refusal::Token(TokenRefusal::Unavailable(detail)) => {
-                        // B216: ours and transient; the client keeps its token
-                        // and resumes again.
-                        err.set_reason(format!("auth store unavailable: {detail}").as_str());
-                        err.get_kind().set_unavailable("token store");
-                    }
-                    Refusal::TooManyConnections { held, max } => {
-                        err.set_reason(
-                            format!("this user already holds {held} native API connections")
-                                .as_str(),
-                        );
-                        let mut limit = err.get_kind().init_limit();
-                        limit.set_name("connections_per_user");
-                        limit.set_value(u64::from(held));
-                        limit.set_max(u64::from(max));
-                    }
-                    Refusal::Token(other) => {
-                        err.set_reason(other.label());
-                        err.get_kind().set_revoked(());
-                    }
-                }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B216, and the backend's error text never reaches the client.
+    #[test]
+    fn an_outage_is_unavailable_without_the_backends_error_text() {
+        let refusal = Refusal::Token(TokenRefusal::Unavailable(
+            "pool timed out talking to db-3.internal:5432".into(),
+        ));
+        assert_eq!(
+            refusal.denial(),
+            Denial::Unavailable {
+                dependency: "token store"
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_or_missing_credential_is_revoked_and_a_cap_is_a_limit() {
+        assert!(matches!(
+            Refusal::NoCredential.denial(),
+            Denial::Revoked { .. }
+        ));
+        for t in [TokenRefusal::InvalidToken, TokenRefusal::UserRevoked] {
+            assert!(matches!(Refusal::Token(t).denial(), Denial::Revoked { .. }));
+        }
+        assert_eq!(
+            Refusal::TooManyConnections { held: 16, max: 16 }.denial(),
+            Denial::Limit {
+                name: "connections_per_user",
+                value: 16,
+                max: 16
+            }
+        );
     }
 }

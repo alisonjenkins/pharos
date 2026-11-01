@@ -31,7 +31,7 @@ struct Method {
     /// Whether a `$secret` field is reachable from its params or results.
     carries_secret: bool,
     /// Result fields holding a capability: `(field, interface label)`, e.g.
-    /// `("library", "library")`. `Revoked` fills them with revoked capabilities.
+    /// `("library", "library")`. `Refused` fills them with refused capabilities.
     cap_results: Vec<(String, String)>,
 }
 
@@ -172,7 +172,7 @@ fn capability_fields(
             let name = f.get_name()?.to_str()?;
             let Some(label) = interface_ids.get(&t.get_type_id()) else {
                 return Err(format!(
-                    "result field `{name}` holds a non-top-level interface; `Revoked` cannot fill it"
+                    "result field `{name}` holds a non-top-level interface; `Refused` cannot fill it"
                 )
                 .into());
             };
@@ -321,7 +321,7 @@ fn emit_interface(o: &mut String, i: &Interface) {
             o,
             "    impl<S: Handler> wire::Server for Instrumented<S> {{}}\n"
         );
-        emit_revoked(o, i);
+        emit_refused(o, i);
         let _ = writeln!(o, "}}\n");
         return;
     }
@@ -465,26 +465,30 @@ fn emit_interface(o: &mut String, i: &Interface) {
         let _ = writeln!(o, "        }}");
     }
     let _ = writeln!(o, "    }}\n");
-    emit_revoked(o, i);
+    emit_refused(o, i);
     let _ = writeln!(o, "}}\n");
 }
 
-/// `Revoked`: what a refused or revoked session serves. Every call answers
-/// `Error.kind.revoked` (counted `revoked`, not `unimplemented`); a capability
-/// getter answers with a `Revoked` capability, because getters never fail and
-/// `resume → library → home` must still pipeline (research R1).
-fn emit_revoked(o: &mut String, i: &Interface) {
+/// `Refused`: what a refused or revoked session serves. Every call answers
+/// with its `Denial` (counted under that kind, not `unimplemented`); a
+/// capability getter answers with a `Refused` capability carrying the same
+/// denial, because getters never fail and `resume → library → home` must
+/// still pipeline (research R1).
+fn emit_refused(o: &mut String, i: &Interface) {
     let _ = writeln!(
         o,
-        "    /// The handler behind a revoked session's `{}`: every call fails",
+        "    /// The handler behind a refused session's `{}`: every call fails",
         i.name
     );
     let _ = writeln!(
         o,
-        "    /// `Error.kind.revoked`; capability getters return `Revoked` capabilities."
+        "    /// with the `Denial`; capability getters return `Refused` capabilities."
     );
-    let _ = writeln!(o, "    pub struct Revoked(pub Rc<Connection>);\n");
-    let _ = writeln!(o, "    impl Handler for Revoked {{");
+    let _ = writeln!(
+        o,
+        "    pub struct Refused(pub Rc<Connection>, pub Rc<crate::instrument::Denial>);\n"
+    );
+    let _ = writeln!(o, "    impl Handler for Refused {{");
     for m in &i.methods {
         let _ = writeln!(o, "        fn {}(", m.label);
         let _ = writeln!(o, "            self: Rc<Self>,");
@@ -499,10 +503,10 @@ fn emit_revoked(o: &mut String, i: &Interface) {
             "        ) -> impl ::core::future::Future<Output = Result<(), ::capnp::Error>> {{"
         );
         if m.cap_results.is_empty() {
-            let _ = writeln!(o, "            ::core::future::ready(crate::instrument::fill_revoked(::capnp::dynamic_value::Builder::from(results.get())))");
+            let _ = writeln!(o, "            ::core::future::ready(crate::instrument::fill_denied(::capnp::dynamic_value::Builder::from(results.get()), &self.1))");
         } else {
             for (field, target) in &m.cap_results {
-                let _ = writeln!(o, "            results.get().set_{field}(super::{target}::client(super::{target}::Revoked(Rc::clone(&self.0)), &self.0));");
+                let _ = writeln!(o, "            results.get().set_{field}(super::{target}::client(super::{target}::Refused(Rc::clone(&self.0), Rc::clone(&self.1)), &self.0));");
             }
             let _ = writeln!(o, "            ::core::future::ready(Ok(()))");
         }

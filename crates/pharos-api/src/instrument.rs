@@ -307,12 +307,56 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     (outcome, reason, detail)
 }
 
-/// Fills a method's results as a revoked session answers: every struct
+/// Why a refused session fails every call. The generated `Refused` handlers
+/// carry one, so a call on a session refused for a store outage says
+/// `unavailable`, not `revoked` (B216).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Denial {
+    /// The credential is missing, invalid or revoked: sign in again.
+    Revoked { reason: &'static str },
+    /// A dependency is down. Transient: the client keeps its token and
+    /// resumes again.
+    Unavailable { dependency: &'static str },
+    /// A cap was reached; resume again once the user holds fewer.
+    Limit {
+        name: &'static str,
+        value: u64,
+        max: u64,
+    },
+}
+
+impl Denial {
+    /// Writes this denial into `error`. The reason is a fixed string, never a
+    /// backend's error text: that stays in the server's own log.
+    pub fn write(&self, mut error: crate::pharos_capnp::error::Builder<'_>) {
+        match *self {
+            Denial::Revoked { reason } => {
+                error.set_reason(reason);
+                error.get_kind().set_revoked(());
+            }
+            Denial::Unavailable { dependency } => {
+                error.set_reason(format!("{dependency} unavailable").as_str());
+                error.get_kind().set_unavailable(dependency);
+            }
+            Denial::Limit { name, value, max } => {
+                error.set_reason(format!("{name} is {value}, at most {max}").as_str());
+                let mut limit = error.get_kind().init_limit();
+                limit.set_name(name);
+                limit.set_value(value);
+                limit.set_max(max);
+            }
+        }
+    }
+}
+
+/// Fills a method's results as a refused session answers: every struct
 /// result with an `error` union member (`MeResult`, `ItemsResult`, `Done`, …)
-/// is set to `Error { reason: "session revoked", kind: revoked }`, which
-/// [`CallScope::finish`] counts as `revoked`. Used by the generated `Revoked`
-/// handlers.
-pub fn fill_revoked(results: dynamic_value::Builder<'_>) -> Result<(), capnp::Error> {
+/// is set to `denial`, which [`CallScope::finish`] counts under its kind.
+/// Used by the generated `Refused` handlers.
+pub fn fill_denied(
+    results: dynamic_value::Builder<'_>,
+    denial: &Denial,
+) -> Result<(), capnp::Error> {
     let mut results = results.downcast::<capnp::dynamic_struct::Builder<'_>>();
     for f in results.get_schema().get_non_union_fields()? {
         if !matches!(
@@ -328,20 +372,12 @@ pub fn fill_revoked(results: dynamic_value::Builder<'_>) -> Result<(), capnp::Er
         let Some(error) = result.get_schema().find_field_by_name("error")? else {
             continue;
         };
-        let mut error = result
-            .reborrow()
-            .init(error)?
-            .downcast::<capnp::dynamic_struct::Builder<'_>>();
-        let schema = error.get_schema();
-        error.set(
-            schema.get_field_by_name("reason")?,
-            dynamic_value::Reader::Text("session revoked".into()),
-        )?;
-        let mut kind = error
-            .get(schema.get_field_by_name("kind")?)?
-            .downcast::<capnp::dynamic_struct::Builder<'_>>();
-        let revoked = kind.get_schema().get_field_by_name("revoked")?;
-        kind.set(revoked, dynamic_value::Reader::Void)?;
+        denial.write(
+            result
+                .reborrow()
+                .init(error)?
+                .downcast_struct::<crate::pharos_capnp::error::Owned>(),
+        );
     }
     Ok(())
 }
