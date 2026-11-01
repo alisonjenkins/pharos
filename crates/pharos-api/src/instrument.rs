@@ -307,6 +307,45 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     (outcome, reason, detail)
 }
 
+/// Fills a method's results as a revoked session answers: every struct
+/// result with an `error` union member (`MeResult`, `ItemsResult`, `Done`, …)
+/// is set to `Error { reason: "session revoked", kind: revoked }`, which
+/// [`CallScope::finish`] counts as `revoked`. Used by the generated `Revoked`
+/// handlers.
+pub fn fill_revoked(results: dynamic_value::Builder<'_>) -> Result<(), capnp::Error> {
+    let mut results = results.downcast::<capnp::dynamic_struct::Builder<'_>>();
+    for f in results.get_schema().get_non_union_fields()? {
+        if !matches!(
+            f.get_type().which(),
+            capnp::introspect::TypeVariant::Struct(_)
+        ) {
+            continue;
+        }
+        let mut result = results
+            .reborrow()
+            .init(f)?
+            .downcast::<capnp::dynamic_struct::Builder<'_>>();
+        let Some(error) = result.get_schema().find_field_by_name("error")? else {
+            continue;
+        };
+        let mut error = result
+            .reborrow()
+            .init(error)?
+            .downcast::<capnp::dynamic_struct::Builder<'_>>();
+        let schema = error.get_schema();
+        error.set(
+            schema.get_field_by_name("reason")?,
+            dynamic_value::Reader::Text("session revoked".into()),
+        )?;
+        let mut kind = error
+            .get(schema.get_field_by_name("kind")?)?
+            .downcast::<capnp::dynamic_struct::Builder<'_>>();
+        let revoked = kind.get_schema().get_field_by_name("revoked")?;
+        kind.set(revoked, dynamic_value::Reader::Void)?;
+    }
+    Ok(())
+}
+
 /// Whether `s`'s active union member is named `name`.
 fn active_is(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> bool {
     matches!(s.which(), Ok(Some(f)) if redact::name_of(f.get_proto().get_name()) == name)

@@ -9,5 +9,6 @@ mod labels;
 mod redact;
 mod registration;
 mod resume;
+mod revoked;
 mod support;
 mod wire;

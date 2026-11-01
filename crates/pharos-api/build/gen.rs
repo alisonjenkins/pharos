@@ -30,6 +30,9 @@ struct Method {
     type_prefix: String,
     /// Whether a `$secret` field is reachable from its params or results.
     carries_secret: bool,
+    /// Result fields holding a capability: `(field, interface label)`, e.g.
+    /// `("library", "library")`. `Revoked` fills them with revoked capabilities.
+    cap_results: Vec<(String, String)>,
 }
 
 struct Interface {
@@ -85,6 +88,7 @@ pub fn generate(request_bytes: &[u8]) -> GenResult<String> {
     let mut interfaces = Vec::new();
     let mut method_structs = Vec::new();
     let mut secret_id = None;
+    let mut interface_ids = HashMap::new();
     for file in request.get_requested_files()? {
         let Some(file_node) = nodes.get(&file.get_id()) else {
             return Err(format!("requested file {:#x} has no node", file.get_id()).into());
@@ -113,12 +117,14 @@ pub fn generate(request_bytes: &[u8]) -> GenResult<String> {
                             type_prefix: capitalize(&mname),
                             label,
                             name: mname,
-                            // Filled in once the annotation id is known.
+                            // Filled in once all nodes are known.
                             carries_secret: false,
+                            cap_results: Vec::new(),
                         });
                         method_structs
                             .push((m.get_param_struct_type(), m.get_result_struct_type()));
                     }
+                    interface_ids.insert(n.get_id(), snake(&name));
                     interfaces.push(Interface {
                         label: snake(&name),
                         name,
@@ -138,9 +144,42 @@ pub fn generate(request_bytes: &[u8]) -> GenResult<String> {
         if let Some((params, results)) = structs.next() {
             m.carries_secret = reaches_secret(&nodes, params, secret_id, &mut HashSet::new())?
                 || reaches_secret(&nodes, results, secret_id, &mut HashSet::new())?;
+            m.cap_results = capability_fields(&nodes, &interface_ids, results)?;
         }
     }
     Ok(emit(&interfaces, secret_id))
+}
+
+/// The fields of struct `id` whose type is an interface, as
+/// `(rust field name, interface label)`.
+fn capability_fields(
+    nodes: &HashMap<u64, node::Reader<'_>>,
+    interface_ids: &HashMap<u64, String>,
+    id: u64,
+) -> GenResult<Vec<(String, String)>> {
+    let Some(n) = nodes.get(&id) else {
+        return Ok(Vec::new());
+    };
+    let node::Struct(st) = n.which()? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for f in st.get_fields()? {
+        let field::Slot(slot) = f.which()? else {
+            continue;
+        };
+        if let type_::Interface(t) = slot.get_type()?.which()? {
+            let name = f.get_name()?.to_str()?;
+            let Some(label) = interface_ids.get(&t.get_type_id()) else {
+                return Err(format!(
+                    "result field `{name}` holds a non-top-level interface; `Revoked` cannot fill it"
+                )
+                .into());
+            };
+            out.push((snake(name), label.clone()));
+        }
+    }
+    Ok(out)
 }
 
 /// Whether struct `id`, or any struct, group or list of structs reachable
@@ -280,8 +319,15 @@ fn emit_interface(o: &mut String, i: &Interface) {
         let _ = writeln!(o, "    }}\n");
         let _ = writeln!(
             o,
-            "    impl<S: Handler> wire::Server for Instrumented<S> {{}}"
+            "    impl<S: Handler> wire::Server for Instrumented<S> {{}}\n"
         );
+        let _ = writeln!(
+            o,
+            "    /// The handler behind a revoked session's `{}`.",
+            i.name
+        );
+        let _ = writeln!(o, "    pub struct Revoked(pub Rc<Connection>);");
+        let _ = writeln!(o, "    impl Handler for Revoked {{}}");
         let _ = writeln!(o, "}}\n");
         return;
     }
@@ -424,6 +470,49 @@ fn emit_interface(o: &mut String, i: &Interface) {
         let _ = writeln!(o, "            }}");
         let _ = writeln!(o, "        }}");
     }
-    let _ = writeln!(o, "    }}");
+    let _ = writeln!(o, "    }}\n");
+    emit_revoked(o, i);
     let _ = writeln!(o, "}}\n");
+}
+
+/// `Revoked`: what a refused or revoked session serves. Every call answers
+/// `Error.kind.revoked` (counted `revoked`, not `unimplemented`); a capability
+/// getter answers with a `Revoked` capability, because getters never fail and
+/// `resume → library → home` must still pipeline (research R1).
+fn emit_revoked(o: &mut String, i: &Interface) {
+    let _ = writeln!(
+        o,
+        "    /// The handler behind a revoked session's `{}`: every call fails",
+        i.name
+    );
+    let _ = writeln!(
+        o,
+        "    /// `Error.kind.revoked`; capability getters return `Revoked` capabilities."
+    );
+    let _ = writeln!(o, "    pub struct Revoked(pub Rc<Connection>);\n");
+    let _ = writeln!(o, "    impl Handler for Revoked {{");
+    for m in &i.methods {
+        let _ = writeln!(o, "        fn {}(", m.label);
+        let _ = writeln!(o, "            self: Rc<Self>,");
+        let _ = writeln!(o, "            _params: wire::{}Params,", m.type_prefix);
+        let _ = writeln!(
+            o,
+            "            results: &mut wire::{}Results,",
+            m.type_prefix
+        );
+        let _ = writeln!(
+            o,
+            "        ) -> impl ::core::future::Future<Output = Result<(), ::capnp::Error>> {{"
+        );
+        if m.cap_results.is_empty() {
+            let _ = writeln!(o, "            ::core::future::ready(crate::instrument::fill_revoked(::capnp::dynamic_value::Builder::from(results.get())))");
+        } else {
+            for (field, target) in &m.cap_results {
+                let _ = writeln!(o, "            results.get().set_{field}(super::{target}::client(super::{target}::Revoked(Rc::clone(&self.0)), &self.0));");
+            }
+            let _ = writeln!(o, "            ::core::future::ready(Ok(()))");
+        }
+        let _ = writeln!(o, "        }}");
+    }
+    let _ = writeln!(o, "    }}");
 }
