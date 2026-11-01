@@ -11,6 +11,7 @@ mod bootstrap;
 mod connect;
 mod gate;
 mod login;
+mod quick_connect;
 mod revocation;
 mod revocation_sites;
 mod session;
