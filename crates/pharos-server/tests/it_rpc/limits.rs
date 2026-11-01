@@ -1,11 +1,33 @@
-//! T026 (FR-010): limits enforced at the socket. The call-concurrency cap
-//! lives in the generated dispatch and is tested in `pharos-api`'s
-//! `it_instrument/limits.rs`.
+//! T026 (FR-010): limits enforced at the socket. Every refusal counts under
+//! `pharos_rpc_limit_total{limit}` and its log names the value and the cap.
+//! The call-concurrency cap lives in the generated dispatch and is tested in
+//! `pharos-api`'s `it_instrument/limits.rs`.
 
 use awc::ws;
 use futures_util::{SinkExt as _, StreamExt as _};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use pharos_server::api::pharos::rpc::socket::{record_closed, record_refused, CloseCause, Refused};
 
 use crate::connect::{start, ws_url};
+
+fn limit_total(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, limit: &str) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_rpc_limit_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "limit" && l.value() == limit)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
 
 /// Sends `messages` and answers the close frame the server sends back.
 async fn close_after(messages: Vec<ws::Message>) -> ws::CloseReason {
@@ -54,4 +76,25 @@ async fn continuations_adding_up_past_the_cap_close_with_size() {
     .await;
     assert_eq!(reason.code, ws::CloseCode::Size);
     assert_eq!(reason.description.as_deref(), Some("message_too_large"));
+}
+
+/// ODD: both socket-level limits count by name. Disarm check: without the
+/// counter in `record_refused` / `record_closed`, both read 0.
+#[test]
+fn socket_limits_count_by_name() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    record_refused(Refused::TooManyUnauthenticated, None, "192.0.2.1");
+    record_closed(
+        &CloseCause::MessageTooLarge,
+        1,
+        false,
+        std::time::Duration::ZERO,
+    );
+    record_closed(&CloseCause::StreamEnd, 2, false, std::time::Duration::ZERO);
+
+    assert_eq!(limit_total(&snapshotter, "unauthenticated_connections"), 1);
+    assert_eq!(limit_total(&snapshotter, "message_size"), 1);
 }

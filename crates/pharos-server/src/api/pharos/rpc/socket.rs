@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, CloseCode, CloseReason, Session};
 use futures_util::StreamExt as _;
+use pharos_api::labels::LIMIT_TOTAL;
 use pharos_api::Connection;
 use pharos_core::UserId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::broadcast;
 
-use super::limits::{ConnectionLimits, AUTH_DEADLINE};
+use super::limits::{ConnectionLimits, AUTH_DEADLINE, MAX_UNAUTHENTICATED};
 use super::{bootstrap_client, origin, ConnectionCtx};
 use crate::config::NativeApiConfig;
 use crate::services::auth::{user_for_token, TokenRefusal};
@@ -59,9 +60,20 @@ impl Refused {
     }
 }
 
-/// Counts and logs a refused upgrade, naming the offending value.
+/// Counts and logs a refused upgrade, naming the offending value. The
+/// connection cap is also a limit (FR-010).
 pub fn record_refused(refused: Refused, origin: Option<&str>, peer: &str) {
     metrics::counter!("pharos_rpc_refused_total", "reason" => refused.label()).increment(1);
+    if refused == Refused::TooManyUnauthenticated {
+        metrics::counter!(LIMIT_TOTAL, "limit" => "unauthenticated_connections").increment(1);
+        tracing::warn!(
+            limit = "unauthenticated_connections",
+            value = MAX_UNAUTHENTICATED,
+            max = MAX_UNAUTHENTICATED,
+            peer,
+            "native api limit reached"
+        );
+    }
     tracing::warn!(
         reason = refused.label(),
         origin = origin.unwrap_or(""),
@@ -165,6 +177,15 @@ impl Recheck {
 /// Counts and logs a closed connection with its cause and lifetime.
 pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived: Duration) {
     metrics::counter!("pharos_rpc_closed_total", "cause" => cause.label()).increment(1);
+    if *cause == CloseCause::MessageTooLarge {
+        metrics::counter!(LIMIT_TOTAL, "limit" => "message_size").increment(1);
+        tracing::warn!(
+            connection,
+            limit = "message_size",
+            max = MAX_FRAME,
+            "native api limit reached"
+        );
+    }
     tracing::info!(
         connection,
         signed_in,

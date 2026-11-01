@@ -13,7 +13,7 @@ mod bootstrap;
 pub mod limits;
 pub mod origin;
 mod session;
-mod socket;
+pub mod socket;
 
 use std::cell::RefCell;
 use std::rc::Rc;
