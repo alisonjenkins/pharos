@@ -441,3 +441,31 @@ async fn initiate_over_the_per_address_cap_is_429_with_retry_after() {
             .as_str()
     );
 }
+
+#[actix_web::test]
+async fn authorize_guessing_is_429_with_retry_after_after_the_failure_limit() {
+    let (state, admin_token) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+    for _ in 0..pharos_server::quick_connect::MAX_AUTHORIZE_FAILURES {
+        let req = test::TestRequest::post()
+            .uri("/QuickConnect/Authorize?Code=999999")
+            .insert_header(("X-Emby-Token", admin_token.as_str()))
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 404);
+    }
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Authorize?Code=999999")
+        .insert_header(("X-Emby-Token", admin_token.as_str()))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 429);
+    let wait: u64 = resp
+        .headers()
+        .get("retry-after")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=301).contains(&wait), "{wait}");
+}
