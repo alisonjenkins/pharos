@@ -46,6 +46,7 @@ on plain TCP and the tests use the same code.
 A connection is closed when:
 - it has not resumed a session within 30 s;
 - it has been idle for 120 s;
+- a token it resumed with no longer resolves (checked every `revalidate_secs`);
 - it sends a text frame;
 - its `RpcSystem` stops.
 
@@ -59,8 +60,11 @@ SameSite=Strict` out); the token is an ordinary ADR-0011 device token. A
 native app keeps the device token from `Bootstrap.login` or Quick Connect.
 `Bootstrap.resume(deviceToken)` resolves the token, or the upgrade's cookie
 when it is empty, on every call, so a revocation takes effect at the next
-resume. A session already open does not yet notice its token being revoked;
-T025a closes it.
+resume. An open connection re-checks every token it resumed with each
+`revalidate_secs` (default 60): once one no longer resolves (revoked token,
+disabled or deleted user) the server closes it with cause `revoked`. A store
+outage keeps it open (B216). Logout and revoke will also close it at once
+(T025).
 
 `resume` always answers with a `Session` capability plus a `status`. A
 refused session is the generated `Refused` handler carrying a `Denial`
