@@ -5402,3 +5402,173 @@ mod tests {
         assert_eq!(with_cache_epoch("/a/0.ts?g=17", 0), "/a/0.ts?g=17");
     }
 }
+
+/// Prewarms for a play session that selected a grouped edition (B252).
+#[cfg(test)]
+mod prewarm_edition_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::state::Stores;
+    use pharos_cache::hls_cache::SourceGen;
+    use pharos_core::{AlternateMediaSource, MediaItem, MediaKind, MediaProbe, MediaStore};
+    use std::path::{Path, PathBuf};
+
+    const EDITION: &str = "3d-hsbs";
+
+    /// Item 7 with a 3D edition, behind a cache whose encoder is a stub that
+    /// prints segment bytes. Returns the state, the cache root and the
+    /// edition's path.
+    async fn seed(dir: &Path) -> (web::Data<AppState>, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let primary = dir.join("Film.mkv");
+        let edition = dir.join("Film - 3D.HSBS.mkv");
+        std::fs::write(&primary, b"primary").unwrap();
+        std::fs::write(&edition, b"edition").unwrap();
+        let probe = MediaProbe {
+            duration_ms: Some(60_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(1_000_000),
+            video_codec: Some("mpeg4".into()),
+            audio_codec: Some("mp3".into()),
+            ..Default::default()
+        };
+        stores
+            .put(MediaItem {
+                id: 7,
+                path: primary,
+                title: "Film".into(),
+                kind: MediaKind::Movie,
+                probe: MediaProbe {
+                    alternate_sources: vec![AlternateMediaSource {
+                        id: EDITION.into(),
+                        path: edition.clone(),
+                        probe: Some(Box::new(probe.clone())),
+                        ..Default::default()
+                    }],
+                    ..probe
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let bin = dir.join("stub-ffmpeg");
+        // Above the cache's 64-byte floor for a truncated segment.
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '{}'\n", "s".repeat(128))).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A subdirectory: the cache wipes everything else in its root.
+        let cache =
+            pharos_cache::HlsSegmentCache::new(dir.join("cache"), 1 << 30).with_ffmpeg(&bin);
+        let root = cache.root().to_path_buf();
+        let state = web::Data::new(AppState::new(stores, "t".into()).with_hls_cache(cache));
+        (state, root, edition)
+    }
+
+    /// Segment filenames under item 7 once `want` of them have landed, or
+    /// whatever is there after the timeout.
+    async fn warmed(root: &Path, want: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        for _ in 0..200 {
+            names = std::fs::read_dir(root.join("7"))
+                .map(|d| {
+                    d.filter_map(|e| e.ok()?.file_name().into_string().ok())
+                        .filter(|n| !n.ends_with(".prov.json"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if names.len() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        names
+    }
+
+    #[actix_web::test]
+    async fn a_group_seek_warms_the_edition_a_member_is_playing() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, edition_path) = seed(td.path()).await;
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            Some(&format!(
+                "{}-{EDITION}",
+                pharos_jellyfin_api::dto::wire_item_id(7)
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(item.edition.as_deref(), Some(EDITION));
+        let mut opts = build_segment_opts(None, &item, 0, None, None);
+        // Muxed audio copies from a continuous encode the stub cannot produce;
+        // the source key does not depend on it.
+        opts.audio = pharos_transcode::AudioDelivery::Separate;
+        state.note_segment_opts("ps-member", 7, item.edition.as_deref(), &opts);
+
+        prewarm_group_seek(&state, 7, 30_000);
+
+        let gen = format!(
+            "-g{}",
+            SourceGen::for_read(&edition_path, Some(EDITION)).get()
+        );
+        let names = warmed(&root, 3).await;
+        assert_eq!(
+            names.len(),
+            3,
+            "the landing segment and two behind it: {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n.contains(&gen)),
+            "every warmed segment must be keyed by the edition's file ({gen}), \
+             not the primary's: {names:?}"
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_cold_start_warms_the_edition_playback_info_negotiated() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, edition_path) = seed(td.path()).await;
+        let session = crate::transcode_sessions::TranscodeSession {
+            media_id: 7,
+            decision: crate::api::jellyfin::device_profile::Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: None,
+            },
+            source_probe: MediaProbe::default(),
+            burn_subtitle_indices: Default::default(),
+        };
+
+        // The demuxed CMAF rendition: its segments are video-only, so the stub
+        // encoder needs no continuous audio behind it.
+        prewarm_cold_start(
+            &state,
+            session,
+            "ps-cold",
+            None,
+            None,
+            None,
+            0,
+            true,
+            Some(format!(
+                "{}-{EDITION}",
+                pharos_jellyfin_api::dto::wire_item_id(7)
+            )),
+        );
+
+        let gen = format!(
+            "-g{}",
+            SourceGen::for_read(&edition_path, Some(EDITION)).get()
+        );
+        let names = warmed(&root, COLD_START_PREWARM_SEGS as usize).await;
+        assert_eq!(names.len(), COLD_START_PREWARM_SEGS as usize, "{names:?}");
+        assert!(
+            names.iter().all(|n| n.contains(&gen)),
+            "every warmed segment must be keyed by the edition's file ({gen}), \
+             not the primary's: {names:?}"
+        );
+    }
+}
