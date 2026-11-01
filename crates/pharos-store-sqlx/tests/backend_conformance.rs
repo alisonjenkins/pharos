@@ -791,6 +791,20 @@ where
         .await
         .unwrap();
     assert!(lib_item_ids.contains(&item_id));
+    assert_eq!(
+        LibraryStore::library_wire_id_of(&store, item_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(lib_wire_id)
+    );
+    assert_eq!(
+        LibraryStore::library_wire_id_of(&store, item_id + 1_000_000)
+            .await
+            .unwrap(),
+        None,
+        "an unknown item belongs to no library"
+    );
 
     // -----------------------------------------------------------------
     // 9. CollectionStore / PlaylistStore

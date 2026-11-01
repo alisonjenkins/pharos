@@ -2830,6 +2830,18 @@ impl LibraryStore for PostgresStore {
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
     }
+
+    async fn library_wire_id_of(&self, item: MediaId) -> DomainResult<Option<String>> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT l.wire_id FROM media_items m \
+             JOIN libraries l ON l.id = m.library_id \
+             WHERE m.id = $1",
+        )
+        .bind(item as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))
+    }
 }
 
 impl UserStore for PostgresStore {
