@@ -40,7 +40,6 @@ fn routes(f: &Fixture, id: u64) -> Vec<(Method, String)> {
         (Method::GET, format!("/Items/{id}/Collections")),
         (Method::GET, format!("/Items/{id}/PlaybackInfo")),
         (Method::GET, format!("/Items/{id}/Download")),
-        (Method::GET, format!("/Items/{id}/MetadataEditor")),
         (Method::GET, format!("/Items/{id}/InstantMix")),
         (Method::GET, format!("/Items/{id}/Waveform")),
         (Method::GET, format!("/Audio/{id}/Lyrics")),

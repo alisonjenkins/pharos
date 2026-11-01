@@ -1220,10 +1220,11 @@ async fn list_tags(
 /// shape).
 async fn item_tags_add(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
     // V-spirit: reject a tag mutation against a non-existent item rather
@@ -1248,10 +1249,11 @@ async fn item_tags_add(
 /// no media item carries that id. Returns 204.
 async fn item_tags_remove(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
     state
