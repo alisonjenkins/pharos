@@ -93,3 +93,62 @@ async fn the_cookie_reaches_only_reads_of_item_bytes() {
         wrong.join("\n")
     );
 }
+
+/// Subtitle and font URLs in PlaybackInfo carry the caller's token, so a
+/// `<track>` or SubtitlesOctopus fetch from any client authenticates.
+/// Disarm check: with the `api_key` append in `playback_info` skipped, the
+/// subtitle URL lacks the token.
+#[actix_web::test]
+async fn playback_info_delivery_urls_carry_the_callers_token() {
+    use pharos_core::{MediaAttachment, MediaItem, MediaKind, MediaProbe, MediaStore as _};
+    let f = seed_rich().await;
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("subbed.mkv");
+    std::fs::write(&video, b"x").unwrap();
+    std::fs::write(
+        dir.path().join("subbed.eng.vtt"),
+        b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+    )
+    .unwrap();
+    f.state
+        .stores
+        .put(MediaItem {
+            id: 500,
+            path: video,
+            title: "Subbed".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                video_codec: Some("h264".into()),
+                attachments: vec![MediaAttachment {
+                    stream_index: 3,
+                    filename: Some("font.ttf".into()),
+                    mime_type: Some("font/ttf".into()),
+                    codec: Some("ttf".into()),
+                }],
+                ..MediaProbe::default()
+            },
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::post()
+        .uri("/Items/500/PlaybackInfo")
+        .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+        .set_json(serde_json::json!({}))
+        .to_request();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let source = &body["MediaSources"][0];
+    let urls: Vec<&str> = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(source["MediaAttachments"].as_array().unwrap())
+        .filter_map(|s| s["DeliveryUrl"].as_str())
+        .collect();
+    assert!(urls.len() >= 2, "{body}");
+    let want = format!("api_key={}", f.admin_token);
+    for url in urls {
+        assert!(url.contains(&want), "{url} lacks the token");
+    }
+}

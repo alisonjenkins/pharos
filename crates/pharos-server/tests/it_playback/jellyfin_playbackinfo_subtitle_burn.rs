@@ -172,7 +172,9 @@ async fn web_profile_with_external_ass_stays_external() {
         ass["DeliveryUrl"]
             .as_str()
             .unwrap_or_default()
-            .ends_with("Stream.ass"),
+            .split('?')
+            .next()
+            .is_some_and(|path| path.ends_with("Stream.ass")),
         "{ass}"
     );
 }
