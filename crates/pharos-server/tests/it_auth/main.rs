@@ -1,4 +1,4 @@
-//! Consolidated integration-test binary: one link instead of 16; each `mod` is a former tests/*.rs.
+//! Consolidated integration-test binary: one link instead of 17; each `mod` is a former tests/*.rs.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "../common/store_calls.rs"]
@@ -14,6 +14,7 @@ mod jellyfin_session_logout;
 mod jellyfin_sessions;
 mod jellyfin_user_password;
 mod last_admin_guard_audit;
+mod login_throttle;
 mod no_path_leak;
 mod no_token_echo;
 mod password_change_audit;

@@ -271,9 +271,37 @@ async fn authenticate_by_name(
     let body = body.into_inner();
     let password = SecretString::new(body.pw);
 
+    // V174 — throttle BEFORE the argon2 verify, so a refused attempt costs
+    // neither a hash nor a guess.
+    let client_ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
+    if let Err(retry) =
+        state
+            .login_throttle
+            .check(&body.username, client_ip, std::time::Instant::now())
+    {
+        let resp = HttpResponse::TooManyRequests()
+            .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
+            .body("too many failed login attempts");
+        return Err(actix_web::error::InternalError::from_response(
+            "too many failed login attempts",
+            resp,
+        )
+        .into());
+    }
+
     let user = match state.auth.authenticate(&body.username, &password).await {
-        Ok(u) => u,
+        Ok(u) => {
+            state
+                .login_throttle
+                .record_success(&body.username, client_ip);
+            u
+        }
         Err(AuthError::InvalidCredentials) | Err(AuthError::UserNotFound) => {
+            state.login_throttle.record_failure(
+                &body.username,
+                client_ip,
+                std::time::Instant::now(),
+            );
             return Err(ErrorUnauthorized("invalid credentials"));
         }
         Err(e) => return Err(actix_web::error::ErrorInternalServerError(e.to_string())),

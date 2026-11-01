@@ -890,6 +890,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("obs.sampling_ratio must be within 0.0..=1.0, got {0}")]
     SamplingRatio(f64),
+    #[error("server.trusted_proxies: {0}")]
+    TrustedProxies(String),
 }
 
 impl Config {
