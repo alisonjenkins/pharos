@@ -556,7 +556,8 @@ pub struct ServerConfig {
 /// `POST /Users/AuthenticateByName`. Accounts are never locked: past the
 /// threshold an attempt is refused with `429` + `Retry-After` for a delay that
 /// doubles with every further failure (1 s, 2 s, 4 s, ...) up to
-/// `max_backoff_secs`, and any success clears the counters.
+/// `max_backoff_secs`. A success clears that username's counter; an address's
+/// count only decays with the window, so a valid account cannot reset it.
 ///
 /// The defaults are deliberately generous: a household mistyping a TV
 /// password ten times in a row is rare and is held for seconds, never minutes
