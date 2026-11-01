@@ -441,12 +441,16 @@ async fn initiate_over_the_per_address_cap_is_429_with_retry_after() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 429);
-    assert_eq!(
-        resp.headers().get("retry-after").unwrap(),
-        pharos_server::quick_connect::CAP_RETRY_AFTER_SECS
-            .to_string()
-            .as_str()
-    );
+    let wait: u64 = resp
+        .headers()
+        .get("retry-after")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // seconds until the oldest pending request (just created) expires
+    assert!((298..=301).contains(&wait), "{wait}");
 }
 
 #[actix_web::test]
