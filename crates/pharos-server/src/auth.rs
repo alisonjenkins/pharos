@@ -323,8 +323,14 @@ impl LoginThrottle {
                 (ThrottleReason::User, by_user)
             };
             if wait.is_zero() {
-                let user = bump(&mut t.users, uk.clone(), now, window);
-                let ip = bump(&mut t.ips, ik, now, window);
+                let user = bump(
+                    &mut t.users,
+                    uk.clone(),
+                    now,
+                    window,
+                    self.policy.max_failures_per_user,
+                );
+                let ip = bump(&mut t.ips, ik, now, window, self.policy.max_failures_per_ip);
                 Ok(FailureCounts { user, ip })
             } else {
                 Err((reason, wait))
@@ -468,13 +474,19 @@ fn bump<K: std::hash::Hash + Eq + Clone>(
     key: K,
     now: Instant,
     window: Duration,
+    threshold: u32,
 ) -> u32 {
     if table.len() >= MAX_ENTRIES && !table.contains_key(&key) {
         table.retain(|_, e| now.saturating_duration_since(e.last_failure) < window);
         if table.len() >= MAX_ENTRIES {
+            // Evict the stalest key still below the threshold. A throttled
+            // key goes only when every key is throttled, so spraying fresh
+            // usernames cannot cheaply reset a victim's held counter: the
+            // attacker would first have to drive 10 000 keys past the
+            // threshold themselves.
             let stalest = table
                 .iter()
-                .min_by_key(|(_, e)| e.last_failure)
+                .min_by_key(|(_, e)| (e.failures >= threshold.max(1), e.last_failure))
                 .map(|(k, _)| k.clone());
             if let Some(k) = stalest {
                 table.remove(&k);
@@ -929,6 +941,32 @@ mod tests {
                 .lock()
                 .users
                 .contains_key(&format!("user{}", MAX_ENTRIES + 499)));
+        }
+
+        /// Security review of #464: filling the table with fresh usernames
+        /// must not evict a throttled victim and hand back its budget.
+        #[test]
+        fn spraying_usernames_does_not_evict_a_throttled_user() {
+            let t = LoginThrottle::new(cfg()).with_per_ip(false);
+            let t0 = Instant::now();
+            for _ in 0..3 {
+                fail(&t, "victim", ip(1), t0);
+            }
+            assert!(t.begin("victim", ip(1), t0).is_err());
+            for i in 0..(MAX_ENTRIES + 10) {
+                fail(
+                    &t,
+                    &format!("junk{i}"),
+                    ip(2),
+                    t0 + Duration::from_millis(1),
+                );
+            }
+            // The victim is the stalest key, but still held.
+            assert!(
+                t.begin("victim", ip(1), t0 + Duration::from_millis(1))
+                    .is_err(),
+                "the victim's counter was evicted"
+            );
         }
 
         #[test]
