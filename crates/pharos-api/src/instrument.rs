@@ -23,7 +23,8 @@ use tracing::{Instrument, Span};
 use web_time::Instant;
 
 use crate::labels::{
-    MethodMeta, Outcome, CALLS_TOTAL, CANCELLED_TOTAL, DURATION_SECONDS, LIMIT_TOTAL,
+    client_schema_label, MethodMeta, Outcome, CALLS_TOTAL, CANCELLED_TOTAL, CLIENT_SCHEMA_TOTAL,
+    DURATION_SECONDS, LIMIT_TOTAL,
 };
 use crate::redact;
 
@@ -49,6 +50,8 @@ pub struct Connection {
     next_call: Cell<u64>,
     user: RefCell<String>,
     in_flight: Rc<Cell<u32>>,
+    /// Whether `pharos_rpc_client_schema_total` has counted this connection.
+    schema_counted: Cell<bool>,
 }
 
 /// Calls one connection may have running at once (FR-010). The UI's busiest
@@ -62,6 +65,7 @@ impl Connection {
             next_call: Cell::new(1),
             user: RefCell::new(String::new()),
             in_flight: Rc::new(Cell::new(0)),
+            schema_counted: Cell::new(false),
         })
     }
 
@@ -147,6 +151,10 @@ impl CallScope {
                     let traceparent = text_field(ctx, "traceparent");
                     record.trace_id = trace_id_of(&traceparent).to_owned();
                     record.client_version = text_field(ctx, "clientVersion");
+                    if !conn.schema_counted.replace(true) {
+                        let version = client_schema_label(u32_field(ctx, "schemaVersion"));
+                        metrics::counter!(CLIENT_SCHEMA_TOTAL, "version" => version).increment(1);
+                    }
                     record.device = struct_field(ctx, "device")
                         .map(|d| text_field(d, "value"))
                         .unwrap_or_default();
@@ -476,6 +484,16 @@ fn struct_field<'a>(
     match s.get(field).ok()? {
         dynamic_value::Reader::Struct(v) => Some(v),
         _ => None,
+    }
+}
+
+fn u32_field(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> u32 {
+    let Ok(Some(field)) = s.get_schema().find_field_by_name(name) else {
+        return 0;
+    };
+    match s.get(field) {
+        Ok(dynamic_value::Reader::UInt32(v)) => v,
+        _ => 0,
     }
 }
 
