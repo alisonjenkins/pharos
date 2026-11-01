@@ -21,7 +21,8 @@ capnpc = { workspace = true }
 metrics-util = { workspace = true }
 pharos-test-metrics = { path = "../pharos-test-metrics" }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "io-util"] }
+tokio-util = { workspace = true, features = ["compat"] }
 tracing-subscriber = { workspace = true }
 
 [lints]

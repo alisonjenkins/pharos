@@ -8,3 +8,4 @@ mod labels;
 mod redact;
 mod registration;
 mod support;
+mod wire;

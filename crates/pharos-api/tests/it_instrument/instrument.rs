@@ -15,7 +15,7 @@ use pharos_api::Connection;
 
 use crate::support::{block_on, fill_ctx, observe, Observed, DEVICE, TRACE_ID};
 
-enum Mode {
+pub(crate) enum Mode {
     NotFound,
     CapnpError,
     Ok,
@@ -23,7 +23,7 @@ enum Mode {
     Hang(Rc<Cell<bool>>),
 }
 
-struct Lib(Mode);
+pub(crate) struct Lib(pub(crate) Mode);
 
 impl server::library::Handler for Lib {
     // A handler can be a plain `async fn`; the trait's `impl Future` return
@@ -54,7 +54,7 @@ impl server::library::Handler for Lib {
     }
 }
 
-fn latest_request(
+pub(crate) fn latest_request(
     client: &library::Client,
 ) -> capnp::capability::RemotePromise<library::latest_results::Owned> {
     let mut req = client.latest_request();
