@@ -18,6 +18,9 @@ pub(crate) enum Route {
     PlaybackInfo,
     /// Subtitle and attachment delivery, which names the source in its path.
     Subtitles,
+    /// Background segment warming for a play session, with no request of its
+    /// own: it names the source the session selected.
+    Prewarm,
 }
 
 impl Route {
@@ -27,6 +30,7 @@ impl Route {
             Self::Hls => "hls",
             Self::PlaybackInfo => "playback_info",
             Self::Subtitles => "subtitles",
+            Self::Prewarm => "prewarm",
         }
     }
 }
@@ -347,10 +351,11 @@ mod tests {
             Route::Hls,
             Route::PlaybackInfo,
             Route::Subtitles,
+            Route::Prewarm,
         ]
         .map(Route::label)
         .into();
-        assert_eq!(rt.len(), 4);
+        assert_eq!(rt.len(), 5);
     }
 
     #[test]

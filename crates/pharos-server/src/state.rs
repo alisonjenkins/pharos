@@ -134,6 +134,17 @@ pub struct StorageFolders {
     pub web: Option<PathBuf>,
 }
 
+/// T87 — what a play session last fetched a segment with, for SyncPlay seek
+/// prewarming.
+#[derive(Debug, Clone)]
+pub struct SegmentOptsHint {
+    pub media_id: u64,
+    /// The grouped edition the session is playing, `None` for the item's own
+    /// file: the edition's segments are keyed by its own file.
+    pub edition: Option<String>,
+    pub opts: SegmentOpts,
+}
+
 pub struct AppState {
     pub stores: Stores,
     pub auth: Auth,
@@ -234,7 +245,7 @@ pub struct AppState {
     /// at `When` and requests data. Bounded small (one entry per live play
     /// session); cleared wholesale past a sanity cap.
     pub segment_opts_hints:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, SegmentOpts)>>>,
+        Arc<std::sync::Mutex<std::collections::HashMap<String, SegmentOptsHint>>>,
     /// Cancellable registry of in-flight HLS segment-prefetch tasks, keyed by
     /// `PlaySessionId`, so an episode swap / track switch / session stop cancels
     /// the abandoned episode's prefetch instead of letting it transcode to
@@ -1047,14 +1058,27 @@ impl AppState {
 
     /// T87 — record the transcode options a play session last used for a
     /// segment, for SyncPlay seek prewarming.
-    pub fn note_segment_opts(&self, play_session_id: &str, media_id: u64, opts: &SegmentOpts) {
+    pub fn note_segment_opts(
+        &self,
+        play_session_id: &str,
+        media_id: u64,
+        edition: Option<&str>,
+        opts: &SegmentOpts,
+    ) {
         if let Ok(mut m) = self.segment_opts_hints.lock() {
             // Sanity cap: play sessions number in the tens; a runaway caller
             // must not grow this unbounded.
             if m.len() > 512 {
                 m.clear();
             }
-            m.insert(play_session_id.to_string(), (media_id, opts.clone()));
+            m.insert(
+                play_session_id.to_string(),
+                SegmentOptsHint {
+                    media_id,
+                    edition: edition.map(str::to_owned),
+                    opts: opts.clone(),
+                },
+            );
         }
     }
 
@@ -1067,13 +1091,13 @@ impl AppState {
     /// playhead it sits — work submitted with no stream sorts last forever, so
     /// discarding the key here would put the segments a whole group is about to
     /// need at the back of the queue.
-    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<(String, SegmentOpts)> {
+    pub fn segment_opts_for_media(&self, media_id: u64) -> Vec<(String, SegmentOptsHint)> {
         self.segment_opts_hints
             .lock()
             .map(|m| {
                 m.iter()
-                    .filter(|(_, (mid, _))| *mid == media_id)
-                    .map(|(psid, (_, o))| (psid.clone(), o.clone()))
+                    .filter(|(_, h)| h.media_id == media_id)
+                    .map(|(psid, h)| (psid.clone(), h.clone()))
                     .collect()
             })
             .unwrap_or_default()
