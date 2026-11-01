@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/017-native-api/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: clarified, planned and tasked (`/speckit-tasks` 2026-11-01); implementation starts at tasks.md Phase 1
 **Input**: "We will still maintain compatibility with the Jellyfin clients,
 however Pharos was always meant to be the next gen. We will be having our own
 API endpoints but reusing the code we have written for the Jellyfin clients
@@ -107,7 +107,7 @@ call the same way, so 016 sees both ends.
 |---|---|---|
 | Span per request | `http.request` | `rpc.<interface>.<method>`, parented on the call context (FR-006); pipelined calls appear as children of the call they depend on, so a pipelined batch reads as one tree in Tempo |
 | Request id | `request_id` | `call_id` (connection id + question id), in span and logs |
-| RED counter | `http_requests_total{method,path,status}` | `pharos_rpc_calls_total{interface,method,outcome}` (outcome = ok / typed error variant / disconnected / cancelled / limit) |
+| RED counter | `http_requests_total{method,path,status}` | `pharos_rpc_calls_total{interface,method,outcome}` (outcome is a closed set from `Outcome::label()`: `ok`; one per `Error.kind` variant: `not_found`, `not_permitted`, `invalid`, `limit`, `revoked`, `unavailable`, `other`; `failed` for a transport/handler `capnp::Error`; `disconnected`; `cancelled`) |
 | Latency | `http_request_duration_seconds{method,path}` | `pharos_rpc_duration_seconds{interface,method}` (histogram; long-running methods added to `LONG_RUNNING_SECONDS`) |
 | Client abort | `http_client_aborted_total{method,path}` | `pharos_rpc_cancelled_total{interface,method}` (caller dropped or disconnected mid-call) |
 | Failure log | JSON line with status + cause | WARN/ERROR line per failed call: interface, method, error variant **and its cause value**, call_id, trace_id, user, device. Symmetric with success: the success path never records a field the failure path omits |
@@ -303,15 +303,15 @@ ordinals.
 - **SC-001** Home, library page and item detail each render from ≤ 1 batch
   after connect (US1), measured in Playwright.
 - **SC-002** Payload bytes and client decode time for a 500-item library page,
-  native vs Jellyfin JSON. The `/speckit-plan` spike measures both on the
-  seeded library and sets the pass gate from the result (recorded in
+  native vs Jellyfin JSON. Task T040 measures both on the
+  seeded library (the plan's spike could not, as it needs a running server) and sets the pass gate from the result (recorded in
   `quickstart.md`); afterwards a CI benchmark fails on a regression of more than
   10 % against that gate. The native API must at least not be worse than JSON on
   either measure.
 - **SC-003** The Jellyfin compat suite is green at every commit of this feature.
-- **SC-005** Every row of the §Observability parity table is asserted by a test that fails with the dispatch wrapper disarmed.
 - **SC-004** By query after deploy: `pharos_rpc_calls_total` by method and
   outcome, p95 `pharos_rpc_duration_seconds` by method, recorded.
+- **SC-005** Every row of the §Observability parity table is asserted by a test that fails with the dispatch wrapper disarmed.
 
 ## Edge cases
 

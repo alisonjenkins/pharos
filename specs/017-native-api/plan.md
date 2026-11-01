@@ -23,7 +23,7 @@ compiles with `capnp` 1.5 and through `capnpc` 0.27 to Rust that builds for wasm
 **Language/Version**: Rust stable (workspace toolchain), wasm32-unknown-unknown for the client in the browser
 **Primary Dependencies**: new: `capnp` 0.27, `capnp-rpc` 0.27, `capnp-futures` (transitive), `capnpc` 0.27 (build), `capnproto` 1.5 (devShell tool). Reused: `actix-ws` 0.4, `tokio-util` (compat), `tracing`, `metrics`, `opentelemetry`.
 **Storage**: none new. Sessions use the existing hashed token store (ADR-0011).
-**Testing**: `cargo nextest`. The in-process server and native `pharos-client` over TCP run in integration tests (`it_rpc` group). Generated-wrapper tests cover V173. The schema-compat test covers FR-009. Playwright covers the browser transport.
+**Testing**: `cargo nextest`. The in-process server and native `pharos-client` over TCP run in integration tests (`it_rpc` group); the tests bind the server's RPC dispatch to a test-only TCP listener, since v1 ships only the WebSocket (FR-002). Generated-wrapper tests cover V173. The schema-compat test covers FR-009. Playwright covers the browser transport.
 **Target Platform**: Linux server (k8s); browsers per 009 NFR-005
 **Project Type**: Rust workspace (server + wasm client + shared crates)
 **Performance Goals**: home/library/detail in ≤ 1 batch after connect (SC-001). Payload and decode gate set from measurement (SC-002, T040).
