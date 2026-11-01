@@ -317,6 +317,14 @@ pub enum Denial {
     /// A dependency is down. Transient: the client keeps its token and
     /// resumes again.
     Unavailable { dependency: &'static str },
+    /// The caller may not do this; `what` names it, a fixed string.
+    NotPermitted { what: &'static str },
+    /// Too many failures; try again in `retry_after_secs`. Written as a
+    /// `limit` named `name` whose `value` is the wait.
+    Throttled {
+        name: &'static str,
+        retry_after_secs: u64,
+    },
     /// A cap was reached; resume again once the user holds fewer.
     Limit {
         name: &'static str,
@@ -337,6 +345,21 @@ impl Denial {
             Denial::Unavailable { dependency } => {
                 error.set_reason(format!("{dependency} unavailable").as_str());
                 error.get_kind().set_unavailable(dependency);
+            }
+            Denial::NotPermitted { what } => {
+                error.set_reason(what);
+                error.get_kind().set_not_permitted(what);
+            }
+            Denial::Throttled {
+                name,
+                retry_after_secs,
+            } => {
+                error.set_reason(
+                    format!("too many failed attempts; retry in {retry_after_secs} s").as_str(),
+                );
+                let mut limit = error.get_kind().init_limit();
+                limit.set_name(name);
+                limit.set_value(retry_after_secs);
             }
             Denial::Limit { name, value, max } => {
                 error.set_reason(format!("{name} is {value}, at most {max}").as_str());
