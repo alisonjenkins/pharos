@@ -11,11 +11,11 @@
 - Integration tests are grouped: `crates/<crate>/tests/it_<area>/main.rs` declares one `mod` per file, so each area links once (a standalone `tests/*.rs` links a ~190 MB binary of its own). Add a new test file to the matching `it_<area>` group, not as a new top-level `tests/*.rs`. Stay standalone only when the file installs a process-global tracing/metrics subscriber (`redaction.rs`), is named by a recipe (`client_compat`), or has a postgres arm. Helpers shared across a group come in with `#[path = "../common/mod.rs"] mod common;` in `main.rs`.
 - Fast-feedback recipes via `just`:
   - `just test-fast` — workspace `--lib` only, skips heavy `tests/*.rs` binaries.
-  - `just test-changed [from=main]` — `cargo-guppy` enumerates packages touched vs `from`, then `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'` runs only the transitively-affected tests.
+  - `just test-changed [from]` — diffs against the merge-base with `from` (default `origin/main`) plus the working tree, maps `crates/<pkg>/` paths to `nextest -E 'rdeps(pkg1) + rdeps(pkg2)'`, runs the full workspace for workspace-wide inputs (`Cargo.toml`, `Cargo.lock`, `workspace-hack/`, toolchain, flake, nextest config) or unclassified paths, runs nothing for docs/specs-only changes, and adds `just test-postgres` when `pharos-store-sqlx` changed. Prints each path's verdict and reason. `just test-changed-plan` shows the decision without running.
   - `just test` — full workspace (strips macOS Gatekeeper quarantine attr first).
   - `just test-thorough` — full workspace with `PROPTEST_CASES=512` for nightly / pre-release.
   - `just test-postgres` — store suite against a real sandboxed postgres.
-  - **Workflow**: iterate with `test-fast` / `test-changed` (blast-radius only) for tight loops; always run the full `just test` before a commit.
+  - **Workflow**: iterate with `test-fast` / `test-changed`; run `just test-changed` (blast radius only) before a commit or push. Do not run the full `just test` routinely: `test-changed` already escalates to the full workspace when a workspace-wide input changed, and CI's `nix flake check` runs the whole suite on every PR as the merge gate. Run `just test` by hand only when you suspect the selection missed something (e.g. a test reads files from another crate at runtime).
   - **`just test` does NOT cover postgres.** The postgres arms skip themselves
     when `PHAROS_TEST_POSTGRES_URL` is unset — they are the bulk of the
     "N skipped" line — and sqlx does not check placeholder arity or column

@@ -101,8 +101,9 @@ depend on traits, so backends swap by wiring, not refactor.
 
 - Work inside the Nix devShell; host toolchains drift from CI.
 - `cargo nextest run --workspace` is the runner; doctests via `cargo test --doc`.
-  Iterate with `just test-fast` / `just test-changed`, run the full `just test`
-  before a commit, and `just test-postgres` after touching any `sqlx::query*` string.
+  Iterate with `just test-fast`; run `just test-changed` (only the tests the change
+  can reach) before a commit, which adds `just test-postgres` when the store crate
+  changed. CI's `nix flake check` runs the full suite on every PR and is the merge gate.
 - Atomic commits: one logical change each, revertable alone. Never squash.
 - Design by mining Jellyfin's structure and feature list for ideas, then adapting
   idiomatically — traits at IO boundaries, not a class-for-class translation.
@@ -121,4 +122,4 @@ is added when a bug reveals a property that was assumed but unenforced.
 `SPEC.md` at the repo root is the frozen pre-migration archive. It is history — do
 not mutate it. All new spec work goes through the `/speckit-*` skills.
 
-**Version**: 1.1.0 | **Ratified**: 2026-07-27 | **Last Amended**: 2026-11-01 (V16 amended, V172 and V173 added; ADR-0028)
+**Version**: 1.2.0 | **Ratified**: 2026-07-27 | **Last Amended**: 2026-11-01 (selective local test gate; V16 amended, V172 and V173 added; ADR-0028)
