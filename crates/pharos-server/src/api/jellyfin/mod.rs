@@ -98,3 +98,18 @@ pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix
         ItemHidden::Unauthenticated => actix_web::error::ErrorUnauthorized("missing token"),
     }
 }
+
+/// The bearer of a request for an item's files (`id` as the path spelled
+/// it), from a header, `api_key` or the `JellyfinAuth` cookie; 401 without
+/// one (V189).
+pub(crate) async fn require_bearer(
+    state: &crate::state::AppState,
+    req: &actix_web::HttpRequest,
+    id: &str,
+    route: &'static str,
+) -> Result<pharos_core::User, actix_web::Error> {
+    let token = auth_extractor::extract_token(req);
+    crate::services::access::authenticate(state, token.as_deref(), id, route)
+        .await
+        .map_err(access_error)
+}
