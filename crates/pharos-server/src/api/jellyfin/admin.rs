@@ -678,7 +678,19 @@ async fn change_password(
         crate::services::auth::RevokeCause::PasswordChanged,
     )
     .await
-    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    .map_err(|e| {
+        // The new password is already stored; say so, so the client does
+        // not retry with the old one. A retry with the new one re-runs the
+        // revoke.
+        tracing::error!(
+            user.id = %target.0.simple(),
+            error = %e,
+            "password changed but other sessions were not revoked"
+        );
+        error::ErrorInternalServerError(
+            "password changed, but signing out other sessions failed; retry with the new password",
+        )
+    })?;
     Ok(HttpResponse::NoContent().finish())
 }
 
