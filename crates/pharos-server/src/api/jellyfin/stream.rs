@@ -20,7 +20,7 @@ use actix_web::{
     },
     web, HttpRequest, HttpResponse,
 };
-use pharos_core::{MediaItem, TokenStore};
+use pharos_core::MediaItem;
 use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -319,12 +319,15 @@ fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool
 /// ffmpeg to the first acceptable target (typically AAC).
 async fn audio_universal(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Audio playback is live too — stamp on entry, meter the body below (V35).
     state.note_playback_activity();
+    let id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "stream").await?;
     let item = load_item(&state, &req, path.id_str()).await?;
     let qs = req.query_string();
     let acceptable = parse_audio_codec_list(qs);
@@ -567,13 +570,15 @@ async fn authorize_media(
     req: &HttpRequest,
     media_id: pharos_core::MediaId,
 ) -> Result<(), actix_web::Error> {
-    // 1. Normal credential.
+    // 1. Normal credential: its user's library policy applies (V187).
     if let Some(token) = crate::api::jellyfin::auth_extractor::extract_token(req) {
-        if state.stores.resolve(&token).await.is_ok() {
-            return Ok(());
+        if let Ok(user) = crate::services::auth::user_for_token(&state.stores, &token).await {
+            return crate::api::jellyfin::require_item_access(state, &user, media_id, "stream")
+                .await;
         }
     }
-    // 2. Capability token forwarded by a native app (tag == our ETag).
+    // 2. Capability token forwarded by a native app (tag == our ETag). The
+    //    session was opened through PlaybackInfo, which applied the policy.
     let qs = req.query_string();
     for key in ["tag", "PlaySessionId"] {
         if let Some(cap) = query_value_ci(qs, key) {

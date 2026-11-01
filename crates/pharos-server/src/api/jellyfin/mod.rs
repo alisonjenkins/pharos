@@ -69,3 +69,31 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     waveform::register(cfg);
     stubs::register(cfg);
 }
+
+/// Answers an item `user` may not reach (V187) as 404, like a missing one,
+/// so a hidden item's existence does not leak; 503 when the store could not
+/// say.
+pub(crate) async fn require_item_access(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    id: pharos_core::MediaId,
+    route: &'static str,
+) -> Result<(), actix_web::Error> {
+    crate::services::access::check_item(state, user, id, route)
+        .await
+        .map_err(access_error)
+}
+
+/// The response for a withheld item: 404 when hidden, 503 when the store
+/// could not say.
+pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix_web::Error {
+    use crate::services::access::ItemHidden;
+    match hidden {
+        ItemHidden::Unavailable(_) => {
+            actix_web::error::ErrorServiceUnavailable("store unavailable")
+        }
+        ItemHidden::LibraryNotAllowed | ItemHidden::NoLibrary => {
+            actix_web::error::ErrorNotFound("not found")
+        }
+    }
+}
