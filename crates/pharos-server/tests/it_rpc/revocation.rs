@@ -239,3 +239,41 @@ async fn an_announcement_closes_only_connections_whose_token_no_longer_resolves(
     assert!(me_works(&admin_session).await);
     assert!(me_works(&user_session).await);
 }
+
+/// T025: `Session.logout` answers on its own connection (which stays open
+/// for a new sign-in) and closes every other connection signed in with the
+/// token at once. Disarm check: without `end_token` in `logout`, the
+/// announcement closes the caller's own socket and the reply may be lost.
+#[actix_web::test]
+async fn logout_answers_and_closes_the_tokens_other_connections() {
+    let (server, fx) = start_with(hourly()).await;
+    let (caller, mut caller_closed) = connect(&server).await;
+    let session = signed_in(&caller, &fx.user_token).await;
+    let (other, other_closed) = connect(&server).await;
+    let _other_session = signed_in(&other, &fx.user_token).await;
+
+    let mut logout = session.logout_request();
+    logout.get().init_ctx();
+    let reply = tokio::time::timeout(Duration::from_secs(2), logout.send().promise)
+        .await
+        .expect("the logout reply must arrive")
+        .unwrap();
+    assert!(matches!(
+        reply.get().unwrap().get_result().unwrap().which().unwrap(),
+        pharos_api::pharos_capnp::done::Ok(())
+    ));
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), other_closed)
+        .await
+        .expect("another connection with the token must close at once")
+        .expect("close frame");
+    assert_eq!(reason.as_deref(), Some("revoked"));
+    assert!(!me_works(&session).await, "the logged-out session is dead");
+    assert!(
+        matches!(
+            caller_closed.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "the caller's connection stays open"
+    );
+}

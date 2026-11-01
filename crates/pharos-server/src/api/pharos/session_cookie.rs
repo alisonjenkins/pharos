@@ -107,6 +107,8 @@ pub async fn sign_in(
             &password,
             client_ip,
             &device_id,
+            // The cookie opens no connection; the upgrade's resume is capped.
+            |_| Ok(()),
         )
         .await
         {

@@ -247,8 +247,13 @@ pub(super) async fn upgrade(
         return Ok(HttpResponse::Forbidden().body(refusal.label()));
     }
     let cookie = req.cookie(SESSION_COOKIE).map(|c| c.value().to_owned());
-    let Some(ctx) = ConnectionCtx::admit(cookie, &limits, cfg.max_connections_per_user.get())
-    else {
+    let client_ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
+    let Some(ctx) = ConnectionCtx::admit(
+        cookie,
+        client_ip,
+        &limits,
+        cfg.max_connections_per_user.get(),
+    ) else {
         record_refused(Refused::TooManyUnauthenticated, origin_header, &peer);
         return Ok(HttpResponse::TooManyRequests()
             .insert_header(("Retry-After", "5"))

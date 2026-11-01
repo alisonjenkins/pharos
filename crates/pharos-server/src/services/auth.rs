@@ -194,6 +194,9 @@ pub enum LoginOutcome {
     Unavailable,
     /// A browser request from an origin not in `allowed_origins`, or none.
     OriginRefused,
+    /// The password was right but the user holds the most connections they
+    /// may (FR-010); no token was issued.
+    Capped,
 }
 
 impl LoginOutcome {
@@ -204,6 +207,7 @@ impl LoginOutcome {
             LoginOutcome::Throttled => "throttled",
             LoginOutcome::Unavailable => "unavailable",
             LoginOutcome::OriginRefused => "origin_refused",
+            LoginOutcome::Capped => "capped",
         }
     }
 }
@@ -225,6 +229,12 @@ pub enum PasswordLoginError {
     Refused(crate::auth::LoginRefusal),
     /// The password was right but the token could not be stored.
     Issue(AuthError),
+    /// The password was right but `admit` refused the user: they hold
+    /// `held` of at most `max` connections.
+    Capped {
+        held: u32,
+        max: u32,
+    },
 }
 
 impl PasswordLoginError {
@@ -235,13 +245,16 @@ impl PasswordLoginError {
             PasswordLoginError::Refused(LoginRefusal::Invalid) => LoginOutcome::Invalid,
             PasswordLoginError::Refused(LoginRefusal::Backend(_))
             | PasswordLoginError::Issue(_) => LoginOutcome::Unavailable,
+            PasswordLoginError::Capped { .. } => LoginOutcome::Capped,
         }
     }
 }
 
 /// A native password sign-in: the shared throttle checks the password
-/// (V174), then a device token is issued for `device_id` in the one token
-/// store (ADR-0011). Counted and logged with its outcome either way.
+/// (V174), `admit` may still refuse the user (`Err((held, max))`, a
+/// connection cap), then a device token is issued for `device_id` in the one
+/// token store (ADR-0011). Counted and logged with its outcome either way;
+/// a refused login issues no token.
 pub async fn password_login(
     state: &AppState,
     transport: LoginTransport,
@@ -249,6 +262,7 @@ pub async fn password_login(
     password: &pharos_core::SecretString,
     client_ip: std::net::IpAddr,
     device_id: &str,
+    admit: impl FnOnce(&User) -> Result<(), (u32, u32)>,
 ) -> Result<(User, pharos_core::AuthToken), PasswordLoginError> {
     let result: Result<_, PasswordLoginError> = async {
         let user = state
@@ -256,6 +270,7 @@ pub async fn password_login(
             .verify(&state.auth, name, password, client_ip)
             .await
             .map_err(PasswordLoginError::Refused)?;
+        admit(&user).map_err(|(held, max)| PasswordLoginError::Capped { held, max })?;
         let token = state
             .stores
             .issue(user.id, device_id)
@@ -356,6 +371,7 @@ mod tests {
             LoginOutcome::Throttled,
             LoginOutcome::Unavailable,
             LoginOutcome::OriginRefused,
+            LoginOutcome::Capped,
         ];
         let unique: std::collections::HashSet<_> = outcomes.iter().map(|o| o.label()).collect();
         assert_eq!(unique.len(), outcomes.len());
