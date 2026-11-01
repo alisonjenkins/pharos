@@ -3328,6 +3328,9 @@ async fn playback_info(
             is_web_client
                 && !matches!(item.kind, pharos_core::MediaKind::Audio)
                 && renditions.first().is_some_and(|c| c == "h264"),
+            // The edition this response negotiated, or the prewarm reloads the
+            // item's own file and warms segments under the primary's key.
+            item.edition.is_some().then(|| source_id.clone()),
         );
     }
 
