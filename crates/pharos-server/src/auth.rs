@@ -135,6 +135,17 @@ pub struct RetryAfter {
     pub secs: u64,
 }
 
+/// Why [`LoginThrottle::verify`] returned no user.
+#[derive(Debug)]
+pub enum LoginRefusal {
+    /// Refused before any hash: answer 429 with `Retry-After`.
+    Throttled(RetryAfter),
+    /// Wrong password or no such user; counted against both keys.
+    Invalid,
+    /// The user store failed; not counted.
+    Backend(AuthError),
+}
+
 /// Running failure counts after an attempt was admitted, for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailureCounts {
@@ -291,7 +302,10 @@ impl LoginThrottle {
     /// right, or [`Attempt::abandon`] if it was never judged (backend error).
     /// Dropping the attempt otherwise leaves it counted and logs
     /// "login failed" with both running counts.
-    pub fn begin(&self, user: &str, ip: IpAddr, now: Instant) -> Result<Attempt<'_>, RetryAfter> {
+    ///
+    /// Private: callers go through [`verify`](Self::verify), so no path can
+    /// check a password without the throttle (V174).
+    fn begin(&self, user: &str, ip: IpAddr, now: Instant) -> Result<Attempt<'_>, RetryAfter> {
         let uk = user_key(user);
         let ik = ip_key(ip);
         let window = self.window();
@@ -337,6 +351,37 @@ impl LoginThrottle {
                     "login throttled: too many failed attempts"
                 );
                 Err(RetryAfter { reason, secs })
+            }
+        }
+    }
+
+    /// The one way to check a password (V174): admit the attempt, verify it
+    /// with `auth`, and settle it. A wrong password or unknown user stays
+    /// counted; a store failure is given back, because the password was never
+    /// judged.
+    pub async fn verify<A: AuthBackend>(
+        &self,
+        auth: &A,
+        user: &str,
+        password: &SecretString,
+        ip: IpAddr,
+    ) -> Result<User, LoginRefusal> {
+        let attempt = self
+            .begin(user, ip, Instant::now())
+            .map_err(LoginRefusal::Throttled)?;
+        match auth.authenticate(user, password).await {
+            Ok(u) => {
+                attempt.succeeded();
+                Ok(u)
+            }
+            Err(AuthError::InvalidCredentials | AuthError::UserNotFound) => {
+                // Dropped unsettled: stays counted as a failed login.
+                drop(attempt);
+                Err(LoginRefusal::Invalid)
+            }
+            Err(e) => {
+                attempt.abandon();
+                Err(LoginRefusal::Backend(e))
             }
         }
     }

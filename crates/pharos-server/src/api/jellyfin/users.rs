@@ -9,7 +9,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error::ErrorUnauthorized, web, HttpRequest, HttpResponse, Responder};
-use pharos_core::{AuthBackend, AuthError, PreferenceStore, SecretString, TokenStore, UserStore};
+use pharos_core::{PreferenceStore, SecretString, TokenStore, UserStore};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -254,6 +254,27 @@ async fn branding_css(state: web::Data<AppState>) -> impl Responder {
         .body(cfg.custom_css.unwrap_or_default())
 }
 
+/// A refused password check as HTTP: 429 with `Retry-After` when throttled,
+/// 401 with `invalid` when the password or user was wrong, 500 otherwise.
+pub(super) fn login_refused(
+    refusal: crate::auth::LoginRefusal,
+    invalid: &'static str,
+) -> actix_web::Error {
+    match refusal {
+        crate::auth::LoginRefusal::Throttled(retry) => {
+            let resp = HttpResponse::TooManyRequests()
+                .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
+                .body("too many failed login attempts");
+            actix_web::error::InternalError::from_response("too many failed login attempts", resp)
+                .into()
+        }
+        crate::auth::LoginRefusal::Invalid => ErrorUnauthorized(invalid),
+        crate::auth::LoginRefusal::Backend(e) => {
+            actix_web::error::ErrorInternalServerError(e.to_string())
+        }
+    }
+}
+
 /// Current wall-clock time as the ISO8601 string the session DTO carries.
 fn now_iso() -> String {
     let ms = std::time::SystemTime::now()
@@ -271,44 +292,14 @@ async fn authenticate_by_name(
     let body = body.into_inner();
     let password = SecretString::new(body.pw);
 
-    // V174 — admit BEFORE the argon2 verify, so a refused attempt costs neither
-    // a hash nor a guess, and the reservation is made under the same lock as
-    // the check so concurrent guesses cannot all slip through.
+    // V174 — the throttle admits the attempt before the argon2 verify, so a
+    // refused attempt costs neither a hash nor a guess.
     let client_ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
-    let attempt =
-        match state
-            .login_throttle
-            .begin(&body.username, client_ip, std::time::Instant::now())
-        {
-            Ok(a) => a,
-            Err(retry) => {
-                let resp = HttpResponse::TooManyRequests()
-                    .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
-                    .body("too many failed login attempts");
-                return Err(actix_web::error::InternalError::from_response(
-                    "too many failed login attempts",
-                    resp,
-                )
-                .into());
-            }
-        };
-
-    let user = match state.auth.authenticate(&body.username, &password).await {
-        Ok(u) => {
-            attempt.succeeded();
-            u
-        }
-        Err(AuthError::InvalidCredentials) | Err(AuthError::UserNotFound) => {
-            // Dropped unsettled: stays counted as a failed login.
-            drop(attempt);
-            return Err(ErrorUnauthorized("invalid credentials"));
-        }
-        Err(e) => {
-            // The credential was never judged (store failure): do not count it.
-            attempt.abandon();
-            return Err(actix_web::error::ErrorInternalServerError(e.to_string()));
-        }
-    };
+    let user = state
+        .login_throttle
+        .verify(&state.auth, &body.username, &password, client_ip)
+        .await
+        .map_err(|r| login_refused(r, "invalid credentials"))?;
 
     let auth = auth_header_from_request(&req);
     let device_id = auth
