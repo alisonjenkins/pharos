@@ -396,7 +396,14 @@ async fn authenticate_by_name(
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
-    Ok(crate::api::jellyfin::wire::json(&result))
+    let mut resp = crate::api::jellyfin::wire::json(&result);
+    // V191 — `<img>`, `<track>` and font fetches cannot send a header.
+    resp.add_cookie(&crate::api::jellyfin::auth_extractor::auth_cookie(
+        &req,
+        &result.access_token,
+    ))
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(resp)
 }
 
 #[derive(serde::Deserialize)]
@@ -500,7 +507,14 @@ async fn authenticate_with_quick_connect(
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
-    Ok(crate::api::jellyfin::wire::json(&result))
+    let mut resp = crate::api::jellyfin::wire::json(&result);
+    // V191 — `<img>`, `<track>` and font fetches cannot send a header.
+    resp.add_cookie(&crate::api::jellyfin::auth_extractor::auth_cookie(
+        &req,
+        &result.access_token,
+    ))
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(resp)
 }
 
 async fn me(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
