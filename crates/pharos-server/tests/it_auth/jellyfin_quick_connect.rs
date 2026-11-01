@@ -112,6 +112,10 @@ fn kotlin_strict_auth_result(body: &[u8]) {
 }
 
 async fn seed_admin() -> (web::Data<AppState>, String) {
+    seed_admin_with_proxies(&[]).await
+}
+
+async fn seed_admin_with_proxies(proxies: &[String]) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -129,8 +133,11 @@ async fn seed_admin() -> (web::Data<AppState>, String) {
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
-    let state = web::Data::new(AppState::new(stores, "t".into()));
-    (state, token.0.expose().to_string())
+    let state = AppState::new(stores, "t".into()).with_login_throttle(
+        pharos_server::config::LoginThrottleConfig::default(),
+        pharos_server::client_ip::TrustedProxies::parse(proxies).unwrap(),
+    );
+    (web::Data::new(state), token.0.expose().to_string())
 }
 
 fn build_app(
@@ -421,7 +428,7 @@ async fn pending_connect_returns_authenticated_false() {
 
 #[actix_web::test]
 async fn initiate_over_the_per_address_cap_is_429_with_retry_after() {
-    let (state, _) = seed_admin().await;
+    let (state, _) = seed_admin_with_proxies(&["10.0.0.0/8".to_string()]).await;
     let app = test::init_service(build_app(state)).await;
     for _ in 0..pharos_server::quick_connect::MAX_PENDING_PER_IP {
         let req = test::TestRequest::post()
@@ -502,4 +509,16 @@ async fn finalize_refuses_when_the_authorizing_user_was_disabled() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401, "a disabled user must not get a token");
+}
+
+#[actix_web::test]
+async fn initiate_has_no_per_address_cap_without_trusted_proxies() {
+    let (state, _) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+    for _ in 0..pharos_server::quick_connect::MAX_PENDING_PER_IP * 2 {
+        let req = test::TestRequest::post()
+            .uri("/QuickConnect/Initiate")
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
 }

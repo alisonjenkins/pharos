@@ -99,7 +99,10 @@ async fn quick_connect_initiate(
             device_name: auth.device.clone().unwrap_or_default(),
             app_name: auth.client.clone().unwrap_or_default(),
             app_version: auth.version.clone().unwrap_or_default(),
-            client_ip: crate::client_ip::client_ip(&req, &state.trusted_proxies),
+            // Only meaningful when the proxies are known; behind an unlisted
+            // ingress every client shares one address (cf. LoginThrottle).
+            client_ip: (!state.trusted_proxies.is_empty())
+                .then(|| crate::client_ip::client_ip(&req, &state.trusted_proxies)),
             reply: reply_tx,
         })
         .await
