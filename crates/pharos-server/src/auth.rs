@@ -166,7 +166,8 @@ struct Entry {
 /// first hash is still running. Time is a parameter so tests are
 /// deterministic. Accounts are never locked; a throttled key is told to retry
 /// later and its delay doubles with each further failure. A success clears the
-/// username's and address's counts.
+/// username's count but only takes back its own reservation on the address, so
+/// an attacker with a valid account cannot reset the address's budget.
 #[derive(Debug)]
 pub struct LoginThrottle {
     policy: LoginThrottleConfig,
@@ -338,12 +339,14 @@ impl Attempt<'_> {
         self.counts
     }
 
-    /// The password was right: clear the username's and address's failures.
+    /// The password was right: clear the username's failures and give back
+    /// this attempt's own count on the address (earlier failures from the
+    /// address stay, so a valid account cannot launder guesses at others).
     pub fn succeeded(mut self) {
         self.settled = true;
         let mut t = self.throttle.lock();
         t.users.remove(&self.user_key);
-        t.ips.remove(&self.ip_key);
+        release(&mut t.ips, &self.ip_key);
     }
 
     /// The password was never judged (e.g. the user store failed): take the
@@ -715,6 +718,25 @@ mod tests {
                 "bob's count restarted"
             );
             assert!(t.begin("amy", ip(2), t0).is_err(), "other users untouched");
+        }
+
+        #[test]
+        fn a_valid_account_cannot_reset_the_address_budget() {
+            let t = LoginThrottle::new(cfg());
+            let t0 = Instant::now();
+            // Four guesses at other users from one address (budget is 5).
+            for u in ["a", "b", "c", "d"] {
+                fail(&t, u, ip(7), t0);
+            }
+            // The attacker logs into its own account in between.
+            t.begin("mine", ip(7), t0).unwrap().succeeded();
+            // That success must not have wiped the four: one more guess uses
+            // the last of the budget and the address is then held.
+            fail(&t, "e", ip(7), t0);
+            let r = t.begin("fresh", ip(7), t0).unwrap_err();
+            assert_eq!(r.reason, ThrottleReason::Ip);
+            // The address count still decays with the window.
+            assert!(t.begin("fresh", ip(7), t0 + secs(60)).is_ok());
         }
 
         #[test]

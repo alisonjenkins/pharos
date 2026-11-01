@@ -207,6 +207,26 @@ async fn one_address_spraying_usernames_is_held_but_other_addresses_are_not() {
 }
 
 #[actix_web::test]
+async fn logging_into_your_own_account_does_not_reset_the_address_budget() {
+    let st = state(Some((policy(100, 3), &[]))).await;
+    let app = app!(st);
+    for i in 0..2 {
+        login!(app, format!("guess{i}"), "x", "198.51.100.1", None).await;
+    }
+    // A valid login from the same address in between...
+    assert_eq!(
+        login!(app, "ali", "hunter2", "198.51.100.1", None).await.0,
+        StatusCode::OK
+    );
+    // ...does not give the guesser a fresh budget: one more miss exhausts it.
+    login!(app, "guess2", "x", "198.51.100.1", None).await;
+    assert_eq!(
+        login!(app, "ali", "hunter2", "198.51.100.1", None).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+#[actix_web::test]
 async fn x_forwarded_for_is_ignored_from_an_untrusted_peer() {
     let st = state(Some((policy(100, 3), &["10.0.0.0/8"]))).await;
     let app = app!(st);
