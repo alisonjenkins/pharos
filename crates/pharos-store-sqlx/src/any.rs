@@ -901,6 +901,13 @@ impl LibraryStore for AnyStore {
             AnyStore::Postgres(p) => p.item_ids_for_library(wire_id).await,
         }
     }
+
+    async fn library_wire_id_of(&self, item: MediaId) -> DomainResult<Option<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.library_wire_id_of(item).await,
+            AnyStore::Postgres(p) => p.library_wire_id_of(item).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
