@@ -15,7 +15,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::common::seed_rich;
 
-async fn start(allowed_origins: Vec<String>) -> actix_test::TestServer {
+pub(crate) async fn start(allowed_origins: Vec<String>) -> actix_test::TestServer {
     let fx = seed_rich().await;
     let state = fx.state;
     let limits = rpc::limits::ConnectionLimits::default();
@@ -31,7 +31,7 @@ async fn start(allowed_origins: Vec<String>) -> actix_test::TestServer {
     })
 }
 
-fn ws_url(server: &actix_test::TestServer) -> String {
+pub(crate) fn ws_url(server: &actix_test::TestServer) -> String {
     server.url("/pharos/rpc").replacen("http", "ws", 1)
 }
 
