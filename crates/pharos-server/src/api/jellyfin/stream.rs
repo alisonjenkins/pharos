@@ -20,7 +20,7 @@ use actix_web::{
     },
     web, HttpRequest, HttpResponse,
 };
-use pharos_core::{MediaItem, MediaStore, TokenStore};
+use pharos_core::{MediaItem, TokenStore};
 use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -271,7 +271,7 @@ async fn head_response(
     req: &HttpRequest,
     id_str: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let item = load_item(state, id_str).await?;
+    let item = load_item(state, req, id_str).await?;
     let file = open_named_file(&item.path)
         .await
         .map_err(|e| source_unreadable(&item, &e))?
@@ -325,7 +325,7 @@ async fn audio_universal(
 ) -> Result<HttpResponse, actix_web::Error> {
     // Audio playback is live too — stamp on entry, meter the body below (V35).
     state.note_playback_activity();
-    let item = load_item(&state, path.id_str()).await?;
+    let item = load_item(&state, &req, path.id_str()).await?;
     let qs = req.query_string();
     let acceptable = parse_audio_codec_list(qs);
     let bitrate = parse_max_streaming_bitrate(qs);
@@ -628,7 +628,7 @@ async fn stream_transcoded_webm(
     // Progressive playback is live too — keep the background backfill parked
     // (the segment handlers do this; this path was missing it).
     state.note_playback_activity();
-    let item = load_item(state, id_str).await?;
+    let item = load_item(state, req, id_str).await?;
     let qs = req.query_string();
     let start_ticks = parse_start_time_ticks(qs);
     // Cap the encode bitrate: VP9 realtime software encoding is CPU-heavy, so
@@ -941,7 +941,7 @@ async fn deliver_stream(
     // parked for the whole stream (V35) — B72's regulator-blind root.
     state.note_playback_activity();
     let clock = state.playback_activity.clone();
-    let item = load_item(state, id_str).await?;
+    let item = load_item(state, req, id_str).await?;
     let has_range = req.headers().contains_key(header::RANGE);
     let start_ticks = parse_start_time_ticks(req.query_string());
     let client = DirectPlayClient::of(req);
@@ -1274,13 +1274,20 @@ fn refuse_remote(item: &MediaItem) -> Option<actix_web::Error> {
     Some(error::ErrorNotFound("media source is not a local file"))
 }
 
-async fn load_item(state: &AppState, id_str: &str) -> Result<MediaItem, actix_web::Error> {
+async fn load_item(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+) -> Result<MediaItem, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load(
+        state,
+        super::media_source::Route::Stream,
+        id,
+        req.query_string(),
+    )
+    .await?;
     // 008 — every route in this module serves bytes straight off the filesystem
     // (NamedFile / tokio::fs), so a URL-backed item cannot be served here at
     // all. Refused ONCE, at the single point every byte route loads through, so

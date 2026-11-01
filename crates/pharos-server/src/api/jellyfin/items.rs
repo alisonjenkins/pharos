@@ -2034,6 +2034,9 @@ struct PlaybackInfoBody {
     enable_transcoding: Option<bool>,
     allow_video_stream_copy: Option<bool>,
     allow_audio_stream_copy: Option<bool>,
+    /// The edition picked in the version selector. jellyfin-web sends it here;
+    /// the SDK may send it as a query parameter instead.
+    media_source_id: Option<String>,
 }
 
 /// Which delivery paths a PlaybackInfo request allows; everything is allowed
@@ -2495,10 +2498,18 @@ async fn playback_info(
     // Canonical wire form regardless of which shape the caller sent —
     // TranscodingUrl / MediaSource.Id must round-trip consistently.
     let id_str = pharos_jellyfin_api::dto::wire_item_id(id);
+    let body = body.map(web::Json::into_inner);
+    let requested_source = crate::api::jellyfin::media_source::requested_id(req.query_string())
+        .or_else(|| body.as_ref().and_then(|b| b.media_source_id.clone()));
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    let item = crate::api::jellyfin::media_source::select(
+        crate::api::jellyfin::media_source::Route::PlaybackInfo,
+        item,
+        requested_source.as_deref(),
+    );
     // 004-books / FR-010 — a book leaves here WITHOUT entering codec
     // negotiation. Returned before the trickplay nudge, the subtitle warm and
     // the device-profile evaluation below, because none of them mean anything
@@ -2580,24 +2591,23 @@ async fn playback_info(
     // Consume the POST body once: the DeviceProfile drives negotiation, and
     // the track picks (present when jellyfin-web reloads for an audio/subtitle
     // switch) fall back into the transcode URL below.
-    let (profile, body_audio_index, body_subtitle_index, switches) =
-        match body.map(web::Json::into_inner) {
-            Some(b) => {
-                let switches = PlaybackSwitches::from_body(&b);
-                (
-                    b.device_profile.unwrap_or_default(),
-                    b.audio_stream_index,
-                    b.subtitle_stream_index,
-                    switches,
-                )
-            }
-            None => (
-                DeviceProfile::default(),
-                None,
-                None,
-                PlaybackSwitches::default(),
-            ),
-        };
+    let (profile, body_audio_index, body_subtitle_index, switches) = match body {
+        Some(b) => {
+            let switches = PlaybackSwitches::from_body(&b);
+            (
+                b.device_profile.unwrap_or_default(),
+                b.audio_stream_index,
+                b.subtitle_stream_index,
+                switches,
+            )
+        }
+        None => (
+            DeviceProfile::default(),
+            None,
+            None,
+            PlaybackSwitches::default(),
+        ),
+    };
     // The client's explicit SubtitleStreamIndex pick — query string wins,
     // falling back to the POST body (jellyfin-web's track-switch reload
     // sends it only in the body). Resolved once, early, so both the

@@ -12,6 +12,7 @@ pub mod images;
 pub mod item_ops;
 pub mod items;
 pub mod live_tv;
+pub(crate) mod media_source;
 pub mod playlists;
 pub mod search;
 pub mod seek;

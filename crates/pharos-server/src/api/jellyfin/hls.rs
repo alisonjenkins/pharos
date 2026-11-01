@@ -156,7 +156,7 @@ async fn subtitle_playlist(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, idx) = path.into_inner();
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = playback_qs(&req);
     let duration_secs = item.duration_seconds.max(0.0);
     // VTT served by the existing subtitle handler. `0` stands in for
@@ -462,13 +462,20 @@ struct HlsItem {
     path: std::path::PathBuf,
 }
 
-async fn load_hls_item(state: &AppState, id_str: &str) -> Result<HlsItem, actix_web::Error> {
+async fn load_hls_item(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+) -> Result<HlsItem, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load(
+        state,
+        super::media_source::Route::Hls,
+        id,
+        req.query_string(),
+    )
+    .await?;
     // Prefer the probe persisted at scan time. Fall back to live
     // ffprobe only when the row predates the probe-metadata migration
     // so the hot path stays subprocess-free.
@@ -723,7 +730,7 @@ async fn master_playlist(
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = playback_qs(&req);
     // Fold the live-session cap together with any URL-carried `VideoBitrate`
     // ceiling (Lace incident) so both the ladder filter AND the advertised
@@ -910,7 +917,7 @@ async fn render_variant_playlist(
     id: String,
     variant: &str,
 ) -> Result<impl Responder, actix_web::Error> {
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = source_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 3,
@@ -1000,10 +1007,13 @@ async fn serve_segment(
     // A client is actively pulling segments → tell the background backfill to
     // stand down so its whole-file decodes don't starve live transcoding.
     state.note_playback_activity();
-    let item = state.stores.get(id_num).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load(
+        &state,
+        super::media_source::Route::Hls,
+        id_num,
+        req.query_string(),
+    )
+    .await?;
 
     // W4 — PlaySessionId enforcement. When the client embeds a
     // PlaySessionId in the segment URL (the common path — jellyfin-web
@@ -2002,7 +2012,7 @@ async fn vp9_master(
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = playback_qs(&req);
 
     // NOTE: text subtitles are delivered as an External rendition via
@@ -2037,7 +2047,7 @@ async fn vp9_audio_playlist(
     let id = path.into_inner();
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_item(&state, media_id).await?;
+    let item = fetch_req_item(&state, &req, media_id).await?;
     let qs = rendition_qs(&req, &item.path);
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
@@ -2056,7 +2066,10 @@ async fn vp9_audio_playlist(
     // timeline to a single 6 s segment — the client could then only seek within
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
-    let duration = load_hls_item(&state, &id).await?.duration_seconds.max(0.0);
+    let duration = load_hls_item(&state, &req, &id)
+        .await?
+        .duration_seconds
+        .max(0.0);
     // B105 — the audio rendition enumerates the SAME grid the video variant
     // does, so a client maps a time to the same index on both. Going through
     // the shared renderer is what keeps that true.
@@ -2086,6 +2099,7 @@ async fn vp9_audio_playlist(
 async fn vp9_audio_file(
     state: web::Data<AppState>,
     _user: AuthUser,
+    req: HttpRequest,
     path: web::Path<(String, String)>,
     q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2095,7 +2109,7 @@ async fn vp9_audio_file(
     let Some(cache) = state.hls.as_ref() else {
         return Err(error::ErrorNotFound("no cache"));
     };
-    let item = fetch_item(&state, media_id).await?;
+    let item = fetch_req_item(&state, &req, media_id).await?;
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
     // B42 — tell the cache WHICH segment this request needs: a deep seek
     // (segment far past the running from-0 session's progress) spawns a
@@ -2236,7 +2250,7 @@ async fn vp9_variant(
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = rendition_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 7,
@@ -2265,7 +2279,7 @@ async fn vp9_init(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_item(&state, id_num).await?;
+    let item = fetch_req_item(&state, &req, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
@@ -2318,7 +2332,7 @@ async fn vp9_segment(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // Active playback → background backfill yields (see serve_segment).
     state.note_playback_activity();
-    let item = fetch_item(&state, id_num).await?;
+    let item = fetch_req_item(&state, &req, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     // Bounds-check against the VOD grid the playlist enumerated. An over-index
     // used to reach the encoder, produce no frames past EOF, and surface as a
@@ -2432,7 +2446,7 @@ async fn h264cmaf_variant(
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &id).await?;
+    let item = load_hls_item(&state, &req, &id).await?;
     let qs = rendition_qs(&req, &item.path);
     let body = MediaPlaylist {
         version: 7,
@@ -2459,7 +2473,7 @@ async fn h264cmaf_init(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_item(&state, id_num).await?;
+    let item = fetch_req_item(&state, &req, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
@@ -2511,7 +2525,7 @@ async fn h264cmaf_segment(
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     state.note_playback_activity();
-    let item = fetch_item(&state, id_num).await?;
+    let item = fetch_req_item(&state, &req, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
@@ -3321,6 +3335,22 @@ fn burn_prefetch_targets(
         }
     }
     out
+}
+
+/// [`fetch_item`] for a client request, as the file its `MediaSourceId`
+/// selects.
+async fn fetch_req_item(
+    state: &AppState,
+    req: &HttpRequest,
+    id: u64,
+) -> Result<pharos_core::MediaItem, actix_web::Error> {
+    super::media_source::load(
+        state,
+        super::media_source::Route::Hls,
+        id,
+        req.query_string(),
+    )
+    .await
 }
 
 async fn fetch_item(state: &AppState, id: u64) -> Result<pharos_core::MediaItem, actix_web::Error> {
