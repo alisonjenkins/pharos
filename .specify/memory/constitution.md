@@ -71,8 +71,11 @@ depend on traits, so backends swap by wiring, not refactor.
 ## Technology Constraints
 
 - Rust stable, backend and frontend. actix-web (perf over axum). clap derive, no
-  builder API. Dioxus → WASM for the web UI, which consumes only the public
-  Jellyfin-compat API — no backdoor endpoints (V16).
+  builder API. Dioxus → WASM for the web UI, which consumes the public, documented
+  pharos-native API (Cap'n Proto, spec 017), the same API future pharos phone
+  and TV apps will use. The Jellyfin API stays fully supported for third-party
+  clients; both sit on shared domain services. No backdoor endpoints (V16,
+  V172, ADR-0028).
 - sqlx behind `pharos-core` traits (`MediaStore` et al.); sqlite default, postgres
   feature-gated. Native `async fn` in traits, no `async_trait`; generics over
   `dyn Trait` for swappable backends.
@@ -118,4 +121,4 @@ is added when a bug reveals a property that was assumed but unenforced.
 `SPEC.md` at the repo root is the frozen pre-migration archive. It is history — do
 not mutate it. All new spec work goes through the `/speckit-*` skills.
 
-**Version**: 1.0.0 | **Ratified**: 2026-07-27 | **Last Amended**: 2026-07-27
+**Version**: 1.1.0 | **Ratified**: 2026-07-27 | **Last Amended**: 2026-11-01 (V16 amended, V172 and V173 added; ADR-0028)
