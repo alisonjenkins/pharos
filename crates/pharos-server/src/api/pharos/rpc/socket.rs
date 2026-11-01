@@ -79,6 +79,8 @@ pub enum CloseCause {
     /// The socket ended without a close frame.
     StreamEnd,
     ReadError(String),
+    /// An inbound message over [`MAX_FRAME`] bytes (FR-010).
+    MessageTooLarge,
     SendFailed,
     /// A text frame: this endpoint speaks binary capnp only.
     TextFrame,
@@ -99,6 +101,7 @@ impl CloseCause {
             CloseCause::PeerClose(_) => "peer_close",
             CloseCause::StreamEnd => "stream_end",
             CloseCause::ReadError(_) => "read_error",
+            CloseCause::MessageTooLarge => "message_too_large",
             CloseCause::SendFailed => "send_failed",
             CloseCause::TextFrame => "text_frame",
             CloseCause::AuthDeadline => "auth_deadline",
@@ -121,6 +124,7 @@ impl CloseCause {
     fn reason(&self) -> Option<CloseReason> {
         let code = match self {
             CloseCause::TextFrame => CloseCode::Unsupported,
+            CloseCause::MessageTooLarge => CloseCode::Size,
             CloseCause::AuthDeadline => CloseCode::Policy,
             CloseCause::IdleTimeout => CloseCode::Away,
             CloseCause::Revoked(_) => CloseCode::Policy,
@@ -169,6 +173,16 @@ pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived
         lived_ms = lived.as_millis() as u64,
         "native api connection closed"
     );
+}
+
+/// A frame over `max_frame_size` is `Overflow`; continuations adding up past
+/// `max_continuation_size` arrive as an `Io` error carrying only text.
+fn is_oversized(e: &actix_ws::ProtocolError) -> bool {
+    match e {
+        actix_ws::ProtocolError::Overflow => true,
+        actix_ws::ProtocolError::Io(io) => io.to_string().contains("maximum continuation size"),
+        _ => false,
+    }
 }
 
 /// Whether every token a connection resumed with still resolves (T025a). A
@@ -321,6 +335,7 @@ async fn run<S>(
             seen.set(Instant::now());
             match msg {
                 None => return CloseCause::StreamEnd,
+                Some(Err(e)) if is_oversized(&e) => return CloseCause::MessageTooLarge,
                 Some(Err(e)) => return CloseCause::ReadError(e.to_string()),
                 Some(Ok(AggregatedMessage::Binary(bytes))) => {
                     if to_rpc.write_all(&bytes).await.is_err() {
@@ -439,6 +454,7 @@ mod tests {
             CloseCause::PeerClose(None),
             CloseCause::StreamEnd,
             CloseCause::ReadError(String::new()),
+            CloseCause::MessageTooLarge,
             CloseCause::SendFailed,
             CloseCause::TextFrame,
             CloseCause::AuthDeadline,
