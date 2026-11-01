@@ -207,6 +207,8 @@ compat-playwright-full:
     trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
     sleep 2
     nix develop --command bash -c 'cd compat-playwright && npx playwright test'
+    # V191 — the item-file auth spec needs jellyfin-web same-origin with pharos.
+    nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.same-origin.config.ts'
 
 # Manual SyncPlay group-watch E2E: up to 3 real jellyfin-web members through
 # the full scenario matrix (VP9) + an h264 demuxed-CMAF smoke. Heavy (3
