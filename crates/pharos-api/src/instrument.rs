@@ -48,7 +48,12 @@ pub struct Connection {
     id: u64,
     next_call: Cell<u64>,
     user: RefCell<String>,
+    in_flight: Rc<Cell<u32>>,
 }
+
+/// Calls one connection may have running at once (FR-010). The UI's busiest
+/// screen issues about a dozen; past this a call answers `limit` at once.
+pub const MAX_CALLS_IN_FLIGHT: u32 = 32;
 
 impl Connection {
     pub fn new() -> Rc<Self> {
@@ -56,6 +61,7 @@ impl Connection {
             id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
             next_call: Cell::new(1),
             user: RefCell::new(String::new()),
+            in_flight: Rc::new(Cell::new(0)),
         })
     }
 
@@ -111,6 +117,8 @@ pub struct CallScope {
     record: CallRecord,
     started: Instant,
     finished: bool,
+    in_flight: Rc<Cell<u32>>,
+    refusal: Option<Denial>,
 }
 
 impl CallScope {
@@ -169,6 +177,14 @@ impl CallScope {
                 (log.payload)(&record, "request", &redact::render(p));
             }
         }
+        let in_flight = Rc::clone(&conn.in_flight);
+        let running = in_flight.get();
+        in_flight.set(running.saturating_add(1));
+        let refusal = (running >= MAX_CALLS_IN_FLIGHT).then_some(Denial::Limit {
+            name: "calls_in_flight",
+            value: u64::from(running),
+            max: u64::from(MAX_CALLS_IN_FLIGHT),
+        });
         Self {
             meta,
             log,
@@ -176,7 +192,16 @@ impl CallScope {
             record,
             started: Instant::now(),
             finished: false,
+            in_flight,
+            refusal,
         }
+    }
+
+    /// Set when the connection already had [`MAX_CALLS_IN_FLIGHT`] calls
+    /// running: the generated wrapper answers with it instead of calling the
+    /// handler.
+    pub fn refusal(&self) -> Option<&Denial> {
+        self.refusal.as_ref()
     }
 
     /// Runs the handler's future inside the call span.
@@ -235,6 +260,7 @@ impl CallScope {
 
 impl Drop for CallScope {
     fn drop(&mut self) {
+        self.in_flight.set(self.in_flight.get().saturating_sub(1));
         if self.finished {
             return;
         }

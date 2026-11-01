@@ -454,11 +454,24 @@ fn emit_interface(o: &mut String, i: &Interface) {
         let _ = writeln!(o, "            let scope = CallScope::begin(&self.conn, &METHODS[{idx}], &LOG, span, params.get().map(::capnp::dynamic_value::Reader::from));");
         let _ = writeln!(o, "            let inner = Rc::clone(&self.inner);");
         let _ = writeln!(o, "            async move {{");
-        let _ = writeln!(
-            o,
-            "                let outcome = scope.run(S::{}(inner, params, &mut results)).await;",
-            m.label
-        );
+        if m.cap_results.is_empty() {
+            let _ = writeln!(o, "                let outcome = match scope.refusal() {{");
+            let _ = writeln!(o, "                    Some(denial) => crate::instrument::fill_denied(::capnp::dynamic_value::Builder::from(results.get()), denial),");
+            let _ = writeln!(
+                o,
+                "                    None => scope.run(S::{}(inner, params, &mut results)).await,",
+                m.label
+            );
+            let _ = writeln!(o, "                }};");
+        } else {
+            // A capability getter answers at once and must pipeline, so it is
+            // never refused.
+            let _ = writeln!(
+                o,
+                "                let outcome = scope.run(S::{}(inner, params, &mut results)).await;",
+                m.label
+            );
+        }
         let _ = writeln!(o, "                let reply = ::capnp::dynamic_value::Reader::from(results.get().into_reader());");
         let _ = writeln!(o, "                scope.finish(outcome, reply)");
         let _ = writeln!(o, "            }}");
