@@ -535,6 +535,44 @@ pub struct ServerConfig {
     /// falls back to the source/ceiling behaviour). Default 6 Mbps.
     #[serde(default = "default_remote_default_bitrate_bps")]
     pub remote_default_bitrate_bps: u64,
+    /// `[server.native_api]` — the pharos-native Cap'n Proto API (spec 017).
+    #[serde(default)]
+    pub native_api: NativeApiConfig,
+}
+
+/// `[server.native_api]` — the pharos-native API (`/pharos/rpc`,
+/// `POST /pharos/session`). Off by default: every push to main deploys
+/// (ADR-0010), so this surface stays dark until it is complete and reviewed;
+/// while off both routes answer 404.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct NativeApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Browser origins, besides the server's own, allowed to open
+    /// `/pharos/rpc` and post to `/pharos/session`, e.g.
+    /// `https://pharos.example.org`. Exact match on scheme, host and port; no
+    /// wildcards. A request without an `Origin` header (a native app) is not
+    /// subject to this list.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Open `/pharos/rpc` connections one user may hold at once; the next
+    /// upgrade is refused with 429. A household runs a few devices per person.
+    #[serde(default = "default_native_max_connections_per_user")]
+    pub max_connections_per_user: u32,
+}
+
+impl Default for NativeApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_origins: Vec::new(),
+            max_connections_per_user: default_native_max_connections_per_user(),
+        }
+    }
+}
+
+fn default_native_max_connections_per_user() -> u32 {
+    16
 }
 
 fn default_played_threshold_pct() -> u32 {
@@ -927,6 +965,14 @@ mod tests {
 
     /// 008 — the feature is off unless somebody says otherwise, and the rest of
     /// the section still has usable defaults so turning it on is one line.
+    #[test]
+    fn native_api_is_off_by_default() {
+        let cfg: ServerConfig = toml::from_str("bind = \"0.0.0.0:1\"").expect("parses");
+        assert_eq!(cfg.native_api, NativeApiConfig::default());
+        assert!(!cfg.native_api.enabled);
+        assert!(cfg.native_api.allowed_origins.is_empty());
+    }
+
     #[test]
     fn remote_sources_are_off_by_default_but_fully_defaulted() {
         let r = RemoteConfig::default();
