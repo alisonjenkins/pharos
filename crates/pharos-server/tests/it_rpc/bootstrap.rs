@@ -10,8 +10,10 @@ use pharos_server::api::pharos::rpc;
 
 use crate::common::seed_rich;
 
+pub(crate) const LOCAL: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
 fn ctx(cookie: Option<String>) -> Rc<rpc::ConnectionCtx> {
-    rpc::ConnectionCtx::admit(cookie, &rpc::limits::ConnectionLimits::default(), 16).unwrap()
+    rpc::ConnectionCtx::admit(cookie, LOCAL, &rpc::limits::ConnectionLimits::default(), 16).unwrap()
 }
 
 fn me_id(
@@ -188,8 +190,8 @@ async fn served_over_a_byte_stream() {
 async fn resume_beyond_the_per_user_cap_is_refused_with_the_count() {
     let fx = seed_rich().await;
     let limits = rpc::limits::ConnectionLimits::default();
-    let first = rpc::ConnectionCtx::admit(None, &limits, 1).unwrap();
-    let second = rpc::ConnectionCtx::admit(None, &limits, 1).unwrap();
+    let first = rpc::ConnectionCtx::admit(None, LOCAL, &limits, 1).unwrap();
+    let second = rpc::ConnectionCtx::admit(None, LOCAL, &limits, 1).unwrap();
     // Both connections stay open for the whole test.
     let mut open = Vec::new();
     for (n, ctx) in [first, second].into_iter().enumerate() {

@@ -6,9 +6,14 @@ use actix_web::web;
 use pharos_api::pharos_capnp::{self, bootstrap as wire};
 use pharos_api::{server, Connection, Denial};
 
+use pharos_core::{SecretString, User};
+
 use super::session::Session;
 use super::ConnectionCtx;
-use crate::services::auth::{user_for_token, TokenRefusal};
+use crate::auth::LoginRefusal;
+use crate::services::auth::{
+    password_login, user_for_token, LoginTransport, PasswordLoginError, TokenRefusal,
+};
 use crate::state::AppState;
 
 pub(super) struct Bootstrap {
@@ -24,6 +29,53 @@ impl Bootstrap {
         conn: Rc<Connection>,
     ) -> Self {
         Self { state, ctx, conn }
+    }
+
+    /// Counts `user` against the per-user connection cap (FR-010).
+    fn admit_user(&self, user: &User) -> Result<(), Refusal> {
+        let ctx = &self.ctx;
+        ctx.limits
+            .sign_in(&mut ctx.slot.borrow_mut(), user.id, ctx.max_per_user)
+            .map_err(|held| Refusal::TooManyConnections {
+                held,
+                max: ctx.max_per_user,
+            })
+    }
+
+    /// The session `resume` and `login` hand out, signed in with `token`.
+    /// The token is re-checked while the connection lives (T025a) and is the
+    /// one `Session.logout` revokes.
+    fn open_session(&self, user: User, token: String) -> pharos_capnp::session::Client {
+        self.ctx.remember_token(token.clone(), user.id);
+        self.conn.set_user(&user.name);
+        let session = Session::new(self.state.clone(), Rc::clone(&self.ctx), user, token);
+        server::session::client(session, &self.conn)
+    }
+}
+
+/// A refused `login` as the client sees it. A wrong password and an unknown
+/// user are one answer (B234); a backend's error text stays in the log.
+fn login_denial(error: &PasswordLoginError) -> Denial {
+    match error {
+        PasswordLoginError::Refused(LoginRefusal::Invalid) => Denial::NotPermitted {
+            what: "invalid credentials",
+        },
+        // V174: the wait is machine-readable, in seconds.
+        PasswordLoginError::Refused(LoginRefusal::Throttled(retry)) => Denial::Throttled {
+            name: "login_retry_after_secs",
+            retry_after_secs: retry.secs,
+        },
+        PasswordLoginError::Refused(LoginRefusal::Backend(_)) => Denial::Unavailable {
+            dependency: "user store",
+        },
+        PasswordLoginError::Issue(_) => Denial::Unavailable {
+            dependency: "token store",
+        },
+        PasswordLoginError::Capped { held, max } => Refusal::TooManyConnections {
+            held: *held,
+            max: *max,
+        }
+        .denial(),
     }
 }
 
@@ -102,26 +154,14 @@ impl server::bootstrap::Handler for Bootstrap {
                 .map_err(Refusal::Token),
             Err(refusal) => Err(refusal.clone()),
         };
-        let user = user.and_then(|user| {
-            let ctx = &self.ctx;
-            ctx.limits
-                .sign_in(&mut ctx.slot.borrow_mut(), user.id, ctx.max_per_user)
-                .map(|()| user)
-                .map_err(|held| Refusal::TooManyConnections {
-                    held,
-                    max: ctx.max_per_user,
-                })
-        });
+        // `user` is only `Ok` when `token` is.
+        let opened = user
+            .and_then(|user| self.admit_user(&user).map(|()| user))
+            .and_then(|user| token.map(|token| (user, token)));
         let mut result = results.get().init_result();
-        match user {
-            Ok(user) => {
-                if let Ok(token) = token {
-                    // T025a: re-checked while the connection lives.
-                    self.ctx.remember_token(token, user.id);
-                }
-                self.conn.set_user(&user.name);
-                let session = Session::new(self.state.clone(), user);
-                result.set_session(server::session::client(session, &self.conn));
+        match opened {
+            Ok((user, token)) => {
+                result.set_session(self.open_session(user, token));
                 result.init_status().set_ok(());
             }
             Err(refusal) => {
@@ -139,6 +179,55 @@ impl server::bootstrap::Handler for Bootstrap {
                     &self.conn,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Checks the password through the login throttle (V174) and answers
+    /// with a session and the device token a native app keeps for `resume`.
+    /// The device id is the server's (`pharos-native-…`), never the
+    /// client's, so it cannot pose as an API key (B235). The per-user
+    /// connection cap is checked before any token is issued.
+    async fn login(
+        self: Rc<Self>,
+        params: wire::LoginParams,
+        results: &mut wire::LoginResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let (name, password) = (params.get_name()?, params.get_password()?);
+        let credentials = name
+            .to_string()
+            .and_then(|n| Ok((n, password.to_string()?)));
+        let result = results.get().init_result();
+        // Not UTF-8: no account has that name or password.
+        let Ok((name, password)) = credentials else {
+            login_denial(&PasswordLoginError::Refused(LoginRefusal::Invalid))
+                .write(result.init_error());
+            return Ok(());
+        };
+        let password = SecretString::new(password);
+        let device_id = format!("pharos-native-{}", uuid::Uuid::new_v4().simple());
+        let login = password_login(
+            &self.state,
+            LoginTransport::Rpc,
+            &name,
+            &password,
+            self.ctx.client_ip,
+            &device_id,
+            |user| match self.admit_user(user) {
+                Err(Refusal::TooManyConnections { held, max }) => Err((held, max)),
+                _ => Ok(()),
+            },
+        )
+        .await;
+        match login {
+            Ok((user, token)) => {
+                let token = token.0.expose().to_owned();
+                let mut ok = result.init_ok();
+                ok.set_device_token(token.as_str());
+                ok.set_session(self.open_session(user, token));
+            }
+            Err(e) => login_denial(&e).write(result.init_error()),
         }
         Ok(())
     }

@@ -93,12 +93,18 @@ pub fn reader_options() -> ReaderOptions {
 pub struct ConnectionCtx {
     /// The `pharos_session` cookie the upgrade carried, used by `resume("")`.
     cookie_token: Option<String>,
+    /// The client's address (`client_ip`, honouring `trusted_proxies`), for
+    /// the login throttle's per-address limit (V174).
+    client_ip: std::net::IpAddr,
     limits: limits::ConnectionLimits,
     max_per_user: u32,
     slot: RefCell<limits::Slot>,
     /// Every token a `resume` succeeded with, and its user, re-checked while
     /// the connection lives so revoking one ends it (T025a, T025).
     resumed: RefCell<Vec<(String, UserId)>>,
+    /// Tokens `Session.logout` revoked on this connection: every session
+    /// opened with one fails `revoked` from then on.
+    ended: RefCell<Vec<String>>,
 }
 
 impl ConnectionCtx {
@@ -106,16 +112,19 @@ impl ConnectionCtx {
     /// [`limits::MAX_UNAUTHENTICATED`] connections that have not signed in.
     pub fn admit(
         cookie_token: Option<String>,
+        client_ip: std::net::IpAddr,
         limits: &limits::ConnectionLimits,
         max_per_user: u32,
     ) -> Option<Rc<Self>> {
         let slot = limits.admit()?;
         Some(Rc::new(Self {
             cookie_token,
+            client_ip,
             limits: limits.clone(),
             max_per_user,
             slot: RefCell::new(slot),
             resumed: RefCell::new(Vec::new()),
+            ended: RefCell::new(Vec::new()),
         }))
     }
 
@@ -124,6 +133,23 @@ impl ConnectionCtx {
         if !resumed.iter().any(|(t, _)| *t == token) {
             resumed.push((token, user));
         }
+    }
+
+    /// Ends `token` on this connection after `Session.logout` revoked it:
+    /// its sessions here fail `revoked`, and it leaves the re-check, so the
+    /// logout's own reply is not cut off by the close the revocation would
+    /// cause. Other connections holding it still close (T025).
+    pub(crate) fn end_token(&self, token: &str) {
+        self.resumed.borrow_mut().retain(|(t, _)| t != token);
+        let mut ended = self.ended.borrow_mut();
+        if !ended.iter().any(|t| t == token) {
+            ended.push(token.to_owned());
+        }
+    }
+
+    /// Whether `Session.logout` ended `token` on this connection.
+    pub(crate) fn has_ended(&self, token: &str) -> bool {
+        self.ended.borrow().iter().any(|t| t == token)
     }
 
     /// The tokens this connection's sessions were resumed with: all of

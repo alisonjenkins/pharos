@@ -10,6 +10,7 @@ mod common;
 mod bootstrap;
 mod connect;
 mod gate;
+mod login;
 mod revocation;
 mod revocation_sites;
 mod session;
