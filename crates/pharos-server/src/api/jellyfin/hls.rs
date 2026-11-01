@@ -1169,7 +1169,7 @@ async fn serve_segment(
     // T87 — remember this play session's exact variant for SyncPlay seek
     // prewarming (same as the VP9 path).
     if let Some(psid) = q.play_session_id.as_deref() {
-        state.note_segment_opts(psid, id_num, &opts);
+        state.note_segment_opts(psid, id_num, item.edition.as_deref(), &opts);
     }
     // P18 — stable ETag derived from cache key inputs. Same
     // `(media_id, seg, audio_idx, sub_idx, bitrate)` tuple drives the
@@ -2398,7 +2398,7 @@ async fn vp9_segment(
     // T87 — remember this play session's exact variant so a SyncPlay seek
     // can prewarm its segments before the client even applies the command.
     if let Some(psid) = q.play_session_id.as_deref() {
-        state.note_segment_opts(psid, item.id, &opts);
+        state.note_segment_opts(psid, item.id, item.edition.as_deref(), &opts);
     }
     // Warm the next few segments in the background so a fast / >1x client finds
     // them cached instead of stalling. Spawned BEFORE this segment's own
@@ -2583,7 +2583,7 @@ async fn h264cmaf_segment(
     }
     resolve_text_burn_assets(&state, &item, &mut opts).await;
     if let Some(psid) = q.play_session_id.as_deref() {
-        state.note_segment_opts(psid, item.id, &opts);
+        state.note_segment_opts(psid, item.id, item.edition.as_deref(), &opts);
     }
     spawn_segment_prefetch(
         &state,
@@ -2848,90 +2848,123 @@ fn prefetch_target_segments(base_seg: u32, total_segs: Option<u32>, ahead_count:
 pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, position_ms: u64) {
     let state = state.clone();
     actix_web::rt::spawn(async move {
-        let Ok(item) = fetch_item(&state, media_id).await else {
-            return;
-        };
-        let variants = state.segment_opts_for_media(media_id);
-        if variants.is_empty() {
+        let hints = state.segment_opts_for_media(media_id);
+        if hints.is_empty() {
             return;
         }
-        let target = (position_ms as f64 / (SEGMENT_SECONDS * 1000.0)) as u32;
-        tracing::info!(
-            media.id = media_id,
-            target_seg = target,
-            variants = variants.len(),
-            prewarm.source = prewarm_source_label(&item),
-            prewarm.edition = item.edition.as_deref().unwrap_or_default(),
-            "syncplay seek prewarm: warming target segments"
-        );
-        let total_segs = item
-            .probe
-            .duration_ms
-            .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
-            .unwrap_or(u32::MAX);
-        for (play_session_id, opts) in variants {
-            // Same derivation as the segment handler's own `StreamKey::of`, so
-            // this prewarm is attributed to the member it is for and lands on
-            // that member's playhead rather than in the scheduler's
-            // no-known-stream bucket.
-            let stream = StreamKey::of(&play_session_id);
-            // Warm the LANDING segment and the two behind it, directly (the
-            // regular prefetch helper only warms base+1.. on the assumption
-            // the base itself is being served — here nothing serves it yet).
-            for seg in target..(target + 3).min(total_segs) {
-                let state = state.clone();
-                let item = item.clone();
-                let mut o = opts.clone();
-                let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
-                o.window = pharos_core::SegmentWindow::for_segment(
-                    seg,
-                    source_frame_rate(item.probe.frame_rate_mille),
-                    item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
-                );
-                actix_web::rt::spawn(async move {
-                    // B46 — gate per TARGET segment (the hinted opts carry the
-                    // hinting segment's burn decision, not this one's).
-                    gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
-                    let Some(cache) = state.hls.as_ref() else {
-                        return;
-                    };
-                    let _ = cache
-                        .segment_bytes_keyed(
-                            item.id,
-                            seg,
-                            o.audio_source_stream_index,
-                            o.burn_subtitle_stream_index,
-                            &item.path,
-                            item.edition.as_deref(),
-                            &o,
-                            JobClass::Background,
-                            stream,
-                            // The group has been told to go here; the member
-                            // just has not applied it yet. If nothing has been
-                            // recorded for this member's stream, the seek
-                            // target is the best statement of where it is.
-                            PlayheadSeed::StatesTheStart,
-                        )
-                        .await;
-                });
-            }
-            // VP9 (fMP4) sessions: pre-seek the audio-rendition session too —
-            // its whole-file encoder is what stalled deep seeks (B42).
-            if matches!(opts.container, SegmentContainer::Fmp4) {
-                if let Some(cache) = state.hls.as_ref() {
-                    let _ = cache
-                        .ensure_audio_hls_covering(
-                            &item.path,
-                            media_id,
-                            opts.audio_source_stream_index,
-                            Some(128_000),
-                            target,
-                        )
-                        .await;
-                }
-            }
+        // Members may be playing different grouped editions of the item, and
+        // each edition is its own file with its own probe and cache key.
+        let mut by_edition: std::collections::BTreeMap<Option<String>, Vec<(String, SegmentOpts)>> =
+            std::collections::BTreeMap::new();
+        for (play_session_id, hint) in hints {
+            by_edition
+                .entry(hint.edition)
+                .or_default()
+                .push((play_session_id, hint.opts));
+        }
+        for (edition, variants) in by_edition {
+            let source_id = edition
+                .as_deref()
+                .map(|e| format!("{}-{e}", pharos_jellyfin_api::dto::wire_item_id(media_id)));
+            let Ok(item) = super::media_source::load_named(
+                &state,
+                super::media_source::Route::Prewarm,
+                media_id,
+                source_id.as_deref(),
+            )
+            .await
+            else {
+                continue;
+            };
+            prewarm_group_seek_source(&state, item, variants, position_ms).await;
         }
     });
+}
+
+/// [`prewarm_group_seek`] for the members playing one file of the item.
+async fn prewarm_group_seek_source(
+    state: &web::Data<AppState>,
+    item: pharos_core::MediaItem,
+    variants: Vec<(String, SegmentOpts)>,
+    position_ms: u64,
+) {
+    let media_id = item.id;
+    let target = (position_ms as f64 / (SEGMENT_SECONDS * 1000.0)) as u32;
+    tracing::info!(
+        media.id = media_id,
+        target_seg = target,
+        variants = variants.len(),
+        prewarm.source = prewarm_source_label(&item),
+        prewarm.edition = item.edition.as_deref().unwrap_or_default(),
+        "syncplay seek prewarm: warming target segments"
+    );
+    let total_segs = item
+        .probe
+        .duration_ms
+        .map(|ms| ((ms as f64) / (SEGMENT_SECONDS * 1000.0)).ceil() as u32)
+        .unwrap_or(u32::MAX);
+    for (play_session_id, opts) in variants {
+        // Same derivation as the segment handler's own `StreamKey::of`, so
+        // this prewarm is attributed to the member it is for and lands on
+        // that member's playhead rather than in the scheduler's
+        // no-known-stream bucket.
+        let stream = StreamKey::of(&play_session_id);
+        // Warm the LANDING segment and the two behind it, directly (the
+        // regular prefetch helper only warms base+1.. on the assumption
+        // the base itself is being served — here nothing serves it yet).
+        for seg in target..(target + 3).min(total_segs) {
+            let state = state.clone();
+            let item = item.clone();
+            let mut o = opts.clone();
+            let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
+            o.window = pharos_core::SegmentWindow::for_segment(
+                seg,
+                source_frame_rate(item.probe.frame_rate_mille),
+                item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
+            );
+            actix_web::rt::spawn(async move {
+                // B46 — gate per TARGET segment (the hinted opts carry the
+                // hinting segment's burn decision, not this one's).
+                gate_image_sub_burn(&state, &item, &mut o, start_secs, dur_secs).await;
+                let Some(cache) = state.hls.as_ref() else {
+                    return;
+                };
+                let _ = cache
+                    .segment_bytes_keyed(
+                        item.id,
+                        seg,
+                        o.audio_source_stream_index,
+                        o.burn_subtitle_stream_index,
+                        &item.path,
+                        item.edition.as_deref(),
+                        &o,
+                        JobClass::Background,
+                        stream,
+                        // The group has been told to go here; the member
+                        // just has not applied it yet. If nothing has been
+                        // recorded for this member's stream, the seek
+                        // target is the best statement of where it is.
+                        PlayheadSeed::StatesTheStart,
+                    )
+                    .await;
+            });
+        }
+        // VP9 (fMP4) sessions: pre-seek the audio-rendition session too —
+        // its whole-file encoder is what stalled deep seeks (B42).
+        if matches!(opts.container, SegmentContainer::Fmp4) {
+            if let Some(cache) = state.hls.as_ref() {
+                let _ = cache
+                    .ensure_audio_hls_covering(
+                        &item.path,
+                        media_id,
+                        opts.audio_source_stream_index,
+                        Some(128_000),
+                        target,
+                    )
+                    .await;
+            }
+        }
+    }
 }
 
 /// Which file a prewarm is warming, for its log line: a grouped edition's own
