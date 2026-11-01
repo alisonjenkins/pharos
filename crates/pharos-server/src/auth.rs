@@ -135,7 +135,7 @@ pub struct RetryAfter {
     pub secs: u64,
 }
 
-/// Failure counts after [`LoginThrottle::record_failure`], for logging.
+/// Running failure counts after an attempt was admitted, for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailureCounts {
     pub user: u32,
@@ -159,11 +159,14 @@ struct Entry {
 
 /// Shared per-username and per-address login throttle (V174).
 ///
-/// Every code path that verifies a password calls [`check`](Self::check)
-/// before the (expensive) hash, then [`record_failure`](Self::record_failure)
-/// or [`record_success`](Self::record_success). Time is a parameter so tests
-/// are deterministic. Accounts are never locked; a throttled key is told to
-/// retry later and its delay doubles with each further failure.
+/// Every code path that verifies a password calls [`begin`](Self::begin)
+/// before the (expensive) hash and settles the returned [`Attempt`] after it.
+/// `begin` checks and reserves under one lock, counting the attempt as a
+/// failure up front, so concurrent guesses cannot all pass the check while the
+/// first hash is still running. Time is a parameter so tests are
+/// deterministic. Accounts are never locked; a throttled key is told to retry
+/// later and its delay doubles with each further failure. A success clears the
+/// username's and address's counts.
 #[derive(Debug)]
 pub struct LoginThrottle {
     policy: LoginThrottleConfig,
@@ -237,66 +240,59 @@ impl LoginThrottle {
         self.delay(e.failures, threshold).saturating_sub(since)
     }
 
-    /// Whether an attempt for `user` from `ip` may proceed. Run it before the
-    /// password hash. A refusal records `pharos_login_throttled_total` and
-    /// WARNs with the reason, username, address and wait.
-    pub fn check(&self, user: &str, ip: IpAddr, now: Instant) -> Result<(), RetryAfter> {
-        let uk = user_key(user);
-        let ik = ip_key(ip);
-        let (by_user, by_ip) = {
-            let t = self.lock();
-            (
-                self.remaining(t.users.get(&uk), self.policy.max_failures_per_user, now),
-                self.remaining(t.ips.get(&ik), self.policy.max_failures_per_ip, now),
-            )
-        };
-        let (reason, wait) = if by_ip > by_user {
-            (ThrottleReason::Ip, by_ip)
-        } else {
-            (ThrottleReason::User, by_user)
-        };
-        if wait.is_zero() {
-            return Ok(());
-        }
-        let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
-        metrics::counter!("pharos_login_throttled_total", "reason" => reason.label()).increment(1);
-        tracing::warn!(
-            reason = reason.label(),
-            user = %uk,
-            client_ip = %ip,
-            retry_after_secs = secs,
-            "login throttled: too many failed attempts"
-        );
-        Err(RetryAfter { reason, secs })
-    }
-
-    /// Count a failed credential check against `user` and `ip`.
-    pub fn record_failure(&self, user: &str, ip: IpAddr, now: Instant) -> FailureCounts {
+    /// Admit or refuse one password attempt for `user` from `ip`, atomically.
+    ///
+    /// Refused: returns how long to wait, records
+    /// `pharos_login_throttled_total{reason}` and WARNs with the reason,
+    /// username, address and wait. Admitted: the attempt is counted as a
+    /// failure immediately; call [`Attempt::succeeded`] if the password was
+    /// right, or [`Attempt::abandon`] if it was never judged (backend error).
+    /// Dropping the attempt otherwise leaves it counted and logs
+    /// "login failed" with both running counts.
+    pub fn begin(&self, user: &str, ip: IpAddr, now: Instant) -> Result<Attempt<'_>, RetryAfter> {
         let uk = user_key(user);
         let ik = ip_key(ip);
         let window = self.window();
-        let counts = {
+        let admitted = {
             let mut t = self.lock();
-            let user = bump(&mut t.users, uk.clone(), now, window);
-            let ip = bump(&mut t.ips, ik, now, window);
-            FailureCounts { user, ip }
+            let by_user = self.remaining(t.users.get(&uk), self.policy.max_failures_per_user, now);
+            let by_ip = self.remaining(t.ips.get(&ik), self.policy.max_failures_per_ip, now);
+            let (reason, wait) = if by_ip > by_user {
+                (ThrottleReason::Ip, by_ip)
+            } else {
+                (ThrottleReason::User, by_user)
+            };
+            if wait.is_zero() {
+                let user = bump(&mut t.users, uk.clone(), now, window);
+                let ip = bump(&mut t.ips, ik, now, window);
+                Ok(FailureCounts { user, ip })
+            } else {
+                Err((reason, wait))
+            }
         };
-        tracing::info!(
-            user = %uk,
-            client_ip = %ip,
-            user_failures = counts.user,
-            ip_failures = counts.ip,
-            "login failed"
-        );
-        counts
-    }
-
-    /// A correct password clears that username's and address's failures.
-    pub fn record_success(&self, user: &str, ip: IpAddr) {
-        let uk = user_key(user);
-        let mut t = self.lock();
-        t.users.remove(&uk);
-        t.ips.remove(&ip_key(ip));
+        match admitted {
+            Ok(counts) => Ok(Attempt {
+                throttle: self,
+                user_key: uk,
+                ip_key: ik,
+                client_ip: ip,
+                counts,
+                settled: false,
+            }),
+            Err((reason, wait)) => {
+                let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                metrics::counter!("pharos_login_throttled_total", "reason" => reason.label())
+                    .increment(1);
+                tracing::warn!(
+                    reason = reason.label(),
+                    user = %uk,
+                    client_ip = %ip,
+                    retry_after_secs = secs,
+                    "login throttled: too many failed attempts"
+                );
+                Err(RetryAfter { reason, secs })
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Tables> {
@@ -311,6 +307,66 @@ impl LoginThrottle {
     fn sizes(&self) -> (usize, usize) {
         let t = self.lock();
         (t.users.len(), t.ips.len())
+    }
+}
+
+/// Take back one counted failure, forgetting the key once it reaches zero.
+fn release<K: std::hash::Hash + Eq>(table: &mut HashMap<K, Entry>, key: &K) {
+    if let Some(e) = table.get_mut(key) {
+        e.failures = e.failures.saturating_sub(1);
+        if e.failures == 0 {
+            table.remove(key);
+        }
+    }
+}
+
+/// One admitted password attempt, counted as a failure until settled.
+#[derive(Debug)]
+#[must_use = "an unsettled attempt stays counted as a failed login"]
+pub struct Attempt<'a> {
+    throttle: &'a LoginThrottle,
+    user_key: String,
+    ip_key: IpAddr,
+    client_ip: IpAddr,
+    counts: FailureCounts,
+    settled: bool,
+}
+
+impl Attempt<'_> {
+    /// Running counts including this attempt.
+    pub fn counts(&self) -> FailureCounts {
+        self.counts
+    }
+
+    /// The password was right: clear the username's and address's failures.
+    pub fn succeeded(mut self) {
+        self.settled = true;
+        let mut t = self.throttle.lock();
+        t.users.remove(&self.user_key);
+        t.ips.remove(&self.ip_key);
+    }
+
+    /// The password was never judged (e.g. the user store failed): take the
+    /// reservation back instead of counting a failure.
+    pub fn abandon(mut self) {
+        self.settled = true;
+        let mut t = self.throttle.lock();
+        release(&mut t.users, &self.user_key);
+        release(&mut t.ips, &self.ip_key);
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            tracing::info!(
+                user = %self.user_key,
+                client_ip = %self.client_ip,
+                user_failures = self.counts.user,
+                ip_failures = self.counts.ip,
+                "login failed"
+            );
+        }
     }
 }
 
@@ -545,40 +601,70 @@ mod tests {
             Duration::from_secs(n)
         }
 
-        fn fail_n(t: &LoginThrottle, user: &str, from: IpAddr, n: u32, at: Instant) {
+        /// One failed attempt: admitted, then dropped unsettled.
+        fn fail(t: &LoginThrottle, user: &str, from: IpAddr, at: Instant) {
+            drop(t.begin(user, from, at).expect("admitted"));
+        }
+
+        /// `n` failures spaced by whatever backoff applies, so each is
+        /// admitted; returns the time of the last one.
+        fn fail_paced(
+            t: &LoginThrottle,
+            user: &str,
+            from: IpAddr,
+            n: u32,
+            mut at: Instant,
+        ) -> Instant {
             for _ in 0..n {
-                t.record_failure(user, from, at);
+                loop {
+                    match t.begin(user, from, at) {
+                        Ok(a) => {
+                            drop(a);
+                            break;
+                        }
+                        Err(r) => at += secs(r.secs),
+                    }
+                }
             }
+            at
         }
 
         #[test]
         fn allows_up_to_the_threshold_then_refuses_with_a_retry_after() {
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
-            fail_n(&t, "bob", ip(1), 2, t0);
-            assert_eq!(t.check("bob", ip(1), t0), Ok(()), "2 < 3 failures");
-            fail_n(&t, "bob", ip(1), 1, t0);
+            for _ in 0..3 {
+                fail(&t, "bob", ip(1), t0);
+            }
             assert_eq!(
-                t.check("bob", ip(1), t0),
-                Err(RetryAfter {
+                t.begin("bob", ip(1), t0).unwrap_err(),
+                RetryAfter {
                     reason: ThrottleReason::User,
                     secs: 1
-                })
+                }
             );
-            assert_eq!(t.check("bob", ip(1), t0 + secs(1)), Ok(()));
+            assert!(t.begin("bob", ip(1), t0 + secs(1)).is_ok());
         }
 
         #[test]
         fn backoff_doubles_per_failure_and_is_capped() {
             let t = LoginThrottle::new(cfg());
-            let t0 = Instant::now();
-            let mut seen = Vec::new();
+            let mut at = Instant::now();
+            let mut waits = Vec::new();
             for _ in 0..8 {
-                t.record_failure("bob", ip(1), t0);
-                seen.push(t.check("bob", ip(1), t0).err().map(|r| r.secs));
+                // Wait out whatever is asked, fail once, then see the next ask.
+                at = fail_paced(&t, "bob", ip(1), 1, at);
+                // Probe without leaving a reservation behind.
+                waits.push(match t.begin("bob", ip(1), at) {
+                    Ok(a) => {
+                        a.abandon();
+                        None
+                    }
+                    Err(r) => Some(r.secs),
+                });
             }
             assert_eq!(
-                seen,
+                waits,
                 [
                     None,
                     None,
@@ -595,10 +681,9 @@ mod tests {
         #[test]
         fn wait_shrinks_as_time_passes_and_rounds_up() {
             let t = LoginThrottle::new(cfg());
-            let t0 = Instant::now();
-            fail_n(&t, "bob", ip(1), 5, t0); // 4 s delay
+            let last = fail_paced(&t, "bob", ip(1), 5, Instant::now()); // 4 s delay now
             let r = t
-                .check("bob", ip(1), t0 + Duration::from_millis(1500))
+                .begin("bob", ip(1), last + Duration::from_millis(1500))
                 .unwrap_err();
             assert_eq!(r.secs, 3, "2.5 s left rounds up to 3");
         }
@@ -606,23 +691,40 @@ mod tests {
         #[test]
         fn failures_are_forgotten_after_the_window() {
             let t = LoginThrottle::new(cfg());
-            let t0 = Instant::now();
-            fail_n(&t, "bob", ip(1), 6, t0);
-            let later = t0 + secs(60);
-            assert_eq!(t.check("bob", ip(1), later), Ok(()));
-            let c = t.record_failure("bob", ip(1), later);
-            assert_eq!(c, FailureCounts { user: 1, ip: 1 }, "count restarted");
+            let last = fail_paced(&t, "bob", ip(1), 6, Instant::now());
+            let a = t
+                .begin("bob", ip(1), last + secs(60))
+                .expect("window lapsed");
+            assert_eq!(a.counts(), FailureCounts { user: 1, ip: 1 });
         }
 
         #[test]
-        fn success_clears_that_user_and_that_ip() {
+        fn success_clears_that_user_only() {
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
-            fail_n(&t, "bob", ip(1), 3, t0);
-            fail_n(&t, "amy", ip(2), 3, t0);
-            t.record_success("bob", ip(1));
-            assert_eq!(t.check("bob", ip(1), t0), Ok(()));
-            assert!(t.check("amy", ip(2), t0).is_err(), "other users untouched");
+            for _ in 0..2 {
+                fail(&t, "bob", ip(1), t0);
+            }
+            for _ in 0..3 {
+                fail(&t, "amy", ip(2), t0);
+            }
+            t.begin("bob", ip(1), t0).unwrap().succeeded();
+            assert_eq!(
+                t.begin("bob", ip(1), t0).unwrap().counts().user,
+                1,
+                "bob's count restarted"
+            );
+            assert!(t.begin("amy", ip(2), t0).is_err(), "other users untouched");
+        }
+
+        #[test]
+        fn an_abandoned_attempt_is_not_counted() {
+            let t = LoginThrottle::new(cfg());
+            let t0 = Instant::now();
+            for _ in 0..10 {
+                t.begin("bob", ip(1), t0).unwrap().abandon();
+            }
+            assert_eq!(t.sizes(), (0, 0));
         }
 
         #[test]
@@ -632,29 +734,29 @@ mod tests {
             // One user guessed from three addresses: the user is held, the
             // addresses and other users are not.
             for n in 1..=3 {
-                t.record_failure("bob", ip(n), t0);
+                fail(&t, "bob", ip(n), t0);
             }
-            let r = t.check("bob", ip(9), t0).unwrap_err();
+            let r = t.begin("bob", ip(9), t0).unwrap_err();
             assert_eq!(r.reason, ThrottleReason::User);
-            assert_eq!(t.check("amy", ip(9), t0), Ok(()));
+            assert!(t.begin("amy", ip(9), t0).is_ok());
             // One address spraying five usernames: the address is held, and
             // no single username is.
             for u in ["a", "b", "c", "d", "e"] {
-                t.record_failure(u, ip(7), t0);
+                fail(&t, u, ip(7), t0);
             }
-            let r = t.check("fresh", ip(7), t0).unwrap_err();
+            let r = t.begin("fresh", ip(7), t0).unwrap_err();
             assert_eq!(r.reason, ThrottleReason::Ip);
-            assert_eq!(t.check("fresh", ip(8), t0), Ok(()));
+            assert!(t.begin("fresh", ip(8), t0).is_ok());
         }
 
         #[test]
         fn usernames_are_case_insensitive() {
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
-            t.record_failure("Bob", ip(1), t0);
-            t.record_failure("BOB", ip(2), t0);
-            t.record_failure("bob", ip(3), t0);
-            assert!(t.check("bOb", ip(4), t0).is_err());
+            fail(&t, "Bob", ip(1), t0);
+            fail(&t, "BOB", ip(2), t0);
+            fail(&t, "bob", ip(3), t0);
+            assert!(t.begin("bOb", ip(4), t0).is_err());
         }
 
         #[test]
@@ -665,11 +767,11 @@ mod tests {
             let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
             let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
             for (i, u) in ["a", "b", "c", "d", "e"].iter().enumerate() {
-                t.record_failure(u, if i % 2 == 0 { a } else { b }, t0);
+                fail(&t, u, if i % 2 == 0 { a } else { b }, t0);
             }
-            assert!(t.check("fresh", a, t0).is_err());
-            assert!(t.check("fresh", b, t0).is_err());
-            assert_eq!(t.check("fresh", other, t0), Ok(()));
+            assert!(t.begin("fresh", a, t0).is_err());
+            assert!(t.begin("fresh", b, t0).is_err());
+            assert!(t.begin("fresh", other, t0).is_ok());
         }
 
         #[test]
@@ -678,7 +780,12 @@ mod tests {
             let t0 = Instant::now();
             for i in 0..(MAX_ENTRIES + 500) {
                 let a = IpAddr::V4(Ipv4Addr::from(u32::try_from(i).unwrap()));
-                t.record_failure(&format!("user{i}"), a, t0 + Duration::from_millis(i as u64));
+                fail(
+                    &t,
+                    &format!("user{i}"),
+                    a,
+                    t0 + Duration::from_millis(i as u64),
+                );
             }
             let (users, ips) = t.sizes();
             assert!(users <= MAX_ENTRIES && ips <= MAX_ENTRIES, "{users} {ips}");
@@ -695,8 +802,45 @@ mod tests {
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
             let long = "x".repeat(100_000);
-            t.record_failure(&long, ip(1), t0);
+            fail(&t, &long, ip(1), t0);
             assert!(t.lock().users.keys().all(|k| k.len() <= MAX_KEY_CHARS));
+        }
+
+        #[test]
+        fn attempts_in_flight_count_against_the_budget() {
+            // Sequentially: the first `threshold` attempts are admitted and
+            // still running (nothing settled); every further one is refused.
+            let t = LoginThrottle::new(cfg());
+            let t0 = Instant::now();
+            let held: Vec<_> = (0..50).map(|_| t.begin("bob", ip(1), t0)).collect();
+            assert_eq!(held.iter().filter(|r| r.is_ok()).count(), 3);
+        }
+
+        #[test]
+        fn concurrent_attempts_cannot_exceed_the_budget() {
+            let t = LoginThrottle::new(cfg());
+            let t0 = Instant::now();
+            let admitted = std::sync::atomic::AtomicUsize::new(0);
+            let go = std::sync::Barrier::new(16);
+            std::thread::scope(|s| {
+                for _ in 0..16 {
+                    s.spawn(|| {
+                        go.wait();
+                        for _ in 0..20 {
+                            // Held until the thread ends: an unfinished hash.
+                            if let Ok(a) = t.begin("bob", ip(1), t0) {
+                                admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                std::mem::forget(a);
+                            }
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                admitted.load(std::sync::atomic::Ordering::SeqCst),
+                3,
+                "only max_failures_per_user guesses may be in flight"
+            );
         }
 
         #[test]
@@ -756,8 +900,10 @@ mod tests {
 
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
-            fail_n(&t, "Mallory", ip(1), 3, t0);
-            assert!(t.check("mallory", ip(1), t0).is_err());
+            for _ in 0..3 {
+                fail(&t, "Mallory", ip(1), t0);
+            }
+            assert!(t.begin("mallory", ip(1), t0).is_err());
             let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
 
             assert!(log.contains("login failed"), "failure is visible: {log}");
@@ -785,9 +931,9 @@ mod tests {
             let t = LoginThrottle::new(cfg());
             let t0 = Instant::now();
             for u in ["a", "b", "c", "d", "e"] {
-                t.record_failure(u, ip(7), t0);
+                fail(&t, u, ip(7), t0);
             }
-            assert!(t.check("fresh", ip(7), t0).is_err());
+            assert!(t.begin("fresh", ip(7), t0).is_err());
             assert_eq!(throttled_count(&rec, "ip"), 1);
         }
     }
