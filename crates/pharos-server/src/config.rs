@@ -539,6 +539,58 @@ pub struct ServerConfig {
     /// `[server.native_api]` — the pharos-native Cap'n Proto API (spec 017).
     #[serde(default)]
     pub native_api: NativeApiConfig,
+    /// Online-guessing throttle for password logins. See [`LoginThrottleConfig`].
+    #[serde(default)]
+    pub login_throttle: LoginThrottleConfig,
+    /// Reverse proxies whose `X-Forwarded-For` header is believed, as IPs or
+    /// CIDRs (`"10.0.0.0/8"`, `"fd00::/8"`, `"192.168.1.5"`). The header is
+    /// client-controlled, so it is ignored unless the direct TCP peer is listed
+    /// here; with an empty list (the default) every client is identified by its
+    /// peer address. Behind an ingress, list the ingress so each client is
+    /// throttled on its own address rather than all sharing the proxy's.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+/// `[server.login_throttle]` — slows online password guessing against
+/// `POST /Users/AuthenticateByName`. Accounts are never locked: past the
+/// threshold an attempt is refused with `429` + `Retry-After` for a delay that
+/// doubles with every further failure (1 s, 2 s, 4 s, ...) up to
+/// `max_backoff_secs`, and any success clears the counters.
+///
+/// The defaults are deliberately generous: a household mistyping a TV
+/// password ten times in a row is rare and is held for seconds, never minutes
+/// (the delay only reaches the cap after ~9 failures past the threshold),
+/// while an attacker is held to roughly `max_failures_per_user` guesses up
+/// front plus about 3 per minute at the cap, per username — useless against a
+/// non-trivial password. The per-IP limit is three times the per-user one so a
+/// family sharing one NAT address and several accounts do not trip it, while
+/// one address spraying many usernames still does.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LoginThrottleConfig {
+    /// Failures for one (case-insensitive) username within the window before
+    /// further attempts for it are delayed.
+    pub max_failures_per_user: u32,
+    /// Failures from one client address within the window before further
+    /// attempts from it are delayed.
+    pub max_failures_per_ip: u32,
+    /// A key's failure count is forgotten once this long passes with no new
+    /// failure for it.
+    pub window_secs: u64,
+    /// Longest a throttled key can be told to wait.
+    pub max_backoff_secs: u64,
+}
+
+impl Default for LoginThrottleConfig {
+    fn default() -> Self {
+        Self {
+            max_failures_per_user: 10,
+            max_failures_per_ip: 30,
+            window_secs: 15 * 60,
+            max_backoff_secs: 5 * 60,
+        }
+    }
 }
 
 /// `[server.native_api]` — the pharos-native API (`/pharos/rpc`). Off by
@@ -949,6 +1001,27 @@ mod tests {
                 .expect("parses")
                 .transcode_vaapi_gpu_resident
         );
+    }
+
+    #[test]
+    fn login_throttle_defaults_when_absent_and_merges_partial_sections() {
+        let parse =
+            |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
+        let c = parse("").expect("parses");
+        assert_eq!(c.login_throttle, LoginThrottleConfig::default());
+        assert_eq!(c.login_throttle.max_failures_per_user, 10);
+        assert_eq!(c.login_throttle.max_failures_per_ip, 30);
+        assert_eq!(c.login_throttle.window_secs, 900);
+        assert_eq!(c.login_throttle.max_backoff_secs, 300);
+        assert!(c.trusted_proxies.is_empty());
+
+        let c = parse(
+            "trusted_proxies = [\"10.0.0.0/8\"]\n[login_throttle]\nmax_failures_per_user = 3",
+        )
+        .expect("parses");
+        assert_eq!(c.login_throttle.max_failures_per_user, 3);
+        assert_eq!(c.login_throttle.max_failures_per_ip, 30);
+        assert_eq!(c.trusted_proxies, ["10.0.0.0/8"]);
     }
 
     #[test]
