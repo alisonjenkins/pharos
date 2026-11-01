@@ -28,7 +28,7 @@ impl server::bootstrap::Handler for Boot {
         _params: bootstrap::ResumeParams,
         results: &mut bootstrap::ResumeResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> {
-        let mut err = results.get().init_result().init_error();
+        let mut err = results.get().init_result().init_status().init_error();
         err.set_reason("token not recognised");
         err.get_kind().set_revoked(());
         std::future::ready(Ok(()))

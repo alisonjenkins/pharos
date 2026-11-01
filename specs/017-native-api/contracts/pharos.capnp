@@ -75,7 +75,7 @@ struct ItemsResult { union { page @0 :ItemPage; error @1 :Error; } }
 # later pass to `resume`.
 interface Bootstrap {
   serverInfo @0 (ctx :CallContext) -> (result :ServerInfoResult);
-  resume @1 (ctx :CallContext, deviceToken :Text $secret) -> (result :SessionResult);
+  resume @1 (ctx :CallContext, deviceToken :Text $secret) -> (result :ResumeResult);
   login @2 (ctx :CallContext, name :Text, password :Text $secret) -> (result :LoginResult);
   quickConnectInitiate @3 (ctx :CallContext) -> (result :QuickConnectResult);
   quickConnectPoll @4 (ctx :CallContext, secret :Text $secret) -> (result :LoginResult);
@@ -84,7 +84,11 @@ interface Bootstrap {
 }
 struct ServerInfo { name @0 :Text; version @1 :Text; schemaVersion @2 :UInt32; anonymousErrors @3 :Bool; }
 struct ServerInfoResult { union { info @0 :ServerInfo; error @1 :Error; } }
-struct SessionResult { union { session @0 :Session; error @1 :Error; } }
+# Not a union: capnp-rust generates no pipeline accessor for a capability
+# inside one, and `resume → session.library() → library.home()` must be one
+# flight (SC-001, research R1). A refused resume still returns a `session`, one
+# whose every call fails `Error.kind.revoked`; `status` says why.
+struct ResumeResult { session @0 :Session; status @1 :Done; }
 struct LoginResult { union { ok @0 :LoginOk; error @1 :Error; } }
 struct LoginOk { session @0 :Session; deviceToken @1 :Text $secret; }
 struct QuickConnectResult { union { pending @0 :QuickConnectPending; error @1 :Error; } }

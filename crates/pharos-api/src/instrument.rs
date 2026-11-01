@@ -254,9 +254,11 @@ pub fn register_metrics() {
 }
 
 /// Reads the outcome a handler wrote: the `error` arm of the `result` union,
-/// if set, names an `Error.kind` variant. Returns the outcome, the error's
-/// `reason`, and the variant's value (the id not found, the dependency
-/// unavailable, …) so the failure log carries the cause, not just its class.
+/// or, for a result that cannot be a union because it carries a pipelined
+/// capability (`ResumeResult`), the `error` arm of its `status`. Returns the
+/// outcome, the error's `reason`, and the variant's value (the id not found,
+/// the dependency unavailable, …) so the failure log carries the cause, not
+/// just its class.
 fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     let ok = (Outcome::Ok, String::new(), String::new());
     let dynamic_value::Reader::Struct(reply) = reply else {
@@ -265,19 +267,15 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     let Some(result) = struct_field(reply, "result") else {
         return ok;
     };
-    let Ok(Some(active)) = result.which() else {
-        return ok;
+    let carrier = if active_is(result, "error") {
+        result
+    } else {
+        match struct_field(result, "status") {
+            Some(status) if active_is(status, "error") => status,
+            _ => return ok,
+        }
     };
-    if active
-        .get_proto()
-        .get_name()
-        .ok()
-        .and_then(|n| n.to_str().ok())
-        != Some("error")
-    {
-        return ok;
-    }
-    let Some(error) = struct_field(result, "error") else {
+    let Some(error) = struct_field(carrier, "error") else {
         return (
             Outcome::Other,
             "error arm unreadable".to_owned(),
@@ -300,6 +298,11 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     let detail = kind.get(variant).map(redact::render).unwrap_or_default();
     let outcome = Outcome::from_error_kind(name).unwrap_or(Outcome::Other);
     (outcome, reason, detail)
+}
+
+/// Whether `s`'s active union member is named `name`.
+fn active_is(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> bool {
+    matches!(s.which(), Ok(Some(f)) if f.get_proto().get_name().ok().and_then(|n| n.to_str().ok()) == Some(name))
 }
 
 fn struct_field<'a>(

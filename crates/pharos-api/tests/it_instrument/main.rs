@@ -7,5 +7,6 @@ mod instrument;
 mod labels;
 mod redact;
 mod registration;
+mod resume;
 mod support;
 mod wire;
