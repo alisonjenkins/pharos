@@ -2857,6 +2857,8 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
             media.id = media_id,
             target_seg = target,
             variants = variants.len(),
+            prewarm.source = prewarm_source_label(&item),
+            prewarm.edition = item.edition.as_deref().unwrap_or_default(),
             "syncplay seek prewarm: warming target segments"
         );
         let total_segs = item
@@ -2927,6 +2929,15 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
             }
         }
     });
+}
+
+/// Which file a prewarm is warming, for its log line: a grouped edition's own
+/// file warms under a different cache key from the item's.
+fn prewarm_source_label(item: &pharos_core::MediaItem) -> &'static str {
+    match item.edition {
+        Some(_) => super::media_source::Served::Alternate.label(),
+        None => super::media_source::Served::Primary.label(),
+    }
 }
 
 /// How many segments the cold-start prewarm warms into the cache at
@@ -3032,6 +3043,8 @@ pub(super) fn prewarm_cold_start(
             resumed = resume_ticks > 0,
             demuxed_cmaf,
             rendition = if demuxed_cmaf { "h264cmaf" } else { "mpegts" },
+            prewarm.source = prewarm_source_label(&item),
+            prewarm.edition = item.edition.as_deref().unwrap_or_default(),
             "cold-start prewarm: warming from the resume position"
         );
         let Some(base) = base else {
