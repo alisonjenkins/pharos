@@ -2,9 +2,10 @@
 //!
 //! Holds the generated bindings for `schema/pharos.capnp`, so the server and
 //! the wasm UI share one wire definition, and the generated instrumentation
-//! every served method goes through: a capability can only be made from a
-//! handler via `server::<interface>::client`, which wraps it in
-//! `Instrumented<S>` (research R4).
+//! every served method goes through: serve a handler via
+//! `server::<interface>::client`, which wraps it in `Instrumented<S>`
+//! (research R4). capnpc's raw `Server` traits stay public, so
+//! `tests/it_instrument/guard.rs` fails on any crate implementing one.
 
 pub mod instrument;
 pub mod labels;
