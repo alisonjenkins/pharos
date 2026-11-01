@@ -301,12 +301,7 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
     let Ok(Some(variant)) = kind.which() else {
         return (Outcome::Other, reason, String::new());
     };
-    let name = variant
-        .get_proto()
-        .get_name()
-        .ok()
-        .and_then(|n| n.to_str().ok())
-        .unwrap_or_default();
+    let name = redact::name_of(variant.get_proto().get_name());
     let detail = kind.get(variant).map(redact::render).unwrap_or_default();
     let outcome = Outcome::from_error_kind(name).unwrap_or(Outcome::Other);
     (outcome, reason, detail)
@@ -314,7 +309,7 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
 
 /// Whether `s`'s active union member is named `name`.
 fn active_is(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> bool {
-    matches!(s.which(), Ok(Some(f)) if f.get_proto().get_name().ok().and_then(|n| n.to_str().ok()) == Some(name))
+    matches!(s.which(), Ok(Some(f)) if redact::name_of(f.get_proto().get_name()) == name)
 }
 
 fn struct_field<'a>(

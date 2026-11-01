@@ -158,6 +158,7 @@ fn write_struct(out: &mut String, s: capnp::dynamic_struct::Reader<'_>, depth: u
     out.push('}');
 }
 
-fn name_of(name: capnp::Result<capnp::text::Reader<'_>>) -> &str {
+/// A schema node's name, or `?` when it cannot be read.
+pub(crate) fn name_of(name: capnp::Result<capnp::text::Reader<'_>>) -> &str {
     name.ok().and_then(|n| n.to_str().ok()).unwrap_or("?")
 }
