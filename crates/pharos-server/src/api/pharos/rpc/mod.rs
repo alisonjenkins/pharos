@@ -54,8 +54,8 @@ pub fn record_state(cfg: &NativeApiConfig) {
     tracing::info!(
         enabled = cfg.enabled,
         allowed_origins = ?cfg.allowed_origins,
-        max_connections_per_user = cfg.max_connections_per_user,
-        "native api (/pharos/rpc, /pharos/session)"
+        max_connections_per_user = cfg.max_connections_per_user.get(),
+        "native api (/pharos/rpc)"
     );
 }
 

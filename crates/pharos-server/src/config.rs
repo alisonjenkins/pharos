@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -540,10 +541,10 @@ pub struct ServerConfig {
     pub native_api: NativeApiConfig,
 }
 
-/// `[server.native_api]` — the pharos-native API (`/pharos/rpc`,
-/// `POST /pharos/session`). Off by default: every push to main deploys
-/// (ADR-0010), so this surface stays dark until it is complete and reviewed;
-/// while off both routes answer 404.
+/// `[server.native_api]` — the pharos-native API (`/pharos/rpc`). Off by
+/// default: every push to main deploys (ADR-0010), so this surface stays dark
+/// until it is complete and reviewed; while off its routes are not registered
+/// and answer 404.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct NativeApiConfig {
     #[serde(default)]
@@ -556,10 +557,11 @@ pub struct NativeApiConfig {
     /// subject to this list.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
-    /// Open `/pharos/rpc` connections one user may hold at once; the next
-    /// upgrade is refused with 429. A household runs a few devices per person.
+    /// Signed-in `/pharos/rpc` connections one user may hold at once; a
+    /// further `resume` is refused with `Error.kind.limit`. A household runs a
+    /// few devices per person. Zero is rejected: it would lock every user out.
     #[serde(default = "default_native_max_connections_per_user")]
-    pub max_connections_per_user: u32,
+    pub max_connections_per_user: NonZeroU32,
 }
 
 impl Default for NativeApiConfig {
@@ -572,8 +574,13 @@ impl Default for NativeApiConfig {
     }
 }
 
-fn default_native_max_connections_per_user() -> u32 {
-    16
+fn default_native_max_connections_per_user() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(16) {
+        Some(n) => n,
+        None => panic!("the default cap must not be zero"),
+    };
+    DEFAULT
 }
 
 fn default_played_threshold_pct() -> u32 {
@@ -964,8 +971,8 @@ mod tests {
         assert!(parse("transcode_stage_timing = \"loud\"").is_err());
     }
 
-    /// 008 — the feature is off unless somebody says otherwise, and the rest of
-    /// the section still has usable defaults so turning it on is one line.
+    /// 017 — new network surface ships dark (ADR-0010): off, and no browser
+    /// origin admitted, unless the operator says otherwise.
     #[test]
     fn native_api_is_off_by_default() {
         let cfg: ServerConfig = toml::from_str("bind = \"0.0.0.0:1\"").expect("parses");
@@ -974,6 +981,15 @@ mod tests {
         assert!(cfg.native_api.allowed_origins.is_empty());
     }
 
+    #[test]
+    fn a_zero_connection_cap_is_rejected() {
+        assert!(toml::from_str::<NativeApiConfig>("max_connections_per_user = 0").is_err());
+        let cfg: NativeApiConfig = toml::from_str("max_connections_per_user = 2").expect("parses");
+        assert_eq!(cfg.max_connections_per_user.get(), 2);
+    }
+
+    /// 008 — the feature is off unless somebody says otherwise, and the rest of
+    /// the section still has usable defaults so turning it on is one line.
     #[test]
     fn remote_sources_are_off_by_default_but_fully_defaulted() {
         let r = RemoteConfig::default();
