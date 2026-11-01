@@ -51,6 +51,8 @@ const ALLOWED_404_PATTERNS: RegExp[] = [
   /\/Items\/0{32}\b/,
 ];
 
+const CROSS_ORIGIN_IMAGE = /\/Items\/[0-9a-f]{32}\/Images\//i;
+
 type Capture = {
   consoleErrors: string[];
   badResponses: string[];
@@ -76,6 +78,12 @@ function start(page: Page): Capture {
     if (status < 400) return;
     const url = resp.url();
     if (ALLOWED_404_PATTERNS.some((re) => re.test(url))) return;
+    // V189/V191 — this suite runs jellyfin-web cross-origin to pharos, where
+    // the browser drops the JellyfinAuth cookie, so an image URL jellyfin-web
+    // builds without `api_key` (the display-preferences preview) answers 401.
+    // Production is same-origin; item-file-auth.spec.ts asserts no image 401
+    // there.
+    if (status === 401 && CROSS_ORIGIN_IMAGE.test(url)) return;
     cap.badResponses.push(`${status} ${url}`);
   });
   return cap;
