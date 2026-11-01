@@ -79,7 +79,9 @@ impl server::bootstrap::Handler for Bootstrap {
     }
 
     /// Resolves the device token (or, when it is empty, the upgrade's
-    /// cookie) on every call, so a revoked token stops working at once.
+    /// cookie) on every call, so a revoked token cannot resume. A session
+    /// already open keeps the user it resumed as until T025a lands: it does
+    /// not yet notice its token being revoked.
     /// Always answers with a session: a refused one fails every call with the
     /// same error as `status` (research R1).
     async fn resume(
