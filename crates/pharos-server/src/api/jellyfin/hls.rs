@@ -2067,7 +2067,13 @@ async fn vp9_audio_playlist(
         return Err(error::ErrorNotFound("no cache"));
     };
     cache
-        .ensure_audio_hls(&item.path, media_id, audio_rel, Some(128_000))
+        .ensure_audio_hls(
+            &item.path,
+            item.edition.as_deref(),
+            media_id,
+            audio_rel,
+            Some(128_000),
+        )
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     // B103 — take duration through `load_hls_item`, which falls back to a live
@@ -2132,7 +2138,14 @@ async fn vp9_audio_file(
         .and_then(|r| r.parse::<u32>().ok())
         .unwrap_or(0);
     let dir = cache
-        .ensure_audio_hls_covering(&item.path, media_id, audio_rel, Some(128_000), want_seg)
+        .ensure_audio_hls_covering(
+            &item.path,
+            item.edition.as_deref(),
+            media_id,
+            audio_rel,
+            Some(128_000),
+            want_seg,
+        )
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
     let file = cache
@@ -2953,6 +2966,7 @@ async fn prewarm_group_seek_source(
                 let _ = cache
                     .ensure_audio_hls_covering(
                         &item.path,
+                        item.edition.as_deref(),
                         media_id,
                         opts.audio_source_stream_index,
                         Some(128_000),

@@ -188,7 +188,7 @@ async fn a_late_starting_audio_track_still_lands_under_its_own_video() {
     // offset. Asking for `SEG` directly spawns a session seeked to it, which
     // lands honestly and would test nothing.
     let dir = cache
-        .ensure_audio_hls_covering(&src, 42, None, Some(128_000), 0)
+        .ensure_audio_hls_covering(&src, None, 42, None, Some(128_000), 0)
         .await
         .expect("audio session");
     let frag = td.path().join("frag.mp4");
@@ -223,7 +223,7 @@ async fn a_seek_sessions_fragment_reports_the_session_it_came_from() {
     let seek_at = 3u32;
     let want_seg = seek_at + 2;
     let dir = cache
-        .ensure_audio_hls_covering(&src, 43, None, Some(128_000), seek_at)
+        .ensure_audio_hls_covering(&src, None, 43, None, Some(128_000), seek_at)
         .await
         .expect("audio session");
     let got = cache
