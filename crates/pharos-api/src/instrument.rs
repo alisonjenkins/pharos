@@ -319,6 +319,9 @@ pub enum Denial {
     Unavailable { dependency: &'static str },
     /// The caller may not do this; `what` names it, a fixed string.
     NotPermitted { what: &'static str },
+    /// `what` (a fixed name, never the caller's input) does not exist, or
+    /// no longer does.
+    NotFound { what: &'static str },
     /// Too many failures; try again in `retry_after_secs`. Written as a
     /// `limit` named `name` whose `value` is the wait.
     Throttled {
@@ -349,6 +352,10 @@ impl Denial {
             Denial::NotPermitted { what } => {
                 error.set_reason(what);
                 error.get_kind().set_not_permitted(what);
+            }
+            Denial::NotFound { what } => {
+                error.set_reason(format!("{what} not found").as_str());
+                error.get_kind().set_not_found(what);
             }
             Denial::Throttled {
                 name,
