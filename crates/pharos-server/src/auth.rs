@@ -250,7 +250,7 @@ fn user_key(user: &str) -> String {
 
 /// IPv6 clients usually hold a whole /64, so key on that prefix; otherwise one
 /// host could rotate through 2^64 addresses to dodge the limit.
-fn ip_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn ip_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {

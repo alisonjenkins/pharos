@@ -418,3 +418,26 @@ async fn pending_connect_returns_authenticated_false() {
     assert_eq!(v["Authenticated"], serde_json::Value::Bool(false));
     assert!(v.get("AccessToken").is_none() || v["AccessToken"].is_null());
 }
+
+#[actix_web::test]
+async fn initiate_over_the_per_address_cap_is_429_with_retry_after() {
+    let (state, _) = seed_admin().await;
+    let app = test::init_service(build_app(state)).await;
+    for _ in 0..pharos_server::quick_connect::MAX_PENDING_PER_IP {
+        let req = test::TestRequest::post()
+            .uri("/QuickConnect/Initiate")
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 429);
+    assert_eq!(
+        resp.headers().get("retry-after").unwrap(),
+        pharos_server::quick_connect::CAP_RETRY_AFTER_SECS
+            .to_string()
+            .as_str()
+    );
+}
