@@ -45,7 +45,16 @@ async fn seed() -> (web::Data<AppState>, UserId) {
     let _ = AuthBackend::authenticate(&auth, "u", &SecretString::new("p"))
         .await
         .unwrap();
-    let state = web::Data::new(AppState::new(stores, "srv".into()));
+    // This audit is about token issuance, not throttling: 32 simultaneous
+    // logins would otherwise hold 32 reservations against the default budget.
+    let state = web::Data::new(AppState::new(stores, "srv".into()).with_login_throttle(
+        pharos_server::config::LoginThrottleConfig {
+            max_failures_per_user: 1_000,
+            max_failures_per_ip: 1_000,
+            ..Default::default()
+        },
+        Default::default(),
+    ));
     (state, uid)
 }
 

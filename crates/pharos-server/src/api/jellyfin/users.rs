@@ -271,40 +271,43 @@ async fn authenticate_by_name(
     let body = body.into_inner();
     let password = SecretString::new(body.pw);
 
-    // V174 — throttle BEFORE the argon2 verify, so a refused attempt costs
-    // neither a hash nor a guess.
+    // V174 — admit BEFORE the argon2 verify, so a refused attempt costs neither
+    // a hash nor a guess, and the reservation is made under the same lock as
+    // the check so concurrent guesses cannot all slip through.
     let client_ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
-    if let Err(retry) =
-        state
+    let attempt =
+        match state
             .login_throttle
-            .check(&body.username, client_ip, std::time::Instant::now())
-    {
-        let resp = HttpResponse::TooManyRequests()
-            .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
-            .body("too many failed login attempts");
-        return Err(actix_web::error::InternalError::from_response(
-            "too many failed login attempts",
-            resp,
-        )
-        .into());
-    }
+            .begin(&body.username, client_ip, std::time::Instant::now())
+        {
+            Ok(a) => a,
+            Err(retry) => {
+                let resp = HttpResponse::TooManyRequests()
+                    .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
+                    .body("too many failed login attempts");
+                return Err(actix_web::error::InternalError::from_response(
+                    "too many failed login attempts",
+                    resp,
+                )
+                .into());
+            }
+        };
 
     let user = match state.auth.authenticate(&body.username, &password).await {
         Ok(u) => {
-            state
-                .login_throttle
-                .record_success(&body.username, client_ip);
+            attempt.succeeded();
             u
         }
         Err(AuthError::InvalidCredentials) | Err(AuthError::UserNotFound) => {
-            state.login_throttle.record_failure(
-                &body.username,
-                client_ip,
-                std::time::Instant::now(),
-            );
+            // Dropped unsettled: stays counted as a failed login.
+            drop(attempt);
             return Err(ErrorUnauthorized("invalid credentials"));
         }
-        Err(e) => return Err(actix_web::error::ErrorInternalServerError(e.to_string())),
+        Err(e) => {
+            // The credential was never judged (store failure): do not count it.
+            attempt.abandon();
+            return Err(actix_web::error::ErrorInternalServerError(e.to_string()));
+        }
     };
 
     let auth = auth_header_from_request(&req);
