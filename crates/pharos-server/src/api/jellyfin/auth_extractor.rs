@@ -7,12 +7,13 @@
 //! - `X-Emby-Authorization: MediaBrowser Token="<token>", …`
 //! - `Authorization: MediaBrowser Token="<token>", …`
 
+use crate::services::auth::TokenRefusal;
 use crate::state::AppState;
 use actix_web::{
     dev::Payload, error::ErrorInternalServerError, error::ErrorUnauthorized, web, FromRequest,
     HttpRequest,
 };
-use pharos_core::{TokenStore, User, UserStore};
+use pharos_core::User;
 use std::{future::Future, pin::Pin};
 
 pub struct AuthUser(pub User);
@@ -40,42 +41,9 @@ async fn authenticate(
         return Err(ErrorUnauthorized("missing token"));
     };
     let state = state.ok_or_else(|| ErrorInternalServerError("AppState not configured"))?;
-    let uid = state
-        .stores
-        .resolve(&token)
+    crate::services::auth::user_for_token(&state.stores, &token)
         .await
-        .map_err(|e| auth_failure(e, Rejected::InvalidToken))?;
-    let record = state
-        .stores
-        .get(uid)
-        .await
-        .map_err(|e| auth_failure(e, Rejected::UserRevoked))?;
-    Ok(record.into_user())
-}
-
-/// Why a request that carried (or lacked) a token was refused; the label is
-/// the `reason` of `pharos_auth_rejected_total`, so a stale-token client that
-/// retries every few seconds is one query away.
-#[derive(Clone, Copy)]
-enum Rejected {
-    InvalidToken,
-    UserRevoked,
-}
-
-impl Rejected {
-    fn label(self) -> &'static str {
-        match self {
-            Rejected::InvalidToken => "invalid_token",
-            Rejected::UserRevoked => "user_revoked",
-        }
-    }
-
-    fn message(self) -> &'static str {
-        match self {
-            Rejected::InvalidToken => "invalid token",
-            Rejected::UserRevoked => "user revoked",
-        }
-    }
+        .map_err(auth_failure)
 }
 
 fn count_rejection(reason: &'static str) {
@@ -134,19 +102,17 @@ impl FromRequest for AuthSession {
 /// request with 401 for sixteen seconds: the pauses were dropped, and the
 /// clients were told their credentials were bad when nothing about them was
 /// (B216).
-fn auth_failure(e: pharos_core::AuthError, rejected: Rejected) -> actix_web::Error {
-    match e {
-        pharos_core::AuthError::Backend(detail) => {
+fn auth_failure(refusal: TokenRefusal) -> actix_web::Error {
+    count_rejection(refusal.label());
+    match refusal {
+        TokenRefusal::Unavailable(detail) => {
             tracing::warn!(error = %detail, "auth store unavailable; answering 503, not 401");
-            count_rejection("store_unavailable");
             actix_web::error::ErrorServiceUnavailable(format!(
                 "auth store unavailable, retry: {detail}"
             ))
         }
-        _ => {
-            count_rejection(rejected.label());
-            ErrorUnauthorized(rejected.message())
-        }
+        TokenRefusal::InvalidToken => ErrorUnauthorized("invalid token"),
+        TokenRefusal::UserRevoked => ErrorUnauthorized("user revoked"),
     }
 }
 
@@ -346,21 +312,14 @@ mod tests {
     /// SyncPlay commands and tells it its session is invalid.
     #[test]
     fn a_backend_failure_is_503_and_a_bad_token_is_401() {
-        let backend = auth_failure(
-            pharos_core::AuthError::Backend("pool timed out".into()),
-            Rejected::InvalidToken,
-        );
+        let backend = auth_failure(TokenRefusal::Unavailable("pool timed out".into()));
         assert_eq!(
             backend.as_response_error().status_code(),
             actix_web::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(backend.to_string().contains("pool timed out"), "{backend}");
-        for e in [
-            pharos_core::AuthError::InvalidToken,
-            pharos_core::AuthError::UserNotFound,
-            pharos_core::AuthError::InvalidCredentials,
-        ] {
-            let err = auth_failure(e, Rejected::InvalidToken);
+        for refusal in [TokenRefusal::InvalidToken, TokenRefusal::UserRevoked] {
+            let err = auth_failure(refusal);
             assert_eq!(
                 err.as_response_error().status_code(),
                 actix_web::http::StatusCode::UNAUTHORIZED
