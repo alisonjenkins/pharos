@@ -97,6 +97,39 @@ scan_probe_concurrency = {{ $s.scanProbeConcurrency | int64 }}
 library_watch_enabled = {{ $s.libraryWatchEnabled }}
 library_poll_interval_secs = {{ $s.libraryPollIntervalSecs | int64 }}
 drain_grace_secs = {{ $s.drainGraceSecs | int64 }}
+{{- with $s.trustedProxies }}
+trusted_proxies = [{{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p | quote }}{{ end }}]
+{{- end }}
+{{- with $s.loginThrottle }}
+
+[server.login_throttle]
+{{- if hasKey . "maxFailuresPerUser" }}
+max_failures_per_user = {{ .maxFailuresPerUser | int64 }}
+{{- end }}
+{{- if hasKey . "maxFailuresPerIp" }}
+max_failures_per_ip = {{ .maxFailuresPerIp | int64 }}
+{{- end }}
+{{- if hasKey . "windowSecs" }}
+window_secs = {{ .windowSecs | int64 }}
+{{- end }}
+{{- if hasKey . "maxBackoffSecs" }}
+max_backoff_secs = {{ .maxBackoffSecs | int64 }}
+{{- end }}
+{{- end }}
+{{- with $s.nativeApi }}
+{{- if .enabled }}
+
+[server.native_api]
+enabled = true
+allowed_origins = [{{ range $i, $o := .allowedOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
+{{- if .maxConnectionsPerUser }}
+max_connections_per_user = {{ .maxConnectionsPerUser | int64 }}
+{{- end }}
+{{- if .revalidateSecs }}
+revalidate_secs = {{ .revalidateSecs | int64 }}
+{{- end }}
+{{- end }}
+{{- end }}
 
 {{- with .Values.config.userDefaults }}
 
