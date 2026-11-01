@@ -19,6 +19,9 @@ pub enum ItemHidden {
     NoLibrary,
     /// The store could not say; the item is withheld rather than served.
     Unavailable(String),
+    /// The request carried no credential, or one that resolves to no
+    /// enabled user. Answered 401, not 404: the caller is not yet anyone.
+    Unauthenticated,
 }
 
 impl ItemHidden {
@@ -28,6 +31,7 @@ impl ItemHidden {
             ItemHidden::LibraryNotAllowed => "library_not_allowed",
             ItemHidden::NoLibrary => "no_library",
             ItemHidden::Unavailable(_) => "store_unavailable",
+            ItemHidden::Unauthenticated => "unauthenticated",
         }
     }
 }
@@ -75,6 +79,58 @@ pub async fn check_item(
         "item withheld by library policy"
     );
     Err(verdict)
+}
+
+/// The user behind `token` on a route that serves an item's files to
+/// element URLs (images, subtitles, attachments), which carry the token in
+/// the query or a cookie rather than a header. A missing token, or one that
+/// resolves to no enabled user, counts under
+/// `pharos_item_access_denied_total{reason="unauthenticated"}` and logs the
+/// item asked for (`item`, as the path spelled it) and `route`: at DEBUG for
+/// a missing token, WARN for one that does not resolve.
+pub async fn authenticate(
+    state: &AppState,
+    token: Option<&str>,
+    item: &str,
+    route: &'static str,
+) -> Result<User, ItemHidden> {
+    let refusal = match token {
+        None => "missing",
+        Some(token) => match crate::services::auth::user_for_token(&state.stores, token).await {
+            Ok(user) => return Ok(user),
+            Err(crate::services::auth::TokenRefusal::Unavailable(detail)) => {
+                let hidden = ItemHidden::Unavailable(detail);
+                metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
+                    .increment(1);
+                tracing::warn!(item_id = item, route, reason = hidden.label(), detail = %hidden, "item withheld: credential not checked");
+                return Err(hidden);
+            }
+            Err(refusal) => refusal.label(),
+        },
+    };
+    let hidden = ItemHidden::Unauthenticated;
+    metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label()).increment(1);
+    // A missing credential is what every anonymous crawler sends to these
+    // internet-facing routes; the counter keeps its rate visible without a
+    // WARN per request. A presented token that does not resolve stays WARN.
+    if token.is_none() {
+        tracing::debug!(
+            item_id = item,
+            route,
+            reason = hidden.label(),
+            credential = refusal,
+            "item withheld from an unauthenticated request"
+        );
+    } else {
+        tracing::warn!(
+            item_id = item,
+            route,
+            reason = hidden.label(),
+            credential = refusal,
+            "item withheld from an unauthenticated request"
+        );
+    }
+    Err(hidden)
 }
 
 /// Keeps the entries of `items` whose item `user` may reach, `id` naming
@@ -146,6 +202,7 @@ mod tests {
             ItemHidden::LibraryNotAllowed.label(),
             ItemHidden::NoLibrary.label(),
             ItemHidden::Unavailable(String::new()).label(),
+            ItemHidden::Unauthenticated.label(),
         ];
         let unique: std::collections::BTreeSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len());

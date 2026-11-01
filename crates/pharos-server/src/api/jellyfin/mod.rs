@@ -95,5 +95,6 @@ pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix
         ItemHidden::LibraryNotAllowed | ItemHidden::NoLibrary => {
             actix_web::error::ErrorNotFound("not found")
         }
+        ItemHidden::Unauthenticated => actix_web::error::ErrorUnauthorized("missing token"),
     }
 }
