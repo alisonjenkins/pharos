@@ -1,9 +1,10 @@
 //! Token to [`User`]: the decision every authenticated call on either API
 //! makes, implemented once (V172).
 
-use pharos_core::{AuthError, TokenStore, User, UserStore};
+use pharos_core::{AuthError, TokenStore, User, UserId, UserStore};
+use tokio::sync::broadcast;
 
-use crate::state::Stores;
+use crate::state::{AppState, Stores};
 
 /// Why a token did not yield a user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +56,109 @@ fn classify(e: AuthError, otherwise: TokenRefusal) -> TokenRefusal {
     }
 }
 
+/// Why a user's tokens may have stopped resolving. The label is the `cause`
+/// of `pharos_auth_revocation_announced_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeCause {
+    /// The caller signed out, revoking its own token.
+    Logout,
+    /// An admin deleted a device, revoking its tokens.
+    DeviceDeleted,
+    /// An admin revoked an API key.
+    ApiKeyRevoked,
+    /// The user was deleted.
+    UserDeleted,
+    /// The user's policy changed (it may now be disabled).
+    PolicyChanged,
+}
+
+impl RevokeCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            RevokeCause::Logout => "logout",
+            RevokeCause::DeviceDeleted => "device_deleted",
+            RevokeCause::ApiKeyRevoked => "api_key_revoked",
+            RevokeCause::UserDeleted => "user_deleted",
+            RevokeCause::PolicyChanged => "policy_changed",
+        }
+    }
+}
+
+/// Announced events a channel holds before a slow subscriber lags. A lagged
+/// connection re-checks all its tokens, so overflow costs a lookup, never a
+/// missed revocation.
+const ANNOUNCE_CAPACITY: usize = 256;
+
+/// Tells open native connections (T025) that some of a user's tokens may no
+/// longer resolve. The message is a trigger, not a verdict: each of that
+/// user's connections re-checks its own tokens against the store, so revoking
+/// one device's token leaves the user's other devices connected. In-process
+/// only: with more than one pharos replica, connections on the others still
+/// wait for their timer (`revalidate_secs`).
+#[derive(Debug, Clone)]
+pub struct Revocations {
+    tx: broadcast::Sender<UserId>,
+}
+
+impl Default for Revocations {
+    fn default() -> Self {
+        Self {
+            tx: broadcast::channel(ANNOUNCE_CAPACITY).0,
+        }
+    }
+}
+
+impl Revocations {
+    /// Counts and logs the announcement, then sends it to every subscriber.
+    pub fn announce(&self, user: UserId, cause: RevokeCause) {
+        metrics::counter!("pharos_auth_revocation_announced_total", "cause" => cause.label())
+            .increment(1);
+        // No subscribers is the normal case with the native API off.
+        // Every open native connection subscribes, whoever its user.
+        let subscribers = self.tx.send(user).unwrap_or(0);
+        tracing::info!(
+            user_id = %user.0,
+            cause = cause.label(),
+            subscribers,
+            "auth: revocation announced"
+        );
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<UserId> {
+        self.tx.subscribe()
+    }
+}
+
+/// Revokes `user`'s `token` (idempotent) and announces the user.
+pub async fn revoke_token(
+    state: &AppState,
+    user: UserId,
+    token: &str,
+    cause: RevokeCause,
+) -> Result<(), AuthError> {
+    state.stores.revoke(token).await?;
+    state.revocations.announce(user, cause);
+    Ok(())
+}
+
+/// Revokes every token `user` holds for `device_id`; announces the user when
+/// any went. Returns how many.
+pub async fn revoke_device(
+    state: &AppState,
+    user: UserId,
+    device_id: &str,
+    cause: RevokeCause,
+) -> Result<u64, AuthError> {
+    let dropped = state
+        .stores
+        .revoke_tokens_by_device(user, device_id)
+        .await?;
+    if dropped > 0 {
+        state.revocations.announce(user, cause);
+    }
+    Ok(dropped)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -81,6 +185,47 @@ mod tests {
                 TokenRefusal::UserRevoked
             );
         }
+    }
+
+    #[test]
+    fn revoke_cause_labels_are_distinct() {
+        let causes = [
+            RevokeCause::Logout,
+            RevokeCause::DeviceDeleted,
+            RevokeCause::ApiKeyRevoked,
+            RevokeCause::UserDeleted,
+            RevokeCause::PolicyChanged,
+        ];
+        let unique: std::collections::HashSet<_> = causes.iter().map(|c| c.label()).collect();
+        assert_eq!(unique.len(), causes.len());
+    }
+
+    /// The announcement is queryable: an operator can see revocations happen
+    /// without a native connection open to notice them.
+    #[test]
+    fn an_announcement_is_counted_by_cause_and_reaches_subscribers() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let bus = Revocations::default();
+        let mut rx = bus.subscribe();
+        let user = UserId::new();
+        metrics::with_local_recorder(&recorder, || bus.announce(user, RevokeCause::Logout));
+        assert_eq!(rx.try_recv().unwrap(), user);
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == "pharos_auth_revocation_announced_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "cause" && l.value() == "logout")
+            });
+        assert!(
+            matches!(counted, Some((.., DebugValue::Counter(1)))),
+            "{counted:?}"
+        );
     }
 
     #[test]
