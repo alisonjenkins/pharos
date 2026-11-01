@@ -430,12 +430,18 @@ async fn authenticate_with_quick_connect(
     })?;
 
     // Resolve the authorizing user (same path the auth extractor uses).
-    let user = state
+    let record = state
         .stores
         .get(by)
         .await
-        .map_err(|e| ErrorUnauthorized(format!("authorizing user unavailable: {e}")))?
-        .into_user();
+        .map_err(|e| ErrorUnauthorized(format!("authorizing user unavailable: {e}")))?;
+    // A disabled account must not receive a token (same rule as password
+    // login); the secret is already consumed, so the client restarts the flow.
+    if record.policy.is_disabled {
+        tracing::warn!(user = %by, "quickconnect: finalize refused, authorizing user is disabled");
+        return Err(ErrorUnauthorized("quick connect not authorized"));
+    }
+    let user = record.into_user();
 
     let token = state
         .stores
