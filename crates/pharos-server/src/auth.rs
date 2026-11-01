@@ -28,13 +28,33 @@ pub enum CreateUserOutcome {
 pub struct BuiltinAuth<U: UserStore> {
     users: U,
     argon: Argon2<'static>,
+    /// PHC hash of a constant, made with `argon` up front (a lazy hash would
+    /// make the first unknown-user login slower than the rest), so an
+    /// unknown-user login verifies at the same cost as a real one.
+    dummy_hash: String,
 }
+
+/// Used only if hashing the dummy fails at startup: the same constant hashed
+/// with `Argon2::default()`'s parameters (argon2id, m=19456, t=2, p=1), which
+/// a verify reads from the string itself.
+const FALLBACK_DUMMY_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$cGhhcm9zZHVtbXlzYWx0MA$EKDomuO8hGAGCl/dbiaNGLsNHz0FAvuuDQQ8+KYw65c";
+const DUMMY_PASSWORD: &[u8] = b"pharos-dummy-password";
 
 impl<U: UserStore> BuiltinAuth<U> {
     pub fn new(users: U) -> Self {
+        let argon = Argon2::default();
+        let dummy_hash = argon
+            .hash_password(DUMMY_PASSWORD)
+            .map(|h| h.to_string())
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "auth: hashing the dummy password failed; using the built-in one");
+                FALLBACK_DUMMY_HASH.to_owned()
+            });
         Self {
             users,
-            argon: Argon2::default(),
+            argon,
+            dummy_hash,
         }
     }
 
@@ -54,6 +74,21 @@ impl<U: UserStore> BuiltinAuth<U> {
             .map_err(|e| AuthError::Backend(format!("hash: {e}")))?
             .to_string();
         Ok(SecretString::new(hash))
+    }
+
+    /// Burn one argon2 verify so an unknown username costs what a known one
+    /// does (V177). The result is irrelevant and ignored.
+    fn dummy_verify(&self, password: &SecretString) {
+        match PasswordHash::new(&self.dummy_hash) {
+            Ok(parsed) => {
+                let _ = self
+                    .argon
+                    .verify_password(password.expose().as_bytes(), &parsed);
+                metrics::counter!("pharos_auth_dummy_verify_total").increment(1);
+            }
+            // Unknown usernames answer faster than known ones until fixed.
+            Err(e) => tracing::error!(error = %e, "auth: dummy argon2 hash unusable"),
+        }
     }
 
     /// Create a user with the given plaintext password, hashing it first.
@@ -90,7 +125,10 @@ impl<U: UserStore> AuthBackend for BuiltinAuth<U> {
     async fn authenticate(&self, name: &str, password: &SecretString) -> AuthResult<User> {
         let record = match self.users.lookup_by_name(name).await {
             Ok(r) => r,
-            Err(AuthError::UserNotFound) => return Err(AuthError::InvalidCredentials),
+            Err(AuthError::UserNotFound) => {
+                self.dummy_verify(password);
+                return Err(AuthError::InvalidCredentials);
+            }
             Err(other) => return Err(other),
         };
         let parsed = PasswordHash::new(record.password_hash.expose())
@@ -617,6 +655,64 @@ mod tests {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!("expected InvalidCredentials, got {other:?}"),
         }
+    }
+
+    fn dummy_verify_count(rec: &metrics_util::debugging::DebuggingRecorder) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        rec.snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, v)| match v {
+                DebugValue::Counter(n) if key.key().name() == "pharos_auth_dummy_verify_total" => {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// The fallback costs what a real hash costs: same algorithm and
+    /// parameters as `Argon2::default()`, and it parses.
+    #[test]
+    fn the_fallback_dummy_hash_matches_the_default_parameters() {
+        let fallback = PasswordHash::new(FALLBACK_DUMMY_HASH).unwrap();
+        let fresh = Argon2::default().hash_password(DUMMY_PASSWORD).unwrap();
+        assert_eq!(fallback.algorithm, fresh.algorithm);
+        assert_eq!(fallback.version, fresh.version);
+        assert_eq!(fallback.params.to_string(), fresh.params.to_string());
+        assert!(Argon2::default()
+            .verify_password(DUMMY_PASSWORD, &fallback)
+            .is_ok());
+    }
+
+    // V177 — an unknown user costs the same argon2 work as a known one.
+    #[tokio::test]
+    async fn unknown_user_pays_a_dummy_verify_known_user_does_not() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+
+        let _ = auth.authenticate("ali", &SecretString::new("wrong")).await;
+        let _ = auth
+            .authenticate("ali", &SecretString::new("hunter2"))
+            .await;
+        assert_eq!(
+            dummy_verify_count(&rec),
+            0,
+            "known user is verified for real"
+        );
+
+        match auth.authenticate("nobody", &SecretString::new("x")).await {
+            Err(AuthError::InvalidCredentials) => {}
+            other => panic!("expected InvalidCredentials, got {other:?}"),
+        }
+        assert_eq!(
+            dummy_verify_count(&rec),
+            1,
+            "unknown user must burn a verify"
+        );
     }
 
     #[tokio::test]
