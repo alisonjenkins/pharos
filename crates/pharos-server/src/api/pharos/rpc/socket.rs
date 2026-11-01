@@ -32,6 +32,8 @@ const MAX_FRAME: usize = 1 << 20;
 const PIPE_BYTES: usize = 64 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(30);
 const IDLE_DROP: Duration = Duration::from_secs(120);
+/// Longest one token re-check may take before it counts as an outage.
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why an upgrade was refused before it became a connection. The label is
 /// the `reason` of `pharos_rpc_refused_total`.
@@ -141,9 +143,18 @@ pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived
 /// Whether every token a connection resumed with still resolves (T025a). A
 /// store outage keeps the connection (B216: ours and transient); only a
 /// definite refusal ends it.
+///
+/// Each lookup is bounded by [`RECHECK_TIMEOUT`] and a timeout counts as an
+/// outage: the re-check runs in the same select as the keepalive and idle
+/// drop, so a stalled store must not hold those off.
 async fn still_valid(state: &AppState, tokens: &[String]) -> bool {
     for token in tokens {
-        match user_for_token(&state.stores, token).await {
+        let lookup = tokio::time::timeout(RECHECK_TIMEOUT, user_for_token(&state.stores, token));
+        let Ok(result) = lookup.await else {
+            tracing::warn!("native api: token re-check timed out; keeping the connection");
+            continue;
+        };
+        match result {
             Ok(_) | Err(TokenRefusal::Unavailable(_)) => {}
             Err(refusal) => {
                 tracing::info!(
