@@ -316,3 +316,19 @@ async fn enforce_enabled_folders_filters_views() {
         );
     }
 }
+
+/// B243: `/Library/VirtualFolders` names every library and its root path, so
+/// only an admin may read it, as in Jellyfin (`RequiresElevation`).
+#[actix_web::test]
+async fn virtual_folders_are_admin_only() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    for (token, want) in [(f.user_token.as_str(), 403), (f.admin_token.as_str(), 200)] {
+        let req = test::TestRequest::get()
+            .uri("/Library/VirtualFolders")
+            .insert_header(("X-Emby-Token", token))
+            .to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        assert_eq!(status, want);
+    }
+}

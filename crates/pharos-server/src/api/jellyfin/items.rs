@@ -7445,10 +7445,13 @@ async fn resume_items(
     }))
 }
 
+/// Admin only, as in Jellyfin (`RequiresElevation`): it names every library
+/// and its root path whatever the caller's `EnabledFolders` (B243, V186).
 async fn virtual_folders(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     // LIB-C1 — one VirtualFolderInfoDto per real typed library, with its
     // root path as the single `Locations` entry and the per-kind
     // CollectionType. Item id = the stable library wire id so client URLs
