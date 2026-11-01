@@ -24,7 +24,7 @@
 //! because the TTL is short and the user just retries).
 
 use pharos_core::UserId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -40,6 +40,11 @@ pub const MAX_PENDING: usize = 1024;
 /// Live pending requests one client address (IPv6: one /64) may hold. A TV
 /// that retries a few times is fine; a flood from one host is not.
 pub const MAX_PENDING_PER_IP: usize = 8;
+
+/// Unknown-code Authorize attempts one signed-in user may make within
+/// [`PENDING_TTL`]. The code space is 1M and a code lives 5 minutes, so an
+/// unthrottled user could enumerate it; 10 leaves room for typos.
+pub const MAX_AUTHORIZE_FAILURES: usize = 10;
 
 /// `Retry-After` sent with a cap refusal: long enough for a stuck request to
 /// be consumed or a client to back off, short enough for a retrying TV.
@@ -88,6 +93,9 @@ pub enum QcRefusal {
     GlobalCap,
     /// The client address already holds [`MAX_PENDING_PER_IP`] live requests.
     IpCap,
+    /// The authorizing user guessed [`MAX_AUTHORIZE_FAILURES`] unknown codes
+    /// within [`PENDING_TTL`].
+    AuthorizeThrottled { retry_after_secs: u64 },
 }
 
 impl QcRefusal {
@@ -96,6 +104,7 @@ impl QcRefusal {
             Self::RngFailed => "rng_failed",
             Self::GlobalCap => "global_cap",
             Self::IpCap => "ip_cap",
+            Self::AuthorizeThrottled { .. } => "authorize_throttled",
         }
     }
 
@@ -118,7 +127,7 @@ pub enum QcMsg {
     Authorize {
         code: String,
         by: UserId,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Result<bool, QcRefusal>>,
     },
     /// Poll for a pending request's state. READ-ONLY — never consumes the
     /// entry: jellyfin-web polls this every 5s and, once `Authenticated`,
@@ -140,6 +149,47 @@ pub enum QcMsg {
     Gc,
 }
 
+/// Failed (unknown-code) Authorize attempts per authorizing user, as a
+/// sliding window of [`PENDING_TTL`]. Only failures are recorded; a success
+/// resets nothing, so interleaving a valid code cannot buy more guesses.
+#[derive(Default)]
+struct AuthorizeFailures {
+    by_user: HashMap<UserId, VecDeque<Instant>>,
+}
+
+impl AuthorizeFailures {
+    fn prune(&mut self, now: Instant) {
+        self.by_user.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > PENDING_TTL)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+
+    /// Time until `user` may try again, or `None` if they may now.
+    fn blocked(&mut self, user: UserId, now: Instant) -> Option<Duration> {
+        self.prune(now);
+        let q = self.by_user.get(&user)?;
+        if q.len() < MAX_AUTHORIZE_FAILURES {
+            return None;
+        }
+        let oldest = *q.front()?;
+        Some(PENDING_TTL.saturating_sub(now.duration_since(oldest)))
+    }
+
+    fn record(&mut self, user: UserId, now: Instant) {
+        self.by_user.entry(user).or_default().push_back(now);
+    }
+
+    fn count(&self, user: UserId) -> usize {
+        self.by_user.get(&user).map_or(0, VecDeque::len)
+    }
+}
+
 #[derive(Clone)]
 pub struct QuickConnectRegistry {
     pub tx: mpsc::Sender<QcMsg>,
@@ -157,6 +207,7 @@ impl QuickConnectRegistry {
         // we hold two HashMaps so neither path scans the other.
         let mut by_secret: HashMap<String, PendingRequest> = HashMap::new();
         let mut by_code: HashMap<String, String> = HashMap::new();
+        let mut authorize_failures = AuthorizeFailures::default();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 gc_expired(&mut by_secret, &mut by_code);
@@ -228,12 +279,32 @@ impl QuickConnectRegistry {
                         let _ = reply.send(Ok(entry));
                     }
                     QcMsg::Authorize { code, by, reply } => {
+                        let now = Instant::now();
+                        if let Some(wait) = authorize_failures.blocked(by, now) {
+                            let refusal = QcRefusal::AuthorizeThrottled {
+                                retry_after_secs: wait.as_secs().saturating_add(1),
+                            };
+                            refusal.record();
+                            tracing::warn!(
+                                reason = refusal.label(),
+                                user = %by,
+                                failures = authorize_failures.count(by),
+                                cap = MAX_AUTHORIZE_FAILURES,
+                                retry_after_secs = wait.as_secs().saturating_add(1),
+                                "quickconnect: authorize refused, too many unknown codes"
+                            );
+                            let _ = reply.send(Err(refusal));
+                            continue;
+                        }
                         let mut ok = false;
                         if let Some(secret) = by_code.get(&code).cloned() {
                             if let Some(entry) = by_secret.get_mut(&secret) {
                                 entry.authorized_by = Some(by);
                                 ok = true;
                             }
+                        }
+                        if !ok {
+                            authorize_failures.record(by, now);
                         }
                         tracing::info!(
                             code = %code,
@@ -242,7 +313,7 @@ impl QuickConnectRegistry {
                             "quickconnect: authorize {}",
                             if ok { "matched" } else { "UNKNOWN CODE" }
                         );
-                        let _ = reply.send(ok);
+                        let _ = reply.send(Ok(ok));
                     }
                     QcMsg::Connect { secret, reply } => {
                         // Read-only poll: jellyfin-web reads `Authenticated`
@@ -456,7 +527,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(rx.await.unwrap(), "authorize should succeed");
+        assert!(rx.await.unwrap().unwrap(), "authorize should succeed");
 
         // Connect after authorize → reports authorized but is READ-ONLY:
         // the client polls this repeatedly, so it must not consume.
@@ -553,7 +624,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!rx.await.unwrap());
+        assert!(!rx.await.unwrap().unwrap());
     }
 
     #[tokio::test]
@@ -703,7 +774,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(rx.await.unwrap());
+        assert!(rx.await.unwrap().unwrap());
         let (tx, rx) = oneshot::channel();
         reg.tx
             .send(QcMsg::Consume {
@@ -758,6 +829,85 @@ mod tests {
         ] {
             assert!(warn.contains(want), "missing {want} in {warn}");
         }
+    }
+
+    async fn authorize_as(
+        reg: &QuickConnectRegistry,
+        code: &str,
+        by: UserId,
+    ) -> Result<bool, QcRefusal> {
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Authorize {
+                code: code.into(),
+                by,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[test]
+    fn failure_window_blocks_at_the_limit_and_clears_after_the_ttl() {
+        let mut f = AuthorizeFailures::default();
+        let u = UserId::new();
+        let t0 = Instant::now();
+        for _ in 0..MAX_AUTHORIZE_FAILURES {
+            assert!(f.blocked(u, t0).is_none());
+            f.record(u, t0);
+        }
+        assert_eq!(f.blocked(u, t0), Some(PENDING_TTL));
+        assert_eq!(
+            f.blocked(u, t0 + Duration::from_secs(100)),
+            Some(PENDING_TTL - Duration::from_secs(100))
+        );
+        assert!(f
+            .blocked(u, t0 + PENDING_TTL + Duration::from_secs(1))
+            .is_none());
+        assert!(
+            f.by_user.is_empty(),
+            "expired window is dropped, not leaked"
+        );
+    }
+
+    #[test]
+    fn failure_windows_are_per_user() {
+        let mut f = AuthorizeFailures::default();
+        let (a, b) = (UserId::new(), UserId::new());
+        let t0 = Instant::now();
+        for _ in 0..MAX_AUTHORIZE_FAILURES {
+            f.record(a, t0);
+        }
+        assert!(f.blocked(a, t0).is_some());
+        assert!(f.blocked(b, t0).is_none());
+    }
+
+    #[tokio::test]
+    async fn guessing_codes_is_throttled_per_user_and_a_success_resets_nobody() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let reg = QuickConnectRegistry::spawn();
+        let (a, b) = (UserId::new(), UserId::new());
+        let real = initiate_from(&reg, ip(1)).await.unwrap();
+
+        for _ in 0..MAX_AUTHORIZE_FAILURES - 1 {
+            assert!(!authorize_as(&reg, "999999", a).await.unwrap());
+        }
+        // a's own success, and b's, must not wipe a's count
+        assert!(authorize_as(&reg, &real.code, a).await.unwrap());
+        assert!(authorize_as(&reg, &real.code, b).await.unwrap());
+        assert!(!authorize_as(&reg, "999999", a).await.unwrap());
+
+        // a is now at the limit: even a correct code is refused
+        let err = authorize_as(&reg, &real.code, a).await.unwrap_err();
+        assert!(
+            matches!(err, QcRefusal::AuthorizeThrottled { .. }),
+            "{err:?}"
+        );
+        // b is untouched
+        assert!(authorize_as(&reg, &real.code, b).await.unwrap());
+        assert_eq!(refused_count(&rec, "authorize_throttled"), 1);
     }
 
     fn failing_fill(_: &mut [u8]) -> Result<(), getrandom::Error> {
@@ -828,8 +978,15 @@ mod tests {
             QcRefusal::RngFailed.label(),
             QcRefusal::GlobalCap.label(),
             QcRefusal::IpCap.label(),
+            QcRefusal::AuthorizeThrottled {
+                retry_after_secs: 1,
+            }
+            .label(),
         ];
-        assert_eq!(labels, ["rng_failed", "global_cap", "ip_cap"]);
+        assert_eq!(
+            labels,
+            ["rng_failed", "global_cap", "ip_cap", "authorize_throttled"]
+        );
     }
 
     #[test]

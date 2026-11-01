@@ -127,6 +127,16 @@ async fn quick_connect_initiate(
     }))
 }
 
+fn too_many_requests(retry_after_secs: u64, msg: &'static str) -> actix_web::Error {
+    let resp = HttpResponse::TooManyRequests()
+        .insert_header((
+            actix_web::http::header::RETRY_AFTER,
+            retry_after_secs.to_string(),
+        ))
+        .body(msg);
+    actix_web::error::InternalError::from_response(msg, resp).into()
+}
+
 /// A registry refusal as HTTP.
 fn qc_refused(refusal: crate::quick_connect::QcRefusal) -> actix_web::Error {
     match refusal {
@@ -134,13 +144,13 @@ fn qc_refused(refusal: crate::quick_connect::QcRefusal) -> actix_web::Error {
             actix_web::error::ErrorServiceUnavailable("quick connect unavailable")
         }
         crate::quick_connect::QcRefusal::GlobalCap | crate::quick_connect::QcRefusal::IpCap => {
-            let resp = HttpResponse::TooManyRequests()
-                .insert_header((
-                    actix_web::http::header::RETRY_AFTER,
-                    crate::quick_connect::CAP_RETRY_AFTER_SECS.to_string(),
-                ))
-                .body("too many pending quick connect requests");
-            actix_web::error::InternalError::from_response("quick connect cap", resp).into()
+            too_many_requests(
+                crate::quick_connect::CAP_RETRY_AFTER_SECS,
+                "too many pending quick connect requests",
+            )
+        }
+        crate::quick_connect::QcRefusal::AuthorizeThrottled { retry_after_secs } => {
+            too_many_requests(retry_after_secs, "too many unknown quick connect codes")
         }
     }
 }
@@ -189,7 +199,8 @@ async fn quick_connect_authorize(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
     let ok = reply_rx
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?
+        .map_err(qc_refused)?;
     if !ok {
         return Err(actix_web::error::ErrorNotFound("unknown code"));
     }
