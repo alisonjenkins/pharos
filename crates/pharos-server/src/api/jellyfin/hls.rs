@@ -1986,6 +1986,10 @@ fn playback_qs(req: &HttpRequest) -> String {
                 parts.push(format!("VideoBitrate={v}"));
             } else if k.eq_ignore_ascii_case("StereoMode") {
                 parts.push(format!("StereoMode={v}"));
+            } else if k.eq_ignore_ascii_case("MediaSourceId") {
+                // The edition the master was built from; without it the
+                // variant and its segments would read the item's own file.
+                parts.push(format!("MediaSourceId={v}"));
             }
         }
     }
@@ -5280,6 +5284,17 @@ mod tests {
         assert_eq!(
             source_qs(&bare, edition, Some("3d-hsbs")),
             format!("s={}", eg.get())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_selected_media_source_reaches_variant_and_segment_urls() {
+        let req = actix_web::test::TestRequest::get()
+            .uri("/videos/9/master.m3u8?mediaSourceId=0000000000000000000000000000002a-3d-hsbs&Static=false")
+            .to_http_request();
+        assert_eq!(
+            playback_qs(&req),
+            "MediaSourceId=0000000000000000000000000000002a-3d-hsbs"
         );
     }
 
