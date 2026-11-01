@@ -321,13 +321,7 @@ fn emit_interface(o: &mut String, i: &Interface) {
             o,
             "    impl<S: Handler> wire::Server for Instrumented<S> {{}}\n"
         );
-        let _ = writeln!(
-            o,
-            "    /// The handler behind a revoked session's `{}`.",
-            i.name
-        );
-        let _ = writeln!(o, "    pub struct Revoked(pub Rc<Connection>);");
-        let _ = writeln!(o, "    impl Handler for Revoked {{}}");
+        emit_revoked(o, i);
         let _ = writeln!(o, "}}\n");
         return;
     }
