@@ -198,6 +198,19 @@ impl SourceGen {
         self.0
     }
 
+    /// The generation of the file a playback request reads: as
+    /// [`for_source`](Self::for_source) for an item's own file, and keyed by
+    /// the path for a grouped edition's. The primary of a local item stays
+    /// [`LOCAL`](Self::LOCAL) so its cache filenames do not move, and an
+    /// edition, which shares the item's `media_id`, cannot collide with it.
+    pub fn for_read(source: &Path, edition: Option<&str>) -> Self {
+        if edition.is_none() {
+            return Self::for_source(source);
+        }
+        use xxhash_rust::xxh3::xxh3_64;
+        Self((xxh3_64(source.as_os_str().as_encoded_bytes()) as u32) | 1)
+    }
+
     /// Whether this is the local, single-generation case.
     ///
     /// Load-bearing for the cache layout: a local segment's filename is
@@ -2319,6 +2332,7 @@ impl HlsSegmentCache {
             None,
             None,
             source,
+            None,
             opts,
             class,
             StreamKey::NONE,
@@ -2342,6 +2356,9 @@ impl HlsSegmentCache {
     /// transcode scheduler as identical jobs, which is why a segment a browser
     /// was waiting for could sit behind a pile of segments nobody had asked for
     /// with nothing in any log or metric to say so.
+    ///
+    /// `edition` names the grouped edition `source` belongs to, `None` for the
+    /// item's own file. It moves the key ([`SourceGen::for_read`]).
     ///
     /// `seeds_playhead` says whether this caller KNOWS where `stream`'s playback
     /// begins — [`PlayheadSeed::StatesTheStart`] for the two prewarms, which
@@ -2367,6 +2384,7 @@ impl HlsSegmentCache {
         audio_index: Option<u32>,
         subtitle_index: Option<u32>,
         source: &Path,
+        edition: Option<&str>,
         opts: &SegmentOpts,
         class: JobClass,
         stream: StreamKey,
@@ -2383,7 +2401,7 @@ impl HlsSegmentCache {
             audio_index,
             subtitle_index,
             opts,
-            SourceGen::for_source(source),
+            SourceGen::for_read(source, edition),
         );
         let path = self.segment_path_keyed(key);
 
@@ -4948,6 +4966,7 @@ mod tests {
                         None,
                         None,
                         Path::new("/definitely/not/a/real/source.mkv"),
+                        None,
                         &opts,
                         JobClass::Interactive,
                         StreamKey::NONE,
@@ -6770,6 +6789,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 viewer,
@@ -6795,6 +6815,7 @@ mod tests {
                     None,
                     None,
                     Path::new("/no/source"),
+                    None,
                     &o,
                     JobClass::Background,
                     viewer,
@@ -6815,6 +6836,7 @@ mod tests {
                     None,
                     None,
                     Path::new("/no/source"),
+                    None,
                     &o,
                     JobClass::Interactive,
                     StreamKey::of("viewer-b"),
@@ -6891,6 +6913,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 viewer,
@@ -6917,6 +6940,7 @@ mod tests {
                     None,
                     None,
                     Path::new("/no/source"),
+                    None,
                     &opts,
                     JobClass::Interactive,
                     viewer,
@@ -6973,6 +6997,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 viewer,
@@ -6990,6 +7015,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 viewer,
@@ -7017,6 +7043,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 viewer,
@@ -7064,6 +7091,7 @@ mod tests {
                 None,
                 None,
                 Path::new("/no/source"),
+                None,
                 &opts,
                 JobClass::Interactive,
                 driver_viewer,
@@ -7083,6 +7111,7 @@ mod tests {
                     None,
                     None,
                     Path::new("/no/source"),
+                    None,
                     &o,
                     JobClass::Background,
                     driver_viewer,
@@ -7104,6 +7133,7 @@ mod tests {
                     None,
                     None,
                     Path::new("/no/source"),
+                    None,
                     &o,
                     JobClass::Interactive,
                     joiner_viewer,
@@ -8938,6 +8968,31 @@ mod tests {
         assert_eq!(
             first,
             key("https://cdn.example/videoplayback?expire=1000&sig=aaa")
+        );
+    }
+
+    /// A grouped edition shares its item's `media_id`, so its segments are
+    /// keyed by its own path; the item's own file stays `LOCAL`.
+    #[test]
+    fn an_edition_does_not_share_its_items_cache_key() {
+        let primary = Path::new("/m/Film.mkv");
+        let hsbs = Path::new("/m/Film - 3D.HSBS.mkv");
+        let htab = Path::new("/m/Film - 3D.HTAB.mkv");
+        assert_eq!(SourceGen::for_read(primary, None), SourceGen::LOCAL);
+        let a = SourceGen::for_read(hsbs, Some("3d-hsbs"));
+        let b = SourceGen::for_read(htab, Some("3d-htab"));
+        assert!(!a.is_local() && !b.is_local());
+        assert_ne!(a, b);
+        let opts = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            None,
+        );
+        assert_ne!(
+            SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::LOCAL).filename(),
+            SegmentIdentity::new(1, 0, None, None, &opts, a).filename(),
         );
     }
 

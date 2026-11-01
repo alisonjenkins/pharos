@@ -460,6 +460,8 @@ struct HlsItem {
     /// URLs can embed the SOURCE generation alongside the placement one; see
     /// [`rendition_qs`].
     path: std::path::PathBuf,
+    /// The grouped edition `path` belongs to, if the request selected one.
+    edition: Option<String>,
 }
 
 async fn load_hls_item(
@@ -517,6 +519,7 @@ async fn load_hls_item(
         frame_rate_mille: item.probe.frame_rate_mille,
         kind: item.kind,
         path: item.path.clone(),
+        edition: item.edition.clone(),
     })
 }
 
@@ -918,7 +921,7 @@ async fn render_variant_playlist(
     variant: &str,
 ) -> Result<impl Responder, actix_web::Error> {
     let item = load_hls_item(&state, &req, &id).await?;
-    let qs = source_qs(&req, &item.path);
+    let qs = source_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 3,
         independent_segments: true,
@@ -1182,6 +1185,7 @@ async fn serve_segment(
         opts.burn_subtitle_stream_index,
         &opts,
         &source,
+        item.edition.as_deref(),
     );
 
     // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
@@ -1228,6 +1232,7 @@ async fn serve_segment(
                 opts.audio_source_stream_index,
                 opts.burn_subtitle_stream_index,
                 &source,
+                item.edition.as_deref(),
                 &opts,
                 JobClass::Interactive,
                 stream,
@@ -1412,6 +1417,7 @@ fn segment_etag(
     sub_idx: Option<u32>,
     opts: &SegmentOpts,
     source: &std::path::Path,
+    edition: Option<&str>,
 ) -> String {
     pharos_cache::hls_cache::SegmentIdentity::new(
         media_id,
@@ -1419,7 +1425,7 @@ fn segment_etag(
         audio_idx,
         sub_idx,
         opts,
-        pharos_cache::hls_cache::SourceGen::for_source(source),
+        pharos_cache::hls_cache::SourceGen::for_read(source, edition),
     )
     .etag()
 }
@@ -1881,7 +1887,7 @@ async fn resolve_text_burn_assets(
 /// a digest of the placement state precisely so it moves whenever placement
 /// can — and it MUST be the same string the server-side cache reconciles
 /// against, or one of the two caches keeps bytes the other threw away.
-fn rendition_qs(req: &HttpRequest, source: &std::path::Path) -> String {
+fn rendition_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&str>) -> String {
     let qs = playback_qs(req);
     let gen = pharos_cache::generation();
     // 008 / V132 — `g=` answers "did the SERVER's placement rule change", which
@@ -1899,7 +1905,7 @@ fn rendition_qs(req: &HttpRequest, source: &std::path::Path) -> String {
     } else {
         format!("{qs}&g={gen}")
     };
-    with_source_gen(base, source)
+    with_source_gen(base, source, edition)
 }
 
 /// `playback_qs` plus the per-item source generation — for a playlist whose
@@ -1913,19 +1919,19 @@ fn rendition_qs(req: &HttpRequest, source: &std::path::Path) -> String {
 /// files back `public, max-age=31536000, immutable` like every other segment,
 /// so a re-resolved source leaves a year of the PREVIOUS resolution's bytes in
 /// the browser regardless of which rung produced them.
-fn source_qs(req: &HttpRequest, source: &std::path::Path) -> String {
-    with_source_gen(playback_qs(req), source)
+fn source_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&str>) -> String {
+    with_source_gen(playback_qs(req), source, edition)
 }
 
 /// Append `s=` when — and only when — the source is one that can be
-/// re-resolved.
+/// re-resolved, or is a grouped edition's file (which shares its item's id).
 ///
 /// One place, because the rule has a trap on each side. Omit it and an
 /// `immutable` response outlives the bytes it describes; apply it
 /// unconditionally and every LOCAL item's segment URLs change, busting a warm
 /// cache and every client's held init for an item whose bytes cannot move.
-fn with_source_gen(qs: String, source: &std::path::Path) -> String {
-    let src = pharos_cache::hls_cache::SourceGen::for_source(source);
+fn with_source_gen(qs: String, source: &std::path::Path, edition: Option<&str>) -> String {
+    let src = pharos_cache::hls_cache::SourceGen::for_read(source, edition);
     if src.is_local() {
         return qs;
     }
@@ -2048,7 +2054,7 @@ async fn vp9_audio_playlist(
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_req_item(&state, &req, media_id).await?;
-    let qs = rendition_qs(&req, &item.path);
+    let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
@@ -2251,7 +2257,7 @@ async fn vp9_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &req, &id).await?;
-    let qs = rendition_qs(&req, &item.path);
+    let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -2447,7 +2453,7 @@ async fn h264cmaf_variant(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
     let item = load_hls_item(&state, &req, &id).await?;
-    let qs = rendition_qs(&req, &item.path);
+    let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
@@ -2887,6 +2893,7 @@ pub(super) fn prewarm_group_seek(state: &web::Data<AppState>, media_id: u64, pos
                             o.audio_source_stream_index,
                             o.burn_subtitle_stream_index,
                             &item.path,
+                            item.edition.as_deref(),
                             &o,
                             JobClass::Background,
                             stream,
@@ -3084,6 +3091,7 @@ pub(super) fn prewarm_cold_start(
                         opts.audio_source_stream_index,
                         opts.burn_subtitle_stream_index,
                         &item.path,
+                        item.edition.as_deref(),
                         &opts,
                         JobClass::Background,
                         stream,
@@ -3173,6 +3181,7 @@ fn spawn_one_prefetch(
                 o.audio_source_stream_index,
                 o.burn_subtitle_stream_index,
                 &item.path,
+                item.edition.as_deref(),
                 &o,
                 JobClass::Background,
                 stream,
@@ -3613,6 +3622,7 @@ async fn vp9_segment_raw(
                 opts.audio_source_stream_index,
                 opts.burn_subtitle_stream_index,
                 &source,
+                item.edition.as_deref(),
                 opts,
                 JobClass::Interactive,
                 stream,
@@ -5184,7 +5194,7 @@ mod tests {
             .uri("/videos/9/h264cmaf.m3u8?PlaySessionId=abc")
             .to_http_request();
         let local = std::path::Path::new("/media/Movies/Arrival.mkv");
-        let qs = rendition_qs(&req, local);
+        let qs = rendition_qs(&req, local, None);
         assert!(
             qs.ends_with(&format!("g={gen}")),
             "generation must be present: {qs}"
@@ -5199,7 +5209,7 @@ mod tests {
         let bare = actix_web::test::TestRequest::get()
             .uri("/videos/9/h264cmaf.m3u8")
             .to_http_request();
-        let qs = rendition_qs(&bare, local);
+        let qs = rendition_qs(&bare, local, None);
         assert_eq!(qs, format!("g={gen}"), "no stray separator: {qs}");
         assert!(!qs.starts_with('&'));
 
@@ -5211,7 +5221,7 @@ mod tests {
         let remote = pharos_core::RemoteRef::new("youtube", "dQw4w9WgXcQ")
             .expect("valid ref")
             .to_synthetic_path();
-        let remote_qs = rendition_qs(&bare, &remote);
+        let remote_qs = rendition_qs(&bare, &remote, None);
         let sg = pharos_cache::hls_cache::SourceGen::for_source(&remote);
         assert!(
             !sg.is_local(),
@@ -5230,7 +5240,7 @@ mod tests {
         // `max-age=31536000, immutable` like every other segment, so a
         // re-resolved source would otherwise leave a year of the previous
         // resolution's bytes in the browser.
-        let ts_local = source_qs(&bare, local);
+        let ts_local = source_qs(&bare, local, None);
         assert!(
             !ts_local.contains("s="),
             "a local mpegts URL must be byte-identical to what it was: {ts_local}"
@@ -5242,7 +5252,7 @@ mod tests {
              #114: {ts_local}"
         );
         assert_eq!(
-            source_qs(&bare, &remote),
+            source_qs(&bare, &remote, None),
             format!("s={}", sg.get()),
             "a URL-backed mpegts rung carries its source generation"
         );
@@ -5250,7 +5260,7 @@ mod tests {
             .uri("/videos/9/main.m3u8?PlaySessionId=abc")
             .to_http_request();
         assert_eq!(
-            source_qs(&with_params, &remote),
+            source_qs(&with_params, &remote, None),
             format!("PlaySessionId=abc&s={}", sg.get()),
             "and keeps the playback params it was given"
         );
@@ -5258,6 +5268,19 @@ mod tests {
         // And the placement generation is still there — `s=` supplements `g=`,
         // it does not replace it. They answer different questions.
         assert!(remote_qs.contains(&format!("g={gen}")));
+
+        // A grouped edition's file shares its item's id, so its URLs must
+        // differ from the primary's or a browser holds the wrong init.
+        let edition = std::path::Path::new("/media/Movies/Arrival - 3D.HSBS.mkv");
+        let eg = pharos_cache::hls_cache::SourceGen::for_read(edition, Some("3d-hsbs"));
+        assert_eq!(
+            rendition_qs(&bare, edition, Some("3d-hsbs")),
+            format!("g={gen}&s={}", eg.get())
+        );
+        assert_eq!(
+            source_qs(&bare, edition, Some("3d-hsbs")),
+            format!("s={}", eg.get())
+        );
     }
 
     /// T121 — the epoch, when set, must reach the URLs a client is handed.
