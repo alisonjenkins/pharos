@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 1;
+const schemaVersion :UInt32 = 2;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -36,6 +36,7 @@ struct CallContext {
   uiAction      @2 :Text;
   clientVersion @3 :Text;
   device        @4 :DeviceId;
+  schemaVersion @5 :UInt32;    # the schemaVersion the client was built against; 0 = unset
 }
 
 struct Error {
