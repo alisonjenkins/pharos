@@ -107,7 +107,7 @@ call the same way, so 016 sees both ends.
 |---|---|---|
 | Span per request | `http.request` | `rpc.<interface>.<method>`, parented on the call context (FR-006); pipelined calls appear as children of the call they depend on, so a pipelined batch reads as one tree in Tempo |
 | Request id | `request_id` | `call_id` (connection id + question id), in span and logs |
-| RED counter | `http_requests_total{method,path,status}` | `pharos_rpc_calls_total{interface,method,outcome}` (outcome is a closed set from `Outcome::label()`: `ok`; one per `Error.kind` variant: `not_found`, `not_permitted`, `invalid`, `limit`, `revoked`, `unavailable`, `other`; `failed` for a transport/handler `capnp::Error`; `disconnected`; `cancelled`) |
+| RED counter | `http_requests_total{method,path,status}` | `pharos_rpc_calls_total{interface,method,outcome}` (outcome is a closed set from `Outcome::label()`: `ok`; one per `Error.kind` variant: `not_found`, `not_permitted`, `invalid`, `limit`, `revoked`, `unavailable`, `other`; `failed` for a transport/handler `capnp::Error`; `disconnected`; `unimplemented` (no handler for the method, e.g. a client ahead of the server); `cancelled`) |
 | Latency | `http_request_duration_seconds{method,path}` | `pharos_rpc_duration_seconds{interface,method}` (histogram; long-running methods added to `LONG_RUNNING_SECONDS`) |
 | Client abort | `http_client_aborted_total{method,path}` | `pharos_rpc_cancelled_total{interface,method}` (caller dropped or disconnected mid-call) |
 | Failure log | JSON line with status + cause | WARN/ERROR line per failed call: interface, method, error variant **and its cause value**, call_id, trace_id, user, device. Symmetric with success: the success path never records a field the failure path omits |
