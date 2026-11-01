@@ -118,7 +118,7 @@ method may exist without it (V173), so it precedes every story.
 
 Each extraction is one commit: service + its unit test, Jellyfin handler rewired (its tests unchanged and green), native method + `it_rpc` test.
 
-- [ ] T029 [US4] `services/library.rs::views` ← `api/jellyfin` views handler; `Library.views` — **COMMIT**
+- [x] T029 [US4] `services/library.rs::views` ← `api/jellyfin` views handler; `Library.views` — **COMMIT**
 - [ ] T030 [US4] `services/library.rs::latest` ← `items.rs latest_items`; `Library.latest` — **COMMIT**
 - [ ] T031 [US4] `services/library.rs::resume` ← `items.rs resume_items` (typed `Vec<MediaKind>` instead of raw query parsing); `Library.resume` — **COMMIT**
 - [ ] T032 [US4] `services/library.rs::next_up`; `Library.nextUp` — **COMMIT**
