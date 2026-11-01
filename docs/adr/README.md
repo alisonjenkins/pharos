@@ -70,3 +70,4 @@ optional **Alternatives considered** / **References**).
 | [0025](0025-kindle-conversion.md) | Kindle-format book conversion (boko, EPUB on delivery, derived state) | Accepted |
 | [0026](0026-client-capability-negotiation.md) | Playback decided by negotiating client against server capabilities | Accepted |
 | [0027](0027-unified-seek-model.md) | One seek model for DirectPlay and HLS | Accepted |
+| [0028](0028-native-api-for-first-party-clients.md) | pharos-ui and future pharos apps use a pharos-native (Cap'n Proto) API; Jellyfin API stays for third-party clients | Accepted |
