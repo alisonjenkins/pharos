@@ -71,3 +71,4 @@ optional **Alternatives considered** / **References**).
 | [0026](0026-client-capability-negotiation.md) | Playback decided by negotiating client against server capabilities | Accepted |
 | [0027](0027-unified-seek-model.md) | One seek model for DirectPlay and HLS | Accepted |
 | [0028](0028-native-api-for-first-party-clients.md) | pharos-ui and future pharos apps use a pharos-native (Cap'n Proto) API; Jellyfin API stays for third-party clients | Accepted |
+| [0029](0029-native-api-transport-and-session.md) | Native API transport: per-worker Cap'n Proto RPC over a WebSocket, sessions resumed from a cookie or device token, off by default | Accepted |
