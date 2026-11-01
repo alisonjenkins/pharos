@@ -276,4 +276,34 @@ impl TokenStore for SqliteStore {
             .map_err(map_sqlx)?;
         Ok(res.rows_affected())
     }
+
+    /// Revoke all of `user`'s session tokens but `keep` (a password change
+    /// keeps the caller's own session). API keys are left alone.
+    #[tracing::instrument(skip(self, keep), fields(user.id = %user.0.simple()))]
+    async fn revoke_sessions_except(&self, user: UserId, keep: Option<&str>) -> AuthResult<u64> {
+        let user_bytes = user.0.as_bytes().to_vec();
+        let not_api_key = format!("{}%", pharos_core::API_KEY_DEVICE_PREFIX);
+        let res = match keep {
+            Some(token) => {
+                sqlx::query(
+                    "DELETE FROM auth_tokens WHERE user_id = ? \
+                     AND device_id NOT LIKE ? AND token_hash <> ?",
+                )
+                .bind(user_bytes)
+                .bind(not_api_key)
+                .bind(crate::auth_token::hash(token))
+                .execute(self.pool())
+                .await
+            }
+            None => {
+                sqlx::query("DELETE FROM auth_tokens WHERE user_id = ? AND device_id NOT LIKE ?")
+                    .bind(user_bytes)
+                    .bind(not_api_key)
+                    .execute(self.pool())
+                    .await
+            }
+        }
+        .map_err(map_sqlx)?;
+        Ok(res.rows_affected())
+    }
 }

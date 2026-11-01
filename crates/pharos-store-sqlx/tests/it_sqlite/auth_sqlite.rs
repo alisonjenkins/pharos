@@ -102,6 +102,34 @@ async fn revoke_removes_token() {
 }
 
 #[tokio::test]
+async fn revoke_sessions_except_spares_only_the_kept_token_of_that_user() {
+    let s = fresh().await;
+    let a = record("ali", "h", false);
+    let b = record("bo", "h", false);
+    let (aid, bid) = (a.id, b.id);
+    s.create(a).await.unwrap();
+    s.create(b).await.unwrap();
+    let keep = s.issue(aid, "d1").await.unwrap();
+    let other = s.issue(aid, "d2").await.unwrap();
+    let bos = s.issue(bid, "d3").await.unwrap();
+    let key = s.issue(aid, "apikey:cli").await.unwrap();
+
+    let n = s
+        .revoke_sessions_except(aid, Some(keep.0.expose()))
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    s.resolve(keep.0.expose()).await.unwrap();
+    assert!(s.resolve(other.0.expose()).await.is_err());
+    s.resolve(bos.0.expose()).await.unwrap();
+
+    assert_eq!(s.revoke_sessions_except(aid, None).await.unwrap(), 1);
+    assert!(s.resolve(keep.0.expose()).await.is_err());
+    s.resolve(bos.0.expose()).await.unwrap();
+    s.resolve(key.0.expose()).await.unwrap();
+}
+
+#[tokio::test]
 async fn token_is_stored_hashed_not_plaintext() {
     // A DB/backup leak must not yield usable tokens: the row holds only a
     // SHA-256 hash (64 hex chars), never the raw token handed to the client.

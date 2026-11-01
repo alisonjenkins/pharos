@@ -1200,4 +1200,11 @@ impl TokenStore for AnyStore {
             AnyStore::Postgres(p) => p.revoke_tokens_by_device(user, device_id).await,
         }
     }
+
+    async fn revoke_sessions_except(&self, user: UserId, keep: Option<&str>) -> AuthResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.revoke_sessions_except(user, keep).await,
+            AnyStore::Postgres(p) => p.revoke_sessions_except(user, keep).await,
+        }
+    }
 }

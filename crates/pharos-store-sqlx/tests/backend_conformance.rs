@@ -179,6 +179,41 @@ where
         "resolving a value-revoked token must fail"
     );
 
+    // revoke_sessions_except spares only `keep`, and only for that user.
+    let keep = TokenStore::issue(&store, uid, "keep-device").await.unwrap();
+    let other = TokenStore::issue(&store, uid, "other-device")
+        .await
+        .unwrap();
+    let api_key = TokenStore::issue(&store, uid, "apikey:conformance")
+        .await
+        .unwrap();
+    let stranger_rec = user_record("conformance-stranger");
+    let stranger_id = stranger_rec.id;
+    UserStore::create(&store, stranger_rec).await.unwrap();
+    let stranger = TokenStore::issue(&store, stranger_id, "stranger-device")
+        .await
+        .unwrap();
+    let dropped = TokenStore::revoke_sessions_except(&store, uid, Some(keep.0.expose()))
+        .await
+        .unwrap();
+    assert_eq!(
+        dropped, 1,
+        "revoke_sessions_except must drop only the others"
+    );
+    TokenStore::resolve(&store, keep.0.expose()).await.unwrap();
+    assert!(TokenStore::resolve(&store, other.0.expose()).await.is_err());
+    TokenStore::resolve(&store, stranger.0.expose())
+        .await
+        .expect("another user's token must survive");
+    let dropped = TokenStore::revoke_sessions_except(&store, uid, None)
+        .await
+        .unwrap();
+    assert_eq!(dropped, 1, "None keeps nothing");
+    assert!(TokenStore::resolve(&store, keep.0.expose()).await.is_err());
+    TokenStore::resolve(&store, api_key.0.expose())
+        .await
+        .expect("an API key is not a session and must survive");
+
     // -----------------------------------------------------------------
     // 4. MediaStore
     // -----------------------------------------------------------------

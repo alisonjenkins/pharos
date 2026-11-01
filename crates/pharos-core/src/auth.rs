@@ -212,6 +212,10 @@ pub trait UserStore: Send + Sync {
     ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 }
 
+/// An API key is stored as an ordinary token whose `device_id` is this prefix
+/// plus the app name. Session-level revocation must not touch these.
+pub const API_KEY_DEVICE_PREFIX: &str = "apikey:";
+
 /// Persistence of session tokens.
 pub trait TokenStore: Send + Sync {
     fn issue(
@@ -247,6 +251,17 @@ pub trait TokenStore: Send + Sync {
         &self,
         user: UserId,
         device_id: &str,
+    ) -> impl std::future::Future<Output = AuthResult<u64>> + Send;
+
+    /// Revoke every session token `user` holds except `keep` (all of them
+    /// when `keep` is `None`). API keys (`device_id` starting with
+    /// [`API_KEY_DEVICE_PREFIX`]) are not sessions and are never touched.
+    /// Returns the number of rows dropped. A `keep` that is not one of the
+    /// user's tokens spares nothing.
+    fn revoke_sessions_except(
+        &self,
+        user: UserId,
+        keep: Option<&str>,
     ) -> impl std::future::Future<Output = AuthResult<u64>> + Send;
 }
 
