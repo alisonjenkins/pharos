@@ -59,14 +59,17 @@ SameSite=Strict` out); the token is an ordinary ADR-0011 device token. A
 native app keeps the device token from `Bootstrap.login` or Quick Connect.
 `Bootstrap.resume(deviceToken)` resolves the token, or the upgrade's cookie
 when it is empty, on every call, so a revocation takes effect at the next
-resume.
+resume. A session already open does not yet notice its token being revoked;
+T025a closes it.
 
 `resume` always answers with a `Session` capability plus a `status`. A
-refused session is the generated `Revoked` handler, which fails every call
-with `Error.kind.revoked`, and its capability getters return `Revoked`
-capabilities. So a pipelined call still costs one flight, and it is counted
-`revoked`, not `unimplemented`. A token-store outage answers `unavailable`,
-not `revoked` (B216).
+refused session is the generated `Refused` handler carrying a `Denial`
+(revoked, unavailable or limit). Every call fails with that same error,
+and its capability getters return `Refused` capabilities carrying it. So a
+pipelined call still costs one flight, and it is counted under the denial's
+kind, not `unimplemented`. A token-store outage answers `unavailable`, not
+`revoked` (B216), on `status` and on every call. Reasons sent to the client
+are fixed strings; a backend's error text is logged server-side only.
 
 **Off by default.** Every push to main deploys (ADR-0010), so the routes
 exist only when `[server.native_api].enabled = true`. Startup logs the state
