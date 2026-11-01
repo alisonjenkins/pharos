@@ -180,7 +180,7 @@ async fn deliver_attachment(
         .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type(content_type)
-        .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+        .insert_header((header::CACHE_CONTROL, "private, max-age=86400"))
         .body(bytes))
 }
 
@@ -227,7 +227,7 @@ async fn deliver_ass(
     let ass_body = |bytes: Vec<u8>| {
         HttpResponse::Ok()
             .content_type("text/x-ssa; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
             .body(bytes)
     };
 
@@ -685,7 +685,7 @@ async fn deliver_srt(
     let srt_response = |bytes: Vec<u8>| {
         HttpResponse::Ok()
             .content_type("application/x-subrip; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
             .body(bytes)
     };
 
@@ -994,7 +994,7 @@ async fn deliver_js(
     let body = webvtt_to_track_events_json(&vtt);
     Ok(HttpResponse::Ok()
         .content_type("application/json; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
         .body(body))
 }
 
@@ -1271,7 +1271,7 @@ fn vtt_response(mut body: Vec<u8>, style_lossy: bool, style: &SubtitleStyle) -> 
     let mut builder = HttpResponse::Ok();
     builder
         .content_type("text/vtt; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"));
+        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"));
     if style_lossy {
         builder.insert_header(("X-Subtitle-Style-Lossy", "true"));
     }
@@ -1616,7 +1616,7 @@ async fn serve_sidecar(
                 .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
             Ok(HttpResponse::Ok()
                 .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                 .body(bytes))
         }
         SidecarKind::Convert => {
@@ -1632,7 +1632,7 @@ async fn serve_sidecar(
                 {
                     return Ok(HttpResponse::Ok()
                         .content_type("text/vtt; charset=utf-8")
-                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                         .body((*bytes).clone()));
                 }
                 let lock = cache
@@ -1645,7 +1645,7 @@ async fn serve_sidecar(
                 {
                     return Ok(HttpResponse::Ok()
                         .content_type("text/vtt; charset=utf-8")
-                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                         .body((*bytes).clone()));
                 }
                 let out = run_ffmpeg_srt_to_vtt(input).await?;
@@ -1654,13 +1654,13 @@ async fn serve_sidecar(
                     .await;
                 return Ok(HttpResponse::Ok()
                     .content_type("text/vtt; charset=utf-8")
-                    .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                    .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                     .body((*stored).clone()));
             }
             let out = run_ffmpeg_srt_to_vtt(input).await?;
             Ok(HttpResponse::Ok()
                 .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                 .body(out))
         }
     }
