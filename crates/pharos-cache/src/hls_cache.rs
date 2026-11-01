@@ -9762,6 +9762,48 @@ mod tests {
         );
     }
 
+    /// A grouped edition shares its primary's media id. Its audio session must
+    /// still be its own: a shared directory serves whichever file's audio
+    /// started first to both. The primary's directory stays where it was.
+    #[tokio::test]
+    async fn an_edition_and_its_primary_open_distinct_audio_sessions() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let primary = cache
+            .ensure_audio_hls_covering(
+                Path::new("/media/film.mkv"),
+                None,
+                7,
+                None,
+                Some(128_000),
+                0,
+            )
+            .await
+            .unwrap();
+        let edition = cache
+            .ensure_audio_hls_covering(
+                Path::new("/media/film-3d.mkv"),
+                Some("3d"),
+                7,
+                None,
+                Some(128_000),
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(primary, cache.root.join("_audiohls").join("7-a0-b128"));
+        let gen = SourceGen::for_read(Path::new("/media/film-3d.mkv"), Some("3d"));
+        assert_eq!(
+            edition,
+            cache
+                .root
+                .join("_audiohls")
+                .join(format!("7-a0-b128-g{}", gen.get())),
+            "the edition's audio session must be keyed by its source generation"
+        );
+    }
+
     #[tokio::test]
     async fn audio_hls_file_waits_for_a_segment_produced_after_a_delay() {
         let td = TempDir::new().unwrap();
