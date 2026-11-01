@@ -252,6 +252,20 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         ..Default::default()
     }];
     pharos_core::MediaStore::put(&sqlite, tagged).await.unwrap();
+    // A 2D title with a grouped 3D edition: the edition list and the
+    // derived has_3d flag must survive the copy, or the version picker and
+    // the Is3D filter lose the 3D rip after a backend move.
+    let mut with_3d = media_item(9_002, "Edition Movie", MediaKind::Movie);
+    with_3d.probe.alternate_sources = vec![pharos_core::AlternateMediaSource {
+        id: "3d-hsbs".into(),
+        path: "/media/migrate/9002 - 3D.HSBS.mkv".into(),
+        name: Some("3D HSBS".into()),
+        video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
+        ..Default::default()
+    }];
+    pharos_core::MediaStore::put(&sqlite, with_3d)
+        .await
+        .unwrap();
 
     // A stored sort name that differs from sort_name(title) must be carried
     // verbatim; a NULL one (not yet backfilled) is derived from the title.
@@ -337,6 +351,24 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .await
         .unwrap();
     assert_eq!(pg_item.title, "Migrate Movie");
+
+    let pg_editions = pharos_core::MediaStore::get(&postgres, 9_002)
+        .await
+        .unwrap();
+    assert_eq!(
+        pg_editions.probe.alternate_sources.len(),
+        1,
+        "grouped editions must be copied"
+    );
+    assert_eq!(
+        pg_editions.probe.alternate_sources[0].video_3d_format,
+        Some(pharos_core::Video3DFormat::HalfSideBySide)
+    );
+    let (has_3d,): (i64,) = sqlx::query_as("SELECT has_3d FROM media_items WHERE id = 9002")
+        .fetch_one(postgres.pool())
+        .await
+        .unwrap();
+    assert_eq!(has_3d, 1, "has_3d must be copied, not reset to its default");
     assert_eq!(
         pg_item.metadata.overview.as_deref(),
         Some("A movie about migrating.")
