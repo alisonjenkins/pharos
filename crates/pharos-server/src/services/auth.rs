@@ -39,6 +39,10 @@ pub async fn user_for_token(stores: &Stores, token: &str) -> Result<User, TokenR
         .get(uid)
         .await
         .map_err(|e| classify(e, TokenRefusal::UserRevoked))?;
+    // A disabled user's tokens stop working, not only their password.
+    if record.policy.is_disabled {
+        return Err(TokenRefusal::UserRevoked);
+    }
     Ok(record.into_user())
 }
 
@@ -96,6 +100,33 @@ mod tests {
         assert_eq!(
             user_for_token(&stores, "nope").await.unwrap_err(),
             TokenRefusal::InvalidToken
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_disabled_users_token_is_refused() {
+        use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let hash = crate::auth::BuiltinAuth::new(stores.clone())
+            .hash_password(&SecretString::new("p"))
+            .unwrap();
+        let id = UserId::new();
+        stores
+            .create(UserRecord {
+                id,
+                name: "off".into(),
+                password_hash: hash,
+                policy: UserPolicy {
+                    is_disabled: true,
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let token = stores.issue(id, "dev").await.unwrap();
+        assert_eq!(
+            user_for_token(&stores, token.0.expose()).await.unwrap_err(),
+            TokenRefusal::UserRevoked
         );
     }
 }
