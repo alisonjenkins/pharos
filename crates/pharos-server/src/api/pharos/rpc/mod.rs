@@ -56,12 +56,14 @@ pub fn configure(
 }
 
 /// Logs and publishes whether the native API is served; call once at startup.
-/// When it is, also starts every call's RED series at zero, so `rate()` works
-/// from the first scrape.
+/// When it is, also starts every call's RED series at zero (so `rate()` works
+/// from the first scrape) and parents call spans on the caller's
+/// `traceparent`.
 pub fn record_state(cfg: &NativeApiConfig) {
     metrics::gauge!("pharos_native_api_enabled").set(f64::from(u8::from(cfg.enabled)));
     if cfg.enabled {
         pharos_api::register_metrics();
+        pharos_api::set_trace_parent_hook(crate::obs::rpc_trace_parent);
     }
     tracing::info!(
         enabled = cfg.enabled,
