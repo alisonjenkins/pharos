@@ -24,10 +24,13 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 async fn tile(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<(String, u32, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, width, tile_index) = path.into_inner();
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id_num, "trickplay").await?;
 
     if !state.trickplay_widths.contains(&width) {
         return Err(error::ErrorNotFound("unknown trickplay width"));
@@ -37,8 +40,6 @@ async fn tile(
         .as_ref()
         .ok_or_else(|| error::ErrorNotFound("trickplay disabled"))?;
 
-    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
-        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = state.stores.get(id_num).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),

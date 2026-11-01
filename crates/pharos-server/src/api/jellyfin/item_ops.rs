@@ -113,11 +113,12 @@ struct MetadataEditorInfoDto {
 
 async fn metadata_editor(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -772,11 +773,12 @@ async fn remote_subtitle_search(
 /// Start}] }`, `Start` in ticks).
 async fn get_lyrics(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -867,16 +869,18 @@ async fn instant_mix(
     use pharos_core::MediaQuery;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let seed = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    let mq = MediaQuery {
+    let mut mq = MediaQuery {
         kinds: vec![seed.kind],
         limit: Some(limit + 1), // +1 so dropping the seed still fills the page
         ..Default::default()
     };
+    items::apply_policy_scope(&mut mq, &user.0.policy, &state.parental_ratings);
     let (rows, _total) = state
         .stores
         .query(&mq)

@@ -153,6 +153,9 @@ async fn playlist_items(
             resolved.push((e.entry_id, item));
         }
     }
+    crate::services::access::retain_visible(&state, &user.0, &mut resolved, |r| r.1.id, "playlist")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let media: Vec<pharos_core::MediaItem> = resolved.iter().map(|(_, m)| m.clone()).collect();
     let total = media.len() as u32;
     let page = items::build_items_page(&state, user.0.id, &media, total, 0).await?;
@@ -182,7 +185,7 @@ struct AddItemsQuery {
 /// `POST /Playlists/{id}/Items?Ids=` — append media ids (each a new entry).
 async fn add_items(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<AddItemsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -191,6 +194,9 @@ async fn add_items(
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
     let ids = items::parse_id_csv(q.ids.as_deref());
+    for id in &ids {
+        crate::api::jellyfin::require_item_access(&state, &user.0, *id, "playlist").await?;
+    }
     let added = state
         .stores
         .add_playlist_items(&wire_id, &ids)

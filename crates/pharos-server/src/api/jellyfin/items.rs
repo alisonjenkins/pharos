@@ -572,9 +572,10 @@ async fn items_similar(
         // pages put in "More Like This"); other synth families (library /
         // series / season / genre) keep the empty result.
         Err(_) => {
-            return music_similar(&state, &id_str, &q).await;
+            return music_similar(&state, &user.0, &id_str, &q).await;
         }
     };
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let all = state
         .list_items_cached()
         .await
@@ -593,6 +594,9 @@ async fn items_similar(
         .map(|i| (similarity_score(target, i), i))
         .filter(|(s, _)| *s > 0)
         .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut scored, |s| s.1.id, "similar")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
     let picks: Vec<&MediaItem> = scored
         .iter()
@@ -633,15 +637,25 @@ async fn items_similar(
 /// overlap across their tracks. Unknown synth families → empty.
 async fn music_similar(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
     q: &SimilarQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     let empty = || crate::api::jellyfin::wire::query_result(Vec::<serde_json::Value>::new(), 0, 0);
-    let all = state
+    let mut all = state
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Both the target and its neighbours come from tracks `user` may reach
+    // (V187).
+    if !user.policy.enable_all_folders {
+        let mut visible: Vec<MediaItem> = all.as_ref().clone();
+        crate::services::access::retain_visible(state, user, &mut visible, |t| t.id, "similar")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        all = std::sync::Arc::new(visible);
+    }
     // B92 — canonicalise the dashed synth album/artist id the kotlin SDK sends
     // so it matches the dashless `album_id_for`/`artist_id_for` hash below.
     let wanted = canonical_wire_id(id_str).to_ascii_lowercase();
@@ -1478,7 +1492,7 @@ async fn list_collections(
 /// box set) are never box-set members, so they yield an empty result.
 async fn item_collections(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
@@ -1486,6 +1500,7 @@ async fn item_collections(
     let canonical = canonical_wire_id(&raw);
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
         state.stores.get(id).await.map_err(|e| match e {
             pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
             other => error::ErrorInternalServerError(other.to_string()),
@@ -1905,6 +1920,9 @@ async fn shows_episodes(
             })
         })
         .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut eps, |e| e.1.id, "series")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     eps.sort_by_key(|(_, e)| {
         let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
         let n = e
@@ -1967,7 +1985,7 @@ async fn shows_episodes(
 /// Season folder items, ordered by season number.
 async fn shows_seasons(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
@@ -1981,18 +1999,21 @@ async fn shows_seasons(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // One representative SeriesInfo per season number (BTreeMap → ascending),
     // plus the episode count per season (B93 — the Season DTO's ChildCount).
+    let mut episodes: Vec<&MediaItem> = all
+        .iter()
+        .filter(|item| matches!(item.kind, MediaKind::Episode))
+        .filter(|item| {
+            item.series.as_ref().is_some_and(|s| {
+                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+            })
+        })
+        .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut episodes, |e| e.id, "series")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
     let mut episode_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    for item in all.iter() {
-        if !matches!(item.kind, MediaKind::Episode) {
-            continue;
-        }
-        let Some(series) = item.series.as_ref() else {
-            continue;
-        };
-        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) != series_id {
-            continue;
-        }
+    for series in episodes.iter().filter_map(|e| e.series.as_ref()) {
         let Some(n) = series.season_number else {
             continue;
         };
@@ -2498,6 +2519,7 @@ async fn playback_info(
     // Canonical wire form regardless of which shape the caller sent —
     // TranscodingUrl / MediaSource.Id must round-trip consistently.
     let id_str = pharos_jellyfin_api::dto::wire_item_id(id);
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "playback").await?;
     let body = body.map(web::Json::into_inner);
     let requested_source = crate::api::jellyfin::media_source::requested_id(req.query_string())
         .or_else(|| body.as_ref().and_then(|b| b.media_source_id.clone()));
@@ -5452,7 +5474,7 @@ fn sort_chain(
 /// ceiling (`MaxParentalRating`). Applied to the query (not a post-filter) so
 /// `TotalRecordCount` and paging stay honest. A no-op for an unrestricted
 /// (default) policy.
-fn apply_policy_scope(
+pub(crate) fn apply_policy_scope(
     mq: &mut pharos_core::MediaQuery,
     policy: &pharos_core::UserPolicy,
     ratings: &crate::parental::ParentalRatingMap,
@@ -6376,8 +6398,11 @@ async fn synth_genre(
     ))
 }
 
+/// An album or artist is shown to `user` only through tracks they may reach
+/// (V187); with none, it answers 404 like an unknown id.
 async fn synth_album_or_artist(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -6391,10 +6416,16 @@ async fn synth_album_or_artist(
             .list_items_cached()
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        let tracks: Vec<_> = all
+        let mut tracks: Vec<_> = all
             .iter()
             .filter(|i| i.probe.album.as_deref() == Some(name.as_str()))
             .collect();
+        crate::services::access::retain_visible(state, user, &mut tracks, |t| t.id, "album")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        if tracks.is_empty() {
+            return Err(error::ErrorNotFound("not found"));
+        }
         let artist = tracks.iter().find_map(|i| {
             i.probe
                 .album_artist
@@ -6439,6 +6470,23 @@ async fn synth_album_or_artist(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if let Some(name) = artists.iter().find(|n| artist_id_for(n) == id_str) {
+        let all = state
+            .list_items_cached()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let mut tracks: Vec<_> = all
+            .iter()
+            .filter(|i| {
+                i.probe.artist.as_deref() == Some(name.as_str())
+                    || i.probe.album_artist.as_deref() == Some(name.as_str())
+            })
+            .collect();
+        crate::services::access::retain_visible(state, user, &mut tracks, |t| t.id, "artist")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        if tracks.is_empty() {
+            return Err(error::ErrorNotFound("not found"));
+        }
         // B78/V38 — typed SynthItemDto.
         return Ok(Some(
             serde_json::to_value(SynthItemDto {
@@ -6527,7 +6575,7 @@ async fn fetch_item_dto(
         }
         // T-fix-18: synth Series + Season DTOs derived from any Episode item
         // whose series_id / season_id matches (one `store.list()`).
-        if let Some(view) = synth_series_or_season(state, id_str).await? {
+        if let Some(view) = synth_series_or_season(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
@@ -6576,7 +6624,7 @@ async fn fetch_item_dto(
         // single items — a 400 here broke the whole music play flow (the
         // detail view aborted before the play button was wired). Same
         // one-way-hash recovery as `resolve_parent_filter`.
-        if let Some(view) = synth_album_or_artist(state, id_str).await? {
+        if let Some(view) = synth_album_or_artist(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         if let Some(view) = synth_genre(state, id_str).await? {
@@ -6588,6 +6636,7 @@ async fn fetch_item_dto(
         // and answered 400 "invalid id", which killed the genre page.
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(state, user, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -6702,6 +6751,7 @@ async fn item_ancestors(
     // Wire ids of the ancestors, nearest first.
     let mut chain: Vec<String> = Vec::new();
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
         let item = state.stores.get(id).await.map_err(|e| match e {
             pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
             other => internal(other),
@@ -6750,7 +6800,7 @@ async fn item_ancestors(
     for wire_id in &chain {
         let dto = match library_view_for_id(&state, &user.0.policy, wire_id).await {
             Some(view) => Some(view),
-            None => synth_series_or_season(&state, wire_id).await?,
+            None => synth_series_or_season(&state, &user.0, wire_id).await?,
         };
         out.extend(dto);
     }
@@ -7094,8 +7144,11 @@ async fn maybe_list_virtual_shows(
     )))
 }
 
+/// A series or season lives in one show folder, so one library: the episode
+/// that matched decides whether `user` may see it (V187).
 async fn synth_series_or_season(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
@@ -7111,6 +7164,7 @@ async fn synth_series_or_season(
             continue;
         };
         if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
+            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
             // B93 — count the series' distinct seasons + total episodes so the
             // detail DTO advertises ChildCount / RecursiveItemCount.
             let mut seasons = std::collections::HashSet::new();
@@ -7159,6 +7213,7 @@ async fn synth_series_or_season(
             season_n,
         ) == id_str
         {
+            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
             // B93 — episodes in this season → the Season DTO's ChildCount.
             let episode_count = all
                 .iter()
@@ -7379,11 +7434,14 @@ async fn resume_items(
         pharos_core::MediaKind::Book => "book",
         pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode => "video",
     };
-    let ids = state
+    let mut ids = state
         .stores
         .resumable_items(user.0.id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    crate::services::access::retain_visible(state, &user.0, &mut ids, |id| *id, "resume")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
     let mut ids_kept: Vec<pharos_core::MediaId> = Vec::with_capacity(ids.len());
     for id in &ids {

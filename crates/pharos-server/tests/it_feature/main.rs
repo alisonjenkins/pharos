@@ -4,6 +4,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod item_access;
 mod jellyfin_feature_inventory;
 mod jellyfin_feature_library_options;
 mod jellyfin_feature_metadata;

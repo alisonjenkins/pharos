@@ -67,13 +67,14 @@ const MAX_BINS: u32 = 2048;
 
 async fn get_waveform(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_str = path.into_inner();
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "waveform").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),

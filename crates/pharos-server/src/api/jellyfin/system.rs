@@ -1006,11 +1006,14 @@ struct SegmentTypesQuery {
 
 async fn media_segments(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<SegmentTypesQuery>,
-) -> impl Responder {
+) -> Result<HttpResponse, actix_web::Error> {
     let item_id = path.into_inner();
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&item_id) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
+    }
     let mut items = build_media_segments(&state, &item_id).await;
     // Honour `includeSegmentTypes` (comma-joined). A non-empty allow-list keeps
     // only those Types; an absent/blank param returns everything.
@@ -1025,7 +1028,7 @@ async fn media_segments(
         }
     }
     let total = items.len() as u32;
-    crate::api::jellyfin::wire::query_result(items, total, 0)
+    Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
 /// Whether this item has anything for a client to skip — a detected segment or
