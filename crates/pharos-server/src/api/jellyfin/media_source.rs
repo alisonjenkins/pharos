@@ -54,10 +54,6 @@ impl Requested {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Served {
     Primary,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no route can read an edition's file yet")
-    )]
     Alternate,
 }
 
@@ -145,11 +141,35 @@ pub(crate) fn record(
     }
 }
 
-/// Classify the request's `MediaSourceId` for `item` and record which file is
-/// served.
-pub(crate) fn select(route: Route, item: MediaItem, raw: Option<&str>) -> MediaItem {
-    let (requested, _alt) = classify(&item, raw);
-    record(route, &item, raw, requested, Served::Primary);
+/// Classify the request's `MediaSourceId` for `item` and return the file to
+/// serve: the edition's path and probe under the item's own id, or the item
+/// unchanged.
+///
+/// An id we cannot place, or an edition probed before its full probe was
+/// kept (ADR-0030), is served the primary rather than refused: a stale id
+/// after a rescan must not stop playback, and the `requested`/`served` pair
+/// says it happened.
+pub(crate) fn select(route: Route, mut item: MediaItem, raw: Option<&str>) -> MediaItem {
+    let (requested, alt) = classify(&item, raw);
+    let Some(alt) = alt else {
+        record(route, &item, raw, requested, Served::Primary);
+        return item;
+    };
+    let Some(probe) = alt.probe.as_deref().cloned() else {
+        tracing::info!(
+            media.id = item.id,
+            edition = %alt.id,
+            path = %alt.path.display(),
+            "edition has no stored probe (probed before schema v9); serving the primary until a rescan"
+        );
+        record(route, &item, raw, requested, Served::Primary);
+        return item;
+    };
+    let edition = alt.id.clone();
+    item.path = alt.path.clone();
+    item.probe = probe;
+    item.edition = Some(edition);
+    record(route, &item, raw, requested, Served::Alternate);
     item
 }
 
@@ -185,9 +205,79 @@ mod tests {
         item.probe.alternate_sources = vec![AlternateMediaSource {
             id: "3d-hsbs".into(),
             path: "/m/Film - 3D.HSBS.mkv".into(),
+            probe: Some(Box::new(pharos_core::MediaProbe {
+                duration_ms: Some(5_000),
+                video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
+                ..Default::default()
+            })),
             ..Default::default()
         }];
         item
+    }
+
+    fn served_label(
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+        requested: &str,
+    ) -> Option<String> {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, _)| {
+                let key = ck.key();
+                let label = |n: &str| {
+                    key.labels()
+                        .find(|l| l.key() == n)
+                        .map(|l| l.value().to_owned())
+                };
+                (key.name() == "pharos_media_source_selection_total"
+                    && label("requested").as_deref() == Some(requested))
+                .then(|| label("served"))
+                .flatten()
+            })
+    }
+
+    #[test]
+    fn select_swaps_in_the_editions_file_and_probe() {
+        let item = item_with_edition();
+        let raw = format!(
+            "{}-3d-hsbs",
+            pharos_jellyfin_api::dto::wire_item_id(item.id)
+        );
+        let got = select(Route::Hls, item, Some(&raw));
+        assert_eq!(got.id, 0x2a, "the item keeps its own id");
+        assert_eq!(got.path, std::path::PathBuf::from("/m/Film - 3D.HSBS.mkv"));
+        assert_eq!(got.probe.duration_ms, Some(5_000));
+        assert_eq!(got.edition.as_deref(), Some("3d-hsbs"));
+    }
+
+    #[test]
+    fn select_serves_the_primary_when_it_cannot_serve_the_edition() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let wire = pharos_jellyfin_api::dto::wire_item_id(0x2a);
+
+        let mut pre_v9 = item_with_edition();
+        pre_v9.probe.alternate_sources[0].probe = None;
+        let got = select(Route::Stream, pre_v9, Some(&format!("{wire}-3d-hsbs")));
+        assert_eq!(got.path, std::path::PathBuf::from("/m/Film.mkv"));
+        assert_eq!(got.edition, None);
+        assert_eq!(
+            served_label(&snapshotter, "alternate").as_deref(),
+            Some("primary")
+        );
+
+        let got = select(
+            Route::Stream,
+            item_with_edition(),
+            Some(&format!("{wire}-extended")),
+        );
+        assert_eq!(got.path, std::path::PathBuf::from("/m/Film.mkv"));
+        assert_eq!(
+            served_label(&snapshotter, "unknown").as_deref(),
+            Some("primary")
+        );
     }
 
     #[test]
@@ -216,6 +306,11 @@ mod tests {
         );
         // An edition id under another item's prefix is not this item's.
         assert_eq!(classify(&item, Some("2b-3d-hsbs")).0, Requested::Unknown);
+        // Some clients send the primary's id as a dashed GUID.
+        assert_eq!(
+            classify(&item, Some("00000000-0000-0000-0000-00000000002a")).0,
+            Requested::Primary
+        );
     }
 
     #[test]
@@ -269,7 +364,7 @@ mod tests {
                 .then(|| (label("served"), v))
             })
             .expect("selection counter recorded");
-        assert_eq!(hit.0.as_deref(), Some("primary"));
+        assert_eq!(hit.0.as_deref(), Some("alternate"));
         assert!(matches!(hit.1, DebugValue::Counter(1)), "got {:?}", hit.1);
     }
 }

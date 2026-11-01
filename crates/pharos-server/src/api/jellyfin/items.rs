@@ -2505,11 +2505,26 @@ async fn playback_info(
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
+    let edition_name =
+        crate::api::jellyfin::media_source::classify(&item, requested_source.as_deref())
+            .1
+            .and_then(|alt| alt.name.clone());
     let item = crate::api::jellyfin::media_source::select(
         crate::api::jellyfin::media_source::Route::PlaybackInfo,
         item,
         requested_source.as_deref(),
     );
+    // A request for one edition is answered with that edition alone, negotiated
+    // against its own probe, under the id the client asked for. Every URL handed
+    // back names it, or the stream and playlists would read the item's own file.
+    let source_id = match &item.edition {
+        Some(e) => format!("{id_str}-{e}"),
+        None => id_str.clone(),
+    };
+    let source_param = match &item.edition {
+        Some(_) => format!("&MediaSourceId={source_id}"),
+        None => String::new(),
+    };
     // 004-books / FR-010 — a book leaves here WITHOUT entering codec
     // negotiation. Returned before the trickplay nudge, the subtitle warm and
     // the device-profile evaluation below, because none of them mean anything
@@ -3046,10 +3061,11 @@ async fn playback_info(
     // the segment handlers reuse the cached Decision; B41 stream_selection +
     // B45/Lace video_bitrate_param ride through master → variant → segment.
     let master_url = format!(
-        "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}&renditions={renditions_param}{stream_selection}{video_bitrate_param}"
+        "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}&renditions={renditions_param}{stream_selection}{video_bitrate_param}{source_param}"
     );
-    let universal_audio_url =
-        format!("/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}");
+    let universal_audio_url = format!(
+        "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}{source_param}"
+    );
     let transcoding_url = match &decision {
         // Transcode: video → unified master; audio-only → universal endpoint.
         Decision::Transcode { .. } if is_video => Some(master_url.clone()),
@@ -3581,13 +3597,16 @@ async fn playback_info(
     );
 
     let primary_source = MediaSourceInfoDto {
-        id: id_str.clone(),
+        id: source_id,
         container: advertised_container.clone(),
         has_segments,
         e_tag: play_session_id.clone(),
         run_time_ticks: probe.run_time_ticks(),
         size: probe.size_bytes,
-        name: item.title.clone(),
+        name: match &item.edition {
+            Some(_) => edition_name.unwrap_or_else(|| item.title.clone()),
+            None => item.title.clone(),
+        },
         supports_direct_play: direct_play,
         supports_direct_stream,
         supports_transcoding: switches.transcoding,
