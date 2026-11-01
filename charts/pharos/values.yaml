@@ -124,6 +124,29 @@ config:
     # graceful stop. /readyz flips 503 immediately so the LB stops new traffic;
     # this window lets active segment/stream reads finish (zero-downtime deploy).
     drainGraceSecs: 10
+    # Reverse proxies whose X-Forwarded-For is believed, as IPs or CIDRs (the
+    # header is client-controlled, so only a listed direct peer is trusted).
+    # Empty: every client is its TCP peer, and the per-address login limit is
+    # OFF, because behind an unlisted ingress every client shares one address.
+    # Behind an ingress, list the address range it connects from.
+    trustedProxies: []
+    # [server.login_throttle] overrides; omitted keys keep the server's
+    # defaults (10 per user, 30 per address, 900 s window, 300 s backoff cap).
+    # Zero values are refused at startup.
+    loginThrottle: {}
+    #   maxFailuresPerUser: 10
+    #   maxFailuresPerIp: 30
+    #   windowSecs: 900
+    #   maxBackoffSecs: 300
+    # [server.native_api] (spec 017): the Cap'n Proto API at /pharos/rpc. Off
+    # unless enabled. allowedOrigins must list every browser origin allowed to
+    # connect, including the one pharos-ui is served from (exact match, no
+    # wildcards); native apps send no Origin.
+    nativeApi:
+      enabled: false
+      allowedOrigins: []
+      # maxConnectionsPerUser: 16
+      # revalidateSecs: 60
   # Track preferences a NEWLY created user starts with (Jellyfin has no
   # server-wide default, so without this every new account meets the same
   # wrong-language playback). Existing accounts are untouched; anyone can
