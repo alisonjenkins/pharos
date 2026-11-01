@@ -269,3 +269,50 @@ async fn enforce_max_parental_rating_filters_items() {
         "PG-13 item must be filtered for a max-rating-0 user"
     );
 }
+
+/// B241: the library list honours `EnabledFolders` too, not only the item
+/// queries: a user restricted to library A must not see library B's name.
+#[actix_web::test]
+async fn enforce_enabled_folders_filters_views() {
+    let f = seed_rich().await;
+    let g = guest(&f);
+    let body = json!({ "EnableAllFolders": false, "EnabledFolders": [f.lib_a_wire] });
+    assert_eq!(post_policy(&f, &g, body).await, 204);
+
+    let app = test::init_service(build_app(f.state.clone())).await;
+    for uri in [
+        format!("/Users/{g}/Views"),
+        format!("/UserViews?userId={g}"),
+        "/UserViews/GroupingOptions".to_owned(),
+        format!("/Users/{g}/GroupingOptions"),
+        "/Library/MediaFolders".to_owned(),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let list = v.get("Items").unwrap_or(&v).as_array().unwrap().clone();
+        let names: Vec<&str> = list.iter().filter_map(|it| it["Name"].as_str()).collect();
+        assert!(names.contains(&"Movies A"), "{uri}: {names:?}");
+        assert!(!names.contains(&"Movies B"), "{uri}: {names:?}");
+    }
+
+    // Nor does library B's own item fetch answer.
+    for uri in [
+        format!("/Items/{}", f.lib_b_wire),
+        format!("/Users/{g}/Items/{}", f.lib_b_wire),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        assert!(
+            !String::from_utf8_lossy(&body).contains("Movies B"),
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}

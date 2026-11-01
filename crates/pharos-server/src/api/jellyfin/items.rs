@@ -3845,11 +3845,11 @@ fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaIte
 
 async fn user_views(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     _path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     Ok(crate::api::jellyfin::wire::json(
-        &synth_views_body(&state).await,
+        &synth_views_body(&state, &user.0.policy).await,
     ))
 }
 
@@ -3862,11 +3862,11 @@ struct UserViewsQuery {
 
 async fn user_views_query(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     _q: CiQuery<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     Ok(crate::api::jellyfin::wire::json(
-        &synth_views_body(&state).await,
+        &synth_views_body(&state, &user.0.policy).await,
     ))
 }
 
@@ -3875,11 +3875,11 @@ async fn user_views_query(
 /// `SpecialViewOptionDto[]` (`{Name, Id}`). Every library view qualifies.
 async fn view_grouping_options(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     _q: CiQuery<UserViewsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     Ok(crate::api::jellyfin::wire::json(
-        &grouping_options(&state).await,
+        &grouping_options(&state, &user.0.policy).await,
     ))
 }
 
@@ -3887,16 +3887,19 @@ async fn view_grouping_options(
 /// [`view_grouping_options`] that jellyfin-web's legacy apiclient still calls.
 async fn user_view_grouping_options(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     _path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     Ok(crate::api::jellyfin::wire::json(
-        &grouping_options(&state).await,
+        &grouping_options(&state, &user.0.policy).await,
     ))
 }
 
-async fn grouping_options(state: &AppState) -> Vec<serde_json::Value> {
-    library_views(state)
+async fn grouping_options(
+    state: &AppState,
+    policy: &pharos_core::UserPolicy,
+) -> Vec<serde_json::Value> {
+    visible_views(state, policy)
         .await
         .into_iter()
         .map(|v| serde_json::json!({ "Name": v["Name"], "Id": v["Id"] }))
@@ -3910,8 +3913,8 @@ async fn grouping_options(state: &AppState) -> Vec<serde_json::Value> {
 ///
 /// Zero roots → single "All Media" placeholder so the sidebar still
 /// renders (used in tests that hit `AppState::new` without roots).
-async fn synth_views_body(state: &AppState) -> serde_json::Value {
-    let views = library_views(state).await;
+async fn synth_views_body(state: &AppState, policy: &pharos_core::UserPolicy) -> serde_json::Value {
+    let views = visible_views(state, policy).await;
     let count = views.len() as u32;
     serde_json::to_value(pharos_jellyfin_api::dto::ItemsResultDto {
         items: views,
@@ -3931,7 +3934,14 @@ fn wire_collection_type(ct: &str) -> serde_json::Value {
     }
 }
 
-async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
+/// B241: the library views `policy` lets its user see. Item queries already
+/// honour `EnabledFolders` ([`apply_policy_scope`]); without the filter here
+/// the list of libraries still named every one of them. Libraries are dropped
+/// before their image lookup, so a hidden one costs nothing.
+async fn visible_views(
+    state: &AppState,
+    policy: &pharos_core::UserPolicy,
+) -> Vec<serde_json::Value> {
     // LIB-C1 — prefer the typed libraries reconciled from config (each
     // carries its own CollectionType). The wire_id is the same
     // library_id_for_root hash a plain root would yield, so client URLs
@@ -3948,7 +3958,10 @@ async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
         // image. The first call warms the whole synth map, so the rest are memo
         // hits — a handful of libraries, one scan.
         let mut out = Vec::with_capacity(libs.len());
-        for lib in libs {
+        for lib in libs
+            .into_iter()
+            .filter(|l| policy.allows_library(&l.wire_id))
+        {
             let image_tags =
                 crate::api::jellyfin::images::synth_primary_tag(state, &lib.wire_id).await;
             out.push({
@@ -3972,13 +3985,22 @@ async fn library_views(state: &AppState) -> Vec<serde_json::Value> {
         return out;
     }
     if state.media_roots.is_empty() {
-        return vec![all_media_placeholder(&state.server_id)];
+        let placeholder = all_media_placeholder(&state.server_id);
+        let allowed = placeholder["Id"]
+            .as_str()
+            .is_some_and(|id| policy.allows_library(id));
+        return if allowed {
+            vec![placeholder]
+        } else {
+            Vec::new()
+        };
     }
     // Fallback: synthesise one `mixed` library per configured root (the
     // legacy shape — used by tests that only call `with_media_roots`).
     state
         .media_roots
         .iter()
+        .filter(|root| policy.allows_library(&library_id_for_root(root)))
         .map(|root| {
             let id = library_id_for_root(root);
             let name = root
@@ -4031,9 +4053,9 @@ pub fn library_id_for_root(path: &std::path::Path) -> String {
 
 async fn media_folders(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let views = library_views(&state).await;
+    let views = visible_views(&state, &user.0.policy).await;
     let count = views.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(views, count, 0))
 }
@@ -6422,7 +6444,7 @@ async fn get_item(
     q: CiQuery<ItemDetailQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    fetch_item_dto(&state, &id_str, user.0.id, q.0.fields.as_deref()).await
+    fetch_item_dto(&state, &id_str, &user.0, q.0.fields.as_deref()).await
 }
 
 async fn get_user_item(
@@ -6436,15 +6458,16 @@ async fn get_user_item(
     if user_path != bearer_id {
         return Err(error::ErrorForbidden("user mismatch"));
     }
-    fetch_item_dto(&state, &item_id, user.0.id, q.0.fields.as_deref()).await
+    fetch_item_dto(&state, &item_id, &user.0, q.0.fields.as_deref()).await
 }
 
 async fn fetch_item_dto(
     state: &AppState,
     id_str: &str,
-    user_id: UserId,
+    user: &pharos_core::User,
     fields: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let user_id = user.id;
     // B85 — accept the dashed synth id the kotlin SDK sends: every synth /
     // entity resolution below compares against the dashless stored form, so a
     // dashed series/season/collection id would 404 the detail fetch and dead-end
@@ -6460,10 +6483,10 @@ async fn fetch_item_dto(
     let numeric_id: Option<u64> = pharos_jellyfin_api::dto::parse_item_id(id_str);
     if numeric_id.is_none() {
         // T-fix-7 follow-up: synthesised library CollectionFolder ids.
-        if let Some(view) = library_view_for_id(state, id_str).await {
+        if let Some(view) = library_view_for_id(state, &user.policy, id_str).await {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
-        if id_str == "00000000000000000000000000000000" {
+        if id_str == "00000000000000000000000000000000" && user.policy.allows_library(id_str) {
             return Ok(crate::api::jellyfin::wire::json(&all_media_placeholder(
                 &state.server_id,
             )));
@@ -6633,7 +6656,7 @@ async fn fetch_item_dto(
 /// yield an empty array.
 async fn item_ancestors(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
@@ -6691,7 +6714,7 @@ async fn item_ancestors(
 
     let mut out: Vec<serde_json::Value> = Vec::with_capacity(chain.len());
     for wire_id in &chain {
-        let dto = match library_view_for_id(&state, wire_id).await {
+        let dto = match library_view_for_id(&state, &user.0.policy, wire_id).await {
             Some(view) => Some(view),
             None => synth_series_or_season(&state, wire_id).await?,
         };
@@ -6702,8 +6725,12 @@ async fn item_ancestors(
 
 /// If `id_str` matches the library id of any configured root, return
 /// the same CollectionFolder JSON that `/Users/{u}/Views` emits.
-async fn library_view_for_id(state: &AppState, id_str: &str) -> Option<serde_json::Value> {
-    library_views(state)
+async fn library_view_for_id(
+    state: &AppState,
+    policy: &pharos_core::UserPolicy,
+    id_str: &str,
+) -> Option<serde_json::Value> {
+    visible_views(state, policy)
         .await
         .into_iter()
         .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
