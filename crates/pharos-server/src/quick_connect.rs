@@ -70,8 +70,9 @@ pub struct PendingRequest {
     pub created_unix_secs: i64,
     /// Set once an authorized user vouches for the code.
     pub authorized_by: Option<UserId>,
-    /// Initiating client address (IPv6 on its /64), for the per-address cap.
-    pub client: IpAddr,
+    /// Initiating client address (IPv6 on its /64) for the per-address cap;
+    /// `None` when the server cannot tell clients apart (no trusted proxies).
+    pub client: Option<IpAddr>,
 }
 
 impl PendingRequest {
@@ -121,7 +122,7 @@ pub enum QcMsg {
         device_name: String,
         app_name: String,
         app_version: String,
-        client_ip: IpAddr,
+        client_ip: Option<IpAddr>,
         reply: oneshot::Sender<Result<PendingRequest, QcRefusal>>,
     },
     Authorize {
@@ -220,8 +221,10 @@ impl QuickConnectRegistry {
                         client_ip,
                         reply,
                     } => {
-                        let client = crate::auth::ip_key(client_ip);
-                        let ip_live = by_secret.values().filter(|e| e.client == client).count();
+                        let client = client_ip.map(crate::auth::ip_key);
+                        let ip_live = client.map_or(0, |c| {
+                            by_secret.values().filter(|e| e.client == Some(c)).count()
+                        });
                         let cap_hit = if ip_live >= MAX_PENDING_PER_IP {
                             Some((QcRefusal::IpCap, ip_live, MAX_PENDING_PER_IP))
                         } else if by_secret.len() >= MAX_PENDING {
@@ -233,7 +236,7 @@ impl QuickConnectRegistry {
                             refusal.record();
                             tracing::warn!(
                                 reason = refusal.label(),
-                                client_ip = %client,
+                                client_ip = client.map(tracing::field::display),
                                 live,
                                 cap,
                                 "quickconnect: initiate refused, pending cap reached"
@@ -365,7 +368,7 @@ fn mint_pending(
     device_name: String,
     app_name: String,
     app_version: String,
-    client: IpAddr,
+    client: Option<IpAddr>,
     by_code: &HashMap<String, String>,
     fill: FillRandom,
 ) -> Result<PendingRequest, getrandom::Error> {
@@ -493,7 +496,7 @@ mod tests {
                 device_name: "Living Room TV".into(),
                 app_name: "Jellyfin Android TV".into(),
                 app_version: "0.18".into(),
-                client_ip: ip(1),
+                client_ip: Some(ip(1)),
                 reply: tx,
             })
             .await
@@ -578,7 +581,7 @@ mod tests {
                 device_name: "Living Room TV".into(),
                 app_name: "Jellyfin Android TV".into(),
                 app_version: "0.18".into(),
-                client_ip: ip(1),
+                client_ip: Some(ip(1)),
                 reply: tx,
             })
             .await
@@ -654,7 +657,7 @@ mod tests {
                 "tv".into(),
                 "app".into(),
                 "1.0".into(),
-                ip(1),
+                Some(ip(1)),
                 &by_code,
                 getrandom::fill,
             )
@@ -674,7 +677,7 @@ mod tests {
 
     async fn initiate_from(
         reg: &QuickConnectRegistry,
-        client_ip: IpAddr,
+        client_ip: impl Into<Option<IpAddr>>,
     ) -> Result<PendingRequest, QcRefusal> {
         let (tx, rx) = oneshot::channel();
         reg.tx
@@ -683,7 +686,7 @@ mod tests {
                 device_name: "tv".into(),
                 app_name: "app".into(),
                 app_version: "1".into(),
-                client_ip,
+                client_ip: client_ip.into(),
                 reply: tx,
             })
             .await
@@ -726,6 +729,16 @@ mod tests {
         // another client is unaffected
         initiate_from(&reg, ip(2)).await.unwrap();
         assert_eq!(refused_count(&rec, "ip_cap"), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_known_client_address_there_is_no_per_ip_cap() {
+        // Behind an unlisted ingress every client shares one peer address, so
+        // the handler passes `None` and a per-address cap would lock everyone out.
+        let reg = QuickConnectRegistry::spawn();
+        for _ in 0..MAX_PENDING_PER_IP * 2 {
+            initiate_from(&reg, None).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -947,7 +960,7 @@ mod tests {
                 device_name: "tv".into(),
                 app_name: "app".into(),
                 app_version: "1".into(),
-                client_ip: ip(1),
+                client_ip: Some(ip(1)),
                 reply: tx,
             })
             .await
@@ -1010,7 +1023,7 @@ mod tests {
             created_at: Instant::now() - Duration::from_secs(400),
             created_unix_secs: 0,
             authorized_by: None,
-            client: ip(1),
+            client: Some(ip(1)),
         };
         assert!(entry.expired(Instant::now()));
     }
