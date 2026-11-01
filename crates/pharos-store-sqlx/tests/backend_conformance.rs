@@ -40,6 +40,7 @@ fn media_item(id: MediaId, title: &str) -> MediaItem {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }
 }
 

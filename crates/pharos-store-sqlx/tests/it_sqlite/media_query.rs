@@ -78,6 +78,7 @@ fn synth_item(id: u64) -> MediaItem {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }
 }
 

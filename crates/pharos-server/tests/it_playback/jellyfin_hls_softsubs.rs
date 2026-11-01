@@ -55,6 +55,7 @@ async fn seed_with_subs(tracks: Vec<SubtitleTrack>) -> (web::Data<AppState>, Str
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();

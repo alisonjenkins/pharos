@@ -73,6 +73,7 @@ async fn seed(dir: &std::path::Path) -> (web::Data<AppState>, String, std::path:
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();
@@ -277,6 +278,7 @@ async fn download_is_not_restricted_to_books() {
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();

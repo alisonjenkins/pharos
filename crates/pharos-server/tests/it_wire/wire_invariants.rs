@@ -104,6 +104,7 @@ async fn silent_video_emits_no_audio_stream_in_playback_info() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -148,6 +149,7 @@ async fn container_alias_is_a_single_known_token() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -206,6 +208,7 @@ async fn direct_play_omits_transcoding_sub_protocol() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -273,6 +276,7 @@ async fn synth_ids_route_via_items_endpoint() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }];
     let (state, token) = seed_with_items(items).await;
     // Add a configured root so library ids exist.
@@ -339,6 +343,7 @@ async fn item_dto_keys_are_pascal_case() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;
@@ -409,6 +414,7 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }])
     .await;
     let app = test::init_service(build_app(state)).await;

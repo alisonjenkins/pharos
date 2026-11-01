@@ -58,6 +58,7 @@ async fn seed() -> (web::Data<AppState>, String) {
                 match_source: None,
                 match_confidence: None,
                 metadata_refreshed_at: None,
+                edition: None,
             }
         };
     let items = [

@@ -92,6 +92,7 @@ async fn seed_with_fixture(
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();

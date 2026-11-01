@@ -104,6 +104,10 @@ pub struct MediaItem {
     /// Unix-seconds of the last successful enrichment write; drives the TTL
     /// that stops already-matched items being re-fetched every pass.
     pub metadata_refreshed_at: Option<i64>,
+    /// The grouped edition (`AlternateMediaSource::id`) whose file and probe
+    /// this value carries, when a playback request selected one. Never
+    /// persisted: a store read always yields the primary, with `None`.
+    pub edition: Option<String>,
 }
 
 impl MediaItem {

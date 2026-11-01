@@ -39,6 +39,7 @@ fn book(id: MediaId, title: &str, book: Option<BookMeta>) -> MediaItem {
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }
 }
 

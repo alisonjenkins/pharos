@@ -1525,6 +1525,7 @@ impl<P: Prober> FsScanner<P> {
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
     }
 
@@ -1617,6 +1618,7 @@ impl<P: Prober> FsScanner<P> {
                     match_source: None,
                     match_confidence: None,
                     metadata_refreshed_at: None,
+                    edition: None,
                 })
             }
             Err(err) => {

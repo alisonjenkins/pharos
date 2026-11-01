@@ -57,6 +57,7 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();
@@ -235,6 +236,7 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();
@@ -310,6 +312,7 @@ async fn resume_list_filters_by_media_types() {
                 match_source: None,
                 match_confidence: None,
                 metadata_refreshed_at: None,
+                edition: None,
             })
             .await
             .unwrap();

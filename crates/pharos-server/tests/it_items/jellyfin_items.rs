@@ -491,6 +491,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
             match_source: None,
             match_confidence: None,
             metadata_refreshed_at: None,
+            edition: None,
         })
         .await
         .unwrap();

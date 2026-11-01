@@ -3229,6 +3229,7 @@ impl MediaRow {
             match_source: self.match_source,
             match_confidence: self.match_confidence,
             metadata_refreshed_at: self.metadata_refreshed_at,
+            edition: None,
         })
     }
 }

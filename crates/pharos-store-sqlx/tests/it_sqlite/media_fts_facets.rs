@@ -44,6 +44,7 @@ fn item(id: u64, title: &str, overview: Option<&str>, kind: MediaKind) -> MediaI
         match_source: None,
         match_confidence: None,
         metadata_refreshed_at: None,
+        edition: None,
     }
 }
 
