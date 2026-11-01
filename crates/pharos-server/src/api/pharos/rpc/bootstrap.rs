@@ -55,7 +55,13 @@ impl Bootstrap {
             .sign_in(&mut self.ctx.slot.borrow_mut(), user.id, u32::MAX);
         self.ctx.remember_token(token.clone(), user.id);
         self.conn.set_user(&user.name);
-        let session = Session::new(self.state.clone(), Rc::clone(&self.ctx), user, token);
+        let session = Session::new(
+            self.state.clone(),
+            Rc::clone(&self.ctx),
+            Rc::clone(&self.conn),
+            user,
+            token,
+        );
         server::session::client(session, &self.conn)
     }
 }

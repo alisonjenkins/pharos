@@ -23,7 +23,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::common::{seed_rich, Fixture};
 
-async fn start() -> (actix_test::TestServer, Fixture) {
+pub(crate) async fn start() -> (actix_test::TestServer, Fixture) {
     start_with(NonZeroU32::MIN).await
 }
 
@@ -47,7 +47,7 @@ async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fix
 
 /// A capnp client over the socket, and the description of the close frame
 /// the server sends, if it sends one.
-async fn connect(
+pub(crate) async fn connect(
     server: &actix_test::TestServer,
 ) -> (bootstrap::Client, oneshot::Receiver<Option<String>>) {
     connect_with(server, None, None).await
@@ -117,7 +117,7 @@ pub(crate) async fn connect_with(
     (client, closed_rx)
 }
 
-async fn signed_in(client: &bootstrap::Client, token: &str) -> session::Client {
+pub(crate) async fn signed_in(client: &bootstrap::Client, token: &str) -> session::Client {
     let mut req = client.resume_request();
     req.get().init_ctx();
     req.get().set_device_token(token);

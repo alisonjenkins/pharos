@@ -10,6 +10,7 @@
 //! [`AppState`] (research R2).
 
 mod bootstrap;
+mod library;
 pub mod limits;
 pub mod origin;
 mod session;
