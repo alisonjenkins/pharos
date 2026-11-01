@@ -82,6 +82,9 @@ pub struct ConnectionCtx {
     limits: limits::ConnectionLimits,
     max_per_user: u32,
     slot: RefCell<limits::Slot>,
+    /// Every token a `resume` succeeded with, re-checked while the
+    /// connection lives so revoking one ends it (T025a).
+    resumed: RefCell<Vec<String>>,
 }
 
 impl ConnectionCtx {
@@ -98,7 +101,20 @@ impl ConnectionCtx {
             limits: limits.clone(),
             max_per_user,
             slot: RefCell::new(slot),
+            resumed: RefCell::new(Vec::new()),
         }))
+    }
+
+    fn remember_token(&self, token: String) {
+        let mut resumed = self.resumed.borrow_mut();
+        if !resumed.contains(&token) {
+            resumed.push(token);
+        }
+    }
+
+    /// The tokens this connection's sessions were resumed with.
+    pub(crate) fn resumed_tokens(&self) -> Vec<String> {
+        self.resumed.borrow().clone()
     }
 
     /// Whether a `resume` has succeeded on this connection.

@@ -28,6 +28,7 @@ impl Bootstrap {
 }
 
 /// Why `resume` refused, as it reaches the client in `ResumeResult.status`.
+#[derive(Clone)]
 enum Refusal {
     /// No device token and no session cookie.
     NoCredential,
@@ -80,8 +81,8 @@ impl server::bootstrap::Handler for Bootstrap {
 
     /// Resolves the device token (or, when it is empty, the upgrade's
     /// cookie) on every call, so a revoked token cannot resume. A session
-    /// already open keeps the user it resumed as until T025a lands: it does
-    /// not yet notice its token being revoked.
+    /// already open is ended by the connection's re-check of the tokens it
+    /// resumed with (T025a, `[server.native_api].revalidate_secs`).
     /// Always answers with a session: a refused one fails every call with the
     /// same error as `status` (research R1).
     async fn resume(
@@ -95,11 +96,11 @@ impl server::bootstrap::Handler for Bootstrap {
             Ok(t) => Ok(t.to_owned()),
             Err(_) => Err(Refusal::Token(TokenRefusal::InvalidToken)),
         };
-        let user = match token {
-            Ok(token) => user_for_token(&self.state.stores, &token)
+        let user = match &token {
+            Ok(token) => user_for_token(&self.state.stores, token)
                 .await
                 .map_err(Refusal::Token),
-            Err(refusal) => Err(refusal),
+            Err(refusal) => Err(refusal.clone()),
         };
         let user = user.and_then(|user| {
             let ctx = &self.ctx;
@@ -114,6 +115,10 @@ impl server::bootstrap::Handler for Bootstrap {
         let mut result = results.get().init_result();
         match user {
             Ok(user) => {
+                if let Ok(token) = token {
+                    // T025a: re-checked while the connection lives.
+                    self.ctx.remember_token(token);
+                }
                 self.conn.set_user(&user.name);
                 let session = Session::new(self.state.clone(), user);
                 result.set_session(server::session::client(session, &self.conn));
