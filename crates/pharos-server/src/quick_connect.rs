@@ -46,10 +46,6 @@ pub const MAX_PENDING_PER_IP: usize = 8;
 /// unthrottled user could enumerate it; 10 leaves room for typos.
 pub const MAX_AUTHORIZE_FAILURES: usize = 10;
 
-/// `Retry-After` sent with a cap refusal: long enough for a stuck request to
-/// be consumed or a client to back off, short enough for a retrying TV.
-pub const CAP_RETRY_AFTER_SECS: u64 = 30;
-
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
     pub code: String,
@@ -91,9 +87,9 @@ pub enum QcRefusal {
     /// The OS CSPRNG failed, so no unpredictable code/secret can be minted.
     RngFailed,
     /// [`MAX_PENDING`] live requests already exist.
-    GlobalCap,
+    GlobalCap { retry_after_secs: u64 },
     /// The client address already holds [`MAX_PENDING_PER_IP`] live requests.
-    IpCap,
+    IpCap { retry_after_secs: u64 },
     /// The authorizing user guessed [`MAX_AUTHORIZE_FAILURES`] unknown codes
     /// within [`PENDING_TTL`].
     AuthorizeThrottled { retry_after_secs: u64 },
@@ -103,9 +99,20 @@ impl QcRefusal {
     pub fn label(self) -> &'static str {
         match self {
             Self::RngFailed => "rng_failed",
-            Self::GlobalCap => "global_cap",
-            Self::IpCap => "ip_cap",
+            Self::GlobalCap { .. } => "global_cap",
+            Self::IpCap { .. } => "ip_cap",
             Self::AuthorizeThrottled { .. } => "authorize_throttled",
+        }
+    }
+
+    /// Seconds a client should wait before retrying, where the refusal has a
+    /// meaningful answer.
+    pub fn retry_after_secs(self) -> Option<u64> {
+        match self {
+            Self::GlobalCap { retry_after_secs }
+            | Self::IpCap { retry_after_secs }
+            | Self::AuthorizeThrottled { retry_after_secs } => Some(retry_after_secs),
+            Self::RngFailed => None,
         }
     }
 
@@ -225,10 +232,27 @@ impl QuickConnectRegistry {
                         let ip_live = client.map_or(0, |c| {
                             by_secret.values().filter(|e| e.client == Some(c)).count()
                         });
+                        let now = Instant::now();
                         let cap_hit = if ip_live >= MAX_PENDING_PER_IP {
-                            Some((QcRefusal::IpCap, ip_live, MAX_PENDING_PER_IP))
+                            let oldest = by_secret
+                                .values()
+                                .filter(|e| e.client == client)
+                                .map(|e| e.created_at)
+                                .min();
+                            let retry_after_secs = expiry_wait_secs(oldest, now);
+                            Some((
+                                QcRefusal::IpCap { retry_after_secs },
+                                ip_live,
+                                MAX_PENDING_PER_IP,
+                            ))
                         } else if by_secret.len() >= MAX_PENDING {
-                            Some((QcRefusal::GlobalCap, by_secret.len(), MAX_PENDING))
+                            let oldest = by_secret.values().map(|e| e.created_at).min();
+                            let retry_after_secs = expiry_wait_secs(oldest, now);
+                            Some((
+                                QcRefusal::GlobalCap { retry_after_secs },
+                                by_secret.len(),
+                                MAX_PENDING,
+                            ))
                         } else {
                             None
                         };
@@ -236,6 +260,7 @@ impl QuickConnectRegistry {
                             refusal.record();
                             tracing::warn!(
                                 reason = refusal.label(),
+                                retry_after_secs = refusal.retry_after_secs(),
                                 client_ip = client.map(tracing::field::display),
                                 live,
                                 cap,
@@ -365,6 +390,15 @@ impl QuickConnectRegistry {
         });
         Self { tx }
     }
+}
+
+/// Whole seconds (rounded up, never 0) until the oldest of `oldest` expires:
+/// the earliest moment a capped client can expect a free slot.
+fn expiry_wait_secs(oldest: Option<Instant>, now: Instant) -> u64 {
+    let wait = oldest.map_or(Duration::ZERO, |t| {
+        PENDING_TTL.saturating_sub(now.saturating_duration_since(t))
+    });
+    wait.as_secs().saturating_add(1)
 }
 
 fn mint_pending(
@@ -727,12 +761,36 @@ mod tests {
             initiate_from(&reg, ip(1)).await.unwrap();
         }
         assert_eq!(
-            initiate_from(&reg, ip(1)).await.unwrap_err(),
-            QcRefusal::IpCap
+            retry_in_ttl(initiate_from(&reg, ip(1)).await.unwrap_err()),
+            "ip_cap"
         );
         // another client is unaffected
         initiate_from(&reg, ip(2)).await.unwrap();
         assert_eq!(refused_count(&rec, "ip_cap"), 1);
+    }
+
+    /// Asserts a cap refusal carries a Retry-After inside the entry TTL and
+    /// returns its label.
+    fn retry_in_ttl(r: QcRefusal) -> &'static str {
+        let (QcRefusal::IpCap { retry_after_secs } | QcRefusal::GlobalCap { retry_after_secs }) = r
+        else {
+            panic!("not a cap refusal: {r:?}");
+        };
+        assert!(
+            (PENDING_TTL.as_secs() - 2..=PENDING_TTL.as_secs() + 1).contains(&retry_after_secs),
+            "{retry_after_secs}"
+        );
+        r.label()
+    }
+
+    #[test]
+    fn retry_after_is_the_time_until_the_oldest_entry_expires() {
+        let now = Instant::now();
+        let oldest = now - Duration::from_secs(100);
+        assert_eq!(expiry_wait_secs(Some(oldest), now), 201);
+        // already past its TTL, or nothing to wait for: still at least 1
+        assert_eq!(expiry_wait_secs(Some(now - PENDING_TTL * 2), now), 1);
+        assert_eq!(expiry_wait_secs(None, now), 1);
     }
 
     #[tokio::test]
@@ -753,7 +811,10 @@ mod tests {
             let b: IpAddr = format!("2001:db8:1:2::{:x}", i + 10).parse().unwrap();
             initiate_from(&reg, b).await.unwrap();
         }
-        assert_eq!(initiate_from(&reg, a).await.unwrap_err(), QcRefusal::IpCap);
+        assert_eq!(
+            retry_in_ttl(initiate_from(&reg, a).await.unwrap_err()),
+            "ip_cap"
+        );
     }
 
     #[tokio::test]
@@ -768,8 +829,8 @@ mod tests {
             initiate_from(&reg, client).await.unwrap();
         }
         assert_eq!(
-            initiate_from(&reg, ip(200)).await.unwrap_err(),
-            QcRefusal::GlobalCap
+            retry_in_ttl(initiate_from(&reg, ip(200)).await.unwrap_err()),
+            "global_cap"
         );
         assert_eq!(refused_count(&rec, "global_cap"), 1);
     }
@@ -1026,8 +1087,14 @@ mod tests {
     fn refusal_labels_are_distinct_and_stable() {
         let labels = [
             QcRefusal::RngFailed.label(),
-            QcRefusal::GlobalCap.label(),
-            QcRefusal::IpCap.label(),
+            QcRefusal::GlobalCap {
+                retry_after_secs: 1,
+            }
+            .label(),
+            QcRefusal::IpCap {
+                retry_after_secs: 1,
+            }
+            .label(),
             QcRefusal::AuthorizeThrottled {
                 retry_after_secs: 1,
             }
