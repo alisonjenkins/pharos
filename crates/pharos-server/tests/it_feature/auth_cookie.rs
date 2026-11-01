@@ -148,7 +148,33 @@ async fn playback_info_delivery_urls_carry_the_callers_token() {
         .collect();
     assert!(urls.len() >= 2, "{body}");
     let want = format!("api_key={}", f.admin_token);
-    for url in urls {
+    for url in &urls {
         assert!(url.contains(&want), "{url} lacks the token");
     }
+
+    // The same file by cookie alone, as a <track> fetches it: served, and
+    // never `public`, or a shared cache would replay it to an anonymous
+    // request for the same token-free URL. Disarm check: with subtitles.rs
+    // back on `public, max-age=3600` this fails.
+    let path = urls
+        .iter()
+        .find(|u| u.contains("/Subtitles/"))
+        .and_then(|u| u.split('?').next())
+        .unwrap();
+    let req = test::TestRequest::get()
+        .uri(path)
+        .insert_header(cookie(&f.admin_token))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status().as_u16(), 200, "{path}");
+    let cache = resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        cache.starts_with("private"),
+        "{path}: Cache-Control {cache:?}"
+    );
 }
