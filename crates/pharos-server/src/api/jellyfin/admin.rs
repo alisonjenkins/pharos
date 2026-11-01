@@ -6,6 +6,7 @@
 //! state rather than throwing on a 404.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::services::auth::{revoke_device, RevokeCause};
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
@@ -184,9 +185,7 @@ async fn revoke_api_key(
     if !device_id.starts_with(API_KEY_PREFIX) {
         return Err(error::ErrorBadRequest("not an API key id"));
     }
-    let dropped = state
-        .stores
-        .revoke_tokens_by_device(user.0.id, &device_id)
+    let dropped = revoke_device(&state, user.0.id, &device_id, RevokeCause::ApiKeyRevoked)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if dropped == 0 {
@@ -488,7 +487,10 @@ async fn delete_user(
         return Err(error::ErrorBadRequest("cannot delete self"));
     }
     match state.stores.delete(target).await {
-        Ok(()) => Ok(HttpResponse::NoContent().finish()),
+        Ok(()) => {
+            state.revocations.announce(target, RevokeCause::UserDeleted);
+            Ok(HttpResponse::NoContent().finish())
+        }
         Err(AuthError::UserNotFound) => Err(error::ErrorNotFound("user not found")),
         Err(e) => Err(error::ErrorInternalServerError(e.to_string())),
     }
@@ -522,7 +524,13 @@ async fn set_user_policy(
         }
     }
     match state.stores.set_policy(target, policy).await {
-        Ok(()) => Ok(HttpResponse::NoContent().finish()),
+        Ok(()) => {
+            // It may now be disabled: its open native connections re-check.
+            state
+                .revocations
+                .announce(target, RevokeCause::PolicyChanged);
+            Ok(HttpResponse::NoContent().finish())
+        }
         Err(AuthError::UserNotFound) => Err(error::ErrorNotFound("user not found")),
         Err(e) => Err(error::ErrorInternalServerError(e.to_string())),
     }
