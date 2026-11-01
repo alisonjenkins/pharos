@@ -252,6 +252,9 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// Whether the DLNA / UPnP HTTP routes answer (`[server].dlna_enabled`).
+    /// UPnP has no authentication, so they are off unless asked for (V190).
+    pub dlna_enabled: bool,
     /// Which progress reports reach the database now and which are held.
     pub progress_writes: Arc<crate::progress_writes::ProgressCoalescer>,
     /// Track preferences a newly created user starts with (`[user_defaults]`).
@@ -627,6 +630,7 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            dlna_enabled: false,
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
             )),
@@ -726,6 +730,7 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            dlna_enabled: false,
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
             )),
@@ -789,6 +794,11 @@ impl AppState {
 
     pub fn with_progress_persist_interval(mut self, interval: std::time::Duration) -> Self {
         self.progress_writes = Arc::new(crate::progress_writes::ProgressCoalescer::new(interval));
+        self
+    }
+
+    pub fn with_dlna_enabled(mut self, enabled: bool) -> Self {
+        self.dlna_enabled = enabled;
         self
     }
 

@@ -18,29 +18,37 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     // T31 lowercase routes — LowercasePath middleware handles
     // PascalCase variants. UPnP clients send mixed case for both
     // /Dlna/{id}/... and the per-service paths.
-    cfg.route(
-        "/dlna/{server_id}/description.xml",
-        web::get().to(description),
-    )
-    .route(
-        "/dlna/{server_id}/contentdirectory/scpd.xml",
-        web::get().to(content_directory_scpd),
-    )
-    .route(
-        "/dlna/{server_id}/contentdirectory/control",
-        web::post().to(content_directory_control),
-    )
-    .route(
-        "/dlna/{server_id}/contentdirectory/events",
-        web::route().to(events_stub),
-    )
-    .route(
-        "/dlna/{server_id}/connectionmanager/scpd.xml",
-        web::get().to(connection_manager_scpd),
-    )
-    .route(
-        "/dlna/{server_id}/connectionmanager/control",
-        web::post().to(connection_manager_control),
+    //
+    // UPnP carries no credentials, so the whole scope answers only when
+    // `[server].dlna_enabled` is set; otherwise nothing matches and the
+    // request falls through to 404 (V190).
+    cfg.service(
+        web::scope("/dlna")
+            .guard(actix_web::guard::fn_guard(|ctx| {
+                ctx.app_data::<web::Data<AppState>>()
+                    .is_some_and(|state| state.dlna_enabled)
+            }))
+            .route("/{server_id}/description.xml", web::get().to(description))
+            .route(
+                "/{server_id}/contentdirectory/scpd.xml",
+                web::get().to(content_directory_scpd),
+            )
+            .route(
+                "/{server_id}/contentdirectory/control",
+                web::post().to(content_directory_control),
+            )
+            .route(
+                "/{server_id}/contentdirectory/events",
+                web::route().to(events_stub),
+            )
+            .route(
+                "/{server_id}/connectionmanager/scpd.xml",
+                web::get().to(connection_manager_scpd),
+            )
+            .route(
+                "/{server_id}/connectionmanager/control",
+                web::post().to(connection_manager_control),
+            ),
     );
 }
 

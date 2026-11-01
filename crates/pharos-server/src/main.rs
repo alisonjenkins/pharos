@@ -1813,6 +1813,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         web: cfg.server.ui_dir.clone(),
     });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
+    state = state.with_dlna_enabled(cfg.server.dlna_enabled);
     state = state.with_progress_persist_interval(std::time::Duration::from_secs(
         cfg.server.playback_progress_persist_secs,
     ));
@@ -2001,7 +2002,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // T48 phase 2 — opt-in SSDP responder so LAN DLNA / UPnP control
     // points discover us. The task owns its own UDP socket; we keep a
     // handle so the runtime tears it down on shutdown.
-    let _ssdp_guard = if cfg.server.ssdp_enabled {
+    if cfg.server.ssdp_enabled && !cfg.server.dlna_enabled {
+        tracing::warn!(
+            "ssdp_enabled is set but dlna_enabled is not: not advertising DLNA routes that answer 404"
+        );
+    }
+    let _ssdp_guard = if cfg.server.ssdp_enabled && cfg.server.dlna_enabled {
         let advertise = cfg.server.ssdp_advertise_url.clone().unwrap_or_else(|| {
             format!("http://{}", cfg.server.bind.replace("0.0.0.0", "127.0.0.1"))
         });
