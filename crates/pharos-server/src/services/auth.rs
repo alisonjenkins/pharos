@@ -159,6 +159,140 @@ pub async fn revoke_device(
     Ok(dropped)
 }
 
+/// How a native sign-in arrived. The label is the `transport` of
+/// `pharos_native_login_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginTransport {
+    /// `POST /pharos/session`, answered with the `pharos_session` cookie.
+    Cookie,
+    /// `Bootstrap.login` / `quickConnectPoll` over `/pharos/rpc`.
+    Rpc,
+}
+
+impl LoginTransport {
+    pub fn label(self) -> &'static str {
+        match self {
+            LoginTransport::Cookie => "cookie",
+            LoginTransport::Rpc => "rpc",
+        }
+    }
+}
+
+/// How a native sign-in ended. The label is the `outcome` of
+/// `pharos_native_login_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Ok,
+    /// Wrong password, unknown or disabled user: one answer for all three.
+    Invalid,
+    /// Refused by the login throttle before any hash (V174).
+    Throttled,
+    /// The user or token store failed.
+    Unavailable,
+    /// A browser request from an origin not in `allowed_origins`, or none.
+    OriginRefused,
+}
+
+impl LoginOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            LoginOutcome::Ok => "ok",
+            LoginOutcome::Invalid => "invalid",
+            LoginOutcome::Throttled => "throttled",
+            LoginOutcome::Unavailable => "unavailable",
+            LoginOutcome::OriginRefused => "origin_refused",
+        }
+    }
+}
+
+/// Counts one native sign-in attempt by transport, method and outcome.
+pub fn record_login(transport: LoginTransport, method: &'static str, outcome: LoginOutcome) {
+    metrics::counter!(
+        "pharos_native_login_total",
+        "transport" => transport.label(),
+        "method" => method,
+        "outcome" => outcome.label()
+    )
+    .increment(1);
+}
+
+/// Why [`password_login`] issued no token.
+#[derive(Debug)]
+pub enum PasswordLoginError {
+    Refused(crate::auth::LoginRefusal),
+    /// The password was right but the token could not be stored.
+    Issue(AuthError),
+}
+
+impl PasswordLoginError {
+    pub fn outcome(&self) -> LoginOutcome {
+        use crate::auth::LoginRefusal;
+        match self {
+            PasswordLoginError::Refused(LoginRefusal::Throttled(_)) => LoginOutcome::Throttled,
+            PasswordLoginError::Refused(LoginRefusal::Invalid) => LoginOutcome::Invalid,
+            PasswordLoginError::Refused(LoginRefusal::Backend(_))
+            | PasswordLoginError::Issue(_) => LoginOutcome::Unavailable,
+        }
+    }
+}
+
+/// A native password sign-in: the shared throttle checks the password
+/// (V174), then a device token is issued for `device_id` in the one token
+/// store (ADR-0011). Counted and logged with its outcome either way.
+pub async fn password_login(
+    state: &AppState,
+    transport: LoginTransport,
+    name: &str,
+    password: &pharos_core::SecretString,
+    client_ip: std::net::IpAddr,
+    device_id: &str,
+) -> Result<(User, pharos_core::AuthToken), PasswordLoginError> {
+    let result: Result<_, PasswordLoginError> = async {
+        let user = state
+            .login_throttle
+            .verify(&state.auth, name, password, client_ip)
+            .await
+            .map_err(PasswordLoginError::Refused)?;
+        let token = state
+            .stores
+            .issue(user.id, device_id)
+            .await
+            .map_err(PasswordLoginError::Issue)?;
+        Ok((user, token))
+    }
+    .await;
+    let outcome = match &result {
+        Ok(_) => LoginOutcome::Ok,
+        Err(e) => e.outcome(),
+    };
+    record_login(transport, "password", outcome);
+    match &result {
+        Ok((user, _)) => {
+            tracing::info!(
+                transport = transport.label(),
+                user = %user.name,
+                client_ip = %client_ip,
+                device_id,
+                "native login"
+            );
+            state.record_activity(
+                &format!("{} logged in", user.name),
+                "SessionStarted",
+                Some(&user.id.0.simple().to_string()),
+                Some("pharos"),
+            );
+        }
+        Err(e) => tracing::info!(
+            transport = transport.label(),
+            outcome = outcome.label(),
+            client_ip = %client_ip,
+            error = ?e,
+            "native login refused"
+        ),
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -185,6 +319,20 @@ mod tests {
                 TokenRefusal::UserRevoked
             );
         }
+    }
+
+    #[test]
+    fn login_labels_are_distinct() {
+        let outcomes = [
+            LoginOutcome::Ok,
+            LoginOutcome::Invalid,
+            LoginOutcome::Throttled,
+            LoginOutcome::Unavailable,
+            LoginOutcome::OriginRefused,
+        ];
+        let unique: std::collections::HashSet<_> = outcomes.iter().map(|o| o.label()).collect();
+        assert_eq!(unique.len(), outcomes.len());
+        assert_ne!(LoginTransport::Cookie.label(), LoginTransport::Rpc.label());
     }
 
     #[test]
