@@ -143,7 +143,8 @@ fn too_many_requests(retry_after_secs: u64, msg: &'static str) -> actix_web::Err
 /// A registry refusal as HTTP.
 fn qc_refused(refusal: crate::quick_connect::QcRefusal) -> actix_web::Error {
     match refusal {
-        crate::quick_connect::QcRefusal::RngFailed => {
+        crate::quick_connect::QcRefusal::RngFailed
+        | crate::quick_connect::QcRefusal::CodeSpaceExhausted => {
             actix_web::error::ErrorServiceUnavailable("quick connect unavailable")
         }
         crate::quick_connect::QcRefusal::GlobalCap { retry_after_secs }

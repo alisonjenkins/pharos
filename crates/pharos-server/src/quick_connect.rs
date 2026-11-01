@@ -77,6 +77,28 @@ impl PendingRequest {
     }
 }
 
+/// Why minting a code and secret failed.
+#[derive(Debug)]
+enum MintError {
+    Rng(getrandom::Error),
+    CodeSpaceExhausted,
+}
+
+impl From<getrandom::Error> for MintError {
+    fn from(e: getrandom::Error) -> Self {
+        Self::Rng(e)
+    }
+}
+
+impl std::fmt::Display for MintError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rng(e) => write!(f, "CSPRNG failed: {e}"),
+            Self::CodeSpaceExhausted => f.write_str("no free 6-digit code among live requests"),
+        }
+    }
+}
+
 /// Source of random bytes; `getrandom::fill` in production, a stub in tests.
 pub type FillRandom = fn(&mut [u8]) -> Result<(), getrandom::Error>;
 
@@ -86,6 +108,8 @@ pub type FillRandom = fn(&mut [u8]) -> Result<(), getrandom::Error>;
 pub enum QcRefusal {
     /// The OS CSPRNG failed, so no unpredictable code/secret can be minted.
     RngFailed,
+    /// Every draw collided with a live code (the 6-digit space is saturated).
+    CodeSpaceExhausted,
     /// [`MAX_PENDING`] live requests already exist.
     GlobalCap { retry_after_secs: u64 },
     /// The client address already holds [`MAX_PENDING_PER_IP`] live requests.
@@ -99,6 +123,7 @@ impl QcRefusal {
     pub fn label(self) -> &'static str {
         match self {
             Self::RngFailed => "rng_failed",
+            Self::CodeSpaceExhausted => "code_space_exhausted",
             Self::GlobalCap { .. } => "global_cap",
             Self::IpCap { .. } => "ip_cap",
             Self::AuthorizeThrottled { .. } => "authorize_throttled",
@@ -112,7 +137,7 @@ impl QcRefusal {
             Self::GlobalCap { retry_after_secs }
             | Self::IpCap { retry_after_secs }
             | Self::AuthorizeThrottled { retry_after_secs } => Some(retry_after_secs),
-            Self::RngFailed => None,
+            Self::RngFailed | Self::CodeSpaceExhausted => None,
         }
     }
 
@@ -280,13 +305,18 @@ impl QuickConnectRegistry {
                         ) {
                             Ok(entry) => entry,
                             Err(e) => {
-                                QcRefusal::RngFailed.record();
+                                let refusal = match e {
+                                    MintError::Rng(_) => QcRefusal::RngFailed,
+                                    MintError::CodeSpaceExhausted => QcRefusal::CodeSpaceExhausted,
+                                };
+                                refusal.record();
                                 tracing::error!(
+                                    reason = refusal.label(),
                                     error = %e,
                                     live_pending = by_secret.len(),
-                                    "quickconnect: initiate refused, CSPRNG failed"
+                                    "quickconnect: initiate refused, could not mint a code"
                                 );
-                                let _ = reply.send(Err(QcRefusal::RngFailed));
+                                let _ = reply.send(Err(refusal));
                                 continue;
                             }
                         };
@@ -409,7 +439,7 @@ fn mint_pending(
     client: Option<IpAddr>,
     by_code: &HashMap<String, String>,
     fill: FillRandom,
-) -> Result<PendingRequest, getrandom::Error> {
+) -> Result<PendingRequest, MintError> {
     let now = Instant::now();
     let created_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -438,20 +468,17 @@ fn mint_pending(
 /// Draw codes until one is not currently live. The 6-digit space is 1M
 /// and live requests are few (short TTL), so this terminates in ~1 draw;
 /// the bound is a safety belt against pathological saturation.
-fn unique_code(
-    by_code: &HashMap<String, String>,
-    fill: FillRandom,
-) -> Result<String, getrandom::Error> {
+fn unique_code(by_code: &HashMap<String, String>, fill: FillRandom) -> Result<String, MintError> {
     let mut fill = fill;
-    for _ in 0..10_000 {
+    for _ in 0..UNIQUE_CODE_ATTEMPTS {
         let c = code_from(&mut fill)?;
         if !by_code.contains_key(&c) {
             return Ok(c);
         }
     }
-    // Astronomically unlikely (would need ~1M live requests). Fall back
-    // to a fresh draw rather than loop forever.
-    code_from(&mut fill)
+    // Only reachable with ~1M live requests, which MAX_PENDING prevents; a
+    // colliding code would let one request shadow another, so refuse instead.
+    Err(MintError::CodeSpaceExhausted)
 }
 
 fn gc_expired(
@@ -471,6 +498,9 @@ fn gc_expired(
 /// Largest multiple of 1_000_000 that fits in a `u32`; draws at or above it
 /// are redrawn so `% 1_000_000` has no modulo bias.
 const CODE_DRAW_LIMIT: u32 = 4_294_000_000;
+
+/// Draws [`unique_code`] makes before declaring the code space exhausted.
+const UNIQUE_CODE_ATTEMPTS: usize = 10_000;
 
 /// Redraws before giving up on a (practically impossible) run of rejected
 /// draws; each is rejected with probability ~1.6e-4.
@@ -1025,10 +1055,40 @@ mod tests {
         Err(getrandom::Error::UNSUPPORTED)
     }
 
+    fn zero_fill(b: &mut [u8]) -> Result<(), getrandom::Error> {
+        b.fill(0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_saturated_code_space_is_an_error_not_a_colliding_code() {
+        let live: HashMap<String, String> = [("000000".to_string(), "s".to_string())].into();
+        let err = unique_code(&live, zero_fill).unwrap_err();
+        assert!(matches!(err, MintError::CodeSpaceExhausted), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn initiate_with_no_free_code_is_refused_and_counted() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        // every draw yields 000000, so the second mint cannot find a free code
+        let reg = QuickConnectRegistry::spawn_with(zero_fill);
+        initiate_from(&reg, None).await.unwrap();
+        assert_eq!(
+            initiate_from(&reg, None).await.unwrap_err(),
+            QcRefusal::CodeSpaceExhausted
+        );
+        assert_eq!(refused_count(&rec, "code_space_exhausted"), 1);
+    }
+
     #[test]
     fn code_draw_fails_closed_when_the_rng_fails() {
         assert!(code_from(&mut failing_fill).is_err());
         assert!(secret_from(&mut failing_fill).is_err());
+        assert!(matches!(
+            unique_code(&HashMap::new(), failing_fill),
+            Err(MintError::Rng(_))
+        ));
     }
 
     #[test]
@@ -1095,6 +1155,7 @@ mod tests {
                 retry_after_secs: 1,
             }
             .label(),
+            QcRefusal::CodeSpaceExhausted.label(),
             QcRefusal::AuthorizeThrottled {
                 retry_after_secs: 1,
             }
@@ -1102,7 +1163,13 @@ mod tests {
         ];
         assert_eq!(
             labels,
-            ["rng_failed", "global_cap", "ip_cap", "authorize_throttled"]
+            [
+                "rng_failed",
+                "global_cap",
+                "ip_cap",
+                "code_space_exhausted",
+                "authorize_throttled"
+            ]
         );
     }
 
