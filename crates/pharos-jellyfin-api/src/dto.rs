@@ -2447,16 +2447,26 @@ pub struct SubtitleStreamCtx {
     /// track is advertised Encode/no-DeliveryUrl so the client requests the
     /// burn transcode instead of trying to render the raw ASS itself.
     pub burn_text_indices: std::collections::BTreeSet<u32>,
+    /// The MediaSource Id the tracks belong to when it is not the item's own
+    /// file (a grouped edition). `None` names the item.
+    pub media_source_id: Option<String>,
 }
 
 impl SubtitleStreamCtx {
     pub fn new(item_id: pharos_core::MediaId) -> Self {
         Self {
             item_id,
+            media_source_id: None,
             sidecar_count: 0,
             sidecar_langs: Vec::new(),
             burn_text_indices: std::collections::BTreeSet::new(),
         }
+    }
+
+    fn source_id(&self) -> String {
+        self.media_source_id
+            .clone()
+            .unwrap_or_else(|| wire_item_id(self.item_id))
     }
 }
 
@@ -2666,8 +2676,9 @@ pub fn build_media_streams_with_subtitles(
                     is_original: false,
                     delivery_url: external.then(|| {
                         format!(
-                            "/Videos/{id}/{id}/Subtitles/{idx}/Stream.{ext}",
+                            "/Videos/{id}/{source}/Subtitles/{idx}/Stream.{ext}",
                             id = wire_item_id(ctx.item_id),
+                            source = ctx.source_id(),
                             idx = t.stream_index,
                         )
                     }),
@@ -2723,8 +2734,9 @@ pub fn build_media_streams_with_subtitles(
                     is_interlaced: false,
                     is_original: false,
                     delivery_url: Some(format!(
-                        "/Videos/{id}/{id}/Subtitles/{idx}/Stream.vtt",
+                        "/Videos/{id}/{source}/Subtitles/{idx}/Stream.vtt",
                         id = wire_item_id(ctx.item_id),
+                        source = ctx.source_id(),
                     )),
                     // Sidecars are already WebVTT — always External text.
                     delivery_method: Some("External"),
@@ -2805,10 +2817,14 @@ pub struct MediaAttachmentDto {
     pub delivery_url: String,
 }
 
+/// `media_source_id` names the source the attachments belong to when it is
+/// not the item's own file (a grouped edition).
 pub fn build_media_attachments(
     item_id: pharos_core::MediaId,
+    media_source_id: Option<&str>,
     attachments: &[pharos_core::MediaAttachment],
 ) -> Vec<MediaAttachmentDto> {
+    let source = media_source_id.map_or_else(|| wire_item_id(item_id), str::to_owned);
     attachments
         .iter()
         .map(|a| MediaAttachmentDto {
@@ -2817,7 +2833,7 @@ pub fn build_media_attachments(
             mime_type: a.mime_type.clone(),
             codec: a.codec.clone(),
             delivery_url: format!(
-                "/Videos/{id}/{id}/Attachments/{idx}",
+                "/Videos/{id}/{source}/Attachments/{idx}",
                 id = wire_item_id(item_id),
                 idx = a.stream_index,
             ),
@@ -3001,7 +3017,7 @@ mod tests {
                 codec: Some("otf".into()),
             },
         ];
-        let out = build_media_attachments(42, &atts);
+        let out = build_media_attachments(42, None, &atts);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].index, 7);
         assert_eq!(out[0].file_name.as_deref(), Some("Arial.ttf"));
@@ -3209,6 +3225,7 @@ mod tests {
             sidecar_count: 3,
             sidecar_langs: vec![Some("eng".into()), Some("spa".into()), None],
             burn_text_indices: Default::default(),
+            media_source_id: None,
         };
         let streams = build_media_streams_with_subtitles(&probe, true, Some(&ctx));
         let subs: Vec<u32> = streams

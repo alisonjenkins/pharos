@@ -3348,11 +3348,16 @@ async fn playback_info(
         sidecar_count: sidecars.len() as u32,
         sidecar_langs,
         burn_text_indices,
+        media_source_id: item.edition.as_ref().map(|_| source_id.clone()),
     };
     let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
     // Embedded fonts → MediaAttachments so jellyfin-web hands them to
     // SubtitlesOctopus and ASS/SSA subtitles render.
-    let media_attachments = build_media_attachments(item.id, &probe.attachments);
+    let media_attachments = build_media_attachments(
+        item.id,
+        item.edition.as_ref().map(|_| source_id.as_str()),
+        &probe.attachments,
+    );
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.

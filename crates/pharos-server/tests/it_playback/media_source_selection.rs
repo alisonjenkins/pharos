@@ -229,3 +229,51 @@ async fn hls_playlists_follow_the_selected_edition() {
     }
     assert!(!primary.contains("MediaSourceId="), "{primary}");
 }
+
+#[actix_web::test]
+async fn an_editions_subtitles_are_its_own() {
+    let td = TempDir::new().unwrap();
+    let (state, token) = setup(td.path()).await;
+    tokio::fs::write(
+        td.path().join("Film.en.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nprimary cue\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        td.path().join("Film - 3D.HSBS.en.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nedition cue\n",
+    )
+    .await
+    .unwrap();
+
+    let one = playback_info(
+        &state,
+        &token,
+        &format!(r#","MediaSourceId":"{}""#, edition_id()),
+    )
+    .await;
+    let url = one["MediaSources"][0]["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|s| {
+            (s["Type"] == "Subtitle")
+                .then(|| s["DeliveryUrl"].as_str())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("no subtitle delivery url: {one}"))
+        .to_owned();
+    assert!(
+        url.starts_with(&format!("/Videos/{}/{}/Subtitles/", wire(), edition_id())),
+        "{url}"
+    );
+
+    let app = app!(state);
+    let req = test::TestRequest::get()
+        .uri(&format!("{url}?api_key={token}"))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("edition cue"), "{body}");
+}

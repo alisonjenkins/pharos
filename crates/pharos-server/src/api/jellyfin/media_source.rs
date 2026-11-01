@@ -16,6 +16,8 @@ pub(crate) enum Route {
     Stream,
     Hls,
     PlaybackInfo,
+    /// Subtitle and attachment delivery, which names the source in its path.
+    Subtitles,
 }
 
 impl Route {
@@ -24,6 +26,7 @@ impl Route {
             Self::Stream => "stream",
             Self::Hls => "hls",
             Self::PlaybackInfo => "playback_info",
+            Self::Subtitles => "subtitles",
         }
     }
 }
@@ -181,11 +184,22 @@ pub(crate) async fn load(
     id: pharos_core::MediaId,
     qs: &str,
 ) -> Result<MediaItem, actix_web::Error> {
+    load_named(state, route, id, requested_id(qs).as_deref()).await
+}
+
+/// [`load`] for a route that carries the media source id itself, such as a
+/// path segment.
+pub(crate) async fn load_named(
+    state: &crate::state::AppState,
+    route: Route,
+    id: pharos_core::MediaId,
+    raw: Option<&str>,
+) -> Result<MediaItem, actix_web::Error> {
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => actix_web::error::ErrorNotFound("not found"),
         other => actix_web::error::ErrorInternalServerError(other.to_string()),
     })?;
-    Ok(select(route, item, requested_id(qs).as_deref()))
+    Ok(select(route, item, raw))
 }
 
 #[cfg(test)]
@@ -328,10 +342,15 @@ mod tests {
             .map(Served::label)
             .into();
         assert_eq!(s.len(), 2);
-        let rt: HashSet<_> = [Route::Stream, Route::Hls, Route::PlaybackInfo]
-            .map(Route::label)
-            .into();
-        assert_eq!(rt.len(), 3);
+        let rt: HashSet<_> = [
+            Route::Stream,
+            Route::Hls,
+            Route::PlaybackInfo,
+            Route::Subtitles,
+        ]
+        .map(Route::label)
+        .into();
+        assert_eq!(rt.len(), 4);
     }
 
     #[test]

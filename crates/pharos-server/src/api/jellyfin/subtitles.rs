@@ -21,7 +21,6 @@
 use crate::{api::jellyfin::auth_extractor::AuthUser, bg_io::BgPermit, state::AppState};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
-use pharos_core::MediaStore;
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -100,8 +99,8 @@ async fn stream_attachment(
     state: web::Data<AppState>,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _msid, stream_index) = path.into_inner();
-    deliver_attachment(&state, &id, stream_index).await
+    let (id, msid, stream_index) = path.into_inner();
+    deliver_attachment(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_attachment_short(
@@ -109,7 +108,7 @@ async fn stream_attachment_short(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
-    deliver_attachment(&state, &id, stream_index).await
+    deliver_attachment(&state, &id, None, stream_index).await
 }
 
 /// Extract + serve an embedded attachment (font) by stream index. Cached on
@@ -118,14 +117,18 @@ async fn stream_attachment_short(
 async fn deliver_attachment(
     state: &AppState,
     id_str: &str,
+    media_source_id: Option<&str>,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Subtitles,
+        id,
+        media_source_id,
+    )
+    .await?;
     let Some(cache) = state.images.as_ref() else {
         return Err(error::ErrorNotFound("no attachment cache"));
     };
@@ -164,8 +167,8 @@ async fn stream_ass(
     state: web::Data<AppState>,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _media_source_id, stream_index) = path.into_inner();
-    deliver_ass(&state, &id, stream_index).await
+    let (id, msid, stream_index) = path.into_inner();
+    deliver_ass(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_ass_short(
@@ -173,7 +176,7 @@ async fn stream_ass_short(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
-    deliver_ass(&state, &id, stream_index).await
+    deliver_ass(&state, &id, None, stream_index).await
 }
 
 /// Serve a subtitle track as RAW ASS/SSA (for SubtitlesOctopus). Sidecars pass
@@ -183,14 +186,18 @@ async fn stream_ass_short(
 async fn deliver_ass(
     state: &AppState,
     id_str: &str,
+    media_source_id: Option<&str>,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Subtitles,
+        id,
+        media_source_id,
+    )
+    .await?;
 
     let ass_body = |bytes: Vec<u8>| {
         HttpResponse::Ok()
@@ -585,9 +592,9 @@ async fn stream_srt(
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _media_source_id, stream_index) = path.into_inner();
+    let (id, msid, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    deliver_srt(&state, &id, stream_index, forced_only).await
+    deliver_srt(&state, &id, Some(&msid), stream_index, forced_only).await
 }
 
 async fn stream_srt_short(
@@ -597,7 +604,7 @@ async fn stream_srt_short(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
-    deliver_srt(&state, &id, stream_index, forced_only).await
+    deliver_srt(&state, &id, None, stream_index, forced_only).await
 }
 
 /// P40 — SRT-form delivery. ffmpeg converts the embedded stream to
@@ -607,15 +614,19 @@ async fn stream_srt_short(
 async fn deliver_srt(
     state: &AppState,
     id_str: &str,
+    media_source_id: Option<&str>,
     stream_index: u32,
     forced_only: bool,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Subtitles,
+        id,
+        media_source_id,
+    )
+    .await?;
     if let Some(track) = item
         .probe
         .subtitle_tracks
@@ -739,10 +750,10 @@ async fn stream_vtt(
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _media_source_id, stream_index) = path.into_inner();
+    let (id, msid, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
     let style = user_subtitle_style(&state, user).await;
-    deliver_vtt(&state, &id, stream_index, forced_only, style).await
+    deliver_vtt(&state, &id, Some(&msid), stream_index, forced_only, style).await
 }
 
 async fn stream_vtt_short(
@@ -754,7 +765,7 @@ async fn stream_vtt_short(
     let (id, stream_index) = path.into_inner();
     let forced_only = parse_forced_only(req.query_string());
     let style = user_subtitle_style(&state, user).await;
-    deliver_vtt(&state, &id, stream_index, forced_only, style).await
+    deliver_vtt(&state, &id, None, stream_index, forced_only, style).await
 }
 
 /// Per-user subtitle style when the request is authenticated; default styling
@@ -784,16 +795,20 @@ fn parse_forced_only(qs: &str) -> bool {
 async fn deliver_vtt(
     state: &AppState,
     id_str: &str,
+    media_source_id: Option<&str>,
     stream_index: u32,
     forced_only: bool,
     style: SubtitleStyle,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Subtitles,
+        id,
+        media_source_id,
+    )
+    .await?;
 
     // Sidecar lookups first — they're free (no ffmpeg spawn).
     let sidecar_base = sidecar_base_index(&item.probe);
@@ -895,8 +910,8 @@ async fn stream_js(
     state: web::Data<AppState>,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _msid, stream_index) = path.into_inner();
-    deliver_js(&state, &id, stream_index).await
+    let (id, msid, stream_index) = path.into_inner();
+    deliver_js(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_js_short(
@@ -904,15 +919,15 @@ async fn stream_js_short(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
-    deliver_js(&state, &id, stream_index).await
+    deliver_js(&state, &id, None, stream_index).await
 }
 
 async fn stream_js_ticks(
     state: web::Data<AppState>,
     path: web::Path<(String, String, u32, i64)>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (id, _msid, stream_index, _start_ticks) = path.into_inner();
-    deliver_js(&state, &id, stream_index).await
+    let (id, msid, stream_index, _start_ticks) = path.into_inner();
+    deliver_js(&state, &id, Some(&msid), stream_index).await
 }
 
 /// Serve a text subtitle track as jellyfin-web's JSON cue format
@@ -924,14 +939,18 @@ async fn stream_js_ticks(
 async fn deliver_js(
     state: &AppState,
     id_str: &str,
+    media_source_id: Option<&str>,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
+    let item = super::media_source::load_named(
+        state,
+        super::media_source::Route::Subtitles,
+        id,
+        media_source_id,
+    )
+    .await?;
 
     // Image subtitles can't become cue text — they burn into the transcode.
     if let Some(codec) = item
