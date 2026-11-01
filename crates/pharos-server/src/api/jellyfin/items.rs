@@ -4010,90 +4010,31 @@ fn wire_collection_type(ct: &str) -> serde_json::Value {
     }
 }
 
-/// B241: the library views `policy` lets its user see. Item queries already
-/// honour `EnabledFolders` ([`apply_policy_scope`]); without the filter here
-/// the list of libraries still named every one of them. Libraries are dropped
-/// before their image lookup, so a hidden one costs nothing.
+/// The library views `policy` lets its user see (V184), as
+/// `CollectionFolder` DTOs.
 async fn visible_views(
     state: &AppState,
     policy: &pharos_core::UserPolicy,
 ) -> Vec<serde_json::Value> {
-    // LIB-C1 — prefer the typed libraries reconciled from config (each
-    // carries its own CollectionType). The wire_id is the same
-    // library_id_for_root hash a plain root would yield, so client URLs
-    // are stable whether or not a library is typed.
-    // Clone out of the guard in its own scope: the loop below awaits per
-    // library, and holding a std RwLock guard across an await can deadlock the
-    // executor.
-    let libs: Vec<pharos_core::Library> = {
-        let libraries = state.libraries();
-        libraries.iter().cloned().collect()
-    };
-    if !libs.is_empty() {
-        // Sequential rather than a `map`: each entry awaits its representative
-        // image. The first call warms the whole synth map, so the rest are memo
-        // hits — a handful of libraries, one scan.
-        let mut out = Vec::with_capacity(libs.len());
-        for lib in libs
-            .into_iter()
-            .filter(|l| policy.allows_library(&l.wire_id))
-        {
-            let image_tags =
-                crate::api::jellyfin::images::synth_primary_tag(state, &lib.wire_id).await;
-            out.push({
-                // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
-                serde_json::to_value(CollectionFolderDto {
-                    id: lib.wire_id.clone(),
-                    name: lib.name.clone(),
-                    server_id: state.server_id.clone(),
-                    kind: "CollectionFolder",
-                    collection_type: wire_collection_type(lib.kind.collection_type())
-                        .as_str()
-                        .map(str::to_string),
-                    media_type: "Unknown",
-                    is_folder: true,
-                    user_data: UserItemDataDto::folder(&lib.wire_id, false, 0, false),
-                    image_tags,
-                })
-                .unwrap_or(serde_json::Value::Null)
-            });
-        }
-        return out;
-    }
-    if state.media_roots.is_empty() {
-        let placeholder = all_media_placeholder(&state.server_id);
-        let allowed = placeholder["Id"]
-            .as_str()
-            .is_some_and(|id| policy.allows_library(id));
-        return if allowed {
-            vec![placeholder]
-        } else {
-            Vec::new()
-        };
-    }
-    // Fallback: synthesise one `mixed` library per configured root (the
-    // legacy shape — used by tests that only call `with_media_roots`).
-    state
-        .media_roots
-        .iter()
-        .filter(|root| policy.allows_library(&library_id_for_root(root)))
-        .map(|root| {
-            let id = library_id_for_root(root);
-            let name = root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Media")
-                .to_string();
+    crate::services::library::views(state, policy)
+        .await
+        .into_iter()
+        .map(|view| {
+            // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
             serde_json::to_value(CollectionFolderDto {
-                id: id.clone(),
-                name,
+                user_data: UserItemDataDto::folder(&view.id, false, 0, false),
+                id: view.id,
+                name: view.name,
                 server_id: state.server_id.clone(),
                 kind: "CollectionFolder",
-                collection_type: None,
+                collection_type: wire_collection_type(view.kind.collection_type())
+                    .as_str()
+                    .map(str::to_string),
                 media_type: "Unknown",
                 is_folder: true,
-                user_data: UserItemDataDto::folder(&id, false, 0, false),
-                image_tags: None,
+                image_tags: view
+                    .primary_tag
+                    .map(|tag| std::collections::BTreeMap::from([("Primary".to_string(), tag)])),
             })
             .unwrap_or(serde_json::Value::Null)
         })
@@ -4101,7 +4042,7 @@ async fn visible_views(
 }
 
 fn all_media_placeholder(server_id: &str) -> serde_json::Value {
-    const ALL_MEDIA_ID: &str = "00000000000000000000000000000000";
+    use crate::services::library::ALL_MEDIA_ID;
     serde_json::to_value(CollectionFolderDto {
         image_tags: None,
         id: ALL_MEDIA_ID.to_string(),
