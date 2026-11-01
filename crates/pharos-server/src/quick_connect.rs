@@ -302,8 +302,12 @@ impl QuickConnectRegistry {
                         let mut ok = false;
                         if let Some(secret) = by_code.get(&code).cloned() {
                             if let Some(entry) = by_secret.get_mut(&secret) {
-                                entry.authorized_by = Some(by);
-                                ok = true;
+                                // First authorizer wins: a second user must not
+                                // redirect an already-vouched request to themselves.
+                                if entry.authorized_by.map_or(true, |first| first == by) {
+                                    entry.authorized_by = Some(by);
+                                    ok = true;
+                                }
                             }
                         }
                         if !ok {
@@ -903,13 +907,14 @@ mod tests {
         let reg = QuickConnectRegistry::spawn();
         let (a, b) = (UserId::new(), UserId::new());
         let real = initiate_from(&reg, ip(1)).await.unwrap();
+        let real_b = initiate_from(&reg, ip(2)).await.unwrap();
 
         for _ in 0..MAX_AUTHORIZE_FAILURES - 1 {
             assert!(!authorize_as(&reg, "999999", a).await.unwrap());
         }
         // a's own success, and b's, must not wipe a's count
         assert!(authorize_as(&reg, &real.code, a).await.unwrap());
-        assert!(authorize_as(&reg, &real.code, b).await.unwrap());
+        assert!(authorize_as(&reg, &real_b.code, b).await.unwrap());
         assert!(!authorize_as(&reg, "999999", a).await.unwrap());
 
         // a is now at the limit: even a correct code is refused
@@ -919,8 +924,40 @@ mod tests {
             "{err:?}"
         );
         // b is untouched
-        assert!(authorize_as(&reg, &real.code, b).await.unwrap());
+        assert!(authorize_as(&reg, &real_b.code, b).await.unwrap());
         assert_eq!(refused_count(&rec, "authorize_throttled"), 1);
+    }
+
+    #[tokio::test]
+    async fn first_authorizer_wins_and_a_later_user_is_told_unknown() {
+        let reg = QuickConnectRegistry::spawn();
+        let (a, b) = (UserId::new(), UserId::new());
+        let req = initiate_from(&reg, None).await.unwrap();
+
+        assert!(authorize_as(&reg, &req.code, a).await.unwrap());
+        // same user again is idempotent
+        assert!(authorize_as(&reg, &req.code, a).await.unwrap());
+        // a different user cannot take the request over
+        assert!(!authorize_as(&reg, &req.code, b).await.unwrap());
+
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Connect {
+                secret: req.secret.clone(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rx.await.unwrap().unwrap().authorized_by, Some(a));
+
+        // and the refused attempt counts toward b's guessing throttle
+        for _ in 0..MAX_AUTHORIZE_FAILURES - 1 {
+            assert!(!authorize_as(&reg, "999999", b).await.unwrap());
+        }
+        assert!(matches!(
+            authorize_as(&reg, "999999", b).await.unwrap_err(),
+            QcRefusal::AuthorizeThrottled { .. }
+        ));
     }
 
     fn failing_fill(_: &mut [u8]) -> Result<(), getrandom::Error> {
