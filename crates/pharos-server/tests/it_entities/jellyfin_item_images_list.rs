@@ -11,6 +11,28 @@ use pharos_core::{MediaItem, MediaKind, MediaStore};
 use pharos_server::{api::jellyfin, middleware::LowercasePath, state::AppState, state::Stores};
 use serde_json::Value;
 
+/// Create an unrestricted user and issue a token for it.
+async fn token_for(stores: &Stores) -> String {
+    use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+    let id = UserId::new();
+    stores
+        .create(UserRecord {
+            id,
+            name: "tester".into(),
+            password_hash: SecretString::new("x"),
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    stores
+        .issue(id, "test")
+        .await
+        .unwrap()
+        .0
+        .expose()
+        .to_string()
+}
+
 async fn seed_movie(cache_dir: &std::path::Path) -> (web::Data<AppState>, u64) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let id = 5258522902891629388u64; // a real-shaped movie id
@@ -38,6 +60,7 @@ async fn seed_movie(cache_dir: &std::path::Path) -> (web::Data<AppState>, u64) {
 async fn edit_images_list_is_served_not_404() {
     let cache = tempfile::tempdir().unwrap();
     let (state, id) = seed_movie(cache.path()).await;
+    let token = token_for(&state.stores).await;
     let app = test::init_service(
         App::new()
             .app_data(state)
@@ -48,6 +71,7 @@ async fn edit_images_list_is_served_not_404() {
 
     // jellyfin-web calls this with the PascalCase path; LowercasePath canonicalises.
     let req = test::TestRequest::get()
+        .insert_header(("X-Emby-Token", token.clone()))
         .uri(&format!("/Items/{:032x}/Images", id))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -88,6 +112,7 @@ async fn edit_images_list_is_served_not_404() {
 async fn unknown_item_yields_empty_list_not_error() {
     let cache = tempfile::tempdir().unwrap();
     let (state, _) = seed_movie(cache.path()).await;
+    let token = token_for(&state.stores).await;
     let app = test::init_service(
         App::new()
             .app_data(state)
@@ -98,6 +123,7 @@ async fn unknown_item_yields_empty_list_not_error() {
 
     // A well-formed but absent id → empty grid, never a hang or a 500.
     let req = test::TestRequest::get()
+        .insert_header(("X-Emby-Token", token.clone()))
         .uri("/Items/00000000000000000000000000000001/Images")
         .to_request();
     let resp = test::call_service(&app, req).await;
