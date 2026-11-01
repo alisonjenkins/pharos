@@ -18,6 +18,19 @@ quickstart.md §0 holds the numbers.
 - **Alternatives**: protobuf + gRPC-web (needs a proxy, no pipelining), FlatBuffers
   (no RPC), JSON over WebSocket (the inefficiency being removed).
 
+- **Finding (T001, 2026-11-01)**: capnpc 0.27 generates no pipeline accessor
+  for a capability inside a union, and `Bootstrap.resume` returns
+  `SessionResult`, a union of `session` and `error`. So `resume` has to be
+  awaited before `session.library()` can be called, and the chain is two round
+  trips, not the single flight claimed above and in US1. `library()` and
+  `latest()`/`home()` do pipeline off the session capability. The wire protocol
+  can pipeline through a union pointer; only the generated Rust lacks the
+  accessor. **Open, to be decided before T024**: either make `resume`'s result
+  pipelinable (e.g. `(session :Session, error :Error)` as plain fields, with a
+  failed resume returning a session whose calls fail `revoked`), or accept two
+  round trips and amend SC-001 / US1's ≤ 2 count. The schema has no released
+  baseline yet (R7), so changing it now costs nothing.
+
 ## R2 — capnp-rpc is `!Send`; actix fits it
 
 - **Finding**: `RpcSystem` and capability clients use `Rc` internally, so they
