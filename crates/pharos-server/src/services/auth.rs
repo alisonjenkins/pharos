@@ -70,6 +70,8 @@ pub enum RevokeCause {
     UserDeleted,
     /// The user's policy changed (it may now be disabled).
     PolicyChanged,
+    /// The user's password changed, so tokens issued under the old one go.
+    PasswordChanged,
 }
 
 impl RevokeCause {
@@ -80,6 +82,7 @@ impl RevokeCause {
             RevokeCause::ApiKeyRevoked => "api_key_revoked",
             RevokeCause::UserDeleted => "user_deleted",
             RevokeCause::PolicyChanged => "policy_changed",
+            RevokeCause::PasswordChanged => "password_changed",
         }
     }
 }
@@ -293,6 +296,30 @@ pub async fn password_login(
     result
 }
 
+/// Revokes every session token `user` holds (API keys excepted) but `keep_token`; announces the user
+/// when any went and logs how many. Returns the count.
+pub async fn revoke_other_tokens(
+    state: &AppState,
+    user: UserId,
+    keep_token: Option<&str>,
+    cause: RevokeCause,
+) -> Result<u64, AuthError> {
+    let revoked = state
+        .stores
+        .revoke_sessions_except(user, keep_token)
+        .await?;
+    tracing::info!(
+        user_id = %user.0,
+        cause = cause.label(),
+        revoked,
+        "auth: user tokens revoked"
+    );
+    if revoked > 0 {
+        state.revocations.announce(user, cause);
+    }
+    Ok(revoked)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -343,6 +370,7 @@ mod tests {
             RevokeCause::ApiKeyRevoked,
             RevokeCause::UserDeleted,
             RevokeCause::PolicyChanged,
+            RevokeCause::PasswordChanged,
         ];
         let unique: std::collections::HashSet<_> = causes.iter().map(|c| c.label()).collect();
         assert_eq!(unique.len(), causes.len());
