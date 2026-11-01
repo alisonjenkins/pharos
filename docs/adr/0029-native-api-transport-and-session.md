@@ -34,9 +34,12 @@ connection's `RpcSystem` runs on the actix worker that accepted the upgrade
 on plain TCP and the tests use the same code.
 
 **Admission.** The server refuses an upgrade before it happens in two cases:
-- An `Origin` header present that is neither this server's own host nor an
-  exact `[server.native_api].allowed_origins` entry gets 403. No `Origin`
-  means a native app and is allowed; there is no wildcard.
+- An `Origin` header present that is not an exact
+  `[server.native_api].allowed_origins` entry gets 403. No `Origin` means a
+  native app and is allowed; there is no wildcard. The request's own `Host`
+  is not trusted as same-origin, because under DNS rebinding the attacker's
+  page names its own domain in both headers; the origin pharos-ui is served
+  from has to be listed too.
 - When 64 connections are already open without a session, the upgrade gets
   429.
 

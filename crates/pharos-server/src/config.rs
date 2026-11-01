@@ -548,10 +548,11 @@ pub struct ServerConfig {
 pub struct NativeApiConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Browser origins, besides the server's own, allowed to open
-    /// `/pharos/rpc` and post to `/pharos/session`, e.g.
-    /// `https://pharos.example.org`. Exact match on scheme, host and port; no
-    /// wildcards. A request without an `Origin` header (a native app) is not
+    /// Browser origins allowed to open `/pharos/rpc`, e.g.
+    /// `https://pharos.example.org`, INCLUDING the origin pharos-ui is served
+    /// from: the request's own Host is not trusted (DNS rebinding). Exact match
+    /// on scheme, host and port; no wildcards. Empty (the default) admits no
+    /// browser. A request without an `Origin` header (a native app) is not
     /// subject to this list.
     #[serde(default)]
     pub allowed_origins: Vec<String>,

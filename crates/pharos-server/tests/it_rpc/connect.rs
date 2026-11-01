@@ -106,10 +106,22 @@ async fn a_native_client_without_origin_connects_and_calls() {
     );
 }
 
+/// DNS rebinding: a page whose Origin names the very host it reached is not
+/// trusted for that; only `allowed_origins` admits a browser.
 #[actix_web::test]
-async fn the_servers_own_origin_connects() {
+async fn an_origin_matching_the_host_is_refused_unless_listed() {
     let server = start(Vec::new()).await;
     let own = server.url("").trim_end_matches('/').to_owned();
+    let refused = awc::Client::new()
+        .ws(ws_url(&server))
+        .origin(own.as_str())
+        .connect()
+        .await;
+    assert!(
+        matches!(refused, Err(awc::error::WsClientError::InvalidResponseStatus(s)) if s == 403),
+        "an unlisted origin must be refused even when it matches Host"
+    );
+    let server = start(vec![own.clone()]).await;
     let client = connect(&server, Some(&own)).await;
     assert_eq!(
         server_info(&client).await,

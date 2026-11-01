@@ -162,8 +162,7 @@ pub(super) async fn upgrade(
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
-    let host = req.connection_info().host().to_owned();
-    if let Err(refusal) = origin::check(origin_header, &host, &cfg.allowed_origins) {
+    if let Err(refusal) = origin::check(origin_header, &cfg.allowed_origins) {
         record_refused(Refused::Origin(refusal), origin_header, &peer);
         return Ok(HttpResponse::Forbidden().body(refusal.label()));
     }
