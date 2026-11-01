@@ -18,7 +18,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_cache::HlsSegmentCache;
-use pharos_core::{MediaStore, Prober};
+use pharos_core::Prober;
 use pharos_scanner::FfmpegProber;
 use pharos_transcode::scheduler::{JobClass, PlayheadSeed, StreamKey};
 use pharos_transcode::{
@@ -3042,6 +3042,7 @@ pub(super) fn prewarm_cold_start(
     video_bitrate_cap: Option<u64>,
     resume_ticks: u64,
     demuxed_cmaf: bool,
+    media_source_id: Option<String>,
 ) {
     if state.hls.is_none() {
         return;
@@ -3050,7 +3051,14 @@ pub(super) fn prewarm_cold_start(
     let stream = StreamKey::of(play_session_id);
     let state = state.clone();
     actix_web::rt::spawn(async move {
-        let Ok(item) = fetch_item(&state, media_id).await else {
+        let Ok(item) = super::media_source::load_named(
+            &state,
+            super::media_source::Route::Prewarm,
+            media_id,
+            media_source_id.as_deref(),
+        )
+        .await
+        else {
             return;
         };
         let total_segs = item
@@ -3399,7 +3407,7 @@ fn burn_prefetch_targets(
     out
 }
 
-/// [`fetch_item`] for a client request, as the file its `MediaSourceId`
+/// Load item `id` for a client request, as the file its `MediaSourceId`
 /// selects.
 /// Loads the edition `req` asks for, once `user` may reach the item (V187).
 async fn fetch_req_item(
@@ -3416,13 +3424,6 @@ async fn fetch_req_item(
         req.query_string(),
     )
     .await
-}
-
-async fn fetch_item(state: &AppState, id: u64) -> Result<pharos_core::MediaItem, actix_web::Error> {
-    state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })
 }
 
 /// W4 — enforce the PlaySessionId (if supplied) is still live, matching the
