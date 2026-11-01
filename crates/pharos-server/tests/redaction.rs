@@ -150,3 +150,50 @@ fn auth_flow_never_logs_token() {
         panic!("32-char hex matched a non-id context — possible token leak:\n  …{context}…",);
     }
 }
+
+/// B247: a token sent as `?api_key=` (how element URLs authenticate) is
+/// masked in the request span's `http.target`, which the error-status WARN
+/// prints and every trace exports. Disarm check: with the stock
+/// `tracing_actix_web::root_span!` in `StatusRootSpanBuilder`, the token
+/// appears in the captured line.
+#[actix_web::test]
+async fn query_token_is_masked_in_the_request_span() {
+    use actix_web::test;
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(VecWriter(buf.clone()))
+            .with_ansi(false),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let state = web::Data::new(AppState::new(stores, "pharos-redact".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(tracing_actix_web::TracingLogger::<
+                pharos_server::obs::StatusRootSpanBuilder,
+            >::new())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let secret = "querytokenmustnotbelogged";
+    let req = test::TestRequest::get()
+        .uri(&format!("/Users/Me?maxWidth=300&api_key={secret}"))
+        .to_request();
+    let status = test::call_service(&app, req).await.status();
+    assert_eq!(status.as_u16(), 401);
+
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap().clone()).into_owned();
+    assert!(
+        captured.contains("http request completed with error status"),
+        "no request line captured:\n{captured}"
+    );
+    assert!(!captured.contains(secret), "token in the log:\n{captured}");
+    assert!(
+        captured.contains("api_key=REDACTED"),
+        "target not masked:\n{captured}"
+    );
+}

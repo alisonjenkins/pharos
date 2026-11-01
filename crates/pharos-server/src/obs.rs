@@ -21,7 +21,7 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
         request
             .extensions_mut()
             .insert(RequestStart(Instant::now()));
-        let span = tracing_actix_web::root_span!(request);
+        let span = root_span(request);
         use opentelemetry::trace::TraceContextExt as _;
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         let parent = parent_context(request.headers());
@@ -73,6 +73,92 @@ impl tracing_actix_web::RootSpanBuilder for StatusRootSpanBuilder {
             }
         }
     }
+}
+
+/// The `HTTP request` span `tracing_actix_web::root_span!` builds, with the
+/// same fields, except that `http.target` has its credential query
+/// parameters masked. Element URLs (images, subtitles, streams, HLS) carry
+/// the bearer token as `?api_key=`, and the target is logged on every error
+/// response and exported with every trace (V8, B247).
+fn root_span(request: &actix_web::dev::ServiceRequest) -> tracing::Span {
+    use tracing::field::Empty;
+    let user_agent = request
+        .headers()
+        .get(actix_web::http::header::USER_AGENT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let route = request.match_pattern().unwrap_or_else(|| "default".into());
+    let method = request.method().as_str();
+    let target = redact_query_credentials(
+        request
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or(""),
+    );
+    let flavor = match request.version() {
+        actix_web::http::Version::HTTP_09 => "0.9",
+        actix_web::http::Version::HTTP_10 => "1.0",
+        actix_web::http::Version::HTTP_11 => "1.1",
+        actix_web::http::Version::HTTP_2 => "2.0",
+        actix_web::http::Version::HTTP_3 => "3.0",
+        _ => "unknown",
+    };
+    let request_id = request
+        .extensions()
+        .get::<tracing_actix_web::RequestId>()
+        .copied()
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let connection_info = request.connection_info();
+    tracing::info_span!(
+        "HTTP request",
+        http.method = %method,
+        http.route = %route,
+        http.flavor = %flavor,
+        http.scheme = %connection_info.scheme(),
+        http.host = %connection_info.host(),
+        http.client_ip = %connection_info.realip_remote_addr().unwrap_or(""),
+        http.user_agent = %user_agent,
+        http.target = %target,
+        http.status_code = Empty,
+        otel.name = %format!("{method} {route}"),
+        otel.kind = "server",
+        otel.status_code = Empty,
+        trace_id = Empty,
+        request_id = %request_id,
+        exception.message = Empty,
+        exception.details = Empty,
+    )
+}
+
+/// Query parameters that carry a credential, compared case-insensitively.
+/// `tag` and `PlaySessionId` are stream capabilities (`authorize_media`).
+const CREDENTIAL_PARAMS: &[&str] = &["api_key", "apikey", "x-emby-token", "tag", "playsessionid"];
+
+/// `target` with the value of every credential query parameter replaced by
+/// `REDACTED`; borrowed unchanged when it has none.
+pub fn redact_query_credentials(target: &str) -> std::borrow::Cow<'_, str> {
+    let Some((path, query)) = target.split_once('?') else {
+        return std::borrow::Cow::Borrowed(target);
+    };
+    let is_credential = |pair: &str| {
+        let key = pair.split_once('=').map_or(pair, |(k, _)| k);
+        CREDENTIAL_PARAMS
+            .iter()
+            .any(|c| key.eq_ignore_ascii_case(c))
+    };
+    if !query.split('&').any(is_credential) {
+        return std::borrow::Cow::Borrowed(target);
+    }
+    let query: Vec<std::borrow::Cow<'_, str>> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_credential(pair) => format!("{key}=REDACTED").into(),
+            _ => pair.into(),
+        })
+        .collect();
+    std::borrow::Cow::Owned(format!("{path}?{}", query.join("&")))
 }
 
 /// Opt-in flag (env `PHAROS_LOG_ALL_REQUESTS`) to log EVERY request, not just
@@ -386,6 +472,32 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn credential_query_values_are_masked() {
+        assert_eq!(
+            redact_query_credentials("/Items/1/Images/Primary?maxWidth=300&api_key=abc&tag=x"),
+            "/Items/1/Images/Primary?maxWidth=300&api_key=REDACTED&tag=REDACTED"
+        );
+        assert_eq!(
+            redact_query_credentials("/Videos/1/stream?Static=true&PlaySessionId=p"),
+            "/Videos/1/stream?Static=true&PlaySessionId=REDACTED"
+        );
+        assert_eq!(
+            redact_query_credentials("/socket?ApiKey=abc&deviceId=d"),
+            "/socket?ApiKey=REDACTED&deviceId=d"
+        );
+        assert_eq!(
+            redact_query_credentials("/a?X-Emby-Token=t"),
+            "/a?X-Emby-Token=REDACTED"
+        );
+        assert!(matches!(
+            redact_query_credentials("/a?b=1&c=2"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(redact_query_credentials("/a"), "/a");
+        assert_eq!(redact_query_credentials("/a?api_key"), "/a?api_key");
+    }
 
     /// The completion line reports the request's own age, or nothing when
     /// the middleware never stamped the request (a synthetic one in tests).
