@@ -1202,7 +1202,7 @@ async fn serve_segment(
                 .insert_header((actix_web::http::header::ETAG, etag.as_str()))
                 .insert_header((
                     actix_web::http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
+                    "private, max-age=31536000, immutable",
                 ))
                 .finish());
         }
@@ -1248,7 +1248,7 @@ async fn serve_segment(
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
             .insert_header((
                 actix_web::http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
+                "private, max-age=31536000, immutable",
             ))
             .body(bytes));
     }
@@ -1280,7 +1280,7 @@ async fn serve_segment(
                     .insert_header((actix_web::http::header::ETAG, etag.as_str()))
                     .insert_header((
                         actix_web::http::header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
+                        "private, max-age=31536000, immutable",
                     ))
                     .streaming(stream));
             }
@@ -1302,7 +1302,7 @@ async fn serve_segment(
         .insert_header((actix_web::http::header::ETAG, etag.as_str()))
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .streaming(stream.into_stream()))
 }
@@ -1919,7 +1919,7 @@ fn rendition_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&st
 /// parameter sets per segment, so it is exempt from the `#114` init hazard `g=`
 /// exists for, and it therefore never adopted `rendition_qs`. But `V132` is a
 /// different question with the same answer — `serve_segment` hands those `.ts`
-/// files back `public, max-age=31536000, immutable` like every other segment,
+/// files back `private, max-age=31536000, immutable` like every other segment,
 /// so a re-resolved source leaves a year of the PREVIOUS resolution's bytes in
 /// the browser regardless of which rung produced them.
 fn source_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&str>) -> String {
@@ -2248,7 +2248,7 @@ async fn vp9_audio_file(
         .content_type(ctype)
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(bytes))
 }
@@ -2327,7 +2327,7 @@ async fn vp9_init(
         .content_type("video/mp4")
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.init))
 }
@@ -2441,7 +2441,7 @@ async fn vp9_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.media))
 }
@@ -2520,7 +2520,7 @@ async fn h264cmaf_init(
         .content_type("video/mp4")
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.init))
 }
@@ -2602,7 +2602,7 @@ async fn h264cmaf_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.media))
 }
