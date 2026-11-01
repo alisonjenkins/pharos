@@ -4,6 +4,7 @@ pub mod bg_io;
 pub mod book_convert;
 pub mod book_cover;
 pub mod cli;
+pub mod client_ip;
 pub mod config;
 pub mod dlna;
 pub mod health;
