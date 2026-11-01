@@ -8,6 +8,7 @@ use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, User};
 use pharos_jellyfin_api::dto::WireId;
 
+use super::bootstrap::token_denial;
 use super::session::Session;
 use crate::services::auth::{user_for_token, TokenRefusal};
 use crate::services::library::{self, LibraryView};
@@ -29,16 +30,11 @@ impl Library {
         }
         user_for_token(&self.session.state.stores, &self.session.token)
             .await
-            .map_err(|refusal| match refusal {
-                TokenRefusal::Unavailable(detail) => {
+            .map_err(|refusal| {
+                if let TokenRefusal::Unavailable(detail) = &refusal {
                     tracing::warn!(error = %detail, "native library: token store unavailable");
-                    Denial::Unavailable {
-                        dependency: "token store",
-                    }
                 }
-                other => Denial::Revoked {
-                    reason: other.label(),
-                },
+                token_denial(&refusal)
             })
     }
 }
