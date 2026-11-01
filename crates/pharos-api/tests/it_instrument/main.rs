@@ -6,6 +6,7 @@
 mod guard;
 mod instrument;
 mod labels;
+mod limits;
 mod redact;
 mod refused;
 mod registration;
