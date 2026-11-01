@@ -3599,7 +3599,7 @@ impl HlsSegmentCache {
 
     /// A/V-sync fix (continuous-audio rendition): ensure a single ffmpeg is
     /// producing the whole audio track as an HLS rendition (fMP4 Opus, 6 s
-    /// segments) into a per-(media,track,bitrate) directory, and return that
+    /// segments) into a per-(media,track,bitrate,source generation) directory, and return that
     /// directory. ONE continuous encode ⇒ one codec preskip total ⇒ gapless,
     /// driftless audio (vs the per-segment preskip that made audio creep ahead
     /// and click). The ffmpeg reads the source SEQUENTIALLY and produces
@@ -3807,10 +3807,13 @@ impl HlsSegmentCache {
     ) -> Result<PathBuf, HlsCacheError> {
         let a = audio_index.unwrap_or(0);
         let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
+        // An edition shares its primary's media id, so without the generation
+        // the two would share one session and its audio.
+        let gen = SourceGen::for_read(source, edition).key_suffix();
         let dir = self
             .root
             .join("_audiohls")
-            .join(format!("{media_id}-a{a}-b{br}"));
+            .join(format!("{media_id}-a{a}-b{br}{gen}"));
         let playlist = dir.join("audio.m3u8");
         // The requested segment already exists in SOME session → nothing to
         // spawn.
