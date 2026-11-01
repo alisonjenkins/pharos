@@ -1437,17 +1437,21 @@ impl<P: Prober> FsScanner<P> {
                     // URL paths survive re-scans the same way the
                     // primary's id does.
                     let id = unique_edition_id(&item.probe.alternate_sources, &edition);
+                    resolve_item_3d_format(&alt_path, item.kind, &mut probe);
                     item.probe.alternate_sources.push(AlternateMediaSource {
                         id,
-                        path: alt_path,
-                        container: probe.container,
-                        video_codec: probe.video_codec,
-                        audio_codec: probe.audio_codec,
+                        container: probe.container.clone(),
+                        video_codec: probe.video_codec.clone(),
+                        audio_codec: probe.audio_codec.clone(),
                         bitrate_bps: probe.bitrate_bps,
                         size_bytes: probe.size_bytes,
                         duration_ms: probe.duration_ms,
                         name: Some(edition_display_name(&edition)),
-                        video_3d_format: parse_3d_edition(&edition),
+                        video_3d_format: probe
+                            .video_3d_format
+                            .or_else(|| parse_3d_edition(&edition)),
+                        path: alt_path,
+                        probe: Some(Box::new(probe)),
                     });
                 }
                 Err(err) => {
@@ -5568,6 +5572,7 @@ mod tests {
             duration_ms: None,
             name: None,
             video_3d_format: None,
+            probe: None,
         };
         assert_eq!(unique_edition_id(&[], "3D HSBS"), "3d-hsbs");
         let one = [alt("3d-hsbs")];
@@ -5637,6 +5642,9 @@ mod tests {
         assert_eq!(alt.id, "3d-hsbs");
         assert_eq!(alt.name.as_deref(), Some("3D HSBS"));
         assert_eq!(alt.video_3d_format, Some(Video3DFormat::HalfSideBySide));
+        let own = alt.probe.as_deref().expect("edition keeps its own probe");
+        assert_eq!(own.video_3d_format, Some(Video3DFormat::HalfSideBySide));
+        assert!(own.alternate_sources.is_empty());
     }
 
     #[tokio::test]

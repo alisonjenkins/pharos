@@ -52,9 +52,21 @@ mod tests {
             duration_ms: Some(7_200_000),
             name: Some("Director's Cut".into()),
             video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
+            probe: Some(Box::new(pharos_core::MediaProbe {
+                duration_ms: Some(7_200_000),
+                video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
+                ..Default::default()
+            })),
         }];
         let s = encode(&alts).unwrap();
         assert_eq!(decode(Some(s.as_str())), alts);
+    }
+
+    #[test]
+    fn a_row_written_before_v9_decodes_without_a_probe() {
+        let alts = decode(Some(r#"[{"id":"3d","path":"/m/Film - 3D.mkv"}]"#));
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0].probe, None);
     }
 
     #[test]

@@ -1939,6 +1939,11 @@ pub struct AlternateMediaSource {
     /// Stereoscopic packing of this edition's file, when known.
     #[serde(default)]
     pub video_3d_format: Option<Video3DFormat>,
+    /// The edition's own full probe (streams, tracks, dimensions), so a
+    /// request for this edition is served from its file without probing on
+    /// the playback path. `None` on rows probed before schema v9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<Box<MediaProbe>>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
@@ -2341,7 +2346,9 @@ pub struct ScanState {
 // a lone 3D file keeps `has_3d = 0`.
 // v8: 3D layout from container/stream metadata (`stereo_mode`, side data, MVC
 // profile). v7 rows were probed before that detection existed.
-pub const PROBE_SCHEMA_VERSION: i64 = 8;
+// v9: each grouped edition keeps its full probe, so it can be played from its
+// own file.
+pub const PROBE_SCHEMA_VERSION: i64 = 9;
 
 /// 005-kindle-conversion — bump when the BOOK extraction changes in a way that
 /// makes already-indexed book rows stale.
@@ -4078,7 +4085,7 @@ mod video_3d_format_tests {
 
     #[test]
     fn probe_schema_version_is_current() {
-        assert_eq!(PROBE_SCHEMA_VERSION, 8);
+        assert_eq!(PROBE_SCHEMA_VERSION, 9);
     }
 
     #[test]

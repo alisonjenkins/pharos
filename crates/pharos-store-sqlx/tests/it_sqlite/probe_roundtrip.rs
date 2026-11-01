@@ -272,6 +272,11 @@ fn alternate_sources_survive_a_reload() {
             duration_ms: Some(7_500_000),
             name: Some("Director's Cut".into()),
             video_3d_format: None,
+            probe: Some(Box::new(MediaProbe {
+                duration_ms: Some(7_500_000),
+                width: Some(3840),
+                ..MediaProbe::default()
+            })),
         };
         let item = MediaItem {
             id: 7,
