@@ -4994,14 +4994,22 @@ mod tests {
     /// (B189). Seeded at a position already past the end, because the drift
     /// itself needs hours of wall clock to reproduce and the hydration path
     /// cannot tell how the position got there.
+    ///
+    /// Seeded past the end by LESS than [`EOF_SETTLE_GRACE_MS`]. The actor's
+    /// prune tick fires at spawn and settles a group further past the end into
+    /// Paused, so a deeper seed made the joiner get a `Pause` instead of the
+    /// `Play` this test reads whenever the tick won the `select!` race after
+    /// the seed (failed under CPU load). Inside the grace the settle cannot
+    /// run, leaving only the clamp under test.
     #[tokio::test]
     async fn a_joiner_is_never_hydrated_past_the_end_of_the_item() {
         const RUNTIME_MS: u64 = 7_026_771;
+        const PAST_END_WITHIN_GRACE_MS: u64 = EOF_SETTLE_GRACE_MS / 2;
         let (h, sinks, _rx1, _m1) = fresh().await;
         h.tx.send(GroupMsg::SeedQueue {
             item_id: "42".into(),
             runtime_ms: Some(RUNTIME_MS),
-            position_ms: 20_337_295,
+            position_ms: RUNTIME_MS + PAST_END_WITHIN_GRACE_MS,
             is_paused: false,
         })
         .await
