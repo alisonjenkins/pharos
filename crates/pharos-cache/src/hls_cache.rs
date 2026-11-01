@@ -416,6 +416,26 @@ fn record_audio_wait(outcome: &'static str) {
     metrics::counter!("pharos_audio_wait_total", "outcome" => outcome).increment(1);
 }
 
+/// Which file an audio-rendition session was opened for: `primary` for the
+/// item's own file, `alternate` for a grouped edition's. Same strings as the
+/// `served` label on `pharos_media_source_selection_total`, so a session can be
+/// set beside the request that asked for it.
+fn audio_session_source_label(edition: Option<&str>) -> &'static str {
+    match edition {
+        Some(_) => "alternate",
+        None => "primary",
+    }
+}
+
+/// Count one audio-rendition session opened, by the file it reads.
+fn record_audio_session_opened(edition: Option<&str>) {
+    metrics::counter!(
+        "pharos_audio_session_opened_total",
+        "source" => audio_session_source_label(edition)
+    )
+    .increment(1);
+}
+
 /// Every `reason` a failed or coalesced-failed segment can carry; mirrors
 /// [`failure_reason`].
 const FAILURE_REASONS: [&str; 8] = [
@@ -3586,11 +3606,12 @@ impl HlsSegmentCache {
     pub async fn ensure_audio_hls(
         &self,
         source: &Path,
+        edition: Option<&str>,
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
     ) -> Result<PathBuf, HlsCacheError> {
-        self.ensure_audio_hls_covering(source, media_id, audio_index, audio_bitrate_bps, 0)
+        self.ensure_audio_hls_covering(source, edition, media_id, audio_index, audio_bitrate_bps, 0)
             .await
     }
 
@@ -3765,9 +3786,13 @@ impl HlsSegmentCache {
     /// directory (see [`audio_session_dir`](Self::audio_session_dir)) because
     /// they cannot agree on where a boundary falls; reads resolve across them
     /// via [`resolve_audio_file`](Self::resolve_audio_file).
+    ///
+    /// `edition` names the grouped edition `source` belongs to, `None` for the
+    /// item's own file.
     pub async fn ensure_audio_hls_covering(
         &self,
         source: &Path,
+        edition: Option<&str>,
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
@@ -3842,13 +3867,17 @@ impl HlsSegmentCache {
             start_seg,
             audio_start,
         )?;
-        if start_seg > 0 {
-            tracing::info!(
-                media.id = media_id,
-                start_seg,
-                "audio HLS: spawning seek session (B42)"
-            );
-        }
+        // Every session, not only seek sessions: which file a session reads is
+        // the question when an edition and its primary share a media id.
+        tracing::info!(
+            media.id = media_id,
+            start_seg,
+            audio.source = audio_session_source_label(edition),
+            audio.edition = edition.unwrap_or_default(),
+            audio.dir = %dir.display(),
+            "audio HLS: opening session"
+        );
+        record_audio_session_opened(edition);
 
         let bin = self.transcoder.binary().to_path_buf();
         let running_marker = running.clone();
@@ -9645,6 +9674,83 @@ mod tests {
     // The high-severity VP9 seek fix: audio_hls_file must WAIT while a cold
     // session is still producing, not 404 on a fixed 5 s cliff. Parameterised
     // budgets keep these sub-second.
+
+    /// Count `pharos_audio_session_opened_total` by its `source` label.
+    fn audio_sessions_opened(
+        snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    ) -> Vec<(String, u64)> {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                if k.name() != "pharos_audio_session_opened_total" {
+                    return None;
+                }
+                let source = k
+                    .labels()
+                    .find(|l| l.key() == "source")
+                    .map(|l| l.value().to_string())?;
+                match v {
+                    DebugValue::Counter(n) => Some((source, n)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// An audio session records which file it was opened for, so a grouped
+    /// edition's session can be told apart from its primary's by query.
+    #[test]
+    fn an_audio_session_records_the_source_it_opened() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                cache
+                    .ensure_audio_hls_covering(
+                        Path::new("/media/film.mkv"),
+                        None,
+                        7,
+                        None,
+                        Some(128_000),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                cache
+                    .ensure_audio_hls_covering(
+                        Path::new("/media/film-3d.mkv"),
+                        Some("3d"),
+                        8,
+                        None,
+                        Some(128_000),
+                        0,
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
+
+        let mut opened = audio_sessions_opened(&snapshotter);
+        opened.sort();
+        assert_eq!(
+            opened,
+            vec![("alternate".to_string(), 1), ("primary".to_string(), 1)],
+            "each opened session must be counted under the file it reads"
+        );
+    }
 
     #[tokio::test]
     async fn audio_hls_file_waits_for_a_segment_produced_after_a_delay() {

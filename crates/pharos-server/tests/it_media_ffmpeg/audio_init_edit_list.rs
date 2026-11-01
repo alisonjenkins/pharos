@@ -141,7 +141,7 @@ fn make_source(dir: &Path) -> PathBuf {
 /// The init bytes of a session covering `want_seg`, and the session's start.
 async fn init_of(cache: &HlsSegmentCache, src: &Path, media_id: u64, want_seg: u32) -> Vec<u8> {
     let dir = cache
-        .ensure_audio_hls_covering(src, media_id, None, Some(128_000), want_seg)
+        .ensure_audio_hls_covering(src, None, media_id, None, Some(128_000), want_seg)
         .await
         .expect("audio session");
     // Force the session to actually produce, so the init exists.
