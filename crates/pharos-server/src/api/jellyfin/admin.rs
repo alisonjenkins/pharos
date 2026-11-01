@@ -555,12 +555,14 @@ impl std::fmt::Debug for SetPasswordBody {
 
 async fn set_user_password(
     state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
     user: AuthUser,
     path: web::Path<String>,
     body: web::Json<SetPasswordBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let target = parse_user_id(&path.into_inner())?;
-    change_password(&state, &user, target, body.into_inner()).await
+    let ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
+    change_password(&state, &user, target, body.into_inner(), ip).await
 }
 
 /// Optional `userId` query on the self-service endpoints. Absent means the
@@ -575,6 +577,7 @@ pub(super) struct TargetUserQuery {
 /// the bearer changes their own password; `userId` is optional.
 pub(super) async fn set_own_password(
     state: web::Data<AppState>,
+    req: actix_web::HttpRequest,
     user: AuthUser,
     q: CiQuery<TargetUserQuery>,
     body: web::Json<SetPasswordBody>,
@@ -583,7 +586,8 @@ pub(super) async fn set_own_password(
         Some(raw) => parse_user_id(raw)?,
         None => user.0.id,
     };
-    change_password(&state, &user, target, body.into_inner()).await
+    let ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
+    change_password(&state, &user, target, body.into_inner(), ip).await
 }
 
 async fn change_password(
@@ -591,6 +595,7 @@ async fn change_password(
     user: &AuthUser,
     target: UserId,
     body: SetPasswordBody,
+    client_ip: std::net::IpAddr,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Either the bearer is the target, or the bearer is admin.
     let is_self = target == user.0.id;
@@ -605,11 +610,14 @@ async fn change_password(
     let auth = BuiltinAuth::new(state.stores.clone());
     let must_verify_current = is_self && !(user.0.policy.admin && body.reset_password);
     if must_verify_current {
+        // V174: a stolen bearer must not buy unthrottled guesses at the
+        // account's password through this check.
         let current = SecretString::new(body.current_pw.clone());
-        use pharos_core::AuthBackend;
-        AuthBackend::authenticate(&auth, &user.0.name, &current)
+        state
+            .login_throttle
+            .verify(&auth, &user.0.name, &current, client_ip)
             .await
-            .map_err(|_| error::ErrorUnauthorized("current password mismatch"))?;
+            .map_err(|r| super::users::login_refused(r, "current password mismatch"))?;
     }
     let new_password = if body.reset_password {
         SecretString::new(String::new())

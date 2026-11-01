@@ -122,3 +122,29 @@ async fn non_admin_cannot_change_someone_elses_password() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(can_log_in(&f, "other", "p").await);
 }
+
+/// V174: the CurrentPw check is a password check, so a stolen bearer cannot
+/// use it to guess the account's password at hash speed. Past the per-user
+/// limit even the right password is held with 429 and `Retry-After`.
+#[actix_web::test]
+async fn guessing_the_current_password_is_throttled() {
+    let f = seed().await;
+    let limit = pharos_server::config::LoginThrottleConfig::default().max_failures_per_user;
+    for _ in 0..limit {
+        let (status, _) = post_json(
+            &f,
+            "/Users/Password",
+            serde_json::json!({"CurrentPw": "guess", "NewPw": "q"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _) = post_json(
+        &f,
+        "/Users/Password",
+        serde_json::json!({"CurrentPw": "p", "NewPw": "q"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(can_log_in(&f, "me", "p").await, "password unchanged");
+}
