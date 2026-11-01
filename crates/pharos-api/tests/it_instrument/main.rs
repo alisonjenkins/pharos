@@ -3,6 +3,7 @@
 //! and recorder thread-locally, so none touches process-global state.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod client_schema;
 mod guard;
 mod instrument;
 mod labels;
