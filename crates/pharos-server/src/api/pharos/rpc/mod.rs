@@ -56,8 +56,13 @@ pub fn configure(
 }
 
 /// Logs and publishes whether the native API is served; call once at startup.
+/// When it is, also starts every call's RED series at zero, so `rate()` works
+/// from the first scrape.
 pub fn record_state(cfg: &NativeApiConfig) {
     metrics::gauge!("pharos_native_api_enabled").set(f64::from(u8::from(cfg.enabled)));
+    if cfg.enabled {
+        pharos_api::register_metrics();
+    }
     tracing::info!(
         enabled = cfg.enabled,
         allowed_origins = ?cfg.allowed_origins,
@@ -346,9 +351,16 @@ mod tests {
                 ..NativeApiConfig::default()
             };
             metrics::with_local_recorder(&recorder, || record_state(&cfg));
-            let value = snapshotter
-                .snapshot()
-                .into_vec()
+            let rows = snapshotter.snapshot().into_vec();
+            // Disarm check: without `register_metrics` here, an enabled API
+            // starts with no call series.
+            assert_eq!(
+                rows.iter()
+                    .any(|(k, ..)| k.key().name() == "pharos_rpc_calls_total"),
+                enabled,
+                "call series at zero only when the API is served"
+            );
+            let value = rows
                 .into_iter()
                 .find(|(k, ..)| k.key().name() == "pharos_native_api_enabled")
                 .map(|(.., v)| v);
