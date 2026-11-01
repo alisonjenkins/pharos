@@ -300,6 +300,22 @@ fn parent_context(headers: &actix_web::http::header::HeaderMap) -> opentelemetry
     opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&HeaderExtractor(headers))
 }
 
+/// Parents a native API call's span on the caller's `CallContext.traceparent`
+/// (017 FR-006), as `parent_context` does for an HTTP request. Installed with
+/// `pharos_api::set_trace_parent_hook`; a malformed value leaves the span a
+/// root.
+pub fn rpc_trace_parent(span: &tracing::Span, traceparent: &str) {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let carrier =
+        std::collections::HashMap::from([("traceparent".to_owned(), traceparent.to_owned())]);
+    let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(&carrier);
+    if parent.span().span_context().is_valid() {
+        let _ = span.set_parent(parent);
+    }
+}
+
 /// Parent-based sampler: an incoming sampled `traceparent` is honoured so a
 /// distributed trace is never cut in half; only root spans started here are
 /// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
@@ -576,6 +592,36 @@ mod tests {
             actix_web::http::header::HeaderValue::from_static("not-a-traceparent"),
         );
         assert!(!parent_context(&headers).span().span_context().is_valid());
+    }
+
+    /// The trace id an RPC call span ends up in after the hook ran on it,
+    /// under a real OpenTelemetry layer.
+    fn rpc_span_trace_id(traceparent: &str) -> String {
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("rpc.library.latest");
+            rpc_trace_parent(&span, traceparent);
+            span.context().span().span_context().trace_id().to_string()
+        })
+    }
+
+    /// FR-006: a call carrying a `traceparent` joins the caller's trace.
+    /// Disarm check: with `rpc_trace_parent` doing nothing, the span starts a
+    /// trace of its own and the first assertion fails.
+    #[test]
+    fn an_rpc_traceparent_parents_the_call_span() {
+        assert_eq!(
+            rpc_span_trace_id("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert_ne!(
+            rpc_span_trace_id("not-a-traceparent"),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
     }
 
     #[test]
