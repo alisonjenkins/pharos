@@ -219,6 +219,17 @@ impl SourceGen {
     pub fn is_local(self) -> bool {
         self == Self::LOCAL
     }
+
+    /// What this generation adds to a cache name: nothing for
+    /// [`LOCAL`](Self::LOCAL), so a local item's names never move, and
+    /// `-g{gen}` otherwise.
+    fn key_suffix(self) -> String {
+        if self.is_local() {
+            String::new()
+        } else {
+            format!("-g{}", self.0)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1333,11 +1344,7 @@ impl SegmentIdentity {
         // and the deploy does not wipe a 40 GiB cache. `LOCAL` and absent are
         // the same thing, and the mapping stays injective because no resolved
         // source may hash to zero.
-        let gen = if source_gen.is_local() {
-            String::new()
-        } else {
-            format!("-g{}", source_gen.get())
-        };
+        let gen = source_gen.key_suffix();
         let sub = if *subtitle_index == NO_SUBTITLE {
             "off".to_string()
         } else {
