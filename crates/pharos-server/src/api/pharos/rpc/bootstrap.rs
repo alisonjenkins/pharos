@@ -46,6 +46,13 @@ impl Bootstrap {
     /// The token is re-checked while the connection lives (T025a) and is the
     /// one `Session.logout` revokes.
     fn open_session(&self, user: User, token: String) -> pharos_capnp::session::Client {
+        // A concurrent failed sign-in on this connection may have settled
+        // the slot meanwhile; the session's user holds it (already counted
+        // by `admit`, so this cannot exceed the cap by more than that).
+        let _ = self
+            .ctx
+            .limits
+            .sign_in(&mut self.ctx.slot.borrow_mut(), user.id, u32::MAX);
         self.ctx.remember_token(token.clone(), user.id);
         self.conn.set_user(&user.name);
         let session = Session::new(self.state.clone(), Rc::clone(&self.ctx), user, token);
@@ -228,7 +235,11 @@ impl server::bootstrap::Handler for Bootstrap {
                 ok.set_device_token(token.as_str());
                 ok.set_session(self.open_session(user, token));
             }
-            Err(e) => login_denial(&e).write(result.init_error()),
+            Err(e) => {
+                // A failure after `admit` must not leave the slot held.
+                self.ctx.settle_slot();
+                login_denial(&e).write(result.init_error());
+            }
         }
         Ok(())
     }
@@ -305,7 +316,12 @@ impl server::bootstrap::Handler for Bootstrap {
                 ok.set_device_token(token.as_str());
                 ok.set_session(self.open_session(user, token));
             }
-            Err(e) => quick_connect_denial(&e).write(result.init_error()),
+            Err(e) => {
+                // A lost consume race or a failed issue comes after `admit`;
+                // the slot must not stay held with no session.
+                self.ctx.settle_slot();
+                quick_connect_denial(&e).write(result.init_error());
+            }
         }
         Ok(())
     }

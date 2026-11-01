@@ -196,3 +196,30 @@ async fn quick_connect_sign_ins_are_counted_and_pending_polls_are_not() {
     assert_eq!(count("invalid"), 1, "the unknown secret");
     assert_eq!(count("pending"), 0);
 }
+
+/// Two connections polling one authorized secret at once: one signs in, the
+/// other is told to start over and keeps no place in the user's connection
+/// count (FR-010). Disarm check: without `settle_slot` on the refused poll,
+/// the user holds 2.
+#[actix_web::test]
+async fn racing_polls_sign_in_once_and_leave_no_slot_behind() {
+    let fx = seed_rich().await;
+    let limits = rpc::limits::ConnectionLimits::default();
+    let mk = || {
+        let ctx = rpc::ConnectionCtx::admit(None, LOCAL, &limits, 16).unwrap();
+        rpc::bootstrap_client(fx.state.clone(), ctx, &Connection::new())
+    };
+    let (a, b) = (mk(), mk());
+    let (code, secret) = initiate(&a).await;
+    authorize(&fx, &code, fx.user_id).await;
+
+    let (ra, rb) = futures_util::join!(poll(&a, &secret), poll(&b, &secret));
+    let oks = [&ra, &rb]
+        .iter()
+        .filter(|r| matches!(r, Poll::Ok { .. }))
+        .count();
+    assert_eq!(oks, 1, "{ra:?} {rb:?}");
+    assert!([&ra, &rb].contains(&&Poll::NotFound), "{ra:?} {rb:?}");
+    assert_eq!(limits.held_by(fx.user_id), 1);
+    assert_eq!(limits.unauthenticated(), 1);
+}

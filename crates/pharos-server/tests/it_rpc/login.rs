@@ -243,3 +243,26 @@ async fn each_native_login_is_counted_by_outcome() {
     assert_eq!(count("ok"), 1);
     assert_eq!(count("invalid"), 1);
 }
+
+/// FR-010: a logout gives back the user's place, though the connection stays
+/// open. Disarm check: without `sign_out` in `end_token`, the second login is
+/// refused `connections_per_user`.
+#[actix_web::test]
+async fn logout_releases_the_connection_cap() {
+    let fx = seed_rich().await;
+    let limits = rpc::limits::ConnectionLimits::default();
+    let open: Vec<_> = (0..2)
+        .map(|_| {
+            let ctx = rpc::ConnectionCtx::admit(None, LOCAL, &limits, 1).unwrap();
+            rpc::bootstrap_client(fx.state.clone(), ctx, &Connection::new())
+        })
+        .collect();
+    let (session, _) = login(&open[0], "guest", "hunter2").await.ok().unwrap();
+    let mut logout = session.logout_request();
+    logout.get().init_ctx();
+    logout.send().promise.await.unwrap();
+    assert_eq!(limits.held_by(fx.user_id), 0);
+    login(&open[1], "guest", "hunter2")
+        .await
+        .unwrap_or_else(|(k, r)| panic!("the logged-out place must be free: {k:?} {r}"));
+}
