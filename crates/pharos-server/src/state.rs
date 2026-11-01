@@ -376,6 +376,9 @@ pub struct AppState {
     /// with the default policy so fixtures need no wiring; boot replaces it
     /// from `[server].login_throttle` via [`AppState::with_login_throttle`].
     pub login_throttle: crate::auth::LoginThrottle,
+    /// Tells open native connections a user's tokens may have been revoked
+    /// (T025).
+    pub revocations: crate::services::auth::Revocations,
     /// Proxies whose `X-Forwarded-For` is believed when keying the throttle
     /// (`[server].trusted_proxies`); empty means the peer address always.
     pub trusted_proxies: crate::client_ip::TrustedProxies,
@@ -650,6 +653,7 @@ impl AppState {
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            revocations: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
@@ -748,6 +752,7 @@ impl AppState {
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
+            revocations: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         })
     }
