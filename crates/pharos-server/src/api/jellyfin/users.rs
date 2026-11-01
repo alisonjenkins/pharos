@@ -85,11 +85,7 @@ async fn quick_connect_initiate(
     req: HttpRequest,
 ) -> Result<impl Responder, actix_web::Error> {
     let auth = auth_header_from_request(&req);
-    let device_id = auth
-        .device_id
-        .clone()
-        .or_else(|| auth.device.clone())
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let device_id = session_device_id(&auth)?;
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     state
         .quick_connect
@@ -308,6 +304,29 @@ pub(super) fn login_refused(
     }
 }
 
+/// The device id a new session is stored under: the client's `DeviceId`,
+/// else its `Device`, else a fresh one. A client may not pick an id shaped
+/// like an API key's (`apikey:…`): that session would be listed and revoked
+/// as a key and would survive a password change (B235).
+fn session_device_id(auth: &super::auth_extractor::AuthHeader) -> Result<String, actix_web::Error> {
+    let device_id = auth
+        .device_id
+        .clone()
+        .or_else(|| auth.device.clone())
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let prefix = pharos_core::API_KEY_DEVICE_PREFIX;
+    let key_shaped = device_id
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix));
+    if key_shaped {
+        tracing::warn!(device_id = %device_id, "session refused: device id shaped like an API key");
+        return Err(actix_web::error::ErrorBadRequest(
+            "DeviceId must not start with apikey:",
+        ));
+    }
+    Ok(device_id)
+}
+
 /// Current wall-clock time as the ISO8601 string the session DTO carries.
 fn now_iso() -> String {
     let ms = std::time::SystemTime::now()
@@ -324,6 +343,9 @@ async fn authenticate_by_name(
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
     let password = SecretString::new(body.pw);
+    // Refused before the password is checked, so the guess is not spent.
+    let auth = auth_header_from_request(&req);
+    let device_id = session_device_id(&auth)?;
 
     // V174 — the throttle admits the attempt before the argon2 verify, so a
     // refused attempt costs neither a hash nor a guess.
@@ -333,13 +355,6 @@ async fn authenticate_by_name(
         .verify(&state.auth, &body.username, &password, client_ip)
         .await
         .map_err(|r| login_refused(r, "invalid credentials"))?;
-
-    let auth = auth_header_from_request(&req);
-    let device_id = auth
-        .device_id
-        .clone()
-        .or_else(|| auth.device.clone())
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
 
     let token = state
         .stores

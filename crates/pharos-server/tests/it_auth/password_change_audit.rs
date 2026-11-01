@@ -290,3 +290,30 @@ async fn refused_change_revokes_nothing_and_announces_nothing() {
     assert!(resolves(&f, other.0.expose()).await);
     assert!(rx.try_recv().is_err());
 }
+
+/// A login cannot name its device like an API key (`apikey:…`): such a
+/// session would be listed and revoked as a key, and would survive the
+/// password change that B235 relies on to evict a thief.
+#[actix_web::test]
+async fn login_refuses_a_device_id_shaped_like_an_api_key() {
+    let f = seed().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    for device in ["apikey:x", "ApiKey:x"] {
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/Users/AuthenticateByName")
+                .insert_header((
+                    "X-Emby-Authorization",
+                    format!(
+                        r#"MediaBrowser Client="c", Device="d", DeviceId="{device}", Version="1""#
+                    ),
+                ))
+                .insert_header(("content-type", "application/json"))
+                .set_payload(r#"{"Username":"alice","Pw":"alice-pass"}"#)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 400, "{device}");
+    }
+}
