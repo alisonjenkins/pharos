@@ -1,6 +1,6 @@
 //! Metric names and label values for the native API. Labels are a dashboard
 //! contract: bounded, stable strings from `label()`, asserted distinct in
-//! `tests/labels.rs` (017 §Observability).
+//! `tests/it_instrument/labels.rs` (017 §Observability).
 
 /// `pharos_rpc_calls_total{interface,method,outcome}`.
 pub const CALLS_TOTAL: &str = "pharos_rpc_calls_total";
