@@ -32,9 +32,12 @@ async function signIn(page: Page) {
 
 test("signed-in jellyfin-web loads posters and a subtitle track", async ({ page }) => {
   const IMAGE = /\/Items\/[0-9a-f]{32}\/Images\//i;
+  const SUBTITLE = /\/Videos\/[0-9a-f]{32}\/[0-9a-f]{32}\/(Subtitles|Attachments)\//i;
   const images: string[] = [];
   page.on("response", (resp) => {
-    if (IMAGE.test(resp.url())) images.push(`${resp.status()} ${resp.url()}`);
+    if (IMAGE.test(resp.url()) || SUBTITLE.test(resp.url())) {
+      images.push(`${resp.status()} ${resp.url()}`);
+    }
   });
   await signIn(page);
   // Cards fetch their artwork lazily after the home view settles.
@@ -47,6 +50,20 @@ test("signed-in jellyfin-web loads posters and a subtitle track", async ({ page 
   expect(auth!.httpOnly).toBe(true);
   expect(auth!.sameSite).toBe("Strict");
 
+  // Browse the views that render artwork, including the display-preferences
+  // preview, then require that no image or subtitle URL answered 401.
+  for (const route of [
+    "#/home",
+    `#/details?id=${SUBBED}`,
+    `#/details?id=${(1).toString(16).padStart(32, "0")}`,
+    "#/mypreferencesmenu",
+    "#/mypreferencesdisplay",
+    "#/home",
+  ]) {
+    await page.goto(`/${route}`);
+    await page.waitForLoadState("networkidle");
+  }
+  expect(images.length, "browse fetched no artwork").toBeGreaterThan(0);
   expect(images.filter((l) => l.startsWith("401 ")), images.join("\n")).toEqual([]);
 
   // An <img> sends no header either: seed movie 1's poster renders on the
