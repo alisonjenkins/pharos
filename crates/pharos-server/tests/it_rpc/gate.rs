@@ -30,6 +30,7 @@ async fn status(enabled: bool, method: &str, path: &str) -> u16 {
 #[actix_web::test]
 async fn native_routes_do_not_exist_when_disabled() {
     assert_eq!(status(false, "GET", "/pharos/rpc").await, 404);
+    assert_eq!(status(false, "POST", "/pharos/session").await, 404);
 }
 
 #[actix_web::test]

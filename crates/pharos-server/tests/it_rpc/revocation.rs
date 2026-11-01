@@ -50,8 +50,25 @@ async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fix
 async fn connect(
     server: &actix_test::TestServer,
 ) -> (bootstrap::Client, oneshot::Receiver<Option<String>>) {
+    connect_with(server, None, None).await
+}
+
+/// [`connect`], carrying an `Origin` and a `pharos_session` cookie as a
+/// browser would.
+pub(crate) async fn connect_with(
+    server: &actix_test::TestServer,
+    origin: Option<&str>,
+    cookie: Option<&str>,
+) -> (bootstrap::Client, oneshot::Receiver<Option<String>>) {
     let url = server.url("/pharos/rpc").replacen("http", "ws", 1);
-    let (_resp, framed) = awc::Client::new().ws(url).connect().await.expect("upgrade");
+    let mut ws = awc::Client::new().ws(url);
+    if let Some(origin) = origin {
+        ws = ws.origin(origin);
+    }
+    if let Some(cookie) = cookie {
+        ws = ws.cookie(actix_web::cookie::Cookie::new(rpc::SESSION_COOKIE, cookie));
+    }
+    let (_resp, framed) = ws.connect().await.expect("upgrade");
     let (mut sink, mut stream) = framed.split();
     let (rpc_end, pump_end) = tokio::io::duplex(64 * 1024);
     let (mut from_rpc, mut to_rpc) = tokio::io::split(pump_end);
@@ -109,7 +126,7 @@ async fn signed_in(client: &bootstrap::Client, token: &str) -> session::Client {
     session
 }
 
-async fn me_works(session: &session::Client) -> bool {
+pub(crate) async fn me_works(session: &session::Client) -> bool {
     let mut me = session.me_request();
     me.get().init_ctx();
     match me.send().promise.await {

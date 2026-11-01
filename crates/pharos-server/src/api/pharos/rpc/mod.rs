@@ -31,8 +31,8 @@ use crate::state::AppState;
 
 pub use socket::{record_closed, record_refused, CloseCause, Recheck, Refused, SESSION_COOKIE};
 
-/// Routes of the native API, or none at all while
-/// `[server.native_api].enabled` is false: every push to main deploys
+/// Routes of the native API (`/pharos/rpc`, `/pharos/session`), or none at
+/// all while `[server.native_api].enabled` is false: every push to main deploys
 /// (ADR-0010), so the surface ships dark until it is complete. `limits` is
 /// shared by every worker, so build it once per server.
 pub fn configure(
@@ -45,7 +45,13 @@ pub fn configure(
         }
         sc.app_data(web::Data::new(cfg))
             .app_data(web::Data::new(limits))
-            .route("/pharos/rpc", web::get().to(socket::upgrade));
+            .route("/pharos/rpc", web::get().to(socket::upgrade))
+            .service(
+                web::resource("/pharos/session")
+                    .app_data(web::JsonConfig::default().limit(super::session_cookie::MAX_BODY))
+                    .route(web::post().to(super::session_cookie::sign_in))
+                    .route(web::delete().to(super::session_cookie::sign_out)),
+            );
     }
 }
 
@@ -58,6 +64,13 @@ pub fn record_state(cfg: &NativeApiConfig) {
         max_connections_per_user = cfg.max_connections_per_user.get(),
         "native api (/pharos/rpc)"
     );
+    for origin in origin::insecure(&cfg.allowed_origins) {
+        tracing::warn!(
+            origin,
+            "native api: allowed origin is plain http; browsers drop the Secure \
+             pharos_session cookie there, so sign-in from it cannot work. Serve the UI over https"
+        );
+    }
 }
 
 /// Words one incoming message may make a reader traverse (8 MiB). capnp's
