@@ -25,11 +25,14 @@ quickstart.md §0 holds the numbers.
   trips, not the single flight claimed above and in US1. `library()` and
   `latest()`/`home()` do pipeline off the session capability. The wire protocol
   can pipeline through a union pointer; only the generated Rust lacks the
-  accessor. **Open, to be decided before T024**: either make `resume`'s result
-  pipelinable (e.g. `(session :Session, error :Error)` as plain fields, with a
-  failed resume returning a session whose calls fail `revoked`), or accept two
-  round trips and amend SC-001 / US1's ≤ 2 count. The schema has no released
-  baseline yet (R7), so changing it now costs nothing.
+  accessor. **Decided 2026-11-01 (Alison, option a)**: `resume` returns
+  `ResumeResult { session :Session; status :Done }`, plain fields, so
+  `resume → session.library() → library.home()` is one flight and SC-001 / US1
+  stand as written. A refused resume returns a session whose every call fails
+  `Error.kind.revoked`, and `status.error` carries the reason; the generated
+  wrapper reads the call's outcome from `status` when `result` is not a union.
+  `login` and `quickConnectPoll` keep their unions: they run once per device,
+  not on every page load.
 
 ## R2 — capnp-rpc is `!Send`; actix fits it
 

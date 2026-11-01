@@ -38,9 +38,9 @@ gzip -9 -c <spike-target>/wasm32-unknown-unknown/release/r8_spike.wasm | wc -c
 ```
 
 The spike's `[profile.release]` sets opt-level="z", lto=true, codegen-units=1,
-strip=true, panic="abort". Its `run` polls the flight once; capnpc 0.27 does not
-pipeline through the `SessionResult` union, so `resume` is awaited and
-`library`/`latest` are pipelined.
+strip=true, panic="abort". Its `run` polls the flight once. With the original
+schema capnpc 0.27 could not pipeline through the `SessionResult` union, so
+`resume` was awaited; `ResumeResult` (research R1) has since removed that hop.
 
 ## 1. Instrumentation cannot be bypassed (V173)
 

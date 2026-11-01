@@ -60,7 +60,9 @@ counted (`pharos_rpc_events_total{outcome="resync"}`).
 - Every method takes `ctx :CallContext` first, which carries `device`
   (FR-006, V173). Capability getters do too, so their spans join the trace.
 - Every method returns a result union of ok and `Error`. Methods with no
-  payload return `Done` (FR-007). The one exception is the `Session`
+  payload return `Done` (FR-007). A result that must carry a pipelined
+  capability cannot be a union (research R1), so it holds the capability as a
+  plain field beside a `status :Done` (`Bootstrap.resume`). The other exception is the `Session`
   capability getters, which cannot fail: a revoked session surfaces as
   `Error.kind.revoked` on the first call made through the returned capability.
 - An optional scalar is an explicit union (`OptU32`, `OptU16`, `StreamChoice`),
