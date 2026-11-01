@@ -3705,6 +3705,27 @@ async fn playback_info(
         });
     }
 
+    // V189 — subtitle and font files answer only an authenticated request,
+    // and a `<track>` or font fetch cannot send a header: their URLs carry
+    // the caller's own token, as the transcode URLs above do.
+    if !api_key.is_empty() {
+        for source in &mut media_sources {
+            let streams = source
+                .media_streams
+                .iter_mut()
+                .filter_map(|s| s.delivery_url.as_mut());
+            let fonts = source
+                .media_attachments
+                .iter_mut()
+                .map(|a| &mut a.delivery_url);
+            for url in streams.chain(fonts) {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push(sep);
+                url.push_str("api_key=");
+                url.push_str(&api_key);
+            }
+        }
+    }
     // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep
     // a local copy of UserData.PlaybackPositionTicks.
     let playable = media_sources.first().is_some_and(|s| {
