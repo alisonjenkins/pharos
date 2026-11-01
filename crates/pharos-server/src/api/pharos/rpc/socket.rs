@@ -20,6 +20,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use super::limits::{ConnectionLimits, AUTH_DEADLINE};
 use super::{bootstrap_client, origin, ConnectionCtx};
 use crate::config::NativeApiConfig;
+use crate::services::auth::{user_for_token, TokenRefusal};
 use crate::state::AppState;
 
 /// The cookie `POST /pharos/session` sets (research R6).
@@ -77,6 +78,9 @@ pub enum CloseCause {
     AuthDeadline,
     /// Nothing heard from the client for [`IDLE_DROP`].
     IdleTimeout,
+    /// A token this connection resumed with was revoked, or its user was
+    /// disabled or deleted (T025a).
+    Revoked,
     /// The `RpcSystem` stopped (it hit a protocol or decode error).
     RpcEnded(String),
 }
@@ -91,6 +95,7 @@ impl CloseCause {
             CloseCause::TextFrame => "text_frame",
             CloseCause::AuthDeadline => "auth_deadline",
             CloseCause::IdleTimeout => "idle_timeout",
+            CloseCause::Revoked => "revoked",
             CloseCause::RpcEnded(_) => "rpc_ended",
         }
     }
@@ -109,6 +114,7 @@ impl CloseCause {
             CloseCause::TextFrame => CloseCode::Unsupported,
             CloseCause::AuthDeadline => CloseCode::Policy,
             CloseCause::IdleTimeout => CloseCode::Away,
+            CloseCause::Revoked => CloseCode::Policy,
             CloseCause::RpcEnded(_) => CloseCode::Protocol,
             _ => return None,
         };
@@ -130,6 +136,25 @@ pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived
         lived_ms = lived.as_millis() as u64,
         "native api connection closed"
     );
+}
+
+/// Whether every token a connection resumed with still resolves (T025a). A
+/// store outage keeps the connection (B216: ours and transient); only a
+/// definite refusal ends it.
+async fn still_valid(state: &AppState, tokens: &[String]) -> bool {
+    for token in tokens {
+        match user_for_token(&state.stores, token).await {
+            Ok(_) | Err(TokenRefusal::Unavailable(_)) => {}
+            Err(refusal) => {
+                tracing::info!(
+                    reason = refusal.label(),
+                    "native api: a resumed token no longer resolves"
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Keeps `pharos_rpc_connections{transport}` true however the task ends.
@@ -181,7 +206,8 @@ pub(super) async fn upgrade(
         .aggregate_continuations()
         .max_continuation_size(MAX_FRAME);
     // R2: the RpcSystem is !Send, so it stays on this worker.
-    actix_web::rt::spawn(run(state, ctx, session, stream, peer));
+    let revalidate = Duration::from_secs(u64::from(cfg.revalidate_secs.get()));
+    actix_web::rt::spawn(run(state, ctx, session, stream, peer, revalidate));
     Ok(response)
 }
 
@@ -191,6 +217,7 @@ async fn run<S>(
     session: Session,
     mut inbound: S,
     peer: String,
+    revalidate: Duration,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -205,7 +232,7 @@ async fn run<S>(
     let rpc = super::serve(
         rpc_read,
         rpc_write,
-        bootstrap_client(state, Rc::clone(&ctx), &conn),
+        bootstrap_client(state.clone(), Rc::clone(&ctx), &conn),
     );
 
     let mut sender = session.clone();
@@ -263,8 +290,16 @@ async fn run<S>(
         let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
         tokio::pin!(auth_deadline);
         let mut checked_auth = false;
+        let mut recheck = tokio::time::interval(revalidate);
+        recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        recheck.reset();
         loop {
             tokio::select! {
+                _ = recheck.tick() => {
+                    if !still_valid(&state, &deadline.resumed_tokens()).await {
+                        return CloseCause::Revoked;
+                    }
+                }
                 () = &mut auth_deadline, if !checked_auth => {
                     if !deadline.is_signed_in() {
                         return CloseCause::AuthDeadline;
@@ -310,6 +345,7 @@ mod tests {
             CloseCause::TextFrame,
             CloseCause::AuthDeadline,
             CloseCause::IdleTimeout,
+            CloseCause::Revoked,
             CloseCause::RpcEnded(String::new()),
         ];
         let labels: std::collections::HashSet<_> = causes.iter().map(CloseCause::label).collect();

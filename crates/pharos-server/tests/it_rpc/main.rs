@@ -10,3 +10,4 @@ mod common;
 mod bootstrap;
 mod connect;
 mod gate;
+mod revocation;

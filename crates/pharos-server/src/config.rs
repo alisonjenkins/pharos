@@ -562,6 +562,11 @@ pub struct NativeApiConfig {
     /// few devices per person. Zero is rejected: it would lock every user out.
     #[serde(default = "default_native_max_connections_per_user")]
     pub max_connections_per_user: NonZeroU32,
+    /// How often an open connection re-checks the tokens it resumed with. A
+    /// revoked token, or a disabled or deleted user, closes the connection
+    /// within this many seconds (cause `revoked`).
+    #[serde(default = "default_native_revalidate_secs")]
+    pub revalidate_secs: NonZeroU32,
 }
 
 impl Default for NativeApiConfig {
@@ -570,8 +575,18 @@ impl Default for NativeApiConfig {
             enabled: false,
             allowed_origins: Vec::new(),
             max_connections_per_user: default_native_max_connections_per_user(),
+            revalidate_secs: default_native_revalidate_secs(),
         }
     }
+}
+
+fn default_native_revalidate_secs() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(60) {
+        Some(n) => n,
+        None => panic!("the default revalidation interval must not be zero"),
+    };
+    DEFAULT
 }
 
 fn default_native_max_connections_per_user() -> NonZeroU32 {
