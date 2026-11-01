@@ -105,7 +105,8 @@ async fn quick_connect_initiate(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
     let entry = reply_rx
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?
+        .map_err(qc_refused)?;
     // DateAdded MUST be a real ISO8601 timestamp: the Jellyfin Android TV app
     // (jellyfin-sdk-kotlin) deserializes it as a DateTime, and an empty string
     // fails to parse — which makes the app treat Quick Connect as unavailable
@@ -123,6 +124,15 @@ async fn quick_connect_initiate(
         authenticated: false,
         date_added: pharos_jellyfin_api::dto::format_iso8601(entry.created_unix_secs),
     }))
+}
+
+/// A registry refusal as HTTP.
+fn qc_refused(refusal: crate::quick_connect::QcRefusal) -> actix_web::Error {
+    match refusal {
+        crate::quick_connect::QcRefusal::RngFailed => {
+            actix_web::error::ErrorServiceUnavailable("quick connect unavailable")
+        }
+    }
 }
 
 /// Case-INSENSITIVE lookup of a single query-string parameter. Jellyfin's

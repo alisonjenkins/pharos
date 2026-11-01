@@ -59,6 +59,30 @@ impl PendingRequest {
     }
 }
 
+/// Source of random bytes; `getrandom::fill` in production, a stub in tests.
+pub type FillRandom = fn(&mut [u8]) -> Result<(), getrandom::Error>;
+
+/// Why the registry refused a request. The label is a dashboard contract
+/// (`pharos_quick_connect_refused_total{reason}`): keep strings stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QcRefusal {
+    /// The OS CSPRNG failed, so no unpredictable code/secret can be minted.
+    RngFailed,
+}
+
+impl QcRefusal {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RngFailed => "rng_failed",
+        }
+    }
+
+    fn record(self) {
+        metrics::counter!("pharos_quick_connect_refused_total", "reason" => self.label())
+            .increment(1);
+    }
+}
+
 #[derive(Debug)]
 pub enum QcMsg {
     Initiate {
@@ -66,7 +90,7 @@ pub enum QcMsg {
         device_name: String,
         app_name: String,
         app_version: String,
-        reply: oneshot::Sender<PendingRequest>,
+        reply: oneshot::Sender<Result<PendingRequest, QcRefusal>>,
     },
     Authorize {
         code: String,
@@ -100,6 +124,10 @@ pub struct QuickConnectRegistry {
 
 impl QuickConnectRegistry {
     pub fn spawn() -> Self {
+        Self::spawn_with(getrandom::fill)
+    }
+
+    pub fn spawn_with(fill: FillRandom) -> Self {
         let (tx, mut rx) = mpsc::channel::<QcMsg>(64);
         // `by_secret` is the polling lookup. `by_code` is the
         // Authorize lookup. Both index into the same logical record;
@@ -117,8 +145,26 @@ impl QuickConnectRegistry {
                         app_version,
                         reply,
                     } => {
-                        let entry =
-                            mint_pending(device_id, device_name, app_name, app_version, &by_code);
+                        let entry = match mint_pending(
+                            device_id,
+                            device_name,
+                            app_name,
+                            app_version,
+                            &by_code,
+                            fill,
+                        ) {
+                            Ok(entry) => entry,
+                            Err(e) => {
+                                QcRefusal::RngFailed.record();
+                                tracing::error!(
+                                    error = %e,
+                                    live_pending = by_secret.len(),
+                                    "quickconnect: initiate refused, CSPRNG failed"
+                                );
+                                let _ = reply.send(Err(QcRefusal::RngFailed));
+                                continue;
+                            }
+                        };
                         by_code.insert(entry.code.clone(), entry.secret.clone());
                         by_secret.insert(entry.secret.clone(), entry.clone());
                         // B62 — QC observability: the mint was a total blind spot
@@ -133,7 +179,7 @@ impl QuickConnectRegistry {
                             live_pending = by_secret.len(),
                             "quickconnect: initiated (code minted)"
                         );
-                        let _ = reply.send(entry);
+                        let _ = reply.send(Ok(entry));
                     }
                     QcMsg::Authorize { code, by, reply } => {
                         let mut ok = false;
@@ -203,7 +249,8 @@ fn mint_pending(
     app_name: String,
     app_version: String,
     by_code: &HashMap<String, String>,
-) -> PendingRequest {
+    fill: FillRandom,
+) -> Result<PendingRequest, getrandom::Error> {
     let now = Instant::now();
     let created_unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -213,9 +260,9 @@ fn mint_pending(
     // overwriting an existing code let an attacker spam Initiate to
     // collide a victim's code and bind the victim's later Authorize to
     // the attacker's secret → account takeover. Generate until free.
-    let code = unique_code(by_code);
-    let secret = generate_secret();
-    PendingRequest {
+    let code = unique_code(by_code, fill)?;
+    let secret = secret_from(&mut { fill })?;
+    Ok(PendingRequest {
         code,
         secret,
         device_id,
@@ -225,22 +272,26 @@ fn mint_pending(
         created_at: now,
         created_unix_secs,
         authorized_by: None,
-    }
+    })
 }
 
 /// Draw codes until one is not currently live. The 6-digit space is 1M
 /// and live requests are few (short TTL), so this terminates in ~1 draw;
 /// the bound is a safety belt against pathological saturation.
-fn unique_code(by_code: &HashMap<String, String>) -> String {
+fn unique_code(
+    by_code: &HashMap<String, String>,
+    fill: FillRandom,
+) -> Result<String, getrandom::Error> {
+    let mut fill = fill;
     for _ in 0..10_000 {
-        let c = generate_code();
+        let c = code_from(&mut fill)?;
         if !by_code.contains_key(&c) {
-            return c;
+            return Ok(c);
         }
     }
     // Astronomically unlikely (would need ~1M live requests). Fall back
     // to a fresh draw rather than loop forever.
-    generate_code()
+    code_from(&mut fill)
 }
 
 fn gc_expired(
@@ -257,24 +308,49 @@ fn gc_expired(
     });
 }
 
+/// Largest multiple of 1_000_000 that fits in a `u32`; draws at or above it
+/// are redrawn so `% 1_000_000` has no modulo bias.
+const CODE_DRAW_LIMIT: u32 = 4_294_000_000;
+
+/// Redraws before giving up on a (practically impossible) run of rejected
+/// draws; each is rejected with probability ~1.6e-4.
+const CODE_DRAW_ATTEMPTS: usize = 16;
+
 /// Six-digit numeric code the user reads aloud. Drawn from a CSPRNG
 /// (`getrandom`) — the old wall-clock `xxh3` seed was predictable, which
 /// (combined with the collision overwrite, now fixed) enabled a code
 /// pre-image / collision attack. Uniqueness is enforced by the caller
-/// ([`unique_code`]); unpredictability is enforced here.
-fn generate_code() -> String {
-    let mut b = [0u8; 8];
-    // A CSPRNG failure is effectively impossible on supported platforms;
-    // if it ever did, zero bytes still yield a valid (if fixed) code and
-    // uniqueness/secret pairing still hold.
-    let _ = getrandom::fill(&mut b);
-    let n = u64::from_le_bytes(b) % 1_000_000;
-    format!("{n:06}")
+/// ([`unique_code`]); unpredictability is enforced here. A CSPRNG error is
+/// returned, never papered over with a fixed code.
+fn code_from(
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<String, getrandom::Error> {
+    for _ in 0..CODE_DRAW_ATTEMPTS {
+        let mut b = [0u8; 4];
+        fill(&mut b)?;
+        let n = u32::from_le_bytes(b);
+        if n < CODE_DRAW_LIMIT {
+            return Ok(format!("{:06}", n % 1_000_000));
+        }
+    }
+    Err(getrandom::Error::UNEXPECTED)
 }
 
-/// Crypto-style random secret. Uses `uuid::Uuid::new_v4().simple()`.
-fn generate_secret() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+#[cfg(test)]
+fn generate_code() -> Result<String, getrandom::Error> {
+    code_from(&mut getrandom::fill)
+}
+
+/// Random 32-char hex secret in the UUIDv4 layout the clients have always seen.
+fn secret_from(
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<String, getrandom::Error> {
+    let mut b = [0u8; 16];
+    fill(&mut b)?;
+    Ok(uuid::Builder::from_random_bytes(b)
+        .into_uuid()
+        .simple()
+        .to_string())
 }
 
 /// First 8 chars of a secret, for correlating trace lines WITHOUT logging the
@@ -302,7 +378,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let entry = rx.await.unwrap();
+        let entry = rx.await.unwrap().unwrap();
         assert_eq!(entry.code.len(), 6, "code is 6 digits");
         assert!(entry.code.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(entry.secret.len(), 32, "secret is 32-char hex");
@@ -386,7 +462,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let entry = rx.await.unwrap();
+        let entry = rx.await.unwrap().unwrap();
 
         // Not yet authorized → Consume yields None and must NOT delete the
         // entry (the client is still polling / about to be authorized).
@@ -458,7 +534,9 @@ mod tests {
                 "app".into(),
                 "1.0".into(),
                 &by_code,
-            );
+                getrandom::fill,
+            )
+            .unwrap();
             assert!(
                 !by_code.contains_key(&e.code),
                 "mint produced a colliding code"
@@ -468,10 +546,77 @@ mod tests {
         assert_eq!(by_code.len(), 2000);
     }
 
+    fn failing_fill(_: &mut [u8]) -> Result<(), getrandom::Error> {
+        Err(getrandom::Error::UNSUPPORTED)
+    }
+
+    #[test]
+    fn code_draw_fails_closed_when_the_rng_fails() {
+        assert!(code_from(&mut failing_fill).is_err());
+        assert!(secret_from(&mut failing_fill).is_err());
+    }
+
+    #[test]
+    fn code_draw_rejects_the_biased_tail() {
+        // 4_294_967_295 sits in the final partial block of u32 and would skew
+        // low codes; it must be redrawn, not reduced.
+        let mut draws = [u32::MAX, 42].into_iter();
+        let mut fill = |b: &mut [u8]| {
+            b.copy_from_slice(&draws.next().unwrap().to_le_bytes());
+            Ok(())
+        };
+        assert_eq!(code_from(&mut fill).unwrap(), "000042");
+    }
+
+    #[tokio::test]
+    async fn initiate_with_failing_rng_is_refused_and_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let reg = QuickConnectRegistry::spawn_with(failing_fill);
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Initiate {
+                device_id: "d".into(),
+                device_name: "tv".into(),
+                app_name: "app".into(),
+                app_version: "1".into(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rx.await.unwrap().unwrap_err(), QcRefusal::RngFailed);
+
+        let n = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let hit = ck.key().name() == "pharos_quick_connect_refused_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "rng_failed");
+                match v {
+                    DebugValue::Counter(n) if hit => Some(n),
+                    _ => None,
+                }
+            });
+        assert_eq!(n, Some(1));
+    }
+
+    #[test]
+    fn refusal_labels_are_distinct_and_stable() {
+        let labels = [QcRefusal::RngFailed.label()];
+        assert_eq!(labels, ["rng_failed"]);
+    }
+
     #[test]
     fn generated_codes_are_six_digits() {
         for _ in 0..100 {
-            let c = generate_code();
+            let c = generate_code().unwrap();
             assert_eq!(c.len(), 6);
             assert!(c.chars().all(|c| c.is_ascii_digit()));
         }
