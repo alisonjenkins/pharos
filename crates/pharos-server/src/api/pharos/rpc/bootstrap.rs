@@ -7,26 +7,23 @@ use pharos_api::pharos_capnp::{self, bootstrap as wire};
 use pharos_api::{server, Connection};
 
 use super::session::Session;
+use super::ConnectionCtx;
 use crate::services::auth::{user_for_token, TokenRefusal};
 use crate::state::AppState;
 
 pub(super) struct Bootstrap {
     state: web::Data<AppState>,
-    cookie_token: Option<String>,
+    ctx: Rc<ConnectionCtx>,
     conn: Rc<Connection>,
 }
 
 impl Bootstrap {
     pub(super) fn new(
         state: web::Data<AppState>,
-        cookie_token: Option<String>,
+        ctx: Rc<ConnectionCtx>,
         conn: Rc<Connection>,
     ) -> Self {
-        Self {
-            state,
-            cookie_token,
-            conn,
-        }
+        Self { state, ctx, conn }
     }
 }
 
@@ -36,6 +33,8 @@ enum Refusal {
     NoCredential,
     /// The token is not valid (or not UTF-8).
     Token(TokenRefusal),
+    /// The user already holds `max_connections_per_user` connections.
+    TooManyConnections { held: u32, max: u32 },
 }
 
 impl server::bootstrap::Handler for Bootstrap {
@@ -64,7 +63,7 @@ impl server::bootstrap::Handler for Bootstrap {
     ) -> Result<(), capnp::Error> {
         let explicit = params.get()?.get_device_token()?;
         let token = match explicit.to_str() {
-            Ok("") => self.cookie_token.clone().ok_or(Refusal::NoCredential),
+            Ok("") => self.ctx.cookie_token.clone().ok_or(Refusal::NoCredential),
             Ok(t) => Ok(t.to_owned()),
             Err(_) => Err(Refusal::Token(TokenRefusal::InvalidToken)),
         };
@@ -74,6 +73,16 @@ impl server::bootstrap::Handler for Bootstrap {
                 .map_err(Refusal::Token),
             Err(refusal) => Err(refusal),
         };
+        let user = user.and_then(|user| {
+            let ctx = &self.ctx;
+            ctx.limits
+                .sign_in(&mut ctx.slot.borrow_mut(), user.id, ctx.max_per_user)
+                .map(|()| user)
+                .map_err(|held| Refusal::TooManyConnections {
+                    held,
+                    max: ctx.max_per_user,
+                })
+        });
         let mut result = results.get().init_result();
         match user {
             Ok(user) => {
@@ -98,6 +107,16 @@ impl server::bootstrap::Handler for Bootstrap {
                         // and resumes again.
                         err.set_reason(format!("auth store unavailable: {detail}").as_str());
                         err.get_kind().set_unavailable("token store");
+                    }
+                    Refusal::TooManyConnections { held, max } => {
+                        err.set_reason(
+                            format!("this user already holds {held} native API connections")
+                                .as_str(),
+                        );
+                        let mut limit = err.get_kind().init_limit();
+                        limit.set_name("connections_per_user");
+                        limit.set_value(u64::from(held));
+                        limit.set_max(u64::from(max));
                     }
                     Refusal::Token(other) => {
                         err.set_reason(other.label());

@@ -10,9 +10,11 @@
 //! [`AppState`] (research R2).
 
 mod bootstrap;
+pub mod limits;
 pub mod origin;
 mod session;
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use actix_web::web;
@@ -40,17 +42,45 @@ pub fn reader_options() -> ReaderOptions {
     options
 }
 
-/// One connection's `Bootstrap` capability. `cookie_token` is the
-/// `pharos_session` cookie the upgrade carried, used by `resume("")`.
+/// What one connection brings to its `Bootstrap`.
+pub struct ConnectionCtx {
+    /// The `pharos_session` cookie the upgrade carried, used by `resume("")`.
+    cookie_token: Option<String>,
+    limits: limits::ConnectionLimits,
+    max_per_user: u32,
+    slot: RefCell<limits::Slot>,
+}
+
+impl ConnectionCtx {
+    /// A new connection's context, or `None` when the server already holds
+    /// [`limits::MAX_UNAUTHENTICATED`] connections that have not signed in.
+    pub fn admit(
+        cookie_token: Option<String>,
+        limits: &limits::ConnectionLimits,
+        max_per_user: u32,
+    ) -> Option<Rc<Self>> {
+        let slot = limits.admit()?;
+        Some(Rc::new(Self {
+            cookie_token,
+            limits: limits.clone(),
+            max_per_user,
+            slot: RefCell::new(slot),
+        }))
+    }
+
+    /// Whether a `resume` has succeeded on this connection.
+    pub fn is_signed_in(&self) -> bool {
+        self.slot.borrow().is_signed_in()
+    }
+}
+
+/// One connection's `Bootstrap` capability.
 pub fn bootstrap_client(
     state: web::Data<AppState>,
-    cookie_token: Option<String>,
+    ctx: Rc<ConnectionCtx>,
     conn: &Rc<Connection>,
 ) -> pharos_capnp::bootstrap::Client {
-    server::bootstrap::client(
-        bootstrap::Bootstrap::new(state, cookie_token, Rc::clone(conn)),
-        conn,
-    )
+    server::bootstrap::client(bootstrap::Bootstrap::new(state, ctx, Rc::clone(conn)), conn)
 }
 
 /// Serves `bootstrap` over one byte stream until the peer goes away.

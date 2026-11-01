@@ -10,6 +10,10 @@ use pharos_server::api::pharos::rpc;
 
 use crate::common::seed_rich;
 
+fn ctx(cookie: Option<String>) -> Rc<rpc::ConnectionCtx> {
+    rpc::ConnectionCtx::admit(cookie, &rpc::limits::ConnectionLimits::default(), 16).unwrap()
+}
+
 fn me_id(
     reply: &capnp::capability::Response<pharos_api::pharos_capnp::session::me_results::Owned>,
 ) -> Vec<u8> {
@@ -33,7 +37,7 @@ async fn resume(
 async fn server_info_reports_name_version_and_schema_version() {
     let fx = seed_rich().await;
     let conn = Rc::new(Connection::new());
-    let client = rpc::bootstrap_client(fx.state.clone(), None, &conn);
+    let client = rpc::bootstrap_client(fx.state.clone(), ctx(None), &conn);
     let mut req = client.server_info_request();
     req.get().init_ctx();
     let reply = req.send().promise.await.unwrap();
@@ -58,7 +62,7 @@ async fn server_info_reports_name_version_and_schema_version() {
 async fn resume_with_a_device_token_reaches_me() {
     let fx = seed_rich().await;
     let conn = Rc::new(Connection::new());
-    let client = rpc::bootstrap_client(fx.state.clone(), None, &conn);
+    let client = rpc::bootstrap_client(fx.state.clone(), ctx(None), &conn);
     let session = resume(&client, &fx.user_token).await;
     let mut me = session.me_request();
     me.get().init_ctx();
@@ -70,7 +74,7 @@ async fn resume_with_a_device_token_reaches_me() {
 async fn resume_with_an_empty_token_uses_the_upgrade_cookie() {
     let fx = seed_rich().await;
     let conn = Rc::new(Connection::new());
-    let client = rpc::bootstrap_client(fx.state.clone(), Some(fx.admin_token.clone()), &conn);
+    let client = rpc::bootstrap_client(fx.state.clone(), ctx(Some(fx.admin_token.clone())), &conn);
     let session = resume(&client, "").await;
     let mut me = session.me_request();
     me.get().init_ctx();
@@ -82,7 +86,7 @@ async fn resume_with_an_empty_token_uses_the_upgrade_cookie() {
 async fn a_bad_token_yields_a_revoked_session_and_says_why() {
     let fx = seed_rich().await;
     let conn = Rc::new(Connection::new());
-    let client = rpc::bootstrap_client(fx.state.clone(), None, &conn);
+    let client = rpc::bootstrap_client(fx.state.clone(), ctx(None), &conn);
 
     let mut req = client.resume_request();
     req.get().init_ctx();
@@ -129,7 +133,7 @@ async fn a_bad_token_yields_a_revoked_session_and_says_why() {
 async fn no_cookie_and_no_token_is_refused() {
     let fx = seed_rich().await;
     let conn = Rc::new(Connection::new());
-    let client = rpc::bootstrap_client(fx.state.clone(), None, &conn);
+    let client = rpc::bootstrap_client(fx.state.clone(), ctx(None), &conn);
     let mut req = client.resume_request();
     req.get().init_ctx();
     let reply = req.send().promise.await.unwrap();
@@ -153,7 +157,7 @@ async fn served_over_a_byte_stream() {
     let fx = seed_rich().await;
     let (server_end, client_end) = tokio::io::duplex(64 * 1024);
     let conn = Rc::new(Connection::new());
-    let bootstrap = rpc::bootstrap_client(fx.state.clone(), None, &conn);
+    let bootstrap = rpc::bootstrap_client(fx.state.clone(), ctx(None), &conn);
     let (sr, sw) = tokio::io::split(server_end);
     actix_web::rt::spawn(rpc::serve(sr, sw, bootstrap));
 
@@ -176,4 +180,44 @@ async fn served_over_a_byte_stream() {
         reply.get().unwrap().get_result().unwrap().which().unwrap(),
         server_info_result::Info(_)
     ));
+}
+
+/// FR-010: a user holding `max_connections_per_user` connections cannot
+/// resume on another; the refusal names the count and the cap.
+#[actix_web::test]
+async fn resume_beyond_the_per_user_cap_is_refused_with_the_count() {
+    let fx = seed_rich().await;
+    let limits = rpc::limits::ConnectionLimits::default();
+    let first = rpc::ConnectionCtx::admit(None, &limits, 1).unwrap();
+    let second = rpc::ConnectionCtx::admit(None, &limits, 1).unwrap();
+    // Both connections stay open for the whole test.
+    let mut open = Vec::new();
+    for (n, ctx) in [first, second].into_iter().enumerate() {
+        let conn = Rc::new(Connection::new());
+        let client = rpc::bootstrap_client(fx.state.clone(), ctx, &conn);
+        open.push(client.clone());
+        let mut req = client.resume_request();
+        req.get().init_ctx();
+        req.get().set_device_token(&fx.user_token);
+        let reply = req.send().promise.await.unwrap();
+        let status = reply
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap()
+            .get_status()
+            .unwrap();
+        match (n, status.which().unwrap()) {
+            (0, done::Ok(())) => {}
+            (1, done::Error(err)) => {
+                let error::kind::Limit(limit) = err.unwrap().get_kind().which().unwrap() else {
+                    panic!("second connection must be refused with a limit");
+                };
+                let limit = limit.unwrap();
+                assert_eq!((limit.get_value(), limit.get_max()), (1, 1));
+            }
+            (n, _) => panic!("connection {n}: unexpected status"),
+        }
+    }
+    assert_eq!(limits.held_by(fx.user_id), 1);
 }
