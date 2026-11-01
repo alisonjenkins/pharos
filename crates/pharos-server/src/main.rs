@@ -1825,6 +1825,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         pharos_server::client_ip::TrustedProxies::parse(&cfg.server.trusted_proxies)
             .map_err(pharos_server::config::ConfigError::TrustedProxies)?,
     );
+    state.login_throttle.record_state();
     let app_state = web::Data::new(state);
 
     // Phase B2 — elect the background-work singleton. Under Postgres this

@@ -168,9 +168,15 @@ struct Entry {
 /// later and its delay doubles with each further failure. A success clears the
 /// username's count but only takes back its own reservation on the address, so
 /// an attacker with a valid account cannot reset the address's budget.
+///
+/// The per-address limit applies only when the server knows its proxies
+/// ([`with_per_ip`](Self::with_per_ip)): behind an ingress that is not in
+/// `trusted_proxies`, every client shares the ingress's address, and one
+/// typo-prone TV would 429 the whole household.
 #[derive(Debug)]
 pub struct LoginThrottle {
     policy: LoginThrottleConfig,
+    per_ip: bool,
     tables: Mutex<Tables>,
 }
 
@@ -210,7 +216,42 @@ impl LoginThrottle {
     pub fn new(policy: LoginThrottleConfig) -> Self {
         Self {
             policy,
+            per_ip: true,
             tables: Mutex::new(Tables::default()),
+        }
+    }
+
+    /// Whether the per-address limit is enforced. Failures are still counted
+    /// per address either way, so the "login failed" line keeps both counts.
+    #[must_use]
+    pub fn with_per_ip(mut self, per_ip: bool) -> Self {
+        self.per_ip = per_ip;
+        self
+    }
+
+    pub fn per_ip(&self) -> bool {
+        self.per_ip
+    }
+
+    /// Logs and publishes `pharos_login_throttle_per_ip_active` (0 or 1);
+    /// call once at startup. Inactive is a WARN naming why, so an operator
+    /// finds it by query rather than by a household's failed logins.
+    pub fn record_state(&self) {
+        metrics::gauge!("pharos_login_throttle_per_ip_active")
+            .set(f64::from(u8::from(self.per_ip)));
+        if self.per_ip {
+            tracing::info!(
+                max_failures_per_user = self.policy.max_failures_per_user,
+                max_failures_per_ip = self.policy.max_failures_per_ip,
+                "login throttle: per-user and per-address limits active"
+            );
+        } else {
+            tracing::warn!(
+                max_failures_per_user = self.policy.max_failures_per_user,
+                reason = "trusted_proxies is empty",
+                "login throttle: per-address limit INACTIVE; only the per-user limit applies. \
+                 Set [server].trusted_proxies to the ingress CIDR to enable it"
+            );
         }
     }
 
@@ -257,7 +298,11 @@ impl LoginThrottle {
         let admitted = {
             let mut t = self.lock();
             let by_user = self.remaining(t.users.get(&uk), self.policy.max_failures_per_user, now);
-            let by_ip = self.remaining(t.ips.get(&ik), self.policy.max_failures_per_ip, now);
+            let by_ip = if self.per_ip {
+                self.remaining(t.ips.get(&ik), self.policy.max_failures_per_ip, now)
+            } else {
+                Duration::ZERO
+            };
             let (reason, wait) = if by_ip > by_user {
                 (ThrottleReason::Ip, by_ip)
             } else {
@@ -718,6 +763,28 @@ mod tests {
                 "bob's count restarted"
             );
             assert!(t.begin("amy", ip(2), t0).is_err(), "other users untouched");
+        }
+
+        /// Without trusted proxies every client may share the ingress's
+        /// address, so the address limit is off and only the user limit holds.
+        #[test]
+        fn without_per_ip_one_address_is_never_held_but_a_user_still_is() {
+            let t = LoginThrottle::new(cfg()).with_per_ip(false);
+            let t0 = Instant::now();
+            for i in 0..50 {
+                fail(&t, &format!("u{i}"), ip(7), t0);
+            }
+            assert!(
+                t.begin("fresh", ip(7), t0).is_ok(),
+                "address must not be held"
+            );
+            for _ in 0..3 {
+                fail(&t, "amy", ip(8), t0);
+            }
+            assert_eq!(
+                t.begin("amy", ip(9), t0).unwrap_err().reason,
+                ThrottleReason::User
+            );
         }
 
         #[test]

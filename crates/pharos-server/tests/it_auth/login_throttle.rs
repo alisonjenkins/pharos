@@ -190,7 +190,7 @@ async fn a_normal_client_with_default_limits_is_never_throttled() {
 async fn one_address_spraying_usernames_is_held_but_other_addresses_are_not() {
     let rec = DebuggingRecorder::new();
     let _m = metrics::set_default_local_recorder(&rec);
-    let st = state(Some((policy(100, 3), &[]))).await;
+    let st = state(Some((policy(100, 3), &["10.0.0.0/8"]))).await;
     let app = app!(st);
     for i in 0..3 {
         let (s, _) = login!(app, &format!("guess{i}"), "x", "198.51.100.1", None).await;
@@ -208,7 +208,7 @@ async fn one_address_spraying_usernames_is_held_but_other_addresses_are_not() {
 
 #[actix_web::test]
 async fn logging_into_your_own_account_does_not_reset_the_address_budget() {
-    let st = state(Some((policy(100, 3), &[]))).await;
+    let st = state(Some((policy(100, 3), &["10.0.0.0/8"]))).await;
     let app = app!(st);
     for i in 0..2 {
         login!(app, format!("guess{i}"), "x", "198.51.100.1", None).await;
@@ -252,4 +252,44 @@ async fn x_forwarded_for_from_a_trusted_proxy_separates_clients_behind_it() {
     // Client B behind the same ingress is unaffected.
     let (s, _) = login!(app, "ali", "hunter2", "10.0.0.1", Some("203.0.113.2")).await;
     assert_eq!(s, StatusCode::OK);
+}
+
+/// The live default: no trusted proxies, so every client may arrive from the
+/// ingress's one address. Failures there must not 429 the whole household;
+/// the per-user limit still holds, and startup says the address limit is off.
+#[actix_web::test]
+async fn without_trusted_proxies_a_shared_address_is_not_held() {
+    let rec = DebuggingRecorder::new();
+    let _m = metrics::set_default_local_recorder(&rec);
+    let st = state(Some((policy(3, 3), &[]))).await;
+    st.login_throttle.record_state();
+    let app = app!(st);
+    for i in 0..10 {
+        let (s, _) = login!(app, &format!("guess{i}"), "x", "10.0.0.1", None).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        login!(app, "ali", "hunter2", "10.0.0.1", None).await.0,
+        StatusCode::OK,
+        "the ingress address must not be held"
+    );
+    for _ in 0..3 {
+        login!(app, "ali", "typo", "10.0.0.1", None).await;
+    }
+    assert_eq!(
+        login!(app, "ali", "hunter2", "10.0.0.1", None).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the per-user limit still holds"
+    );
+    let gauge = rec
+        .snapshotter()
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(k, ..)| k.key().name() == "pharos_login_throttle_per_ip_active")
+        .map(|(.., v)| v);
+    assert!(
+        matches!(gauge, Some(DebugValue::Gauge(g)) if g.into_inner() == 0.0),
+        "startup must publish the address limit as inactive: {gauge:?}"
+    );
 }

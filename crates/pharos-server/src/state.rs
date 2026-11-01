@@ -649,7 +649,7 @@ impl AppState {
             tmdb_api_key: None,
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
-            login_throttle: crate::auth::LoginThrottle::default(),
+            login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
@@ -747,7 +747,7 @@ impl AppState {
             tmdb_api_key: None,
             tvdb_api_key: None,
             metadata_config: crate::config::MetadataConfig::default(),
-            login_throttle: crate::auth::LoginThrottle::default(),
+            login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         })
     }
@@ -813,13 +813,16 @@ impl AppState {
         self
     }
 
-    /// Apply `[server].login_throttle` and `[server].trusted_proxies`.
+    /// Apply `[server].login_throttle` and `[server].trusted_proxies`. With no
+    /// trusted proxies the per-address limit is off: behind an unlisted
+    /// ingress every client would share one address.
     pub fn with_login_throttle(
         mut self,
         policy: crate::config::LoginThrottleConfig,
         trusted_proxies: crate::client_ip::TrustedProxies,
     ) -> Self {
-        self.login_throttle = crate::auth::LoginThrottle::new(policy);
+        self.login_throttle =
+            crate::auth::LoginThrottle::new(policy).with_per_ip(!trusted_proxies.is_empty());
         self.trusted_proxies = trusted_proxies;
         self
     }
