@@ -22,7 +22,9 @@ use capnp::dynamic_value;
 use tracing::{Instrument, Span};
 use web_time::Instant;
 
-use crate::labels::{MethodMeta, Outcome, CALLS_TOTAL, CANCELLED_TOTAL, DURATION_SECONDS};
+use crate::labels::{
+    MethodMeta, Outcome, CALLS_TOTAL, CANCELLED_TOTAL, DURATION_SECONDS, LIMIT_TOTAL,
+};
 use crate::redact;
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
@@ -190,10 +192,13 @@ impl CallScope {
         reply: dynamic_value::Reader<'_>,
     ) -> Result<(), capnp::Error> {
         self.finished = true;
-        let (outcome, reason, detail) = match &returned {
-            Err(e) => (Outcome::from_capnp(e), e.to_string(), String::new()),
+        let (outcome, reason, detail, limit) = match &returned {
+            Err(e) => (Outcome::from_capnp(e), e.to_string(), String::new(), None),
             Ok(()) => outcome_of(reply),
         };
+        if let Some(limit) = limit {
+            metrics::counter!(LIMIT_TOTAL, "limit" => limit).increment(1);
+        }
         if let dynamic_value::Reader::Struct(r) = reply {
             self.record.response_bytes = r.total_size().map_or(0, |s| s.word_count * 8);
         }
@@ -270,9 +275,9 @@ pub fn register_metrics() {
 /// capability (`ResumeResult`), the `error` arm of its `status`. Returns the
 /// outcome, the error's `reason`, and the variant's value (the id not found,
 /// the dependency unavailable, …) so the failure log carries the cause, not
-/// just its class.
-fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
-    let ok = (Outcome::Ok, String::new(), String::new());
+/// just its class. A `limit` also yields its name, for `LIMIT_TOTAL`.
+fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String, Option<String>) {
+    let ok = (Outcome::Ok, String::new(), String::new(), None);
     let dynamic_value::Reader::Struct(reply) = reply else {
         return ok;
     };
@@ -292,19 +297,39 @@ fn outcome_of(reply: dynamic_value::Reader<'_>) -> (Outcome, String, String) {
             Outcome::Other,
             "error arm unreadable".to_owned(),
             String::new(),
+            None,
         );
     };
     let reason = text_field(error, "reason");
     let Some(kind) = struct_field(error, "kind") else {
-        return (Outcome::Other, reason, String::new());
+        return (Outcome::Other, reason, String::new(), None);
     };
     let Ok(Some(variant)) = kind.which() else {
-        return (Outcome::Other, reason, String::new());
+        return (Outcome::Other, reason, String::new(), None);
     };
     let name = redact::name_of(variant.get_proto().get_name());
     let detail = kind.get(variant).map(redact::render).unwrap_or_default();
     let outcome = Outcome::from_error_kind(name).unwrap_or(Outcome::Other);
-    (outcome, reason, detail)
+    let limit = match kind.get(variant) {
+        Ok(dynamic_value::Reader::Struct(l)) if outcome == Outcome::Limit => {
+            Some(limit_label(text_field(l, "name")))
+        }
+        _ => None,
+    };
+    (outcome, reason, detail, limit)
+}
+
+/// A limit's name as the `limit` label. Names are fixed snake_case strings;
+/// anything else is `other`, so a handler bug cannot grow the label set.
+fn limit_label(name: String) -> String {
+    let fixed = !name.is_empty()
+        && name.len() <= 40
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if fixed {
+        name
+    } else {
+        "other".to_owned()
+    }
 }
 
 /// Why a refused session fails every call. The generated `Refused` handlers
