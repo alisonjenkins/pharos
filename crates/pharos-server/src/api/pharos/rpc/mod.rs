@@ -10,6 +10,7 @@
 //! [`AppState`] (research R2).
 
 mod bootstrap;
+pub mod origin;
 mod session;
 
 use std::rc::Rc;
