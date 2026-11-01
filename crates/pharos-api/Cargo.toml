@@ -9,9 +9,20 @@ publish.workspace = true
 [dependencies]
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }
+web-time = { workspace = true }
 
 [build-dependencies]
+capnp = { workspace = true }
 capnpc = { workspace = true }
+
+[dev-dependencies]
+metrics-util = { workspace = true }
+pharos-test-metrics = { path = "../pharos-test-metrics" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -136,6 +136,8 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 tracing-opentelemetry = "0.34"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
+# 017: Instant that works on wasm32 (std's panics there); pharos-api times RPC calls on both targets.
+web-time = "1"
 walkdir = "2"
 
 # Dev/test profile: drop full DWARF, keep line tables. Backtraces +

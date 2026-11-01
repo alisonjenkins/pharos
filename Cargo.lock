@@ -3227,6 +3227,14 @@ dependencies = [
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "metrics",
+ "metrics-util",
+ "pharos-test-metrics",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
