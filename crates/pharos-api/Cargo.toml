@@ -1,0 +1,17 @@
+[package]
+name = "pharos-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+
+[build-dependencies]
+capnpc = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pharos-api",
     "crates/pharos-cache",
     "crates/pharos-core",
     "crates/pharos-discovery",
@@ -46,6 +47,9 @@ actix-web = { version = "4", default-features = false, features = [
 actix-ws = "0.4"
 anyhow = "1"
 argon2 = "0.6"
+capnp = "0.27"
+capnp-rpc = "0.27"
+capnpc = "0.27"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 getrandom = "0.4"
