@@ -21,6 +21,7 @@ pub(crate) enum Mode {
     Ok,
     /// Marks the flag, then never completes.
     Hang(Rc<Cell<bool>>),
+    Panic,
 }
 
 pub(crate) struct Lib(pub(crate) Mode);
@@ -45,6 +46,7 @@ impl server::library::Handler for Lib {
                 results.get().init_result().init_page().set_total(3);
                 Ok(())
             }
+            Mode::Panic => panic!("handler bug"),
             Mode::Hang(started) => {
                 started.set(true);
                 std::future::pending::<()>().await;
@@ -256,4 +258,23 @@ fn a_method_without_a_handler_is_counted_unimplemented() {
         "logs:\n{}",
         o.logs
     );
+}
+
+/// A handler that panics is a server fault: counted `failed` and logged as
+/// a failure, never mistaken for the caller cancelling.
+#[test]
+fn a_panicking_handler_is_counted_failed_not_cancelled() {
+    let (unwound, o) = observe("info", || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let client = server::library::client(Lib(Mode::Panic), &Connection::new());
+            block_on(async move { latest_request(&client).promise.await.map(|_| ()) })
+        }))
+        .is_err()
+    });
+    assert!(unwound, "the panic should reach the test");
+    assert_eq!(calls(&o, "failed"), Some(1), "logs:\n{}", o.logs);
+    assert_eq!(calls(&o, "cancelled"), None);
+    assert_eq!(o.counter("pharos_rpc_cancelled_total", &LATEST), None);
+    let line = o.event("rpc call failed").expect("failure line");
+    assert_eq!(line["fields"]["reason"], "handler panicked");
 }

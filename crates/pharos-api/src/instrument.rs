@@ -230,9 +230,21 @@ impl CallScope {
 
 impl Drop for CallScope {
     fn drop(&mut self) {
-        if !self.finished {
-            self.count(Outcome::Cancelled);
-            let _entered = self.span.enter();
+        if self.finished {
+            return;
+        }
+        // Unwinding out of the handler is a server fault, not a caller giving
+        // up: count and log it as one.
+        let panicked = std::thread::panicking();
+        self.count(if panicked {
+            Outcome::Failed
+        } else {
+            Outcome::Cancelled
+        });
+        let _entered = self.span.enter();
+        if panicked {
+            (self.log.failure)(&self.record, "handler panicked", "");
+        } else {
             (self.log.cancelled)(&self.record);
         }
     }
