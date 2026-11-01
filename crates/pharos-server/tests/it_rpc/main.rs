@@ -10,6 +10,7 @@ mod common;
 mod bootstrap;
 mod connect;
 mod gate;
+mod library;
 mod limits;
 mod login;
 mod quick_connect;
