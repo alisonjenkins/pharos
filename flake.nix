@@ -92,7 +92,9 @@
           # ffmpeg dev libs resolve/link the same ffmpeg the runtime uses. Real
           # cargo (crane) applies the crate's modern `cargo::` build-cfgs
           # correctly — the correctness reason crate2nix was ruled out.
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ];
+          # capnp: pharos-api's build.rs runs capnpc, which shells out to the
+          # Cap'n Proto compiler (017).
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook pkgs.capnproto ];
           buildInputs = [ pkgs.ffmpeg-headless.dev ];
         };
         # Compile the dependency tree ONCE — a store artifact cached across
@@ -1051,6 +1053,8 @@
             pkgs.cargo-audit
             pkgs.dioxus-cli
             wasmBindgenCli
+            # 017 — Cap'n Proto compiler for pharos-api's capnpc build step.
+            pkgs.capnproto
             pkgs.ffmpeg-headless
             # 008 — resolves a URL-backed source's real locator. In the shell so
             # the resolver's tests and a manual `just`-driven check use the same
