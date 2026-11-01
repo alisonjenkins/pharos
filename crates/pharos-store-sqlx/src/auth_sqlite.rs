@@ -282,25 +282,30 @@ impl TokenStore for SqliteStore {
     #[tracing::instrument(skip(self, keep), fields(user.id = %user.0.simple()))]
     async fn revoke_sessions_except(&self, user: UserId, keep: Option<&str>) -> AuthResult<u64> {
         let user_bytes = user.0.as_bytes().to_vec();
-        let not_api_key = format!("{}%", pharos_core::API_KEY_DEVICE_PREFIX);
+        // An exact, case-sensitive prefix match: SQLite's LIKE ignores ASCII
+        // case and Postgres's does not, so LIKE would split the backends.
+        let api_key_prefix = pharos_core::API_KEY_DEVICE_PREFIX;
         let res = match keep {
             Some(token) => {
                 sqlx::query(
-                    "DELETE FROM auth_tokens WHERE user_id = ? \
-                     AND device_id NOT LIKE ? AND token_hash <> ?",
+                    "DELETE FROM auth_tokens WHERE user_id = ?1 \
+                     AND substr(device_id, 1, length(?2)) <> ?2 AND token_hash <> ?3",
                 )
                 .bind(user_bytes)
-                .bind(not_api_key)
+                .bind(api_key_prefix)
                 .bind(crate::auth_token::hash(token))
                 .execute(self.pool())
                 .await
             }
             None => {
-                sqlx::query("DELETE FROM auth_tokens WHERE user_id = ? AND device_id NOT LIKE ?")
-                    .bind(user_bytes)
-                    .bind(not_api_key)
-                    .execute(self.pool())
-                    .await
+                sqlx::query(
+                    "DELETE FROM auth_tokens WHERE user_id = ?1 \
+                     AND substr(device_id, 1, length(?2)) <> ?2",
+                )
+                .bind(user_bytes)
+                .bind(api_key_prefix)
+                .execute(self.pool())
+                .await
             }
         }
         .map_err(map_sqlx)?;

@@ -113,12 +113,15 @@ async fn revoke_sessions_except_spares_only_the_kept_token_of_that_user() {
     let other = s.issue(aid, "d2").await.unwrap();
     let bos = s.issue(bid, "d3").await.unwrap();
     let key = s.issue(aid, "apikey:cli").await.unwrap();
+    // SQLite's LIKE ignores ASCII case; the key match must not.
+    let lookalike = s.issue(aid, "APIKEY:cli").await.unwrap();
 
     let n = s
         .revoke_sessions_except(aid, Some(keep.0.expose()))
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, 2);
+    assert!(s.resolve(lookalike.0.expose()).await.is_err());
     s.resolve(keep.0.expose()).await.unwrap();
     assert!(s.resolve(other.0.expose()).await.is_err());
     s.resolve(bos.0.expose()).await.unwrap();

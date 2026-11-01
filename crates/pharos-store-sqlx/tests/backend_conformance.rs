@@ -187,6 +187,11 @@ where
     let api_key = TokenStore::issue(&store, uid, "apikey:conformance")
         .await
         .unwrap();
+    // Only the exact prefix marks a key: the backends must agree that a
+    // differently cased lookalike is an ordinary session.
+    let lookalike = TokenStore::issue(&store, uid, "APIKEY:conformance")
+        .await
+        .unwrap();
     let stranger_rec = user_record("conformance-stranger");
     let stranger_id = stranger_rec.id;
     UserStore::create(&store, stranger_rec).await.unwrap();
@@ -197,9 +202,12 @@ where
         .await
         .unwrap();
     assert_eq!(
-        dropped, 1,
+        dropped, 2,
         "revoke_sessions_except must drop only the others"
     );
+    assert!(TokenStore::resolve(&store, lookalike.0.expose())
+        .await
+        .is_err());
     TokenStore::resolve(&store, keep.0.expose()).await.unwrap();
     assert!(TokenStore::resolve(&store, other.0.expose()).await.is_err());
     TokenStore::resolve(&store, stranger.0.expose())
