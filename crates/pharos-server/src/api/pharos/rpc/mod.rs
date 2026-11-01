@@ -222,12 +222,105 @@ where
     W: AsyncWrite + Unpin + 'static,
 {
     let network = twoparty::VatNetwork::new(
-        reader.compat(),
-        writer.compat_write(),
+        Counted::new(reader, Direction::In).compat(),
+        Counted::new(writer, Direction::Out).compat_write(),
         Side::Server,
         reader_options(),
     );
     RpcSystem::new(Box::new(network), Some(bootstrap.client)).await
+}
+
+/// Which way bytes moved. The `direction` label of `pharos_rpc_bytes_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Read from the client.
+    In,
+    /// Written to the client.
+    Out,
+}
+
+impl Direction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+        }
+    }
+}
+
+/// A reader or writer that counts the bytes through it under
+/// `pharos_rpc_bytes_total{direction}` (017 §Observability).
+struct Counted<T> {
+    inner: T,
+    bytes: metrics::Counter,
+}
+
+impl<T> Counted<T> {
+    fn new(inner: T, direction: Direction) -> Self {
+        Self {
+            inner,
+            bytes: metrics::counter!("pharos_rpc_bytes_total", "direction" => direction.label()),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Counted<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = polled {
+            self.bytes.increment((buf.filled().len() - before) as u64);
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.bytes.increment(n as u64);
+        }
+        polled
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let std::task::Poll::Ready(Ok(n)) = polled {
+            self.bytes.increment(n as u64);
+        }
+        polled
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +328,11 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     use super::*;
+
+    #[test]
+    fn direction_labels_are_distinct() {
+        assert_ne!(Direction::In.label(), Direction::Out.label());
+    }
 
     /// An operator asking "is the native API on in this pod?" gets the answer
     /// by query (`pharos_native_api_enabled`), not by reading config.
