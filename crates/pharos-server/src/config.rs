@@ -583,6 +583,27 @@ pub struct LoginThrottleConfig {
     pub max_backoff_secs: u64,
 }
 
+impl LoginThrottleConfig {
+    /// Names the first field whose zero would switch the throttle off or make
+    /// it meaningless: a zero window or backoff never holds anyone, and a zero
+    /// threshold would be silently read as one.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_failures_per_user == 0 {
+            return Err("max_failures_per_user");
+        }
+        if self.max_failures_per_ip == 0 {
+            return Err("max_failures_per_ip");
+        }
+        if self.window_secs == 0 {
+            return Err("window_secs");
+        }
+        if self.max_backoff_secs == 0 {
+            return Err("max_backoff_secs");
+        }
+        Ok(())
+    }
+}
+
 impl Default for LoginThrottleConfig {
     fn default() -> Self {
         Self {
@@ -893,6 +914,8 @@ pub enum ConfigError {
     SamplingRatio(f64),
     #[error("server.trusted_proxies: {0}")]
     TrustedProxies(String),
+    #[error("server.login_throttle.{0} must not be 0: it would disable the login throttle")]
+    LoginThrottleZero(&'static str),
 }
 
 impl Config {
@@ -902,6 +925,10 @@ impl Config {
         if !(0.0..=1.0).contains(&ratio) {
             return Err(ConfigError::SamplingRatio(ratio));
         }
+        cfg.server
+            .login_throttle
+            .validate()
+            .map_err(ConfigError::LoginThrottleZero)?;
         Ok(cfg)
     }
 
@@ -1062,6 +1089,23 @@ mod tests {
         assert!(toml::from_str::<NativeApiConfig>("max_connections_per_user = 0").is_err());
         let cfg: NativeApiConfig = toml::from_str("max_connections_per_user = 2").expect("parses");
         assert_eq!(cfg.max_connections_per_user.get(), 2);
+    }
+
+    /// V174: a zero in `[server.login_throttle]` would quietly switch the
+    /// throttle off, so it is refused at load and the error names the field.
+    #[test]
+    fn a_zero_login_throttle_value_is_rejected() {
+        for field in [
+            "max_failures_per_user",
+            "max_failures_per_ip",
+            "window_secs",
+            "max_backoff_secs",
+        ] {
+            let toml = format!("{SAMPLE}\n[server.login_throttle]\n{field} = 0\n");
+            let err = Config::from_toml_str(&toml).expect_err(field).to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+        assert!(LoginThrottleConfig::default().validate().is_ok());
     }
 
     /// 008 — the feature is off unless somebody says otherwise, and the rest of
