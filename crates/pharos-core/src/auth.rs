@@ -74,6 +74,14 @@ pub struct UserPolicy {
     pub sync_play_access: String,
 }
 
+impl UserPolicy {
+    /// Whether this user may see the library with `wire_id`
+    /// (`EnableAllFolders` / `EnabledFolders`).
+    pub fn allows_library(&self, wire_id: &str) -> bool {
+        self.enable_all_folders || self.enabled_folders.iter().any(|f| f == wire_id)
+    }
+}
+
 impl Default for UserPolicy {
     fn default() -> Self {
         Self {
