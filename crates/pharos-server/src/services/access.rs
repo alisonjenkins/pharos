@@ -3,7 +3,9 @@
 //! Jellyfin routes and the native API answer alike and a new route cannot
 //! forget the check by re-implementing it.
 
-use pharos_core::{LibraryStore, MediaId, User};
+use std::sync::Arc;
+
+use pharos_core::{LibraryStore, MediaId, MediaItem, User};
 
 use crate::state::AppState;
 
@@ -114,6 +116,24 @@ pub async fn retain_visible<T>(
         tracing::debug!(user = %user.name, route, dropped, "items outside the user's libraries left out");
     }
     Ok(())
+}
+
+/// The cached item list narrowed to what `user` may reach. Routes that
+/// build a list or an aggregate (latest, next up, artists, albums, genres,
+/// counts) straight from `list_items_cached` filter through this, since no
+/// `MediaQuery` scopes them. An unrestricted user gets `all` back as is.
+pub async fn visible_items(
+    state: &AppState,
+    user: &User,
+    all: Arc<Vec<MediaItem>>,
+    route: &'static str,
+) -> Result<Arc<Vec<MediaItem>>, ItemHidden> {
+    if user.policy.enable_all_folders {
+        return Ok(all);
+    }
+    let mut kept: Vec<&MediaItem> = all.iter().collect();
+    retain_visible(state, user, &mut kept, |i| i.id, route).await?;
+    Ok(Arc::new(kept.into_iter().cloned().collect()))
 }
 
 #[cfg(test)]

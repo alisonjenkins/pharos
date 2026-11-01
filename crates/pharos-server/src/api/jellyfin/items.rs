@@ -193,13 +193,16 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
 /// aggregate name counts (Artist/Album/Genre) for the music view.
 async fn items_counts(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use std::collections::HashSet;
     let all = state
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "counts")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut movies = 0u32;
     let mut episodes = 0u32;
     let mut audio = 0u32;
@@ -947,7 +950,7 @@ async fn list_genres(
 /// [`genres_with_counts`]: pharos_core::GenreStore::genres_with_counts
 async fn list_music_genres(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::GenreStore;
     use std::collections::HashMap;
@@ -965,6 +968,9 @@ async fn list_music_genres(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "genres")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
 
     // Count each genre over audio items only. `probe.genre` is the raw tag
     // string and may pack several genres, so it is split on the same
@@ -1004,7 +1010,7 @@ async fn list_music_genres(
 /// /Items?ParentId={id} which restrict_to_parent resolves.
 async fn list_artists(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::artist_id_for;
@@ -1013,6 +1019,9 @@ async fn list_artists(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "artists")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     // A-Z letter picker filters by artist name.
     let name_prefix = q
         .name_starts_with
@@ -1062,7 +1071,7 @@ async fn list_artists(
 /// "Album • Artist" subtitle without a follow-up fetch.
 async fn list_albums(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -1071,6 +1080,9 @@ async fn list_albums(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "albums")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     // A-Z letter picker filters by album name.
     let name_prefix = q
         .name_starts_with
@@ -1731,6 +1743,9 @@ async fn shows_next_up(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "next_up")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -3749,6 +3764,9 @@ async fn latest_items(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(state, &user.0, all, "latest")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     // Honour ParentId so home-page "Latest" rows match the library
     // the user clicked into. Library / series / season ids all
     // resolve via the shared restrict_to_parent helper.
@@ -4673,7 +4691,7 @@ fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]
 ///   loose tracks that have no album tag.
 async fn maybe_list_music(
     state: &AppState,
-    user_id: UserId,
+    user: &pharos_core::User,
     q: &ListQuery,
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -4696,6 +4714,9 @@ async fn maybe_list_music(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(state, user, all, "music")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let orders = parse_sort_orders(q.sort_order.as_deref());
 
     if let Some(artist) = artist_parent {
@@ -4729,7 +4750,7 @@ async fn maybe_list_music(
             let ids: Vec<u64> = loose.iter().map(|i| i.id).collect();
             let ud = state
                 .stores
-                .user_data_bulk(user_id, &ids)
+                .user_data_bulk(user.id, &ids)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             for (n, t) in loose.iter().enumerate() {
@@ -4841,7 +4862,7 @@ async fn list_items(
             &list_playlists_page(&state, user.0.id, &q).await?,
         ));
     }
-    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
         return Ok(resp);
     }
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
@@ -4875,7 +4896,7 @@ async fn list_user_items(
             &list_playlists_page(&state, user.0.id, &q).await?,
         ));
     }
-    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
         return Ok(resp);
     }
     // Virtual Series/Season listing — pharos stores no Series/Season row, so a

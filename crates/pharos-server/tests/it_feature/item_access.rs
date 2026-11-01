@@ -289,3 +289,97 @@ async fn adding_a_hidden_item_to_a_playlist_is_not_found() {
     .await;
     assert_eq!(item_ids(&page), vec![wire(f.rich_item_id)], "{page}");
 }
+
+/// Lists and aggregates built straight from the item cache (latest, next
+/// up, artists, albums, music genres, counts, the album shortcut of
+/// `/Items`) leave out items in libraries the user may not reach.
+#[actix_web::test]
+async fn cache_built_lists_leave_out_hidden_libraries() {
+    use pharos_core::{
+        LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _, SeriesInfo,
+    };
+    let f = seed_rich().await;
+    f.state
+        .stores
+        .put(MediaItem {
+            id: 302,
+            path: "/libB/Hidden Show/S01E01.mkv".into(),
+            title: "Hidden Episode".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Hidden Show".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                ..SeriesInfo::default()
+            }),
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    f.state
+        .stores
+        .put(MediaItem {
+            id: 303,
+            path: "/libB/hidden-track.flac".into(),
+            title: "Hidden Track".into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                artist: Some("Hidden Artist".into()),
+                album_artist: Some("Hidden Artist".into()),
+                album: Some("Hidden Album".into()),
+                genre: Some("Hiddenwave".into()),
+                ..MediaProbe::default()
+            },
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    f.state.stores.backfill_library_ids().await.unwrap();
+    restrict_to_library_a(&f).await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+
+    let mut leaks = Vec::new();
+    for uri in [
+        "/Items/Latest",
+        "/Shows/NextUp",
+        "/Artists",
+        "/Albums",
+        "/MusicGenres",
+        "/Items?IncludeItemTypes=MusicAlbum&Recursive=true",
+    ] {
+        let resp = test::call_service(&app, get(&f.user_token, uri).to_request()).await;
+        assert_eq!(resp.status().as_u16(), 200, "{uri}");
+        let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+        for hidden in [
+            "Other Movie",
+            "Hidden Episode",
+            "Hidden Show",
+            "Hidden Artist",
+            "Hidden Album",
+            "Hiddenwave",
+        ] {
+            if body.contains(hidden) {
+                leaks.push(format!("{uri} lists {hidden}"));
+            }
+        }
+    }
+    let counts: serde_json::Value =
+        test::call_and_read_body_json(&app, get(&f.user_token, "/Items/Counts").to_request()).await;
+    for (field, want) in [
+        ("MovieCount", 1),
+        ("EpisodeCount", 0),
+        ("SeriesCount", 0),
+        ("SongCount", 0),
+        ("AlbumCount", 0),
+        ("ArtistCount", 0),
+    ] {
+        if counts[field] != want {
+            leaks.push(format!("/Items/Counts {field} = {}", counts[field]));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "hidden items listed:\n{}",
+        leaks.join("\n")
+    );
+}
