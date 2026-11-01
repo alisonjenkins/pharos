@@ -111,3 +111,51 @@ async fn native_views_follow_the_users_current_policy() {
         "a disabled user's open session must stop listing libraries"
     );
 }
+
+/// Over the wire a view carries its library's id in the variant
+/// `WireId::parse` gives it and the same Primary tag the Jellyfin listing
+/// advertises, with a URL that serves it.
+/// Disarm check: with `write_view` skipping `images`, or writing every id as
+/// `real`, this fails.
+#[actix_web::test]
+async fn native_views_carry_the_library_id_and_its_poster() {
+    use pharos_api::pharos_capnp::item_id;
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let expected = library::views(&fx.state, &UserPolicy::default()).await;
+
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.views_request();
+    req.get().init_ctx();
+    let reply = req.send().promise.await.expect("views");
+    let result = reply.get().unwrap().get_result().unwrap();
+    let items_result::Page(page) = result.which().unwrap() else {
+        panic!("views answered an error");
+    };
+    let items = page.unwrap().get_items().unwrap();
+    assert_eq!(items.len() as usize, expected.len());
+    for (item, view) in items.iter().zip(&expected) {
+        let id = match item.get_id().unwrap().which().unwrap() {
+            item_id::Real(id) => WireId::Real(id),
+            item_id::Synth(id) => WireId::Synth(id),
+        };
+        assert_eq!(Some(id), WireId::parse(&view.id), "{}", view.name);
+
+        let images = item.get_images().unwrap();
+        let tag = view
+            .primary_tag
+            .as_deref()
+            .expect("a seeded movie library has a poster");
+        assert_eq!(images.len(), 1, "{}", view.name);
+        let image = images.get(0);
+        assert_eq!(image.get_kind().unwrap().to_str().unwrap(), "Primary");
+        assert_eq!(image.get_tag().unwrap().to_str().unwrap(), tag);
+        assert_eq!(
+            image.get_url().unwrap().to_str().unwrap(),
+            format!("/Items/{}/Images/Primary?tag={tag}", view.id)
+        );
+    }
+}
