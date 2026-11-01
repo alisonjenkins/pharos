@@ -137,6 +137,9 @@ async fn a_live_token_survives_its_re_checks() {
     let session = signed_in(&client, &fx.user_token).await;
 
     tokio::time::sleep(Duration::from_millis(2_500)).await;
-    assert!(closed.try_recv().is_err(), "a live connection was closed");
+    assert!(
+        matches!(closed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "a live connection was closed"
+    );
     assert!(me_works(&session).await);
 }
