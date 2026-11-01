@@ -278,3 +278,50 @@ fn a_panicking_handler_is_counted_failed_not_cancelled() {
     let line = o.event("rpc call failed").expect("failure line");
     assert_eq!(line["fields"]["reason"], "handler panicked");
 }
+
+/// Client-supplied context lands in every span and log line, so an oversized
+/// value is cut to a bound, with a marker, rather than copied whole.
+#[test]
+fn oversized_context_fields_are_cut_to_a_bound() {
+    let huge = "r".repeat(10_000);
+    let ((), o) = observe("info", || {
+        let client = server::library::client(Lib(Mode::NotFound), &Connection::new());
+        block_on(async {
+            let mut req = client.latest_request();
+            let mut ctx = req.get().init_ctx();
+            fill_ctx(ctx.reborrow());
+            ctx.set_ui_route(huge.as_str());
+            ctx.init_device().set_value(huge.as_str());
+            req.get().init_parent_id().set_real(42);
+            let _ = req.send().promise.await;
+        });
+    });
+    let span = o.span_close("rpc.library.latest").expect("span");
+    for key in ["ui_route", "device"] {
+        let v = span["span"][key].as_str().unwrap_or_default();
+        assert!(
+            v.len() <= 160 && v.ends_with("…(10000 bytes)"),
+            "{key} not bounded: {} bytes",
+            v.len()
+        );
+    }
+}
+
+/// A context string that is not UTF-8 says so, instead of vanishing as "".
+#[test]
+fn invalid_utf8_context_is_reported_not_blanked() {
+    let ((), o) = observe("info", || {
+        let client = server::library::client(Lib(Mode::NotFound), &Connection::new());
+        block_on(async {
+            let mut req = client.latest_request();
+            let mut ctx = req.get().init_ctx();
+            fill_ctx(ctx.reborrow());
+            ctx.init_device()
+                .set_value(capnp::text::Reader::from(&b"\xff\xfedev"[..]));
+            req.get().init_parent_id().set_real(42);
+            let _ = req.send().promise.await;
+        });
+    });
+    let line = o.event("rpc call failed").expect("failure line");
+    assert_eq!(line["fields"]["device"], "<invalid utf-8: 5 bytes>");
+}

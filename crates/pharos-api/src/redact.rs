@@ -35,6 +35,36 @@ pub fn is_secret(field: Field) -> bool {
         .unwrap_or(false)
 }
 
+/// `t` cut to at most `max` bytes, with `…(<len> bytes)` appended when cut;
+/// text that is not UTF-8 renders as `<invalid utf-8: <len> bytes>` rather
+/// than vanishing.
+pub(crate) fn bounded_text(t: capnp::text::Reader<'_>, max: usize) -> String {
+    match t.to_str() {
+        Ok(s) => format!("{}{}", cut(s, max), cut_note(s, max)),
+        Err(_) => invalid_utf8(t),
+    }
+}
+
+fn cut(s: &str, max: usize) -> &str {
+    let end = (0..=max.min(s.len()))
+        .rev()
+        .find(|i| s.is_char_boundary(*i))
+        .unwrap_or(0);
+    &s[..end]
+}
+
+fn cut_note(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("…({} bytes)", s.len())
+    } else {
+        String::new()
+    }
+}
+
+fn invalid_utf8(t: capnp::text::Reader<'_>) -> String {
+    format!("<invalid utf-8: {} bytes>", t.as_bytes().len())
+}
+
 fn write_value(out: &mut String, value: dynamic_value::Reader<'_>, depth: usize) {
     use dynamic_value::Reader as V;
     if depth > MAX_DEPTH {
@@ -58,18 +88,10 @@ fn write_value(out: &mut String, value: dynamic_value::Reader<'_>, depth: usize)
             Ok(Some(en)) => write!(out, "{}", name_of(en.get_proto().get_name())),
             _ => write!(out, "#{}", e.get_value()),
         },
-        V::Text(t) => {
-            let s = t.to_string().unwrap_or_default();
-            if s.len() > MAX_TEXT {
-                let cut = (0..=MAX_TEXT)
-                    .rev()
-                    .find(|i| s.is_char_boundary(*i))
-                    .unwrap_or(0);
-                write!(out, "{:?}…({} bytes)", &s[..cut], s.len())
-            } else {
-                write!(out, "{s:?}")
-            }
-        }
+        V::Text(t) => match t.to_str() {
+            Ok(s) => write!(out, "{:?}{}", cut(s, MAX_TEXT), cut_note(s, MAX_TEXT)),
+            Err(_) => write!(out, "{}", invalid_utf8(t)),
+        },
         V::Data(d) => write!(out, "<{} bytes>", d.len()),
         V::Struct(s) => {
             write_struct(out, s, depth);

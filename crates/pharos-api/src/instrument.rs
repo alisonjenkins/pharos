@@ -328,12 +328,16 @@ fn struct_field<'a>(
     }
 }
 
+/// Bytes kept of a string read from a message (context fields, error reasons):
+/// it lands in every span and log line, so a caller cannot inflate them.
+const MAX_FIELD: usize = 128;
+
 fn text_field(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> String {
     let Ok(Some(field)) = s.get_schema().find_field_by_name(name) else {
         return String::new();
     };
     match s.get(field) {
-        Ok(dynamic_value::Reader::Text(t)) => t.to_string().unwrap_or_default(),
+        Ok(dynamic_value::Reader::Text(t)) => crate::redact::bounded_text(t, MAX_FIELD),
         _ => String::new(),
     }
 }
