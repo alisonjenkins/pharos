@@ -55,9 +55,51 @@ pub fn check(origin: Option<&str>, allowed: &[String]) -> Result<(), OriginRefus
     }
 }
 
+/// Entries of `allowed` a browser cannot keep the `Secure` session cookie
+/// on: plain `http://` other than a loopback host, which browsers treat as
+/// secure.
+pub fn insecure(allowed: &[String]) -> Vec<&str> {
+    allowed
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| {
+            let Some(authority) = a.strip_prefix("http://") else {
+                return false;
+            };
+            let host = authority
+                .rsplit_once(':')
+                .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+                .map_or(authority, |(host, _)| host)
+                .trim_end_matches('/');
+            !(host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+                || host == "127.0.0.1"
+                || host == "[::1]")
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_is_insecure_except_on_loopback() {
+        let allowed = [
+            "https://pharos.example.org",
+            "http://192.168.1.10:8096",
+            "http://pharos.lan",
+            "http://localhost:8080",
+            "http://127.0.0.1",
+            "http://[::1]:3000",
+            "http://ui.localhost",
+        ]
+        .map(String::from);
+        assert_eq!(
+            insecure(&allowed),
+            ["http://192.168.1.10:8096", "http://pharos.lan"]
+        );
+    }
 
     #[test]
     fn no_origin_is_a_native_client_and_allowed() {
