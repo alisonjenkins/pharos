@@ -7,6 +7,7 @@
 //! output is sent back as binary messages. The bounded pipe is the
 //! backpressure.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -221,39 +222,48 @@ async fn run<S>(
         }
     };
 
+    // Inbound frames feed the RPC pipe, whose `write_all` waits whenever the
+    // RpcSystem is behind. The timers run in their own future so a stalled
+    // pipe can never hold off the auth deadline or the idle drop.
+    let last_seen = Rc::new(Cell::new(Instant::now()));
     let mut ponger = session.clone();
-    let deadline = ctx.clone();
+    let seen = Rc::clone(&last_seen);
     let inbound = async move {
+        loop {
+            let msg = inbound.next().await;
+            seen.set(Instant::now());
+            match msg {
+                None => return CloseCause::StreamEnd,
+                Some(Err(e)) => return CloseCause::ReadError(e.to_string()),
+                Some(Ok(AggregatedMessage::Binary(bytes))) => {
+                    if to_rpc.write_all(&bytes).await.is_err() {
+                        return CloseCause::RpcEnded("rpc input closed".into());
+                    }
+                }
+                Some(Ok(AggregatedMessage::Ping(p))) => {
+                    if ponger.pong(&p).await.is_err() {
+                        return CloseCause::SendFailed;
+                    }
+                }
+                Some(Ok(AggregatedMessage::Pong(_))) => {}
+                Some(Ok(AggregatedMessage::Text(_))) => return CloseCause::TextFrame,
+                Some(Ok(AggregatedMessage::Close(reason))) => {
+                    return CloseCause::PeerClose(reason.map(|r| r.code));
+                }
+            }
+        }
+    };
+
+    let mut pinger = session.clone();
+    let deadline = ctx.clone();
+    let timers = async move {
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
         tokio::pin!(auth_deadline);
         let mut checked_auth = false;
-        let mut last_seen = Instant::now();
         loop {
             tokio::select! {
-                msg = inbound.next() => {
-                    last_seen = Instant::now();
-                    match msg {
-                        None => return CloseCause::StreamEnd,
-                        Some(Err(e)) => return CloseCause::ReadError(e.to_string()),
-                        Some(Ok(AggregatedMessage::Binary(bytes))) => {
-                            if to_rpc.write_all(&bytes).await.is_err() {
-                                return CloseCause::RpcEnded("rpc input closed".into());
-                            }
-                        }
-                        Some(Ok(AggregatedMessage::Ping(p))) => {
-                            if ponger.pong(&p).await.is_err() {
-                                return CloseCause::SendFailed;
-                            }
-                        }
-                        Some(Ok(AggregatedMessage::Pong(_))) => {}
-                        Some(Ok(AggregatedMessage::Text(_))) => return CloseCause::TextFrame,
-                        Some(Ok(AggregatedMessage::Close(reason))) => {
-                            return CloseCause::PeerClose(reason.map(|r| r.code));
-                        }
-                    }
-                }
                 () = &mut auth_deadline, if !checked_auth => {
                     if !deadline.is_signed_in() {
                         return CloseCause::AuthDeadline;
@@ -261,10 +271,10 @@ async fn run<S>(
                     checked_auth = true;
                 }
                 _ = keepalive.tick() => {
-                    if last_seen.elapsed() > IDLE_DROP {
+                    if last_seen.get().elapsed() > IDLE_DROP {
                         return CloseCause::IdleTimeout;
                     }
-                    if ponger.ping(b"").await.is_err() {
+                    if pinger.ping(b"").await.is_err() {
                         return CloseCause::SendFailed;
                     }
                 }
@@ -274,6 +284,7 @@ async fn run<S>(
 
     let cause = tokio::select! {
         cause = inbound => cause,
+        cause = timers => cause,
         cause = outbound => cause,
         result = rpc => CloseCause::RpcEnded(match result {
             Ok(()) => "rpc system finished".into(),
