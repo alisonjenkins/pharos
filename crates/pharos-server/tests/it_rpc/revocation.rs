@@ -16,6 +16,7 @@ use pharos_api::pharos_capnp::{bootstrap, me_result, session};
 use pharos_core::TokenStore;
 use pharos_server::api::pharos::rpc;
 use pharos_server::config::NativeApiConfig;
+use pharos_server::services::auth::RevokeCause;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::oneshot;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -23,13 +24,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::common::{seed_rich, Fixture};
 
 async fn start() -> (actix_test::TestServer, Fixture) {
+    start_with(NonZeroU32::MIN).await
+}
+
+/// A server whose timer re-checks every `revalidate_secs`.
+async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fixture) {
     let fx = seed_rich().await;
     let state = fx.state.clone();
     let limits = rpc::limits::ConnectionLimits::default();
     let server = actix_test::start(move || {
         let cfg = NativeApiConfig {
             enabled: true,
-            revalidate_secs: NonZeroU32::MIN,
+            revalidate_secs,
             ..NativeApiConfig::default()
         };
         App::new()
@@ -142,4 +148,77 @@ async fn a_live_token_survives_its_re_checks() {
         "a live connection was closed"
     );
     assert!(me_works(&session).await);
+}
+
+/// An hour between timer re-checks: only an announced revocation can close
+/// the socket inside these tests (T025).
+fn hourly() -> NonZeroU32 {
+    NonZeroU32::new(3_600).unwrap()
+}
+
+/// T025: logout and revoke drop the connection at once, not at the next
+/// re-check. Disarm check: without the `revocations` branch in the socket's
+/// select, this times out.
+#[actix_web::test]
+async fn an_announced_revocation_closes_the_connection_at_once() {
+    let (server, fx) = start_with(hourly()).await;
+    let (client, closed) = connect(&server).await;
+    let _session = signed_in(&client, &fx.user_token).await;
+
+    pharos_server::services::auth::revoke_token(
+        &fx.state,
+        fx.user_id,
+        &fx.user_token,
+        RevokeCause::Logout,
+    )
+    .await
+    .unwrap();
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), closed)
+        .await
+        .expect("an announced revocation must close the connection at once")
+        .expect("close frame");
+    assert_eq!(reason.as_deref(), Some("revoked"));
+}
+
+/// An announcement only makes the user's connections re-check: another of
+/// their tokens, or another user's, keeps its connection.
+#[actix_web::test]
+async fn an_announcement_closes_only_connections_whose_token_no_longer_resolves() {
+    let (server, fx) = start_with(hourly()).await;
+    let (revoked, revoked_closed) = connect(&server).await;
+    let _revoked_session = signed_in(&revoked, &fx.user_token).await;
+    let (admin, mut admin_closed) = connect(&server).await;
+    let admin_session = signed_in(&admin, &fx.admin_token).await;
+    let second = fx
+        .state
+        .stores
+        .issue(fx.user_id, "other-device")
+        .await
+        .unwrap();
+    let (user, mut user_closed) = connect(&server).await;
+    let user_session = signed_in(&user, second.0.expose()).await;
+
+    pharos_server::services::auth::revoke_token(
+        &fx.state,
+        fx.user_id,
+        &fx.user_token,
+        RevokeCause::Logout,
+    )
+    .await
+    .unwrap();
+
+    let reason = tokio::time::timeout(Duration::from_secs(2), revoked_closed)
+        .await
+        .expect("the revoked token's connection must close at once")
+        .expect("close frame");
+    assert_eq!(reason.as_deref(), Some("revoked"));
+    for closed in [&mut admin_closed, &mut user_closed] {
+        assert!(
+            matches!(closed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a connection with a live token was closed"
+        );
+    }
+    assert!(me_works(&admin_session).await);
+    assert!(me_works(&user_session).await);
 }
