@@ -933,14 +933,25 @@ async fn delete_device(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut revoked = 0u64;
+    let mut affected = Vec::new();
     for device_id in &device_ids {
         for u in &users {
-            revoked += state
+            let dropped = state
                 .stores
                 .revoke_tokens_by_device(u.id, device_id)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            if dropped > 0 && !affected.contains(&u.id) {
+                affected.push(u.id);
+            }
+            revoked += dropped;
         }
+    }
+    // Once per user, however many of their devices went.
+    for user in affected {
+        state
+            .revocations
+            .announce(user, crate::services::auth::RevokeCause::DeviceDeleted);
     }
     tracing::info!(
         devices = device_ids.len(),

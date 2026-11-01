@@ -50,15 +50,13 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// token on this request, so the user's other devices stay signed in.
 async fn logout(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     req: HttpRequest,
 ) -> Result<impl Responder, actix_web::Error> {
-    use pharos_core::TokenStore;
+    use crate::services::auth::{revoke_token, RevokeCause};
     let token = crate::api::jellyfin::auth_extractor::extract_token(&req)
         .ok_or_else(|| error::ErrorUnauthorized("missing token"))?;
-    state
-        .stores
-        .revoke(&token)
+    revoke_token(&state, user.0.id, &token, RevokeCause::Logout)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
