@@ -25,11 +25,25 @@
 
 use pharos_core::UserId;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// How long a pending request lives before it's GC'd.
 pub const PENDING_TTL: Duration = Duration::from_secs(300);
+
+/// Live pending requests the registry will hold. Initiate is unauthenticated,
+/// so without a bound anyone could grow the map until the process OOMs; 1024
+/// is far above any household's concurrent sign-ins.
+pub const MAX_PENDING: usize = 1024;
+
+/// Live pending requests one client address (IPv6: one /64) may hold. A TV
+/// that retries a few times is fine; a flood from one host is not.
+pub const MAX_PENDING_PER_IP: usize = 8;
+
+/// `Retry-After` sent with a cap refusal: long enough for a stuck request to
+/// be consumed or a client to back off, short enough for a retrying TV.
+pub const CAP_RETRY_AFTER_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
@@ -51,6 +65,8 @@ pub struct PendingRequest {
     pub created_unix_secs: i64,
     /// Set once an authorized user vouches for the code.
     pub authorized_by: Option<UserId>,
+    /// Initiating client address (IPv6 on its /64), for the per-address cap.
+    pub client: IpAddr,
 }
 
 impl PendingRequest {
@@ -68,12 +84,18 @@ pub type FillRandom = fn(&mut [u8]) -> Result<(), getrandom::Error>;
 pub enum QcRefusal {
     /// The OS CSPRNG failed, so no unpredictable code/secret can be minted.
     RngFailed,
+    /// [`MAX_PENDING`] live requests already exist.
+    GlobalCap,
+    /// The client address already holds [`MAX_PENDING_PER_IP`] live requests.
+    IpCap,
 }
 
 impl QcRefusal {
     pub fn label(self) -> &'static str {
         match self {
             Self::RngFailed => "rng_failed",
+            Self::GlobalCap => "global_cap",
+            Self::IpCap => "ip_cap",
         }
     }
 
@@ -90,6 +112,7 @@ pub enum QcMsg {
         device_name: String,
         app_name: String,
         app_version: String,
+        client_ip: IpAddr,
         reply: oneshot::Sender<Result<PendingRequest, QcRefusal>>,
     },
     Authorize {
@@ -143,13 +166,36 @@ impl QuickConnectRegistry {
                         device_name,
                         app_name,
                         app_version,
+                        client_ip,
                         reply,
                     } => {
+                        let client = crate::auth::ip_key(client_ip);
+                        let ip_live = by_secret.values().filter(|e| e.client == client).count();
+                        let cap_hit = if ip_live >= MAX_PENDING_PER_IP {
+                            Some((QcRefusal::IpCap, ip_live, MAX_PENDING_PER_IP))
+                        } else if by_secret.len() >= MAX_PENDING {
+                            Some((QcRefusal::GlobalCap, by_secret.len(), MAX_PENDING))
+                        } else {
+                            None
+                        };
+                        if let Some((refusal, live, cap)) = cap_hit {
+                            refusal.record();
+                            tracing::warn!(
+                                reason = refusal.label(),
+                                client_ip = %client,
+                                live,
+                                cap,
+                                "quickconnect: initiate refused, pending cap reached"
+                            );
+                            let _ = reply.send(Err(refusal));
+                            continue;
+                        }
                         let entry = match mint_pending(
                             device_id,
                             device_name,
                             app_name,
                             app_version,
+                            client,
                             &by_code,
                             fill,
                         ) {
@@ -248,6 +294,7 @@ fn mint_pending(
     device_name: String,
     app_name: String,
     app_version: String,
+    client: IpAddr,
     by_code: &HashMap<String, String>,
     fill: FillRandom,
 ) -> Result<PendingRequest, getrandom::Error> {
@@ -272,6 +319,7 @@ fn mint_pending(
         created_at: now,
         created_unix_secs,
         authorized_by: None,
+        client,
     })
 }
 
@@ -374,6 +422,7 @@ mod tests {
                 device_name: "Living Room TV".into(),
                 app_name: "Jellyfin Android TV".into(),
                 app_version: "0.18".into(),
+                client_ip: ip(1),
                 reply: tx,
             })
             .await
@@ -458,6 +507,7 @@ mod tests {
                 device_name: "Living Room TV".into(),
                 app_name: "Jellyfin Android TV".into(),
                 app_version: "0.18".into(),
+                client_ip: ip(1),
                 reply: tx,
             })
             .await
@@ -533,6 +583,7 @@ mod tests {
                 "tv".into(),
                 "app".into(),
                 "1.0".into(),
+                ip(1),
                 &by_code,
                 getrandom::fill,
             )
@@ -544,6 +595,169 @@ mod tests {
             by_code.insert(e.code.clone(), e.secret.clone());
         }
         assert_eq!(by_code.len(), 2000);
+    }
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([192, 0, 2, n])
+    }
+
+    async fn initiate_from(
+        reg: &QuickConnectRegistry,
+        client_ip: IpAddr,
+    ) -> Result<PendingRequest, QcRefusal> {
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Initiate {
+                device_id: "d".into(),
+                device_name: "tv".into(),
+                app_name: "app".into(),
+                app_version: "1".into(),
+                client_ip,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    fn refused_count(rec: &metrics_util::debugging::DebuggingRecorder, reason: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        pharos_test_metrics::snapshotter(rec)
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let hit = ck.key().name() == "pharos_quick_connect_refused_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == reason);
+                match v {
+                    DebugValue::Counter(n) if hit => Some(n),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn one_address_cannot_hold_more_than_the_per_ip_cap() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let reg = QuickConnectRegistry::spawn();
+        for _ in 0..MAX_PENDING_PER_IP {
+            initiate_from(&reg, ip(1)).await.unwrap();
+        }
+        assert_eq!(
+            initiate_from(&reg, ip(1)).await.unwrap_err(),
+            QcRefusal::IpCap
+        );
+        // another client is unaffected
+        initiate_from(&reg, ip(2)).await.unwrap();
+        assert_eq!(refused_count(&rec, "ip_cap"), 1);
+    }
+
+    #[tokio::test]
+    async fn ipv6_clients_share_the_cap_across_their_slash_64() {
+        let reg = QuickConnectRegistry::spawn();
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        for i in 0..MAX_PENDING_PER_IP {
+            let b: IpAddr = format!("2001:db8:1:2::{:x}", i + 10).parse().unwrap();
+            initiate_from(&reg, b).await.unwrap();
+        }
+        assert_eq!(initiate_from(&reg, a).await.unwrap_err(), QcRefusal::IpCap);
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_bounded_globally() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let reg = QuickConnectRegistry::spawn();
+        for i in 0..MAX_PENDING {
+            // spread over IPv4 so the per-IP cap is never the one that trips
+            let o = i / MAX_PENDING_PER_IP;
+            let client = IpAddr::from([10, (o / 256) as u8, (o % 256) as u8, 1]);
+            initiate_from(&reg, client).await.unwrap();
+        }
+        assert_eq!(
+            initiate_from(&reg, ip(200)).await.unwrap_err(),
+            QcRefusal::GlobalCap
+        );
+        assert_eq!(refused_count(&rec, "global_cap"), 1);
+    }
+
+    #[tokio::test]
+    async fn consuming_frees_a_slot_under_the_cap() {
+        let reg = QuickConnectRegistry::spawn();
+        let mut first = None;
+        for _ in 0..MAX_PENDING_PER_IP {
+            first.get_or_insert(initiate_from(&reg, ip(1)).await.unwrap());
+        }
+        let first = first.unwrap();
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Authorize {
+                code: first.code.clone(),
+                by: UserId::new(),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        reg.tx
+            .send(QcMsg::Consume {
+                secret: first.secret,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        assert!(rx.await.unwrap().is_some());
+        initiate_from(&reg, ip(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cap_refusal_warns_with_the_offending_values() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let reg = QuickConnectRegistry::spawn();
+        for _ in 0..=MAX_PENDING_PER_IP {
+            let _ = initiate_from(&reg, ip(7)).await;
+        }
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warn = log
+            .lines()
+            .find(|l| l.contains("WARN"))
+            .unwrap_or_else(|| panic!("no WARN in {log}"));
+        for want in [
+            "reason=\"ip_cap\"",
+            "client_ip=192.0.2.7",
+            "live=8",
+            "cap=8",
+        ] {
+            assert!(warn.contains(want), "missing {want} in {warn}");
+        }
     }
 
     fn failing_fill(_: &mut [u8]) -> Result<(), getrandom::Error> {
@@ -583,6 +797,7 @@ mod tests {
                 device_name: "tv".into(),
                 app_name: "app".into(),
                 app_version: "1".into(),
+                client_ip: ip(1),
                 reply: tx,
             })
             .await
@@ -609,8 +824,12 @@ mod tests {
 
     #[test]
     fn refusal_labels_are_distinct_and_stable() {
-        let labels = [QcRefusal::RngFailed.label()];
-        assert_eq!(labels, ["rng_failed"]);
+        let labels = [
+            QcRefusal::RngFailed.label(),
+            QcRefusal::GlobalCap.label(),
+            QcRefusal::IpCap.label(),
+        ];
+        assert_eq!(labels, ["rng_failed", "global_cap", "ip_cap"]);
     }
 
     #[test]
@@ -634,6 +853,7 @@ mod tests {
             created_at: Instant::now() - Duration::from_secs(400),
             created_unix_secs: 0,
             authorized_by: None,
+            client: ip(1),
         };
         assert!(entry.expired(Instant::now()));
     }

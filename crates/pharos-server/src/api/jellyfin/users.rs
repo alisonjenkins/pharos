@@ -99,6 +99,7 @@ async fn quick_connect_initiate(
             device_name: auth.device.clone().unwrap_or_default(),
             app_name: auth.client.clone().unwrap_or_default(),
             app_version: auth.version.clone().unwrap_or_default(),
+            client_ip: crate::client_ip::client_ip(&req, &state.trusted_proxies),
             reply: reply_tx,
         })
         .await
@@ -131,6 +132,15 @@ fn qc_refused(refusal: crate::quick_connect::QcRefusal) -> actix_web::Error {
     match refusal {
         crate::quick_connect::QcRefusal::RngFailed => {
             actix_web::error::ErrorServiceUnavailable("quick connect unavailable")
+        }
+        crate::quick_connect::QcRefusal::GlobalCap | crate::quick_connect::QcRefusal::IpCap => {
+            let resp = HttpResponse::TooManyRequests()
+                .insert_header((
+                    actix_web::http::header::RETRY_AFTER,
+                    crate::quick_connect::CAP_RETRY_AFTER_SECS.to_string(),
+                ))
+                .body("too many pending quick connect requests");
+            actix_web::error::InternalError::from_response("quick connect cap", resp).into()
         }
     }
 }
