@@ -10,5 +10,6 @@ mod redact;
 mod refused;
 mod registration;
 mod resume;
+mod schema_copy;
 mod support;
 mod wire;
