@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 pharos-cache = { path = "../pharos-cache", default-features = false }
+pharos-api = { path = "../pharos-api" }
 pharos-core = { path = "../pharos-core" }
 pharos-discovery = { path = "../pharos-discovery" }
 pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
@@ -33,8 +34,10 @@ tempfile = "3"
 # absent from release builds.
 zip = { workspace = true }
 mime_guess = "2"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
 anyhow.workspace = true
+capnp.workspace = true
+capnp-rpc.workspace = true
 argon2.workspace = true
 clap.workspace = true
 getrandom.workspace = true

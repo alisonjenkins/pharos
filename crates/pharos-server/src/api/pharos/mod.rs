@@ -6,3 +6,4 @@
 //! already has assumptions about.
 
 pub mod remote_items;
+pub mod rpc;
