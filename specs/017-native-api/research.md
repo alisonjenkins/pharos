@@ -1,14 +1,12 @@
 # Research: 017-native-api
 
-**Date**: 2026-11-01. Measurements were taken in a cloud container with host
-`cargo` 1.99.1, **not** the Nix devShell (the flake's GitHub inputs could not be
-fetched there). Re-take them in the devShell during implementation, as task
-T001 does, before setting any gate.
+**Date**: 2026-11-01. R8 was re-taken in the devShell on 2026-11-01 (T001);
+quickstart.md §0 holds the numbers.
 
 ## R1 — capnp-rpc compiles to wasm32 and is small enough
 
 - **Decision**: use `capnp` 0.27 + `capnp-rpc` 0.27 + `capnpc` 0.27 (build-time)
-  with the `capnp` 1.5 compiler from nixpkgs.
+  with the `capnp` 1.4.0 compiler from nixpkgs.
 - **Evidence**: a spike crate (bootstrap → `resume()` → `library()` →
   `latest()`, pipelined in one flight over a generic `AsyncRead`/`AsyncWrite`)
   builds for `wasm32-unknown-unknown` with no feature changes. Stripped,
@@ -102,6 +100,9 @@ T001 does, before setting any gate.
 | Current pharos-ui wasm, workspace release profile | 3.53 MB raw / 724 KB gzip | not stripped, no wasm-opt |
 | Same, `opt-level=z`, LTO, 1 CGU, stripped | 1.86 MB raw / 525 KB gzip | still no wasm-opt / wasm-bindgen post-processing |
 | capnp + capnp-rpc spike (standalone) | 343 KB raw / 112 KB gzip | upper bound on increment |
+
+The table above is the original host-cargo run, kept for reference. The devShell
+figures (the same three rows) are in quickstart.md §0.
 
 The SC-002 payload and decode comparison needs a server, so it is task T040,
 against the seeded fixture library.

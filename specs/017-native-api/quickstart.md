@@ -4,9 +4,43 @@ All commands run inside `nix develop`.
 
 ## Prerequisites
 
-- `capnp --version` prints 1.5.x (devShell).
+- `capnp --version` prints 1.4.0 (devShell).
 - A seeded library: the fixtures `just compat-playwright-full` seeds (a standalone
   seed recipe is added by this feature if the plan's tasks need one).
+
+## 0. wasm size baseline (R8)
+
+Measured 2026-11-01 (T001) inside the devShell, replacing the host-cargo
+numbers in research.md §R8.
+
+Toolchain: rustc 1.99.0 (b940084d7 2026-09-28), cargo 1.99.0 (5f94df478
+2026-08-27), Cap'n Proto compiler `capnp` 1.4.0.
+
+| Measure | Raw bytes | Gzip -9 bytes | Notes |
+|---|---|---|---|
+| Current pharos-ui-web wasm, workspace release profile | 3,533,954 (3.53 MB) | 725,042 (725 KB) | not stripped, no wasm-opt |
+| Same, opt-level=z, LTO, 1 CGU, stripped | 1,861,309 (1.86 MB) | 526,279 (526 KB) | no wasm-opt / wasm-bindgen post-processing |
+| capnp + capnp-rpc spike (standalone) | 290,744 (291 KB) | 106,983 (107 KB) | upper bound on increment; `run` polls the R1 flight so the client code is linked |
+
+Commands, run from the repo root (`<target-dir>` is a scratch dir outside the
+repo, passed as `--target-dir`; `<spike>` is the scratch spike crate):
+
+```sh
+nix develop --command cargo build -p pharos-ui --release --target wasm32-unknown-unknown --bin pharos-ui-web --features web --target-dir <target-dir>
+gzip -9 -c <target-dir>/wasm32-unknown-unknown/release/pharos-ui-web.wasm | wc -c
+
+nix develop --command env CARGO_PROFILE_RELEASE_OPT_LEVEL=z CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=true cargo build -p pharos-ui --release --target wasm32-unknown-unknown --bin pharos-ui-web --features web --target-dir <target-dir>
+gzip -9 -c <target-dir>/wasm32-unknown-unknown/release/pharos-ui-web.wasm | wc -c
+
+# spike: standalone crate outside the repo (schema copied from contracts/pharos.capnp)
+nix develop --command cargo build --manifest-path <spike>/Cargo.toml --release --target wasm32-unknown-unknown --target-dir <spike-target>
+gzip -9 -c <spike-target>/wasm32-unknown-unknown/release/r8_spike.wasm | wc -c
+```
+
+The spike's `[profile.release]` sets opt-level="z", lto=true, codegen-units=1,
+strip=true, panic="abort". Its `run` polls the flight once; capnpc 0.27 does not
+pipeline through the `SessionResult` union, so `resume` is awaited and
+`library`/`latest` are pipelined.
 
 ## 1. Instrumentation cannot be bypassed (V173)
 
