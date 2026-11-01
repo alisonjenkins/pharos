@@ -72,7 +72,7 @@ has no business in.
 | `items.rs:618,767,915,3761,3917,5294`, `image_cache.rs:1081,1092` (`Audio`) | audio-library grouping, album art |
 | `waveform.rs:81` (`!Audio` → 404) | waveform is audio-only; a Book is rejected |
 | `images.rs:578` (`Audio && Backdrop\|Thumb` → 404) | a Book is not audio, so it falls through to the Primary path — which is what we want, since that is where the cover lives |
-| `images.rs:684` (`Audio && !has_primary_art`) | audio cover-art fallback |
+| `images.rs:734` (`!(Movie\|Episode) && !has_primary_art`) | synth Primary tag: only video has a frame to fall back on; a coverless Book advertises none (B251) |
 | `items.rs:2128` (`Movie\|Episode`) | `is_video` for playback capability |
 | `filename.rs:216` (`Movie`) | `(year)`-in-filename parsing; books rarely carry it and a wrong year is worse than none |
 | `fs.rs:1022,1027` (`Movie`→`Episode` promotion, series info) | a Book is never promoted to an episode |
