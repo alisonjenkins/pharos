@@ -202,3 +202,91 @@ async fn non_admin_cannot_change_other_users_password() {
     assert_eq!(resp.status().as_u16(), 403);
     let _ = f.admin_id;
 }
+
+async fn resolves(f: &Fixture, token: &str) -> bool {
+    f.state.stores.resolve(token).await.is_ok()
+}
+
+/// B235: changing a password revokes the user's other sessions, so a thief
+/// holding a stolen token loses it; the caller keeps the token they used.
+#[actix_web::test]
+async fn self_change_keeps_callers_token_and_revokes_the_users_others() {
+    let f = seed().await;
+    let thief = f.state.stores.issue(f.alice_id, "thief").await.unwrap();
+    let thief = thief.0.expose().to_string();
+    let key = f
+        .state
+        .stores
+        .issue(f.alice_id, "apikey:cli")
+        .await
+        .unwrap();
+    let mut rx = f.state.revocations.subscribe();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/Users/{}/Password", f.alice_id.0.simple()))
+            .insert_header(("X-Emby-Token", f.alice_token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"NewPw":"new-alice","CurrentPw":"alice-pass"}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 204);
+    assert!(resolves(&f, &f.alice_token).await, "caller keeps its token");
+    assert!(!resolves(&f, &thief).await, "other token must be revoked");
+    assert!(resolves(&f, key.0.expose()).await, "API key must survive");
+    assert_eq!(rx.try_recv().unwrap(), f.alice_id, "user is announced");
+}
+
+/// An admin reset runs on the admin's token, so all of the target's go.
+#[actix_web::test]
+async fn admin_reset_revokes_all_of_the_targets_tokens_and_not_the_admins() {
+    let f = seed().await;
+    let bob_a = f.state.stores.issue(f.bob_id, "a").await.unwrap();
+    let bob_b = f.state.stores.issue(f.bob_id, "b").await.unwrap();
+    let bob_key = f.state.stores.issue(f.bob_id, "apikey:cli").await.unwrap();
+    let mut rx = f.state.revocations.subscribe();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/Users/{}/Password", f.bob_id.0.simple()))
+            .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"NewPw":"new-bob","CurrentPw":""}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 204);
+    assert!(!resolves(&f, bob_a.0.expose()).await);
+    assert!(!resolves(&f, bob_b.0.expose()).await);
+    assert!(
+        resolves(&f, bob_key.0.expose()).await,
+        "API key must survive"
+    );
+    assert!(resolves(&f, &f.admin_token).await, "admin keeps its token");
+    assert_eq!(rx.try_recv().unwrap(), f.bob_id);
+}
+
+/// A refused change (wrong current password) revokes nothing.
+#[actix_web::test]
+async fn refused_change_revokes_nothing_and_announces_nothing() {
+    let f = seed().await;
+    let other = f.state.stores.issue(f.alice_id, "other").await.unwrap();
+    let mut rx = f.state.revocations.subscribe();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/Users/{}/Password", f.alice_id.0.simple()))
+            .insert_header(("X-Emby-Token", f.alice_token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"NewPw":"x","CurrentPw":"wrong"}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(resolves(&f, other.0.expose()).await);
+    assert!(rx.try_recv().is_err());
+}
