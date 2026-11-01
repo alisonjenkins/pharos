@@ -2684,12 +2684,6 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lzma-rust2"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7277c9742229dc25243236d578b6471a798c554512c6f6a04365ec2e87c2a3bb"
-
-[[package]]
-name = "lzma-rust2"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
@@ -4355,7 +4349,7 @@ checksum = "30146010a60b5773ef63f7b0033576c7a0487ecc87a30d97b787ca8e27c85140"
 dependencies = [
  "crc32fast",
  "js-sys",
- "lzma-rust2 0.23.0",
+ "lzma-rust2",
  "wasm-bindgen",
 ]
 
@@ -5947,7 +5941,6 @@ dependencies = [
  "aho-corasick",
  "base64",
  "bitflags",
- "brotli-decompressor 5.0.3",
  "bytes",
  "cc",
  "clap",
@@ -5982,7 +5975,7 @@ dependencies = [
  "libsqlite3-sys",
  "linux-raw-sys",
  "log",
- "lzma-rust2 0.22.0",
+ "lzma-rust2",
  "md-5",
  "memchr",
  "metrics-util",
