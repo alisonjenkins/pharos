@@ -66,6 +66,20 @@ impl ConnectionLimits {
         Ok(())
     }
 
+    /// Moves a signed-in `slot` back to not signed in, after its last
+    /// session logged out, so the user's count drops. Counted as
+    /// unauthenticated even past [`MAX_UNAUTHENTICATED`]: the connection is
+    /// already open, and the auth deadline closes it if nobody signs in.
+    pub fn sign_out(&self, slot: &mut Slot) {
+        if slot.held == Held::Unauthenticated {
+            return;
+        }
+        let mut counts = self.lock();
+        release(&mut counts, slot.held);
+        counts.unauthenticated += 1;
+        slot.held = Held::Unauthenticated;
+    }
+
     /// Connections `user` holds now.
     pub fn held_by(&self, user: UserId) -> u32 {
         self.lock().per_user.get(&user).copied().unwrap_or(0)
@@ -148,6 +162,22 @@ mod tests {
         drop(a);
         assert_eq!(limits.held_by(user), 0);
         limits.sign_in(&mut b, user, 1).unwrap();
+        assert_eq!(limits.unauthenticated(), 0);
+    }
+
+    /// A logout must not keep the user's place: otherwise N logouts on
+    /// connections left open lock the user out.
+    #[test]
+    fn signing_out_releases_the_user_and_counts_unauthenticated() {
+        let limits = ConnectionLimits::default();
+        let user = UserId::new();
+        let mut slot = limits.admit().unwrap();
+        limits.sign_in(&mut slot, user, 1).unwrap();
+        limits.sign_out(&mut slot);
+        assert_eq!(limits.held_by(user), 0);
+        assert_eq!(limits.unauthenticated(), 1);
+        assert!(!slot.is_signed_in());
+        drop(slot);
         assert_eq!(limits.unauthenticated(), 0);
     }
 

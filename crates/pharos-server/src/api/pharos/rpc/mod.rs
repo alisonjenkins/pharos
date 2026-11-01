@@ -105,6 +105,9 @@ pub struct ConnectionCtx {
     /// Tokens `Session.logout` revoked on this connection: every session
     /// opened with one fails `revoked` from then on.
     ended: RefCell<Vec<String>>,
+    /// Woken when a logout leaves the connection with no session, so the
+    /// socket re-arms its auth deadline.
+    pub(crate) signed_out: tokio::sync::Notify,
 }
 
 impl ConnectionCtx {
@@ -125,6 +128,7 @@ impl ConnectionCtx {
             slot: RefCell::new(slot),
             resumed: RefCell::new(Vec::new()),
             ended: RefCell::new(Vec::new()),
+            signed_out: tokio::sync::Notify::new(),
         }))
     }
 
@@ -139,11 +143,35 @@ impl ConnectionCtx {
     /// its sessions here fail `revoked`, and it leaves the re-check, so the
     /// logout's own reply is not cut off by the close the revocation would
     /// cause. Other connections holding it still close (T025).
+    /// When that leaves no session here, the connection is no longer signed
+    /// in: its per-user slot is released (FR-010) and it has the auth
+    /// deadline again to sign in or be closed.
     pub(crate) fn end_token(&self, token: &str) {
-        self.resumed.borrow_mut().retain(|(t, _)| t != token);
+        let mut resumed = self.resumed.borrow_mut();
+        resumed.retain(|(t, _)| t != token);
         let mut ended = self.ended.borrow_mut();
         if !ended.iter().any(|t| t == token) {
             ended.push(token.to_owned());
+        }
+        if resumed.is_empty() {
+            self.limits.sign_out(&mut self.slot.borrow_mut());
+            self.signed_out.notify_one();
+        }
+    }
+
+    /// Puts the slot back in line with the sessions this connection holds,
+    /// after a sign-in that failed once `admit` had moved it: not signed in
+    /// when it holds none, else its last user's (already counted before).
+    pub(crate) fn settle_slot(&self) {
+        let last = self.resumed.borrow().last().map(|(_, user)| *user);
+        let mut slot = self.slot.borrow_mut();
+        match last {
+            None => self.limits.sign_out(&mut slot),
+            Some(user) => {
+                // Back to a user it held a moment ago, so the cap can only
+                // refuse if others filled it meanwhile; it then stays as is.
+                let _ = self.limits.sign_in(&mut slot, user, u32::MAX);
+            }
         }
     }
 

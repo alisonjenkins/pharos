@@ -371,6 +371,16 @@ async fn run<S>(
                         None
                     }
                 },
+                () = deadline.signed_out.notified() => {
+                    // A stale wake (signed in again since) changes nothing.
+                    if !deadline.is_signed_in() {
+                        auth_deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + AUTH_DEADLINE);
+                        checked_auth = false;
+                    }
+                    None
+                }
                 () = &mut auth_deadline, if !checked_auth => {
                     if !deadline.is_signed_in() {
                         return CloseCause::AuthDeadline;
