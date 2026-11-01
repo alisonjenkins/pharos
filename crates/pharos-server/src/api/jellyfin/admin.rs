@@ -80,7 +80,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         .route("/auth/keys/{device_id}", web::delete().to(revoke_api_key));
 }
 
-const API_KEY_PREFIX: &str = "apikey:";
+const API_KEY_PREFIX: &str = pharos_core::API_KEY_DEVICE_PREFIX;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -570,7 +570,16 @@ async fn set_user_password(
 ) -> Result<impl Responder, actix_web::Error> {
     let target = parse_user_id(&path.into_inner())?;
     let ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
-    change_password(&state, &user, target, body.into_inner(), ip).await
+    let token = super::auth_extractor::extract_token(&req);
+    change_password(
+        &state,
+        &user,
+        target,
+        body.into_inner(),
+        ip,
+        token.as_deref(),
+    )
+    .await
 }
 
 /// Optional `userId` query on the self-service endpoints. Absent means the
@@ -595,7 +604,16 @@ pub(super) async fn set_own_password(
         None => user.0.id,
     };
     let ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
-    change_password(&state, &user, target, body.into_inner(), ip).await
+    let token = super::auth_extractor::extract_token(&req);
+    change_password(
+        &state,
+        &user,
+        target,
+        body.into_inner(),
+        ip,
+        token.as_deref(),
+    )
+    .await
 }
 
 async fn change_password(
@@ -604,6 +622,7 @@ async fn change_password(
     target: UserId,
     body: SetPasswordBody,
     client_ip: std::net::IpAddr,
+    request_token: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Either the bearer is the target, or the bearer is admin.
     let is_self = target == user.0.id;
@@ -647,6 +666,19 @@ async fn change_password(
             AuthError::UserNotFound => error::ErrorNotFound("user not found"),
             other => error::ErrorInternalServerError(other.to_string()),
         })?;
+    // B235: the old password may be in a thief's hands, and so may the
+    // sessions made with it. Jellyfin's UpdateUserPassword keeps only the
+    // request's own token; an admin resetting someone else holds a token that
+    // is not the target's, so all of the target's go.
+    let keep = if is_self { request_token } else { None };
+    crate::services::auth::revoke_other_tokens(
+        state,
+        target,
+        keep,
+        crate::services::auth::RevokeCause::PasswordChanged,
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
 }
 
