@@ -12,7 +12,7 @@
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
-    api::jellyfin::auth_extractor::{extract_token, AuthUser},
+    api::jellyfin::auth_extractor::{extract_token, AuthUser, MediaUser},
     api::jellyfin::fmp4,
     state::AppState,
 };
@@ -151,7 +151,7 @@ async fn stop_active_encodings(
 
 async fn subtitle_playlist(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -730,7 +730,7 @@ fn push_h264_cmaf_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
 
 async fn master_playlist(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -894,7 +894,7 @@ async fn session_burn_indices(
 
 async fn variant_playlist_main(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -904,7 +904,7 @@ async fn variant_playlist_main(
 
 async fn variant_playlist_named(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -917,7 +917,7 @@ async fn variant_playlist_named(
 
 async fn render_variant_playlist(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     id: String,
     variant: &str,
@@ -976,7 +976,7 @@ where
 
 async fn segment_main(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -987,7 +987,7 @@ async fn segment_main(
 
 async fn segment_named(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -1000,7 +1000,7 @@ async fn segment_named(
 
 async fn serve_segment(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     id: String,
     seg: u32,
@@ -2020,7 +2020,7 @@ const VP9_HLS_CODECS: &str = "vp09.00.40.08,opus";
 /// the H.264 master. jellyfin-web loads this as the negotiated TranscodingUrl.
 async fn vp9_master(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2052,7 +2052,7 @@ async fn vp9_master(
 /// as a separate rendition the player syncs the two by PTS.
 async fn vp9_audio_playlist(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2111,7 +2111,7 @@ async fn vp9_audio_playlist(
 /// requested before the playlist still works.
 async fn vp9_audio_file(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
     q: CiQuery<SegmentQuery>,
@@ -2258,7 +2258,7 @@ async fn vp9_audio_file(
 /// duration, identical to the H.264 variant.
 async fn vp9_variant(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2285,7 +2285,7 @@ async fn vp9_variant(
 /// identical across a source's segments, so segment 0 is representative.
 async fn vp9_init(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2335,7 +2335,7 @@ async fn vp9_init(
 /// Serve one VP9 fMP4 media segment (`moof`+`mdat`, `tfdt`-corrected).
 async fn vp9_segment(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2454,7 +2454,7 @@ async fn vp9_segment(
 /// tracks — an audio switch reuses it instead of cold-re-transcoding.
 async fn h264cmaf_variant(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2479,7 +2479,7 @@ async fn h264cmaf_variant(
 /// `GET /videos/{id}/h264cmaf/init.mp4` — shared h264 fMP4 init (`ftyp`+`moov`).
 async fn h264cmaf_init(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2529,7 +2529,7 @@ async fn h264cmaf_init(
 /// segment. Mirrors [`vp9_segment`] with the h264 output codec.
 async fn h264cmaf_segment(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,

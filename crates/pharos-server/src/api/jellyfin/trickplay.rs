@@ -3,13 +3,13 @@
 //! Wire shape:
 //! - `GET /videos/{id}/trickplay/{width}/{tile}.jpg` — one sprite-grid
 //!   tile JPEG. `tile` is 0-based. Auth via the standard
-//!   `AuthUser` extractor (Emby headers or `api_key` query param).
+//!   `MediaUser` extractor (Emby headers, `api_key`, or the `JellyfinAuth` cookie).
 //!
 //! The per-item sprite layout is advertised inline in
 //! `BaseItemDto.Trickplay`; clients discover widths + thumbnail count +
 //! interval from there. No separate manifest endpoint.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{api::jellyfin::auth_extractor::MediaUser, state::AppState};
 use actix_web::{error, web, HttpResponse};
 use pharos_cache::trickplay_cache::TrickplayCacheError;
 use pharos_core::MediaStore;
@@ -24,7 +24,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 
 async fn tile(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     path: web::Path<(String, u32, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, width, tile_index) = path.into_inner();
