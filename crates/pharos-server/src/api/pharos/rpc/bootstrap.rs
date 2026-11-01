@@ -11,8 +11,10 @@ use pharos_core::{SecretString, User};
 use super::session::Session;
 use super::ConnectionCtx;
 use crate::auth::LoginRefusal;
+use crate::quick_connect::{QcMsg, QcRefusal};
 use crate::services::auth::{
-    password_login, user_for_token, LoginTransport, PasswordLoginError, TokenRefusal,
+    password_login, quick_connect_login, user_for_token, LoginTransport, PasswordLoginError,
+    QuickConnectLoginError, TokenRefusal,
 };
 use crate::state::AppState;
 
@@ -31,15 +33,13 @@ impl Bootstrap {
         Self { state, ctx, conn }
     }
 
-    /// Counts `user` against the per-user connection cap (FR-010).
-    fn admit_user(&self, user: &User) -> Result<(), Refusal> {
+    /// Counts `user` against the per-user connection cap (FR-010), or
+    /// answers `(held, max)` when they hold the most they may.
+    fn admit_user(&self, user: &User) -> Result<(), (u32, u32)> {
         let ctx = &self.ctx;
         ctx.limits
             .sign_in(&mut ctx.slot.borrow_mut(), user.id, ctx.max_per_user)
-            .map_err(|held| Refusal::TooManyConnections {
-                held,
-                max: ctx.max_per_user,
-            })
+            .map_err(|held| (held, ctx.max_per_user))
     }
 
     /// The session `resume` and `login` hand out, signed in with `token`.
@@ -156,7 +156,11 @@ impl server::bootstrap::Handler for Bootstrap {
         };
         // `user` is only `Ok` when `token` is.
         let opened = user
-            .and_then(|user| self.admit_user(&user).map(|()| user))
+            .and_then(|user| {
+                self.admit_user(&user)
+                    .map(|()| user)
+                    .map_err(|(held, max)| Refusal::TooManyConnections { held, max })
+            })
             .and_then(|user| token.map(|token| (user, token)));
         let mut result = results.get().init_result();
         match opened {
@@ -214,10 +218,7 @@ impl server::bootstrap::Handler for Bootstrap {
             &password,
             self.ctx.client_ip,
             &device_id,
-            |user| match self.admit_user(user) {
-                Err(Refusal::TooManyConnections { held, max }) => Err((held, max)),
-                _ => Ok(()),
-            },
+            |user| self.admit_user(user),
         )
         .await;
         match login {
@@ -230,6 +231,128 @@ impl server::bootstrap::Handler for Bootstrap {
             Err(e) => login_denial(&e).write(result.init_error()),
         }
         Ok(())
+    }
+
+    /// Starts a Quick Connect request: a code for the user to authorize on a
+    /// signed-in client and a secret this client keeps for
+    /// `quickConnectPoll`. The device id is the server's, as for `login`.
+    async fn quick_connect_initiate(
+        self: Rc<Self>,
+        _params: wire::QuickConnectInitiateParams,
+        results: &mut wire::QuickConnectInitiateResults,
+    ) -> Result<(), capnp::Error> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let sent = self
+            .state
+            .quick_connect
+            .tx
+            .send(QcMsg::Initiate {
+                device_id: format!("pharos-native-{}", uuid::Uuid::new_v4().simple()),
+                device_name: String::new(),
+                app_name: "pharos".into(),
+                app_version: String::new(),
+                // As on the Jellyfin side: only meaningful behind known
+                // proxies, else every client shares the ingress address.
+                client_ip: (!self.state.trusted_proxies.is_empty()).then_some(self.ctx.client_ip),
+                reply,
+            })
+            .await;
+        let answer = match sent {
+            Ok(()) => rx.await.ok(),
+            Err(_) => None,
+        };
+        let result = results.get().init_result();
+        match answer {
+            Some(Ok(entry)) => {
+                let mut pending = result.init_pending();
+                pending.set_code(entry.code.as_str());
+                pending.set_secret(entry.secret.as_str());
+            }
+            Some(Err(refusal)) => {
+                tracing::info!(reason = refusal.label(), "native quick connect refused");
+                qc_denial(refusal).write(result.init_error());
+            }
+            None => {
+                tracing::warn!("native quick connect: registry unavailable");
+                Denial::Unavailable {
+                    dependency: "quick connect",
+                }
+                .write(result.init_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Exchanges an authorized Quick Connect secret, once, for a session and
+    /// a device token, as `login` does. A code not yet authorized answers
+    /// `notPermitted` (poll again); an unknown, expired or spent one
+    /// answers `notFound` (start over).
+    async fn quick_connect_poll(
+        self: Rc<Self>,
+        params: wire::QuickConnectPollParams,
+        results: &mut wire::QuickConnectPollResults,
+    ) -> Result<(), capnp::Error> {
+        let secret = params.get()?.get_secret()?.to_string().unwrap_or_default();
+        let login = quick_connect_login(&self.state, LoginTransport::Rpc, &secret, |user| {
+            self.admit_user(user)
+        })
+        .await;
+        let result = results.get().init_result();
+        match login {
+            Ok((user, token)) => {
+                let token = token.0.expose().to_owned();
+                let mut ok = result.init_ok();
+                ok.set_device_token(token.as_str());
+                ok.set_session(self.open_session(user, token));
+            }
+            Err(e) => quick_connect_denial(&e).write(result.init_error()),
+        }
+        Ok(())
+    }
+}
+
+/// A refused `quickConnectInitiate`.
+fn qc_denial(refusal: QcRefusal) -> Denial {
+    match refusal {
+        QcRefusal::GlobalCap { retry_after_secs } | QcRefusal::IpCap { retry_after_secs } => {
+            Denial::Throttled {
+                name: "quick_connect_retry_after_secs",
+                retry_after_secs,
+            }
+        }
+        // Not reachable from initiate; mapped for completeness.
+        QcRefusal::AuthorizeThrottled { retry_after_secs } => Denial::Throttled {
+            name: "quick_connect_retry_after_secs",
+            retry_after_secs,
+        },
+        QcRefusal::RngFailed | QcRefusal::CodeSpaceExhausted => Denial::Unavailable {
+            dependency: "quick connect",
+        },
+    }
+}
+
+/// A refused `quickConnectPoll`. A disabled authorizer's code is spent and
+/// answers `notFound`, as an expired one does, so the poller learns nothing
+/// about the account.
+fn quick_connect_denial(error: &QuickConnectLoginError) -> Denial {
+    match error {
+        QuickConnectLoginError::Pending => Denial::NotPermitted {
+            what: "quick connect not yet authorized",
+        },
+        QuickConnectLoginError::Unknown => Denial::NotFound {
+            what: "quick connect request",
+        },
+        QuickConnectLoginError::Disabled => Denial::NotFound {
+            what: "quick connect request",
+        },
+        QuickConnectLoginError::Capped { held, max } => Refusal::TooManyConnections {
+            held: *held,
+            max: *max,
+        }
+        .denial(),
+        QuickConnectLoginError::Unavailable(_) => Denial::Unavailable {
+            dependency: "quick connect",
+        },
     }
 }
 

@@ -197,6 +197,9 @@ pub enum LoginOutcome {
     /// The password was right but the user holds the most connections they
     /// may (FR-010); no token was issued.
     Capped,
+    /// A Quick Connect poll for a code nobody has authorized yet. Not
+    /// counted: clients poll every few seconds.
+    Pending,
 }
 
 impl LoginOutcome {
@@ -208,6 +211,7 @@ impl LoginOutcome {
             LoginOutcome::Unavailable => "unavailable",
             LoginOutcome::OriginRefused => "origin_refused",
             LoginOutcome::Capped => "capped",
+            LoginOutcome::Pending => "pending",
         }
     }
 }
@@ -335,6 +339,120 @@ pub async fn revoke_other_tokens(
     Ok(revoked)
 }
 
+/// Why [`quick_connect_login`] issued no token.
+#[derive(Debug)]
+pub enum QuickConnectLoginError {
+    /// No live request has this secret: never issued, expired, or already
+    /// signed in.
+    Unknown,
+    /// The code has not been authorized yet; the client polls again.
+    Pending,
+    /// The authorizing user is disabled (V176); the code is spent.
+    Disabled,
+    /// `admit` refused the authorizing user (a connection cap); the code is
+    /// kept, so a retry can still sign in.
+    Capped { held: u32, max: u32 },
+    /// The registry, user store or token store failed.
+    Unavailable(String),
+}
+
+impl QuickConnectLoginError {
+    pub fn outcome(&self) -> LoginOutcome {
+        match self {
+            Self::Unknown | Self::Disabled => LoginOutcome::Invalid,
+            Self::Pending => LoginOutcome::Pending,
+            Self::Capped { .. } => LoginOutcome::Capped,
+            Self::Unavailable(_) => LoginOutcome::Unavailable,
+        }
+    }
+}
+
+/// A native Quick Connect sign-in: once a code is authorized, its secret is
+/// spent (one-shot, as the Jellyfin finalize) and a token is issued to the
+/// authorizer under the device id the request was initiated with. A
+/// disabled authorizer gets none (V176). Counted under
+/// `method="quick_connect"` and logged, except while the code is pending.
+pub async fn quick_connect_login(
+    state: &AppState,
+    transport: LoginTransport,
+    secret: &str,
+    admit: impl FnOnce(&User) -> Result<(), (u32, u32)>,
+) -> Result<(User, pharos_core::AuthToken), QuickConnectLoginError> {
+    use crate::quick_connect::QcMsg;
+    use QuickConnectLoginError as E;
+    let result: Result<_, E> = async {
+        let ask = |consume: bool| async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            let secret = secret.to_owned();
+            let msg = if consume {
+                QcMsg::Consume { secret, reply }
+            } else {
+                QcMsg::Connect { secret, reply }
+            };
+            state
+                .quick_connect
+                .tx
+                .send(msg)
+                .await
+                .map_err(|e| E::Unavailable(e.to_string()))?;
+            rx.await.map_err(|e| E::Unavailable(e.to_string()))
+        };
+        // A read first, so a pending code is told apart from an unknown one.
+        let entry = ask(false).await?.ok_or(E::Unknown)?;
+        let by = entry.authorized_by.ok_or(E::Pending)?;
+        let record = state
+            .stores
+            .get(by)
+            .await
+            .map_err(|e| E::Unavailable(e.to_string()))?;
+        if record.policy.is_disabled {
+            // Spend the code, as the Jellyfin finalize does.
+            if let Err(e) = ask(true).await {
+                tracing::warn!(error = ?e, "quick connect: could not spend a disabled user's code");
+            }
+            return Err(E::Disabled);
+        }
+        let user = record.into_user();
+        admit(&user).map_err(|(held, max)| E::Capped { held, max })?;
+        // One-shot: of two racing polls, only one consumes the entry.
+        let entry = ask(true).await?.ok_or(E::Unknown)?;
+        let token = state
+            .stores
+            .issue(user.id, &entry.device_id)
+            .await
+            .map_err(|e| E::Unavailable(e.to_string()))?;
+        Ok((user, token))
+    }
+    .await;
+    match &result {
+        Err(E::Pending) => {}
+        Ok((user, _)) => {
+            record_login(transport, "quick_connect", LoginOutcome::Ok);
+            tracing::info!(
+                transport = transport.label(),
+                user = %user.name,
+                "native quick connect login"
+            );
+            state.record_activity(
+                &format!("{} logged in via Quick Connect", user.name),
+                "SessionStarted",
+                Some(&user.id.0.simple().to_string()),
+                Some("pharos"),
+            );
+        }
+        Err(e) => {
+            record_login(transport, "quick_connect", e.outcome());
+            tracing::info!(
+                transport = transport.label(),
+                outcome = e.outcome().label(),
+                error = ?e,
+                "native quick connect login refused"
+            );
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -372,6 +490,7 @@ mod tests {
             LoginOutcome::Unavailable,
             LoginOutcome::OriginRefused,
             LoginOutcome::Capped,
+            LoginOutcome::Pending,
         ];
         let unique: std::collections::HashSet<_> = outcomes.iter().map(|o| o.label()).collect();
         assert_eq!(unique.len(), outcomes.len());
