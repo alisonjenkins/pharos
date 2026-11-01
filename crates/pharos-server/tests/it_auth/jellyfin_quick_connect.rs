@@ -469,3 +469,37 @@ async fn authorize_guessing_is_429_with_retry_after_after_the_failure_limit() {
         .unwrap();
     assert!((1..=301).contains(&wait), "{wait}");
 }
+
+#[actix_web::test]
+async fn finalize_refuses_when_the_authorizing_user_was_disabled() {
+    let (state, admin_token) = seed_admin().await;
+    let app = test::init_service(build_app(state.clone())).await;
+
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = v["Code"].as_str().unwrap().to_string();
+    let secret = v["Secret"].as_str().unwrap().to_string();
+
+    let req = test::TestRequest::post()
+        .uri(&format!("/QuickConnect/Authorize?Code={code}"))
+        .insert_header(("X-Emby-Token", admin_token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status(), 200);
+
+    // An admin disables the account between Authorize and the finalize.
+    let boss = state.stores.list().await.unwrap().remove(0);
+    let mut policy = boss.policy.clone();
+    policy.is_disabled = true;
+    state.stores.set_policy(boss.id, policy).await.unwrap();
+
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateWithQuickConnect")
+        .insert_header(("content-type", "application/json"))
+        .set_payload(format!(r#"{{"Secret":"{secret}"}}"#))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401, "a disabled user must not get a token");
+}
