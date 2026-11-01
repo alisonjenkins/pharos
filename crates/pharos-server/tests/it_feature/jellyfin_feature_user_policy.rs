@@ -332,3 +332,61 @@ async fn virtual_folders_are_admin_only() {
         assert_eq!(status, want);
     }
 }
+
+/// B245: the metadata-editing routes change what every user sees, and
+/// RemoteImages/Download fetches a caller-chosen URL, so only an admin may
+/// call them, as in Jellyfin (`RequiresElevation`).
+#[actix_web::test]
+async fn metadata_editing_routes_are_admin_only() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let id = f.rich_item_id;
+    for (method, uri) in [
+        (
+            actix_web::http::Method::GET,
+            format!("/Items/{id}/MetadataEditor"),
+        ),
+        (
+            actix_web::http::Method::GET,
+            format!("/Items/{id}/RemoteImages"),
+        ),
+        (
+            actix_web::http::Method::GET,
+            format!("/Items/{id}/RemoteImages/Providers"),
+        ),
+        (
+            actix_web::http::Method::POST,
+            format!("/Items/{id}/RemoteImages/Download?Type=Primary&ImageUrl=http://127.0.0.1:1/x"),
+        ),
+        (
+            actix_web::http::Method::GET,
+            format!("/Items/{id}/RemoteSearch/Movie"),
+        ),
+        (
+            actix_web::http::Method::GET,
+            format!("/Items/{id}/RemoteSearch/Series"),
+        ),
+        (
+            actix_web::http::Method::POST,
+            format!("/Items/{id}/Tags?Tags=x"),
+        ),
+        (
+            actix_web::http::Method::DELETE,
+            format!("/Items/{id}/Tags?Tags=x"),
+        ),
+    ] {
+        let req = test::TestRequest::default()
+            .method(method.clone())
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        assert_eq!(status, 403, "{method} {uri}");
+    }
+    let req = test::TestRequest::post()
+        .uri(&format!("/Items/{id}/RemoteSearch/Apply"))
+        .insert_header(("X-Emby-Token", f.user_token.as_str()))
+        .set_json(serde_json::json!({ "Provider": "tmdb", "Id": "1" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status().as_u16(), 403);
+}
