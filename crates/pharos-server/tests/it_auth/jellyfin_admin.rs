@@ -112,6 +112,38 @@ async fn create_duplicate_user_409() {
     assert_eq!(resp.status(), 409);
 }
 
+// V211 — an account cannot be created without a password.
+#[actix_web::test]
+async fn create_user_without_or_with_empty_password_is_400() {
+    let (state, token, _uid) = seed(true).await;
+    let app = test::init_service(build_app(state)).await;
+    for payload in [
+        serde_json::json!({"Name":"alice"}),
+        serde_json::json!({"Name":"alice","Password":""}),
+    ] {
+        let req = test::TestRequest::post()
+            .uri("/Users/New")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .set_json(payload.clone())
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "payload {payload} must be refused");
+        let body = test::read_body(resp).await;
+        assert_eq!(body.as_ref(), b"a password is required");
+    }
+    let req = test::TestRequest::get()
+        .uri("/Users")
+        .insert_header(("X-Emby-Token", token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v.as_array().unwrap().len(),
+        1,
+        "no user may have been created"
+    );
+}
+
 #[actix_web::test]
 async fn cannot_delete_self() {
     let (state, token, uid) = seed(true).await;

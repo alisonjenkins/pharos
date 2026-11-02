@@ -453,7 +453,10 @@ async fn create_user(
     if body.name.trim().is_empty() {
         return Err(error::ErrorBadRequest("name required"));
     }
-    let password = SecretString::new(body.password.unwrap_or_default());
+    let password = match body.password {
+        Some(p) if !p.is_empty() => SecretString::new(p),
+        _ => return Err(error::ErrorBadRequest("a password is required")),
+    };
     let auth = BuiltinAuth::new(state.stores.clone());
     let hash = auth
         .hash_password_off_worker(&password)
@@ -641,6 +644,16 @@ async fn change_password(
     // existing hash. Admin changing someone else's password (or
     // resetting their own with ResetPassword=true) skips this — it
     // matches Jellyfin's admin-reset flow.
+    // V211: validate before the CurrentPw check so a malformed request
+    // does not spend a login-throttle attempt.
+    if body.reset_password {
+        return Err(error::ErrorBadRequest(
+            "reset to an empty password is not supported; set a new password",
+        ));
+    }
+    if body.new_pw.is_empty() {
+        return Err(error::ErrorBadRequest("a password is required"));
+    }
     let auth = BuiltinAuth::new(state.stores.clone());
     let must_verify_current = is_self && !(user.0.policy.admin && body.reset_password);
     if must_verify_current {
@@ -653,13 +666,8 @@ async fn change_password(
             .await
             .map_err(|r| super::users::login_refused(r, "current password mismatch"))?;
     }
-    let new_password = if body.reset_password {
-        SecretString::new(String::new())
-    } else {
-        SecretString::new(body.new_pw)
-    };
     let hash = auth
-        .hash_password_off_worker(&new_password)
+        .hash_password_off_worker(&SecretString::new(body.new_pw))
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // Atomic single-UPDATE password swap. The previous delete+create
