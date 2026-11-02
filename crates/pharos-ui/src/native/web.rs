@@ -805,3 +805,123 @@ pub async fn pick_file(
         .map(Some)
         .ok_or_else(|| storage_error("the file is not text".into()))
 }
+
+/// Resolves on the next animation frame with its timestamp. Browsers stop
+/// animation frames in a hidden tab, so a loop over this idles there.
+pub async fn animation_frame() -> f64 {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.request_animation_frame(&resolve);
+        }
+    });
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .ok()
+        .and_then(|t| t.as_f64())
+        .unwrap_or(0.0)
+}
+
+/// Whether the page has had a user gesture, so an `AudioContext` starts
+/// running rather than suspended. True where the browser cannot say.
+pub fn user_activated() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    js_sys::Reflect::get(&window.navigator(), &"userActivation".into())
+        .ok()
+        .filter(|a| !a.is_undefined())
+        .and_then(|a| js_sys::Reflect::get(&a, &"hasBeenActive".into()).ok())
+        .map_or(true, |active| active.is_truthy())
+}
+
+/// The page's `--px-color-bg`, `-accent` and `-fg`, as the theme set them.
+pub fn theme_palette() -> crate::render::Palette {
+    let style = web_sys::window().and_then(|w| {
+        let root = w.document()?.document_element()?;
+        w.get_computed_style(&root).ok().flatten()
+    });
+    let Some(style) = style else {
+        return crate::render::Palette::default();
+    };
+    let token = |name: &str| style.get_property_value(name).unwrap_or_default();
+    crate::render::Palette::from_tokens(
+        &token("--px-color-bg"),
+        &token("--px-color-accent"),
+        &token("--px-color-fg"),
+    )
+}
+
+/// Analyser frame size: 1024 frequency bins, ~43 ms of samples at 48 kHz.
+const FFT_SIZE: u32 = 2048;
+
+/// Web Audio's view of a media element: the element plays through an
+/// `AnalyserNode` into the speakers.
+struct WebAudioTap {
+    context: web_sys::AudioContext,
+    analyser: web_sys::AnalyserNode,
+    samples: Vec<u8>,
+}
+
+impl super::visualiser::AudioTap for WebAudioTap {
+    fn read(&mut self, bins: &mut [u8], wave: &mut [u8]) {
+        self.analyser.get_byte_frequency_data(bins);
+        self.analyser.get_byte_time_domain_data(&mut self.samples);
+        let step = (self.samples.len() / wave.len().max(1)).max(1);
+        for (out, sample) in wave.iter_mut().zip(self.samples.iter().step_by(step)) {
+            *out = *sample;
+        }
+    }
+
+    fn bins(&self) -> usize {
+        self.analyser.frequency_bin_count() as usize
+    }
+
+    fn sample_rate(&self) -> f32 {
+        self.context.sample_rate()
+    }
+}
+
+impl Drop for WebAudioTap {
+    fn drop(&mut self) {
+        let _ = self.context.close();
+    }
+}
+
+/// Route the media element `media_id` through an analyser. A media element
+/// can be routed once, so the caller keeps the tap for the element's life.
+///
+/// A cross-origin source without CORS would play silence once routed, so
+/// only same-origin and MSE (`blob:`) sources are tapped.
+pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>, String> {
+    let media = video_element(media_id).ok_or_else(|| format!("no media element {media_id}"))?;
+    let src = media.current_src();
+    let origin = web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default();
+    let same_origin =
+        src.starts_with("blob:") || web_sys::Url::new(&src).is_ok_and(|u| u.origin() == origin);
+    if !same_origin {
+        return Err(format!("cross-origin source {src}"));
+    }
+    let js = |e: JsValue| format!("{e:?}");
+    let context = web_sys::AudioContext::new().map_err(js)?;
+    let source = context.create_media_element_source(&media).map_err(js)?;
+    let analyser = context.create_analyser().map_err(js)?;
+    analyser.set_fft_size(FFT_SIZE);
+    analyser.set_smoothing_time_constant(0.0);
+    source.connect_with_audio_node(&analyser).map_err(js)?;
+    analyser
+        .connect_with_audio_node(&context.destination())
+        .map_err(js)?;
+    let _ = context.resume();
+    Ok(Box::new(WebAudioTap {
+        context,
+        analyser,
+        samples: vec![128; FFT_SIZE as usize],
+    }))
+}
+
+/// Whether the media element `id` has a source and is playing.
+pub fn media_playing(id: &str) -> bool {
+    video_element(id).is_some_and(|m| !m.paused() && !m.current_src().is_empty())
+}
