@@ -54,7 +54,7 @@ optional **Alternatives considered** / **References**).
 | [0009](0009-nix-flake-reproducibility.md) | Nix flake + devShell; buildRustPackage for the OCI image | Accepted |
 | [0010](0010-cd-ghcr-flux-automation.md) | CI on self-hosted builder → GHCR → Flux image automation | Accepted |
 | [0011](0011-auth-hashed-bounded-tokens.md) | Hashed, bounded-lifetime session tokens + CLI admin bootstrap | Accepted |
-| [0012](0012-dioxus-wasm-ui.md) | Dioxus + dx (WASM) for the built-in web UI | Accepted; serving superseded by 0033 |
+| [0012](0012-dioxus-wasm-ui.md) | Dioxus + dx (WASM) for the built-in web UI | Accepted; serving superseded by 0033, then 0038 |
 | [0013](0013-observability-tracing-metrics.md) | Structured tracing + Prometheus metrics + OTLP traces | Accepted |
 | [0014](0014-watch-together-group-sync.md) | Watch-together group-sync over a WebSocket, Jellyfin SyncPlay-compatible | Accepted (extended by 0016) |
 | [0015](0015-postgres-cnpg-deployment.md) | CNPG Postgres for the home deployment; zero-downtime rolling deploys | Accepted |
@@ -75,8 +75,9 @@ optional **Alternatives considered** / **References**).
 | [0030](0030-edition-full-probe.md) | Each grouped edition keeps its full probe in `alternate_sources_json` | Accepted |
 | [0031](0031-item-file-auth-cookie.md) | Item file routes require auth; the `JellyfinAuth` cookie authenticates only GET/HEAD byte routes | Accepted |
 | [0032](0032-syncplay-members-record-their-user.md) | SyncPlay group members record their user (persisted and on the bus, absent = sees nothing); a queue change needs every member to see it | Accepted |
-| [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Accepted |
+| [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Superseded by 0038 |
 | [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
 | [0035](0035-native-ui-vendors-hlsjs.md) | The native web UI plays HLS through a vendored, pinned hls.js 1.7.4 served from `'self'`, loaded only where the browser lacks native HLS | Accepted |
 | [0036](0036-themes-are-toml-over-a-token-model.md) | Themes are TOML documents over a typed, platform-neutral token model; the web UI renders them as `--px-*` custom properties and `pharos.css` reads nothing else | Accepted |
 | [0037](0037-per-user-prefs-store-and-telemetry-opt-in-gate.md) | Per-user prefs live in their own `UserPrefStore` (opaque bytes per key, policy in `rpc/prefs.rs`); `Telemetry.submit` drops batches from users who have not opted in (`diagnostics.opt_in`) | Accepted |
+| [0038](0038-pharos-ui-served-under-ui.md) | pharos-ui is served under `/ui/` (`/ui` → 308 `/ui/`), leaving `/` to the core root and jellyfin-web; supersedes 0033's root mount | Accepted |
