@@ -1,9 +1,9 @@
 import { test, expect } from "@playwright/test";
 
-// T51 phase 3 — drive the pharos Dioxus UI (served at `/ui/*` by
+// T51 phase 3 — drive the pharos Dioxus UI (served at `/` by
 // `[server].ui_dir`) end-to-end through a real Chromium.
 //
-// Skips cleanly when `/ui/` 404s — useful in environments where the
+// Skips cleanly when `/` is not the UI — useful in environments where the
 // WASM bundle hasn't been built. Build with:
 //   nix develop --command dx build --package pharos-ui --release
 // then point `[server].ui_dir` at `target/dx/pharos-ui/release/web/public`.
@@ -14,9 +14,11 @@ const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
 
 test.describe("pharos Dioxus UI", () => {
   test.beforeAll(async ({ request }) => {
-    const probe = await request.get(`${PHAROS_URL}/ui/`);
+    const probe = await request.get(`${PHAROS_URL}/`, {
+      headers: { Accept: "text/html" },
+    });
     test.skip(
-      probe.status() === 404,
+      !(probe.headers()["content-type"] ?? "").includes("text/html"),
       "pharos has no [server].ui_dir configured — build the bundle and re-run",
     );
   });
@@ -31,7 +33,7 @@ test.describe("pharos Dioxus UI", () => {
       }
     });
 
-    await page.goto("/ui/");
+    await page.goto("/");
 
     // App shell renders.
     await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
@@ -52,7 +54,7 @@ test.describe("pharos Dioxus UI", () => {
   });
 
   test("server-picker toggle reveals the picker form", async ({ page }) => {
-    await page.goto("/ui/");
+    await page.goto("/");
     await page.locator(".pharos-switch-server").click();
     await expect(page.locator(".pharos-server-picker")).toBeVisible();
     // Either an empty-state or the saved-server list renders.
@@ -81,7 +83,7 @@ test.describe("pharos Dioxus UI", () => {
       `pharos has no seeded test user (${TEST_USER}); skipping login flow`,
     );
 
-    await page.goto("/ui/");
+    await page.goto("/");
     await page.locator('input[type="text"]').fill(TEST_USER);
     await page.locator('input[type="password"]').fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
