@@ -331,6 +331,15 @@ async fn playing_stopped(
     let body = body.into_inner();
     let progress_session = body.play_session_id.clone();
     if let Some(session_id) = body.play_session_id {
+        // B256: the PlaySessionId authorizes streams on its own, so the
+        // stop that ends the playback ends the capability too.
+        if let Err(e) = state
+            .transcode_sessions
+            .end_held(&session_id, user.0.id)
+            .await
+        {
+            tracing::warn!(error = %e, "playing_stopped: transcode session end failed");
+        }
         state
             .sessions
             .apply(SessionEvent::Stopped { session_id })
