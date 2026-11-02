@@ -16,9 +16,9 @@ use crate::state::AppState;
 /// anything else run freely. An entry lives only while someone holds or waits
 /// for its lock.
 #[derive(Clone, Default)]
-pub struct WriteLocks(Arc<Mutex<HashMap<(UserId, u64), Weak<ItemLock>>>>);
+pub struct WriteLocks(Arc<Mutex<LockMap>>);
 
-type ItemLock = tokio::sync::Mutex<()>;
+type LockMap = HashMap<(UserId, u64), Weak<tokio::sync::Mutex<()>>>;
 
 impl WriteLocks {
     async fn lock(&self, user: UserId, id: u64) -> tokio::sync::OwnedMutexGuard<()> {
