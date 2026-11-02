@@ -1017,6 +1017,35 @@ impl TranscodeSessionStore for AnyStore {
         }
     }
 
+    async fn trim_transcode_sessions_for_holder(
+        &self,
+        holder: UserId,
+        except_play_session_id: &str,
+        keep: usize,
+        updated_since_unix_secs: i64,
+    ) -> DomainResult<Vec<String>> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.trim_transcode_sessions_for_holder(
+                    holder,
+                    except_play_session_id,
+                    keep,
+                    updated_since_unix_secs,
+                )
+                .await
+            }
+            AnyStore::Postgres(p) => {
+                p.trim_transcode_sessions_for_holder(
+                    holder,
+                    except_play_session_id,
+                    keep,
+                    updated_since_unix_secs,
+                )
+                .await
+            }
+        }
+    }
+
     async fn prune_transcode_sessions(&self, cutoff_unix_secs: i64) -> DomainResult<u64> {
         match self {
             AnyStore::Sqlite(s) => s.prune_transcode_sessions(cutoff_unix_secs).await,

@@ -991,6 +991,90 @@ where
     );
 
     // -----------------------------------------------------------------
+    // 10b. TranscodeSessionStore::trim_transcode_sessions_for_holder (B279)
+    // A holder's live rows are bounded in the durable store, not only in
+    // one replica's memory. Fresh ids per run: postgres persists across runs.
+    // -----------------------------------------------------------------
+    let trim_user = UserId::new();
+    let other_user = UserId::new();
+    let tag = trim_user.0.simple().to_string();
+    let row_for = |user: UserId| PersistedTranscodeSession {
+        media_id: item_id,
+        decision_json: r#"{"Transcode":{"target_container":"mp4"}}"#.into(),
+        source_probe_json: r#"{"container":"mkv"}"#.into(),
+        burn_subtitle_indices_json: "[]".into(),
+        holder: Some(pharos_core::SessionHolder {
+            user_id: user,
+            token_id: "trim-token-id".into(),
+        }),
+    };
+    let (trim_row, other_row) = (row_for(trim_user), row_for(other_user));
+    let trim_ids: Vec<String> = (0..34).map(|i| format!("trim-{tag}-{i:02}")).collect();
+    for (i, id) in trim_ids.iter().enumerate() {
+        let ts = 1000 + i as i64;
+        TranscodeSessionStore::upsert_transcode_session(&store, id, &trim_row, ts)
+            .await
+            .unwrap();
+    }
+    for i in 0..3 {
+        let id = format!("trim-other-{tag}-{i}");
+        TranscodeSessionStore::upsert_transcode_session(&store, &id, &other_row, 1000 + i)
+            .await
+            .unwrap();
+    }
+    // Written before the cutoff below: not live, so neither counted nor trimmed.
+    let stale_id = format!("trim-stale-{tag}");
+    TranscodeSessionStore::upsert_transcode_session(&store, &stale_id, &trim_row, 10)
+        .await
+        .unwrap();
+
+    let newest = trim_ids.last().unwrap();
+    let trimmed = TranscodeSessionStore::trim_transcode_sessions_for_holder(
+        &store, trim_user, newest, 32, 500,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        trimmed,
+        trim_ids[..2].to_vec(),
+        "34 live rows trimmed to 32 must remove exactly the two oldest, oldest first"
+    );
+    for id in &trim_ids[..2] {
+        assert!(
+            TranscodeSessionStore::get_transcode_session(&store, id, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "a trimmed row must no longer authorize"
+        );
+    }
+    for id in trim_ids[2..].iter().chain(std::iter::once(&stale_id)) {
+        assert!(
+            TranscodeSessionStore::get_transcode_session(&store, id, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "an untrimmed row ({id}) must survive the trim"
+        );
+    }
+    for i in 0..3 {
+        let id = format!("trim-other-{tag}-{i}");
+        assert!(
+            TranscodeSessionStore::get_transcode_session(&store, &id, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "another holder's rows must be untouched"
+        );
+    }
+    let again = TranscodeSessionStore::trim_transcode_sessions_for_holder(
+        &store, trim_user, newest, 32, 500,
+    )
+    .await
+    .unwrap();
+    assert!(again.is_empty(), "a repeated trim must be a no-op");
+
+    // -----------------------------------------------------------------
     // 11. SyncGroupStore (Phase B4 group-survives-deploy snapshot)
     // -----------------------------------------------------------------
     let gid = "conformance-sync-group";
