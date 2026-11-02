@@ -121,7 +121,7 @@ pub fn AppearanceView(
                     "Send diagnostics to this server"
                 }
                 p { id: "diagnostics-help",
-                    "Off by default. When on, playback errors and theme fallbacks are sent to this server's logs. Stream URLs and credentials are never sent."
+                    "Off by default, and saved to your account on this server. When on, playback errors and theme fallbacks are sent to this server's logs. Stream URLs and credentials are never sent."
                 }
             }
             ul { class: "pharos-theme-gallery",
