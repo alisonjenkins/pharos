@@ -43,14 +43,17 @@ pub enum BackfillOutcome {
     NotSameOrigin,
     /// The request holds a cookie for another token; never overwritten.
     OtherCookie,
+    /// The cookie was due but the token is not a valid cookie value.
+    Unencodable,
 }
 
 impl BackfillOutcome {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Set,
         Self::Held,
         Self::NotSameOrigin,
         Self::OtherCookie,
+        Self::Unencodable,
     ];
 
     pub fn label(self) -> &'static str {
@@ -59,6 +62,7 @@ impl BackfillOutcome {
             Self::Held => "held",
             Self::NotSameOrigin => "not_same_origin",
             Self::OtherCookie => "other_cookie",
+            Self::Unencodable => "unencodable",
         }
     }
 }
@@ -149,7 +153,7 @@ where
                             error = %e,
                             "JellyfinAuth cookie backfill failed: token is not a valid cookie value"
                         );
-                        return Ok(res);
+                        BackfillOutcome::Unencodable
                     }
                 }
             } else {
