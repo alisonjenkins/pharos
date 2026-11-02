@@ -232,16 +232,23 @@ test.describe("pharos Dioxus UI", () => {
       test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
       const { AccessToken: token, User: user } = await auth.json();
       const api = { "X-Emby-Token": token };
-      const items = await (
-        await request.get(
-          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie`,
-          { headers: api },
-        )
-      ).json();
-      // The one seeded title with a probe; with Matroska hidden it remuxes to HLS.
-      const movie = items.Items?.find(
-        (i: { Name: string }) => i.Name === "Playwright Multitrack",
-      );
+      // A plain WebM fixture: with WebM hidden it remuxes to HLS. The startup
+      // rescan probes it, so wait until the server knows its container.
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/fixture-1.webm"));
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
       test.skip(!movie, "pharos has no seeded movie");
       const nativeId = BigInt(`0x${movie.Id}`).toString();
 
