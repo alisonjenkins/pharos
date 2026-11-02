@@ -178,6 +178,9 @@ pub trait PharosApi {
         start: u32,
         limit: u32,
     ) -> Result<Page, ClientError>;
+    /// The items whose title or text matches `text`, best match first, at
+    /// most `limit` (0 is the server's default page).
+    async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
     /// Negotiate playback of `id` with the default audio track and no
     /// subtitles.
@@ -277,22 +280,19 @@ impl PharosApi for NativeApi {
             q.set_limit(limit);
         }
         let reply = req.send().promise.await?;
-        match reply
-            .get()?
-            .get_result()?
-            .which()
-            .map_err(capnp::Error::from)?
+        read_page(reply.get()?.get_result()?)
+    }
+
+    async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError> {
+        let mut req = self.library.search_request();
         {
-            items_result::Page(page) => {
-                let page = page?;
-                Ok(Page {
-                    items: read_items(page.get_items()?)?,
-                    total: page.get_total(),
-                    start: page.get_start(),
-                })
-            }
-            items_result::Error(e) => Err(ClientError::from_api(e?)),
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_text(text);
+            p.set_limit(limit);
         }
+        let reply = req.send().promise.await?;
+        read_page(reply.get()?.get_result()?)
     }
 
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError> {
@@ -490,6 +490,21 @@ fn read_opt_u32(o: opt_u32::Reader<'_>) -> Result<Option<u32>, capnp::Error> {
         opt_u32::Some(n) => Some(n),
         opt_u32::None(()) => None,
     })
+}
+
+/// An `ItemsResult` as a [`Page`], or the API error it carries.
+fn read_page(result: items_result::Reader<'_>) -> Result<Page, ClientError> {
+    match result.which().map_err(capnp::Error::from)? {
+        items_result::Page(page) => {
+            let page = page?;
+            Ok(Page {
+                items: read_items(page.get_items()?)?,
+                total: page.get_total(),
+                start: page.get_start(),
+            })
+        }
+        items_result::Error(e) => Err(ClientError::from_api(e?)),
+    }
 }
 
 fn read_items(
