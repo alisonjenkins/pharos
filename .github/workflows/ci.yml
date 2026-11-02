@@ -130,21 +130,31 @@ jobs:
           # the image tar to stdout; stream it ONCE into a local OCI layout, then
           # push every tag from that layout — one assembly per image, no per-tag
           # re-stream, no gzipped store tarball, no artifact round-trip.
-          OCI_SCRIPT="$(nix build .#oci --no-link --print-out-paths)"
-          JFWEB_SCRIPT="$(nix build .#jellyfinWebOci --no-link --print-out-paths)"
+          # The store is the host daemon's: its auto-GC can delete any path this
+          # pod cannot root (B284). Build each script right before streaming it,
+          # and rebuild and re-stream once if a path vanished.
           publish() {
-            script="$1"; repo="$2"
+            attr="$1"; repo="$2"
             stage="$(mktemp -d)/img"
-            "$script" | nix develop --command skopeo --insecure-policy copy \
-              docker-archive:/dev/stdin "oci:${stage}:img"
+            for attempt in 1 2; do
+              script="$(nix build ".#${attr}" --no-link --print-out-paths)"
+              if "$script" | nix develop --command skopeo --insecure-policy copy \
+                   docker-archive:/dev/stdin "oci:${stage}:img"; then
+                break
+              fi
+              present=no; [[ -e "$script" ]] && present=yes
+              echo "publish: stream of ${attr} failed, attempt ${attempt}, script ${script} present=${present}" >&2
+              [[ $attempt -eq 2 ]] && return 1
+              rm -rf "$stage"
+            done
             for tag in latest "$GITHUB_SHA" "$SORTABLE"; do
               nix develop --command skopeo --insecure-policy copy \
                 --dest-creds "$GHCR_CREDS" \
                 "oci:${stage}:img" "docker://${repo}:${tag}"
             done
           }
-          publish "$OCI_SCRIPT"   ghcr.io/alisonjenkins/pharos
-          publish "$JFWEB_SCRIPT" ghcr.io/alisonjenkins/pharos-jellyfin-web
+          publish oci            ghcr.io/alisonjenkins/pharos
+          publish jellyfinWebOci ghcr.io/alisonjenkins/pharos-jellyfin-web
 
   compat-playwright:
     name: jellyfin-web crawl
