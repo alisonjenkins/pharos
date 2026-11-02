@@ -328,7 +328,7 @@ impl QuickConnectRegistry {
                         // (never the full secret) + device + the live pool size.
                         tracing::info!(
                             code = %entry.code,
-                            secret.prefix = %secret_prefix(&entry.secret),
+                            secret.prefix = %pharos_core::secret_prefix(&entry.secret),
                             device.id = %entry.device_id,
                             device.name = %entry.device_name,
                             live_pending = by_secret.len(),
@@ -385,7 +385,7 @@ impl QuickConnectRegistry {
                         // before the finalize could find it.
                         let hit = by_secret.get(&secret).cloned();
                         tracing::debug!(
-                            secret.prefix = %secret_prefix(&secret),
+                            secret.prefix = %pharos_core::secret_prefix(&secret),
                             found = hit.is_some(),
                             authenticated = hit.as_ref().map(|e| e.authorized_by.is_some()),
                             live_pending = by_secret.len(),
@@ -406,7 +406,7 @@ impl QuickConnectRegistry {
                             by_code.remove(&entry.code);
                         }
                         tracing::info!(
-                            secret.prefix = %secret_prefix(&secret),
+                            secret.prefix = %pharos_core::secret_prefix(&secret),
                             secret_known = present.is_some(),
                             was_authorized = present.as_ref().map(|e| e.authorized_by.is_some()),
                             consumed = result.is_some(),
@@ -541,12 +541,6 @@ fn secret_from(
         .into_uuid()
         .simple()
         .to_string())
-}
-
-/// First 8 chars of a secret, for correlating trace lines WITHOUT logging the
-/// full credential (a full secret in logs would be a bearer-token leak).
-fn secret_prefix(s: &str) -> &str {
-    &s[..s.len().min(8)]
 }
 
 #[cfg(test)]

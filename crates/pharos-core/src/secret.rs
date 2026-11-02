@@ -52,6 +52,13 @@ impl From<&str> for SecretString {
     }
 }
 
+/// The first 8 characters of a secret, for joining log lines that name it
+/// without logging the whole credential. Cut on a character boundary, since
+/// some secrets (a PlaySessionId) arrive from the client as any string.
+pub fn secret_prefix(s: &str) -> &str {
+    s.char_indices().nth(8).map_or(s, |(end, _)| &s[..end])
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -98,5 +105,12 @@ mod tests {
         assert!(dbg.contains("ali"));
         assert!(!dbg.contains("xyz"));
         assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn secret_prefix_keeps_eight_characters() {
+        assert_eq!(super::secret_prefix("0123456789abcdef"), "01234567");
+        assert_eq!(super::secret_prefix("short"), "short");
+        assert_eq!(super::secret_prefix("ééééééééé"), "éééééééé");
     }
 }
