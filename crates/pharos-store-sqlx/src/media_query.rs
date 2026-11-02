@@ -272,6 +272,28 @@ pub(crate) fn build(
         clauses.push(format!("({rating_ok} OR {unrated_ok})"));
     }
 
+    // Policy tag restriction (B266): hide an item carrying a blocked tag;
+    // with an allow list, show only an item carrying one of its tags.
+    if let Some(tags) = &q.tag_scope {
+        for (names, negate) in [(&tags.blocked_lc, "NOT "), (&tags.allowed_lc, "")] {
+            if names.is_empty() {
+                continue;
+            }
+            let placeholders: Vec<String> = names
+                .iter()
+                .map(|n| {
+                    params.push(Param::Text(n.clone()));
+                    ph(params.len())
+                })
+                .collect();
+            clauses.push(format!(
+                "{negate}EXISTS (SELECT 1 FROM item_tags it JOIN tags t ON t.id = it.tag_id \
+                 WHERE it.item_id = media_items.id AND LOWER(t.name) IN ({}))",
+                placeholders.join(", ")
+            ));
+        }
+    }
+
     // --- residual chip filters (LIB-B2) ---
     if q.filters.is_active() {
         push_residual_clauses(&q.filters, &mut clauses, &mut params, &mut ph);

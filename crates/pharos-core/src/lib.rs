@@ -2786,6 +2786,9 @@ pub struct MediaQuery {
     pub allowed_library_wire_ids: Vec<String>,
     /// T68 — user-policy parental restriction. `None` = unrestricted.
     pub parental: Option<ParentalScope>,
+    /// User-policy tag restriction (`BlockedTags` / `AllowedTags`). `None` =
+    /// unrestricted.
+    pub tag_scope: Option<TagScope>,
     /// Per-user-data predicates (favourite / played / resumable).
     pub user_data: UserDataQuery,
     /// The sort chain. Empty = the implicit `(Id, Asc)` order. The store
@@ -2813,6 +2816,16 @@ pub struct ParentalScope {
     pub allowed_ratings_lc: Vec<String>,
     /// Whether unrated items (NULL / empty `official_rating`) are blocked.
     pub block_unrated: bool,
+}
+
+/// User-policy tag restriction, applied in SQL like [`ParentalScope`]. Names
+/// are lowercased; an item's tags match without regard to case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagScope {
+    /// An item carrying any of these is hidden.
+    pub blocked_lc: Vec<String>,
+    /// When non-empty, only an item carrying one of these is shown.
+    pub allowed_lc: Vec<String>,
 }
 
 /// LIB-B2 — the residual scalar / boolean `/Items` chip filters (the
