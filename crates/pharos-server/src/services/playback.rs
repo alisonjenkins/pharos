@@ -99,7 +99,9 @@ pub struct Negotiated {
     pub explicit_preserve: bool,
     /// A `CodecProfile` condition rejected the source's 3D format.
     pub profile_rejected_3d: bool,
-    pub burning_sub_on_packed_3d: bool,
+    /// A subtitle is burned into a packed 3D source: drawn into each eye, the
+    /// layout kept (V223), unless the output is 2D.
+    pub burning_sub_per_eye: bool,
     pub stereo_output: pharos_transcode::StereoOutput,
     pub direct_play: bool,
     /// Whether the raw `/stream` file plays as-is for this client.
@@ -403,7 +405,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         adjusted
     };
 
-    let burning_sub_on_packed_3d = is_video
+    let burning_sub_per_eye = is_video
         && probe
             .video_3d_format
             .is_some_and(|f| f.is_packed_sbs_or_tab())
@@ -411,9 +413,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
             is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
                 || burn_text_indices.contains(&t.stream_index)
         });
-    let stereo_output = if !explicit_preserve
-        && (explicit_mono || profile_rejected_3d || burning_sub_on_packed_3d)
-    {
+    let stereo_output = if !explicit_preserve && (explicit_mono || profile_rejected_3d) {
         pharos_transcode::StereoOutput::Mono2D
     } else {
         pharos_transcode::StereoOutput::Preserve
@@ -458,11 +458,37 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         explicit_mono,
         explicit_preserve,
         profile_rejected_3d,
-        burning_sub_on_packed_3d,
+        burning_sub_per_eye,
         stereo_output,
         direct_play,
         supports_direct_stream,
         webm_relabel_playable,
+    }
+}
+
+/// Why a 3D source got the `stereo_output` it did, for the
+/// `pharos_playback_3d_decision_total{reason}` label and its log line. A
+/// bounded set: `passthrough`, `stereo_mode_query`, `profile_condition`,
+/// `burn_per_eye`, else the downgrade or direct-play-block label.
+pub fn playback_3d_reason(
+    direct_play: bool,
+    supports_direct_stream: bool,
+    explicit_mono: bool,
+    profile_rejected_3d: bool,
+    burning_sub_per_eye: bool,
+    downgrade: Option<&'static str>,
+    direct_play_block: &'static str,
+) -> &'static str {
+    if direct_play || supports_direct_stream {
+        "passthrough"
+    } else if explicit_mono {
+        "stereo_mode_query"
+    } else if profile_rejected_3d {
+        "profile_condition"
+    } else if burning_sub_per_eye {
+        "burn_per_eye"
+    } else {
+        downgrade.unwrap_or(direct_play_block)
     }
 }
 
@@ -1798,5 +1824,128 @@ mod subtitle_selection_forces_transcode_tests {
             Some(&sel),
             &[]
         ));
+    }
+}
+
+/// V223 — a subtitle burned into a packed 3D source keeps the layout; only an
+/// explicit 2D request or a profile that rejects 3D downmixes it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod burn_on_packed_3d_tests {
+    use super::*;
+    use crate::state::Stores;
+    use pharos_core::{MediaKind, MediaProbe, SubtitleTrack, Video3DFormat};
+    use pharos_transcode::StereoOutput;
+
+    const PACKED: [Video3DFormat; 4] = [
+        Video3DFormat::HalfSideBySide,
+        Video3DFormat::FullSideBySide,
+        Video3DFormat::HalfTopAndBottom,
+        Video3DFormat::FullTopAndBottom,
+    ];
+
+    fn item(format: Video3DFormat, subtitle_codec: &str) -> MediaItem {
+        MediaItem {
+            id: 1,
+            path: "/m/3d.mkv".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                video_3d_format: Some(format),
+                subtitle_tracks: vec![SubtitleTrack {
+                    stream_index: 3,
+                    codec: Some(subtitle_codec.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn negotiated(item: &MediaItem, stereo_mode: Option<&str>) -> Negotiated {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = AppState::new(stores, "t".into());
+        let profile = DeviceProfile::default();
+        negotiate(
+            &state,
+            item,
+            &NegotiateRequest {
+                profile: &profile,
+                switches: PlaybackSwitches::default(),
+                explicit_subtitle_index: Some(3),
+                stereo_mode,
+                client_is_remote: false,
+                is_web_client: false,
+            },
+        )
+    }
+
+    #[actix_web::test]
+    async fn burning_an_image_subtitle_keeps_every_packed_layout() {
+        for format in PACKED {
+            let n = negotiated(&item(format, "hdmv_pgs_subtitle"), None).await;
+            assert!(n.burning_sub_per_eye, "{format:?}");
+            assert_eq!(n.stereo_output, StereoOutput::Preserve, "{format:?}");
+            let n = negotiated(&item(format, "hdmv_pgs_subtitle"), Some("preserve")).await;
+            assert_eq!(n.stereo_output, StereoOutput::Preserve, "{format:?}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn asking_for_2d_still_downmixes_a_burned_packed_source() {
+        for format in PACKED {
+            for mode in ["mono", "mono2d"] {
+                let n = negotiated(&item(format, "hdmv_pgs_subtitle"), Some(mode)).await;
+                assert_eq!(n.stereo_output, StereoOutput::Mono2D, "{format:?} {mode}");
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn mvc_burn_is_not_a_per_eye_burn() {
+        let n = negotiated(&item(Video3DFormat::Mvc, "hdmv_pgs_subtitle"), None).await;
+        assert!(!n.burning_sub_per_eye);
+        assert_eq!(n.stereo_output, StereoOutput::Preserve);
+    }
+
+    #[test]
+    fn the_3d_decision_reason_names_a_per_eye_burn_and_stays_distinct() {
+        let block = "no_direct_play_profile";
+        let reasons = [
+            playback_3d_reason(true, false, false, false, false, None, block),
+            playback_3d_reason(false, false, true, false, false, None, block),
+            playback_3d_reason(false, false, false, true, false, None, block),
+            playback_3d_reason(false, false, false, false, true, None, block),
+            playback_3d_reason(
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some("subtitle_burn"),
+                block,
+            ),
+            playback_3d_reason(false, false, false, false, false, None, block),
+        ];
+        assert_eq!(
+            reasons,
+            [
+                "passthrough",
+                "stereo_mode_query",
+                "profile_condition",
+                "burn_per_eye",
+                "subtitle_burn",
+                block
+            ]
+        );
+        let distinct: std::collections::BTreeSet<_> = reasons.iter().collect();
+        assert_eq!(distinct.len(), reasons.len(), "{reasons:?}");
+        // A 2D request outranks the burn: the plan is then not per-eye.
+        assert_eq!(
+            playback_3d_reason(false, false, true, false, true, None, block),
+            "stereo_mode_query"
+        );
     }
 }

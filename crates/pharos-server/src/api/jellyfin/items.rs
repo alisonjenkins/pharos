@@ -2347,7 +2347,7 @@ async fn playback_info(
         ref burn_text_indices,
         explicit_mono,
         profile_rejected_3d,
-        burning_sub_on_packed_3d,
+        burning_sub_per_eye,
         stereo_output,
         direct_play,
         supports_direct_stream,
@@ -2504,17 +2504,15 @@ async fn playback_info(
             } else {
                 "transcode"
             };
-            let reason_3d_label = if direct_play || supports_direct_stream {
-                "passthrough"
-            } else if explicit_mono {
-                "stereo_mode_query"
-            } else if profile_rejected_3d {
-                "profile_condition"
-            } else if burning_sub_on_packed_3d {
-                "subtitle_burn"
-            } else {
-                downgrade.unwrap_or_else(|| direct_play_block.label())
-            };
+            let reason_3d_label = playback::playback_3d_reason(
+                direct_play,
+                supports_direct_stream,
+                explicit_mono,
+                profile_rejected_3d,
+                burning_sub_per_eye,
+                downgrade,
+                direct_play_block.label(),
+            );
             metrics::counter!(
                 "pharos_playback_3d_decision_total",
                 "format" => fmt.wire_name(),
