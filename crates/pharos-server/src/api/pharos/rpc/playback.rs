@@ -12,6 +12,7 @@ use pharos_jellyfin_api::dto::WireId;
 
 use super::library::{item_denial, read_item_id};
 use super::session::Session;
+use crate::services::access::ItemHidden;
 use crate::services::play_state::{self, Report};
 use crate::services::playback::{self, Capabilities, GrantError, GrantRequest};
 
@@ -142,7 +143,7 @@ impl server::playback_grant::Handler for Grant {
         let reported = match self.session.current_user().await {
             Ok(user) => play_state::report(&self.session.state, &user, report)
                 .await
-                .map_err(registry_denial),
+                .map_err(report_denial),
             Err(denial) => Err(denial),
         };
         write_done(results.get().init_result(), reported);
@@ -158,7 +159,7 @@ impl server::playback_grant::Handler for Grant {
         let stopped = match self.session.current_user().await {
             Ok(user) => play_state::stop(&self.session.state, &user, report)
                 .await
-                .map_err(registry_denial),
+                .map_err(report_denial),
             Err(denial) => Err(denial),
         };
         write_done(results.get().init_result(), stopped);
@@ -187,10 +188,18 @@ fn write_decision(mut out: decision::Builder<'_>, grant: &Grant) {
         .set_value(grant.play_session_id.as_str());
 }
 
-fn registry_denial(e: play_state::RegistryDown) -> Denial {
-    tracing::warn!(error = %e, "native playback report: session registry unavailable");
-    Denial::Unavailable {
-        dependency: "session registry",
+fn report_denial(e: play_state::ReportError) -> Denial {
+    match e {
+        play_state::ReportError::Withheld(ItemHidden::Unavailable(_)) => Denial::Unavailable {
+            dependency: "item store",
+        },
+        play_state::ReportError::Withheld(_) => Denial::NotFound { what: "item" },
+        play_state::ReportError::RegistryDown(_) => {
+            tracing::warn!(error = %e, "native playback report: session registry unavailable");
+            Denial::Unavailable {
+                dependency: "session registry",
+            }
+        }
     }
 }
 
