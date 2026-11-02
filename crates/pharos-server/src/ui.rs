@@ -38,12 +38,16 @@ pub enum UiBundleError {
     },
     #[error("ui bundle: {a} and {b} differ only in case, and paths are matched lowercased")]
     CaseCollision { a: PathBuf, b: PathBuf },
+    #[error("ui bundle: index.html yields an invalid Content-Security-Policy header")]
+    Csp,
 }
 
 /// A built pharos-ui bundle (`dx build`'s `public/`).
 #[derive(Debug)]
 pub struct UiBundle {
     index: PathBuf,
+    /// The Content-Security-Policy every UI response carries.
+    csp: HeaderValue,
     /// Lowercased path relative to the bundle root, `/`-separated → file.
     files: HashMap<String, PathBuf>,
 }
@@ -60,7 +64,13 @@ impl UiBundle {
             .ok_or_else(|| UiBundleError::NoIndex {
                 dir: dir.to_path_buf(),
             })?;
-        Ok(Self { index, files })
+        let html = std::fs::read_to_string(&index).map_err(|source| UiBundleError::Read {
+            dir: dir.to_path_buf(),
+            source,
+        })?;
+        let csp = HeaderValue::from_str(&content_security_policy(&html))
+            .map_err(|_| UiBundleError::Csp)?;
+        Ok(Self { index, csp, files })
     }
 
     pub fn file_count(&self) -> usize {
@@ -98,6 +108,45 @@ fn walk(
         }
     }
     Ok(())
+}
+
+/// The policy for the bundle's pages. Script runs only from this origin,
+/// plus wasm compilation and `index.html`'s own inline scripts by hash; the
+/// page connects only to this origin (the native API's WebSocket included),
+/// plays media from it or from `blob:` (MSE), and is never framed.
+fn content_security_policy(index_html: &str) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let hashes: String = inline_scripts(index_html)
+        .map(|body| {
+            let digest = sha2::Sha256::digest(body.as_bytes());
+            format!(
+                " 'sha256-{}'",
+                base64::engine::general_purpose::STANDARD.encode(digest)
+            )
+        })
+        .collect();
+    format!(
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'{hashes}; \
+         style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
+         media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; \
+         font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// The bodies of `<script>` elements with no `src`, as the browser hashes them.
+fn inline_scripts(html: &str) -> impl Iterator<Item = &str> {
+    html.match_indices("<script").filter_map(move |(at, _)| {
+        let rest = &html[at..];
+        let open_end = rest.find('>')?;
+        let tag = &rest[..open_end];
+        if tag.contains(" src=") || tag.contains(" src ") {
+            return None;
+        }
+        let body = &rest[open_end + 1..];
+        Some(&body[..body.find("</script>")?])
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -141,10 +190,15 @@ async fn root(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
 }
 
 async fn index(req: &HttpRequest, bundle: &UiBundle) -> HttpResponse {
-    respond(req, &bundle.index, Outcome::Index).await
+    respond(req, bundle, &bundle.index, Outcome::Index).await
 }
 
-async fn respond(req: &HttpRequest, path: &Path, outcome: Outcome) -> HttpResponse {
+async fn respond(
+    req: &HttpRequest,
+    bundle: &UiBundle,
+    path: &Path,
+    outcome: Outcome,
+) -> HttpResponse {
     let file = match NamedFile::open(path) {
         Ok(file) => file,
         Err(e) => {
@@ -162,9 +216,20 @@ async fn respond(req: &HttpRequest, path: &Path, outcome: Outcome) -> HttpRespon
     };
     record(outcome);
     let mut resp = file.into_response(req);
+    let headers = resp.headers_mut();
     if let Ok(value) = HeaderValue::from_str(&cache.to_string()) {
-        resp.headers_mut().insert(header::CACHE_CONTROL, value);
+        headers.insert(header::CACHE_CONTROL, value);
     }
+    headers.insert(header::CONTENT_SECURITY_POLICY, bundle.csp.clone());
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
     resp
 }
 
@@ -205,7 +270,7 @@ async fn fallback(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse
             } else {
                 Outcome::File
             };
-            return respond(&req, path, outcome).await;
+            return respond(&req, &bundle, path, outcome).await;
         }
         let last = key.rsplit('/').next().unwrap_or("");
         if wants_html(&req) && !last.contains('.') {
