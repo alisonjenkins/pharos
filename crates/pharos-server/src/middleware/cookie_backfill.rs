@@ -10,7 +10,7 @@
 //! once the token store accepted a header token. A 2xx response to such a
 //! request gets the cookie for that token only when the browser says the
 //! request came from pharos's own page (`Sec-Fetch-Site: same-origin`) and it
-//! holds no `JellyfinAuth` cookie yet (B253, V193). An `api_key` in the URL
+//! holds no `JellyfinAuth` cookie yet (B254, V194). An `api_key` in the URL
 //! never counts: any page on a sibling host can put one in an `<img>`, and
 //! echoing it would plant the attacker's session in the victim's browser.
 //! For the same reason a cookie holding another token is never overwritten;

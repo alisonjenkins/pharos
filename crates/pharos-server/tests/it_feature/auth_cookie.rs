@@ -240,7 +240,7 @@ async fn header_authenticated_request_without_the_cookie_gets_it() {
 
 /// A cookie for another token is never overwritten: a page that can make
 /// the browser send someone else's token must not be able to swap the
-/// victim's session for it (B253). Signing in replaces the cookie. Disarm
+/// victim's session for it (B254). Signing in replaces the cookie. Disarm
 /// check: with `OtherCookie` answering `Set` this fails.
 #[actix_web::test]
 async fn a_cookie_holding_another_token_is_kept() {
@@ -256,7 +256,7 @@ async fn a_cookie_holding_another_token_is_kept() {
     assert!(set_auth_cookies(&resp).is_empty());
 }
 
-/// Session fixation (B253): a page on a sibling host embeds
+/// Session fixation (B254): a page on a sibling host embeds
 /// `<img src="https://pharos/…?api_key=ATTACKER">`. The browser sends it as
 /// a same-site request with no cookie, and pharos accepts the token. The
 /// response must not plant the attacker's token as the victim's cookie,
