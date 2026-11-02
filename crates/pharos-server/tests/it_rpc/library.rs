@@ -708,3 +708,61 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
         .unwrap();
     assert_eq!(ids(a), [402]);
 }
+
+/// `Library.nextUp` on `session`, as its total and items.
+async fn wire_next_up(session: &session::Client, limit: u32) -> (u32, Vec<serde_json::Value>) {
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.next_up_request();
+    req.get().init_ctx();
+    req.get().set_limit(limit);
+    let reply = req.send().promise.await.expect("nextUp");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// T032 over the wire: `Library.nextUp` lists what `/Shows/NextUp` lists for
+/// the same user, with the same total, and a policy change applies to the
+/// next call.
+/// Disarm check: with `next_up` passing `Some(1)` as the limit, the
+/// agreement fails (one series instead of two).
+#[actix_web::test]
+async fn native_next_up_agrees_with_the_jellyfin_next_up_route() {
+    use actix_web::test;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_shows(&fx).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let req = test::TestRequest::get()
+        .uri("/Shows/NextUp")
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .to_request();
+    let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+
+    let (total, native) = wire_next_up(&session, 0).await;
+    assert_eq!(native.len(), 2);
+    assert_eq!(native, project(web["Items"].as_array().unwrap()));
+    assert_eq!(u64::from(total), web["TotalRecordCount"].as_u64().unwrap());
+    assert_eq!(wire_next_up(&session, 1).await.1.len(), 1);
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_a_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (_, items) = wire_next_up(&session, 0).await;
+    assert_eq!(
+        items
+            .iter()
+            .map(|i| i["SeriesName"].clone())
+            .collect::<Vec<_>>(),
+        [serde_json::json!("Show")]
+    );
+}

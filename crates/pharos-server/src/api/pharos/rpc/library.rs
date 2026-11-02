@@ -142,6 +142,31 @@ impl server::library::Handler for Library {
         );
         Ok(())
     }
+
+    async fn next_up(
+        self: Rc<Self>,
+        params: wire::NextUpParams,
+        results: &mut wire::NextUpResults,
+    ) -> Result<(), capnp::Error> {
+        // 0 is the field's default: the caller asked for no particular limit.
+        let limit = Some(params.get()?.get_limit()).filter(|&n| n > 0);
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let listed = library::next_up(state, &user, None, limit).await;
+        write_listing(
+            results.get().init_result(),
+            listed,
+            "next_up",
+            &state.server_id,
+        );
+        Ok(())
+    }
 }
 
 /// A listing's page, or `unavailable` with its cause logged.
