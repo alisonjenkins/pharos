@@ -592,3 +592,97 @@ async fn entity_lists_answer_only_through_visible_items() {
         leaked.join("\n")
     );
 }
+
+/// B263: a genre or person reached by id answers only through items the
+/// bearer may see (V200). `/Items/{genre id}` and a person's portrait answer
+/// a hidden one as they answer an id that names nothing.
+/// Disarm check: with the by-id routes skipping `visible_entity`, the genre
+/// answers 200 with library A's count and the portrait redirects.
+#[actix_web::test]
+async fn an_entity_by_id_answers_only_through_visible_items() {
+    use pharos_core::PersonStore as _;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    f.state
+        .stores
+        .upsert_person(
+            "Jane Star",
+            None,
+            None,
+            Some("https://img.example/jane.jpg"),
+        )
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let get = |uri: &str| {
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+    let id_of = |body: &serde_json::Value, name: &str| {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["Name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))["Id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let genres: serde_json::Value = test::call_and_read_body_json(&app, get("/Genres")).await;
+    let persons: serde_json::Value = test::call_and_read_body_json(&app, get("/Persons")).await;
+    let (action, jane) = (id_of(&genres, "Action"), id_of(&persons, "Jane Star"));
+    let genre_uri = format!("/Items/{action}");
+    let portrait_uri = format!("/Items/{jane}/Images/Primary");
+
+    // Unrestricted, then restricted to library A, which holds them: both
+    // answer.
+    let genre: serde_json::Value = test::call_and_read_body_json(&app, get(&genre_uri)).await;
+    assert_eq!(genre["ChildCount"], 1, "{genre}");
+    let resp = test::call_service(&app, get(&portrait_uri)).await;
+    assert_eq!(resp.status(), 302);
+    restrict_to_library_a(&f).await;
+    let genre: serde_json::Value = test::call_and_read_body_json(&app, get(&genre_uri)).await;
+    assert_eq!(genre["ChildCount"], 1, "{genre}");
+    let resp = test::call_service(&app, get(&portrait_uri)).await;
+    assert_eq!(resp.status(), 302);
+
+    // Restricted to library B: both answer as an id naming nothing does,
+    // each counted.
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    let mut leaked = Vec::new();
+    let bogus = "f".repeat(32);
+    for (uri, missing, kind) in [
+        (&genre_uri, format!("/Items/{bogus}"), "genre"),
+        (
+            &portrait_uri,
+            format!("/Items/{bogus}/Images/Primary"),
+            "person",
+        ),
+    ] {
+        let want = test::call_service(&app, get(&missing)).await.status();
+        let before = entity_hidden_total(&snapshotter, kind);
+        let status = test::call_service(&app, get(uri)).await.status();
+        let counted = entity_hidden_total(&snapshotter, kind) - before;
+        if status != want || counted != 1 {
+            leaked.push(format!(
+                "{uri}: {status} (missing: {want}), counted {counted}"
+            ));
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "library A leaked:\n{}",
+        leaked.join("\n")
+    );
+}

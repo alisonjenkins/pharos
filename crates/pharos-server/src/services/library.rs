@@ -806,6 +806,12 @@ pub async fn home(
     })
 }
 
+/// Whether `policy` lets its user see every stored item (every library, no
+/// parental cap), so no query need narrow what they see.
+pub fn hides_nothing(policy: &UserPolicy) -> bool {
+    policy.enable_all_folders && policy.max_parental_rating.is_none()
+}
+
 /// The stored items `user` may see, or `None` when their policy hides
 /// nothing (every library, no parental cap).
 pub async fn visible_items(
@@ -813,7 +819,7 @@ pub async fn visible_items(
     user: &User,
 ) -> Result<Option<Vec<MediaItem>>, DomainError> {
     let policy = &user.policy;
-    if policy.enable_all_folders && policy.max_parental_rating.is_none() {
+    if hides_nothing(policy) {
         return Ok(None);
     }
     let mut mq = pharos_core::MediaQuery::default();
@@ -915,19 +921,54 @@ where
     Ok(kept)
 }
 
-/// How many of `ids` (one entity's items) `user` may see, or `None` when
-/// their policy hides nothing.
-pub async fn visible_count(
+/// What one entity asked for by id shows `user` (V200).
+#[derive(Debug)]
+pub enum EntityView {
+    /// Their policy hides nothing: the store's own count stands.
+    All,
+    /// The entity's items they may see, at least one.
+    Visible(Vec<MediaItem>),
+    /// None of its items: answer as an id that names nothing.
+    Hidden,
+}
+
+/// One genre or person asked for by id (V200). No query for a user whose
+/// policy hides nothing; otherwise one `apply_policy_scope` query over the
+/// entity's items. An entity whose items are all hidden from `user` counts
+/// under `pharos_entity_hidden_total{kind}` and logs a WARN.
+pub async fn visible_entity(
     state: &AppState,
     user: &User,
-    ids: &[pharos_core::MediaId],
-) -> Result<Option<u32>, DomainError> {
-    let Some(visible) = visible_items(state, user).await? else {
-        return Ok(None);
-    };
-    let ids: std::collections::HashSet<_> = ids.iter().collect();
-    let n = visible.iter().filter(|i| ids.contains(&i.id)).count();
-    Ok(Some(u32::try_from(n).unwrap_or(u32::MAX)))
+    kind: EntityKind,
+    wire_id: &str,
+) -> Result<EntityView, DomainError> {
+    if hides_nothing(&user.policy) {
+        return Ok(EntityView::All);
+    }
+    let mut mq = pharos_core::MediaQuery::default();
+    match kind {
+        EntityKind::Genre => mq.genre_wire_id = Some(wire_id.to_string()),
+        EntityKind::Studio => mq.studio_wire_id = Some(wire_id.to_string()),
+        EntityKind::Tag => mq.tag_wire_ids = vec![wire_id.to_string()],
+        EntityKind::Person => mq.person_wire_id = Some(wire_id.to_string()),
+    }
+    let mut scoped = mq.clone();
+    crate::api::jellyfin::items::apply_policy_scope(
+        &mut scoped,
+        &user.policy,
+        &state.parental_ratings,
+    );
+    let (items, _total) = state.stores.query(&scoped).await?;
+    if !items.is_empty() {
+        return Ok(EntityView::Visible(items));
+    }
+    mq.limit = Some(1);
+    let (any, _total) = state.stores.query(&mq).await?;
+    if !any.is_empty() {
+        metrics::counter!("pharos_entity_hidden_total", "kind" => kind.label()).increment(1);
+        tracing::warn!(user = %user.name, kind = kind.label(), wire_id, "refused an entity with no visible item");
+    }
+    Ok(EntityView::Hidden)
 }
 
 #[cfg(test)]
