@@ -219,3 +219,51 @@ async fn a_bundle_without_an_index_is_refused() {
     let err = ui::UiBundle::load(dir.path()).unwrap_err().to_string();
     assert!(err.contains("index.html"), "{err}");
 }
+
+/// Every UI response carries a strict policy: script only from this origin,
+/// wasm, and `index.html`'s own inline loader by hash; never framed. Disarm
+/// check: drop the hash and the inline loader's `sha256-` source is missing.
+#[actix_web::test]
+async fn ui_responses_carry_a_strict_content_security_policy() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let loader = "import init from \"/assets/app.js\"; init();";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("index.html"),
+        format!(
+            "<html><head><script src=\"/assets/x.js\"></script>\
+             <script type=\"module\">{loader}</script></head></html>"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+    std::fs::write(dir.path().join("assets/app.js"), "").unwrap();
+    let app = app!(Arc::new(ui::UiBundle::load(dir.path()).unwrap()));
+    let want = format!(
+        "'sha256-{}'",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(loader))
+    );
+    for uri in ["/", "/title/1", "/assets/app.js"] {
+        let resp = test::call_service(&app, html(uri).to_request()).await;
+        let h = resp.headers();
+        let csp = h
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        for part in [
+            "default-src 'self'",
+            "frame-ancestors 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "connect-src 'self'",
+            want.as_str(),
+        ] {
+            assert!(csp.contains(part), "{uri}: {part} missing from {csp}");
+        }
+        assert!(!csp.contains("'unsafe-eval'"), "{csp}");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    }
+}
