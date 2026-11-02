@@ -1912,6 +1912,36 @@ async fn a_music_library_lists_its_artists_then_albums_then_tracks() {
         ),
         ["First", "Second"]
     );
+    let (_, beta) = wire_query(
+        &session,
+        Some(&music),
+        &[Kind::Artist],
+        "",
+        false,
+        "b",
+        &[],
+        0,
+        0,
+    )
+    .await;
+    assert_eq!(
+        beta.len(),
+        1,
+        "the letter picker filters artists by name: {beta:?}"
+    );
+    let (_, desc) = wire_query(
+        &session,
+        Some(&music),
+        &[Kind::Artist],
+        "",
+        true,
+        "",
+        &[],
+        0,
+        0,
+    )
+    .await;
+    assert_eq!(desc[0]["Name"], "Beta", "descending lists artists Z to A");
     assert_eq!(
         names(
             listed(

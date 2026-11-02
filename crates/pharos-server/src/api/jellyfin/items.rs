@@ -5893,7 +5893,32 @@ pub(crate) async fn music_groups_page(
             )
             .await
         }
-        MusicGrouping::Artist => filed_artist_dtos(state, &tracks).await,
+        MusicGrouping::Artist => {
+            let mut artists = filed_artist_dtos(state, &tracks).await;
+            if first_sort_order_descending(q.sort_order.as_deref()) {
+                artists.reverse();
+            }
+            artists
+        }
+    };
+    // The letter picker filters by the group's own name, as the series
+    // listing does, not by its tracks' titles.
+    let prefix = q
+        .name_starts_with
+        .as_deref()
+        .or(q.name_starts_with_or_greater.as_deref())
+        .map(str::to_lowercase)
+        .filter(|p| !p.is_empty());
+    let items = match prefix {
+        Some(prefix) => items
+            .into_iter()
+            .filter(|dto| {
+                dto.get("Name")
+                    .and_then(|n| n.as_str())
+                    .is_some_and(|n| name_matches_letter(n, &prefix))
+            })
+            .collect(),
+        None => items,
     };
     Ok(synth_page(items, q.start_index, q.limit))
 }
