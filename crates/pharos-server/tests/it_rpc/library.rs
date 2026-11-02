@@ -1267,7 +1267,8 @@ async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
             .put(MediaItem {
                 id,
                 path: format!("/libTV/{show}/Season {season:02}/e{ep}.mkv").into(),
-                title: format!("{show} {season}x{ep}"),
+                // Alphabetical order is the reverse of episode order.
+                title: format!("{show} {}", ["Zulu", "Alpha"][usize::from(ep % 2 == 0)]),
                 kind: MediaKind::Episode,
                 metadata: MediaMetadata {
                     official_rating: Some(rating.into()),
@@ -1341,19 +1342,156 @@ async fn browsing_a_library_a_series_and_a_season_answers_detail_then_listing() 
     };
 
     assert_eq!(detail(tv.clone()).await["Name"], "TV");
+    // A TV library lists its series by name, as jellyfin-web's grid does.
     let in_library = list(tv).await;
-    assert_eq!(in_library.len(), 4, "{in_library:?}");
+    let names: Vec<_> = in_library.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, ["Mature", "Show"], "{in_library:?}");
 
     // The ids a title screen reaches through an episode's parents.
     let show_id = series_id_for_key(Some("/libTV/Show"), "Show");
+    assert_eq!(in_library[1].0, show_id);
     assert_eq!(detail(show_id.clone()).await["Name"], "Show");
-    assert_eq!(list(show_id).await.len(), 3);
+    let seasons = list(show_id).await;
+    let names: Vec<_> = seasons.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, ["Season 1", "Season 2"], "{seasons:?}");
 
     let season_id = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    assert_eq!(seasons[0].0, season_id);
     let season = detail(season_id.clone()).await;
     assert_eq!(season["Name"], "Season 1");
     assert_eq!(season["SeriesName"], "Show");
-    assert_eq!(list(season_id).await.len(), 2);
+    // A season lists its episodes in index order, not by title.
+    let episodes = list(season_id).await;
+    let names: Vec<_> = episodes.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, ["Show Zulu", "Show Alpha"], "{episodes:?}");
+}
+
+/// The series tiles a TV library lists name the same things, in the same
+/// order, as the Jellyfin route lists for `IncludeItemTypes=Series`; a page
+/// holds the tiles it was asked for; naming episodes still lists stored rows
+/// and a movie library is unchanged.
+/// Disarm check: with `shows_mode` always `None`, the TV library lists its
+/// four episodes and this fails.
+#[actix_web::test]
+async fn tv_browse_agrees_with_the_jellyfin_series_route_and_leaves_movies_alone() {
+    use actix_web::test;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+
+    let (total, native) =
+        wire_query(&session, Some(&tv), &[], "SortName", false, "", &[], 0, 0).await;
+    assert_eq!(total, 2);
+    let req = test::TestRequest::get()
+        .uri(&format!(
+            "/Users/{}/Items?ParentId={tv}&IncludeItemTypes=Series&SortBy=SortName",
+            fx.user_id.0.simple()
+        ))
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .to_request();
+    let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(native, project(web["Items"].as_array().unwrap()));
+
+    // One tile per page; the total still counts both.
+    let (total, first) =
+        wire_query(&session, Some(&tv), &[], "SortName", false, "", &[], 0, 1).await;
+    let (_, second) = wire_query(&session, Some(&tv), &[], "SortName", false, "", &[], 1, 1).await;
+    assert_eq!((total, first.len(), second.len()), (2, 1, 1));
+    assert_ne!(first[0]["Id"], second[0]["Id"]);
+
+    // Naming episodes lists stored rows; a movie library is unchanged.
+    let (episodes, _) = wire_query(
+        &session,
+        Some(&tv),
+        &[Kind::Episode],
+        "SortName",
+        false,
+        "",
+        &[],
+        0,
+        0,
+    )
+    .await;
+    assert_eq!(episodes, 4);
+    let (_, movies) = wire_query(
+        &session,
+        Some(&fx.lib_a_wire),
+        &[],
+        "SortName",
+        false,
+        "",
+        &[],
+        0,
+        0,
+    )
+    .await;
+    assert!(!movies.is_empty());
+}
+
+/// Native TV browsing follows the same access rules as `/Items`: a user
+/// capped below a series' rating, or barred from the TV library, is listed
+/// none of its series or seasons.
+/// Disarm check: with `list_virtual_shows` skipping `apply_policy_scope`, the
+/// capped user lists the R-rated series and this fails.
+#[actix_web::test]
+async fn tv_browse_follows_the_parental_cap_and_library_access() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let mature = pharos_jellyfin_api::dto::series_id_for_key(Some("/libTV/Mature"), "Mature");
+    let names = |items: Vec<serde_json::Value>| -> Vec<String> {
+        items
+            .iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                max_parental_rating: Some(0),
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (total, series) =
+        wire_query(&session, Some(&tv), &[], "SortName", false, "", &[], 0, 0).await;
+    assert_eq!((total, names(series)), (1, vec!["Show".to_owned()]));
+    let (total, _) = wire_query(
+        &session,
+        Some(&mature),
+        &[],
+        "SortName",
+        false,
+        "",
+        &[],
+        0,
+        0,
+    )
+    .await;
+    assert_eq!(total, 0, "the capped user lists no season of the R series");
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_a_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (total, _) = wire_query(&session, Some(&tv), &[], "SortName", false, "", &[], 0, 0).await;
+    assert_eq!(total, 0);
 }
 
 /// A user who may not see a library, or whose parental cap rules out a

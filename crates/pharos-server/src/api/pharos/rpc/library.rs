@@ -172,13 +172,60 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let target = browse_target(state, parent.as_deref()).await;
+        let wanted: Vec<Kind> = q.get_kinds()?.iter().filter_map(Result::ok).collect();
+        if let Some(mode) = shows_mode(target, &wanted) {
+            // Seasons keep their numeric order and a series list its name
+            // order whatever the caller's sort.
+            let tiles = crate::api::jellyfin::items::list_virtual_shows(
+                state,
+                user.id,
+                &user.policy,
+                parent.as_deref(),
+                mode,
+                &query,
+            )
+            .await;
+            match tiles {
+                Ok((tiles, total)) => {
+                    let tiles = synth_tiles(&tiles);
+                    record_browse(
+                        parent.as_deref(),
+                        target,
+                        tiles.len(),
+                        total,
+                        query.start_index,
+                    );
+                    write_tiles(
+                        results.get().init_result(),
+                        &tiles,
+                        total,
+                        query.start_index,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(parent = parent.as_deref().unwrap_or(""), error = %e, "native library: show listing unavailable");
+                    Denial::Unavailable {
+                        dependency: "media store",
+                    }
+                    .write(results.get().init_result().init_error());
+                }
+            }
+            return Ok(());
+        }
+        let query = episode_order(target, query);
         let listed = match library::query(state, &user, parent.as_deref(), &query).await {
             Ok(page) => library::with_user_data(state, &user, page).await,
             Err(e) => Err(e),
         }
         .map_err(ListError::Store);
         if let Ok(page) = &listed {
-            record_browse(parent.as_deref(), target, page);
+            record_browse(
+                parent.as_deref(),
+                target,
+                page.items.len(),
+                page.total,
+                page.start,
+            );
         }
         write_listing(
             results.get().init_result(),
@@ -626,7 +673,9 @@ async fn browse_target(
 fn record_browse(
     parent: Option<&str>,
     target: (BrowseLevel, Option<LibraryKind>),
-    page: &ListPage,
+    count: usize,
+    total: u32,
+    start: u32,
 ) {
     let (level, kind) = target;
     let kind = browse_kind_label(kind);
@@ -637,7 +686,6 @@ fn record_browse(
     )
     .increment(1);
     let parent = parent.unwrap_or("");
-    let (count, total, start) = (page.items.len(), page.total, page.start);
     if count == 0 && level != BrowseLevel::Other {
         tracing::info!(
             parent,
@@ -658,6 +706,56 @@ fn record_browse(
             start,
             "native browse"
         );
+    }
+}
+
+/// The synthesised folders a browse lists instead of stored rows, as
+/// jellyfin-web's TV views do: a TV library lists its series, a series its
+/// seasons. A caller that names other kinds (episodes) still gets stored rows.
+fn shows_mode(
+    target: (BrowseLevel, Option<LibraryKind>),
+    wanted: &[Kind],
+) -> Option<crate::api::jellyfin::items::ShowFolderKind> {
+    use crate::api::jellyfin::items::ShowFolderKind;
+    let only = |kind: Kind| wanted.iter().all(|k| *k == kind);
+    match target {
+        (BrowseLevel::Library, Some(LibraryKind::TvShows)) if only(Kind::Series) => {
+            Some(ShowFolderKind::Series)
+        }
+        (BrowseLevel::Series, _) if only(Kind::Season) => Some(ShowFolderKind::Season),
+        _ => None,
+    }
+}
+
+/// A season's episodes list in (season, episode) order, not by title: the
+/// default `SortName` the UI sends alphabetises them (B99).
+fn episode_order(target: (BrowseLevel, Option<LibraryKind>), mut query: ItemQuery) -> ItemQuery {
+    if target.0 == BrowseLevel::Season && query.sort_by.as_deref() == Some("SortName") {
+        query.sort_by = None;
+    }
+    query
+}
+
+/// The wire id and DTO of each synthesised tile that has an id.
+fn synth_tiles(dtos: &[serde_json::Value]) -> Vec<(WireId, &serde_json::Value)> {
+    dtos.iter()
+        .filter_map(|dto| Some((WireId::parse(dto_str(dto, "Id"))?, dto)))
+        .collect()
+}
+
+/// A page of synthesised tiles.
+fn write_tiles(
+    out: items_result::Builder<'_>,
+    tiles: &[(WireId, &serde_json::Value)],
+    total: u32,
+    start: u32,
+) {
+    let mut page = out.init_page();
+    page.set_total(total);
+    page.set_start(start);
+    let mut items = page.init_items(len_u32(tiles));
+    for (i, (id, dto)) in (0..items.len()).zip(tiles) {
+        write_synth_summary(items.reborrow().get(i), *id, dto);
     }
 }
 
