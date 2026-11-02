@@ -225,6 +225,12 @@ compat-dioxus-full native="on":
     PHAROS_CONFIG="$TMP/pharos.toml"
     nix develop --command cargo build -q --bin pharos --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    echo "compat-dioxus-full: ui bundle $UI_DIR"
+    if [[ -d "$UI_DIR" ]]; then echo "  present"; else echo "  MISSING from this view of /nix/store"; fi
+    nix path-info "$UI_DIR" 2>&1 | sed 's/^/  path-info: /' || true
+    nix-store -q --roots "$UI_DIR" 2>&1 | sed 's/^/  root: /' || true
+    df -h /nix/store 2>&1 | tail -1 | sed 's/^/  df: /' || true
+    if [[ -r /proc/self/mountinfo ]]; then grep -E ' /nix(/| )' /proc/self/mountinfo | sed 's/^/  mount: /' || true; fi
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
     nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
     for _ in $(seq 1 120); do
