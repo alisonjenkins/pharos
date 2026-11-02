@@ -3,7 +3,7 @@
 //! progress. The browser answers come in as plain values, so all of it is
 //! tested on the host.
 
-use pharos_client::api::Capabilities;
+use pharos_client::api::{Capabilities, Segment, SegmentKind, Track, Trickplay};
 
 /// Something that turns a stream URL into playback on the page's `<video>`
 /// (009 Boundaries: each external dependency sits behind an adapter). The
@@ -96,6 +96,29 @@ pub fn capabilities(
     }
 }
 
+/// The `<video>` as the controls show it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaState {
+    pub position_ms: u64,
+    /// 0 until the metadata has loaded.
+    pub duration_ms: u64,
+    pub paused: bool,
+    pub volume: f64,
+    pub muted: bool,
+}
+
+impl Default for MediaState {
+    fn default() -> Self {
+        Self {
+            position_ms: 0,
+            duration_ms: 0,
+            paused: true,
+            volume: 1.0,
+            muted: false,
+        }
+    }
+}
+
 /// A `<video>` event the report clock cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaEvent {
@@ -104,6 +127,9 @@ pub enum MediaEvent {
     Seeked,
     TimeUpdate,
     Ended,
+    /// Volume, duration or metadata changed: the controls redraw, nothing
+    /// is reported.
+    Changed,
 }
 
 /// What to send the server.
@@ -160,6 +186,7 @@ impl ReportClock {
                 Outgoing::Report { paused: false }
             }
             MediaEvent::Ended => return self.stop().then_some(Outgoing::Stop),
+            MediaEvent::Changed => return None,
         };
         self.last_report_ms = Some(now_ms);
         Some(send)
@@ -251,9 +278,246 @@ pub fn start_ms(position_ms: u64, played: bool) -> u64 {
     }
 }
 
+/// One trickplay thumbnail: the tile it is on and where in the tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Thumb {
+    pub url: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The thumbnail nearest before `at_ms`, clamped to the last one; `None`
+/// for a set with no thumbnails.
+pub fn thumb_at(set: &Trickplay, at_ms: u64) -> Option<Thumb> {
+    let per_tile = set.grid.checked_mul(set.grid).filter(|&n| n > 0)?;
+    let last = set.thumb_count.checked_sub(1)?;
+    let n = (at_ms / u64::from(set.interval_ms.max(1))).min(u64::from(last));
+    let n = u32::try_from(n).unwrap_or(last);
+    let (tile, within) = (n / per_tile, n % per_tile);
+    Some(Thumb {
+        url: set.tile_url.replace("{tile}", &tile.to_string()),
+        x: (within % set.grid).saturating_mul(set.width),
+        y: (within / set.grid).saturating_mul(set.height),
+        width: set.width,
+        height: set.height,
+    })
+}
+
+/// The narrowest sprite set: the seek-bar preview is small, and the
+/// narrowest tiles load fastest.
+pub fn preview_set(sets: &[Trickplay]) -> Option<&Trickplay> {
+    sets.iter().min_by_key(|s| s.width)
+}
+
+/// The segment playing at `at_ms`, whose skip button shows.
+pub fn segment_at(segments: &[Segment], at_ms: u64) -> Option<Segment> {
+    segments
+        .iter()
+        .find(|s| s.start_ms <= at_ms && at_ms < s.end_ms)
+        .copied()
+}
+
+pub fn skip_label(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::Intro => "Skip intro",
+        SegmentKind::Outro => "Skip credits",
+        SegmentKind::Recap => "Skip recap",
+        SegmentKind::Preview => "Skip preview",
+        SegmentKind::Commercial => "Skip ad",
+    }
+}
+
+/// `at_ms` as a percentage of `total_ms`, for a left offset on the seek bar.
+pub fn percent(at_ms: u64, total_ms: u64) -> f64 {
+    if total_ms == 0 {
+        return 0.0;
+    }
+    // Lossy for positions past 2^53 ms, far beyond any runtime.
+    (at_ms.min(total_ms) as f64 / total_ms as f64) * 100.0
+}
+
+/// The position a fraction of the way along a seek bar `width` wide. `None`
+/// while the length is unknown, as for a live stream, so a click seeks nowhere
+/// rather than to the start.
+pub fn position_at(x: f64, width: f64, total_ms: u64) -> Option<u64> {
+    if total_ms == 0 || width.is_nan() || width <= 0.0 || !x.is_finite() {
+        return None;
+    }
+    let fraction = (x / width).clamp(0.0, 1.0);
+    // Saturating cast of a value already within 0..=total_ms.
+    Some((fraction * total_ms as f64) as u64)
+}
+
+/// "4:05", "1:02:03".
+pub fn clock(ms: u64) -> String {
+    let s = ms / 1000;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// How a track is named in a picker: its title, else its language, else its
+/// position, with the forced and SDH flags the title does not already say.
+pub fn track_label(track: &Track, position: usize) -> String {
+    let mut label = [&track.title, &track.language]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("Track {}", position.saturating_add(1)));
+    let lower = label.to_lowercase();
+    if track.is_forced && !lower.contains("forced") {
+        label.push_str(" (forced)");
+    }
+    if track.is_hearing_impaired && !lower.contains("sdh") {
+        label.push_str(" [SDH]");
+    }
+    label
+}
+
+/// How the player moves from the subtitle it shows to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleSwitch {
+    /// Show or hide WebVTT on the `<video>`; the stream plays on.
+    InPlace,
+    /// The server must start or stop burning a subtitle: a new playback.
+    Renegotiate,
+}
+
+/// `burned` is whether the playing stream has a subtitle drawn in; `to` the
+/// track picked, `None` for off.
+pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
+    match (burned, to) {
+        (true, _) | (false, Some(Track { vtt_url: None, .. })) => SubtitleSwitch::Renegotiate,
+        (false, _) => SubtitleSwitch::InPlace,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sprites() -> Trickplay {
+        Trickplay {
+            width: 320,
+            height: 180,
+            interval_ms: 10_000,
+            thumb_count: 250,
+            tile_count: 3,
+            grid: 10,
+            tile_url: "/videos/7/trickplay/320/{tile}.jpg".into(),
+        }
+    }
+
+    #[test]
+    fn a_thumbnail_is_found_by_tile_column_and_row() {
+        let set = sprites();
+        let at = |ms| thumb_at(&set, ms).map(|t| (t.url, t.x, t.y));
+        assert_eq!(at(0), Some(("/videos/7/trickplay/320/0.jpg".into(), 0, 0)));
+        // Thumbnail 23: tile 0, row 2, column 3.
+        assert_eq!(
+            at(235_000),
+            Some(("/videos/7/trickplay/320/0.jpg".into(), 960, 360))
+        );
+        // Thumbnail 105: tile 1, row 0, column 5.
+        assert_eq!(
+            at(1_050_000),
+            Some(("/videos/7/trickplay/320/1.jpg".into(), 1600, 0))
+        );
+        // Past the end: the last thumbnail, 249 (tile 2, row 4, column 9).
+        assert_eq!(
+            at(99_000_000),
+            Some(("/videos/7/trickplay/320/2.jpg".into(), 2880, 720))
+        );
+        let empty = Trickplay {
+            thumb_count: 0,
+            ..sprites()
+        };
+        assert_eq!(thumb_at(&empty, 0), None);
+    }
+
+    #[test]
+    fn the_preview_uses_the_narrowest_sprites() {
+        let wide = Trickplay {
+            width: 640,
+            ..sprites()
+        };
+        let sets = [wide, sprites()];
+        assert_eq!(preview_set(&sets).map(|s| s.width), Some(320));
+        assert_eq!(preview_set(&[]), None);
+    }
+
+    #[test]
+    fn the_skip_button_shows_only_inside_a_segment() {
+        let intro = Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 5_000,
+            end_ms: 65_000,
+        };
+        let segments = [intro];
+        assert_eq!(segment_at(&segments, 4_999), None);
+        assert_eq!(segment_at(&segments, 5_000), Some(intro));
+        assert_eq!(segment_at(&segments, 64_999), Some(intro));
+        assert_eq!(segment_at(&segments, 65_000), None);
+        assert_eq!(skip_label(intro.kind), "Skip intro");
+    }
+
+    #[test]
+    fn seek_bar_maths_clamps_to_the_runtime() {
+        assert_eq!(percent(30_000, 120_000), 25.0);
+        assert_eq!(percent(500_000, 120_000), 100.0);
+        assert_eq!(percent(1, 0), 0.0);
+        assert_eq!(position_at(50.0, 200.0, 120_000), Some(30_000));
+        assert_eq!(position_at(-5.0, 200.0, 120_000), Some(0));
+        assert_eq!(position_at(400.0, 200.0, 120_000), Some(120_000));
+        assert_eq!(position_at(10.0, 0.0, 120_000), None);
+        assert_eq!(position_at(10.0, 200.0, 0), None);
+    }
+
+    #[test]
+    fn clock_shows_hours_only_when_there_are_some() {
+        assert_eq!(clock(0), "0:00");
+        assert_eq!(clock(245_000), "4:05");
+        assert_eq!(clock(3_723_000), "1:02:03");
+    }
+
+    #[test]
+    fn tracks_are_named_by_title_then_language_then_position() {
+        let mut t = Track {
+            language: "eng".into(),
+            ..Track::default()
+        };
+        assert_eq!(track_label(&t, 0), "eng");
+        t.title = "Commentary".into();
+        assert_eq!(track_label(&t, 0), "Commentary");
+        t.is_forced = true;
+        assert_eq!(track_label(&t, 0), "Commentary (forced)");
+        assert_eq!(track_label(&Track::default(), 2), "Track 3");
+    }
+
+    #[test]
+    fn only_a_burned_subtitle_needs_a_new_playback() {
+        let text = Track {
+            vtt_url: Some("/videos/7/subtitles/3/stream.vtt".into()),
+            ..Track::default()
+        };
+        let image = Track::default();
+        assert_eq!(subtitle_switch(false, Some(&text)), SubtitleSwitch::InPlace);
+        assert_eq!(subtitle_switch(false, None), SubtitleSwitch::InPlace);
+        assert_eq!(
+            subtitle_switch(false, Some(&image)),
+            SubtitleSwitch::Renegotiate
+        );
+        assert_eq!(
+            subtitle_switch(true, Some(&text)),
+            SubtitleSwitch::Renegotiate
+        );
+        assert_eq!(subtitle_switch(true, None), SubtitleSwitch::Renegotiate);
+    }
 
     #[test]
     fn hls_prefers_native_then_hlsjs() {
