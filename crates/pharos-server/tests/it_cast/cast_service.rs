@@ -245,6 +245,19 @@ impl Rig {
             .sum()
     }
 
+    fn histogram_samples(&self, name: &str) -> usize {
+        self.snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == name)
+            .map(|(_, _, _, v)| match v {
+                DebugValue::Histogram(h) => h.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
     fn event_total(&self, event: &str) -> u64 {
         self.snap
             .snapshot()
@@ -656,13 +669,24 @@ async fn a_dropped_connection_that_comes_back_keeps_the_seat() {
     .await;
     let casts = rig.service.snapshot().await;
     assert_eq!(casts.len(), 1, "the seat survives a reconnect inside grace");
+    let mut following = false;
     for _ in 0..100 {
         if rig.service.snapshot().await[0].state == ConnState::Following {
+            following = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(following, "the seat never returned to Following");
+    // The group took the seat back: its socket outage is recorded only when a
+    // `ResyncMember` marks the member connected again.
+    for _ in 0..100 {
+        if rig.histogram_samples("pharos_syncplay_socket_gone_seconds") > 0 {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("the seat never returned to Following");
+    panic!("the reconnected seat was never resynced with the group");
 }
 
 fn has_command_count(h: &FakeReceiverHandle, name: &str) -> usize {

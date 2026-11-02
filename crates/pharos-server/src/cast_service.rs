@@ -299,6 +299,31 @@ enum EndedBy {
     Service,
 }
 
+/// What a driver state change tells the group about the seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatSignal {
+    /// The TV's connection dropped: the seat stops gating the group.
+    Lost,
+    /// The TV is back after a loss: the seat is a member again and gets the
+    /// group's catch-up.
+    Resync,
+}
+
+/// The signal for entering `state`, and whether a resync is still owed after
+/// it. A reconnect never goes straight from `Lost` to `Following`: the driver
+/// passes through `Loading` (an item was loaded) or stops at `Connecting`
+/// (nothing loaded yet), so the resync waits for the first of `Following` or
+/// `Connecting` after a loss, whatever came between.
+fn seat_signal(resync_pending: bool, state: ConnState) -> (Option<SeatSignal>, bool) {
+    match state {
+        ConnState::Lost => (Some(SeatSignal::Lost), true),
+        ConnState::Following | ConnState::Connecting if resync_pending => {
+            (Some(SeatSignal::Resync), false)
+        }
+        _ => (None, resync_pending),
+    }
+}
+
 struct ActiveCast {
     id: u64,
     tv: String,
@@ -315,6 +340,10 @@ struct ActiveCast {
     renew_at: Instant,
     driver: Arc<CastDriverHandle>,
     state: ConnState,
+    /// The seat was reported lost and has not been resynced with the group
+    /// since: set on `Lost`, cleared by the `ResyncMember` that follows the
+    /// reconnect.
+    resync_pending: bool,
     forwarder: JoinHandle<()>,
     pump: JoinHandle<()>,
     watcher: JoinHandle<()>,
@@ -979,15 +1008,24 @@ impl<F: TransportFactory> Actor<F> {
             return;
         };
         let previous = std::mem::replace(&mut cast.state, state);
+        let (signal, pending) = seat_signal(cast.resync_pending, state);
+        cast.resync_pending = pending;
         let seat = cast.seat_member;
         let group = cast.group.tx.clone();
-        match (previous, state) {
-            (_, ConnState::Lost) => {
+        match signal {
+            Some(SeatSignal::Lost) => {
                 let _ = group
                     .send(GroupMsg::MemberSocketLost { member_id: seat })
                     .await;
             }
-            (ConnState::Lost, ConnState::Following) => {
+            Some(SeatSignal::Resync) => {
+                tracing::info!(
+                    tv,
+                    seat = %seat,
+                    from = previous.label(),
+                    to = state.label(),
+                    "cast seat reconnected; resyncing it with the group"
+                );
                 let _ = group
                     .send(GroupMsg::ResyncMember {
                         member_id: seat,
@@ -995,7 +1033,7 @@ impl<F: TransportFactory> Actor<F> {
                     })
                     .await;
             }
-            _ => {}
+            None => {}
         }
     }
 
@@ -1312,6 +1350,7 @@ impl<F: TransportFactory> Actor<F> {
             renew_at: Instant::now() + self.token_lifetime() / 2,
             driver,
             state: ConnState::Connecting,
+            resync_pending: false,
             forwarder,
             pump,
             watcher,
@@ -1628,6 +1667,39 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The driver's reconnect paths, as it enters them: the seat is resynced
+    /// once, on the first `Following` (an item was loaded) or `Connecting`
+    /// (nothing loaded) after the loss, never on `Loading`.
+    #[test]
+    fn a_reconnect_resyncs_the_seat_once_whatever_path_it_takes() {
+        use ConnState::*;
+        let walk = |states: &[ConnState]| {
+            let mut pending = false;
+            states
+                .iter()
+                .filter_map(|s| {
+                    let (signal, next) = seat_signal(pending, *s);
+                    pending = next;
+                    signal
+                })
+                .collect::<Vec<_>>()
+        };
+        use SeatSignal::{Lost as L, Resync as R};
+        assert_eq!(walk(&[Connecting, Loading, Following]), vec![]);
+        assert_eq!(
+            walk(&[Following, Lost, Loading, Following, Following]),
+            vec![L, R]
+        );
+        assert_eq!(
+            walk(&[Following, Lost, Connecting, Loading, Following]),
+            vec![L, R]
+        );
+        assert_eq!(
+            walk(&[Following, Lost, Loading, Lost, Loading, Following]),
+            vec![L, L, R]
+        );
+    }
 
     fn tv(name: &str, addr: std::net::SocketAddr) -> ConfiguredTv {
         ConfiguredTv {
