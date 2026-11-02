@@ -3552,6 +3552,20 @@ pub trait TranscodeSessionStore: Send + Sync {
         &self,
         cutoff_unix_secs: i64,
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// Remove `holder`'s live sessions (`updated_at >= updated_since_unix_secs`)
+    /// other than `except_play_session_id`, keeping the newest `keep - 1` of
+    /// them so that with the excepted row at most `keep` remain. Removal is a
+    /// stop: the row is deleted, as `remove_transcode_session` does. One
+    /// statement, so concurrent mints across replicas cannot both skip the
+    /// trim. Returns the removed ids, oldest first.
+    fn trim_transcode_sessions_for_holder(
+        &self,
+        holder: UserId,
+        except_play_session_id: &str,
+        keep: usize,
+        updated_since_unix_secs: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send;
 }
 
 /// Persisted SyncPlay group snapshot (Phase B4 — zero-downtime deploys).
