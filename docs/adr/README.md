@@ -77,3 +77,4 @@ optional **Alternatives considered** / **References**).
 | [0032](0032-syncplay-members-record-their-user.md) | SyncPlay group members record their user (persisted and on the bus, absent = sees nothing); a queue change needs every member to see it | Accepted |
 | [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Accepted |
 | [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
+| [0035](0035-native-ui-vendors-hlsjs.md) | The native web UI plays HLS through a vendored, pinned hls.js 1.7.4 served from `'self'`, loaded only where the browser lacks native HLS | Accepted |
