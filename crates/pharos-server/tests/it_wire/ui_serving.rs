@@ -293,3 +293,40 @@ async fn ui_responses_carry_a_strict_content_security_policy() {
         assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
     }
 }
+
+/// A redirect and a 404 carry the same security headers as a served page,
+/// not only the files `respond` serves. Disarm check: drop `secured` from
+/// `redirect` or `fallback` and that reply's headers go missing.
+#[actix_web::test]
+async fn redirects_and_not_found_carry_the_security_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app!(bundle(dir.path()));
+    let replies = [
+        ("308 redirect", html("/ui/title/7").to_request(), 308),
+        (
+            "404",
+            test::TestRequest::get().uri("/missing.js").to_request(),
+            404,
+        ),
+    ];
+    for (name, req, status) in replies {
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), status, "{name}");
+        let h = resp.headers();
+        assert!(
+            h.get(header::CONTENT_SECURITY_POLICY).is_some(),
+            "{name}: CSP"
+        );
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY", "{name}");
+        assert_eq!(
+            h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+            "nosniff",
+            "{name}"
+        );
+        assert_eq!(
+            h.get(header::REFERRER_POLICY).unwrap(),
+            "same-origin",
+            "{name}"
+        );
+    }
+}
