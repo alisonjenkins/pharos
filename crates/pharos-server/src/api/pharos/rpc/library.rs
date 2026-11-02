@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_detail, item_id, item_summary, items_result, library as wire, user_state,
-    Kind, LibraryKind as WireKind,
+    home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
+    user_state, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
@@ -17,6 +17,7 @@ use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::services::{segments, watch};
 use crate::state::AppState;
 
 pub(super) struct Library {
@@ -288,12 +289,53 @@ impl server::library::Handler for Library {
             genres.set(i, genre.as_str());
         }
         let count = u32::try_from(dto.chapters.len()).unwrap_or(u32::MAX);
-        let mut chapters = out.init_chapters(count);
+        let mut chapters = out.reborrow().init_chapters(count);
         for (i, chapter) in (0..count).zip(&dto.chapters) {
             let mut c = chapters.reborrow().get(i);
             c.set_name(chapter.name.as_str());
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
+        let tracks = watch::tracks(&item).await;
+        write_tracks(
+            out.reborrow().init_audio_tracks(len(&tracks.audio)),
+            &tracks.audio,
+        );
+        write_tracks(
+            out.reborrow().init_subtitle_tracks(len(&tracks.subtitles)),
+            &tracks.subtitles,
+        );
+        let trickplay = watch::trickplay(state, &item);
+        let mut sets = out.reborrow().init_trickplay(len(&trickplay));
+        for (i, t) in (0..).zip(&trickplay) {
+            let mut w = sets.reborrow().get(i);
+            w.set_width(t.width);
+            w.set_height(t.height);
+            w.set_interval_ms(t.interval_ms);
+            w.set_thumb_count(t.thumb_count);
+            w.set_tile_count(t.tile_count);
+            w.set_grid(t.grid);
+            w.set_tile_url(t.tile_url.as_str());
+        }
+        let segments: Vec<_> = segments::for_item(state, &item)
+            .await
+            .into_iter()
+            .filter_map(|s| segment_kind(s.kind).map(|k| (k, s)))
+            .collect();
+        let mut list = out.init_segments(len(&segments));
+        for (i, (kind, s)) in (0..).zip(&segments) {
+            let mut w = list.reborrow().get(i);
+            w.set_kind(*kind);
+            w.set_start_ms(s.start_ms);
+            w.set_end_ms(s.end_ms);
+        }
+        tracing::debug!(
+            media.id = id,
+            audio_tracks = tracks.audio.len(),
+            subtitle_tracks = tracks.subtitles.len(),
+            trickplay_widths = trickplay.len(),
+            segments = segments.len(),
+            "native detail: player facts"
+        );
         Ok(())
     }
 
@@ -871,6 +913,43 @@ fn wire_library_kind(kind: LibraryKind) -> WireKind {
         LibraryKind::Music => WireKind::Music,
         LibraryKind::Books => WireKind::Books,
     }
+}
+
+fn len<T>(v: &[T]) -> u32 {
+    u32::try_from(v.len()).unwrap_or(u32::MAX)
+}
+
+fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: &[watch::Track]) {
+    for (i, t) in (0..).zip(tracks) {
+        let mut w = out.reborrow().get(i);
+        w.set_index(t.index);
+        w.set_language(t.language.as_deref().unwrap_or_default());
+        w.set_title(t.title.as_deref().unwrap_or_default());
+        w.set_codec(t.codec.as_deref().unwrap_or_default());
+        w.set_is_default(t.is_default);
+        w.set_is_forced(t.is_forced);
+        w.set_is_hearing_impaired(t.is_hearing_impaired);
+        match &t.vtt_url {
+            Some(url) => {
+                w.set_delivery(SubtitleDelivery::External);
+                w.set_url(url.as_str());
+            }
+            None => w.set_delivery(SubtitleDelivery::Burn),
+        }
+    }
+}
+
+/// The wire kind of a `services::segments` type; `None` for one the schema
+/// does not know, which a client could not act on.
+fn segment_kind(kind: &str) -> Option<SegmentKind> {
+    Some(match kind {
+        "Intro" => SegmentKind::Intro,
+        "Outro" => SegmentKind::Outro,
+        "Recap" => SegmentKind::Recap,
+        "Preview" => SegmentKind::Preview,
+        "Commercial" => SegmentKind::Commercial,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

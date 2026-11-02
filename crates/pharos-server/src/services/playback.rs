@@ -1273,6 +1273,10 @@ pub struct Grant {
     pub negotiated: Negotiated,
     /// The raw file for a direct play, else the transcoding URL.
     pub stream_url: String,
+    /// The audio track the playback starts on, when the item has one.
+    pub audio_stream_index: Option<u32>,
+    /// The subtitle it starts with; `None` is off.
+    pub subtitle_stream_index: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -1318,15 +1322,17 @@ pub async fn grant(
     } else {
         user_data.last_played_position_ticks
     };
-    // The same start track PlaybackInfo picks: the user's remembered track,
-    // else their language rules. Subtitle URLs are not built here, so the
-    // streams need no subtitle context.
-    let streams = pharos_jellyfin_api::dto::build_media_streams_with_subtitles(
-        &item.probe,
-        negotiated.is_video,
-        None,
-    );
+    // The same start tracks PlaybackInfo picks: the user's remembered track,
+    // else their language rules.
+    let streams = crate::services::watch::streams(&item).await;
     let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
+    let subtitle = pick_subtitle(
+        &audio,
+        &streams,
+        &item.probe,
+        &profile.subtitle_profiles,
+        r.subtitle_stream_index,
+    );
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
             "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
@@ -1385,6 +1391,8 @@ pub async fn grant(
         item_wire_id,
         negotiated,
         stream_url,
+        audio_stream_index: audio.index,
+        subtitle_stream_index: subtitle,
     })
 }
 

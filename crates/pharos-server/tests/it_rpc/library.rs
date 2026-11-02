@@ -1994,3 +1994,221 @@ async fn native_queries_are_counted_by_shape_and_outcome() {
     assert_eq!(count("season", "error"), 1);
     assert_eq!(count("stored", "ok"), 1);
 }
+
+/// 013 FR-003/FR-005 over the wire: `Library.detail` lists the tracks
+/// PlaybackInfo lists and the segments `/MediaSegments/{id}` serves, so the
+/// native player and jellyfin-web offer the same picks and skips. A text
+/// subtitle comes with its WebVTT; an image one plays only burned in.
+/// Disarm check: with `detail` writing no segments, or a PGS track given a
+/// URL, the comparison fails.
+#[actix_web::test]
+async fn native_detail_lists_the_tracks_and_segments_the_jellyfin_routes_serve() {
+    use actix_web::test;
+    use pharos_api::pharos_capnp::{detail_result, SegmentKind, SubtitleDelivery};
+    use pharos_core::{
+        AudioTrack, DetectedSegment, MediaChapter, MediaItem, MediaKind, MediaSegmentKind,
+        MediaSegmentStore as _, MediaStore as _, SubtitleTrack,
+    };
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut item = MediaItem {
+        id: 104,
+        path: "/libA/Tracked.mkv".into(),
+        title: "Tracked".into(),
+        kind: MediaKind::Movie,
+        ..MediaItem::default()
+    };
+    item.probe.duration_ms = Some(1_800_000);
+    item.probe.video_codec = Some("h264".into());
+    item.probe.audio_tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            language: Some("eng".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("ac3".into()),
+            language: Some("jpn".into()),
+            title: Some("Japanese".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.subtitle_tracks = vec![
+        SubtitleTrack {
+            stream_index: 3,
+            codec: Some("subrip".into()),
+            language: Some("eng".into()),
+            is_forced: true,
+            ..SubtitleTrack::default()
+        },
+        SubtitleTrack {
+            stream_index: 4,
+            codec: Some("hdmv_pgs_subtitle".into()),
+            language: Some("eng".into()),
+            ..SubtitleTrack::default()
+        },
+    ];
+    item.probe.chapters = vec![
+        MediaChapter {
+            start_ms: 0,
+            end_ms: 90_000,
+            title: "Opening".into(),
+        },
+        MediaChapter {
+            start_ms: 90_000,
+            end_ms: 1_800_000,
+            title: "Part One".into(),
+        },
+    ];
+    fx.state.stores.put(item).await.unwrap();
+    fx.state
+        .stores
+        .set_media_segments(
+            104,
+            &[DetectedSegment {
+                kind: MediaSegmentKind::Outro,
+                start_ms: 1_700_000,
+                end_ms: 1_790_000,
+                detector: "blackframe".into(),
+                confidence: 0.8,
+            }],
+            pharos_core::SEGMENT_SCHEMA_VERSION,
+        )
+        .await
+        .unwrap();
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    req.get().init_id().set_real(104);
+    let reply = req.send().promise.await.expect("detail");
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail refused");
+    };
+    let d = d.unwrap();
+    let text = |t: capnp::Result<capnp::text::Reader<'_>>| t.unwrap().to_str().unwrap().to_owned();
+
+    let audio: Vec<(u32, String, bool)> = d
+        .get_audio_tracks()
+        .unwrap()
+        .iter()
+        .map(|t| (t.get_index(), text(t.get_language()), t.get_is_default()))
+        .collect();
+    let subtitles: Vec<(u32, bool, SubtitleDelivery, String)> = d
+        .get_subtitle_tracks()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t.get_index(),
+                t.get_is_forced(),
+                t.get_delivery().unwrap(),
+                text(t.get_url()),
+            )
+        })
+        .collect();
+    let id = WireId::Real(104);
+    assert_eq!(
+        audio,
+        vec![(1, "eng".to_owned(), true), (2, "jpn".to_owned(), false)]
+    );
+    assert_eq!(
+        subtitles,
+        vec![
+            (
+                3,
+                true,
+                SubtitleDelivery::External,
+                format!("/videos/{id}/subtitles/3/stream.vtt")
+            ),
+            (4, false, SubtitleDelivery::Burn, String::new()),
+        ]
+    );
+
+    // The same streams PlaybackInfo hands jellyfin-web, by index and kind.
+    let req = test::TestRequest::post()
+        .uri(&format!("/Items/{id}/PlaybackInfo"))
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .set_json(serde_json::json!({}))
+        .to_request();
+    let info: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let jf: Vec<(String, u64)> = info["MediaSources"][0]["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["Type"] != "Video")
+        .map(|s| {
+            (
+                s["Type"].as_str().unwrap().to_owned(),
+                s["Index"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let native: Vec<(String, u64)> = audio
+        .iter()
+        .map(|a| ("Audio".to_owned(), u64::from(a.0)))
+        .chain(
+            subtitles
+                .iter()
+                .map(|s| ("Subtitle".to_owned(), u64::from(s.0))),
+        )
+        .collect();
+    assert_eq!(native, jf);
+
+    // The WebVTT route serves the URL the detail names (the fixture has no
+    // file: anything but 401/404-route got past auth and routing).
+    let vtt = test::TestRequest::get()
+        .uri(&subtitles[0].3)
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .to_request();
+    let status = test::call_service(&app, vtt).await.status();
+    assert_ne!(status, actix_web::http::StatusCode::UNAUTHORIZED);
+
+    let segments: Vec<(SegmentKind, u64, u64)> = d
+        .get_segments()
+        .unwrap()
+        .iter()
+        .map(|s| (s.get_kind().unwrap(), s.get_start_ms(), s.get_end_ms()))
+        .collect();
+    assert_eq!(
+        segments,
+        vec![
+            (SegmentKind::Intro, 0, 90_000),
+            (SegmentKind::Outro, 1_700_000, 1_790_000)
+        ]
+    );
+    let req = test::TestRequest::get()
+        .uri(&format!("/MediaSegments/{id}"))
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .to_request();
+    let jf: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    let jf: Vec<(String, u64, u64)> = jf["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["Type"].as_str().unwrap().to_owned(),
+                s["StartTicks"].as_u64().unwrap() / 10_000,
+                s["EndTicks"].as_u64().unwrap() / 10_000,
+            )
+        })
+        .collect();
+    assert_eq!(
+        jf,
+        vec![
+            ("Intro".to_owned(), 0, 90_000),
+            ("Outro".to_owned(), 1_700_000, 1_790_000)
+        ]
+    );
+    // Trickplay is off in this fixture, so no sprite set is advertised.
+    assert_eq!(d.get_trickplay().unwrap().len(), 0);
+}
