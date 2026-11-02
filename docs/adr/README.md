@@ -76,3 +76,4 @@ optional **Alternatives considered** / **References**).
 | [0031](0031-item-file-auth-cookie.md) | Item file routes require auth; the `JellyfinAuth` cookie authenticates only GET/HEAD byte routes | Accepted |
 | [0032](0032-syncplay-members-record-their-user.md) | SyncPlay group members record their user (persisted and on the bus, absent = sees nothing); a queue change needs every member to see it | Accepted |
 | [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Accepted |
+| [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
