@@ -9,6 +9,7 @@ mod common;
 
 mod bootstrap;
 mod client;
+mod client_api;
 mod connect;
 mod gate;
 mod library;

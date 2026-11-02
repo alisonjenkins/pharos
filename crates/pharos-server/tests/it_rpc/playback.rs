@@ -15,11 +15,11 @@ use pharos_server::services::playback::{self, Capabilities, NegotiateRequest, Pl
 
 use crate::common::Fixture;
 
-const MOVIE: u64 = 300;
+pub(crate) const MOVIE: u64 = 300;
 const BOOK: u64 = 301;
 const NATIVE_UA: &str = "pharos-native-test/1.0";
 
-async fn seed_playable(fx: &Fixture) {
+pub(crate) async fn seed_playable(fx: &Fixture) {
     let stores = &fx.state.stores;
     stores
         .put(MediaItem {
