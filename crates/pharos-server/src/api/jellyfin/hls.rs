@@ -5411,7 +5411,7 @@ mod tests {
     }
 }
 
-/// Prewarms for a play session that selected a grouped edition (B246).
+/// Prewarms for a play session that selected a grouped edition (B252).
 #[cfg(test)]
 mod prewarm_edition_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
