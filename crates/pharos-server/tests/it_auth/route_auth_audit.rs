@@ -124,6 +124,9 @@ fn audit_rows() -> Vec<(Method, &'static str, Expect)> {
         (Method::GET, "/System/Logs", Auth),
         (Method::GET, "/System/ActivityLog/Entries", Auth),
         (Method::POST, "/System/Configuration", Auth),
+        // B267: a named section's stored values include live TV provider
+        // credentials.
+        (Method::GET, "/System/Configuration/livetv", Auth),
         (Method::GET, "/Videos/1/stream", Auth),
         (Method::GET, "/Videos/1/master.m3u8", Auth),
         (Method::GET, "/Videos/1/main.m3u8", Auth),
