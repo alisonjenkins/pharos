@@ -1708,3 +1708,259 @@ async fn native_search_agrees_with_the_jellyfin_search_hints_route() {
         assert_eq!(ids, hinted, "{term}");
     }
 }
+
+/// The names (and index numbers) a `Library.query` page lists, in order.
+async fn listed(
+    session: &session::Client,
+    parent: &str,
+    kinds: &[Kind],
+    sort_by: &str,
+) -> Vec<(String, Option<u64>)> {
+    let (_, items) = wire_query(session, Some(parent), kinds, sort_by, false, "", &[], 0, 0).await;
+    items
+        .iter()
+        .map(|i| {
+            (
+                i["Name"].as_str().unwrap().to_owned(),
+                i["IndexNumber"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// The error kind a `Library.query` answers instead of a page.
+async fn query_refusal(session: &session::Client, parent: &str, kinds: &[Kind]) -> String {
+    use pharos_api::pharos_capnp::error;
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    match WireId::parse(parent).unwrap() {
+        WireId::Real(n) => q.reborrow().init_parent_id().set_real(n),
+        WireId::Synth(n) => q.reborrow().init_parent_id().set_synth(n),
+    }
+    let mut list = q.init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    let reply = req.send().promise.await.unwrap();
+    let items_result::Error(e) = reply.get().unwrap().get_result().unwrap().which().unwrap() else {
+        panic!("the listing answered a page");
+    };
+    match e.unwrap().get_kind().which().unwrap() {
+        error::kind::NotPermitted(what) => {
+            format!("not permitted: {}", what.unwrap().to_str().unwrap())
+        }
+        error::kind::Unavailable(what) => {
+            format!("unavailable: {}", what.unwrap().to_str().unwrap())
+        }
+        _ => "other".to_owned(),
+    }
+}
+
+/// The native browse hierarchy for TV (V230): a library's series, a series'
+/// seasons in number order, a season's episodes in episode order, each a
+/// grouping the same `Library.query` answers when asked for the kind.
+/// Seasons outside a series are refused, not folded across shows.
+/// Disarm check: with `grouping_of` answering `None`, the series listing is
+/// empty (B153's "matches nothing").
+#[actix_web::test]
+async fn a_tv_library_lists_its_series_then_seasons_then_episodes() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+
+    assert_eq!(
+        listed(&session, &tv, &[Kind::Series], "SortName").await,
+        [("Mature".to_owned(), None), ("Show".to_owned(), None)]
+    );
+
+    let show = series_id_for_key(Some("/libTV/Show"), "Show");
+    assert_eq!(
+        listed(&session, &show, &[Kind::Season], "").await,
+        [
+            ("Season 1".to_owned(), Some(1)),
+            ("Season 2".to_owned(), Some(2))
+        ]
+    );
+
+    let season = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    let episodes = listed(&session, &season, &[], "ParentIndexNumber,IndexNumber").await;
+    let numbers: Vec<_> = episodes.iter().map(|(_, n)| *n).collect();
+    assert_eq!(numbers, [Some(1), Some(2)], "{episodes:?}");
+
+    assert_eq!(
+        query_refusal(&session, &tv, &[Kind::Season]).await,
+        "not permitted: seasons outside a series"
+    );
+}
+
+/// A user capped below a series' rating sees no tile for it: the grouping
+/// folds only the episodes the policy lets through (012 FR-007).
+#[actix_web::test]
+async fn grouped_listings_follow_the_parental_cap() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                max_parental_rating: Some(0),
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed(&session, &tv, &[Kind::Series], "SortName").await,
+        [("Show".to_owned(), None)]
+    );
+}
+
+/// Adds music libraries at /libMusic (artists "Alpha", with albums "First"
+/// on two discs and "Second", and "Beta", album "Third") and /libOther
+/// (artist "Gamma"), and returns the first's wire id.
+async fn seed_music_libraries(fx: &crate::common::Fixture) -> String {
+    use pharos_core::{
+        LibraryKind, LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _,
+    };
+    let wire = "d".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("Music", "/libMusic", LibraryKind::Music, &wire)
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .upsert_library("Other", "/libOther", LibraryKind::Music, &"e".repeat(32))
+        .await
+        .unwrap();
+    let tracks = [
+        (701, "libMusic", "Alpha", "First", 2, 1, "Disc two opener"),
+        (702, "libMusic", "Alpha", "First", 1, 2, "Second song"),
+        (703, "libMusic", "Alpha", "First", 1, 1, "Opener"),
+        (704, "libMusic", "Alpha", "Second", 1, 1, "Only song"),
+        (705, "libMusic", "Beta", "Third", 1, 1, "Beta song"),
+        (706, "libOther", "Gamma", "Elsewhere", 1, 1, "Gamma song"),
+    ];
+    for (id, lib, artist, album, disc, track, title) in tracks {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/{lib}/{artist}/{album}/{disc}-{track}.flac").into(),
+                title: title.into(),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    artist: Some(artist.into()),
+                    album_artist: Some(artist.into()),
+                    album: Some(album.into()),
+                    disc_number: Some(disc),
+                    track_number: Some(track),
+                    ..MediaProbe::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    wire
+}
+
+/// The native browse hierarchy for music (V230): a library's artists (only
+/// its own), an artist's albums, an album's tracks in disc then track order.
+/// Disarm check: with `scoped_tracks` ignoring the parent, "Gamma" from the
+/// other library joins the artist list.
+#[actix_web::test]
+async fn a_music_library_lists_its_artists_then_albums_then_tracks() {
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let music = seed_music_libraries(&fx).await;
+    let names =
+        |rows: Vec<(String, Option<u64>)>| rows.into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+
+    assert_eq!(
+        names(listed(&session, &music, &[Kind::Artist], "").await),
+        ["Alpha", "Beta"]
+    );
+    assert_eq!(
+        names(listed(&session, &music, &[Kind::Album], "SortName").await),
+        ["First", "Second", "Third"]
+    );
+    assert_eq!(
+        names(
+            listed(
+                &session,
+                &artist_id_for("Alpha"),
+                &[Kind::Album],
+                "SortName"
+            )
+            .await
+        ),
+        ["First", "Second"]
+    );
+    assert_eq!(
+        names(
+            listed(
+                &session,
+                &album_id_for("First"),
+                &[],
+                "ParentIndexNumber,IndexNumber"
+            )
+            .await
+        ),
+        ["Opener", "Second song", "Disc two opener"]
+    );
+}
+
+/// Every native `Library.query` counts under
+/// `pharos_rpc_query_total{shape,outcome}`: which listing answered it and
+/// whether it had a page, a refusal counted as `error`.
+/// Disarm check: with `write_grouped` skipping `record_query`, the series
+/// and season counts stay at 0.
+#[actix_web::test]
+async fn native_queries_are_counted_by_shape_and_outcome() {
+    use crate::telemetry::counter;
+    use pharos_jellyfin_api::dto::series_id_for_key;
+
+    let fx = crate::common::seed_rich().await;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let tv = seed_tv_library(&fx).await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = crate::telemetry::connect(&fx);
+            let session = crate::telemetry::session_for(&client, &fx.user_token).await;
+            listed(&session, &tv, &[Kind::Series], "").await;
+            let show = series_id_for_key(Some("/libTV/Show"), "Show");
+            listed(&session, &show, &[Kind::Season], "").await;
+            listed(&session, &show, &[], "").await;
+            query_refusal(&session, &tv, &[Kind::Season]).await;
+        })
+        .await;
+    let count = |shape, outcome| {
+        counter(
+            &snapshotter,
+            "pharos_rpc_query_total",
+            &[("shape", shape), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(count("series", "ok"), 1);
+    assert_eq!(count("season", "ok"), 1);
+    assert_eq!(count("season", "error"), 1);
+    assert_eq!(count("stored", "ok"), 1);
+}
