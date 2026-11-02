@@ -1029,6 +1029,44 @@ mod tests {
         );
     }
 
+    /// V177 — every refusal pays an argon2 verify through the shared slots
+    /// before it answers. With no slot free each one is a busy backend fault,
+    /// not an `InvalidCredentials` that came back without verifying.
+    #[tokio::test]
+    async fn every_refusal_path_waits_for_a_verify_slot() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let off = seed(&auth, "off", "hunter2").await;
+        auth.users()
+            .set_policy(
+                off.id,
+                UserPolicy {
+                    is_disabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let no_slots = Arc::new(Semaphore::new(0));
+        let wait = Duration::from_millis(20);
+
+        for (case, name, password) in [
+            ("unknown user", "nobody", "hunter2"),
+            ("wrong password", "ali", "wrong"),
+            ("disabled user", "off", "hunter2"),
+        ] {
+            match auth
+                .judge_with(name, &SecretString::new(password), &no_slots, wait)
+                .await
+            {
+                Err(Denial::Backend(AuthError::Backend(msg))) => {
+                    assert_eq!(msg, "password check busy", "{case}");
+                }
+                other => panic!("{case}: refused without waiting for a slot: {other:?}"),
+            }
+        }
+    }
+
     /// The slot is handed back when the verify finishes, so one slot serves
     /// logins in turn, and the blocking path still accepts and refuses correctly.
     #[tokio::test]
