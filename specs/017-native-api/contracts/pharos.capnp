@@ -157,7 +157,7 @@ struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 # ---- playback -------------------------------------------------------------
 struct Capabilities { videoCodecs @0 :List(Text); audioCodecs @1 :List(Text); containers @2 :List(Text); maxBitrate @3 :UInt64; hdr @4 :Bool; }
 struct Decision {
-  method @0 :Text;             # direct_play | direct_stream | transcode
+  method @0 :Text;             # direct_play | audio_remux | video_remux | transcode (pharos_playback_decision_total's decision)
   directPlayBlock @1 :Text;    # same label values as pharos_playback_decision_total
   downgrade @2 :Text;
   streamUrl @3 :Text;          # HLS master or direct stream (HTTP, 017 §Scope)
