@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_id, item_summary, items_result, library as wire, user_state, Kind,
-    LibraryKind as WireKind,
+    home_result, item_detail, item_id, item_summary, items_result, library as wire, user_state,
+    Kind, LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
@@ -16,6 +16,7 @@ use crate::services::library::{
     self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QueryPage,
     QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::state::AppState;
 
 pub(super) struct Library {
     session: Rc<Session>,
@@ -238,19 +239,19 @@ impl server::library::Handler for Library {
                 return Ok(());
             }
         };
-        let item_not_found = Denial::NotFound { what: "item" };
-        // Synthesised items (series, season, album…) have no detail here yet.
-        let WireId::Real(id) = id else {
-            record_refusal(
-                "detail",
-                id,
-                RefusalReason::SynthUnsupported,
-                "synthesised items have no detail yet",
-            );
-            item_not_found.write(results.get().init_result().init_error());
-            return Ok(());
-        };
         let state = &self.session.state;
+        let id = match id {
+            WireId::Real(id) => id,
+            synth @ WireId::Synth(_) => {
+                match synth_detail(state, &user, synth).await {
+                    Ok(dto) => {
+                        write_synth_detail(results.get().init_result().init_detail(), synth, &dto)
+                    }
+                    Err(denial) => denial.write(results.get().init_result().init_error()),
+                }
+                return Ok(());
+            }
+        };
         let (item, user_data) = match library::detail(state, &user, id).await {
             Ok(found) => found,
             Err(e) => {
@@ -501,8 +502,8 @@ pub enum RefusalReason {
     NotFound,
     /// The store could not say.
     StoreUnavailable,
-    /// The call has no answer for a synthesised id.
-    SynthUnsupported,
+    /// A synthesised item the user's policy withholds.
+    SynthHidden,
 }
 
 impl RefusalReason {
@@ -511,7 +512,7 @@ impl RefusalReason {
             RefusalReason::Hidden(label) => label,
             RefusalReason::NotFound => "not_found",
             RefusalReason::StoreUnavailable => "store_unavailable",
-            RefusalReason::SynthUnsupported => "synth_unsupported",
+            RefusalReason::SynthHidden => "synth_hidden",
         }
     }
 }
@@ -541,6 +542,116 @@ pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReas
         tracing::warn!(item.id = %id, call, id_kind, reason = reason.label(), error = %detail, "native item call: store unavailable");
     } else {
         tracing::info!(item.id = %id, call, id_kind, reason = reason.label(), detail, "native item call: refused");
+    }
+}
+
+/// The synthesised item `id` (library view, series, season, album…) as the
+/// Jellyfin `/Items/{id}` projection, resolved by the same
+/// `synth_item_json` so the two APIs agree and apply the same access rules.
+/// A refusal is recorded and answers like an id that names nothing.
+async fn synth_detail(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: WireId,
+) -> Result<serde_json::Value, Denial> {
+    let item_not_found = Denial::NotFound { what: "item" };
+    match crate::api::jellyfin::items::synth_item_json(state, user, &id.to_string()).await {
+        Ok(Some(dto)) => Ok(dto),
+        Ok(None) => {
+            record_refusal(
+                "detail",
+                id,
+                RefusalReason::NotFound,
+                "no such synthesised item",
+            );
+            Err(item_not_found)
+        }
+        Err(e) if e.as_response_error().status_code().is_server_error() => {
+            record_refusal(
+                "detail",
+                id,
+                RefusalReason::StoreUnavailable,
+                &e.to_string(),
+            );
+            Err(Denial::Unavailable {
+                dependency: "media store",
+            })
+        }
+        Err(e) => {
+            record_refusal("detail", id, RefusalReason::SynthHidden, &e.to_string());
+            Err(item_not_found)
+        }
+    }
+}
+
+/// The text field `key` of a Jellyfin DTO, empty when absent.
+fn dto_str<'a>(dto: &'a serde_json::Value, key: &str) -> &'a str {
+    dto.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+}
+
+fn synth_kind(dto: &serde_json::Value) -> Kind {
+    match dto_str(dto, "Type") {
+        "Series" => Kind::Series,
+        "Season" => Kind::Season,
+        "MusicAlbum" => Kind::Album,
+        "MusicArtist" => Kind::Artist,
+        "Playlist" => Kind::Playlist,
+        "CollectionFolder" | "UserView" => Kind::Library,
+        _ => Kind::Collection,
+    }
+}
+
+/// A synthesised item's `ItemDetail` from its Jellyfin DTO: name, kind,
+/// overview, genres, year, Primary image and parentage, whichever it has.
+fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
+    let kind = synth_kind(dto);
+    let mut summary = out.reborrow().init_summary();
+    set_item_id(summary.reborrow().init_id(), id);
+    summary.set_kind(kind);
+    summary.set_name(dto_str(dto, "Name"));
+    if kind == Kind::Library {
+        summary.set_library_kind(match dto_str(dto, "CollectionType") {
+            "movies" => WireKind::Movies,
+            "tvshows" => WireKind::TvShows,
+            "music" => WireKind::Music,
+            "books" => WireKind::Books,
+            _ => WireKind::Mixed,
+        });
+    }
+    if let Some(year) = dto
+        .get("ProductionYear")
+        .and_then(|y| y.as_u64())
+        .and_then(|y| u16::try_from(y).ok())
+    {
+        summary.reborrow().init_year().set_some(year);
+    }
+    if let Some(tag) = dto.pointer("/ImageTags/Primary").and_then(|t| t.as_str()) {
+        let mut image = summary.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_tag(tag);
+        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto_str(dto, "Id")).as_str());
+    }
+    if let Some(parent) = WireId::parse(dto_str(dto, "ParentId")) {
+        set_item_id(summary.reborrow().init_parent_id(), parent);
+    }
+    summary.set_series_name(dto_str(dto, "SeriesName"));
+    if let Some(n) = dto
+        .get("IndexNumber")
+        .and_then(|n| n.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        summary.init_index_number().set_some(n);
+    }
+    out.set_overview(dto_str(dto, "Overview"));
+    let genres: Vec<&str> = dto
+        .get("Genres")
+        .and_then(|g| g.as_array())
+        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
+        .unwrap_or_default();
+    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
+    let mut list = out.init_genres(count);
+    for (i, genre) in (0..count).zip(&genres) {
+        list.set(i, genre);
     }
 }
 
@@ -665,7 +776,7 @@ mod tests {
             [
                 RefusalReason::NotFound,
                 RefusalReason::StoreUnavailable,
-                RefusalReason::SynthUnsupported,
+                RefusalReason::SynthHidden,
             ]
             .map(RefusalReason::label),
         );
