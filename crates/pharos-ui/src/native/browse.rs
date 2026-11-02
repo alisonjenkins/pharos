@@ -67,6 +67,9 @@ pub enum Plan {
     Grid,
     /// A TV library: its series, by name.
     SeriesGrid,
+    /// A library of mixed kinds: its series, if it has any, ahead of its
+    /// other stored items; episodes appear only inside their series.
+    MixedLibrary,
     MusicLibrary,
     /// A series: its seasons, the first regular one shown.
     Series,
@@ -85,6 +88,7 @@ pub fn plan(detail: Option<&Detail>) -> Plan {
     match (item.kind, item.library_kind) {
         (ItemKind::Library, Some(LibraryKind::TvShows)) => Plan::SeriesGrid,
         (ItemKind::Library, Some(LibraryKind::Music)) => Plan::MusicLibrary,
+        (ItemKind::Library, Some(LibraryKind::Mixed)) => Plan::MixedLibrary,
         (ItemKind::Series, _) => Plan::Series,
         (ItemKind::Season, _) => Plan::Season {
             series: item.parent,
@@ -92,6 +96,34 @@ pub fn plan(detail: Option<&Detail>) -> Plan {
         (ItemKind::Artist, _) => Plan::Artist,
         (ItemKind::Album, _) => Plan::Album,
         _ => Plan::Grid,
+    }
+}
+
+/// A mixed library's listing: its series, then its stored items other than
+/// episodes, which the series tiles stand for. With no series, the stored
+/// items as they are.
+pub fn series_first(series: Page, stored: Page) -> Page {
+    if series.items.is_empty() {
+        return stored;
+    }
+    let episodes = stored
+        .items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Episode)
+        .count();
+    let rest = stored
+        .items
+        .into_iter()
+        .filter(|i| i.kind != ItemKind::Episode);
+    let total = series.total
+        + stored
+            .total
+            .saturating_sub(u32::try_from(episodes).unwrap_or(u32::MAX));
+    let items: Vec<Item> = series.items.into_iter().chain(rest).collect();
+    Page {
+        total: total.max(u32::try_from(items.len()).unwrap_or(u32::MAX)),
+        items,
+        start: 0,
     }
 }
 
@@ -130,6 +162,17 @@ pub async fn load<A: PharosApi>(
             title,
             page: list(id, Some(ItemKind::Series), "SortName").await?,
         },
+        (Plan::MixedLibrary, _) => {
+            let (series, stored) = try_join(
+                list(id, Some(ItemKind::Series), "SortName"),
+                list(id, None, "SortName"),
+            )
+            .await?;
+            Browse::Grid {
+                title,
+                page: series_first(series, stored),
+            }
+        }
         (Plan::MusicLibrary, _) => {
             let (artists, albums) = try_join(
                 list(id, Some(ItemKind::Artist), "SortName"),
@@ -762,9 +805,24 @@ mod tests {
         assert_eq!(plan(Some(&library(LibraryKind::TvShows))), Plan::SeriesGrid);
         assert_eq!(plan(Some(&library(LibraryKind::Music))), Plan::MusicLibrary);
         assert_eq!(plan(Some(&library(LibraryKind::Movies))), Plan::Grid);
+        assert_eq!(plan(Some(&library(LibraryKind::Mixed))), Plan::MixedLibrary);
         assert_eq!(plan(None), Plan::Grid);
         let artist = detail(item(ItemRef::Synth(2), ItemKind::Artist, "A"));
         assert_eq!(plan(Some(&artist)), Plan::Artist);
+    }
+
+    #[test]
+    fn a_mixed_library_shows_series_in_place_of_their_episodes() {
+        let series = page(vec![item(SERIES, ItemKind::Series, "Show")]);
+        let stored = page(vec![
+            item(ItemRef::Real(1), ItemKind::Episode, "Pilot"),
+            item(ItemRef::Real(2), ItemKind::Movie, "Film"),
+        ]);
+        let mixed = series_first(series, stored.clone());
+        let names: Vec<_> = mixed.items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["Show", "Film"]);
+        assert_eq!(mixed.total, 2);
+        assert_eq!(series_first(Page::default(), stored.clone()), stored);
     }
 
     #[test]
