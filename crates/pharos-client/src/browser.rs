@@ -22,6 +22,16 @@ pub struct Closed {
     pub reason: String,
 }
 
+impl Closed {
+    /// No close frame arrived (RFC 6455 code 1006).
+    fn abnormal() -> Self {
+        Closed {
+            code: 1006,
+            reason: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     /// The browser refused to create the socket (a malformed URL, or a
@@ -52,19 +62,20 @@ impl Connection {
     /// Resolves once the socket closes, with its close frame. Resolves at
     /// most once; later calls resolve immediately with code 1006.
     pub async fn closed(&mut self) -> Closed {
-        let abnormal = || Closed {
-            code: 1006,
-            reason: String::new(),
-        };
         match self.closed.take() {
-            Some(rx) => rx.await.unwrap_or_else(|_| abnormal()),
-            None => abnormal(),
+            Some(rx) => rx.await.unwrap_or_else(|_| Closed::abnormal()),
+            None => Closed::abnormal(),
         }
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        // The close event fires after the handlers are freed; a JS call into
+        // a dropped closure throws.
+        self.socket.set_onmessage(None);
+        self.socket.set_onopen(None);
+        self.socket.set_onclose(None);
         let _ = self.socket.close();
     }
 }
@@ -116,23 +127,21 @@ pub async fn connect(url: &str) -> Result<Connection, ConnectError> {
         _open: open,
     };
 
-    let mut closed = Some(closed_rx);
     if opened_rx.await.is_err() {
-        let why = match closed.take() {
-            Some(rx) => rx.await.unwrap_or(Closed {
-                code: 1006,
-                reason: String::new(),
-            }),
-            None => Closed {
-                code: 1006,
-                reason: String::new(),
-            },
-        };
+        let why = closed_rx.await.unwrap_or_else(|_| Closed::abnormal());
         return Err(ConnectError::NotOpened(why));
     }
 
     let sender = socket.clone();
     let writer = ChunkWriter::new(move |bytes: &[u8]| {
+        // send() on a closing or closed socket discards the bytes without
+        // an error, so a call made then would wait for a reply forever.
+        if sender.ready_state() != WebSocket::OPEN {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("websocket not open (readyState {})", sender.ready_state()),
+            ));
+        }
         sender
             .send_with_u8_array(bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, format!("{e:?}")))
@@ -143,7 +152,7 @@ pub async fn connect(url: &str) -> Result<Connection, ConnectError> {
     });
     Ok(Connection {
         bootstrap: client,
-        closed,
+        closed: Some(closed_rx),
         socket,
         _handlers: handlers,
     })
