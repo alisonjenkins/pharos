@@ -871,6 +871,34 @@ pub async fn search_hits(
     })
 }
 
+/// How many matches a native `Library.search` answers when the caller names
+/// no limit: the page the Jellyfin search box shows. The most it answers when
+/// one is named is [`QUERY_MAX`], the cap every native listing shares.
+pub const SEARCH_DEFAULT: u32 = 25;
+
+/// The stored items `user` may see that match `text`, best match first, at
+/// most `limit` (0 is [`SEARCH_DEFAULT`], capped at [`QUERY_MAX`]). The
+/// matching and the policy scope are `/Search/Hints`'s, so the two agree on
+/// the same term. Blank `text` matches nothing.
+pub async fn search(
+    state: &AppState,
+    user: &User,
+    text: &str,
+    limit: u32,
+) -> Result<Vec<MediaItem>, DomainError> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = match limit {
+        0 => SEARCH_DEFAULT,
+        n => n.min(QUERY_MAX),
+    };
+    let visible = visible_items(state, user).await?;
+    let mut hits = search_hits(state, visible.as_deref(), text, None, limit).await?;
+    hits.truncate(limit as usize);
+    Ok(hits)
+}
+
 /// Whether `/Items?ParentId={parent_wire_id}` lists anything `user` may see.
 /// A person, studio, tag or box set has no library of its own: it is
 /// visible through its items, and only through them.
