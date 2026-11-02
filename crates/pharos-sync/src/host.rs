@@ -9,6 +9,7 @@
 //! `pharos_transcode::FfmpegBackend`. Stable Rust, no `async-trait`
 //! macro dep.
 
+use crate::group::GroupHandle;
 use pharos_core::{SecretString, UserId};
 use std::future::Future;
 use std::pin::Pin;
@@ -18,4 +19,12 @@ pub trait TokenResolver: Send + Sync + 'static {
         &'a self,
         token: &'a SecretString,
     ) -> Pin<Box<dyn Future<Output = Option<UserId>> + Send + 'a>>;
+
+    /// Whether `user` may join `group`, asked before a `Join` admits them. A
+    /// refusal reads to the client as an unknown group.
+    fn may_join<'a>(
+        &'a self,
+        user: UserId,
+        group: &'a GroupHandle,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 }

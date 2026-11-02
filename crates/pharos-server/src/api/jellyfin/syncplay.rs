@@ -1131,11 +1131,13 @@ fn play_state_str(s: pharos_sync::messages::GroupPlayState) -> &'static str {
 /// Where a group was withheld from a user: the `route` label of
 /// `pharos_syncplay_group_hidden_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GroupHiddenRoute {
+pub(crate) enum GroupHiddenRoute {
     List,
     Join,
     /// A `SyncPlayJoinGroup` frame on `/socket`.
     Socket,
+    /// A `Join` on the native `/sync/v1/ws`.
+    Native,
 }
 
 impl GroupHiddenRoute {
@@ -1144,6 +1146,7 @@ impl GroupHiddenRoute {
             GroupHiddenRoute::List => "list",
             GroupHiddenRoute::Join => "join",
             GroupHiddenRoute::Socket => "socket",
+            GroupHiddenRoute::Native => "native",
         }
     }
 }
@@ -1182,7 +1185,7 @@ async fn may_see_queue(
 /// `route`. The queue comes from the group's actor, or from its persisted
 /// snapshot when the actor answers nothing (it lives on another replica). A
 /// queue that cannot be read refuses a restricted user.
-pub(super) async fn may_join(
+pub(crate) async fn may_join(
     state: &crate::state::AppState,
     user: &pharos_core::User,
     handle: &GroupHandle,
@@ -1687,12 +1690,14 @@ mod tests {
             GroupHiddenRoute::List,
             GroupHiddenRoute::Join,
             GroupHiddenRoute::Socket,
+            GroupHiddenRoute::Native,
         ];
         let labels: std::collections::HashSet<_> = routes.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), routes.len());
         assert_eq!(GroupHiddenRoute::List.label(), "list");
         assert_eq!(GroupHiddenRoute::Join.label(), "join");
         assert_eq!(GroupHiddenRoute::Socket.label(), "socket");
+        assert_eq!(GroupHiddenRoute::Native.label(), "native");
     }
 
     /// B265 / V201: a group whose actor answers nothing (it lives on another

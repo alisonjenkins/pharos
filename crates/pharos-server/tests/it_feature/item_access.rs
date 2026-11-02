@@ -918,3 +918,120 @@ async fn a_syncplay_group_answers_only_a_user_who_may_see_its_queue() {
         leaked.join("\n")
     );
 }
+
+/// The type of the native socket's answer to a `Join` on `group_id`:
+/// `joined`, or `error` when the group is refused.
+async fn native_join_reply(
+    server: &actix_test::TestServer,
+    token: &str,
+    group_id: pharos_sync::messages::GroupId,
+) -> String {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    let url = server.url("/sync/v1/ws").replacen("http", "ws", 1);
+    let (_resp, mut ws) = awc::Client::new().ws(url).connect().await.unwrap();
+    for msg in [
+        serde_json::json!({
+            "type": "hello", "token": token, "client": "t", "device_id": "d", "name": "n",
+        }),
+        serde_json::json!({ "type": "join", "group_id": group_id }),
+    ] {
+        ws.send(awc::ws::Message::Text(msg.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let deadline = std::time::Duration::from_secs(5);
+    while let Ok(Some(frame)) = tokio::time::timeout(deadline, ws.next()).await {
+        if let Ok(awc::ws::Frame::Text(text)) = frame {
+            let msg: serde_json::Value = serde_json::from_slice(&text).unwrap();
+            let kind = msg["type"].as_str().unwrap_or_default();
+            if kind == "joined" || kind == "error" {
+                return kind.to_string();
+            }
+        }
+    }
+    "no answer".into()
+}
+
+/// B265 / V201: a `Join` on the native `/sync/v1/ws` admits only a user who
+/// may see the group's queue; a refusal reads as an unknown group.
+/// Disarm check: with `StoreTokenResolver::may_join` answering true, the user
+/// restricted to library B receives `joined`.
+#[actix_web::test]
+async fn a_native_sync_join_needs_a_visible_queue() {
+    use pharos_sync::group::GroupMsg;
+    use pharos_sync::messages::MemberId;
+    let f = seed_rich().await;
+    let sinks = pharos_sync::MemberSinks::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    // A group playing library A's item, kept alive by its leader.
+    let group = registry.create().await.unwrap();
+    let (tx, _leader_rx) = tokio::sync::mpsc::channel(64);
+    let leader = MemberId::new();
+    sinks.insert(leader, 1, tx);
+    let (reply, joined) = tokio::sync::oneshot::channel();
+    group
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: leader,
+            name: "admin".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+    joined.await.unwrap();
+    group
+        .tx
+        .send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec![pharos_jellyfin_api::dto::wire_item_id(f.rich_item_id)],
+            item_runtimes_ms: vec![None],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(group.snapshot().await.unwrap().queue_item_ids.len(), 1);
+
+    let state = f.state.clone();
+    let server = actix_test::start(move || {
+        actix_web::App::new()
+            .app_data(state.clone())
+            .app_data(actix_web::web::Data::new(registry.clone()))
+            .app_data(actix_web::web::Data::new(sinks.clone()))
+            .app_data(actix_web::web::Data::new(
+                pharos_server::sync_resolver::build(state.clone().into_inner()),
+            ))
+            .configure(pharos_sync::ws::register)
+    });
+
+    let mut replies = Vec::new();
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    replies.push((
+        "library B",
+        native_join_reply(&server, &f.user_token, group.group_id).await,
+    ));
+    restrict_to_library_a(&f).await;
+    replies.push((
+        "library A",
+        native_join_reply(&server, &f.user_token, group.group_id).await,
+    ));
+    replies.push((
+        "admin",
+        native_join_reply(&server, &f.admin_token, group.group_id).await,
+    ));
+    assert_eq!(
+        replies,
+        vec![
+            ("library B", "error".to_string()),
+            ("library A", "joined".to_string()),
+            ("admin", "joined".to_string()),
+        ]
+    );
+}

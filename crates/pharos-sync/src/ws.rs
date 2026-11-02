@@ -15,7 +15,7 @@ use super::registry::GroupRegistry;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{AggregatedMessage, Session};
 use futures_util::StreamExt;
-use pharos_core::SecretString;
+use pharos_core::{SecretString, UserId};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -76,7 +76,7 @@ async fn handle_connection<S>(
     let started = Instant::now();
     let conn_gen = WS_CONN_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // 1) wait for Hello, authenticate.
-    let (member_name, member_id) =
+    let (member_name, member_id, user_id) =
         match expect_hello(&mut session, &mut stream, resolver.as_ref()).await {
             Ok(v) => v,
             Err(e) => {
@@ -99,7 +99,15 @@ async fn handle_connection<S>(
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
 
     // 4) wait for Join (or CreateAndJoin).
-    let group_handle = match expect_join(&mut session, &mut stream, &registry).await {
+    let group_handle = match expect_join(
+        &mut session,
+        &mut stream,
+        &registry,
+        resolver.as_ref(),
+        user_id,
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => {
             close_with_error(&mut session, ErrorCode::UnknownGroup, &e.to_string()).await;
@@ -195,7 +203,7 @@ async fn expect_hello<S>(
     session: &mut Session,
     stream: &mut S,
     resolver: &dyn TokenResolver,
-) -> Result<(String, MemberId), WsError>
+) -> Result<(String, MemberId, UserId), WsError>
 where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -224,15 +232,16 @@ where
     let user_id = resolver.resolve(&token).await.ok_or(WsError::AuthFailed)?;
     // Use the user's UUID as the member id base — but generate a new one
     // per connection so a user with multiple devices doesn't conflict.
-    let _ = user_id;
     let _ = session;
-    Ok((name, MemberId::new()))
+    Ok((name, MemberId::new(), user_id))
 }
 
 async fn expect_join<S>(
     session: &mut Session,
     stream: &mut S,
     registry: &GroupRegistry,
+    resolver: &dyn TokenResolver,
+    user_id: UserId,
 ) -> Result<super::group::GroupHandle, WsError>
 where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
@@ -250,10 +259,16 @@ where
     let msg: ClientMsg =
         sonic_rs::from_str(&txt).map_err(|e| WsError::Protocol(format!("join parse: {e}")))?;
     match msg {
-        ClientMsg::Join { group_id } => registry
-            .get_or_create(group_id)
-            .await
-            .map_err(|_| WsError::Protocol("registry actor down".into())),
+        ClientMsg::Join { group_id } => {
+            let handle = registry
+                .get_or_create(group_id)
+                .await
+                .map_err(|_| WsError::Protocol("registry actor down".into()))?;
+            if !resolver.may_join(user_id, &handle).await {
+                return Err(WsError::Protocol("unknown group".into()));
+            }
+            Ok(handle)
+        }
         ClientMsg::CreateAndJoin => registry
             .create()
             .await
