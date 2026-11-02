@@ -36,7 +36,7 @@ impl FromRequest for AuthUser {
 
 /// The token a request authenticated with by header, left in the request
 /// extensions once the store accepted it. An `api_key` in the URL is never
-/// noted: another site's page can put one in an `<img>` (B253). The
+/// noted: another site's page can put one in an `<img>` (B254). The
 /// [`CookieBackfill`](crate::middleware::CookieBackfill) middleware reads it
 /// to give a browser that signed in before the cookie existed its
 /// `JellyfinAuth`. It has no `Debug` impl, so it cannot reach a log line.
