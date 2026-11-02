@@ -3482,6 +3482,28 @@ pub trait PreferenceStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
+/// Per-user key/value preferences the native API serves (`Prefs`). Values
+/// are opaque bytes; which keys exist and how large a value may be is the
+/// caller's policy, not the store's. Separate from [`PreferenceStore`],
+/// whose rows are Jellyfin JSON documents keyed by display-preference id
+/// and client, which a flat key per user does not fit.
+pub trait UserPrefStore: Send + Sync {
+    /// The value stored under `key` for `user`, or `None` when never set.
+    fn get_user_pref(
+        &self,
+        user: UserId,
+        key: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<Vec<u8>>>> + Send;
+
+    /// Stores `value` under `key` for `user`, replacing any earlier value.
+    fn set_user_pref(
+        &self,
+        user: UserId,
+        key: &str,
+        value: &[u8],
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+}
+
 /// Persisted transcode negotiation for a PlaySessionId (Phase B1 —
 /// zero-downtime deploys). `decision_json` / `source_probe_json` are opaque
 /// serde payloads owned by the server layer (`device_profile::Decision` +
