@@ -8,8 +8,8 @@ use dioxus::prelude::*;
 
 use super::platform;
 use super::playback::MediaEvent;
-use super::views::VIDEO_ID;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
+use super::watch_view::VIDEO_ID;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
 
 use crate::render::{self, Fallback, Frame, Surface};

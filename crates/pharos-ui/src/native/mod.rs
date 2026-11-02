@@ -20,3 +20,4 @@ pub mod playback;
 pub mod route;
 pub mod views;
 pub mod visualiser;
+pub mod watch_view;

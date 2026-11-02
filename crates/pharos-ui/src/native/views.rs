@@ -6,7 +6,6 @@ use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, Item, ItemKind, Page};
 
 use super::depth;
-use super::playback::MediaEvent;
 use super::route::Route;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
@@ -324,32 +323,6 @@ pub fn TitleView(detail: Detail) -> Element {
                 if !detail.genres.is_empty() {
                     p { class: "pharos-muted", "{detail.genres.join(\", \")}" }
                 }
-            }
-        }
-    }
-}
-
-/// The `<video>` the playback engine attaches to.
-pub const VIDEO_ID: &str = "pharos-video";
-
-/// The player. The engine gives the `<video>` its stream once mounted;
-/// `on_media` hears the events progress reports follow.
-#[component]
-pub fn WatchView(title: String, on_media: EventHandler<MediaEvent>) -> Element {
-    rsx! {
-        section { class: "pharos-watch",
-            h2 { class: "pharos-watch-title", "{title}" }
-            video {
-                id: VIDEO_ID,
-                class: "pharos-video",
-                controls: true,
-                autoplay: true,
-                playsinline: true,
-                onplaying: move |_| on_media.call(MediaEvent::Playing),
-                onpause: move |_| on_media.call(MediaEvent::Pause),
-                onseeked: move |_| on_media.call(MediaEvent::Seeked),
-                ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
-                onended: move |_| on_media.call(MediaEvent::Ended),
             }
         }
     }

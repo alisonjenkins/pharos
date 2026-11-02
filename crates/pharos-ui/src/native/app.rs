@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _, PlaybackGrant as _,
-    TrackPicks,
+    TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -21,12 +21,15 @@ use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, start_ms, Engine, MediaEvent, OnFatal, Outgoing, PlaybackEngine, ReportClock,
+    choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
+    MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
-    WatchView, VIDEO_ID,
+};
+use super::watch_view::{
+    text_track_id, Control, Controls, WatchView, PLAYER_ID, SEEK_ID, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -1062,6 +1065,22 @@ struct Playing {
     /// The server's play session; a new one remounts the player.
     session: String,
     grant: NativeGrant,
+    detail: Detail,
+    /// The tracks the server started this playback on.
+    audio: Option<u32>,
+    subtitle: Option<u32>,
+}
+
+impl Playing {
+    /// Whether the stream has its subtitle drawn in by the server.
+    fn burned(&self) -> bool {
+        self.subtitle.is_some_and(|i| {
+            self.detail
+                .subtitle_tracks
+                .iter()
+                .any(|t| t.index == i && t.vtt_url.is_none())
+        })
+    }
 }
 
 /// The playback props, compared by identity: a new negotiation is a new
@@ -1078,20 +1097,23 @@ impl PartialEq for PlayingRef {
 #[component]
 fn WatchScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
-    // Where the player was, so a renegotiation after a reconnect carries on
-    // from there rather than from the stored position.
+    // Where the player was, so a renegotiation after a reconnect or a track
+    // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
+    // The tracks asked for; changing them negotiates a new playback.
+    let mut picks = use_signal(TrackPicks::default);
     let resume_from = Rc::clone(&last_ms);
     let playing = use_resource(move || {
         let api = ctx.api.read().clone();
         let resume_from = Rc::clone(&resume_from);
+        let asked = picks();
         async move {
             let api = api?;
             let info = call("watch", "play");
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let (decision, grant) = api
-                    .play(&info, id, &platform::capabilities(), TrackPicks::default())
+                    .play(&info, id, &platform::capabilities(), asked)
                     .await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
@@ -1104,10 +1126,12 @@ fn WatchScreen(id: ItemRef) -> Element {
                         platform::has_mse(),
                     );
                     platform::info(&format!(
-                        "pharos: playback method={} engine={engine:?} block={} downgrade={} url={}",
+                        "pharos: playback method={} engine={engine:?} block={} downgrade={} audio={:?} subtitle={:?} url={}",
                         decision.method,
                         decision.direct_play_block,
                         decision.downgrade,
+                        decision.audio,
+                        decision.subtitle,
                         decision.stream_url
                     ));
                     if engine == Engine::Unsupported {
@@ -1120,14 +1144,17 @@ fn WatchScreen(id: ItemRef) -> Element {
                         here => here,
                     };
                     Ok(PlayingRef(Rc::new(Playing {
-                        title: detail.item.name,
+                        title: detail.item.name.clone(),
                         kind: detail.item.kind,
-                        image: detail.item.image,
+                        image: detail.item.image.clone(),
                         url: decision.stream_url,
                         start_ms,
                         engine,
                         session: decision.play_session,
                         grant,
+                        detail,
+                        audio: decision.audio,
+                        subtitle: decision.subtitle,
                     })))
                 }),
             )
@@ -1135,7 +1162,14 @@ fn WatchScreen(id: ItemRef) -> Element {
     });
     let state = playing.read();
     loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
-        rsx! { Player { key: "{p.0.session}", playing: p.clone(), last_ms: LastMs(Rc::clone(&last_ms)) } }
+        rsx! {
+            Player {
+                key: "{p.0.session}",
+                playing: p.clone(),
+                last_ms: LastMs(Rc::clone(&last_ms)),
+                on_renegotiate: move |next| picks.set(next),
+            }
+        }
     })
 }
 
@@ -1149,16 +1183,32 @@ impl PartialEq for LastMs {
     }
 }
 
-/// Attaches the engine and reports progress: on play, pause and seek, every
-/// 10 s while playing, and one stop when the video ends, the player
-/// unmounts or the page is hidden.
+fn choice(index: Option<u32>) -> TrackChoice {
+    index.map_or(TrackChoice::Off, TrackChoice::Index)
+}
+
+/// Attaches the engine, draws the controls and reports progress: on play,
+/// pause and seek, every 10 s while playing, and one stop when the video
+/// ends, the player unmounts or the page is hidden. A track change the
+/// `<video>` cannot make itself asks the screen for a new playback.
 #[component]
-fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
+fn Player(
+    playing: PlayingRef,
+    last_ms: LastMs,
+    on_renegotiate: EventHandler<TrackPicks>,
+) -> Element {
     let ctx = use_context::<Ctx>();
     let p = playing.0;
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let mut failed = use_signal(|| None::<String>);
+    let mut media = use_signal(MediaState::default);
+    let mut hover_ms = use_signal(|| None::<u64>);
+    // The subtitle on screen: the server's pick, then the viewer's.
+    let mut subtitle = use_signal(|| p.subtitle);
+    // The subtitle the viewer switched to in place, which reports carry so
+    // the next playback starts on it.
+    let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
 
     let stop = {
         let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
@@ -1216,10 +1266,29 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
             });
         }
     });
+    // A burned subtitle is in the picture, not a text track.
+    let burned = p.burned();
+    use_effect(move || {
+        let shown = if burned { None } else { subtitle() };
+        let id = shown.map(text_track_id);
+        platform::show_text_track(VIDEO_ID, id.as_deref());
+    });
 
     let on_media = {
-        let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
+        let (p, clock, last_ms, switched) = (
+            Rc::clone(&p),
+            Rc::clone(&clock),
+            Rc::clone(&last_ms.0),
+            Rc::clone(&switched),
+        );
         move |event: MediaEvent| {
+            media.set(platform::media_state(VIDEO_ID));
+            if event == MediaEvent::Changed && !burned {
+                // Text tracks load with the metadata; show the picked one.
+                let shown: Option<u32> = *subtitle.peek();
+                let id = shown.map(text_track_id);
+                platform::show_text_track(VIDEO_ID, id.as_deref());
+            }
             let at = platform::position_ms(VIDEO_ID);
             if at > 0 {
                 last_ms.set(at);
@@ -1236,9 +1305,13 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
             };
             let grant = p.grant.clone();
             let at = last_ms.get();
+            let tracks = TrackPicks {
+                audio: TrackChoice::Default,
+                subtitle: switched.get().unwrap_or_default(),
+            };
             spawn(async move {
                 let result = grant
-                    .report(&call("watch", "report"), at, paused, TrackPicks::default())
+                    .report(&call("watch", "report"), at, paused, tracks)
                     .await;
                 if let Err(e) = settle(ctx.machine, result) {
                     platform::warn(&format!("pharos: progress report failed: {e}"));
@@ -1247,6 +1320,68 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
         }
     };
 
+    let on_control = {
+        let p = Rc::clone(&p);
+        move |control: Control| {
+            let state = *media.peek();
+            let total = match state.duration_ms {
+                0 => p.detail.item.runtime_ms,
+                d => d,
+            };
+            match control {
+                Control::TogglePlay => platform::toggle_play(VIDEO_ID),
+                // An unknown length (0) clamps nothing rather than everything.
+                Control::Seek(ms) if total > 0 => platform::seek_ms(VIDEO_ID, ms.min(total)),
+                Control::Seek(ms) => platform::seek_ms(VIDEO_ID, ms),
+                Control::SeekAt(x) => {
+                    if let Some(ms) = position_at(x, platform::element_width(SEEK_ID), total) {
+                        platform::seek_ms(VIDEO_ID, ms);
+                    }
+                }
+                Control::Hover(x) => hover_ms
+                    .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
+                Control::Volume { volume, muted } => {
+                    platform::set_volume(VIDEO_ID, volume, muted);
+                }
+                Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::Audio(index) => {
+                    if p.audio != Some(index) {
+                        on_renegotiate.call(TrackPicks {
+                            audio: TrackChoice::Index(index),
+                            subtitle: choice(*subtitle.peek()),
+                        });
+                    }
+                }
+                Control::Subtitle(to) => {
+                    let track =
+                        to.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
+                    match subtitle_switch(p.burned(), track) {
+                        SubtitleSwitch::InPlace => {
+                            switched.set(Some(choice(to)));
+                            subtitle.set(to);
+                        }
+                        SubtitleSwitch::Renegotiate => on_renegotiate.call(TrackPicks {
+                            audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                            subtitle: choice(to),
+                        }),
+                    }
+                }
+            }
+        }
+    };
+
+    let controls = Controls {
+        media: media(),
+        runtime_ms: p.detail.item.runtime_ms,
+        chapters: p.detail.chapters.clone(),
+        segments: p.detail.segments.clone(),
+        preview: preview_set(&p.detail.trickplay).cloned(),
+        hover_ms: hover_ms(),
+        audio: p.detail.audio_tracks.clone(),
+        subtitles: p.detail.subtitle_tracks.clone(),
+        audio_pick: p.audio,
+        subtitle_pick: subtitle(),
+    };
     rsx! {
         if let Some(message) = failed() {
             ErrorNote { message }
@@ -1254,7 +1389,7 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
         if p.kind == ItemKind::Audio {
             ListenView { title: p.title.clone(), image: p.image.clone(), on_media }
         } else {
-            WatchView { title: p.title.clone(), on_media }
+            WatchView { title: p.title.clone(), controls, on_media, on_control }
         }
     }
 }

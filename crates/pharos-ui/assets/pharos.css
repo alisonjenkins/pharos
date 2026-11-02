@@ -393,6 +393,149 @@ input:focus-visible {
   background: black; /* not themed: the letterbox around video is black in every theme */
   border-radius: 8px;
 }
+/* The controls sit on the picture, so they are light on a dark scrim in every
+   theme; only the accent follows the theme. */
+.pharos-player {
+  position: relative;
+  border-radius: 8px;
+  outline: none;
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-player:focus-visible {
+  box-shadow: 0 0 0 2px var(--px-color-accent);
+}
+.pharos-player:fullscreen .pharos-video {
+  max-height: none;
+  height: 100%;
+  border-radius: 0;
+}
+.pharos-controls {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 2rem 0.75rem 0.5rem;
+  border-radius: 0 0 8px 8px;
+  background: linear-gradient(transparent, rgb(0 0 0 / 0.75)); /* not themed: controls sit on the video, whose colours no theme sets */
+  transition: opacity 0.2s;
+}
+/* A touch screen has no hover to bring hidden controls back. */
+@media (hover: hover) {
+  .pharos-player:not(.is-paused):not(:hover):not(:focus-within) .pharos-controls {
+    opacity: 0;
+  }
+}
+.pharos-control-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.pharos-control-spacer {
+  flex: 1;
+}
+.pharos-control {
+  min-width: 2.25rem;
+  min-height: 2.25rem;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 1.1rem;
+  cursor: pointer;
+}
+.pharos-control:hover,
+.pharos-control:focus-visible {
+  background: rgb(255 255 255 / 0.15); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-time {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9rem;
+}
+.pharos-volume {
+  width: 6rem;
+  accent-color: var(--px-color-accent);
+}
+.pharos-track-picker {
+  max-width: 12rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid rgb(255 255 255 / 0.3); /* not themed: controls sit on the video, whose colours no theme sets */
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: inherit;
+}
+.pharos-seek {
+  position: relative;
+  padding: 0.5rem 0;
+  cursor: pointer;
+  touch-action: none;
+}
+.pharos-seek > * {
+  pointer-events: none;
+}
+.pharos-seek-track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: rgb(255 255 255 / 0.3); /* not themed: controls sit on the video, whose colours no theme sets */
+  transition: height 0.1s;
+}
+.pharos-seek:hover .pharos-seek-track {
+  height: 6px;
+}
+.pharos-seek-track > span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+.pharos-seek-played {
+  left: 0;
+  border-radius: 2px;
+  background: var(--px-color-accent);
+}
+.pharos-seek-segment {
+  background: rgb(255 255 255 / 0.35); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-seek-chapter {
+  width: 2px;
+  margin-left: -1px;
+  background: rgb(0 0 0 / 0.8); /* not themed: controls sit on the video, whose colours no theme sets */
+  z-index: 1;
+}
+.pharos-seek-preview {
+  position: absolute;
+  bottom: 1.5rem;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  text-shadow: 0 1px 2px #000; /* not themed: controls sit on the video, whose colours no theme sets */
+  white-space: nowrap;
+}
+.pharos-seek-thumb {
+  border: 2px solid #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  border-radius: 4px;
+  background-color: #000; /* not themed: controls sit on the video, whose colours no theme sets */
+  background-repeat: no-repeat;
+  zoom: 0.5;
+}
+.pharos-skip {
+  position: absolute;
+  right: 1rem;
+  bottom: 5.5rem;
+  padding: 0.6rem 1.2rem;
+  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.65); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  font-size: 1rem;
+  cursor: pointer;
+}
+.pharos-skip:hover,
+.pharos-skip:focus-visible {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
 
 /* Now playing (013 US7): a song's art and controls over the visualiser.
    Without the GPU layer the gradient is the whole look. */
@@ -476,7 +619,9 @@ input:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pharos-button {
+  .pharos-button,
+  .pharos-controls,
+  .pharos-seek-track {
     transition: none;
   }
 }

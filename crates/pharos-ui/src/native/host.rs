@@ -8,7 +8,7 @@ use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, PlaybackEngine};
+use super::playback::{Engine, MediaState, PlaybackEngine};
 
 const NO_BROWSER: &str = "the native app needs a browser";
 
@@ -72,6 +72,24 @@ pub fn capabilities() -> Capabilities {
 pub fn position_ms(_video_id: &str) -> u64 {
     0
 }
+
+pub fn media_state(_video_id: &str) -> MediaState {
+    MediaState::default()
+}
+
+pub fn seek_ms(_video_id: &str, _ms: u64) {}
+
+pub fn toggle_play(_video_id: &str) {}
+
+pub fn set_volume(_video_id: &str, _volume: f64, _muted: bool) {}
+
+pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}
+
+pub fn element_width(_id: &str) -> f64 {
+    0.0
+}
+
+pub fn toggle_fullscreen(_id: &str) {}
 
 pub fn now_ms() -> f64 {
     0.0

@@ -1,0 +1,490 @@
+//! The watch page as a pure component: the `<video>` and the controls drawn
+//! over it (013 US2, US3). What the controls show comes in as [`Controls`];
+//! what the viewer does goes out as [`Control`], which the player turns into
+//! calls on the `<video>` or a new playback.
+
+use dioxus::prelude::*;
+use pharos_client::api::{Chapter, Segment, Track, Trickplay};
+
+use super::playback::{
+    clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
+};
+
+/// The `<video>` the playback engine attaches to.
+pub const VIDEO_ID: &str = "pharos-video";
+/// The element that goes fullscreen: the video with its controls.
+pub const PLAYER_ID: &str = "pharos-player";
+/// The seek bar, whose width turns a pointer offset into a position.
+pub const SEEK_ID: &str = "pharos-seek";
+
+/// How far the arrow keys seek.
+const SEEK_STEP_MS: u64 = 10_000;
+/// How far the up and down keys move the volume.
+const VOLUME_STEP: f64 = 0.1;
+
+/// Everything the controls show.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Controls {
+    pub media: MediaState,
+    /// The item's runtime, for the seek bar until the `<video>` knows its
+    /// duration.
+    pub runtime_ms: u64,
+    pub chapters: Vec<Chapter>,
+    pub segments: Vec<Segment>,
+    /// The sprite set the seek-bar preview draws from.
+    pub preview: Option<Trickplay>,
+    /// Where the pointer is over the seek bar.
+    pub hover_ms: Option<u64>,
+    pub audio: Vec<Track>,
+    pub subtitles: Vec<Track>,
+    pub audio_pick: Option<u32>,
+    /// The subtitle on screen, rendered or burned; `None` is off.
+    pub subtitle_pick: Option<u32>,
+}
+
+impl Controls {
+    fn total_ms(&self) -> u64 {
+        match self.media.duration_ms {
+            0 => self.runtime_ms,
+            d => d,
+        }
+    }
+}
+
+/// What the viewer asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Control {
+    TogglePlay,
+    Seek(u64),
+    /// The pointer is `x` px into the seek bar; `None` when it left.
+    Hover(Option<f64>),
+    /// A click `x` px into the seek bar.
+    SeekAt(f64),
+    Volume {
+        volume: f64,
+        muted: bool,
+    },
+    Audio(u32),
+    Subtitle(Option<u32>),
+    Fullscreen,
+}
+
+/// The player. The engine gives the `<video>` its stream once mounted;
+/// `on_media` hears the events progress reports follow, `on_control` the
+/// viewer.
+#[component]
+pub fn WatchView(
+    title: String,
+    controls: Controls,
+    on_media: EventHandler<MediaEvent>,
+    on_control: EventHandler<Control>,
+) -> Element {
+    let c = &controls;
+    let total = c.total_ms();
+    let media = c.media;
+    let class = if media.paused {
+        "pharos-player is-paused"
+    } else {
+        "pharos-player"
+    };
+    let on_key = move |evt: KeyboardEvent| {
+        let back = |by: u64| Control::Seek(media.position_ms.saturating_sub(by));
+        let volume = |v: f64| Control::Volume {
+            volume: v.clamp(0.0, 1.0),
+            muted: false,
+        };
+        let control = match evt.key() {
+            Key::Character(k) if k == " " || k == "k" => Control::TogglePlay,
+            Key::Character(k) if k == "m" => Control::Volume {
+                volume: media.volume,
+                muted: !media.muted,
+            },
+            Key::Character(k) if k == "f" => Control::Fullscreen,
+            Key::ArrowLeft => back(SEEK_STEP_MS),
+            Key::ArrowRight => Control::Seek(media.position_ms.saturating_add(SEEK_STEP_MS)),
+            Key::ArrowUp => volume(media.volume + VOLUME_STEP),
+            Key::ArrowDown => volume(media.volume - VOLUME_STEP),
+            _ => return,
+        };
+        evt.prevent_default();
+        on_control.call(control);
+    };
+    let skip = segment_at(&c.segments, media.position_ms);
+    let text_tracks: Vec<(String, Track)> = c
+        .subtitles
+        .iter()
+        .filter(|t| t.vtt_url.is_some())
+        .map(|t| (text_track_id(t.index), t.clone()))
+        .collect();
+
+    rsx! {
+        section { class: "pharos-watch",
+            h2 { class: "pharos-watch-title", "{title}" }
+            div {
+                id: PLAYER_ID,
+                class,
+                tabindex: 0,
+                onkeydown: on_key,
+                video {
+                    id: VIDEO_ID,
+                    class: "pharos-video",
+                    autoplay: true,
+                    playsinline: true,
+                    onclick: move |_| on_control.call(Control::TogglePlay),
+                    onplaying: move |_| on_media.call(MediaEvent::Playing),
+                    onpause: move |_| on_media.call(MediaEvent::Pause),
+                    onseeked: move |_| on_media.call(MediaEvent::Seeked),
+                    ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
+                    onended: move |_| on_media.call(MediaEvent::Ended),
+                    onvolumechange: move |_| on_media.call(MediaEvent::Changed),
+                    ondurationchange: move |_| on_media.call(MediaEvent::Changed),
+                    onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                    for (id, t) in text_tracks {
+                        track {
+                            key: "{id}",
+                            id: "{id}",
+                            kind: "subtitles",
+                            src: t.vtt_url.clone().unwrap_or_default(),
+                            srclang: "{t.language}",
+                            label: track_label(&t, 0),
+                        }
+                    }
+                }
+                if let Some(seg) = skip {
+                    button {
+                        class: "pharos-skip",
+                        r#type: "button",
+                        onclick: move |_| on_control.call(Control::Seek(seg.end_ms)),
+                        {skip_label(seg.kind)}
+                    }
+                }
+                div { class: "pharos-controls",
+                    SeekBar { controls: controls.clone(), total, on_control }
+                    div { class: "pharos-control-row",
+                        button {
+                            class: "pharos-control",
+                            r#type: "button",
+                            aria_label: if media.paused { "Play" } else { "Pause" },
+                            onclick: move |_| on_control.call(Control::TogglePlay),
+                            if media.paused { "▶" } else { "❚❚" }
+                        }
+                        span { class: "pharos-time",
+                            "{clock(media.position_ms)} / {clock(total)}"
+                        }
+                        Volume { media, on_control }
+                        span { class: "pharos-control-spacer" }
+                        TrackPicker {
+                            label: "Audio",
+                            tracks: c.audio.clone(),
+                            pick: c.audio_pick,
+                            offer_off: false,
+                            on_pick: move |p: Option<u32>| {
+                                if let Some(i) = p {
+                                    on_control.call(Control::Audio(i));
+                                }
+                            },
+                        }
+                        TrackPicker {
+                            label: "Subtitles",
+                            tracks: c.subtitles.clone(),
+                            pick: c.subtitle_pick,
+                            offer_off: true,
+                            on_pick: move |p| on_control.call(Control::Subtitle(p)),
+                        }
+                        button {
+                            class: "pharos-control",
+                            r#type: "button",
+                            aria_label: "Fullscreen",
+                            onclick: move |_| on_control.call(Control::Fullscreen),
+                            "⛶"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The `<track id>` of the subtitle stream `index`.
+pub fn text_track_id(index: u32) -> String {
+    format!("pharos-sub-{index}")
+}
+
+/// Played and buffered progress, chapter ticks, skippable spans and the
+/// trickplay preview under the pointer.
+#[component]
+fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) -> Element {
+    let c = &controls;
+    let played = percent(c.media.position_ms, total);
+    let hover = c.hover_ms.map(|ms| {
+        let chapter = c
+            .chapters
+            .iter()
+            .rev()
+            .find(|ch| ch.start_ms <= ms)
+            .map(|ch| ch.name.clone())
+            .filter(|n| !n.is_empty());
+        let thumb = c.preview.as_ref().and_then(|set| thumb_at(set, ms));
+        (percent(ms, total), clock(ms), chapter, thumb)
+    });
+    rsx! {
+        div {
+            id: SEEK_ID,
+            class: "pharos-seek",
+            role: "slider",
+            aria_label: "Seek",
+            aria_valuemin: 0,
+            aria_valuemax: total / 1000,
+            aria_valuenow: c.media.position_ms / 1000,
+            aria_valuetext: clock(c.media.position_ms),
+            onmousemove: move |evt: MouseEvent| {
+                on_control.call(Control::Hover(Some(evt.element_coordinates().x)));
+            },
+            onmouseleave: move |_| on_control.call(Control::Hover(None)),
+            onclick: move |evt: MouseEvent| {
+                on_control.call(Control::SeekAt(evt.element_coordinates().x));
+            },
+            div { class: "pharos-seek-track",
+                for (i, s) in c.segments.iter().enumerate().filter(|(_, s)| s.end_ms > s.start_ms) {
+                    span {
+                        key: "{i}",
+                        class: "pharos-seek-segment",
+                        style: "left: {percent(s.start_ms, total)}%; width: {percent(s.end_ms, total) - percent(s.start_ms, total)}%",
+                    }
+                }
+                span { class: "pharos-seek-played", style: "width: {played}%" }
+                for (i, ch) in c.chapters.iter().enumerate().filter(|(_, ch)| ch.start_ms > 0) {
+                    span {
+                        key: "{i}",
+                        class: "pharos-seek-chapter",
+                        style: "left: {percent(ch.start_ms, total)}%",
+                        title: "{ch.name}",
+                    }
+                }
+            }
+            if let Some((at, time, chapter, thumb)) = hover {
+                div { class: "pharos-seek-preview", style: "left: {at}%",
+                    if let Some(t) = thumb {
+                        div {
+                            class: "pharos-seek-thumb",
+                            style: "width: {t.width}px; height: {t.height}px; background-image: url('{t.url}'); background-position: -{t.x}px -{t.y}px",
+                        }
+                    }
+                    if let Some(name) = chapter {
+                        span { class: "pharos-seek-chapter-name", "{name}" }
+                    }
+                    span { class: "pharos-seek-time", "{time}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn Volume(media: MediaState, on_control: EventHandler<Control>) -> Element {
+    let shown = if media.muted { 0.0 } else { media.volume };
+    rsx! {
+        button {
+            class: "pharos-control",
+            r#type: "button",
+            aria_label: if media.muted { "Unmute" } else { "Mute" },
+            onclick: move |_| on_control.call(Control::Volume {
+                // Unmuting a slider dragged to 0 would stay silent.
+                volume: if media.muted && media.volume == 0.0 { 1.0 } else { media.volume },
+                muted: !media.muted,
+            }),
+            if shown == 0.0 { "🔇" } else { "🔊" }
+        }
+        input {
+            class: "pharos-volume",
+            r#type: "range",
+            aria_label: "Volume",
+            min: 0,
+            max: 1,
+            step: 0.05,
+            value: "{shown}",
+            // Arrows move the slider, not the player's volume and seek keys.
+            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            oninput: move |evt: FormEvent| {
+                if let Ok(volume) = evt.value().parse::<f64>() {
+                    on_control.call(Control::Volume { volume, muted: volume == 0.0 });
+                }
+            },
+        }
+    }
+}
+
+/// A `<select>` of tracks; nothing at all for an item with one audio track
+/// or no subtitles.
+#[component]
+fn TrackPicker(
+    label: &'static str,
+    tracks: Vec<Track>,
+    pick: Option<u32>,
+    offer_off: bool,
+    on_pick: EventHandler<Option<u32>>,
+) -> Element {
+    let worth_showing = if offer_off {
+        !tracks.is_empty()
+    } else {
+        tracks.len() > 1
+    };
+    if !worth_showing {
+        return rsx! {};
+    }
+    rsx! {
+        select {
+            class: "pharos-track-picker",
+            aria_label: label,
+            title: label,
+            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            onchange: move |evt: FormEvent| {
+                on_pick.call(evt.value().parse::<u32>().ok());
+            },
+            if offer_off {
+                option { value: "off", selected: pick.is_none(), "{label} off" }
+            }
+            for (i, t) in tracks.iter().enumerate() {
+                option {
+                    key: "{t.index}",
+                    value: "{t.index}",
+                    selected: pick == Some(t.index),
+                    {track_label(t, i)}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pharos_client::api::SegmentKind;
+
+    use super::*;
+
+    fn render(controls: Controls) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |controls: Controls| {
+                rsx! {
+                    WatchView {
+                        title: "Pilot",
+                        controls,
+                        on_media: |_| {},
+                        on_control: |_| {},
+                    }
+                }
+            },
+            controls,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn controls() -> Controls {
+        let english = Track {
+            index: 3,
+            language: "eng".into(),
+            vtt_url: Some("/videos/7/subtitles/3/stream.vtt".into()),
+            ..Track::default()
+        };
+        let signs = Track {
+            index: 4,
+            title: "Signs".into(),
+            ..Track::default()
+        };
+        Controls {
+            media: MediaState {
+                position_ms: 30_000,
+                duration_ms: 1_200_000,
+                ..MediaState::default()
+            },
+            runtime_ms: 1_200_000,
+            chapters: vec![
+                Chapter {
+                    name: "Cold open".into(),
+                    start_ms: 0,
+                },
+                Chapter {
+                    name: "Act one".into(),
+                    start_ms: 300_000,
+                },
+            ],
+            segments: vec![Segment {
+                kind: SegmentKind::Intro,
+                start_ms: 10_000,
+                end_ms: 70_000,
+            }],
+            audio: vec![
+                Track {
+                    index: 1,
+                    language: "eng".into(),
+                    ..Track::default()
+                },
+                Track {
+                    index: 2,
+                    language: "jpn".into(),
+                    ..Track::default()
+                },
+            ],
+            subtitles: vec![english, signs],
+            audio_pick: Some(2),
+            subtitle_pick: Some(3),
+            ..Controls::default()
+        }
+    }
+
+    #[test]
+    fn the_controls_offer_skip_tracks_and_chapters() {
+        let html = render(controls());
+        assert!(html.contains("Skip intro"), "{html}");
+        assert!(html.contains("0:30 / 20:00"), "{html}");
+        // One tick for "Act one" a quarter of the way along; none at 0.
+        assert!(html.contains("left: 25%"), "{html}");
+        assert_eq!(html.matches("pharos-seek-chapter\"").count(), 1, "{html}");
+        // Only the text subtitle becomes a <track>.
+        assert!(
+            html.contains(r#"id="pharos-sub-3""#) && !html.contains("pharos-sub-4"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Subtitles off") && html.contains("Signs"),
+            "{html}"
+        );
+        assert!(html.contains(r#"value="2" selected"#), "{html}");
+        // The browser's own controls are gone.
+        assert!(!html.contains("controls=true"), "{html}");
+    }
+
+    #[test]
+    fn no_skip_outside_a_segment_and_no_lone_audio_picker() {
+        let mut c = controls();
+        c.media.position_ms = 80_000;
+        c.audio.truncate(1);
+        let html = render(c);
+        assert!(!html.contains("Skip intro"), "{html}");
+        assert!(!html.contains(r#"aria-label="Audio""#), "{html}");
+    }
+
+    #[test]
+    fn hovering_the_seek_bar_previews_the_thumbnail_and_chapter() {
+        let mut c = controls();
+        c.preview = Some(Trickplay {
+            width: 320,
+            height: 180,
+            interval_ms: 10_000,
+            thumb_count: 120,
+            tile_count: 2,
+            grid: 10,
+            tile_url: "/videos/7/trickplay/320/{tile}.jpg".into(),
+        });
+        c.hover_ms = Some(310_000);
+        let html = render(c);
+        // Thumbnail 31: tile 0, row 3, column 1.
+        assert!(
+            html.contains("/videos/7/trickplay/320/0.jpg")
+                && html.contains("background-position: -320px -540px"),
+            "{html}"
+        );
+        assert!(html.contains("Act one") && html.contains("5:10"), "{html}");
+    }
+}

@@ -14,7 +14,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
+use super::playback::{Engine, MediaState, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
 
 const SESSION: &str = "/pharos/session";
 
@@ -213,6 +213,91 @@ fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
 /// The `<video>`'s current position, 0 when it is gone.
 pub fn position_ms(video_id: &str) -> u64 {
     video_element(video_id).map_or(0, |v| seconds_to_ms(v.current_time()))
+}
+
+/// What the controls show of the `<video>`.
+pub fn media_state(video_id: &str) -> MediaState {
+    video_element(video_id).map_or_else(MediaState::default, |v| MediaState {
+        position_ms: seconds_to_ms(v.current_time()),
+        duration_ms: seconds_to_ms(v.duration()),
+        paused: v.paused(),
+        volume: v.volume(),
+        muted: v.muted(),
+    })
+}
+
+pub fn seek_ms(video_id: &str, ms: u64) {
+    if let Some(v) = video_element(video_id) {
+        // Lossless below 2^53 ms.
+        v.set_current_time(ms as f64 / 1000.0);
+    }
+}
+
+/// Play if paused, else pause. A refused `play()` (autoplay policy) leaves
+/// it paused, which the controls then show.
+pub fn toggle_play(video_id: &str) {
+    let Some(v) = video_element(video_id) else {
+        return;
+    };
+    if v.paused() {
+        if let Err(e) = v.play() {
+            warn(&format!("pharos: play() refused: {e:?}"));
+        }
+    } else if let Err(e) = v.pause() {
+        warn(&format!("pharos: pause() refused: {e:?}"));
+    }
+}
+
+pub fn set_volume(video_id: &str, volume: f64, muted: bool) {
+    if let Some(v) = video_element(video_id) {
+        v.set_volume(volume.clamp(0.0, 1.0));
+        v.set_muted(muted);
+    }
+}
+
+/// Shows the text track whose `<track id>` is `track_id`, hiding the rest;
+/// `None` hides them all.
+pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
+    let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
+        return;
+    };
+    for i in 0..tracks.length() {
+        if let Some(t) = tracks.get(i) {
+            let on = track_id.is_some_and(|id| t.id() == id);
+            t.set_mode(if on {
+                web_sys::TextTrackMode::Showing
+            } else {
+                web_sys::TextTrackMode::Disabled
+            });
+        }
+    }
+}
+
+/// The rendered width of the element `id`, 0 when it is gone.
+pub fn element_width(id: &str) -> f64 {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .map_or(0.0, |e| e.get_bounding_client_rect().width())
+}
+
+/// Enters fullscreen on the element `id`, or leaves it.
+pub fn toggle_fullscreen(id: &str) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let result = if document.fullscreen_element().is_some() {
+        document.exit_fullscreen();
+        Ok(())
+    } else {
+        match document.get_element_by_id(id) {
+            Some(e) => e.request_fullscreen(),
+            None => Ok(()),
+        }
+    };
+    if let Err(e) = result {
+        warn(&format!("pharos: fullscreen refused: {e:?}"));
+    }
 }
 
 fn seconds_to_ms(secs: f64) -> u64 {
