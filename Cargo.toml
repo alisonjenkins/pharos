@@ -124,7 +124,7 @@ sonic-rs = "0.5"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 toml = "1"

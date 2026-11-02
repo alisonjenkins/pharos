@@ -14,8 +14,9 @@ use pharos_core::{
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 /// Result of [`BuiltinAuth::create_user`] — distinguishes a fresh create
 /// from an idempotent no-op so the caller can report accurately.
@@ -40,6 +41,58 @@ pub struct BuiltinAuth<U: UserStore> {
 const FALLBACK_DUMMY_HASH: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$cGhhcm9zZHVtbXlzYWx0MA$EKDomuO8hGAGCl/dbiaNGLsNHz0FAvuuDQQ8+KYw65c";
 const DUMMY_PASSWORD: &[u8] = b"pharos-dummy-password";
+
+/// Each verify allocates `Argon2::default()`'s 19 MiB; four at once keep the
+/// peak near 76 MiB however many logins arrive.
+const MAX_CONCURRENT_VERIFIES: usize = 4;
+/// How long a login waits for a verify slot before it is refused as busy.
+const VERIFY_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One for the whole process, not per `BuiltinAuth`: handlers build one per
+/// request, and a per-instance bound would bound nothing.
+static VERIFY_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFIES)));
+
+/// Outcome of a verify that was given a slot. `Busy` means no slot freed in time.
+enum Verified {
+    Done(AuthResult<bool>),
+    Busy,
+}
+
+fn busy_refusal() -> AuthError {
+    AuthError::Backend("password check busy".into())
+}
+
+/// Counts a verify while it runs on a blocking thread. Drop runs on panic too,
+/// so the gauge cannot drift upward.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        metrics::gauge!("pharos_password_verify_in_flight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        metrics::gauge!("pharos_password_verify_in_flight").decrement(1.0);
+    }
+}
+
+/// Runs on a blocking thread. `Ok(false)` is a wrong password; a hash that
+/// does not parse is a backend fault, not a wrong guess.
+fn verify_blocking(
+    argon: &Argon2<'static>,
+    hash: &str,
+    password: &SecretString,
+) -> AuthResult<bool> {
+    let parsed =
+        PasswordHash::new(hash).map_err(|e| AuthError::Backend(format!("parse hash: {e}")))?;
+    Ok(argon
+        .verify_password(password.expose().as_bytes(), &parsed)
+        .is_ok())
+}
 
 impl<U: UserStore> BuiltinAuth<U> {
     pub fn new(users: U) -> Self {
@@ -94,19 +147,101 @@ impl<U: UserStore> BuiltinAuth<U> {
             .collect()
     }
 
+    /// Verify on a blocking thread, holding one process-wide slot while it
+    /// runs. A login that gets no slot within `wait` is refused as `Busy`
+    /// rather than queued without bound.
+    async fn verify_off_worker(
+        &self,
+        hash: &str,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> AuthResult<Verified> {
+        let started = Instant::now();
+        let permit = match tokio::time::timeout(wait, slots.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => {
+                return Err(AuthError::Backend("password check unavailable".into()))
+            }
+            Err(_elapsed) => {
+                let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                metrics::counter!("pharos_password_verify_busy_total").increment(1);
+                tracing::warn!(waited_ms, "password check busy: refused");
+                return Ok(Verified::Busy);
+            }
+        };
+        let argon = self.argon.clone();
+        let hash = hash.to_owned();
+        let password = password.clone();
+        let verdict = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _in_flight = InFlight::enter();
+            verify_blocking(&argon, &hash, &password)
+        })
+        .await
+        .map_err(|e| AuthError::Backend(format!("password check task: {e}")))?;
+        Ok(Verified::Done(verdict))
+    }
+
     /// Burn one argon2 verify so an unknown username costs what a known one
-    /// does (V177). The result is irrelevant and ignored.
-    fn dummy_verify(&self, password: &SecretString) {
-        match PasswordHash::new(&self.dummy_hash) {
-            Ok(parsed) => {
-                let _ = self
-                    .argon
-                    .verify_password(password.expose().as_bytes(), &parsed);
+    /// does (V177). The result is irrelevant and ignored; only a busy refusal
+    /// reaches the caller.
+    async fn dummy_verify(
+        &self,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> AuthResult<()> {
+        match self
+            .verify_off_worker(&self.dummy_hash, password, slots, wait)
+            .await?
+        {
+            Verified::Busy => Err(busy_refusal()),
+            Verified::Done(Ok(_)) => {
                 metrics::counter!("pharos_auth_dummy_verify_total").increment(1);
+                Ok(())
             }
             // Unknown usernames answer faster than known ones until fixed.
-            Err(e) => tracing::error!(error = %e, "auth: dummy argon2 hash unusable"),
+            Verified::Done(Err(e)) => {
+                tracing::error!(error = %e, "auth: dummy argon2 hash unusable");
+                Ok(())
+            }
         }
+    }
+
+    async fn authenticate_with(
+        &self,
+        name: &str,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> AuthResult<User> {
+        let record = match self.users.lookup_by_name(name).await {
+            Ok(r) => r,
+            Err(AuthError::UserNotFound) => {
+                self.dummy_verify(password, slots, wait).await?;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(other) => return Err(other),
+        };
+        let matched = match self
+            .verify_off_worker(record.password_hash.expose(), password, slots, wait)
+            .await?
+        {
+            Verified::Busy => return Err(busy_refusal()),
+            Verified::Done(verdict) => verdict?,
+        };
+        if !matched {
+            return Err(AuthError::InvalidCredentials);
+        }
+        // T68 — a disabled user must not authenticate even with valid
+        // credentials. Checked after the password verify so a disabled account
+        // is indistinguishable from a wrong password (no account-state
+        // enumeration): both yield InvalidCredentials → 401.
+        if record.policy.is_disabled {
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(record.into_user())
     }
 
     /// Create a user with the given plaintext password, hashing it first.
@@ -141,27 +276,8 @@ impl<U: UserStore> BuiltinAuth<U> {
 impl<U: UserStore> AuthBackend for BuiltinAuth<U> {
     #[tracing::instrument(skip(self, password), fields(user.name = %name))]
     async fn authenticate(&self, name: &str, password: &SecretString) -> AuthResult<User> {
-        let record = match self.users.lookup_by_name(name).await {
-            Ok(r) => r,
-            Err(AuthError::UserNotFound) => {
-                self.dummy_verify(password);
-                return Err(AuthError::InvalidCredentials);
-            }
-            Err(other) => return Err(other),
-        };
-        let parsed = PasswordHash::new(record.password_hash.expose())
-            .map_err(|e| AuthError::Backend(format!("parse hash: {e}")))?;
-        self.argon
-            .verify_password(password.expose().as_bytes(), &parsed)
-            .map_err(|_| AuthError::InvalidCredentials)?;
-        // T68 — a disabled user must not authenticate even with valid
-        // credentials. Checked after the password verify so a disabled account
-        // is indistinguishable from a wrong password (no account-state
-        // enumeration): both yield InvalidCredentials → 401.
-        if record.policy.is_disabled {
-            return Err(AuthError::InvalidCredentials);
-        }
-        Ok(record.into_user())
+        self.authenticate_with(name, password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
+            .await
     }
 }
 
@@ -675,19 +791,82 @@ mod tests {
         }
     }
 
-    fn dummy_verify_count(rec: &metrics_util::debugging::DebuggingRecorder) -> u64 {
+    fn counter_value(rec: &metrics_util::debugging::DebuggingRecorder, name: &str) -> u64 {
         use metrics_util::debugging::DebugValue;
         rec.snapshotter()
             .snapshot()
             .into_vec()
             .into_iter()
             .find_map(|(key, _, _, v)| match v {
-                DebugValue::Counter(n) if key.key().name() == "pharos_auth_dummy_verify_total" => {
-                    Some(n)
-                }
+                DebugValue::Counter(n) if key.key().name() == name => Some(n),
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    fn dummy_verify_count(rec: &metrics_util::debugging::DebuggingRecorder) -> u64 {
+        counter_value(rec, "pharos_auth_dummy_verify_total")
+    }
+
+    fn wrong() -> SecretString {
+        SecretString::new("wrong")
+    }
+
+    /// Refused with no slot free, a login is a backend fault, never a wrong
+    /// password: the throttle abandons the attempt instead of counting it.
+    #[tokio::test]
+    async fn busy_verify_is_a_backend_refusal_not_invalid_credentials() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let no_slots = Arc::new(Semaphore::new(0));
+        let wait = Duration::from_millis(50);
+
+        match auth
+            .authenticate_with("ali", &SecretString::new("hunter2"), &no_slots, wait)
+            .await
+        {
+            Err(AuthError::Backend(msg)) => assert_eq!(msg, "password check busy"),
+            other => panic!("known user: expected busy Backend, got {other:?}"),
+        }
+        match auth
+            .authenticate_with("nobody", &wrong(), &no_slots, wait)
+            .await
+        {
+            Err(AuthError::Backend(msg)) => assert_eq!(msg, "password check busy"),
+            other => panic!("unknown user: expected busy Backend, got {other:?}"),
+        }
+        assert_eq!(counter_value(&rec, "pharos_password_verify_busy_total"), 2);
+        assert_eq!(
+            dummy_verify_count(&rec),
+            0,
+            "a refused unknown-user login burned no verify"
+        );
+    }
+
+    /// The slot is handed back when the verify finishes, so one slot serves
+    /// logins in turn, and the blocking path still accepts and refuses correctly.
+    #[tokio::test]
+    async fn one_slot_serves_logins_in_turn_and_is_released() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let one = Arc::new(Semaphore::new(1));
+        let wait = Duration::from_secs(5);
+
+        assert!(auth
+            .authenticate_with("ali", &SecretString::new("hunter2"), &one, wait)
+            .await
+            .is_ok());
+        assert!(matches!(
+            auth.authenticate_with("ali", &wrong(), &one, wait).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(auth
+            .authenticate_with("ali", &SecretString::new("hunter2"), &one, wait)
+            .await
+            .is_ok());
+        assert_eq!(one.available_permits(), 1);
     }
 
     /// The fallback costs what a real hash costs: same algorithm and
