@@ -1,7 +1,7 @@
 //! `PreferenceStore` impl for `SqliteStore`. Migrations: 0008.
 
 use crate::sqlite::SqliteStore;
-use pharos_core::{DomainError, DomainResult, PreferenceStore, UserId};
+use pharos_core::{DomainError, DomainResult, PreferenceStore, UserId, UserPrefStore};
 
 fn now_unix_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,6 +82,38 @@ impl PreferenceStore for SqliteStore {
         .bind(dp_id)
         .bind(client)
         .bind(json)
+        .bind(now_unix_secs())
+        .execute(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl UserPrefStore for SqliteStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn get_user_pref(&self, user: UserId, key: &str) -> DomainResult<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value FROM user_prefs WHERE user_id = ? AND key = ?")
+                .bind(user.0.as_bytes().to_vec())
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    #[tracing::instrument(skip(self, value), fields(user.id = %user.0.simple(), bytes = value.len()))]
+    async fn set_user_pref(&self, user: UserId, key: &str, value: &[u8]) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO user_prefs (user_id, key, value, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value,
+                                                     updated_at = excluded.updated_at",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(key)
+        .bind(value)
         .bind(now_unix_secs())
         .execute(self.pool())
         .await

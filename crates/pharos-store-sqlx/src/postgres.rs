@@ -3733,6 +3733,38 @@ impl PreferenceStore for PostgresStore {
     }
 }
 
+impl pharos_core::UserPrefStore for PostgresStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn get_user_pref(&self, user: UserId, key: &str) -> DomainResult<Option<Vec<u8>>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value FROM user_prefs WHERE user_id = $1 AND key = $2")
+                .bind(user.0.as_bytes().to_vec())
+                .bind(key)
+                .fetch_optional(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    #[tracing::instrument(skip(self, value), fields(user.id = %user.0.simple(), bytes = value.len()))]
+    async fn set_user_pref(&self, user: UserId, key: &str, value: &[u8]) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO user_prefs (user_id, key, value, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (user_id, key) DO UPDATE SET value = EXCLUDED.value,
+                                                     updated_at = EXCLUDED.updated_at",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(key)
+        .bind(value)
+        .bind(now_unix_secs())
+        .execute(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+}
+
 type SessionRow = crate::TranscodeSessionRow;
 
 impl TranscodeSessionStore for PostgresStore {
