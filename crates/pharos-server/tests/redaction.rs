@@ -323,3 +323,102 @@ async fn play_session_id_is_logged_by_prefix_only() {
         );
     }
 }
+
+/// B267: a live TV playlist URL carries the provider's credentials, so the
+/// stream relay's log lines (and reqwest's, at every level) name the channel,
+/// never the URL, on success and on each failure.
+/// Disarm check: with `without_url()` dropped from the unreachable-upstream
+/// line, the credentials appear in the log.
+#[actix_web::test]
+async fn live_tv_stream_never_logs_the_provider_url() {
+    use actix_web::test;
+    use pharos_core::TokenStore as _;
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(VecWriter(buf.clone()))
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let provider = actix_test::start(|| {
+        App::new()
+            .route(
+                "/live/ok",
+                web::get().to(|| async {
+                    actix_web::HttpResponse::Ok()
+                        .insert_header(("content-type", "video/mp2t"))
+                        .body("TS")
+                }),
+            )
+            .route(
+                "/live/gone",
+                web::get().to(|| async { actix_web::HttpResponse::ServiceUnavailable().finish() }),
+            )
+    });
+    let addr = provider.addr();
+    // A bound-then-dropped listener leaves a port nothing answers on.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let m3u = format!(
+        "#EXTM3U\n\
+         #EXTINF:-1 tvg-id=\"ok\",Ok\nhttp://prov-user:prov-pass@{addr}/live/ok?password=prov-pass\n\
+         #EXTINF:-1 tvg-id=\"gone\",Gone\nhttp://prov-user:prov-pass@{addr}/live/gone?password=prov-pass\n\
+         #EXTINF:-1 tvg-id=\"dead\",Dead\nhttp://prov-user:prov-pass@{closed}/live/dead?password=prov-pass\n"
+    );
+    let td = tempfile::TempDir::new().unwrap();
+    let m3u_path = td.path().join("p.m3u");
+    std::fs::write(&m3u_path, m3u).unwrap();
+    let backend = pharos_discovery::live_tv::M3uXmltvBackend::new();
+    backend.load_m3u(&m3u_path).await.unwrap();
+
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: SecretString::new("x"),
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+    let state = web::Data::new(AppState::new(stores, "pharos-redact".into()).with_live_tv(backend));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(tracing_actix_web::TracingLogger::<
+                pharos_server::obs::StatusRootSpanBuilder,
+            >::new())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    for (channel, status) in [("ok", 200), ("gone", 502), ("dead", 502)] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/LiveTv/Channels/{channel}/Stream"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status().as_u16(), status, "{channel}");
+        test::read_body(resp).await;
+    }
+
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap().clone()).into_owned();
+    for line in [
+        "live tv stream relayed",
+        "live tv upstream refused the stream",
+        "live tv upstream unreachable",
+    ] {
+        assert!(captured.contains(line), "no {line:?} line:\n{captured}");
+    }
+    assert!(
+        !captured.contains("prov-"),
+        "provider credentials in the log:\n{captured}"
+    );
+}

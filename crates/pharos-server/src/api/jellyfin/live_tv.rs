@@ -3,8 +3,8 @@
 //! Phase 1 wires read-only endpoints — Channels + Programs from the
 //! configured `TunerBackend`. Recordings / Timers / SeriesTimers
 //! return empty so jellyfin-web's Live TV view renders without
-//! throwing. /LiveTv/Channels/{id}/Stream redirects to the upstream
-//! `stream_url`; transcode-on-tune is its own follow-up.
+//! throwing. /LiveTv/Channels/{id}/Stream relays the upstream
+//! `stream_url`'s bytes; transcode-on-tune is its own follow-up.
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
@@ -218,13 +218,85 @@ async fn channel(
     })
 }
 
+/// How a channel stream request ended, for
+/// `pharos_live_tv_stream_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamOutcome {
+    Relayed,
+    NotConfigured,
+    UnknownChannel,
+    UpstreamUnreachable,
+    UpstreamStatus,
+    PlaylistUnsupported,
+}
+
+impl StreamOutcome {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Relayed => "relayed",
+            Self::NotConfigured => "not_configured",
+            Self::UnknownChannel => "unknown_channel",
+            Self::UpstreamUnreachable => "upstream_unreachable",
+            Self::UpstreamStatus => "upstream_status",
+            Self::PlaylistUnsupported => "playlist_unsupported",
+        }
+    }
+}
+
+/// A stream that makes no TCP connection in this long is unreachable.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A live stream has no total deadline; one that sends nothing for this long
+/// has stalled.
+const UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn upstream_client() -> Result<&'static reqwest::Client, reqwest::Error> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .read_timeout(UPSTREAM_READ_TIMEOUT)
+        .build()?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+fn is_playlist(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/vnd.apple.mpegurl"
+            | "application/x-mpegurl"
+            | "audio/mpegurl"
+            | "audio/x-mpegurl"
+    )
+}
+
+fn stream_refused(outcome: StreamOutcome, response: HttpResponse) -> HttpResponse {
+    metrics::counter!("pharos_live_tv_stream_total", "outcome" => outcome.label()).increment(1);
+    response
+}
+
+/// Relay the channel's upstream stream. The upstream URL often carries the
+/// provider's credentials (userinfo, query or path), so it never reaches the
+/// client, a log line or an error body: the client sees only the bytes. An
+/// HLS playlist upstream is refused, since its segment URLs would resolve
+/// against pharos or name the provider directly.
 async fn stream(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> impl Responder {
     let Some(backend) = state.live_tv.as_ref() else {
-        return HttpResponse::NotFound().body("");
+        return stream_refused(
+            StreamOutcome::NotConfigured,
+            HttpResponse::NotFound().finish(),
+        );
     };
     let id = path.into_inner();
     let chs = match backend.channels().await {
@@ -232,13 +304,76 @@ async fn stream(
         Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
     };
     let Some(ch) = chs.into_iter().find(|c| c.id == id) else {
-        return HttpResponse::NotFound().body("");
+        return stream_refused(
+            StreamOutcome::UnknownChannel,
+            HttpResponse::NotFound().finish(),
+        );
     };
-    // 302 to the upstream URL. Jellyfin clients follow redirects on
-    // playback URLs. Transcode-on-tune lands with T47 phase 2.
-    HttpResponse::Found()
-        .insert_header((header::LOCATION, ch.stream_url))
-        .finish()
+    let upstream = match upstream_client() {
+        Ok(client) => client.get(&ch.stream_url).send().await,
+        Err(e) => Err(e),
+    };
+    let resp = match upstream {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(
+                channel = %id,
+                user = %user.0.name,
+                error = %e.without_url(),
+                "live tv upstream unreachable"
+            );
+            return stream_refused(
+                StreamOutcome::UpstreamUnreachable,
+                HttpResponse::BadGateway().finish(),
+            );
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!(channel = %id, user = %user.0.name, %status, "live tv upstream refused the stream");
+        return stream_refused(
+            StreamOutcome::UpstreamStatus,
+            HttpResponse::BadGateway().finish(),
+        );
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("video/mp2t")
+        .to_string();
+    if is_playlist(&content_type) {
+        tracing::warn!(
+            channel = %id,
+            content_type,
+            "live tv upstream is an HLS playlist, which pharos cannot relay"
+        );
+        return stream_refused(
+            StreamOutcome::PlaylistUnsupported,
+            HttpResponse::BadGateway().finish(),
+        );
+    }
+    metrics::counter!("pharos_live_tv_stream_total", "outcome" => StreamOutcome::Relayed.label())
+        .increment(1);
+    tracing::info!(channel = %id, user = %user.0.name, content_type, "live tv stream relayed");
+    let body = futures_util::stream::unfold(Some(resp), move |resp| {
+        let id = id.clone();
+        async move {
+            let mut resp = resp?;
+            match resp.chunk().await {
+                Ok(Some(bytes)) => Some((Ok(bytes), Some(resp))),
+                Ok(None) => None,
+                Err(e) => {
+                    let e = e.without_url();
+                    tracing::warn!(channel = %id, error = %e, "live tv upstream stream broke");
+                    Some((Err(actix_web::error::ErrorBadGateway(e.to_string())), None))
+                }
+            }
+        }
+    });
+    HttpResponse::Ok()
+        .insert_header((header::CONTENT_TYPE, content_type))
+        .streaming(body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,4 +520,30 @@ fn ymd_hms_to_unix(y: i64, m: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i6
     let days = era * 146_097 + doe - 719_468;
     let secs_of_day = (h as i64) * 3600 + (mi as i64) * 60 + (s as i64);
     days.checked_mul(86_400)?.checked_add(secs_of_day)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn stream_outcome_labels_are_distinct() {
+        let all = [
+            StreamOutcome::Relayed,
+            StreamOutcome::NotConfigured,
+            StreamOutcome::UnknownChannel,
+            StreamOutcome::UpstreamUnreachable,
+            StreamOutcome::UpstreamStatus,
+            StreamOutcome::PlaylistUnsupported,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn an_hls_content_type_is_a_playlist() {
+        assert!(is_playlist("application/vnd.apple.mpegurl"));
+        assert!(is_playlist("Application/X-MpegURL; charset=utf-8"));
+        assert!(!is_playlist("video/mp2t"));
+    }
 }
