@@ -661,17 +661,7 @@ async fn join_group(
         tracing::error!("syncplay: group registry unreachable on Join");
         return no_content();
     };
-    let queue = handle
-        .snapshot()
-        .await
-        .map(|s| s.queue_item_ids)
-        .unwrap_or_default();
-    if !may_see_queue(&state, &auth.user, &queue).await {
-        group_hidden(
-            GroupHiddenRoute::Join,
-            &auth.user,
-            &handle.group_id.to_string(),
-        );
+    if !may_join(&state, &auth.user, &handle, GroupHiddenRoute::Join).await {
         // Jellyfin-web leaves group mode on NotInGroup rather than waiting.
         if let Some(sess) = hub.resolve(&dev) {
             let _ = sess
@@ -1185,6 +1175,52 @@ async fn may_see_queue(
         && ids.len() == wanted
 }
 
+/// Whether `user` may join `handle`'s group (V201), counting a refusal under
+/// `route`. The queue comes from the group's actor, or from its persisted
+/// snapshot when the actor answers nothing (it lives on another replica). A
+/// queue that cannot be read refuses a restricted user.
+async fn may_join(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    handle: &GroupHandle,
+    route: GroupHiddenRoute,
+) -> bool {
+    if user.policy.enable_all_folders {
+        return true;
+    }
+    let group = handle.group_id.to_string();
+    let queue = match handle.snapshot().await {
+        Some(snap) => Some(snap.queue_item_ids),
+        None => persisted_queue(state, &group).await,
+    };
+    let allowed = match &queue {
+        Some(queue) => may_see_queue(state, user, queue).await,
+        None => {
+            tracing::warn!(user = %user.name, group, "syncplay join: the group's queue could not be read");
+            false
+        }
+    };
+    if !allowed {
+        group_hidden(route, user, &group);
+    }
+    allowed
+}
+
+/// The queue in a group's persisted snapshot; `None` when there is no
+/// readable row.
+async fn persisted_queue(state: &crate::state::AppState, group: &str) -> Option<Vec<String>> {
+    use pharos_core::SyncGroupStore;
+    match state.stores.get_sync_group(group).await {
+        Ok(row) => row
+            .and_then(|row| pharos_sync::group::snapshot_summary(&row.state_json))
+            .map(|summary| summary.queue_item_ids),
+        Err(e) => {
+            tracing::warn!(group, error = %e, "syncplay: persisted group snapshot unreadable");
+            None
+        }
+    }
+}
+
 async fn list_groups(
     user: AuthUser,
     registry: web::Data<GroupRegistry>,
@@ -1650,6 +1686,132 @@ mod tests {
             GroupHiddenRoute::List.label(),
             GroupHiddenRoute::Join.label()
         );
+    }
+
+    /// B265 / V201: a group whose actor answers nothing (it lives on another
+    /// replica) is judged by its persisted snapshot, and refused to a
+    /// restricted user when there is none.
+    /// Disarm check: with the `persisted_queue` fallback replaced by an empty
+    /// queue, the hidden and unreadable groups are admitted.
+    #[actix_web::test]
+    async fn join_reads_a_remote_groups_queue_from_its_snapshot() {
+        use pharos_core::{PersistedSyncGroup, SyncGroupStore};
+        use pharos_sync::persistence::GroupPersistence;
+        struct Capture(std::sync::Mutex<Option<String>>);
+        impl GroupPersistence for Capture {
+            fn persist(&self, _g: GroupId, _e: u64, state_json: String) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state_json);
+            }
+            fn remove(&self, _g: GroupId) {}
+        }
+        async fn persisted_when(
+            capture: &Capture,
+            done: impl Fn(&pharos_sync::group::SnapshotSummary) -> bool,
+        ) -> String {
+            for _ in 0..200 {
+                let json = capture
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(json) = json {
+                    if pharos_sync::group::snapshot_summary(&json).is_some_and(|s| done(&s)) {
+                        return json;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("group actor never persisted the expected snapshot");
+        }
+
+        let (state, _) = seed_auth().await;
+        let capture = std::sync::Arc::new(Capture(std::sync::Mutex::new(None)));
+        let actor = GroupHandle::spawn_persistent(
+            GroupId::new(),
+            1_000,
+            std::sync::Arc::new(pharos_sync::LocalDelivery::new(MemberSinks::new())),
+            capture.clone(),
+            None,
+        );
+        let member = MemberId::new();
+        let (reply, joined) = oneshot::channel();
+        actor
+            .tx
+            .send(GroupMsg::AddMember {
+                member_id: member,
+                name: "leader".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        joined.await.unwrap();
+        let empty = persisted_when(&capture, |s| s.queue_item_ids.is_empty()).await;
+        actor
+            .tx
+            .send(GroupMsg::SetNewQueue {
+                sender: member,
+                item_ids: vec![format!("{:032x}", 4242)],
+                item_runtimes_ms: vec![None],
+                playing_index: 0,
+                start_position_ms: 0,
+            })
+            .await
+            .unwrap();
+        let hidden = persisted_when(&capture, |s| !s.queue_item_ids.is_empty()).await;
+
+        let now = crate::sync_recovery::now_unix_secs();
+        let remote = |json: Option<String>| {
+            let group_id = GroupId::new();
+            let (tx, _) = tokio::sync::mpsc::channel(1);
+            (
+                GroupHandle {
+                    group_id,
+                    tx,
+                    epoch_unix_ms: 1_000,
+                },
+                json.map(|state_json| PersistedSyncGroup {
+                    group_id: group_id.to_string(),
+                    epoch_unix_ms: 1_000,
+                    state_json,
+                    updated_at: 0,
+                }),
+            )
+        };
+        let mut user = pharos_core::User {
+            id: UserId::new(),
+            name: "restricted".into(),
+            policy: UserPolicy {
+                enable_all_folders: false,
+                ..UserPolicy::default()
+            },
+            has_password: true,
+        };
+        let mut verdicts = Vec::new();
+        for (label, json) in [
+            ("empty", Some(empty)),
+            ("hidden", Some(hidden)),
+            ("unreadable", None),
+        ] {
+            let (handle, row) = remote(json);
+            assert!(handle.snapshot().await.is_none());
+            if let Some(row) = row {
+                state.stores.upsert_sync_group(&row, now).await.unwrap();
+            }
+            verdicts.push((
+                label,
+                may_join(&state, &user, &handle, GroupHiddenRoute::Join).await,
+            ));
+        }
+        assert_eq!(
+            verdicts,
+            vec![("empty", true), ("hidden", false), ("unreadable", false)]
+        );
+        user.policy.enable_all_folders = true;
+        let (handle, _) = remote(None);
+        assert!(may_join(&state, &user, &handle, GroupHiddenRoute::Join).await);
     }
 
     #[actix_web::test]
