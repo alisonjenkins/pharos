@@ -10,6 +10,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
+use super::playback::{Engine, PlaybackEngine};
 
 const SESSION: &str = "/pharos/session";
 
@@ -159,22 +160,260 @@ pub fn on_pop_state(mut on_path: impl FnMut(String) + 'static) -> PopState {
     PopState(listener)
 }
 
-/// Whether `<video>` plays an HLS playlist itself (Safari, recent Chrome).
-pub fn plays_hls() -> bool {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.create_element("video").ok())
-        .and_then(|e| e.dyn_into::<web_sys::HtmlMediaElement>().ok())
-        .is_some_and(|v| !v.can_play_type("application/vnd.apple.mpegurl").is_empty())
+fn probe_video() -> Option<web_sys::HtmlMediaElement> {
+    web_sys::window()?
+        .document()?
+        .create_element("video")
+        .ok()?
+        .dyn_into::<web_sys::HtmlMediaElement>()
+        .ok()
 }
 
-/// What a browser `<video>` decodes everywhere pharos targets.
+/// Whether `<video>` plays an HLS playlist itself (Safari).
+pub fn plays_hls() -> bool {
+    probe_video().is_some_and(|v| !v.can_play_type(HLS_MIME).is_empty())
+}
+
+const HLS_MIME: &str = "application/vnd.apple.mpegurl";
+
+/// Whether Media Source Extensions exist, which hls.js plays through.
+pub fn has_mse() -> bool {
+    web_sys::window().is_some_and(|w| {
+        ["MediaSource", "ManagedMediaSource"]
+            .iter()
+            .any(|name| js_sys::Reflect::has(&w, &JsValue::from_str(name)).unwrap_or(false))
+    })
+}
+
+/// What this browser decodes: a codec counts if MSE or `<video>` accepts it,
+/// a container if `<video>` does.
 pub fn capabilities() -> Capabilities {
-    let own = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect();
-    Capabilities {
-        video_codecs: own(&["h264", "vp9", "av1"]),
-        audio_codecs: own(&["aac", "mp3", "opus", "flac"]),
-        containers: own(&["mp4", "m4v", "webm"]),
-        max_bitrate: 0,
+    let video = probe_video();
+    let can_play = |mime: &str| {
+        video
+            .as_ref()
+            .is_some_and(|v| !v.can_play_type(mime).is_empty())
+    };
+    let mse = |mime: &str| web_sys::MediaSource::is_type_supported(mime);
+    super::playback::capabilities(|mime| (has_mse() && mse(mime)) || can_play(mime), can_play)
+}
+
+fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
+    web_sys::window()?
+        .document()?
+        .get_element_by_id(id)?
+        .dyn_into::<web_sys::HtmlMediaElement>()
+        .ok()
+}
+
+/// The `<video>`'s current position, 0 when it is gone.
+pub fn position_ms(video_id: &str) -> u64 {
+    video_element(video_id).map_or(0, |v| seconds_to_ms(v.current_time()))
+}
+
+fn seconds_to_ms(secs: f64) -> u64 {
+    if secs.is_finite() && secs > 0.0 {
+        // Saturating cast; a position past u64 milliseconds is not real.
+        (secs * 1000.0) as u64
+    } else {
+        0
     }
+}
+
+/// A monotonic clock for the report cadence.
+pub fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
+/// Run `fut` to completion even after the component that started it is
+/// gone (a stop sent on unmount).
+pub fn spawn_detached(fut: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(fut);
+}
+
+/// A `pagehide` listener; removed on drop.
+pub struct PageHide(Closure<dyn FnMut(web_sys::Event)>);
+
+impl Drop for PageHide {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("pagehide", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Call `on_hide` when the page is closed or navigated away from.
+pub fn on_page_hide(mut on_hide: impl FnMut() + 'static) -> PageHide {
+    let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| on_hide());
+    if let Some(window) = web_sys::window() {
+        let _ =
+            window.add_event_listener_with_callback("pagehide", listener.as_ref().unchecked_ref());
+    }
+    PageHide(listener)
+}
+
+/// The engine for `kind`, loading hls.js first when it is needed.
+pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
+    match kind {
+        Engine::Direct | Engine::NativeHls => Ok(Box::new(NativeVideo::default())),
+        Engine::HlsJs => {
+            load_hlsjs().await?;
+            Ok(Box::new(HlsJs::default()))
+        }
+        Engine::Unsupported => Err("this browser cannot play HLS".into()),
+    }
+}
+
+/// Plays a URL through the `<video>` element's own `src`.
+#[derive(Default)]
+struct NativeVideo {
+    video: Option<web_sys::HtmlMediaElement>,
+}
+
+impl PlaybackEngine for NativeVideo {
+    fn attach(&mut self, video_id: &str, url: &str, start_ms: u64) -> Result<(), String> {
+        let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
+        if start_ms > 0 {
+            let target = video.clone();
+            let seek = Closure::once_into_js(move || {
+                #[allow(clippy::cast_precision_loss)]
+                target.set_current_time(start_ms as f64 / 1000.0);
+            });
+            let once = web_sys::AddEventListenerOptions::new();
+            once.set_once(true);
+            video
+                .add_event_listener_with_callback_and_add_event_listener_options(
+                    "loadedmetadata",
+                    seek.unchecked_ref(),
+                    &once,
+                )
+                .map_err(|e| format!("seek listener: {e:?}"))?;
+        }
+        video.set_src(url);
+        self.video = Some(video);
+        Ok(())
+    }
+}
+
+impl Drop for NativeVideo {
+    fn drop(&mut self) {
+        if let Some(video) = self.video.take() {
+            let _ = video.pause();
+            let _ = video.remove_attribute("src");
+            video.load();
+        }
+    }
+}
+
+/// The vendored hls.js (ADR-0035), served from this origin so the CSP's
+/// `script-src 'self'` covers it.
+const HLSJS_SRC: &str = "/assets/vendor/hls.min.js";
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = Hls)]
+    type HlsPlayer;
+    #[wasm_bindgen(constructor, js_class = "Hls")]
+    fn new(config: &JsValue) -> HlsPlayer;
+    #[wasm_bindgen(method, js_class = "Hls", js_name = loadSource)]
+    fn load_source(this: &HlsPlayer, url: &str);
+    #[wasm_bindgen(method, js_class = "Hls", js_name = attachMedia)]
+    fn attach_media(this: &HlsPlayer, media: &web_sys::HtmlMediaElement);
+    #[wasm_bindgen(method, js_class = "Hls")]
+    fn on(this: &HlsPlayer, event: &str, listener: &js_sys::Function);
+    #[wasm_bindgen(method, js_class = "Hls")]
+    fn destroy(this: &HlsPlayer);
+}
+
+/// Add hls.js's `<script>` once and wait for it.
+async fn load_hlsjs() -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    if js_sys::Reflect::has(&window, &JsValue::from_str("Hls")).unwrap_or(false) {
+        return Ok(());
+    }
+    let document = window.document().ok_or("no document")?;
+    let script = document
+        .create_element("script")
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into::<web_sys::HtmlScriptElement>()
+        .map_err(|_| "not a script element")?;
+    script.set_src(HLSJS_SRC);
+    let loaded = js_sys::Promise::new(&mut |resolve, reject| {
+        script.set_onload(Some(&resolve));
+        script.set_onerror(Some(&reject));
+    });
+    document
+        .head()
+        .ok_or("no <head>")?
+        .append_child(&script)
+        .map_err(|e| format!("{e:?}"))?;
+    wasm_bindgen_futures::JsFuture::from(loaded)
+        .await
+        .map_err(|_| format!("could not load {HLSJS_SRC}"))?;
+    Ok(())
+}
+
+/// Plays an HLS playlist through hls.js and Media Source Extensions.
+#[derive(Default)]
+struct HlsJs {
+    player: Option<HlsPlayer>,
+    _on_error: Option<Closure<dyn FnMut(JsValue, JsValue)>>,
+}
+
+impl PlaybackEngine for HlsJs {
+    fn attach(&mut self, video_id: &str, url: &str, start_ms: u64) -> Result<(), String> {
+        let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
+        let config = js_sys::Object::new();
+        #[allow(clippy::cast_precision_loss)]
+        let start = if start_ms > 0 {
+            start_ms as f64 / 1000.0
+        } else {
+            -1.0
+        };
+        js_sys::Reflect::set(&config, &"startPosition".into(), &start.into())
+            .map_err(|e| format!("{e:?}"))?;
+        let player = HlsPlayer::new(&config);
+        let on_error = Closure::<dyn FnMut(JsValue, JsValue)>::new(|_event, data: JsValue| {
+            let field = |name: &str| {
+                js_sys::Reflect::get(&data, &name.into())
+                    .ok()
+                    .and_then(|v| v.as_string().or_else(|| v.as_bool().map(|b| b.to_string())))
+                    .unwrap_or_default()
+            };
+            web_sys::console::warn_1(
+                &format!(
+                    "pharos: hls.js error type={} details={} fatal={}",
+                    field("type"),
+                    field("details"),
+                    field("fatal")
+                )
+                .into(),
+            );
+        });
+        player.on("hlsError", on_error.as_ref().unchecked_ref());
+        player.load_source(url);
+        player.attach_media(&video);
+        self.player = Some(player);
+        self._on_error = Some(on_error);
+        Ok(())
+    }
+}
+
+impl Drop for HlsJs {
+    fn drop(&mut self) {
+        if let Some(player) = self.player.take() {
+            player.destroy();
+        }
+    }
+}
+
+pub fn warn(message: &str) {
+    web_sys::console::warn_1(&message.into());
+}
+
+pub fn info(message: &str) {
+    web_sys::console::info_1(&message.into());
 }
