@@ -53,9 +53,9 @@ const VERIFY_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 static VERIFY_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFIES)));
 
-/// Outcome of a verify that was given a slot. `Busy` means no slot freed in time.
-enum Verified {
-    Done(AuthResult<bool>),
+/// Outcome of work that was given a slot. `Busy` means no slot freed in time.
+enum Bounded<T> {
+    Done(T),
     Busy,
 }
 
@@ -147,16 +147,19 @@ impl<U: UserStore> BuiltinAuth<U> {
             .collect()
     }
 
-    /// Verify on a blocking thread, holding one process-wide slot while it
-    /// runs. A login that gets no slot within `wait` is refused as `Busy`
-    /// rather than queued without bound.
-    async fn verify_off_worker(
-        &self,
-        hash: &str,
-        password: &SecretString,
+    /// Runs `work` on a blocking thread while holding one slot of `slots`, so
+    /// every argon2 call (hash or verify) shares the same memory bound. A
+    /// caller that gets no slot within `wait` is refused as `Busy` rather than
+    /// queued without bound.
+    async fn run_bounded<T, F>(
         slots: &Arc<Semaphore>,
         wait: Duration,
-    ) -> AuthResult<Verified> {
+        work: F,
+    ) -> AuthResult<Bounded<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         let started = Instant::now();
         let permit = match tokio::time::timeout(wait, slots.clone().acquire_owned()).await {
             Ok(Ok(permit)) => permit,
@@ -167,20 +170,34 @@ impl<U: UserStore> BuiltinAuth<U> {
                 let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 metrics::counter!("pharos_password_verify_busy_total").increment(1);
                 tracing::warn!(waited_ms, "password check busy: refused");
-                return Ok(Verified::Busy);
+                return Ok(Bounded::Busy);
             }
         };
-        let argon = self.argon.clone();
-        let hash = hash.to_owned();
-        let password = password.clone();
         let verdict = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _in_flight = InFlight::enter();
-            verify_blocking(&argon, &hash, &password)
+            work()
         })
         .await
         .map_err(|e| AuthError::Backend(format!("password check task: {e}")))?;
-        Ok(Verified::Done(verdict))
+        Ok(Bounded::Done(verdict))
+    }
+
+    /// Verify on a blocking thread under the slot bound (see [`Self::run_bounded`]).
+    async fn verify_off_worker(
+        &self,
+        hash: &str,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> AuthResult<Bounded<AuthResult<bool>>> {
+        let argon = self.argon.clone();
+        let hash = hash.to_owned();
+        let password = password.clone();
+        Self::run_bounded(slots, wait, move || {
+            verify_blocking(&argon, &hash, &password)
+        })
+        .await
     }
 
     /// Burn one argon2 verify so an unknown username costs what a known one
@@ -196,13 +213,13 @@ impl<U: UserStore> BuiltinAuth<U> {
             .verify_off_worker(&self.dummy_hash, password, slots, wait)
             .await?
         {
-            Verified::Busy => Err(busy_refusal()),
-            Verified::Done(Ok(_)) => {
+            Bounded::Busy => Err(busy_refusal()),
+            Bounded::Done(Ok(_)) => {
                 metrics::counter!("pharos_auth_dummy_verify_total").increment(1);
                 Ok(())
             }
             // Unknown usernames answer faster than known ones until fixed.
-            Verified::Done(Err(e)) => {
+            Bounded::Done(Err(e)) => {
                 tracing::error!(error = %e, "auth: dummy argon2 hash unusable");
                 Ok(())
             }
@@ -228,8 +245,8 @@ impl<U: UserStore> BuiltinAuth<U> {
             .verify_off_worker(record.password_hash.expose(), password, slots, wait)
             .await?
         {
-            Verified::Busy => return Err(busy_refusal()),
-            Verified::Done(verdict) => verdict?,
+            Bounded::Busy => return Err(busy_refusal()),
+            Bounded::Done(verdict) => verdict?,
         };
         if !matched {
             return Err(AuthError::InvalidCredentials);
