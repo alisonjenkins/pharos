@@ -13,6 +13,8 @@ fn media_id_i64(id: MediaId) -> DomainResult<i64> {
     i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))
 }
 
+type SessionRow = crate::TranscodeSessionRow;
+
 impl TranscodeSessionStore for SqliteStore {
     #[tracing::instrument(skip(self, session), fields(psid = %play_session_id))]
     async fn upsert_transcode_session(
@@ -25,13 +27,15 @@ impl TranscodeSessionStore for SqliteStore {
         sqlx::query(
             "INSERT INTO transcode_sessions \
              (play_session_id, media_id, decision_json, source_probe_json, \
-              burn_subtitle_indices_json, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
+              burn_subtitle_indices_json, holder_user_id, holder_token_id, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(play_session_id) DO UPDATE SET \
                media_id = excluded.media_id, \
                decision_json = excluded.decision_json, \
                source_probe_json = excluded.source_probe_json, \
                burn_subtitle_indices_json = excluded.burn_subtitle_indices_json, \
+               holder_user_id = excluded.holder_user_id, \
+               holder_token_id = excluded.holder_token_id, \
                updated_at = excluded.updated_at",
         )
         .bind(play_session_id)
@@ -39,6 +43,13 @@ impl TranscodeSessionStore for SqliteStore {
         .bind(&session.decision_json)
         .bind(&session.source_probe_json)
         .bind(&session.burn_subtitle_indices_json)
+        .bind(
+            session
+                .holder
+                .as_ref()
+                .map(|h| h.user_id.0.simple().to_string()),
+        )
+        .bind(session.holder.as_ref().map(|h| h.token_id.as_str()))
         .bind(now_unix_secs)
         .execute(self.pool())
         .await
@@ -51,25 +62,16 @@ impl TranscodeSessionStore for SqliteStore {
         &self,
         play_session_id: &str,
     ) -> DomainResult<Option<PersistedTranscodeSession>> {
-        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+        let row: Option<SessionRow> = sqlx::query_as(
             "SELECT media_id, decision_json, source_probe_json, \
-                    burn_subtitle_indices_json \
+                    burn_subtitle_indices_json, holder_user_id, holder_token_id \
              FROM transcode_sessions WHERE play_session_id = ?",
         )
         .bind(play_session_id)
         .fetch_optional(self.pool())
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
-        Ok(row.map(
-            |(media_id, decision_json, source_probe_json, burn_subtitle_indices_json)| {
-                PersistedTranscodeSession {
-                    media_id: media_id as u64,
-                    decision_json,
-                    source_probe_json,
-                    burn_subtitle_indices_json,
-                }
-            },
-        ))
+        Ok(row.map(crate::session_from_row))
     }
 
     #[tracing::instrument(skip(self), fields(psid = %play_session_id))]

@@ -93,6 +93,32 @@ pub mod string_list_json;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod media_query;
 
+/// A `transcode_sessions` row as both backends select it.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) type TranscodeSessionRow = (i64, String, String, String, Option<String>, Option<String>);
+
+/// A selected [`TranscodeSessionRow`] as the domain record. A holder needs
+/// both columns and a parseable user id; anything less is no holder.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn session_from_row(
+    (media_id, decision_json, source_probe_json, burn_subtitle_indices_json, user_id, token_id): TranscodeSessionRow,
+) -> pharos_core::PersistedTranscodeSession {
+    let holder = user_id
+        .and_then(|u| uuid::Uuid::parse_str(&u).ok())
+        .zip(token_id)
+        .map(|(user_id, token_id)| pharos_core::SessionHolder {
+            user_id: pharos_core::UserId(user_id),
+            token_id,
+        });
+    pharos_core::PersistedTranscodeSession {
+        media_id: media_id as u64,
+        decision_json,
+        source_probe_json,
+        burn_subtitle_indices_json,
+        holder,
+    }
+}
+
 // Session-token hashing + lifetime, shared by both backends' TokenStore.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod auth_token {

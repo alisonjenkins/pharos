@@ -887,6 +887,10 @@ where
         // Distinct from sess2's, so the round-trip below proves this column is
         // actually stored and re-read rather than defaulted.
         burn_subtitle_indices_json: "[3,7]".into(),
+        holder: Some(pharos_core::SessionHolder {
+            user_id: pharos_core::UserId::new(),
+            token_id: "holder-token-id".into(),
+        }),
     };
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 100)
         .await
@@ -903,6 +907,8 @@ where
         decision_json: r#"{"DirectPlay":null}"#.into(),
         source_probe_json: r#"{"container":"mp4"}"#.into(),
         burn_subtitle_indices_json: "[]".into(),
+        // Overwriting with no holder clears it rather than keeping sess's.
+        holder: None,
     };
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess2, 200)
         .await
