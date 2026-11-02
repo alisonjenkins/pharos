@@ -386,3 +386,47 @@ fn matrix_doc_lists_every_ignored_test() {
         );
     }
 }
+
+/// B267: a named section's stored values are what an admin saved, and for
+/// `livetv` that includes tuner and guide provider URLs with credentials. An
+/// admin reads them back; any other user gets the defaults, counted under
+/// `pharos_named_config_withheld_total`. (Anonymous reads answer 401:
+/// `route_auth_audit`.)
+/// Disarm check: with the admin check removed, the user reads the tuner URL.
+#[actix_web::test]
+async fn a_named_sections_stored_values_are_admin_only() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let tuner = "http://tuner-user:tuner-pass@iptv.example/get.php";
+    let post = test::TestRequest::post()
+        .uri("/System/Configuration/livetv")
+        .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+        .set_json(serde_json::json!({ "TunerHosts": [{ "Url": tuner }] }))
+        .to_request();
+    assert!(test::call_service(&app, post).await.status().is_success());
+    let read = |token: &str| {
+        test::TestRequest::get()
+            .uri("/System/Configuration/livetv")
+            .insert_header(("X-Emby-Token", token))
+            .to_request()
+    };
+    let admin: Value = test::call_and_read_body_json(&app, read(f.admin_token.as_str())).await;
+    assert_eq!(admin["TunerHosts"][0]["Url"], tuner);
+    let user: Value = test::call_and_read_body_json(&app, read(f.user_token.as_str())).await;
+    assert_eq!(user["TunerHosts"], serde_json::json!([]), "{user}");
+    let withheld: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| k.key().name() == "pharos_named_config_withheld_total")
+        .map(|(.., v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum();
+    assert_eq!(withheld, 1);
+}
