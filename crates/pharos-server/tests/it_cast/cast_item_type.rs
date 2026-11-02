@@ -3,8 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[path = "common/cast_rig.rs"]
-mod cast_rig;
+use crate::cast_rig;
 
 use cast_rig::CastRig;
 use pharos_cast::messages::CommandBody;

@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use actix_web::{http::StatusCode, test, web};
 use pharos_core::{

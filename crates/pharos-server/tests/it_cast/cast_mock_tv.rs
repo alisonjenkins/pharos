@@ -5,8 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-#[path = "common/cast_rig.rs"]
-mod cast_rig;
+use crate::cast_rig;
 
 use std::time::Duration;
 

@@ -3,8 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-#[path = "common/cast_rig.rs"]
-mod cast_rig;
+use crate::cast_rig;
 
 use cast_rig::{counter, drain, eventually, wait_msg, CastRig};
 use pharos_cast::obs::ConnState;
