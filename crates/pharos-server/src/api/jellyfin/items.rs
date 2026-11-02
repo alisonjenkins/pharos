@@ -18,7 +18,7 @@ use crate::{
             PlaybackInfoResponseDto, SeriesFolderDto, SubtitleStreamCtx, SynthItemDto,
             UserItemDataDto,
         },
-        subtitles::{discover_sidecars, is_image_subtitle_codec},
+        subtitles::discover_sidecars,
     },
     state::AppState,
 };
@@ -2285,14 +2285,12 @@ async fn playback_info(
     let playback::Negotiated {
         ref source,
         ref container,
-        ref server_codecs,
         ref decision,
         ref direct_play_block,
         downgrade,
         remote_ceiling,
         ref burn_text_indices,
         explicit_mono,
-        explicit_preserve,
         profile_rejected_3d,
         burning_sub_on_packed_3d,
         stereo_output,
@@ -2300,188 +2298,32 @@ async fn playback_info(
         supports_direct_stream,
         ..
     } = negotiated;
-    let selected_sub = negotiated.selected_subtitle.as_ref();
 
-    // Firefox/Gecko browsers (including Zen) report `canPlayType("…avc1…")` =
-    // "probably" — so jellyfin-web advertises H.264 and lists it first — yet
-    // their Media Source Extensions frequently CANNOT decode H.264
-    // (`isTypeSupported` → false). hls.js then aborts our H.264 HLS with a
-    // fatal manifestParsingError ("no level with compatible codecs"). pharos
-    // can't see that canPlayType/MSE mismatch from the profile, so use a
-    // targeted client quirk: when a Firefox-family UA ALSO advertises a VP9
-    // transcode target, serve the progressive VP9/WebM stream (which its MSE
-    // decodes reliably) instead. Chromium/Safari keep the efficient H.264 HLS.
-    // The rendition SET for the unified multi-codec master. The old code forced
-    // Linux Firefox onto VP9 via a UA sniff, because a codec-less distro Firefox
-    // reports `canPlayType('avc1')="probably"` (lists h264) yet its MSE
-    // `isTypeSupported` is false. pharos can't see that from the profile — so
-    // instead of guessing by UA, advertise EVERY codec the client's profile says
-    // it decodes AND this server can encode (ranked hardware-first), and let the
-    // client's own `isTypeSupported` drop the rungs it can't play. A modern
-    // Firefox decodes h264 and takes the cheap hardware rung; a codec-less one
-    // drops h264 and self-selects VP9. Limited to the codecs pharos has a
-    // segment surface for: h264 (mpegts) and vp9 (fMP4).
-    let client_video_csv = profile
-        .transcoding_profiles
-        .iter()
-        .filter(|t| t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
-        .map(|t| t.video_codec.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut renditions: Vec<String> =
-        pharos_jellyfin_api::device_profile::rank_transcode_video_codecs(
-            &client_video_csv,
-            server_codecs,
-        )
-        .into_iter()
-        .filter(|c| matches!(c.as_str(), "h264" | "vp9"))
-        .collect();
-    if renditions.is_empty() {
-        renditions.push("h264".to_string()); // the always-available safe surface
-    }
-    // Native clients don't MSE-`isTypeSupported`-filter a master; they take the
-    // first rung. Give them a single codec (the negotiated target).
-    if !is_web_client {
-        let one = match &decision {
-            Decision::Transcode {
-                target_video_codec: Some(c),
-                ..
-            } if c.to_ascii_lowercase().starts_with("vp") => "vp9".to_string(),
-            _ => renditions.first().cloned().unwrap_or_else(|| "h264".into()),
-        };
-        renditions = vec![one];
-    }
+    // The query string wins; jellyfin-web's transcode track switch sends the
+    // audio index only in the POST body.
+    let audio_stream_index = query_param(req.query_string(), "AudioStreamIndex")
+        .map(str::to_owned)
+        .or_else(|| body_audio_index.map(|n| n.to_string()));
+    let playback::Delivery {
+        renditions,
+        transcoding_url,
+    } = playback::delivery(
+        &negotiated,
+        &playback::DeliveryRequest {
+            profile: &profile,
+            probe,
+            item_wire_id: &id_str,
+            source_param: &source_param,
+            play_session_id: &play_session_id,
+            api_key: Some(&api_key),
+            audio_stream_index,
+            explicit_subtitle_index,
+            is_web_client,
+            resume_ticks,
+            transcoding: switches.transcoding,
+        },
+    );
     let renditions_param = renditions.join(",");
-
-    // Forward the client's audio/subtitle track selection into the VP9 HLS
-    // URL — jellyfin-web re-requests PlaybackInfo with these when the user
-    // switches tracks. The VP9 segment handler maps them into ffmpeg (audio
-    // select) + burns the chosen subtitle in.
-    let stream_selection = {
-        let q = req.query_string();
-        // Query string wins (legacy/other clients + explicit overrides); the
-        // POST body is the fallback, since jellyfin-web's transcode audio/
-        // subtitle switch sends the index ONLY in the body.
-        let from_query = |key: &str| -> Option<String> {
-            q.split('&')
-                .filter_map(|kv| kv.split_once('='))
-                .find(|(k, _)| k.eq_ignore_ascii_case(key))
-                .map(|(_, v)| v)
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        };
-        let mut s = String::new();
-        let mut push = |key: &str, val: String| {
-            s.push('&');
-            s.push_str(key);
-            s.push('=');
-            s.push_str(&val);
-        };
-        if let Some(v) =
-            from_query("AudioStreamIndex").or_else(|| body_audio_index.map(|n| n.to_string()))
-        {
-            push("AudioStreamIndex", v);
-        }
-        // Subtitle "off" (-1) is meaningful to the segment handler (it clears
-        // any prior burn-in) — forward it, unlike an absent value.
-        //
-        // Forward a POSITIVE index only when the SELECTED track (explicit
-        // pick, else the container's default-disposition track —
-        // `resolve_selected_subtitle`, the same resolver the DirectPlay burn
-        // -downgrade above consults, so both act on one source of truth)
-        // MUST burn: an IMAGE subtitle (PGS/VOBSUB — no external rendition
-        // exists), or a TEXT/ASS sub this client's SubtitleProfile can't
-        // render externally (`burn_text_indices`, Task 3/B44). A text sub
-        // the client DOES render externally must never ride the URL —
-        // burning it is redundant AND catastrophically slow: a burned-sub
-        // VP9 segment uses output seeking (decode from 0), so a segment deep
-        // in the file takes tens of seconds (Code Geass S01E01 seg ~90
-        // measured at ~100 s for 6 s of content → constant stutter).
-        if explicit_subtitle_index == Some(-1) {
-            push("SubtitleStreamIndex", "-1".to_string());
-        } else if let Some(t) = selected_sub {
-            if is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
-                || burn_text_indices.contains(&t.stream_index)
-            {
-                push("SubtitleStreamIndex", t.stream_index.to_string());
-            }
-        }
-        if is_video && probe.video_3d_format.is_some() {
-            if stereo_output == pharos_transcode::StereoOutput::Mono2D {
-                push("StereoMode", "mono".to_string());
-            } else if explicit_preserve {
-                push("StereoMode", "preserve".to_string());
-            }
-        }
-        s
-    };
-    // VP9-in-fMP4 HLS, NOT progressive WebM. A progressive `<video src>` VP9
-    // stream plays in Firefox but cannot seek to an unbuffered position and
-    // reports no reliable position for resume. Serving VP9 as fMP4 HLS (like
-    // Jellyfin) gives hls.js a seekable VOD playlist — restoring seeking,
-    // resume, and mid-playback track switching. SubProtocol resolves to "hls".
-    // Fix (Lace incident): bake the negotiated video-bitrate ceiling into the
-    // TranscodingUrl as `&VideoBitrate=` (real-Jellyfin convention). The
-    // segment surfaces already read the cap from the registered session, but
-    // the URL param rides `playback_qs` through master → variant → segment so
-    // the ceiling still applies if the session is GC'd (a cold segment hit) and
-    // on the re-encoding remux paths, which carry no cap in the Decision. Empty
-    // when there's no ceiling (LAN client / no client pick / non-transcode).
-    let video_bitrate_param = match &decision {
-        Decision::Transcode {
-            max_video_bitrate_bps: Some(bps),
-            ..
-        } => format!("&VideoBitrate={bps}"),
-        // A remote client remuxing (container/audio only) still RE-ENCODES video
-        // on the segmented-HLS surface (B45), so carry the connection ceiling.
-        _ => remote_ceiling
-            .map(|b| format!("&VideoBitrate={b}"))
-            .unwrap_or_default(),
-    };
-    // Every VIDEO transcode/remux drives the UNIFIED master playlist. It carries
-    // `renditions=` (the capability-ranked codec set) so the h264/mpegts rung
-    // AND — when the client offers vp9 — the vp9/fMP4 rung are advertised
-    // together; the client's own isTypeSupported picks the codec it can decode.
-    // No UA sniffing, no separate vp9 master URL. PlaySessionId rides the URL so
-    // the segment handlers reuse the cached Decision; B41 stream_selection +
-    // B45/Lace video_bitrate_param ride through master → variant → segment.
-    let master_url = format!(
-        "/videos/{id_str}/master.m3u8?PlaySessionId={play_session_id}&api_key={api_key}&renditions={renditions_param}{stream_selection}{video_bitrate_param}{source_param}"
-    );
-    let universal_audio_url = format!(
-        "/audio/{id_str}/universal?PlaySessionId={play_session_id}&api_key={api_key}{source_param}"
-    );
-    let transcoding_url = match &decision {
-        // Transcode: video → unified master; audio-only → universal endpoint.
-        Decision::Transcode { .. } if is_video => Some(master_url.clone()),
-        Decision::Transcode { .. } => Some(universal_audio_url.clone()),
-        // P9 — VideoRemux drives the same master; the segment handler reads
-        // Decision::VideoRemux from the session and emits `-c:v copy` for the
-        // h264 rung (the vp9 rung, if advertised, full-transcodes VP9 for a
-        // client that can't decode the copied h264).
-        Decision::VideoRemux { .. } => Some(master_url.clone()),
-        // B77 — a VIDEO AudioRemux (compatible video, undecodable audio) drives
-        // the master too: the segment surface re-encodes to a decodable codec.
-        Decision::AudioRemux { .. } if is_video => Some(master_url.clone()),
-        // Audio-only source whose codec the client can't direct-play → universal.
-        Decision::AudioRemux { .. } => Some(universal_audio_url.clone()),
-        _ => None,
-    };
-    let transcoding_url = transcoding_url.filter(|_| switches.transcoding);
-    // B74 — native players (Android TV / ExoPlayer) use the TranscodingUrl
-    // verbatim and do NOT client-seek a transcode, so a resume must ride the
-    // URL as `StartTimeTicks` (real Jellyfin does exactly this). Web self-seeks
-    // in the full VOD playlist + carries its own resume via the top-level
-    // StartPositionTicks, so its URL is left untouched. On the native side this
-    // reaches `render_variant_playlist` (via playback_qs, B74) which emits
-    // `EXT-X-START:TIME-OFFSET` → the player lands at the resume point instead
-    // of 0:00 (deep segments transcode as fast as seg 0 — input seek).
-    let transcoding_url = match transcoding_url {
-        Some(u) if !is_web_client && resume_ticks > 0 && !u.contains("StartTimeTicks") => {
-            Some(format!("{u}&StartTimeTicks={resume_ticks}"))
-        }
-        other => other,
-    };
     // P9 — emitted container reflects the negotiated target when remuxing.
     let advertised_container = match &decision {
         Decision::VideoRemux {
@@ -2622,7 +2464,15 @@ async fn playback_info(
         }
     }
 
-    playback::register(&state, &play_session_id, id, &negotiated, probe, holder.clone()).await;
+    playback::register(
+        &state,
+        &play_session_id,
+        id,
+        &negotiated,
+        probe,
+        holder.clone(),
+    )
+    .await;
 
     // Cold-start prewarm (a): the moment a video transcode is negotiated onto
     // the h264/mpegts master, warm its first few `main`-rung segments into the
@@ -2632,9 +2482,10 @@ async fn playback_info(
     // gone. Only when h264 is the rung the client actually starts on (every
     // real browser); a vp9-first client never touches /hls1/main, so skip it.
     if route == "hls-master" && renditions.first().is_some_and(|c| c == "h264") {
-        let audio_idx =
-            query_param(&stream_selection, "AudioStreamIndex").and_then(|v| v.parse::<u32>().ok());
-        let sub_idx = query_param(&stream_selection, "SubtitleStreamIndex")
+        // The master URL carries the track picks the segments will ask for.
+        let url = transcoding_url.as_deref().unwrap_or_default();
+        let audio_idx = query_param(url, "AudioStreamIndex").and_then(|v| v.parse::<u32>().ok());
+        let sub_idx = query_param(url, "SubtitleStreamIndex")
             .and_then(|v| v.parse::<i32>().ok())
             .filter(|&i| i >= 0)
             .map(|i| i as u32);
@@ -7850,4 +7701,3 @@ mod series_dto_tests {
         assert_eq!(v["Type"], "Series");
     }
 }
-

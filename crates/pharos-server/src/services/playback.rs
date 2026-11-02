@@ -753,6 +753,164 @@ fn subtitle_selection_forces_transcode(
         })
 }
 
+/// What the transcoding URL is built from, beyond the negotiated outcome.
+pub struct DeliveryRequest<'a> {
+    pub profile: &'a DeviceProfile,
+    pub probe: &'a pharos_core::MediaProbe,
+    /// The item (or edition) as the client names it on the wire.
+    pub item_wire_id: &'a str,
+    /// `&MediaSourceId=…` when one edition was asked for, else empty.
+    pub source_param: &'a str,
+    pub play_session_id: &'a str,
+    /// The Jellyfin API puts the token in the URL; the native API does not.
+    pub api_key: Option<&'a str>,
+    pub audio_stream_index: Option<String>,
+    pub explicit_subtitle_index: Option<i64>,
+    pub is_web_client: bool,
+    pub resume_ticks: u64,
+    /// The client's `EnableTranscoding` switch.
+    pub transcoding: bool,
+}
+
+/// The segmented delivery of a negotiated playback.
+pub struct Delivery {
+    /// The codecs the HLS master advertises, best first.
+    pub renditions: Vec<String>,
+    /// `None` when the playback is direct, or transcoding is switched off.
+    pub transcoding_url: Option<String>,
+}
+
+/// Builds the URL a non-direct playback streams from: the unified HLS
+/// master for video, the universal endpoint for audio.
+pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
+    let renditions = renditions(n, r);
+    let api_key = r
+        .api_key
+        .map(|k| format!("&api_key={k}"))
+        .unwrap_or_default();
+    let (id, psid, source) = (r.item_wire_id, r.play_session_id, r.source_param);
+    let transcoding_url = match (&n.decision, n.is_video) {
+        (Decision::DirectPlay, _) => None,
+        // Every video transcode or remux drives the unified master. It
+        // advertises each rendition the client can decode and lets the
+        // client's own isTypeSupported pick; the PlaySessionId lets the
+        // segment handlers reuse the registered decision (P9, B77).
+        (Decision::VideoRemux { .. }, _) | (_, true) => Some(format!(
+            "/videos/{id}/master.m3u8?PlaySessionId={psid}{api_key}&renditions={}{}{}{source}",
+            renditions.join(","),
+            stream_selection(n, r),
+            video_bitrate_param(n),
+        )),
+        (_, false) => Some(format!(
+            "/audio/{id}/universal?PlaySessionId={psid}{api_key}{source}"
+        )),
+    }
+    .filter(|_| r.transcoding)
+    // B74 — native players replay the URL verbatim and do not client-seek a
+    // transcode, so a resume rides it as StartTimeTicks. The web client
+    // seeks in the full VOD playlist itself.
+    .map(|u| {
+        if !r.is_web_client && r.resume_ticks > 0 {
+            format!("{u}&StartTimeTicks={}", r.resume_ticks)
+        } else {
+            u
+        }
+    });
+    Delivery {
+        renditions,
+        transcoding_url,
+    }
+}
+
+/// Every codec the client's profile decodes and this server encodes, ranked
+/// hardware-first, limited to the codecs with a segment surface (h264 on
+/// mpegts, vp9 on fMP4). A browser filters them by isTypeSupported; a native
+/// player takes the first rung, so it gets only the negotiated target.
+fn renditions(n: &Negotiated, r: &DeliveryRequest<'_>) -> Vec<String> {
+    let client_video_csv = r
+        .profile
+        .transcoding_profiles
+        .iter()
+        .filter(|t| t.kind.is_empty() || t.kind.eq_ignore_ascii_case("Video"))
+        .map(|t| t.video_codec.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut renditions: Vec<String> =
+        pharos_jellyfin_api::device_profile::rank_transcode_video_codecs(
+            &client_video_csv,
+            &n.server_codecs,
+        )
+        .into_iter()
+        .filter(|c| matches!(c.as_str(), "h264" | "vp9"))
+        .collect();
+    if renditions.is_empty() {
+        renditions.push("h264".to_string());
+    }
+    if !r.is_web_client {
+        let one = match &n.decision {
+            Decision::Transcode {
+                target_video_codec: Some(c),
+                ..
+            } if c.to_ascii_lowercase().starts_with("vp") => "vp9".to_string(),
+            _ => renditions.swap_remove(0),
+        };
+        renditions = vec![one];
+    }
+    renditions
+}
+
+/// The track picks the segment handler needs: the audio stream, the subtitle
+/// to burn, and the 3D output.
+///
+/// A subtitle rides the URL only when it must burn: an image subtitle, or a
+/// text one this client cannot render (`burn_text_indices`). Burning a text
+/// subtitle the client renders itself is redundant and slow: a burned segment
+/// seeks by decoding from the start. `-1` ("off") always rides, since it
+/// clears an earlier burn.
+fn stream_selection(n: &Negotiated, r: &DeliveryRequest<'_>) -> String {
+    let mut s = String::new();
+    let mut push = |key: &str, val: &dyn std::fmt::Display| {
+        s.push_str(&format!("&{key}={val}"));
+    };
+    if let Some(v) = &r.audio_stream_index {
+        push("AudioStreamIndex", v);
+    }
+    if r.explicit_subtitle_index == Some(-1) {
+        push("SubtitleStreamIndex", &-1);
+    } else if let Some(t) = &n.selected_subtitle {
+        if is_image_subtitle_codec(t.codec.as_deref().unwrap_or(""))
+            || n.burn_text_indices.contains(&t.stream_index)
+        {
+            push("SubtitleStreamIndex", &t.stream_index);
+        }
+    }
+    if n.is_video && r.probe.video_3d_format.is_some() {
+        if n.stereo_output == pharos_transcode::StereoOutput::Mono2D {
+            push("StereoMode", &"mono");
+        } else if n.explicit_preserve {
+            push("StereoMode", &"preserve");
+        }
+    }
+    s
+}
+
+/// The negotiated video bitrate ceiling as `&VideoBitrate=` (Lace incident):
+/// it rides master → variant → segment, so the cap holds on a cold segment
+/// whose session was collected, and on the remux paths, whose decision
+/// carries no cap. A remote remux re-encodes video too (B45), so it carries
+/// the connection ceiling.
+fn video_bitrate_param(n: &Negotiated) -> String {
+    match &n.decision {
+        Decision::Transcode {
+            max_video_bitrate_bps: Some(bps),
+            ..
+        } => Some(*bps),
+        _ => n.remote_ceiling,
+    }
+    .map(|b| format!("&VideoBitrate={b}"))
+    .unwrap_or_default()
+}
+
 /// Convert the boot-resolved server encode capabilities into the negotiator's
 /// codec-support DTO (canonical codec names, hw flag, cost tier). An empty
 /// capability set (tests / not-yet-wired) yields an empty support list, so the
