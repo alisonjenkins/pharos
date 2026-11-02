@@ -79,3 +79,4 @@ optional **Alternatives considered** / **References**).
 | [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
 | [0035](0035-native-ui-vendors-hlsjs.md) | The native web UI plays HLS through a vendored, pinned hls.js 1.7.4 served from `'self'`, loaded only where the browser lacks native HLS | Accepted |
 | [0036](0036-themes-are-toml-over-a-token-model.md) | Themes are TOML documents over a typed, platform-neutral token model; the web UI renders them as `--px-*` custom properties and `pharos.css` reads nothing else | Accepted |
+| [0037](0037-per-user-prefs-store-and-telemetry-opt-in-gate.md) | Per-user prefs live in their own `UserPrefStore` (opaque bytes per key, policy in `rpc/prefs.rs`); `Telemetry.submit` drops batches from users who have not opted in (`diagnostics.opt_in`) | Accepted |
