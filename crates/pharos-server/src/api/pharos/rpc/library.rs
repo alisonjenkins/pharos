@@ -14,7 +14,8 @@ use super::bootstrap::token_denial;
 use super::session::Session;
 use crate::services::auth::{user_for_token, TokenRefusal};
 use crate::services::library::{
-    self, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QUERY_DEFAULT, QUERY_MAX,
+    self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QUERY_DEFAULT,
+    QUERY_MAX,
 };
 
 pub(super) struct Library {
@@ -197,6 +198,81 @@ impl server::library::Handler for Library {
             "query",
             &state.server_id,
         );
+        Ok(())
+    }
+
+    async fn detail(
+        self: Rc<Self>,
+        params: wire::DetailParams,
+        results: &mut wire::DetailResults,
+    ) -> Result<(), capnp::Error> {
+        let id = read_item_id(params.get()?.get_id()?)?;
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let item_not_found = Denial::NotFound { what: "item" };
+        // Synthesised items (series, season, album…) have no detail here yet.
+        let WireId::Real(id) = id else {
+            item_not_found.write(results.get().init_result().init_error());
+            return Ok(());
+        };
+        let state = &self.session.state;
+        let (item, user_data) = match library::detail(state, &user, id).await {
+            Ok(found) => found,
+            Err(e) => {
+                use crate::services::access::ItemHidden;
+                let (denial, detail) = match &e {
+                    DetailError::Hidden(ItemHidden::Unavailable(detail)) => (
+                        Denial::Unavailable {
+                            dependency: "media store",
+                        },
+                        detail.clone(),
+                    ),
+                    // A hidden item answers as a missing one, so its id says
+                    // nothing about what exists.
+                    DetailError::Hidden(hidden) => (item_not_found, hidden.label().to_owned()),
+                    DetailError::NotFound => (item_not_found, "not_found".to_owned()),
+                    DetailError::Store(e) => (
+                        Denial::Unavailable {
+                            dependency: "media store",
+                        },
+                        e.to_string(),
+                    ),
+                };
+                if matches!(denial, Denial::Unavailable { .. }) {
+                    tracing::warn!(media.id = id, error = %detail, "native library: detail unavailable");
+                } else {
+                    tracing::info!(media.id = id, reason = %detail, "native library: detail refused");
+                }
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
+        let mut out = results.get().init_result().init_detail();
+        write_item(
+            out.reborrow().init_summary(),
+            &item,
+            user_data,
+            &state.server_id,
+        );
+        out.set_overview(dto.overview.as_deref().unwrap_or_default());
+        let count = u32::try_from(dto.genres.len()).unwrap_or(u32::MAX);
+        let mut genres = out.reborrow().init_genres(count);
+        for (i, genre) in (0..count).zip(&dto.genres) {
+            genres.set(i, genre.as_str());
+        }
+        let count = u32::try_from(dto.chapters.len()).unwrap_or(u32::MAX);
+        let mut chapters = out.init_chapters(count);
+        for (i, chapter) in (0..count).zip(&dto.chapters) {
+            let mut c = chapters.reborrow().get(i);
+            c.set_name(chapter.name.as_str());
+            c.set_start_ms(chapter.start_position_ticks / 10_000);
+        }
         Ok(())
     }
 

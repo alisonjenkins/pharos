@@ -286,13 +286,18 @@ async fn wire_latest(
 
 /// The page's total and its items as the Jellyfin fields the tests compare.
 fn summaries(result: items_result::Reader<'_>) -> (u32, Vec<serde_json::Value>) {
-    use pharos_api::pharos_capnp::{item_id, opt_u16, opt_u32};
-    use pharos_jellyfin_api::dto::WireId;
     let items_result::Page(page) = result.which().unwrap() else {
         panic!("the listing answered an error");
     };
     let page = page.unwrap();
-    let items = page.get_items().unwrap();
+    let items = page.get_items().unwrap().iter().map(summary).collect();
+    (page.get_total(), items)
+}
+
+/// One `ItemSummary` as the Jellyfin fields the tests compare.
+fn summary(item: pharos_api::pharos_capnp::item_summary::Reader<'_>) -> serde_json::Value {
+    use pharos_api::pharos_capnp::{item_id, opt_u16, opt_u32};
+    use pharos_jellyfin_api::dto::WireId;
     let opt16 = |o: opt_u16::Reader<'_>| match o.which().unwrap() {
         opt_u16::Some(n) => Some(u32::from(n)),
         opt_u16::None(()) => None,
@@ -301,26 +306,20 @@ fn summaries(result: items_result::Reader<'_>) -> (u32, Vec<serde_json::Value>) 
         opt_u32::Some(n) => Some(n),
         opt_u32::None(()) => None,
     };
-    let items = items
-        .iter()
-        .map(|item| {
-            let id = match item.get_id().unwrap().which().unwrap() {
-                item_id::Real(n) => WireId::Real(n),
-                item_id::Synth(n) => WireId::Synth(n),
-            };
-            let images = item.get_images().unwrap();
-            serde_json::json!({
-                "Id": id.to_string(),
-                "Name": item.get_name().unwrap().to_str().unwrap(),
-                "ProductionYear": item.has_year().then(|| opt16(item.get_year().unwrap())).flatten(),
-                "SeriesName": Some(item.get_series_name().unwrap().to_str().unwrap()).filter(|s| !s.is_empty()),
-                "IndexNumber": item.has_index_number().then(|| opt32(item.get_index_number().unwrap())).flatten(),
-                "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
-                "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
-            })
-        })
-        .collect();
-    (page.get_total(), items)
+    let id = match item.get_id().unwrap().which().unwrap() {
+        item_id::Real(n) => WireId::Real(n),
+        item_id::Synth(n) => WireId::Synth(n),
+    };
+    let images = item.get_images().unwrap();
+    serde_json::json!({
+        "Id": id.to_string(),
+        "Name": item.get_name().unwrap().to_str().unwrap(),
+        "ProductionYear": item.has_year().then(|| opt16(item.get_year().unwrap())).flatten(),
+        "SeriesName": Some(item.get_series_name().unwrap().to_str().unwrap()).filter(|s| !s.is_empty()),
+        "IndexNumber": item.has_index_number().then(|| opt32(item.get_index_number().unwrap())).flatten(),
+        "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
+        "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
+    })
 }
 
 /// A Jellyfin `BaseItemDto` list reduced to the fields `summaries` reads.
@@ -1016,4 +1015,175 @@ async fn native_query_agrees_with_the_jellyfin_items_route() {
             "{jf}"
         );
     }
+}
+
+/// `Library.detail` on `session` for `id`: the detail as the Jellyfin fields
+/// the test compares, or the error kind's `notFound` / `unavailable` text.
+async fn wire_detail(
+    session: &session::Client,
+    id: pharos_jellyfin_api::dto::WireId,
+) -> Result<serde_json::Value, String> {
+    use pharos_api::pharos_capnp::{detail_result, error};
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    let mut out = req.get().init_id();
+    match id {
+        WireId::Real(n) => out.set_real(n),
+        WireId::Synth(n) => out.set_synth(n),
+    }
+    let reply = req.send().promise.await.expect("detail");
+    let result = reply.get().unwrap().get_result().unwrap();
+    match result.which().unwrap() {
+        detail_result::Detail(d) => {
+            let d = d.unwrap();
+            let mut row = summary(d.get_summary().unwrap());
+            row["Overview"] = d.get_overview().unwrap().to_str().unwrap().into();
+            row["Genres"] = d
+                .get_genres()
+                .unwrap()
+                .iter()
+                .map(|g| g.unwrap().to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+                .into();
+            row["Chapters"] = d
+                .get_chapters()
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "Name": c.get_name().unwrap().to_str().unwrap(),
+                        "StartMs": c.get_start_ms(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+            Ok(row)
+        }
+        detail_result::Error(e) => Err(match e.unwrap().get_kind().which().unwrap() {
+            error::kind::NotFound(what) => {
+                format!("not found: {}", what.unwrap().to_str().unwrap())
+            }
+            error::kind::Unavailable(what) => {
+                format!("unavailable: {}", what.unwrap().to_str().unwrap())
+            }
+            _ => "other".to_owned(),
+        }),
+    }
+}
+
+/// T034 over the wire: `Library.detail` shows what `/Users/{id}/Items/{id}`
+/// shows for the same user and item: its summary, overview, genres and
+/// chapters.
+/// Disarm check: with `detail` leaving out the chapters (or the genres),
+/// the agreement fails.
+#[actix_web::test]
+async fn native_detail_agrees_with_the_jellyfin_item_route() {
+    use actix_web::test;
+    use pharos_core::{LibraryStore as _, MediaChapter, MediaItem, MediaKind, MediaStore as _};
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut item = MediaItem {
+        id: 103,
+        path: "/libA/Chaptered.mkv".into(),
+        title: "Chaptered".into(),
+        kind: MediaKind::Movie,
+        ..MediaItem::default()
+    };
+    item.metadata.overview = Some("Told in two parts.".into());
+    item.probe.genre = Some("Drama".into());
+    item.probe.chapters = vec![
+        MediaChapter {
+            start_ms: 0,
+            end_ms: 60_000,
+            title: "Opening".into(),
+        },
+        MediaChapter {
+            start_ms: 60_000,
+            end_ms: 120_000,
+            title: "Close".into(),
+        },
+    ];
+    fx.state.stores.put(item).await.unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let uid = fx.user_id.0.simple();
+
+    for id in [103, fx.rich_item_id] {
+        let native = wire_detail(&session, WireId::Real(id)).await.unwrap();
+        let req = test::TestRequest::get()
+            .uri(&format!("/Users/{uid}/Items/{}", WireId::Real(id)))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request();
+        let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        let mut want = project(std::slice::from_ref(&web)).remove(0);
+        want["Overview"] = web
+            .get("Overview")
+            .and_then(|o| o.as_str())
+            .unwrap_or("")
+            .into();
+        want["Genres"] = web["Genres"].clone();
+        want["Chapters"] = web["Chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "Name": c["Name"],
+                    "StartMs": c["StartPositionTicks"].as_u64().unwrap() / 10_000,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        assert_eq!(native, want, "item {id}");
+    }
+    assert_eq!(
+        wire_detail(&session, WireId::Real(103)).await.unwrap()["Chapters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// T034: an item the policy hides answers `notFound`, exactly like an id
+/// that names nothing, so a detail call reveals nothing about what exists;
+/// a synthesised id has no detail yet.
+/// Disarm check: with the access check removed from
+/// `services::library::detail`, the hidden item answers its detail.
+#[actix_web::test]
+async fn a_hidden_item_answers_like_a_missing_one() {
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(wire_detail(&session, WireId::Real(fx.other_item_id))
+        .await
+        .is_ok());
+    let hidden = wire_detail(&session, WireId::Real(fx.rich_item_id)).await;
+    let missing = wire_detail(&session, WireId::Real(987_654_321)).await;
+    assert_eq!(hidden, Err("not found: item".to_owned()));
+    assert_eq!(hidden, missing);
+    let synth = WireId::parse(&fx.lib_b_wire).unwrap();
+    assert_eq!(
+        wire_detail(&session, synth).await,
+        Err("not found: item".to_owned())
+    );
 }
