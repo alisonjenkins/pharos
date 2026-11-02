@@ -9,7 +9,7 @@ use std::str::FromStr;
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, item_id, item_summary, items_result,
     library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs,
-    session, stream_choice, telemetry, Kind,
+    session, stream_choice, telemetry, Kind, LibraryKind as WireLibraryKind,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
@@ -55,7 +55,7 @@ impl FromStr for ItemRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemKind {
     Movie,
     Episode,
@@ -81,6 +81,16 @@ impl ItemKind {
     }
 }
 
+/// What a library holds, which decides how its page lays it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryKind {
+    Mixed,
+    Movies,
+    TvShows,
+    Music,
+    Books,
+}
+
 /// One item as a list or rail shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -96,8 +106,14 @@ pub struct Item {
     pub favorite: bool,
     pub position_ms: u64,
     pub series_name: Option<String>,
+    /// An episode's season, or a track's disc.
     pub season: Option<u32>,
+    /// An episode's number, or a track's number on its disc.
     pub episode: Option<u32>,
+    /// Where the server says: a season's series, an episode's season.
+    pub parent: Option<ItemRef>,
+    /// A library's kind; `None` for anything else.
+    pub library_kind: Option<LibraryKind>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +193,23 @@ pub trait PharosApi {
         &self,
         call: &CallInfo,
         parent: ItemRef,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page, ClientError> {
+        self.list(call, parent, None, "SortName", start, limit)
+            .await
+    }
+    /// The children of `parent` that `group` names: a kind the server
+    /// synthesises (series, season, album, artist) lists those groups
+    /// folded out of what is stored there; `None` lists the stored items.
+    /// `sort_by` takes Jellyfin `SortBy` tokens, such as
+    /// `ParentIndexNumber,IndexNumber` for episode or track order.
+    async fn list(
+        &self,
+        call: &CallInfo,
+        parent: ItemRef,
+        group: Option<ItemKind>,
+        sort_by: &str,
         start: u32,
         limit: u32,
     ) -> Result<Page, ClientError>;
@@ -361,10 +394,12 @@ impl PharosApi for NativeApi {
         }
     }
 
-    async fn browse(
+    async fn list(
         &self,
         call: &CallInfo,
         parent: ItemRef,
+        group: Option<ItemKind>,
+        sort_by: &str,
         start: u32,
         limit: u32,
     ) -> Result<Page, ClientError> {
@@ -374,7 +409,10 @@ impl PharosApi for NativeApi {
             call.write(p.reborrow().init_ctx());
             let mut q = p.init_q();
             set_item_ref(q.reborrow().init_parent_id(), parent);
-            q.set_sort_by("SortName");
+            if let Some(kind) = group.and_then(wire_kind) {
+                q.reborrow().init_kinds(1).set(0, kind);
+            }
+            q.set_sort_by(sort_by);
             q.set_start(start);
             q.set_limit(limit);
         }
@@ -567,6 +605,36 @@ fn read_item_ref(id: item_id::Reader<'_>) -> Result<ItemRef, capnp::Error> {
     })
 }
 
+/// The wire kind for `kind`; `None` for a kind this client does not know.
+fn wire_kind(kind: ItemKind) -> Option<Kind> {
+    Some(match kind {
+        ItemKind::Movie => Kind::Movie,
+        ItemKind::Episode => Kind::Episode,
+        ItemKind::Audio => Kind::Audio,
+        ItemKind::Book => Kind::Book,
+        ItemKind::Series => Kind::Series,
+        ItemKind::Season => Kind::Season,
+        ItemKind::Album => Kind::Album,
+        ItemKind::Artist => Kind::Artist,
+        ItemKind::Person => Kind::Person,
+        ItemKind::Collection => Kind::Collection,
+        ItemKind::Playlist => Kind::Playlist,
+        ItemKind::Channel => Kind::Channel,
+        ItemKind::Library => Kind::Library,
+        ItemKind::Other => return None,
+    })
+}
+
+fn read_library_kind(kind: Result<WireLibraryKind, capnp::NotInSchema>) -> LibraryKind {
+    match kind {
+        Ok(WireLibraryKind::Movies) => LibraryKind::Movies,
+        Ok(WireLibraryKind::TvShows) => LibraryKind::TvShows,
+        Ok(WireLibraryKind::Music) => LibraryKind::Music,
+        Ok(WireLibraryKind::Books) => LibraryKind::Books,
+        Ok(WireLibraryKind::Mixed) | Err(_) => LibraryKind::Mixed,
+    }
+}
+
 fn read_kind(kind: Result<Kind, capnp::NotInSchema>) -> ItemKind {
     let Ok(kind) = kind else {
         return ItemKind::Other;
@@ -630,9 +698,14 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
         .filter(|u| !u.is_empty());
     let series_name = Some(text(item.get_series_name())?).filter(|s| !s.is_empty());
     let state = item.get_user_state()?;
+    let kind = read_kind(item.get_kind());
+    let parent = match item.has_parent_id() {
+        true => Some(read_item_ref(item.get_parent_id()?)?),
+        false => None,
+    };
     Ok(Item {
         id: read_item_ref(item.get_id()?)?,
-        kind: read_kind(item.get_kind()),
+        kind,
         name: text(item.get_name())?,
         year,
         runtime_ms: item.get_runtime_ms(),
@@ -643,6 +716,9 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
         series_name,
         season: read_opt_u32(item.get_parent_index_number()?)?,
         episode: read_opt_u32(item.get_index_number()?)?,
+        parent,
+        library_kind: (kind == ItemKind::Library)
+            .then(|| read_library_kind(item.get_library_kind())),
     })
 }
 

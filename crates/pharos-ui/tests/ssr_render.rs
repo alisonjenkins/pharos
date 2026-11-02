@@ -1392,6 +1392,8 @@ fn find_item(id: u64, name: &str) -> pharos_client::api::Item {
         series_name: None,
         season: None,
         episode: None,
+        parent: None,
+        library_kind: None,
     }
 }
 
