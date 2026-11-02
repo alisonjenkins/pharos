@@ -34,6 +34,10 @@ fn movie(id: u64, title: &str, probe: MediaProbe) -> MediaItem {
 
 /// 1 = plain 2D, 2 = a lone 3D rip, 3 = 2D movie with a 3D edition.
 async fn seed() -> (web::Data<AppState>, String) {
+    seed_with(Vec::new()).await
+}
+
+async fn seed_with(extra: Vec<MediaItem>) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -79,6 +83,9 @@ async fn seed() -> (web::Data<AppState>, String) {
         ))
         .await
         .unwrap();
+    for item in extra {
+        stores.put(item).await.unwrap();
+    }
     let token = stores.issue(uid, "t").await.unwrap();
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     (state, token.0.expose().to_string())
@@ -170,4 +177,100 @@ async fn playback_info_labels_each_source_with_its_3d_format() {
     assert!(sources[0].get("Video3DFormat").is_none());
     assert_eq!(sources[1]["Name"], "3D HSBS");
     assert_eq!(sources[1]["Video3DFormat"], "HalfSideBySide");
+}
+
+/// 10 = Blu-ray 3D rip, 11 = half side-by-side rip; both h264/aac in Matroska.
+fn transcode_fixtures() -> Vec<MediaItem> {
+    [
+        (10, "Bluray 3D", Video3DFormat::Mvc),
+        (11, "Packed HSBS", Video3DFormat::HalfSideBySide),
+    ]
+    .into_iter()
+    .map(|(id, title, fmt)| {
+        movie(
+            id,
+            title,
+            MediaProbe {
+                audio_codec: Some("aac".into()),
+                video_3d_format: Some(fmt),
+                ..Default::default()
+            },
+        )
+    })
+    .collect()
+}
+
+const MKV_PLAYER: &str = r#""DeviceProfile":{
+  "DirectPlayProfiles":[{"Type":"Video","Container":"mkv","VideoCodec":"h264","AudioCodec":"aac"}],
+  "TranscodingProfiles":[{"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}]
+}"#;
+
+const MP4_ONLY_PLAYER: &str = r#""DeviceProfile":{
+  "DirectPlayProfiles":[{"Type":"Video","Container":"mp4","VideoCodec":"h264","AudioCodec":"aac"}],
+  "TranscodingProfiles":[{"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}]
+}"#;
+
+/// The first MediaSource of `item`'s PlaybackInfo for `profile`.
+macro_rules! playback_source {
+    ($app:expr, $token:expr, $item:expr, $query:expr, $profile:expr) => {{
+        let resp = test::call_service(
+            &$app,
+            test::TestRequest::post()
+                .uri(&format!("/Items/{}/PlaybackInfo{}", $item, $query))
+                .insert_header(("X-Emby-Token", $token.as_str()))
+                .insert_header(("content-type", "application/json"))
+                .set_payload(format!("{{{}}}", $profile))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value = serde_json::from_slice(&test::read_body(resp).await).unwrap();
+        v["MediaSources"][0].clone()
+    }};
+}
+
+fn video_stream(source: &serde_json::Value) -> &serde_json::Value {
+    source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Type"] == "Video")
+        .unwrap()
+}
+
+/// The signal for B290: how often a transcode flattens 3D, and why.
+/// Disarm check: dropping the `output` label from the counter fails this.
+#[actix_web::test]
+async fn the_3d_decision_counter_says_what_the_output_is() {
+    let (state, token) = seed_with(transcode_fixtures()).await;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let app = app!(state);
+    let _ = playback_source!(app, token, 10, "", MP4_ONLY_PLAYER);
+    let _ = playback_source!(app, token, 11, "?StereoMode=mono", MKV_PLAYER);
+    let _ = playback_source!(app, token, 11, "", MP4_ONLY_PLAYER);
+    let _ = playback_source!(app, token, 10, "", MKV_PLAYER);
+    let count = |output: &str, decision: &str| -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| {
+                let key = k.key();
+                key.name() == "pharos_playback_3d_decision_total"
+                    && [("output", output), ("decision", decision)]
+                        .iter()
+                        .all(|(lk, lv)| key.labels().any(|l| l.key() == *lk && l.value() == *lv))
+            })
+            .map(|(.., v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                other => panic!("{other:?}"),
+            })
+            .sum()
+    };
+    assert_eq!(count("flattened_mvc", "transcode"), 1);
+    assert_eq!(count("flattened_mono", "transcode"), 1);
+    assert_eq!(count("preserved", "transcode"), 1);
+    assert_eq!(count("preserved", "direct_play"), 1);
 }
