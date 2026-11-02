@@ -634,7 +634,11 @@ impl<P: Prober> FsScanner<P> {
         struct Pending {
             primary: PathBuf,
             alts: Vec<(String, PathBuf)>,
+            /// `stable_id(primary)`: the probe memo's key.
             id: MediaId,
+            /// The id the probed row is written under: the row already
+            /// holding `primary` when there is one, else `id` (B257).
+            row: MediaId,
             sig: Option<(i64, u64)>,
             /// Content fingerprint already computed for a path-miss group.
             /// `Some` only when we had to read the file to disambiguate a
@@ -699,10 +703,17 @@ impl<P: Prober> FsScanner<P> {
                     continue;
                 }
 
-                let existing_state = store.scan_state(id).await?;
+                let (row, existing_state) = match store.scan_state(id).await? {
+                    Some(state) => (id, Some(state)),
+                    // B257 — a seeded row, or one rebound after a move, holds
+                    // this path under another id.
+                    None => match store.id_at_path(&primary).await? {
+                        Some(held) => (held, store.scan_state(held).await?),
+                        None => (id, None),
+                    },
+                };
                 if let Some(state) = existing_state {
-                    // Existing-by-path: the row is keyed on this exact path
-                    // (its id is stable_id(path)). Skip the probe iff the
+                    // Existing-by-path: `row` holds this exact path. Skip the probe iff the
                     // signature still matches; otherwise re-probe + put. `--force`
                     // (self.force) bypasses the skip so every file is re-probed.
                     if let Some((mtime, size)) = sig {
@@ -711,7 +722,7 @@ impl<P: Prober> FsScanner<P> {
                             && state.file_size == size
                             && state.probe_schema_version == expected_schema_version(&primary)
                         {
-                            seen_batch.push((id, mtime, size));
+                            seen_batch.push((row, mtime, size));
                             seen += 1;
                             outcome.skipped += 1;
                             continue;
@@ -721,6 +732,7 @@ impl<P: Prober> FsScanner<P> {
                         primary,
                         alts,
                         id,
+                        row,
                         sig,
                         fp: None,
                         existed: true,
@@ -792,6 +804,7 @@ impl<P: Prober> FsScanner<P> {
                             primary,
                             alts,
                             id,
+                            row,
                             sig,
                             fp,
                             existed: false,
@@ -871,7 +884,7 @@ impl<P: Prober> FsScanner<P> {
                         Some(it) => self.resolve_metadata(it).await,
                         None => MetadataResult::default(),
                     };
-                    (p.id, p.sig, p.existed, fp, item, meta)
+                    (p.id, p.row, p.sig, p.existed, fp, item, meta)
                 }
             })
             .buffer_unordered(self.probe_concurrency);
@@ -913,7 +926,7 @@ impl<P: Prober> FsScanner<P> {
                         }
                     }
                 };
-                let Some((probed_id, sig, existed, fp, item, meta)) = next else {
+                let Some((probed_id, row, sig, existed, fp, item, meta)) = next else {
                     break;
                 };
                 // Cancellation: stop draining the probe stream. Rows already
@@ -943,6 +956,7 @@ impl<P: Prober> FsScanner<P> {
                     }
                 }
                 let Some(mut item) = item else { continue };
+                item.id = row;
                 let item_id = item.id;
                 // LIB-D7 — merge resolved metadata onto the probe-built item
                 // BEFORE `put` (which consumes it). `merge_metadata_into_item`
@@ -1119,17 +1133,25 @@ impl<P: Prober> FsScanner<P> {
 
         // Existing-by-path row: skip when the signature still matches,
         // else re-probe.
-        let existing_state = store.scan_state(id).await?;
+        let (row, existing_state) = match store.scan_state(id).await? {
+            Some(state) => (id, Some(state)),
+            // B257 — a seeded row, or one rebound after a move, holds this
+            // path under another id.
+            None => match store.id_at_path(path).await? {
+                Some(held) => (held, store.scan_state(held).await?),
+                None => (id, None),
+            },
+        };
         if let Some(state) = existing_state {
             if let Some((mtime, size)) = sig {
                 if !self.force && state.file_mtime == mtime && state.file_size == size {
-                    store.mark_seen(id, scan_id, mtime, size).await?;
+                    store.mark_seen(row, scan_id, mtime, size).await?;
                     return Ok(PathUpdate::Skipped);
                 }
             }
             // Signature changed (or unreadable) — re-probe + put.
             return self
-                .probe_put_one(path, store, scan_id, sig, None, true)
+                .probe_put_one(path, store, scan_id, sig, None, Some(row))
                 .await;
         }
 
@@ -1175,7 +1197,7 @@ impl<P: Prober> FsScanner<P> {
             }
             // New file or genuine duplicate (old path still on disk) — probe + insert.
             _ => {
-                self.probe_put_one(path, store, scan_id, sig, fp, false)
+                self.probe_put_one(path, store, scan_id, sig, fp, None)
                     .await
             }
         }
@@ -1337,8 +1359,9 @@ impl<P: Prober> FsScanner<P> {
     }
 
     /// LIB-A8 — probe a single path and persist it (the create/modify tail
-    /// shared by [`update_path`]). `existed` drives the added-vs-updated
-    /// result; `fp` is reused when already computed during move-detect.
+    /// shared by [`update_path`]). `existing` is the row already holding the
+    /// path, written over under its own id (B257) and reported as updated;
+    /// `fp` is reused when already computed during move-detect.
     #[tracing::instrument(skip(self, store, sig, fp), fields(media.path = %path.display()))]
     async fn probe_put_one<
         S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
@@ -1349,7 +1372,7 @@ impl<P: Prober> FsScanner<P> {
         scan_id: i64,
         sig: Option<(i64, u64)>,
         fp: Option<Fingerprint>,
-        existed: bool,
+        existing: Option<MediaId>,
     ) -> DomainResult<PathUpdate> {
         if !self.rate_limit.is_zero() {
             tokio::time::sleep(self.rate_limit).await;
@@ -1362,6 +1385,9 @@ impl<P: Prober> FsScanner<P> {
             // V6 — probe failed, already logged in `probe_one`. No write.
             return Ok(PathUpdate::Skipped);
         };
+        if let Some(row) = existing {
+            item.id = row;
+        }
         let item_id = item.id;
         // LIB-D7 — resolve local-first metadata for the (re)probed file, off
         // the reactor, and merge it onto the item before `put` (mirrors the
@@ -1407,7 +1433,7 @@ impl<P: Prober> FsScanner<P> {
         if let Some(fp) = fp {
             store.set_fingerprint(item_id, fp).await?;
         }
-        if existed {
+        if existing.is_some() {
             Ok(PathUpdate::Updated(item_id))
         } else {
             Ok(PathUpdate::Added(item_id))
