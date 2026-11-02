@@ -394,14 +394,8 @@ async fn a_capability_opens_only_its_own_item() {
     );
 }
 
-/// B256: a capability ends when its holder reports the playback stopped, and
-/// only its holder can end it.
-/// Disarm check: with `playing_stopped` not ending the session, the stopped
-/// tag still authorizes the stream; with the holder check skipped, the other
-/// user's stop ends it.
-#[actix_web::test]
-async fn a_capability_ends_when_its_holder_stops() {
-    let (state, token) = seed().await;
+/// A second user's token, to try ending a session it does not hold.
+async fn other_user_token(state: &AppState) -> String {
     let other = UserId::new();
     state
         .stores
@@ -413,26 +407,40 @@ async fn a_capability_ends_when_its_holder_stops() {
         })
         .await
         .unwrap();
-    let other_token = state.stores.issue(other, "o").await.unwrap();
-    let app = init_app!(state.clone());
-    let tag = negotiate_tag!(&app, token.as_str(), 1);
-    let uri = format!("/videos/1/stream?static=true&tag={tag}");
-    let stop = |by: &str| {
+    let token = state.stores.issue(other, "o").await.unwrap();
+    token.0.expose().to_owned()
+}
+
+/// Asserts that `$end(token, tag)` ends the capability for item 1 only when
+/// `token` is the holder's.
+macro_rules! only_the_holder_ends {
+    ($end:expr) => {{
+        let (state, token) = seed().await;
+        let other = other_user_token(&state).await;
+        let app = init_app!(state.clone());
+        let tag = negotiate_tag!(&app, token.as_str(), 1);
+        let uri = format!("/videos/1/stream?static=true&tag={tag}");
+        let end = $end;
+
+        assert!(test::call_service(&app, end(&other, &tag)).await.status().is_success());
+        assert_ne!(tokenless_stream!(&app, &uri), 401);
+        assert!(test::call_service(&app, end(&token, &tag)).await.status().is_success());
+        assert_eq!(tokenless_stream!(&app, &uri), 401);
+    }};
+}
+
+/// B256: a capability ends when its holder reports the playback stopped, and
+/// only its holder can end it.
+/// Disarm check: with `playing_stopped` not ending the session, the stopped
+/// tag still authorizes the stream; with the holder check skipped, the other
+/// user's stop ends it.
+#[actix_web::test]
+async fn a_capability_ends_when_its_holder_stops() {
+    only_the_holder_ends!(|by: &str, tag: &str| {
         test::TestRequest::post()
             .uri("/Sessions/Playing/Stopped")
             .insert_header(("X-Emby-Token", by.to_owned()))
             .set_json(serde_json::json!({ "PlaySessionId": tag }))
             .to_request()
-    };
-
-    assert!(test::call_service(&app, stop(other_token.0.expose()))
-        .await
-        .status()
-        .is_success());
-    assert_ne!(tokenless_stream!(&app, &uri), 401);
-    assert!(test::call_service(&app, stop(&token))
-        .await
-        .status()
-        .is_success());
-    assert_eq!(tokenless_stream!(&app, &uri), 401);
+    });
 }
