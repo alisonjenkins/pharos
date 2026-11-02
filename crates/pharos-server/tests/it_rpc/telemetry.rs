@@ -17,10 +17,10 @@ use crate::common::{seed_rich, Fixture};
 
 /// Every log line the test thread emits, as formatted text.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Captured {
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }
@@ -42,7 +42,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
-fn subscriber(logs: &Captured) -> impl tracing::Subscriber + Send + Sync {
+pub(crate) fn subscriber(logs: &Captured) -> impl tracing::Subscriber + Send + Sync {
     tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
@@ -51,7 +51,7 @@ fn subscriber(logs: &Captured) -> impl tracing::Subscriber + Send + Sync {
 }
 
 /// Serves the bootstrap on this thread. Call inside a `LocalSet`.
-fn connect(fx: &Fixture) -> bootstrap::Client {
+pub(crate) fn connect(fx: &Fixture) -> bootstrap::Client {
     let (server_end, client_end) = tokio::io::duplex(64 * 1024);
     let (sr, sw) = tokio::io::split(server_end);
     let ctx = rpc::ConnectionCtx::admit(None, LOCAL, &rpc::limits::ConnectionLimits::default(), 16)
@@ -71,7 +71,7 @@ fn connect(fx: &Fixture) -> bootstrap::Client {
     client
 }
 
-async fn session_for(client: &bootstrap::Client, token: &str) -> session::Client {
+pub(crate) async fn session_for(client: &bootstrap::Client, token: &str) -> session::Client {
     let mut req = client.resume_request();
     req.get().init_ctx();
     req.get().set_device_token(token);
@@ -138,7 +138,7 @@ async fn submit(tel: &telemetry::Client, events: &[Ev]) -> Result<(), String> {
 
 /// The value of `pharos_client_events_total` (or the dropped counter) for
 /// the given labels, 0 when no such series was recorded.
-fn counter(
+pub(crate) fn counter(
     snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
     name: &str,
     labels: &[(&str, &str)],

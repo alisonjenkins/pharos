@@ -14,6 +14,8 @@ mod library;
 pub mod limits;
 pub mod origin;
 mod playback;
+mod prefs;
+pub use prefs::MAX_PREF_VALUE_BYTES;
 mod session;
 pub mod socket;
 mod telemetry;
