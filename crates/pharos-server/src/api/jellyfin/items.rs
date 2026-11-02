@@ -3416,11 +3416,11 @@ fn playlist_only_request(q: &ListQuery) -> bool {
 /// honouring StartIndex / Limit. Shared by `/Items` and `/Users/{u}/Items`.
 async fn list_playlists_page(
     state: &AppState,
-    user_id: UserId,
+    user: &pharos_core::User,
     q: &ListQuery,
 ) -> Result<serde_json::Value, actix_web::Error> {
     use pharos_core::PlaylistStore;
-    let owner = user_id.0.simple().to_string();
+    let owner = user.id.0.simple().to_string();
     let rows = state
         .stores
         .playlists_for_owner(Some(&owner))
@@ -3428,12 +3428,8 @@ async fn list_playlists_page(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut all: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for pl in &rows {
-        let count = state
-            .stores
-            .playlist_entries(&pl.wire_id)
-            .await
-            .map(|e| e.len() as u32)
-            .unwrap_or(0);
+        let count =
+            crate::api::jellyfin::playlists::visible_entry_count(state, user, &pl.wire_id).await?;
         all.push(crate::api::jellyfin::playlists::playlist_dto(
             state, pl, count,
         ));
@@ -3843,7 +3839,7 @@ async fn list_items(
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
         return Ok(crate::api::jellyfin::wire::json(
-            &list_playlists_page(&state, user.0.id, &q).await?,
+            &list_playlists_page(&state, &user.0, &q).await?,
         ));
     }
     if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
@@ -3877,7 +3873,7 @@ async fn list_user_items(
     // T70 — Playlist-only listing comes from the playlists entity table.
     if playlist_only_request(&q) {
         return Ok(crate::api::jellyfin::wire::json(
-            &list_playlists_page(&state, user.0.id, &q).await?,
+            &list_playlists_page(&state, &user.0, &q).await?,
         ));
     }
     if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
@@ -5254,12 +5250,8 @@ async fn fetch_item_dto(
             None => false,
         };
         if let (Some(playlist), true) = (playlist, readable) {
-            let count = state
-                .stores
-                .playlist_entries(id_str)
-                .await
-                .map(|e| e.len() as u32)
-                .unwrap_or(0);
+            let count =
+                crate::api::jellyfin::playlists::visible_entry_count(state, user, id_str).await?;
             return Ok(crate::api::jellyfin::wire::json(
                 &crate::api::jellyfin::playlists::playlist_dto(state, &playlist, count),
             ));
