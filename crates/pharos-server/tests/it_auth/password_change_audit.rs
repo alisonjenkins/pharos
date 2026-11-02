@@ -291,6 +291,58 @@ async fn refused_change_revokes_nothing_and_announces_nothing() {
     assert!(rx.try_recv().is_err());
 }
 
+/// V211 — a reset to an empty password is refused, and the old password
+/// keeps working.
+#[actix_web::test]
+async fn reset_password_true_is_400_and_leaves_the_hash_unchanged() {
+    let f = seed().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/Users/{}/Password", f.bob_id.0.simple()))
+            .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"NewPw":"","CurrentPw":"","ResetPassword":true}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = test::read_body(resp).await;
+    assert_eq!(
+        body.as_ref(),
+        b"reset to an empty password is not supported; set a new password"
+    );
+    let auth = BuiltinAuth::new(f.state.stores.clone());
+    AuthBackend::authenticate(&auth, "bob", &SecretString::new("bob-pass"))
+        .await
+        .expect("refused reset must leave bob's password in place");
+}
+
+/// V211 — an empty new password is refused and changes nothing.
+#[actix_web::test]
+async fn empty_new_password_is_400_and_leaves_the_hash_unchanged() {
+    let f = seed().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/Users/{}/Password", f.bob_id.0.simple()))
+            .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(r#"{"NewPw":"","CurrentPw":""}"#)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = test::read_body(resp).await;
+    assert_eq!(body.as_ref(), b"a password is required");
+    let auth = BuiltinAuth::new(f.state.stores.clone());
+    AuthBackend::authenticate(&auth, "bob", &SecretString::new("bob-pass"))
+        .await
+        .expect("refused change must leave bob's password in place");
+}
+
 /// A login cannot name its device like an API key (`apikey:…`): such a
 /// session would be listed and revoked as a key, and would survive the
 /// password change that B235 relies on to evict a thief.
