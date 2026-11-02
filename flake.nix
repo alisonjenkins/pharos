@@ -675,6 +675,14 @@
         # suite's `http-server --proxy PHAROS?` fixture (cross-origin fails:
         # the connect probe must be same-origin). `__PHAROS_URL__` is the
         # only runtime knob; the entrypoint seds it into the config.
+        # B278: angie's default access log writes the whole request line,
+        # and jellyfin-web puts the session token in media URLs as
+        # `api_key=`, so live tokens reached Loki. Log the path only: no
+        # query string and no Referer.
+        angieAccessLog = ''
+          log_format pharos_noquery '$remote_addr - [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent $request_time "$http_user_agent"';
+          access_log /dev/stdout pharos_noquery;
+        '';
         mkAngieUi = { pname, port, prefix, bundle }:
           let
             conf = pkgs.writeText "${pname}.angie.conf" ''
@@ -686,7 +694,7 @@
               http {
                 include ${pkgs.angie}/conf/mime.types;
                 default_type application/octet-stream;
-                access_log /dev/stdout;
+                ${angieAccessLog}
                 sendfile on;
 
                 # B162 — compress text on the way out. The jellyfin-web bundle
@@ -1182,6 +1190,18 @@
         checks.clippy = pharosClippy;
         checks.clippy-postgres = pharosClippyPostgres;
         checks.fmt = pharosFmt;
+        # B278: the angie access log must not carry query strings (tokens).
+        checks.angie-access-log = pkgs.runCommand "angie-access-log-check" { } ''
+          conf=${pkgs.writeText "angie-access-log.conf" angieAccessLog}
+          for leak in '$request ' '$request"' '$request_uri' '$args' '$query_string' '$http_referer' '$arg_'; do
+            if grep -qF -- "$leak" "$conf"; then
+              echo "angie access log logs $leak, which can carry api_key (B278)" >&2
+              exit 1
+            fi
+          done
+          grep -q 'access_log /dev/stdout pharos_noquery;' "$conf"
+          touch $out
+        '';
         # Runs the store conformance suite against a real ephemeral Postgres.
         checks.postgres = pharosPgTests;
 
