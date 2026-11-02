@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/pharos-api",
+    "crates/pharos-client",
     "crates/pharos-cache",
     "crates/pharos-core",
     "crates/pharos-discovery",

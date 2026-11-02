@@ -1846,6 +1846,7 @@ checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -3255,6 +3256,21 @@ dependencies = [
  "tracing",
  "workspace-hack",
  "xxhash-rust",
+]
+
+[[package]]
+name = "pharos-client"
+version = "0.0.0"
+dependencies = [
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "js-sys",
+ "pharos-api",
+ "thiserror",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -6043,8 +6059,10 @@ dependencies = [
  "flate2",
  "foldhash",
  "form_urlencoded",
+ "futures",
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",

@@ -1,0 +1,35 @@
+[package]
+name = "pharos-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Client core for the pharos native API (017): transport, connection, session resume"
+
+[dependencies]
+capnp = { workspace = true }
+capnp-rpc = { workspace = true }
+futures = "0.3"
+pharos-api = { path = "../pharos-api" }
+thiserror.workspace = true
+
+# The browser transport (017 T049). Native builds use `connect_stream` with
+# any byte stream, which is what the server's integration tests drive.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType",
+    "CloseEvent",
+    "Event",
+    "MessageEvent",
+    "WebSocket",
+] }
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"] }
+
+[lints]
+workspace = true
