@@ -205,5 +205,105 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
     });
+
+    // The page is told it has neither WebM nor native HLS, as Firefox on a
+    // WebM-less build would be, so the server remuxes the VP9 fixture to HLS
+    // and the page plays it through the vendored hls.js. MediaSource answers
+    // are left alone: hls.js asks them itself.
+    test("an HLS title plays through hls.js and moves the resume point", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-watch-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie`,
+          { headers: api },
+        )
+      ).json();
+      // The one seeded title with a probe; with Matroska hidden it remuxes to HLS.
+      const movie = items.Items?.find(
+        (i: { Name: string }) => i.Name === "Playwright Multitrack",
+      );
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+        };
+      });
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      page.on("console", (m) => {
+        if (m.text().includes("Refused to")) problems.push(`csp: ${m.text()}`);
+      });
+      const hlsjs: string[] = [];
+      page.on("request", (r) => {
+        if (r.url().includes("/assets/vendor/hls.min.js")) hlsjs.push(r.url());
+      });
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      expect(hlsjs, "hls.js is fetched only by the watch page").toEqual([]);
+
+      await page.goto(`/title/${nativeId}`);
+      await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+      await expect(page).toHaveURL(new RegExp(`/watch/${nativeId}$`));
+      await expect.poll(() => hlsjs.length, { timeout: 15_000 }).toBe(1);
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () =>
+                (document.getElementById("pharos-video") as HTMLVideoElement | null)
+                  ?.currentTime ?? 0,
+            ),
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(3);
+      await page.evaluate(() =>
+        (document.getElementById("pharos-video") as HTMLVideoElement).pause(),
+      );
+
+      // A pause is written at once (progress_writes), so the position lands
+      // within a poll or two.
+      await expect
+        .poll(
+          async () => {
+            const res = await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items/${movie.Id}`,
+              { headers: api },
+            );
+            return (await res.json()).UserData?.PlaybackPositionTicks ?? 0;
+          },
+          { timeout: 20_000 },
+        )
+        .toBeGreaterThan(3 * 10_000_000);
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
   });
 });
