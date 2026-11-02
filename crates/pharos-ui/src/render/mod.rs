@@ -171,4 +171,17 @@ mod tests {
         assert_eq!(Frame::clock(0.0, 500.0), 0.0);
         assert!(Frame::clock(TIME_WRAP_S * 1000.0 + 2000.0, 0.0) < 3.0);
     }
+
+    #[test]
+    fn fallback_labels_are_distinct() {
+        let all = [
+            Fallback::ReducedMotion,
+            Fallback::NoWebgl2,
+            Fallback::ContextLost,
+            Fallback::Shader(String::new()),
+            Fallback::NoCanvas,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(Fallback::label).collect();
+        assert_eq!(labels.len(), all.len());
+    }
 }
