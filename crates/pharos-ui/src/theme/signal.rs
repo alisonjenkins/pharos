@@ -2,6 +2,7 @@
 //! playback logs use.
 
 use super::contrast::ContrastResult;
+use super::doc;
 use super::resolve::{ThemeError, ThemeWarning};
 
 /// Where a theme came from.
@@ -11,15 +12,18 @@ pub enum Source {
     Local,
     Import,
     Editor,
+    Auto,
 }
 
 impl Source {
+    /// The spelling used in log lines.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Shipped => "shipped",
             Self::Local => "local",
             Self::Import => "import",
             Self::Editor => "editor",
+            Self::Auto => "auto",
         }
     }
 }
@@ -69,6 +73,16 @@ pub fn fallback(name: &str, source: Source, error: &ThemeError, to: &str) -> Str
         field(&path),
         field(&value),
         field(to)
+    )
+}
+
+/// A custom theme was saved, with `warnings` warnings.
+pub fn saved(name: &str, source: Source, warnings: usize) -> String {
+    format!(
+        "pharos: theme saved name={} source={} schema={} warnings={warnings}",
+        field(name),
+        source.label(),
+        doc::SCHEMA
     )
 }
 
@@ -146,6 +160,14 @@ mod tests {
     }
 
     #[test]
+    fn saved_line_has_the_documented_shape() {
+        assert_eq!(
+            saved("Mine", Source::Editor, 2),
+            "pharos: theme saved name=Mine source=editor schema=1 warnings=2"
+        );
+    }
+
+    #[test]
     fn rejected_line_gives_the_pair_ratio_to_two_places_and_minimum() {
         let result = ContrastResult {
             pair: PAIRS[0],
@@ -167,11 +189,12 @@ mod tests {
             Source::Local,
             Source::Import,
             Source::Editor,
+            Source::Auto,
         ]
         .iter()
         .map(Source::label)
         .collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
     }
 
     #[test]
@@ -199,6 +222,7 @@ mod tests {
                 name: String::new(),
             },
             ThemeError::ExtendsCycle { chain: vec![] },
+            ThemeError::ExtendsTooDeep { chain: vec![] },
             ThemeError::TooLarge { bytes: 0 },
             ThemeError::Contrast {
                 pair,
@@ -241,6 +265,7 @@ mod tests {
             "missing_key",
             "unknown_base",
             "extends_cycle",
+            "extends_too_deep",
             "too_large",
             "contrast",
             "unknown_theme",

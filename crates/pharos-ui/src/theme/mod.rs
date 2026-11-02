@@ -98,11 +98,40 @@ pub fn shipped() -> Catalogue {
     catalogue
 }
 
+/// A lowercase ASCII identifier for a theme name, for element ids and file
+/// names: every run of other characters becomes one `-`.
+pub fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "theme".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn slug_keeps_ascii_alphanumerics_and_collapses_the_rest() {
+        assert_eq!(slug("../My \"Theme\" <x>"), "my-theme-x");
+        assert_eq!(slug("Kali Dark"), "kali-dark");
+        assert_eq!(slug("Neon  Grid 2"), "neon-grid-2");
+        assert_eq!(slug("Café"), "caf");
+        assert_eq!(slug("---"), "theme");
+        assert_eq!(slug(""), "theme");
+    }
 
     #[test]
     fn there_are_exactly_the_seven_shipped_themes() {

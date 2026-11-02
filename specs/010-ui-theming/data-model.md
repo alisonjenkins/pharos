@@ -90,6 +90,7 @@ Each error and warning names the TOML path and the offending value
 - `OutOfRange { path, value, min, max }`
 - `UnknownBase { name }`
 - `ExtendsCycle { chain }`
+- `ExtendsTooDeep { chain }` (a chain of more than `MAX_EXTENDS_DEPTH` = 8 themes)
 - `Contrast { pair, ratio, min }` (only when saving or importing, US6)
 - `TooLarge { bytes }` (over 64 KiB, before parsing)
 - `UnknownTheme { name }` (a stored name that is not in the catalogue)
@@ -139,7 +140,7 @@ same fields:
 ```
 pharos: theme applied name=<n> source=shipped|local|import schema=<v> warnings=<count>
 pharos: theme warning name=<n> source=<s> reason=unknown_key|newer_schema|font_missing|effects_reduced path=<p> value=<v>
-pharos: theme fallback name=<n> source=<s> reason=syntax|missing_key|bad_value|out_of_range|unknown_base|extends_cycle|too_large|unknown_theme|storage path=<p> value=<v> to=<default>
+pharos: theme fallback name=<n> source=<s> reason=syntax|missing_key|bad_value|out_of_range|unknown_base|extends_cycle|extends_too_deep|too_large|unknown_theme|storage path=<p> value=<v> to=<default>
 pharos: theme rejected name=<n> source=import|editor reason=contrast pair=<fg>/<bg> ratio=<r> min=<m>
 ```
 

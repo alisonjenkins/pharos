@@ -15,6 +15,10 @@ use super::value::{
 };
 use super::DEFAULT;
 
+/// The longest `extends` chain, counting the root, that resolves; a longer
+/// one is refused so a hostile file cannot make resolution walk a deep tree.
+pub const MAX_EXTENDS_DEPTH: usize = 8;
+
 /// Why a document is rejected.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ThemeError {
@@ -39,6 +43,8 @@ pub enum ThemeError {
     UnknownBase { name: String },
     #[error("meta.extends: cycle {}", .chain.join(" > "))]
     ExtendsCycle { chain: Vec<String> },
+    #[error("meta.extends: chain deeper than {}", MAX_EXTENDS_DEPTH)]
+    ExtendsTooDeep { chain: Vec<String> },
     #[error("document: {bytes} bytes is over the {} byte limit", doc::MAX_BYTES)]
     TooLarge { bytes: usize },
     #[error("contrast {pair}: ratio {ratio:.2} is below the minimum {min}")]
@@ -63,6 +69,7 @@ impl ThemeError {
             Self::OutOfRange { .. } => "out_of_range",
             Self::UnknownBase { .. } => "unknown_base",
             Self::ExtendsCycle { .. } => "extends_cycle",
+            Self::ExtendsTooDeep { .. } => "extends_too_deep",
             Self::TooLarge { .. } => "too_large",
             Self::Contrast { .. } => "contrast",
             Self::UnknownTheme { .. } => "unknown_theme",
@@ -80,6 +87,7 @@ impl ThemeError {
             Self::OutOfRange { path, value, .. } => (path.clone(), value.to_string()),
             Self::UnknownBase { name } => ("meta.extends".to_owned(), name.clone()),
             Self::ExtendsCycle { chain } => (none(), chain.join(">")),
+            Self::ExtendsTooDeep { chain } => (none(), chain.join(">")),
             Self::TooLarge { bytes } => (none(), bytes.to_string()),
             Self::Contrast { pair, ratio, .. } => (none(), format!("{pair}={ratio:.2}")),
             Self::UnknownTheme { name } => (none(), name.clone()),
@@ -367,6 +375,9 @@ impl Catalogue {
             };
             names.push(current);
             entries.push(entry);
+            if entries.len() > MAX_EXTENDS_DEPTH {
+                return Err(ThemeError::ExtendsTooDeep { chain: names });
+            }
             let base = if entry.name == DEFAULT {
                 None
             } else {
@@ -890,6 +901,56 @@ mod tests {
                 chain: vec!["Me".into(), "Me".into()]
             }
         );
+    }
+
+    fn custom_chain(custom: usize) -> Catalogue {
+        let mut catalogue = shipped();
+        for i in 0..custom {
+            let base = match i {
+                0 => DEFAULT.to_owned(),
+                _ => format!("C{}", i - 1),
+            };
+            catalogue
+                .insert(document(&format!("C{i}"), Some(&base), ""))
+                .unwrap();
+        }
+        catalogue
+    }
+
+    #[test]
+    fn an_extends_chain_up_to_the_limit_resolves() {
+        let top = format!("C{}", MAX_EXTENDS_DEPTH - 2);
+        let resolved = custom_chain(MAX_EXTENDS_DEPTH - 1).resolve(&top).unwrap();
+        assert_eq!(resolved.theme.name, top);
+    }
+
+    #[test]
+    fn an_extends_chain_past_the_limit_is_refused_with_its_chain() {
+        let top = format!("C{}", MAX_EXTENDS_DEPTH - 1);
+        let err = custom_chain(MAX_EXTENDS_DEPTH).resolve(&top).unwrap_err();
+        assert!(
+            matches!(&err, ThemeError::ExtendsTooDeep { chain }
+                if chain.len() == MAX_EXTENDS_DEPTH + 1 && chain.last().map(String::as_str) == Some(DEFAULT)),
+            "{err:?}"
+        );
+        assert_eq!(err.label(), "extends_too_deep");
+    }
+
+    #[test]
+    fn hostile_palette_values_are_refused_before_any_css_is_emitted() {
+        let hostile = ["red; background: url(x)", "expression(alert(1))", "#fff;}"];
+        for role in PaletteRole::ALL {
+            for value in hostile {
+                let err = resolve_child(&format!("[palette]\n{} = \"{value}\"\n", role.label()))
+                    .unwrap_err();
+                let path = format!("palette.{}", role.label());
+                assert!(
+                    matches!(&err, ThemeError::BadValue { path: p, value: v, .. }
+                        if *p == path && v == value),
+                    "{path} {value}: {err:?}"
+                );
+            }
+        }
     }
 
     #[test]
