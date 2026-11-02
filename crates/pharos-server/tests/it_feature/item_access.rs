@@ -1341,3 +1341,327 @@ async fn sync_play_access_gates_listing_joining_and_creating() {
         ]
     );
 }
+
+fn queue_refused_total(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    via: &str,
+    reason: &str,
+) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_syncplay_queue_refused_total"
+                && key.labels().any(|l| l.key() == "via" && l.value() == via)
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == reason)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
+
+/// A live SyncPlay group whose members are the given users, each on its own
+/// device registered in the hub so the HTTP routes resolve it.
+struct SyncParty {
+    registry: pharos_sync::GroupRegistry,
+    sinks: pharos_sync::MemberSinks,
+    hub: pharos_sync::SessionHub,
+    group: pharos_sync::group::GroupHandle,
+    _rxs: Vec<tokio::sync::mpsc::Receiver<pharos_sync::messages::ServerMsg>>,
+}
+
+async fn sync_party(
+    members: &[(pharos_core::UserId, Option<pharos_core::UserId>, &str)],
+) -> SyncParty {
+    use pharos_sync::group::GroupMsg;
+    let sinks = pharos_sync::MemberSinks::new();
+    let hub = pharos_sync::SessionHub::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    let group = registry.create().await.unwrap();
+    let mut rxs = Vec::new();
+    for (uid, recorded, device) in members {
+        let key = format!("{}:{device}", uid.0.simple());
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let reg = hub.register(key.clone(), "member".into(), tx.clone());
+        sinks.insert(reg.member_id, reg.gen, tx);
+        hub.attach_group(&key, group.clone());
+        let (reply, joined) = tokio::sync::oneshot::channel();
+        group
+            .tx
+            .send(GroupMsg::AddMember {
+                user: *recorded,
+                member_id: reg.member_id,
+                name: "member".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        joined.await.unwrap();
+        rxs.push(rx);
+    }
+    SyncParty {
+        registry,
+        sinks,
+        hub,
+        group,
+        _rxs: rxs,
+    }
+}
+
+fn sync_post(token: &str, device: &str, uri: &str, body: serde_json::Value) -> test::TestRequest {
+    test::TestRequest::post()
+        .uri(uri)
+        .insert_header(("X-Emby-Token", token))
+        .insert_header(("X-Emby-Device-Id", device))
+        .set_json(body)
+}
+
+fn set_new_queue(item: u64) -> serde_json::Value {
+    serde_json::json!({
+        "PlayingQueue": [pharos_jellyfin_api::dto::wire_item_id(item)],
+        "PlayingItemPosition": 0,
+        "StartPositionTicks": 0,
+    })
+}
+
+fn queue(item: u64) -> serde_json::Value {
+    serde_json::json!({
+        "ItemIds": [pharos_jellyfin_api::dto::wire_item_id(item)],
+        "Mode": "Queue",
+    })
+}
+
+/// B268: a SyncPlay queue change applies only when every member's user may
+/// see every new item (V201), Jellyfin's `AllUsersHaveAccessToQueue`.
+/// Otherwise the change answers 204, applies nothing, and counts under
+/// `pharos_syncplay_queue_refused_total{via,reason}`. Disarm check: with
+/// `may_queue` answering true, the library B item lands in the queue and
+/// nothing counts.
+#[actix_web::test]
+async fn a_syncplay_queue_change_needs_every_member_to_see_its_items() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    restrict_to_library_a(&f).await;
+    let p = sync_party(&[
+        (f.admin_id, Some(f.admin_id), "dev-admin"),
+        (f.user_id, Some(f.user_id), "dev-guest"),
+    ])
+    .await;
+    let group = p.group.clone();
+    let app = test::init_service(
+        build_app(f.state.clone())
+            .app_data(actix_web::web::Data::new(p.registry))
+            .app_data(actix_web::web::Data::new(p.sinks))
+            .app_data(actix_web::web::Data::new(p.hub)),
+    )
+    .await;
+    let queued = || async { group.snapshot().await.unwrap().queue_item_ids };
+    let (a, b) = (
+        pharos_jellyfin_api::dto::wire_item_id(f.rich_item_id),
+        pharos_jellyfin_api::dto::wire_item_id(f.other_item_id),
+    );
+    let admin = f.admin_token.as_str();
+    let guest = f.user_token.as_str();
+
+    // Positive control: both members may see library A's item.
+    let req = sync_post(
+        admin,
+        "dev-admin",
+        "/SyncPlay/SetNewQueue",
+        set_new_queue(f.rich_item_id),
+    );
+    assert_eq!(
+        test::call_service(&app, req.to_request()).await.status(),
+        204
+    );
+    assert_eq!(queued().await, std::slice::from_ref(&a));
+
+    let mut failures = Vec::new();
+    let req = sync_post(
+        admin,
+        "dev-admin",
+        "/SyncPlay/SetNewQueue",
+        set_new_queue(f.other_item_id),
+    );
+    let status = test::call_service(&app, req.to_request()).await.status();
+    if status != 204 || queued().await != [a.clone()] {
+        failures.push(format!(
+            "admin SetNewQueue of B: {status}, queue {:?}",
+            queued().await
+        ));
+    }
+    let req = sync_post(
+        admin,
+        "dev-admin",
+        "/SyncPlay/Queue",
+        queue(f.other_item_id),
+    );
+    let status = test::call_service(&app, req.to_request()).await.status();
+    if status != 204 || queued().await != [a.clone()] {
+        failures.push(format!(
+            "admin Queue of B: {status}, queue {:?}",
+            queued().await
+        ));
+    }
+    let req = sync_post(
+        guest,
+        "dev-guest",
+        "/SyncPlay/Queue",
+        queue(f.other_item_id),
+    );
+    let status = test::call_service(&app, req.to_request()).await.status();
+    if status != 204 || queued().await != [a.clone()] {
+        failures.push(format!(
+            "guest Queue of B: {status}, queue {:?}",
+            queued().await
+        ));
+    }
+    for (via, reason) in [
+        ("set_new_queue", "member"),
+        ("queue", "member"),
+        ("queue", "queuer"),
+    ] {
+        let n = queue_refused_total(&snapshotter, via, reason);
+        if n != 1 {
+            failures.push(format!("{via}/{reason} counted {n}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // A change everyone may see still applies.
+    let req = sync_post(guest, "dev-guest", "/SyncPlay/Queue", queue(f.rich_item_id));
+    assert_eq!(
+        test::call_service(&app, req.to_request()).await.status(),
+        204
+    );
+    assert_eq!(queued().await, [a.clone(), a]);
+    assert!(!queued().await.contains(&b));
+}
+
+/// B268: a member whose user was not recorded (it joined before ADR 0032)
+/// blocks a queue change until it reconnects, since nobody can say what it
+/// may see. Disarm check: with the `None` member skipped, the queue applies
+/// and `unknown_member` reads 0.
+#[actix_web::test]
+async fn a_member_with_no_recorded_user_blocks_a_queue_change() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let p = sync_party(&[
+        (f.admin_id, Some(f.admin_id), "dev-admin"),
+        (f.user_id, None, "dev-old"),
+    ])
+    .await;
+    let group = p.group.clone();
+    let app = test::init_service(
+        build_app(f.state.clone())
+            .app_data(actix_web::web::Data::new(p.registry))
+            .app_data(actix_web::web::Data::new(p.sinks))
+            .app_data(actix_web::web::Data::new(p.hub)),
+    )
+    .await;
+
+    let req = sync_post(
+        &f.admin_token,
+        "dev-admin",
+        "/SyncPlay/SetNewQueue",
+        set_new_queue(f.rich_item_id),
+    );
+    assert_eq!(
+        test::call_service(&app, req.to_request()).await.status(),
+        204
+    );
+    assert!(group.snapshot().await.unwrap().queue_item_ids.is_empty());
+    assert_eq!(
+        queue_refused_total(&snapshotter, "set_new_queue", "unknown_member"),
+        1
+    );
+}
+
+/// B268: `/SyncPlay/New` seeds a group from its creator's now-playing item
+/// only when the creator may see it (V201). Disarm check: with the seed's
+/// `may_queue` skipped, the library B item seeds the group and `seed/queuer`
+/// reads 0.
+#[actix_web::test]
+async fn a_new_group_is_seeded_only_with_an_item_its_creator_may_see() {
+    use pharos_server::sessions::SessionEvent;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    restrict_to_library_a(&f).await;
+    let sinks = pharos_sync::MemberSinks::new();
+    let hub = pharos_sync::SessionHub::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    let mut rxs = Vec::new();
+    for (device, item) in [("dev-b", f.other_item_id), ("dev-a", f.rich_item_id)] {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let key = format!("{}:{device}", f.user_id.0.simple());
+        let reg = hub.register(key, "guest".into(), tx.clone());
+        sinks.insert(reg.member_id, reg.gen, tx);
+        rxs.push(rx);
+        f.state
+            .sessions
+            .apply(SessionEvent::Started {
+                session_id: device.into(),
+                user_id: f.user_id,
+                user_name: "guest".into(),
+                device_id: device.into(),
+                device_name: "d".into(),
+                client: "c".into(),
+                version: "1".into(),
+                item_id: pharos_jellyfin_api::dto::wire_item_id(item),
+                position_ticks: 0,
+            })
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(
+        build_app(f.state.clone())
+            .app_data(actix_web::web::Data::new(registry))
+            .app_data(actix_web::web::Data::new(sinks))
+            .app_data(actix_web::web::Data::new(hub.clone())),
+    )
+    .await;
+
+    let mut seeded = Vec::new();
+    for device in ["dev-b", "dev-a"] {
+        let req = sync_post(
+            &f.user_token,
+            device,
+            "/SyncPlay/New",
+            serde_json::json!({ "GroupName": "g" }),
+        );
+        assert_eq!(
+            test::call_service(&app, req.to_request()).await.status(),
+            204
+        );
+        let key = format!("{}:{device}", f.user_id.0.simple());
+        let group = hub.resolve(&key).unwrap().group.expect("joined a group");
+        seeded.push(group.snapshot().await.unwrap().queue_item_ids);
+    }
+    assert_eq!(
+        seeded,
+        [
+            vec![],
+            vec![pharos_jellyfin_api::dto::wire_item_id(f.rich_item_id)]
+        ]
+    );
+    assert_eq!(queue_refused_total(&snapshotter, "seed", "queuer"), 1);
+}

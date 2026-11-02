@@ -91,6 +91,9 @@ enum CommandOutcome {
     /// (the group emptied while this socket was between reconnects). The
     /// handle is detached and the client told `NotInGroup`.
     ActorDown,
+    /// The group was found but the command's check refused it (a queue
+    /// change a member may not see, V201); nothing was applied.
+    Refused,
 }
 
 impl CommandOutcome {
@@ -102,6 +105,7 @@ impl CommandOutcome {
             Self::DroppedNoSocket => "dropped_no_socket",
             Self::NoDevice => "no_device",
             Self::ActorDown => "actor_down",
+            Self::Refused => "refused",
         }
     }
 }
@@ -126,6 +130,7 @@ fn record_command(command: &str, outcome: CommandOutcome) {
 /// the action locally (jellyfin-web pauses/seeks first, then POSTs), and its
 /// view reconciles via catch-up the instant its `/socket` reconnects (B24).
 /// Returns whether a group was found and the command sent.
+#[allow(clippy::too_many_arguments)]
 async fn recover_and_apply(
     hub: &SessionHub,
     registry: &GroupRegistry,
@@ -133,6 +138,7 @@ async fn recover_and_apply(
     member_id: MemberId,
     device_id: &str,
     label: &str,
+    check: impl AsyncFnOnce(&GroupHandle) -> bool,
     make: impl FnOnce(MemberId) -> GroupMsg,
 ) -> bool {
     let Some(gid) = crate::sync_recovery::find_persisted_group(stores, member_id).await else {
@@ -156,6 +162,10 @@ async fn recover_and_apply(
     // B24 re-attach lands, every message this group delivers to the socket
     // would be translated with no group id and a zero epoch (When = 1970).
     hub.attach_group(device_id, h.clone());
+    if !check(&h).await {
+        record_command(label, CommandOutcome::Refused);
+        return true;
+    }
     let _ = h.tx.send(make(member_id)).await;
     record_command(label, CommandOutcome::Recovered);
     true
@@ -173,6 +183,31 @@ async fn dispatch(
     stores: &crate::state::Stores,
     device_id: Option<String>,
     label: &str,
+    make: impl FnOnce(MemberId) -> GroupMsg,
+) -> HttpResponse {
+    dispatch_checked(
+        hub,
+        registry,
+        stores,
+        device_id,
+        label,
+        async |_| true,
+        make,
+    )
+    .await
+}
+
+/// [`dispatch`], applying the command only when `check` passes for the group
+/// it resolved to, on every path (live session or persisted recovery). A
+/// refusal answers 204 and applies nothing, as Jellyfin ignores a queue
+/// change a member may not see.
+async fn dispatch_checked(
+    hub: &SessionHub,
+    registry: &GroupRegistry,
+    stores: &crate::state::Stores,
+    device_id: Option<String>,
+    label: &str,
+    check: impl AsyncFnOnce(&GroupHandle) -> bool,
     make: impl FnOnce(MemberId) -> GroupMsg,
 ) -> HttpResponse {
     let Some(dev) = device_id.as_deref() else {
@@ -196,6 +231,10 @@ async fn dispatch(
     match resolve_with_retry(hub, dev).await {
         Some(sess) => match sess.group {
             Some(h) => {
+                if !check(&h).await {
+                    record_command(label, CommandOutcome::Refused);
+                    return no_content();
+                }
                 if h.tx.send(make(sess.member_id)).await.is_err() {
                     // The actor is gone (the group emptied while this socket
                     // was between reconnects) but the hub still pointed at
@@ -219,7 +258,17 @@ async fn dispatch(
             // A live socket but no attached group here: its B24 re-attach may
             // not have run yet, so try persisted recovery before giving up.
             None => {
-                if !recover_and_apply(hub, registry, stores, sess.member_id, dev, label, make).await
+                if !recover_and_apply(
+                    hub,
+                    registry,
+                    stores,
+                    sess.member_id,
+                    dev,
+                    label,
+                    check,
+                    make,
+                )
+                .await
                 {
                     tracing::warn!(
                         command = label, device_id = %dev,
@@ -240,7 +289,7 @@ async fn dispatch(
         // persisted membership instead of dropping (was: silent WARN + drop).
         None => {
             let member_id = pharos_sync::hub::member_id_for_device(dev);
-            if !recover_and_apply(hub, registry, stores, member_id, dev, label, make).await {
+            if !recover_and_apply(hub, registry, stores, member_id, dev, label, check, make).await {
                 tracing::warn!(
                     command = label, device_id = %dev,
                     "syncplay: no /socket registered and no persisted group — command dropped"
@@ -638,6 +687,17 @@ async fn new_group(
             .into_iter()
             .next()
             .flatten();
+        if !may_queue(
+            &state,
+            &auth.user,
+            &handle,
+            std::slice::from_ref(&seed.item_id),
+            QueueVia::Seed,
+        )
+        .await
+        {
+            return no_content();
+        }
         let _ = handle
             .tx
             .send(GroupMsg::SeedQueue {
@@ -723,12 +783,14 @@ async fn set_new_queue(
     // builder, and this is a store read. Mapping over the same vec is what
     // keeps the two index-aligned.
     let item_runtimes_ms = resolve_runtimes_ms(&state, &body.playing_queue).await;
-    dispatch(
+    let queued = body.playing_queue.clone();
+    dispatch_checked(
         &hub,
         &registry,
         &state.stores,
         auth.sync_key(),
         "setnewqueue",
+        async |group| may_queue(&state, &auth.user, group, &queued, QueueVia::SetNewQueue).await,
         move |mid| GroupMsg::SetNewQueue {
             sender: mid,
             item_ids: body.playing_queue,
@@ -941,11 +1003,11 @@ async fn queue(
     }
     // Only a caller that is in a group costs store lookups and a roster
     // snapshot; anyone else is answered by `dispatch` (NotInGroup / recovery).
+    let mut item_runtimes_ms = Vec::new();
     let group = auth
         .sync_key()
         .and_then(|key| hub.resolve(&key))
         .and_then(|sess| sess.group);
-    let mut item_runtimes_ms = Vec::new();
     if let Some(group) = group {
         let queued = group.snapshot().await.map_or(0, |s| s.queue_len);
         if queued.saturating_add(body.item_ids.len()) > MAX_QUEUE_LEN {
@@ -955,12 +1017,14 @@ async fn queue(
         }
         item_runtimes_ms = resolve_runtimes_ms(&state, &body.item_ids).await;
     }
-    dispatch(
+    let queued = body.item_ids.clone();
+    dispatch_checked(
         &hub,
         &registry,
         &state.stores,
         auth.sync_key(),
         "queue",
+        async |group| may_queue(&state, &auth.user, group, &queued, QueueVia::Queue).await,
         move |mid| GroupMsg::Queue {
             sender: mid,
             item_ids: body.item_ids,
@@ -1266,6 +1330,137 @@ pub(crate) async fn may_join(
     allowed
 }
 
+/// The queue change a refusal was for: the `via` label of
+/// `pharos_syncplay_queue_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueVia {
+    SetNewQueue,
+    Queue,
+    /// The creator's now-playing item seeding a new group.
+    Seed,
+}
+
+impl QueueVia {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            QueueVia::SetNewQueue => "set_new_queue",
+            QueueVia::Queue => "queue",
+            QueueVia::Seed => "seed",
+        }
+    }
+}
+
+/// Why a queue change was refused: the `reason` label of
+/// `pharos_syncplay_queue_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueRefusal {
+    /// The member asking may not see an item.
+    Queuer,
+    /// Another member's user may not see an item, or no longer exists.
+    Member,
+    /// A member has no recorded user (restored from an older snapshot or
+    /// admitted by an older replica) and so can see nothing.
+    UnknownMember,
+    /// The group's members could not be read.
+    Unreadable,
+}
+
+impl QueueRefusal {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            QueueRefusal::Queuer => "queuer",
+            QueueRefusal::Member => "member",
+            QueueRefusal::UnknownMember => "unknown_member",
+            QueueRefusal::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// Whether `user` may put `items` in `handle`'s queue: as in Jellyfin
+/// (`AllUsersHaveAccessToQueue`), every member's user, the asker included,
+/// must be able to see every one of them, so no member's client is handed an
+/// item its user may not open (V201). Members come from the group's actor,
+/// or its persisted snapshot when the actor lives on another replica. A
+/// refusal counts under `pharos_syncplay_queue_refused_total{via,reason}`
+/// and logs a WARN naming the group, the asker and, for another member, that
+/// member's user.
+pub(crate) async fn may_queue(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    handle: &GroupHandle,
+    items: &[String],
+    via: QueueVia,
+) -> bool {
+    use pharos_core::UserStore as _;
+    let group = handle.group_id.to_string();
+    let refuse = |reason: QueueRefusal, member: Option<pharos_core::UserId>| {
+        metrics::counter!(
+            "pharos_syncplay_queue_refused_total",
+            "via" => via.label(),
+            "reason" => reason.label()
+        )
+        .increment(1);
+        tracing::warn!(
+            user = %user.name,
+            group,
+            via = via.label(),
+            reason = reason.label(),
+            member_user = ?member.map(|m| m.0),
+            items = items.len(),
+            "syncplay queue change refused"
+        );
+        false
+    };
+    if !may_see_queue(state, user, items).await {
+        return refuse(QueueRefusal::Queuer, Some(user.id));
+    }
+    let members = match handle.snapshot().await {
+        Some(snap) => Some(snap.member_users),
+        None => persisted_member_users(state, &group).await,
+    };
+    let Some(members) = members else {
+        return refuse(QueueRefusal::Unreadable, None);
+    };
+    let mut checked = std::collections::HashSet::from([user.id]);
+    for member in members {
+        let Some(member) = member else {
+            return refuse(QueueRefusal::UnknownMember, None);
+        };
+        if !checked.insert(member) {
+            continue;
+        }
+        let sees = match state.stores.get(member).await {
+            Ok(record) => may_see_queue(state, &record.into_user(), items).await,
+            Err(e) => {
+                tracing::warn!(group, member_user = %member.0, error = %e, "syncplay: member's user unreadable");
+                false
+            }
+        };
+        if !sees {
+            return refuse(QueueRefusal::Member, Some(member));
+        }
+    }
+    true
+}
+
+/// Each member's user in a group's persisted snapshot; `None` when there is
+/// no readable row.
+async fn persisted_member_users(
+    state: &crate::state::AppState,
+    group: &str,
+) -> Option<Vec<Option<pharos_core::UserId>>> {
+    use pharos_core::SyncGroupStore;
+    match state.stores.get_sync_group(group).await {
+        Ok(row) => row
+            .and_then(|row| pharos_sync::group::snapshot_summary(&row.state_json))
+            .map(|summary| summary.member_users),
+        Err(e) => {
+            tracing::warn!(group, error = %e, "syncplay: persisted group snapshot unreadable");
+            None
+        }
+    }
+}
+
 /// The queue in a group's persisted snapshot; `None` when there is no
 /// readable row.
 async fn persisted_queue(state: &crate::state::AppState, group: &str) -> Option<Vec<String>> {
@@ -1401,6 +1596,7 @@ mod tests {
             CommandOutcome::DroppedNoSocket,
             CommandOutcome::NoDevice,
             CommandOutcome::ActorDown,
+            CommandOutcome::Refused,
         ];
         let labels: HashSet<&str> = all.iter().map(|o| o.label()).collect();
         assert_eq!(
@@ -1490,6 +1686,7 @@ mod tests {
             MemberId::new(),
             "dev-in-no-group",
             "pause",
+            async |_| true,
             |mid| GroupMsg::PauseShared { sender: mid },
         )
         .await;
@@ -1761,6 +1958,25 @@ mod tests {
         assert_eq!(GroupHiddenRoute::Join.label(), "join");
         assert_eq!(GroupHiddenRoute::Socket.label(), "socket");
         assert_eq!(GroupHiddenRoute::Native.label(), "native");
+    }
+
+    /// `pharos_syncplay_queue_refused_total{via,reason}` is a dashboard
+    /// contract: each label set stays distinct and stable.
+    #[actix_web::test]
+    async fn queue_refusal_labels_are_distinct() {
+        let via = [QueueVia::SetNewQueue, QueueVia::Queue, QueueVia::Seed].map(QueueVia::label);
+        assert_eq!(via, ["set_new_queue", "queue", "seed"]);
+        let reasons = [
+            QueueRefusal::Queuer,
+            QueueRefusal::Member,
+            QueueRefusal::UnknownMember,
+            QueueRefusal::Unreadable,
+        ]
+        .map(QueueRefusal::label);
+        assert_eq!(
+            reasons,
+            ["queuer", "member", "unknown_member", "unreadable"]
+        );
     }
 
     /// B265 / V201: a group whose actor answers nothing (it lives on another
