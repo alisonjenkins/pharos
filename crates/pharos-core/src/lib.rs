@@ -3467,6 +3467,17 @@ pub struct PersistedTranscodeSession {
     /// back to burning every requested subtitle, which is exactly the expensive
     /// default this set exists to avoid.
     pub burn_subtitle_indices_json: String,
+    /// Who negotiated the session. `None` for a row written before sessions
+    /// recorded it.
+    pub holder: Option<SessionHolder>,
+}
+
+/// The user who negotiated a play session and the id of the token they used
+/// ([`TokenStore::token_id`]), so the session ends with that token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHolder {
+    pub user_id: UserId,
+    pub token_id: String,
 }
 
 /// Cross-replica store for [`PersistedTranscodeSession`]s keyed on

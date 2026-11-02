@@ -145,6 +145,7 @@ where
             decision_json: serde_json::to_string(&session.decision)?,
             source_probe_json: serde_json::to_string(&session.source_probe)?,
             burn_subtitle_indices_json: serde_json::to_string(&session.burn_subtitle_indices)?,
+            holder: None,
         })
     }
 
