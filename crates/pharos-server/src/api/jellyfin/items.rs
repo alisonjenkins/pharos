@@ -7093,7 +7093,13 @@ async fn resume_items(
     // requests `Limit=12` and was served 86 items, 400 KB of JSON to render
     // twelve tiles. `TotalRecordCount` stays the unpaged total, which is what
     // Jellyfin means by it and what a client would page against.
-    let int_param = |name: &str| query_param(name).and_then(|v| v.parse::<u32>().ok());
+    // Parsed wide and saturated, so a StartIndex past u32 is an empty page,
+    // not a silent restart from the top.
+    let int_param = |name: &str| {
+        query_param(name)
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
     let page = crate::services::library::resume(
         state,
         &user.0,
