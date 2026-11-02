@@ -1,6 +1,6 @@
 # ADR-0012: Dioxus + dx (WASM) for the built-in web UI
 
-- **Status:** Accepted
+- **Status:** Accepted; the serving paragraph of "build wiring" is superseded by ADR-0033
 - **Date:** 2026-07-09T00:00:00Z
 - **Deciders:** Alison
 
