@@ -729,6 +729,9 @@ pub struct GroupSnapshot {
     pub current_item_id: Option<String>,
     /// Number of entries in the play queue.
     pub queue_len: usize,
+    /// Wire item id of every queue entry, in order: who may see the group
+    /// depends on who may see all of them.
+    pub queue_item_ids: Vec<String>,
 }
 
 struct MemberRec {
@@ -2546,6 +2549,8 @@ pub struct SnapshotSummary {
     pub group_name: String,
     pub participants: Vec<String>,
     pub play_state: GroupPlayState,
+    /// Wire item id of every queue entry, in order.
+    pub queue_item_ids: Vec<String>,
 }
 
 /// Parse a persisted snapshot's display summary. `None` for malformed JSON.
@@ -2564,6 +2569,7 @@ pub fn snapshot_summary(state_json: &str) -> Option<SnapshotSummary> {
         group_name: ps.group_name,
         participants: ps.members.into_iter().map(|m| m.name).collect(),
         play_state,
+        queue_item_ids: ps.queue_items.into_iter().map(|q| q.item_id).collect(),
     })
 }
 
@@ -4189,6 +4195,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .get(state.queue.playing_index)
                     .map(|e| e.item_id.clone()),
                 queue_len: state.queue.items.len(),
+                queue_item_ids: state
+                    .queue
+                    .items
+                    .iter()
+                    .map(|e| e.item_id.clone())
+                    .collect(),
             };
             let _ = reply.send(snap);
         }
