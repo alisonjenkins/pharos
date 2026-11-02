@@ -126,6 +126,15 @@ snapshot plus `PlaySessionId` to the client-log endpoint.
   uploaded as GPU textures for zero-latency scrubbing.
 - **FR-005** MediaSegments client (`GET MediaSegments/{itemId}`), with per-type
   user preference stored with user settings.
+
+  *Native player, 2026-11-02*: the watch page reads tracks, trickplay sprite
+  sets and segments from `Library.detail` (017 schema 4) rather than the
+  Jellyfin routes, served by the same `services::segments` and
+  `services::watch`. Trickplay thumbnails are CSS sprites
+  (`background-position` on the tile JPEG), not GPU textures: the DOM player
+  has no canvas to upload to, and a cached tile already scrubs without a
+  fetch. Text subtitles of every format play as WebVTT (ASS loses its
+  styling until 017 T071); the skip button always asks (017 T070).
 - **FR-006** Playback reporting: `Sessions/Playing`, `/Progress`, `/Stopped`,
   plus remote-control commands received over the 009 websocket (014 US3).
 - **FR-007** Queue model shared by video and music: play now/next/last, shuffle,
