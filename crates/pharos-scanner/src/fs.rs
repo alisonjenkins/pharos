@@ -5794,10 +5794,152 @@ mod tests {
         assert!(own.alternate_sources.is_empty());
     }
 
+    fn reprobe_counter(snap: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| match v {
+                DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_reprobe_total"
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == reason) =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    const FILM: &str = "Film (2010)/Film (2010).mkv";
+    const FILM_3D: &str = "Film (2010)/Film (2010) - 3D.HSBS.mkv";
+
     #[test]
     fn reprobe_reason_labels_are_distinct() {
         let labels: HashSet<&'static str> = ReprobeReason::ALL.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), ReprobeReason::ALL.len());
+    }
+
+    #[tokio::test]
+    async fn a_rescan_drops_an_edition_whose_file_was_deleted() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        write_file(td.path(), FILM_3D, b"3dddd").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id = stable_id(&td.path().join(FILM));
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.probe.alternate_sources.len(), 1);
+        assert!(
+            stored.probe.alternate_sources[0].video_3d_format.is_some(),
+            "the 3D edition makes the item 3D"
+        );
+
+        tokio::fs::remove_file(td.path().join(FILM_3D))
+            .await
+            .unwrap();
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert!(
+            stored.probe.alternate_sources.is_empty(),
+            "deleted edition must leave the row: {:?}",
+            stored.probe.alternate_sources
+        );
+        assert_eq!(out.updated, [id], "the primary was re-put, not skipped");
+        assert_eq!(reprobe_counter(&snapshotter, "edition_removed"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rescan_picks_up_an_edition_added_beside_a_scanned_primary() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id = stable_id(&td.path().join(FILM));
+        assert!(store
+            .get(id)
+            .await
+            .unwrap()
+            .probe
+            .alternate_sources
+            .is_empty());
+
+        write_file(td.path(), FILM_3D, b"3dddd").await;
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.probe.alternate_sources.len(), 1);
+        assert_eq!(
+            stored.probe.alternate_sources[0].video_3d_format,
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        assert_eq!(reprobe_counter(&snapshotter, "edition_added"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rescan_refreshes_an_edition_whose_file_changed_size() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        write_file(td.path(), FILM_3D, b"3dddd").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id = stable_id(&td.path().join(FILM));
+
+        write_file(td.path(), FILM_3D, b"3d-re-encoded-bigger").await;
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(
+            stored.probe.alternate_sources[0].size_bytes,
+            Some(b"3d-re-encoded-bigger".len() as u64)
+        );
+        assert_eq!(reprobe_counter(&snapshotter, "edition_changed"), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_rescan_of_a_grouped_primary_still_skips() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        write_file(td.path(), FILM_3D, b"3dddd").await;
+        let prober = FakeProber::default();
+        let store = MemStore::default();
+        let s = FsScanner::new(prober.clone());
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let before = prober.calls.load(Ordering::SeqCst);
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(out.skipped, 1, "nothing changed: the primary skips");
+        assert_eq!(
+            prober.calls.load(Ordering::SeqCst),
+            before,
+            "no extra probe"
+        );
+        for reason in ReprobeReason::ALL {
+            assert_eq!(reprobe_counter(&snapshotter, reason.label()), 0);
+        }
     }
 
     #[test]
