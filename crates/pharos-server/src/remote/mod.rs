@@ -172,6 +172,8 @@ fn is_public(ip: &std::net::IpAddr) -> bool {
 pub enum ResolveError {
     #[error("[remote] is not enabled")]
     Disabled,
+    #[error(transparent)]
+    Target(#[from] TargetRefused),
     #[error("could not run {bin}: {source}")]
     Spawn {
         bin: String,
@@ -204,6 +206,7 @@ impl ResolveError {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::Target(refusal) => refusal.label(),
             Self::Spawn { .. } => "spawn",
             Self::Failed { .. } => "exit",
             Self::Json { .. } => "json",
@@ -497,11 +500,6 @@ impl ResolverCache {
         self
     }
 
-    /// `Ok` when `url` may be catalogued: see [`check_target`].
-    pub async fn check_target(&self, url: &str) -> Result<(), TargetRefused> {
-        check_target(url, &self.allowed_private_hosts).await
-    }
-
     /// Release the bytes held against locators nothing will ask for again.
     ///
     /// A signed URL is the cache's KEY, so a re-resolution does not update an
@@ -564,7 +562,10 @@ impl ResolverCache {
     /// when a person adds a link, and the descriptive facts it returns are
     /// persisted, so serving them from a memo could write a stale title for a
     /// video that has since been renamed.
+    /// A caller-chosen URL is checked first ([`check_target`]), so no path
+    /// into the resolver fetches inside the network.
     pub async fn describe(&self, url: &str) -> Result<ResolvedItem, ResolveError> {
+        check_target(url, &self.allowed_private_hosts).await?;
         self.resolver.describe(url).await
     }
 
