@@ -766,3 +766,254 @@ async fn native_next_up_agrees_with_the_jellyfin_next_up_route() {
         [serde_json::json!("Show")]
     );
 }
+
+/// Seeds movies 101 "Alpha" and 102 "Beta" in /libA and 201 "Gamma" in
+/// /libB beside the fixture's own rows, with 102 a favourite.
+async fn seed_movies(fx: &crate::common::Fixture) {
+    use pharos_core::{
+        LibraryStore as _, MediaItem, MediaKind, MediaStore as _, UserDataStore as _,
+    };
+    for (id, title) in [(101, "Alpha"), (102, "Beta"), (201, "Gamma")] {
+        let lib = if id < 200 { "libA" } else { "libB" };
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/{lib}/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    fx.state
+        .stores
+        .set_user_data(
+            fx.user_id,
+            102,
+            pharos_core::UserItemData {
+                is_favorite: true,
+                ..pharos_core::UserItemData::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// T033: the listing pages with the unpaged total, and a restricted user
+/// sees only the libraries the policy allows, in the total and under a
+/// forbidden parent alike.
+/// Disarm check: with `apply_policy_scope` skipped in
+/// `services::library::query`, the restricted totals count /libA.
+#[actix_web::test]
+async fn query_pages_and_keeps_to_the_policy() {
+    let fx = seed_rich().await;
+    seed_movies(&fx).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids = |page: &library::QueryPage| page.items.iter().map(|i| i.id).collect::<Vec<_>>();
+    let by_name = |start, limit| library::ItemQuery {
+        sort_by: Some("SortName".into()),
+        start_index: start,
+        limit,
+        ..library::ItemQuery::default()
+    };
+
+    let all = library::query(&fx.state, &user, None, &by_name(0, None))
+        .await
+        .unwrap();
+    assert_eq!(all.total, 5);
+    let second = library::query(&fx.state, &user, None, &by_name(1, Some(2)))
+        .await
+        .unwrap();
+    assert_eq!((second.total, second.start), (5, 1));
+    assert_eq!(ids(&second), ids(&all)[1..3]);
+
+    let restricted = pharos_core::User {
+        policy: UserPolicy {
+            enable_all_folders: false,
+            enabled_folders: vec![fx.lib_b_wire.clone()],
+            ..UserPolicy::default()
+        },
+        ..user.clone()
+    };
+    let b = library::query(&fx.state, &restricted, None, &by_name(0, None))
+        .await
+        .unwrap();
+    assert_eq!(b.total, 2);
+    assert!(ids(&b).iter().all(|id| *id >= 200), "{:?}", ids(&b));
+    let hidden = library::query(
+        &fx.state,
+        &restricted,
+        Some(&fx.lib_a_wire),
+        &by_name(0, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!((hidden.total, ids(&hidden)), (0, vec![]));
+}
+
+/// One `Library.query` call on `session`.
+#[allow(clippy::too_many_arguments)]
+async fn wire_query(
+    session: &session::Client,
+    parent: Option<&str>,
+    kinds: &[Kind],
+    sort_by: &str,
+    descending: bool,
+    name_prefix: &str,
+    filters: &[&str],
+    start: u32,
+    limit: u32,
+) -> (u32, Vec<serde_json::Value>) {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    if let Some(parent) = parent {
+        let mut id = q.reborrow().init_parent_id();
+        match WireId::parse(parent).expect("parent is a wire id") {
+            WireId::Real(n) => id.set_real(n),
+            WireId::Synth(n) => id.set_synth(n),
+        }
+    }
+    let mut list = q.reborrow().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    q.set_sort_by(sort_by);
+    q.set_descending(descending);
+    q.set_name_starts_with(name_prefix);
+    let mut list = q.reborrow().init_filters(filters.len() as u32);
+    for (i, f) in filters.iter().enumerate() {
+        list.set(i as u32, *f);
+    }
+    q.set_start(start);
+    q.set_limit(limit);
+    let reply = req.send().promise.await.expect("query");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// A `Library.query` call's arguments and the `/Items` query that should
+/// list the same: parent, kinds, sort, descending, prefix, filters, start,
+/// limit, then the Jellyfin query string.
+type Shape<'a> = (
+    Option<&'a str>,
+    &'a [Kind],
+    &'a str,
+    bool,
+    &'a str,
+    &'a [&'a str],
+    u32,
+    u32,
+    String,
+);
+
+/// T033 over the wire: `Library.query` lists what `/Users/{id}/Items` lists
+/// for the same parent, kinds, sort, name prefix, filters and page, with the
+/// same total; a limit of 0 is the default page.
+/// Disarm check: with `query` dropping `descending` (or the filters), the
+/// matching shape disagrees.
+#[actix_web::test]
+async fn native_query_agrees_with_the_jellyfin_items_route() {
+    use actix_web::test;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let uid = fx.user_id.0.simple();
+    let lib_a = fx.lib_a_wire.clone();
+
+    let shapes: Vec<Shape<'_>> = vec![
+        (
+            None,
+            &[],
+            "SortName",
+            false,
+            "",
+            &[],
+            0,
+            0,
+            "SortBy=SortName&Limit=100".into(),
+        ),
+        (
+            None,
+            &[],
+            "SortName",
+            true,
+            "",
+            &[],
+            0,
+            50,
+            "SortBy=SortName&SortOrder=Descending&Limit=50".into(),
+        ),
+        (
+            Some(&lib_a),
+            &[Kind::Movie],
+            "SortName",
+            false,
+            "",
+            &[],
+            0,
+            50,
+            format!("ParentId={lib_a}&IncludeItemTypes=Movie&SortBy=SortName&Limit=50"),
+        ),
+        (
+            None,
+            &[],
+            "SortName",
+            false,
+            "B",
+            &[],
+            0,
+            50,
+            "SortBy=SortName&NameStartsWith=B&Limit=50".into(),
+        ),
+        (
+            None,
+            &[],
+            "SortName",
+            false,
+            "",
+            &["IsFavorite"],
+            0,
+            50,
+            "SortBy=SortName&Filters=IsFavorite&Limit=50".into(),
+        ),
+        (
+            None,
+            &[],
+            "SortName",
+            false,
+            "",
+            &[],
+            1,
+            2,
+            "SortBy=SortName&StartIndex=1&Limit=2".into(),
+        ),
+    ];
+    for (parent, kinds, sort, desc, prefix, filters, start, limit, jf) in shapes {
+        let (total, native) = wire_query(
+            &session, parent, kinds, sort, desc, prefix, filters, start, limit,
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri(&format!("/Users/{uid}/Items?{jf}"))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request();
+        let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        assert!(!native.is_empty(), "{jf}: the shape must list something");
+        assert_eq!(native, project(web["Items"].as_array().unwrap()), "{jf}");
+        assert_eq!(
+            u64::from(total),
+            web["TotalRecordCount"].as_u64().unwrap(),
+            "{jf}"
+        );
+    }
+}
