@@ -6,6 +6,7 @@
 //! today — moves to SQL-side once library sizes warrant it.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::services::library::KindFilter;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
@@ -3760,45 +3761,26 @@ async fn latest_items(
     user: &AuthUser,
     q: &ListQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let all = crate::services::access::visible_items(state, &user.0, all, "latest")
-        .await
-        .map_err(crate::api::jellyfin::access_error)?;
-    // Honour ParentId so home-page "Latest" rows match the library
-    // the user clicked into. Library / series / season ids all
-    // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(state, &all, q.parent_id.as_deref()).await;
-    // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
-    // row filters to Type=Movie.
-    let mut typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
-    // B97 — "Latest" means most-recently-ADDED first (DateCreated desc). Without
-    // this sort the items came back in `list_items_cached` order (id/cache
-    // order), so a newly-scanned film — the one with the newest DateCreated —
-    // never surfaced in the home "Recently Added" row. Sort by `created_at`
-    // desc with id as a stable tiebreak; rows lacking a timestamp sort last.
-    typed.sort_by(|a, b| {
-        b.created_at
-            .unwrap_or(i64::MIN)
-            .cmp(&a.created_at.unwrap_or(i64::MIN))
-            .then(b.id.cmp(&a.id))
-    });
-    let limit = q.limit.unwrap_or(100).min(100) as usize;
-    let page: Vec<MediaItem> = typed.into_iter().take(limit).collect();
-    let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.0.id, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let dtos: Vec<BaseItemDto> = page
+    let latest = crate::services::library::latest(
+        state,
+        &user.0,
+        q.parent_id.as_deref(),
+        &parse_kind_filter(q.include_item_types.as_deref()),
+        q.limit,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::services::library::LatestError::Hidden(hidden) => {
+            crate::api::jellyfin::access_error(hidden)
+        }
+        crate::services::library::LatestError::Store(e) => {
+            error::ErrorInternalServerError(e.to_string())
+        }
+    })?;
+    let dtos: Vec<BaseItemDto> = latest
         .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        .map(|(item, ud)| {
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, *ud)
                 .with_converted_book(
                     crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
                 )
@@ -3811,28 +3793,6 @@ async fn latest_items(
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
     Ok(crate::api::jellyfin::wire::json(&dtos))
-}
-
-/// What an `IncludeItemTypes=` parameter asks of the SQL list path.
-///
-/// B153 — the distinction that was missing. `MusicVideo` names a type pharos
-/// stores none of, and the old code read "zero recognised kinds" as "no kind
-/// filter", so a request for music videos returned the ENTIRE library: 51.6 MB
-/// of JSON for a query whose honest answer is an empty list. "I asked for X"
-/// must never widen to "I asked for anything".
-///
-/// Reaching this point already means every synth short-circuit (MusicAlbum,
-/// MusicArtist, Playlist, BoxSet, the show folders) has declined the request,
-/// and the SQL path can only ever return Movie / Episode / Audio rows — so if
-/// none of the named types is one of those, nothing can match, whichever
-/// unknown type it was.
-enum KindFilter {
-    /// No `IncludeItemTypes` at all — every kind is acceptable.
-    Unset,
-    /// At least one named type is a kind pharos stores.
-    Kinds(Vec<MediaKind>),
-    /// Types were named and none of them can appear in this result.
-    MatchesNothing,
 }
 
 /// Types pharos SYNTHESISES rather than stores: they are not a [`MediaKind`],
@@ -3906,17 +3866,6 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
-    match parse_kind_filter(include) {
-        KindFilter::Unset => items,
-        KindFilter::MatchesNothing => Vec::new(),
-        KindFilter::Kinds(wanted) => items
-            .into_iter()
-            .filter(|i| wanted.contains(&i.kind))
-            .collect(),
-    }
 }
 
 async fn user_views(
@@ -6032,7 +5981,7 @@ async fn apply_tags_filter(
 /// Drop items that don't live under the configured root / series /
 /// season mapped to `parent_id`. Unknown `parent_id` → empty list.
 /// The All-Media placeholder + `None` pass everything through.
-async fn restrict_to_parent(
+pub(crate) async fn restrict_to_parent(
     state: &AppState,
     items: &[MediaItem],
     parent_id: Option<&str>,
