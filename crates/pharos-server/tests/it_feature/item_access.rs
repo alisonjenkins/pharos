@@ -1035,3 +1035,70 @@ async fn a_native_sync_join_needs_a_visible_queue() {
         ]
     );
 }
+
+/// Tag policies used by the B266 tests: blocking the rich item's tag, and
+/// allowing only it. Names differ in case from the stored `award-winner`.
+fn tag_policies() -> [(&'static str, UserPolicy, bool); 2] {
+    [
+        (
+            "blocked",
+            UserPolicy {
+                blocked_tags: vec!["Award-Winner".into()],
+                ..UserPolicy::default()
+            },
+            false,
+        ),
+        (
+            "allowed",
+            UserPolicy {
+                allowed_tags: vec!["AWARD-WINNER".into()],
+                ..UserPolicy::default()
+            },
+            true,
+        ),
+    ]
+}
+
+/// B266: `BlockedTags` hides an item carrying one of them and `AllowedTags`
+/// shows only items carrying one, on every query-scoped list (`/Items`,
+/// `/Search/Hints`, `/Tags`). Names match without regard to case.
+/// Disarm check: with `apply_policy_scope` setting no `tag_scope`, the
+/// blocked user lists the rich item.
+#[actix_web::test]
+async fn tag_lists_narrow_every_query_scoped_list() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let (rich, other) = (wire(f.rich_item_id), wire(f.other_item_id));
+    let mut wrong = Vec::new();
+    for (label, policy, rich_visible) in tag_policies() {
+        f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+        let page: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            get(&f.user_token, "/Items?Recursive=true").to_request(),
+        )
+        .await;
+        let ids = item_ids(&page);
+        let seen = (ids.contains(&rich), ids.contains(&other));
+        if seen != (rich_visible, !rich_visible) {
+            wrong.push(format!("{label} /Items (rich, other) = {seen:?}"));
+        }
+        let hints: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            get(&f.user_token, "/Search/Hints?searchTerm=Rich").to_request(),
+        )
+        .await;
+        let hinted = hints["SearchHints"]
+            .as_array()
+            .is_some_and(|h| !h.is_empty());
+        if hinted != rich_visible {
+            wrong.push(format!("{label} /Search/Hints: {hints}"));
+        }
+        let tags: serde_json::Value =
+            test::call_and_read_body_json(&app, get(&f.user_token, "/Tags").to_request()).await;
+        let tagged = tags.to_string().contains("award-winner");
+        if tagged != rich_visible {
+            wrong.push(format!("{label} /Tags: {tags}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

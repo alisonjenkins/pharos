@@ -4444,8 +4444,9 @@ fn sort_chain(
 }
 
 /// T68 — narrow a built [`MediaQuery`] to what the requesting user's policy
-/// permits: the library allow-list (`EnabledFolders`) and the parental-rating
-/// ceiling (`MaxParentalRating`). Applied to the query (not a post-filter) so
+/// permits: the library allow-list (`EnabledFolders`), the parental-rating
+/// ceiling (`MaxParentalRating`) and the tag lists (`BlockedTags`,
+/// `AllowedTags`, B266). Applied to the query (not a post-filter) so
 /// `TotalRecordCount` and paging stay honest. A no-op for an unrestricted
 /// (default) policy.
 pub(crate) fn apply_policy_scope(
@@ -4468,6 +4469,13 @@ pub(crate) fn apply_policy_scope(
             // Jellyfin's BlockUnratedItems is a per-type list; pharos applies it
             // coarsely — any entry blocks unrated items for this user.
             block_unrated: !policy.block_unrated_items.is_empty(),
+        });
+    }
+    if !policy.blocked_tags.is_empty() || !policy.allowed_tags.is_empty() {
+        let lowercase = |tags: &[String]| tags.iter().map(|t| t.to_lowercase()).collect();
+        mq.tag_scope = Some(pharos_core::TagScope {
+            blocked_lc: lowercase(&policy.blocked_tags),
+            allowed_lc: lowercase(&policy.allowed_tags),
         });
     }
 }
