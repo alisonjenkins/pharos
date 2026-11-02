@@ -162,8 +162,9 @@ compat-dioxus:
 
 # `native=on` writes `[server.native_api]` (native sign-in cases run); `native=off`
 # omits it (the not-enabled case runs). Pharos is stopped by PID in the trap.
-# Seeded pharos + Dioxus Playwright suite; native=on|off selects the mode.
-compat-dioxus-full native="on":
+# Seeded pharos + Dioxus Playwright suite; native=on|off selects the mode,
+# port lets two worktrees run it at once.
+compat-dioxus-full native="on" port="8096":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ native }}" in
@@ -204,13 +205,13 @@ compat-dioxus-full native="on":
 
     [server.native_api]
     enabled = true
-    allowed_origins = ["http://127.0.0.1:8096"]
+    allowed_origins = ["http://127.0.0.1:{{ port }}"]
     NATIVE
     )
     fi
     cat > "$TMP/pharos.toml" <<EOF
     [server]
-    bind = "127.0.0.1:8096"
+    bind = "127.0.0.1:{{ port }}"
     name = "pharos-playwright"
     ui_dir = "$UI_DIR"
     image_cache_dir = "$TMP/images"
@@ -240,14 +241,14 @@ compat-dioxus-full native="on":
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
     nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
     for _ in $(seq 1 120); do
-      if curl -fsS -o /dev/null http://127.0.0.1:8096/ui/ 2>/dev/null; then ready=1; break; fi
+      if curl -fsS -o /dev/null http://127.0.0.1:{{ port }}/ui/ 2>/dev/null; then ready=1; break; fi
       sleep 1
     done
     if [[ -z "${ready:-}" ]]; then
-      echo "compat-dioxus-full: pharos not ready on 127.0.0.1:8096 after 120s" >&2
+      echo "compat-dioxus-full: pharos not ready on 127.0.0.1:{{ port }} after 120s" >&2
       exit 1
     fi
-    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:8096 npx playwright test --config playwright.dioxus.config.ts'
+    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:{{ port }} npx playwright test --config playwright.dioxus.config.ts'
 
 # Convenience: spin up pharos with seeded data + run Playwright in one
 # shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
