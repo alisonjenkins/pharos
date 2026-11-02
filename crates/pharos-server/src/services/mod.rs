@@ -5,4 +5,5 @@
 pub mod access;
 pub mod auth;
 pub mod library;
+pub mod playback;
 pub mod user_data;
