@@ -76,6 +76,24 @@ impl<U: UserStore> BuiltinAuth<U> {
         Ok(SecretString::new(hash))
     }
 
+    /// The names of the records whose stored hash accepts the empty password
+    /// (B271). One argon2 verify per record, so callers keep it off the async
+    /// workers. A hash that does not parse is skipped with a warning: it is not
+    /// an empty password, and one bad row must not hide the rest.
+    pub fn names_with_empty_password(&self, records: &[UserRecord]) -> Vec<String> {
+        records
+            .iter()
+            .filter(|r| match PasswordHash::new(r.password_hash.expose()) {
+                Ok(parsed) => self.argon.verify_password(b"", &parsed).is_ok(),
+                Err(e) => {
+                    tracing::warn!(user = %r.name, error = %e, "auth: stored hash does not parse; skipped in the empty-password check");
+                    false
+                }
+            })
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
     /// Burn one argon2 verify so an unknown username costs what a known one
     /// does (V177). The result is irrelevant and ignored.
     fn dummy_verify(&self, password: &SecretString) {

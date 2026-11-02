@@ -1830,6 +1830,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     );
     state.login_throttle.record_state();
     let app_state = web::Data::new(state);
+    // Off the startup path: one argon2 verify per account (B271).
+    let empty_check_state = app_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) =
+            pharos_server::services::auth::report_empty_password_accounts(empty_check_state).await
+        {
+            tracing::error!(error = %e, "could not check accounts for an empty password");
+        }
+    });
 
     // Phase B2 — elect the background-work singleton. Under Postgres this
     // holds an advisory lock so exactly one replica runs the DB-writing

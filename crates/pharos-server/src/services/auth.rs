@@ -344,6 +344,31 @@ pub async fn password_login(
     result
 }
 
+/// Startup check (B271): sets `pharos_users_empty_password` to the number of
+/// accounts whose password is "", and says which ones. The argon2 checks run on
+/// the blocking pool, so a large user table does not hold a worker.
+pub async fn report_empty_password_accounts(
+    state: actix_web::web::Data<AppState>,
+) -> Result<(), AuthError> {
+    let records = state.auth.users().list().await?;
+    let checker = state.clone();
+    let names =
+        tokio::task::spawn_blocking(move || checker.auth.names_with_empty_password(&records))
+            .await
+            .map_err(|e| AuthError::Backend(format!("empty-password check task: {e}")))?;
+    metrics::gauge!("pharos_users_empty_password").set(names.len() as f64);
+    if names.is_empty() {
+        tracing::info!(count = 0, "no account has an empty password");
+    } else {
+        tracing::warn!(
+            count = names.len(),
+            users = %names.join(", "),
+            "accounts with an empty password: native sign-in refuses them; set a password"
+        );
+    }
+    Ok(())
+}
+
 /// Revokes every session token `user` holds (API keys excepted) but `keep_token`; announces the user
 /// when any went and logs how many. Returns the count.
 pub async fn revoke_other_tokens(

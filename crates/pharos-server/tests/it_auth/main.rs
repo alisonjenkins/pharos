@@ -8,6 +8,7 @@ mod auth_header_fuzz;
 mod auth_rejected_metrics;
 mod concurrent_auth_audit;
 mod cross_user_isolation;
+mod empty_password_report;
 mod jellyfin_admin;
 mod jellyfin_quick_connect;
 mod jellyfin_session_logout;
