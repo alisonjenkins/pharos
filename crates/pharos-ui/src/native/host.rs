@@ -8,6 +8,7 @@ use pharos_client::api::{Capabilities, NativeApi};
 use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
+use super::playback::{Engine, PlaybackEngine};
 
 const NO_BROWSER: &str = "the native app needs a browser";
 
@@ -60,6 +61,36 @@ pub fn plays_hls() -> bool {
     false
 }
 
+pub fn has_mse() -> bool {
+    false
+}
+
 pub fn capabilities() -> Capabilities {
     Capabilities::default()
 }
+
+pub fn position_ms(_video_id: &str) -> u64 {
+    0
+}
+
+pub fn now_ms() -> f64 {
+    0.0
+}
+
+pub fn spawn_detached(_fut: impl std::future::Future<Output = ()> + 'static) {}
+
+pub struct PageHide;
+
+pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
+    PageHide
+}
+
+pub async fn engine(_kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
+    Err(NO_BROWSER.into())
+}
+
+pub fn warn(message: &str) {
+    eprintln!("{message}");
+}
+
+pub fn info(_message: &str) {}

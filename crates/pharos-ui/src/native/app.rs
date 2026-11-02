@@ -1,20 +1,24 @@
 //! The native app: routing and history, the connection lifecycle that
 //! drives [`Machine`], and the screens that load data for the pure views.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 use pharos_client::api::{
-    Decision, Detail, Home, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _,
+    Detail, Home, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _, PlaybackGrant as _,
 };
 use pharos_client::{CallInfo, ClientError};
 
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
+use super::playback::{
+    choose_engine, start_ms, Engine, MediaEvent, Outgoing, PlaybackEngine, ReportClock,
+};
 use super::route::Route;
 use super::views::{
     BrowseView, ErrorNote, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
-    WatchView,
+    WatchView, VIDEO_ID,
 };
 use crate::views::RootApp;
 
@@ -308,45 +312,186 @@ fn TitleScreen(id: ItemRef) -> Element {
     )
 }
 
-/// A negotiated playback. The grant lives as long as the screen, so the
-/// server keeps the session it started.
+/// A negotiated playback, ready for the player.
 struct Playing {
     title: String,
-    decision: Decision,
-    _grant: NativeGrant,
+    url: String,
+    start_ms: u64,
+    engine: Engine,
+    /// The server's play session; a new one remounts the player.
+    session: String,
+    grant: NativeGrant,
+}
+
+/// The playback props, compared by identity: a new negotiation is a new
+/// player.
+#[derive(Clone)]
+struct PlayingRef(Rc<Playing>);
+
+impl PartialEq for PlayingRef {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[component]
 fn WatchScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
+    // Where the player was, so a renegotiation after a reconnect carries on
+    // from there rather than from the stored position.
+    let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
+    let resume_from = Rc::clone(&last_ms);
     let playing = use_resource(move || {
         let api = ctx.api.read().clone();
+        let resume_from = Rc::clone(&resume_from);
         async move {
             let api = api?;
             let info = call("watch", "play");
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let (decision, grant) = api.play(&info, id, &platform::capabilities()).await?;
-                Ok::<_, ClientError>(Playing {
-                    title: detail.item.name,
-                    decision,
-                    _grant: grant,
-                })
+                Ok::<_, ClientError>((detail, decision, grant))
             }
             .await;
-            Some(settle(ctx.machine, result).and_then(|p| {
-                if p.decision.is_hls() && !platform::plays_hls() {
-                    Err("This title needs HLS, which this browser cannot play yet.".to_owned())
-                } else {
-                    Ok(p)
-                }
-            }))
+            Some(
+                settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
+                    let engine = choose_engine(
+                        decision.is_hls(),
+                        platform::plays_hls(),
+                        platform::has_mse(),
+                    );
+                    platform::info(&format!(
+                        "pharos: playback method={} engine={engine:?} block={} downgrade={} url={}",
+                        decision.method,
+                        decision.direct_play_block,
+                        decision.downgrade,
+                        decision.stream_url
+                    ));
+                    if engine == Engine::Unsupported {
+                        return Err(
+                            "This title needs HLS, which this browser cannot play.".to_owned()
+                        );
+                    }
+                    let start_ms = match resume_from.get() {
+                        0 => start_ms(detail.item.position_ms, detail.item.played),
+                        here => here,
+                    };
+                    Ok(PlayingRef(Rc::new(Playing {
+                        title: detail.item.name,
+                        url: decision.stream_url,
+                        start_ms,
+                        engine,
+                        session: decision.play_session,
+                        grant,
+                    })))
+                }),
+            )
         }
     });
     let state = playing.read();
-    loaded(state.as_ref().and_then(Option::as_ref), |p: &Playing| {
-        rsx! { WatchView { title: p.title.clone(), src: p.decision.stream_url.clone() } }
+    loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+        rsx! { Player { key: "{p.0.session}", playing: p.clone(), last_ms: LastMs(Rc::clone(&last_ms)) } }
     })
+}
+
+/// The player's last known position, shared with its screen.
+#[derive(Clone)]
+struct LastMs(Rc<Cell<u64>>);
+
+impl PartialEq for LastMs {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Attaches the engine and reports progress: on play, pause and seek, every
+/// 10 s while playing, and one stop when the video ends, the player
+/// unmounts or the page is hidden.
+#[component]
+fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
+    let ctx = use_context::<Ctx>();
+    let p = playing.0;
+    let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
+    let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
+    let mut failed = use_signal(|| None::<String>);
+
+    let stop = {
+        let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
+        move || {
+            if !clock.borrow_mut().stop() {
+                return;
+            }
+            let grant = p.grant.clone();
+            let at = last_ms.get();
+            platform::spawn_detached(async move {
+                if let Err(e) = grant.stop(&call("watch", "stop"), at).await {
+                    platform::warn(&format!("pharos: playback stop failed: {e}"));
+                }
+            });
+        }
+    };
+    use_hook({
+        let stop = stop.clone();
+        move || Rc::new(platform::on_page_hide(stop))
+    });
+    use_drop({
+        let (engine, stop) = (Rc::clone(&engine), stop.clone());
+        move || {
+            engine.borrow_mut().take();
+            stop();
+        }
+    });
+    use_effect({
+        let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
+        move || {
+            let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
+            spawn(async move {
+                let attached = match platform::engine(p.engine).await {
+                    Ok(mut e) => e.attach(VIDEO_ID, &p.url, p.start_ms).map(|()| e),
+                    Err(e) => Err(e),
+                };
+                match attached {
+                    Ok(e) => *engine.borrow_mut() = Some(e),
+                    Err(e) => failed.set(Some(format!("Could not start playback: {e}"))),
+                }
+            });
+        }
+    });
+
+    let on_media = {
+        let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
+        move |event: MediaEvent| {
+            let at = platform::position_ms(VIDEO_ID);
+            if at > 0 {
+                last_ms.set(at);
+            }
+            let Some(send) = clock.borrow_mut().on(platform::now_ms(), event) else {
+                return;
+            };
+            if send == Outgoing::Stop {
+                stop();
+                return;
+            }
+            let Outgoing::Report { paused } = send else {
+                return;
+            };
+            let grant = p.grant.clone();
+            let at = last_ms.get();
+            spawn(async move {
+                let result = grant.report(&call("watch", "report"), at, paused).await;
+                if let Err(e) = settle(ctx.machine, result) {
+                    platform::warn(&format!("pharos: progress report failed: {e}"));
+                }
+            });
+        }
+    };
+
+    rsx! {
+        if let Some(message) = failed() {
+            ErrorNote { message }
+        }
+        WatchView { title: p.title.clone(), on_media }
+    }
 }
 
 #[cfg(test)]
