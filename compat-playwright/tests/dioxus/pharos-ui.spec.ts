@@ -521,6 +521,133 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // 013 US2/FR-003: the watch page draws its own controls. A text subtitle
+    // switches in place as a WebVTT track the server converts; volume, mute,
+    // play/pause and the seek bar drive the <video>.
+    test("the watch controls switch subtitles in place and drive the video", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-controls-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const subtitled = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/07-test-subtitles.webm"));
+      // The startup rescan probes the fixture; its streams appear once it has.
+      const subtitleStreams = async () => {
+        const item = await subtitled();
+        if (!item) return [];
+        const info = await request.post(`${PHAROS_URL}/Items/${item.Id}/PlaybackInfo`, {
+          headers: api,
+          data: {},
+        });
+        return ((await info.json()).MediaSources?.[0]?.MediaStreams ?? []).filter(
+          (s: { Type: string }) => s.Type === "Subtitle",
+        );
+      };
+      await expect
+        .poll(async () => (await subtitleStreams()).length, { timeout: 60_000 })
+        .toBeGreaterThan(0);
+      const movie = await subtitled();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/watch/${nativeId}`);
+
+      const video = page.locator("#pharos-video");
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect(video).not.toHaveAttribute("controls", /.*/);
+      const media = () =>
+        page.evaluate(() => {
+          const v = document.getElementById("pharos-video") as HTMLVideoElement;
+          return {
+            time: v.currentTime,
+            duration: v.duration,
+            paused: v.paused,
+            volume: v.volume,
+            muted: v.muted,
+            showing: Array.from(v.textTracks)
+              .filter((t) => t.mode === "showing")
+              .map((t) => ({ id: t.id, cues: t.cues?.length ?? 0 })),
+          };
+        });
+      await expect.poll(async () => (await media()).duration, { timeout: 30_000 }).toBeGreaterThan(0);
+
+      // Subtitles: off at first (the fixture's track is not default), then on
+      // in place, with cues fetched from the server's WebVTT route.
+      const picker = page.getByRole("combobox", { name: "Subtitles" });
+      const option = await picker.locator("option").nth(1).getAttribute("value");
+      expect(option, "a subtitle track is offered").toMatch(/^\d+$/);
+      const before = page.url();
+      await picker.selectOption(option!);
+      await expect
+        .poll(async () => (await media()).showing, { timeout: 15_000 })
+        .toEqual([expect.objectContaining({ id: `pharos-sub-${option}` })]);
+      await expect
+        .poll(async () => (await media()).showing[0]?.cues ?? 0, { timeout: 15_000 })
+        .toBeGreaterThan(0);
+      expect(page.url(), "a text subtitle does not leave the page").toBe(before);
+      await picker.selectOption("off");
+      await expect.poll(async () => (await media()).showing).toEqual([]);
+
+      // Volume and mute.
+      await page.locator(".pharos-volume").fill("0.5");
+      await expect.poll(async () => (await media()).volume).toBeCloseTo(0.5, 2);
+      await page.getByRole("button", { name: "Mute" }).click();
+      await expect.poll(async () => (await media()).muted).toBe(true);
+      await page.getByRole("button", { name: "Unmute" }).click();
+      await expect.poll(async () => (await media()).muted).toBe(false);
+
+      // Play/pause through the control, not the element.
+      const toggle = page.locator(".pharos-control-row .pharos-control").first();
+      if (!(await media()).paused) {
+        await toggle.click();
+      }
+      await expect.poll(async () => (await media()).paused).toBe(true);
+
+      // The seek bar: hovering previews a time, a click seeks there.
+      const seek = page.locator("#pharos-seek");
+      const box = (await seek.boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await expect(page.locator(".pharos-seek-time")).toBeVisible();
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await expect
+        .poll(async () => {
+          const m = await media();
+          return Math.abs(m.time - m.duration / 2);
+        })
+        .toBeLessThan(1.5);
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // A playlist that never loads is fatal to hls.js with nothing to restart
     // from, so the page must say so rather than show a black box.
     test("an HLS stream that cannot load shows why", async ({ page, request }) => {
