@@ -274,18 +274,82 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
 
+      // A series is the show page: its name over the season's episodes.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
-      await expect(page.locator("section.pharos-browse h2")).toHaveText(episode.SeriesName, {
+      await expect(page.locator("section.pharos-show h2")).toHaveText(episode.SeriesName, {
         timeout: 15_000,
       });
-      await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
+      await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
 
+      // A season opens the same page with that season shown.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeasonId)}`);
-      await expect(page.locator("section.pharos-browse h2")).toHaveText(/^Season 1$/, {
+      await expect(page.locator("section.pharos-show h2")).toHaveText(episode.SeriesName, {
         timeout: 15_000,
       });
-      await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
+      await expect(
+        page.locator("section.pharos-show").getByText(/^Season 1$/).first(),
+      ).toBeVisible();
+      await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      // An episode row plays it.
+      await page.locator("ol.pharos-episodes li a.pharos-episode-play").first().click();
+      await expect(page).toHaveURL(/\/ui\/watch\/\d+$/);
+    });
+
+    // 012 US5: artist, then album, then track list.
+    test("browse walks an artist to an album and its tracks", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-music-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const json = async (path: string) =>
+        (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+      const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+      // An artist with an album: the first tagged track names both.
+      const tracks = await json(
+        `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+      );
+      const track = tracks.Items?.find(
+        (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
+      );
+      test.skip(!track, "the seed has no track tagged with an album and artist");
+      const artists = await json(`/Artists`);
+      const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
+      expect(artist, "the track's album artist is listed").toBeTruthy();
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      await page.goto(`/ui/browse/${nativeSynth(artist.Id)}`);
+      await expect(page.locator("section.pharos-artist h2")).toHaveText(artist.Name, {
+        timeout: 15_000,
+      });
+      await page
+        .locator("section.pharos-artist ul.pharos-grid li a", { hasText: track.Album })
+        .first()
+        .click();
+      await expect(page.locator("section.pharos-album h2")).toHaveText(track.Album, {
+        timeout: 15_000,
+      });
+      await expect(page.locator("ol.pharos-tracks li").first()).toBeVisible();
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
     });
 
