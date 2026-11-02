@@ -3685,7 +3685,7 @@ impl PreferenceStore for PostgresStore {
 type SessionRow = crate::TranscodeSessionRow;
 
 impl TranscodeSessionStore for PostgresStore {
-    #[tracing::instrument(skip(self, session), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id, session), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn upsert_transcode_session(
         &self,
         play_session_id: &str,
@@ -3726,7 +3726,7 @@ impl TranscodeSessionStore for PostgresStore {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn get_transcode_session(
         &self,
         play_session_id: &str,
@@ -3743,7 +3743,7 @@ impl TranscodeSessionStore for PostgresStore {
         Ok(row.map(crate::session_from_row))
     }
 
-    #[tracing::instrument(skip(self), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn remove_transcode_session(&self, play_session_id: &str) -> DomainResult<()> {
         sqlx::query("DELETE FROM transcode_sessions WHERE play_session_id = $1")
             .bind(play_session_id)

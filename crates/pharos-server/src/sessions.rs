@@ -156,7 +156,7 @@ fn sweep_idle_sessions(state: &mut std::collections::HashMap<String, SessionReco
     });
     for s in &evicted {
         tracing::info!(
-            session_id = %s.id,
+            session_id = %pharos_core::secret_prefix(&s.id),
             user_id = %s.user_id,
             device_id = %s.device_id,
             item_id = s.now_playing_item_id.as_deref().unwrap_or(""),
