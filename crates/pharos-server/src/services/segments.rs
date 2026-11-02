@@ -61,19 +61,28 @@ pub async fn for_item(state: &AppState, item: &MediaItem) -> Vec<Segment> {
     // black-frame credits) the backfill persisted, skipping any Type a chapter
     // already covered. This is what makes Skip Intro / Skip Outro work for the
     // vast majority of TV rips, which carry no labeled intro chapters.
-    if let Ok(detected) = state.stores.media_segments_for(item.id).await {
-        for (di, seg) in detected.iter().enumerate() {
-            let kind = seg.kind.as_str();
-            if seen_types.contains(kind) {
-                continue;
-            }
-            out.push(Segment {
-                key: format!("d{di}"),
-                kind,
-                start_ms: seg.start_ms,
-                end_ms: seg.end_ms,
-            });
+    let detected = match state.stores.media_segments_for(item.id).await {
+        Ok(detected) => detected,
+        Err(e) => {
+            tracing::warn!(
+                media.id = item.id,
+                error = %e,
+                "media segments: detected segments unreadable, serving chapters only"
+            );
+            Vec::new()
         }
+    };
+    for (di, seg) in detected.iter().enumerate() {
+        let kind = seg.kind.as_str();
+        if seen_types.contains(kind) {
+            continue;
+        }
+        out.push(Segment {
+            key: format!("d{di}"),
+            kind,
+            start_ms: seg.start_ms,
+            end_ms: seg.end_ms,
+        });
     }
     out
 }
