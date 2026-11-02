@@ -768,7 +768,7 @@ async fn native_next_up_agrees_with_the_jellyfin_next_up_route() {
 
 /// Seeds movies 101 "Alpha" and 102 "Beta" in /libA and 201 "Gamma" in
 /// /libB beside the fixture's own rows, with 102 a favourite.
-async fn seed_movies(fx: &crate::common::Fixture) {
+pub(crate) async fn seed_movies(fx: &crate::common::Fixture) {
     use pharos_core::{
         LibraryStore as _, MediaItem, MediaKind, MediaStore as _, UserDataStore as _,
     };
