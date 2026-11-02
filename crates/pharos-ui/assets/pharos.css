@@ -408,3 +408,161 @@ input:focus-visible {
     --px-motion-duration: 0ms;
   }
 }
+
+/* Appearance (010) */
+
+.pharos-appearance {
+  display: grid;
+  gap: 1.5rem;
+}
+.pharos-appearance button {
+  padding: 0.4rem 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 4px;
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
+  font: inherit;
+  cursor: pointer;
+}
+.pharos-appearance button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.pharos-appearance button[aria-pressed="true"] {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-appearance textarea,
+.pharos-appearance input[type="text"],
+.pharos-appearance select {
+  box-sizing: border-box;
+  padding: 0.5rem 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 4px;
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
+  font: inherit;
+}
+.pharos-notice {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
+
+.pharos-theme-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: 1rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.pharos-theme-card {
+  display: grid;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.75rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 8px;
+  background: var(--px-color-surface);
+}
+.pharos-theme-card[aria-current="true"] {
+  outline: 2px solid var(--px-color-accent);
+  outline-offset: 2px;
+}
+.pharos-theme-name {
+  margin: 0;
+  font-weight: 600;
+}
+.pharos-theme-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-swatches {
+  display: flex;
+  gap: 0.25rem;
+}
+.pharos-swatch {
+  display: inline-block;
+  width: 1.5rem;
+  height: 1.5rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 4px;
+}
+
+.pharos-import {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 40rem;
+}
+.pharos-import h3 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+.pharos-import textarea {
+  min-height: 6rem;
+}
+
+.pharos-theme-editor {
+  display: grid;
+  gap: 1.5rem;
+}
+.pharos-editor-fields,
+.pharos-editor-check {
+  display: grid;
+  gap: 0.75rem;
+  align-content: start;
+  min-width: 0;
+}
+.pharos-theme-editor label {
+  font-size: 0.875rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-colour,
+.pharos-effect {
+  display: grid;
+  gap: 0.25rem;
+}
+.pharos-colour input[type="color"] {
+  width: 3rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.pharos-effect input[type="range"] {
+  width: 100%;
+}
+.pharos-editor-actions {
+  display: flex;
+  gap: 0.75rem;
+}
+.pharos-editor-actions button:first-child {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-weight: 600;
+}
+
+.pharos-contrast {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+.pharos-contrast caption {
+  text-align: left;
+  color: var(--px-color-fg-muted);
+  margin-bottom: 0.25rem;
+}
+.pharos-contrast th,
+.pharos-contrast td {
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  border-bottom: var(--px-border) solid var(--px-color-border);
+}
+
+@media (min-width: 48rem) {
+  .pharos-theme-editor {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
+  }
+}

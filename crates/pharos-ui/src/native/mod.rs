@@ -2,6 +2,7 @@
 //! served at `/`. The older REST panes stay reachable at `/manage`.
 
 pub mod app;
+pub mod appearance;
 pub mod machine;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 #[path = "host.rs"]

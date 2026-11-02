@@ -258,6 +258,9 @@ fn Screen(route: Route) -> Element {
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
+        Route::Appearance => {
+            rsx! { ErrorNote { message: "Appearance is not wired yet.".to_string() } }
+        }
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
 }

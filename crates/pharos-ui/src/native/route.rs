@@ -16,12 +16,14 @@ pub enum Route {
     /// The older REST panes (admin, preferences, search, live TV) until they
     /// move to the native API.
     Manage,
+    /// The theme picker and editor, under `/settings`.
+    Appearance,
     /// No route matched; carries the path for the message.
     NotFound(String),
 }
 
 /// The first path segment of every route but `Home`, lowercase.
-pub const FIRST_SEGMENTS: &[&str] = &["browse", "title", "watch", "signin", "manage"];
+pub const FIRST_SEGMENTS: &[&str] = &["browse", "title", "watch", "signin", "manage", "settings"];
 
 impl Route {
     /// The route for a URL path. Case-insensitive, as the server lowercases
@@ -37,6 +39,7 @@ impl Route {
             ["watch", s] => id(s).map_or_else(|| not_found(path), Route::Watch),
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
+            ["settings", "appearance"] => Route::Appearance,
             _ => not_found(path),
         }
     }
@@ -50,6 +53,7 @@ impl Route {
             Route::Watch(id) => format!("/watch/{id}"),
             Route::SignIn => "/signin".into(),
             Route::Manage => "/manage".into(),
+            Route::Appearance => "/settings/appearance".into(),
             Route::NotFound(path) => path.clone(),
         }
     }
@@ -63,6 +67,7 @@ impl Route {
             Route::Watch(_) => "watch",
             Route::SignIn => "signin",
             Route::Manage => "manage",
+            Route::Appearance => "appearance",
             Route::NotFound(_) => "not_found",
         }
     }
@@ -86,6 +91,7 @@ mod tests {
             Route::Watch(ItemRef::Real(42)),
             Route::SignIn,
             Route::Manage,
+            Route::Appearance,
         ] {
             assert_eq!(Route::parse(&route.path()), route, "{route:?}");
         }
@@ -114,6 +120,7 @@ mod tests {
             Route::Watch(ItemRef::Real(1)),
             Route::SignIn,
             Route::Manage,
+            Route::Appearance,
         ] {
             let path = route.path();
             let first = path.trim_start_matches('/').split('/').next().unwrap_or("");

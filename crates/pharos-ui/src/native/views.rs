@@ -42,6 +42,7 @@ pub fn Shell(on_sign_out: EventHandler<()>, children: Element) -> Element {
             header { class: "pharos-banner pharos-shell-bar",
                 Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
                 nav { class: "pharos-shell-nav",
+                    Link { to: Route::Appearance, "Appearance" }
                     Link { to: Route::Manage, "Manage" }
                     button {
                         class: "pharos-link-button",
