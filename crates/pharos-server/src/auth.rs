@@ -288,6 +288,19 @@ impl<U: UserStore> BuiltinAuth<U> {
         slots: &Arc<Semaphore>,
         wait: Duration,
     ) -> Result<User, Denial> {
+        // V211: no account may hold an empty password, so refuse it before
+        // any lookup or argon2, on every sign-in path (the Jellyfin and
+        // native logins reach here through the throttle). The answer does
+        // not depend on whether the name exists, and the throttle counts it
+        // as a wrong password.
+        if password.expose().is_empty() {
+            metrics::counter!("pharos_login_empty_password_total").increment(1);
+            tracing::warn!(user.name = %name, reason = "empty_password", "sign-in refused");
+            return Err(Denial::Refused {
+                reason: LoginFailure::BadPassword,
+                name_mismatch: NameMismatch::None,
+            });
+        }
         let typed = name;
         let name = typed.trim();
         let mut found = self
@@ -1012,6 +1025,47 @@ mod tests {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!("expected InvalidCredentials, got {other:?}"),
         }
+    }
+
+    // V211 — the stored hash is hash(""), so only the empty-password check
+    // stands between this account and a sign-in.
+    #[tokio::test]
+    async fn empty_password_is_refused_even_when_the_stored_hash_is_for_empty() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "").await;
+        match auth.authenticate("ali", &SecretString::new("")).await {
+            Err(AuthError::InvalidCredentials) => {}
+            other => panic!("expected InvalidCredentials, got {other:?}"),
+        }
+    }
+
+    // V211 — the Jellyfin and native logins go through the throttle, which
+    // judges rather than authenticates; an empty password is refused there too.
+    #[tokio::test]
+    async fn the_throttled_sign_in_path_refuses_an_empty_password() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "").await;
+        match auth.judge("ali", &SecretString::new("")).await {
+            Err(Denial::Refused { .. }) => {}
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_password_refusal_is_counted_and_skips_argon2() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        seed(&auth, "ali", "").await;
+        let _ = auth.authenticate("ali", &SecretString::new("")).await;
+        let _ = auth.authenticate("nobody", &SecretString::new("")).await;
+        let refused = counter_value(&rec, "pharos_login_empty_password_total");
+        assert_eq!(refused, 2, "each empty-password sign-in must be counted");
+        assert_eq!(
+            dummy_verify_count(&rec),
+            0,
+            "an empty password is refused before any argon2 work"
+        );
     }
 
     fn counter_value(rec: &metrics_util::debugging::DebuggingRecorder, name: &str) -> u64 {
