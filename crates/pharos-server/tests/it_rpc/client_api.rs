@@ -52,6 +52,36 @@ async fn home_browse_and_detail_read_the_library() {
     assert_eq!(detail.item.name, "Beta");
 }
 
+/// The diagnostics opt-in as the UI reads and writes it: unset, set, and an
+/// unknown key refused as an API error.
+#[actix_web::test]
+async fn prefs_read_and_write_the_diagnostics_opt_in() {
+    let (api, _fx, _server) = api().await;
+    let call = CallInfo::default();
+    assert_eq!(api.pref(&call, "diagnostics.opt_in").await.unwrap(), None);
+    api.set_pref(&call, "diagnostics.opt_in", b"true")
+        .await
+        .expect("stored");
+    assert_eq!(
+        api.pref(&call, "diagnostics.opt_in").await.unwrap(),
+        Some(b"true".to_vec())
+    );
+    let err = api
+        .set_pref(&call, "nope", b"x")
+        .await
+        .expect_err("unknown key");
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "notPermitted",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 #[actix_web::test]
 async fn a_missing_item_is_an_api_error_not_a_transport_failure() {
     let (api, _fx, _server) = api().await;
