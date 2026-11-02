@@ -247,7 +247,7 @@ impl server::library::Handler for Library {
                 if matches!(denial, Denial::Unavailable { .. }) {
                     tracing::warn!(media.id = id, error = %detail, "native library: detail unavailable");
                 } else {
-                    tracing::info!(media.id = id, reason = %detail, "native library: detail refused");
+                    tracing::debug!(media.id = id, reason = %detail, "native library: detail refused");
                 }
                 denial.write(results.get().init_result().init_error());
                 return Ok(());
