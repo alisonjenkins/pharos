@@ -6087,7 +6087,6 @@ async fn fetch_item_dto(
     user: &pharos_core::User,
     fields: Option<&str>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let user_id = user.id;
     // B85 — accept the dashed synth id the kotlin SDK sends: every synth /
     // entity resolution below compares against the dashless stored form, so a
     // dashed series/season/collection id would 404 the detail fetch and dead-end
@@ -6174,16 +6173,16 @@ async fn fetch_item_dto(
         // and answered 400 "invalid id", which killed the genre page.
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    crate::api::jellyfin::require_item_access(state, user, id, "item").await?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
-    let user_data = state
-        .stores
-        .get_user_data(user_id, id)
+    let (item, user_data) = crate::services::library::detail(state, user, id)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| {
+            use crate::services::library::DetailError;
+            match e {
+                DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
+                DetailError::NotFound => error::ErrorNotFound("not found"),
+                DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
+            }
+        })?;
     // LIB-D5 — advertise ImageTags for any role with a recorded local
     // sidecar (D4) so clients request roles that are otherwise
     // upload-only (Logo/Banner/Art/Disc). Best-effort: a store error
