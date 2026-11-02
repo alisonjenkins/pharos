@@ -212,10 +212,6 @@ async fn header_authenticated_request_without_the_cookie_gets_it() {
                 format!(r#"MediaBrowser Client="t", Token="{}""#, f.user_token),
             )),
         ),
-        (
-            "api_key",
-            test::TestRequest::get().uri(&format!("/Users/Me?api_key={}", f.user_token)),
-        ),
     ] {
         let resp = test::call_service(&app, req.to_request()).await;
         assert_eq!(resp.status().as_u16(), 200, "{name}");
@@ -252,6 +248,34 @@ async fn a_stale_cookie_holding_another_token_is_replaced() {
     let set = set_auth_cookies(&resp);
     assert_eq!(set.len(), 1);
     assert_eq!(set[0].value(), f.user_token);
+}
+
+/// Session fixation (B253): a page on a sibling host embeds
+/// `<img src="https://pharos/…?api_key=ATTACKER">`. The browser sends it as
+/// a same-site request with no cookie, and pharos accepts the token. The
+/// response must not plant the attacker's token as the victim's cookie,
+/// whatever `Sec-Fetch-Site` says. Disarm check: with `note_header_credential`
+/// noting `extract_token` again, this fails.
+#[actix_web::test]
+async fn an_api_key_never_sets_the_cookie() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let id = f.rich_item_id;
+    for site in ["same-site", "cross-site", "same-origin"] {
+        for uri in [
+            format!("/Items/{id}/Images?api_key={}", f.admin_token),
+            format!("/Users/Me?api_key={}", f.admin_token),
+        ] {
+            let req = test::TestRequest::get()
+                .uri(&uri)
+                .insert_header(("Sec-Fetch-Site", site))
+                .insert_header(("Sec-Fetch-Dest", "image"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status().as_u16(), 200, "{site} {uri}");
+            assert!(set_auth_cookies(&resp).is_empty(), "{site} {uri}");
+        }
+    }
 }
 
 #[actix_web::test]
