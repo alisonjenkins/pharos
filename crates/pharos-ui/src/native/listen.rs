@@ -203,14 +203,19 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
 }
 
 /// Draw every animation frame until the component unmounts (which drops
-/// this future) or the surface fails.
+/// this future) or the surface fails. A paused song keeps its last frame,
+/// so a headset spends no GPU time on a still picture.
 async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> {
     let start = platform::now_ms();
     let mut palette = platform::theme_palette();
     let mut palette_at = start;
     let mut analysis: Option<Analysis> = None;
+    let mut drawn = false;
     loop {
         platform::animation_frame().await;
+        if drawn && !platform::media_playing(VIDEO_ID) {
+            continue;
+        }
         let now = platform::now_ms();
         if now - palette_at >= PALETTE_REFRESH_MS {
             palette = platform::theme_palette();
@@ -229,6 +234,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
             level: analysis.map_or(0.0, Analysis::level),
             data: analysis.map(Analysis::data),
         })?;
+        drawn = true;
     }
 }
 
