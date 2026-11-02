@@ -1,6 +1,8 @@
 //! `Session`: a signed-in user's root capability.
 
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Instant;
 
 use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
@@ -10,6 +12,8 @@ use pharos_core::{AuthError, User};
 use super::bootstrap::token_denial;
 use super::library::Library;
 use super::playback::Playback;
+use super::socket::MessageBucket;
+use super::telemetry::{Telemetry, TELEMETRY_BATCHES_PER_SECOND, TELEMETRY_BATCH_BURST};
 use super::user_data::UserData;
 use super::ConnectionCtx;
 use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
@@ -22,6 +26,8 @@ pub(super) struct Session {
     user: User,
     /// The device token this session was opened with; `logout` revokes it.
     pub(super) token: String,
+    /// Paces this session's `Telemetry.submit` batches.
+    pub(super) telemetry_bucket: RefCell<MessageBucket>,
 }
 
 impl Session {
@@ -38,6 +44,11 @@ impl Session {
             conn,
             user,
             token,
+            telemetry_bucket: RefCell::new(MessageBucket::with_rate(
+                Instant::now(),
+                TELEMETRY_BATCH_BURST,
+                TELEMETRY_BATCHES_PER_SECOND,
+            )),
         }
     }
 
@@ -120,6 +131,19 @@ impl server::session::Handler for Session {
         results
             .get()
             .set_user_data(server::user_data::client(UserData::new(self), &conn));
+        Ok(())
+    }
+
+    /// Never refused, like `library`; each `submit` checks the session itself.
+    async fn telemetry(
+        self: Rc<Self>,
+        _params: wire::TelemetryParams,
+        results: &mut wire::TelemetryResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_telemetry(server::telemetry::client(Telemetry::new(self), &conn));
         Ok(())
     }
 

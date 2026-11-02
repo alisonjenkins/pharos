@@ -20,5 +20,6 @@ mod quick_connect;
 mod revocation;
 mod revocation_sites;
 mod session;
+mod telemetry;
 mod traffic;
 mod user_data;
