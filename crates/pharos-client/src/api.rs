@@ -7,9 +7,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    decision_result, detail_result, home_result, item_id, item_summary, items_result, library,
-    negotiate_result, opt_u16, opt_u32, playback, playback_grant, session, stream_choice, Kind,
+    decision_result, detail_result, done, home_result, item_id, item_summary, items_result,
+    library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, session, stream_choice,
+    telemetry, Kind,
 };
+pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
 use crate::{CallInfo, ClientError};
 
@@ -206,6 +208,16 @@ pub trait PlaybackGrant {
 pub struct NativeApi {
     library: library::Client,
     playback: playback::Client,
+    telemetry: telemetry::Client,
+}
+
+/// One client event for `Telemetry.submit`, in plain Rust types.
+#[derive(Debug, Clone)]
+pub struct ClientEvent {
+    pub kind: ClientEventKind,
+    pub level: ClientLevel,
+    pub route: String,
+    pub fields: Vec<(&'static str, String)>,
 }
 
 impl NativeApi {
@@ -214,6 +226,44 @@ impl NativeApi {
         Self {
             library: session.library_request().send().pipeline.get_library(),
             playback: session.playback_request().send().pipeline.get_playback(),
+            telemetry: session.telemetry_request().send().pipeline.get_telemetry(),
+        }
+    }
+
+    /// Sends `events` as one batch. The server logs and counts each one; a
+    /// refusal (too many, or too fast) comes back as the error.
+    pub async fn submit_events(
+        &self,
+        call: &CallInfo,
+        events: &[ClientEvent],
+    ) -> Result<(), ClientError> {
+        let mut req = self.telemetry.submit_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            let mut list = p.reborrow().init_events(count(events.len()));
+            for (i, event) in events.iter().enumerate() {
+                let mut out = list.reborrow().get(count(i));
+                out.set_kind(event.kind);
+                out.set_level(event.level);
+                out.set_route(&event.route);
+                let mut fields = out.init_fields(count(event.fields.len()));
+                for (j, (key, value)) in event.fields.iter().enumerate() {
+                    let mut f = fields.reborrow().get(count(j));
+                    f.set_key(key);
+                    f.set_value(value);
+                }
+            }
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 }
@@ -441,7 +491,11 @@ fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Erro
 }
 
 fn len(list: &[String]) -> u32 {
-    u32::try_from(list.len()).unwrap_or(u32::MAX)
+    count(list.len())
+}
+
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 fn set_texts(mut out: capnp::text_list::Builder<'_>, values: &[String]) {
