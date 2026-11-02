@@ -218,6 +218,13 @@ compat-dioxus-full native="on":
     [media]
     roots = ["$TMP/media"]
 
+    # The seeded shows live under TV/, which the TV library holds apart from the
+    # mixed root around it.
+    [[media.libraries]]
+    path = "$TMP/media/TV"
+    name = "TV"
+    kind = "tvshows"
+
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
     $NATIVE_BLOCK

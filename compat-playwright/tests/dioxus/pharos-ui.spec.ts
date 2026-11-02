@@ -289,6 +289,70 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
     });
 
+    // A TV library lists its series, a series its seasons and a season its
+    // episodes, as jellyfin-web does; every step is a click, not a URL.
+    test("browse walks TV: library, series, season, episode, title", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-tv-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      const names = () => page.locator("ul.pharos-grid .pharos-poster-name");
+      const heading = page.locator("section.pharos-browse h2");
+      const noError = () => expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      // Home -> the TV library, whose tiles are series sorted by name.
+      await page
+        .locator("section.pharos-rail h2 a", { hasText: /^TV$/ })
+        .click();
+      await expect(heading).toHaveText("TV", { timeout: 15_000 });
+      await expect(names()).toHaveText(["Another Show", "Playwright Show"]);
+      await noError();
+
+      // Series -> its seasons.
+      await names().filter({ hasText: "Playwright Show" }).click();
+      await expect(heading).toHaveText("Playwright Show", { timeout: 15_000 });
+      await expect(names()).toHaveText(["Season 1"]);
+      await noError();
+
+      // Season -> its three episodes.
+      await names().first().click();
+      await expect(heading).toHaveText("Season 1", { timeout: 15_000 });
+      await expect(names()).toHaveCount(3);
+      await noError();
+
+      // Episode -> its title page.
+      const episode = (await names().first().innerText()).trim();
+      await names().first().click();
+      await expect(page).toHaveURL(/\/ui\/title\//);
+      await expect(page.locator("article.pharos-title h2")).toHaveText(episode, {
+        timeout: 15_000,
+      });
+      await noError();
+    });
+
     test("unknown route renders a message, not a blank page", async ({
       page,
       request,
