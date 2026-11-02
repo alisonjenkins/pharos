@@ -6,6 +6,7 @@
 //! parent whose detail cannot be read, is the plain grid of its children.
 
 use dioxus::prelude::*;
+use futures_util::future::{join3, try_join};
 use pharos_client::api::{Detail, Item, ItemKind, ItemRef, LibraryKind, Page, PharosApi};
 use pharos_client::{CallInfo, ClientError};
 
@@ -129,11 +130,18 @@ pub async fn load<A: PharosApi>(
             title,
             page: list(id, Some(ItemKind::Series), "SortName").await?,
         },
-        (Plan::MusicLibrary, _) => Browse::Music {
-            title,
-            artists: list(id, Some(ItemKind::Artist), "SortName").await?,
-            albums: list(id, Some(ItemKind::Album), "SortName").await?,
-        },
+        (Plan::MusicLibrary, _) => {
+            let (artists, albums) = try_join(
+                list(id, Some(ItemKind::Artist), "SortName"),
+                list(id, Some(ItemKind::Album), "SortName"),
+            )
+            .await?;
+            Browse::Music {
+                title,
+                artists,
+                albums,
+            }
+        }
         (Plan::Series, series) => {
             let seasons = list(id, Some(ItemKind::Season), "").await?.items;
             let selected = default_season(&seasons);
@@ -155,7 +163,15 @@ pub async fn load<A: PharosApi>(
             },
             season,
         ) => {
-            let series = match api.detail(info, series_id).await {
+            // The series' detail, its seasons and this season's episodes do
+            // not depend on each other: one round trip, not three.
+            let (series, seasons, episodes) = join3(
+                api.detail(info, series_id),
+                list(series_id, Some(ItemKind::Season), ""),
+                list(id, None, INDEX_ORDER),
+            )
+            .await;
+            let series = match series {
                 Ok(series) => Some(series),
                 Err(e) => {
                     warn(format!(
@@ -175,9 +191,9 @@ pub async fn load<A: PharosApi>(
             Browse::Show(Show {
                 title,
                 series,
-                seasons: list(series_id, Some(ItemKind::Season), "").await?.items,
+                seasons: seasons?.items,
                 selected: Some(id),
-                episodes: list(id, None, INDEX_ORDER).await?,
+                episodes: episodes?,
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
