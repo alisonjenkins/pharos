@@ -1,4 +1,5 @@
-//! V191 / B250: the `JellyfinAuth` cookie set at sign-in authenticates only
+//! V191 / B250: the `JellyfinAuth` cookie set at sign-in, and the
+//! `pharos_media` cookie the native sign-in sets (ADR-0034), authenticate only
 //! GET and HEAD requests on routes that serve an item's bytes to element
 //! URLs. A browser sends it on every same-site request, including one a
 //! sibling subdomain's page makes, so it must not reach a write or a JSON
@@ -10,7 +11,11 @@ use actix_web::{http::header, test};
 use crate::common::{build_app, seed_rich};
 
 fn cookie(token: &str) -> (header::HeaderName, String) {
-    (header::COOKIE, format!("JellyfinAuth={token}"))
+    named_cookie("JellyfinAuth", token)
+}
+
+fn named_cookie(name: &str, token: &str) -> (header::HeaderName, String) {
+    (header::COOKIE, format!("{name}={token}"))
 }
 
 #[actix_web::test]
@@ -62,11 +67,17 @@ async fn the_cookie_reaches_only_reads_of_item_bytes() {
     let uid = f.user_id.0.simple();
     let mut wrong = Vec::new();
     // (method, uri, accepted): accepted means the cookie got past auth.
-    for (method, uri, accepted) in [
+    let rows = [
         ("GET", format!("/Items/{id}/Images"), true),
         ("HEAD", format!("/Items/{id}/Images/Primary"), true),
         ("GET", format!("/Videos/{id}/Subtitles/0/Stream.vtt"), true),
         ("GET", format!("/Videos/{id}/Trickplay/320/0.jpg"), true),
+        ("GET", format!("/Videos/{id}/stream?static=true"), true),
+        (
+            "GET",
+            format!("/videos/{id}/master.m3u8?PlaySessionId=x"),
+            true,
+        ),
         ("GET", "/Users/Me".to_owned(), false),
         ("GET", format!("/Users/{uid}/Items/{id}"), false),
         ("POST", format!("/UserFavoriteItems/{id}"), false),
@@ -76,15 +87,18 @@ async fn the_cookie_reaches_only_reads_of_item_bytes() {
             "/Videos/ActiveEncodings?PlaySessionId=x".to_owned(),
             false,
         ),
-    ] {
-        let req = test::TestRequest::default()
-            .method(method.parse().unwrap())
-            .uri(&uri)
-            .insert_header(cookie(&f.user_token))
-            .to_request();
-        let status = test::call_service(&app, req).await.status().as_u16();
-        if (status == 401) == accepted {
-            wrong.push(format!("{method} {uri}: {status}"));
+    ];
+    for name in ["JellyfinAuth", "pharos_media"] {
+        for (method, uri, accepted) in &rows {
+            let req = test::TestRequest::default()
+                .method(method.parse().unwrap())
+                .uri(uri)
+                .insert_header(named_cookie(name, &f.user_token))
+                .to_request();
+            let status = test::call_service(&app, req).await.status().as_u16();
+            if (status == 401) == *accepted {
+                wrong.push(format!("{name}: {method} {uri}: {status}"));
+            }
         }
     }
     assert!(
