@@ -60,6 +60,20 @@ pub(crate) async fn connect_with(
     origin: Option<&str>,
     cookie: Option<&str>,
 ) -> (bootstrap::Client, oneshot::Receiver<Option<String>>) {
+    connect_tapped(server, origin, cookie, None).await
+}
+
+/// The bytes of each WebSocket frame in the order they crossed the socket,
+/// `true` for client to server.
+pub(crate) type Tap = std::rc::Rc<std::cell::RefCell<Vec<(bool, Vec<u8>)>>>;
+
+/// [`connect_with`], recording every frame into `tap` when one is given.
+pub(crate) async fn connect_tapped(
+    server: &actix_test::TestServer,
+    origin: Option<&str>,
+    cookie: Option<&str>,
+    tap: Option<Tap>,
+) -> (bootstrap::Client, oneshot::Receiver<Option<String>>) {
     let url = server.url("/pharos/rpc").replacen("http", "ws", 1);
     let mut ws = awc::Client::new().ws(url);
     if let Some(origin) = origin {
@@ -72,9 +86,13 @@ pub(crate) async fn connect_with(
     let (mut sink, mut stream) = framed.split();
     let (rpc_end, pump_end) = tokio::io::duplex(64 * 1024);
     let (mut from_rpc, mut to_rpc) = tokio::io::split(pump_end);
+    let sent = tap.clone();
     actix_web::rt::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         while let Ok(n) = from_rpc.read(&mut buf).await {
+            if let Some(tap) = &sent {
+                tap.borrow_mut().push((true, buf[..n].to_vec()));
+            }
             if n == 0
                 || sink
                     .send(ws::Message::Binary(buf[..n].to_vec().into()))
@@ -90,6 +108,9 @@ pub(crate) async fn connect_with(
         while let Some(Ok(frame)) = stream.next().await {
             match frame {
                 ws::Frame::Binary(bytes) => {
+                    if let Some(tap) = &tap {
+                        tap.borrow_mut().push((false, bytes.to_vec()));
+                    }
                     if to_rpc.write_all(&bytes).await.is_err() {
                         break;
                     }
