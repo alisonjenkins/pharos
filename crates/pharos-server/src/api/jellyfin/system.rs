@@ -163,8 +163,14 @@ struct ServerConfigurationDto {
 /// doesn't persist these (its config is the toml file), but returning a
 /// well-shaped default lets each dashboard page render its form fields with
 /// sensible values instead of throwing on a 404 / undefined access.
+///
+/// The stored overlay holds what an admin saved, which for `livetv` includes
+/// tuner and guide provider URLs and their credentials, so it is shown to
+/// admins only; any other signed-in user gets the defaults, counted under
+/// `pharos_named_config_withheld_total`.
 async fn system_configuration_named(
     state: web::Data<AppState>,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let key = path.into_inner().to_ascii_lowercase();
@@ -219,6 +225,11 @@ async fn system_configuration_named(
         // Unknown key → an empty object (still valid JSON the form can read).
         _ => serde_json::Value::Object(serde_json::Map::new()),
     };
+    if !user.0.policy.admin {
+        metrics::counter!("pharos_named_config_withheld_total").increment(1);
+        tracing::debug!(user = %user.0.name, key, "named configuration shown without its stored values");
+        return Ok(crate::api::jellyfin::wire::json(&body));
+    }
     // T72 — overlay any persisted section blob on the shaped defaults so a
     // dashboard change (POST to the same key) is reflected here and survives
     // restart. Stored keys win; keys pharos didn't persist keep their default.
