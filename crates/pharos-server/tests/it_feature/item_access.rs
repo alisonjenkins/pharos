@@ -1102,3 +1102,93 @@ async fn tag_lists_narrow_every_query_scoped_list() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// B266: the parental cap and the tag lists hide an item from every by-id
+/// route and from the lists built outside a `MediaQuery`, as the library
+/// allow-list does. Each by-id refusal answers 404 and counts once under
+/// its reason (`parental_rating`, `tag`).
+/// Disarm check: with `check_item` and `retain_visible` short-circuiting on
+/// `enable_all_folders` again, the rich item is served to both users.
+#[actix_web::test]
+async fn the_parental_cap_and_tags_hide_an_item_everywhere() {
+    use pharos_core::{UserDataStore as _, UserItemData};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    for id in [f.rich_item_id, f.other_item_id] {
+        let data = UserItemData {
+            last_played_position_ticks: 10_000_000,
+            last_played_at: 1,
+            ..UserItemData::default()
+        };
+        f.state
+            .stores
+            .set_user_data(f.user_id, id, data)
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let capped = UserPolicy {
+        // The rich item is rated PG-13; the other item is unrated.
+        max_parental_rating: Some(0),
+        ..UserPolicy::default()
+    };
+    let blocked = UserPolicy {
+        blocked_tags: vec!["Award-Winner".into()],
+        ..UserPolicy::default()
+    };
+
+    let mut failures = Vec::new();
+    for (reason, policy) in [("parental_rating", capped), ("tag", blocked)] {
+        f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+        for (method, uri) in routes(&f, f.rich_item_id) {
+            let before = denied_total(&snapshotter, reason);
+            let req = test::TestRequest::default()
+                .method(method.clone())
+                .uri(&uri)
+                .insert_header(("X-Emby-Token", f.user_token.as_str()))
+                .to_request();
+            let status = test::call_service(&app, req).await.status().as_u16();
+            let counted = denied_total(&snapshotter, reason) - before;
+            if status != 404 || counted != 1 {
+                failures.push(format!(
+                    "{reason}: {method} {uri}: {status}, counted {counted}"
+                ));
+            }
+        }
+        let other = format!("/Items/{}", f.other_item_id);
+        let status = test::call_service(&app, get(&f.user_token, &other).to_request())
+            .await
+            .status();
+        if status != 200 {
+            failures.push(format!("{reason}: visible {other}: {status}"));
+        }
+        let resume: serde_json::Value = test::call_and_read_body_json(
+            &app,
+            get(&f.user_token, "/UserItems/Resume").to_request(),
+        )
+        .await;
+        if item_ids(&resume) != vec![wire(f.other_item_id)] {
+            failures.push(format!("{reason}: /UserItems/Resume {resume}"));
+        }
+        let counts: serde_json::Value =
+            test::call_and_read_body_json(&app, get(&f.user_token, "/Items/Counts").to_request())
+                .await;
+        if counts["MovieCount"] != 1 {
+            failures.push(format!("{reason}: /Items/Counts {counts}"));
+        }
+        let latest =
+            test::call_service(&app, get(&f.user_token, "/Items/Latest").to_request()).await;
+        let body = String::from_utf8(test::read_body(latest).await.to_vec()).unwrap();
+        if body.contains("Rich") {
+            failures.push(format!("{reason}: /Items/Latest {body}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "item hidden by the parental cap or a tag was served:\n{}",
+        failures.join("\n")
+    );
+}

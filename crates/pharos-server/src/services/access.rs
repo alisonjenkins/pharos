@@ -1,13 +1,18 @@
-//! Item access: whether a user's library policy lets them reach one item
-//! (V187). Every by-id route asks here before it serves an item, so the
+//! Item access: whether a user's policy (libraries, parental cap, tag lists)
+//! lets them reach one item (V187). Every by-id route asks here before it serves an item, so the
 //! Jellyfin routes and the native API answer alike and a new route cannot
 //! forget the check by re-implementing it.
 
 use std::sync::Arc;
 
-use pharos_core::{LibraryStore, MediaId, MediaItem, User};
+use pharos_core::{LibraryStore, MediaFilters, MediaId, MediaItem, MediaQuery, MediaStore, User};
 
+use crate::services::library::hides_nothing;
 use crate::state::AppState;
+
+/// Ids per policy query: well under SQLite's bound-parameter limit once the
+/// policy's own parameters are added.
+const IDS_PER_QUERY: usize = 500;
 
 /// Why an item was withheld. A wire layer answers `NotAllowed` as "not
 /// found", so a hidden item is indistinguishable from a missing one.
@@ -17,6 +22,14 @@ pub enum ItemHidden {
     LibraryNotAllowed,
     /// The item belongs to no library, so no allow-list can admit it.
     NoLibrary,
+    /// The item's rating is above the user's `MaxParentalRating`, or it is
+    /// unrated and the user's unrated items are blocked.
+    ParentalRating,
+    /// The item carries one of the user's `BlockedTags`, or none of their
+    /// `AllowedTags`.
+    Tag,
+    /// No stored item has the id, so the policy could not be checked.
+    NotFound,
     /// The store could not say; the item is withheld rather than served.
     Unavailable(String),
     /// The request carried no credential, or one that resolves to no
@@ -30,6 +43,9 @@ impl ItemHidden {
         match self {
             ItemHidden::LibraryNotAllowed => "library_not_allowed",
             ItemHidden::NoLibrary => "no_library",
+            ItemHidden::ParentalRating => "parental_rating",
+            ItemHidden::Tag => "tag",
+            ItemHidden::NotFound => "not_found",
             ItemHidden::Unavailable(_) => "store_unavailable",
             ItemHidden::Unauthenticated => "unauthenticated",
         }
@@ -59,26 +75,128 @@ pub async fn check_item(
     route: &'static str,
 ) -> Result<(), ItemHidden> {
     let policy = &user.policy;
-    if policy.enable_all_folders {
+    if hides_nothing(policy) {
         return Ok(());
     }
-    let (verdict, library) = match state.stores.library_wire_id_of(id).await {
-        Ok(Some(library)) if policy.allows_library(&library) => return Ok(()),
-        Ok(Some(library)) => (ItemHidden::LibraryNotAllowed, Some(library)),
-        Ok(None) => (ItemHidden::NoLibrary, None),
-        Err(e) => (ItemHidden::Unavailable(e.to_string()), None),
+    let library = if policy.enable_all_folders {
+        None
+    } else {
+        match state.stores.library_wire_id_of(id).await {
+            Ok(Some(library)) if policy.allows_library(&library) => Some(library),
+            Ok(Some(library)) => {
+                return Err(refused(
+                    user,
+                    id,
+                    route,
+                    ItemHidden::LibraryNotAllowed,
+                    Some(&library),
+                ))
+            }
+            Ok(None) => return Err(refused(user, id, route, ItemHidden::NoLibrary, None)),
+            Err(e) => {
+                return Err(refused(
+                    user,
+                    id,
+                    route,
+                    ItemHidden::Unavailable(e.to_string()),
+                    None,
+                ))
+            }
+        }
     };
+    match rating_or_tag(state, user, id).await {
+        None => Ok(()),
+        Some(verdict) => Err(refused(user, id, route, verdict, library.as_deref())),
+    }
+}
+
+/// Count and log `verdict` for item `id`, and pass it on.
+fn refused(
+    user: &User,
+    id: MediaId,
+    route: &'static str,
+    verdict: ItemHidden,
+    library: Option<&str>,
+) -> ItemHidden {
     metrics::counter!("pharos_item_access_denied_total", "reason" => verdict.label()).increment(1);
     tracing::warn!(
         item_id = id,
         user = %user.name,
-        library = library.as_deref().unwrap_or(""),
+        library = library.unwrap_or(""),
         reason = verdict.label(),
         route,
         detail = %verdict,
-        "item withheld by library policy"
+        "item withheld by policy"
     );
-    Err(verdict)
+    verdict
+}
+
+/// Why the parental cap or a tag list hides item `id` from `user`, or `None`
+/// when neither does. An item the full policy does not show is always
+/// withheld; the probes with the tag lists, then the cap, lifted only name
+/// the reason, and an item no probe shows is `NotFound`.
+async fn rating_or_tag(state: &AppState, user: &User, id: MediaId) -> Option<ItemHidden> {
+    let policy = &user.policy;
+    if policy.max_parental_rating.is_none()
+        && policy.blocked_tags.is_empty()
+        && policy.allowed_tags.is_empty()
+    {
+        return None;
+    }
+    let shown = match policy_visible_ids(state, user, &[id]).await {
+        Ok(shown) => shown,
+        Err(hidden) => return Some(hidden),
+    };
+    if shown.contains(&id) {
+        return None;
+    }
+    // Ask again with the tag lists lifted: if the item shows, a tag hid it.
+    let mut lifted = user.clone();
+    lifted.policy.blocked_tags.clear();
+    lifted.policy.allowed_tags.clear();
+    match policy_visible_ids(state, &lifted, &[id]).await {
+        Ok(shown) if shown.contains(&id) => return Some(ItemHidden::Tag),
+        Ok(_) => {}
+        Err(hidden) => return Some(hidden),
+    }
+    lifted.policy.max_parental_rating = None;
+    Some(match policy_visible_ids(state, &lifted, &[id]).await {
+        Ok(shown) if shown.contains(&id) => ItemHidden::ParentalRating,
+        Ok(_) => ItemHidden::NotFound,
+        Err(hidden) => hidden,
+    })
+}
+
+/// The ids among `ids` that `user`'s policy shows, asked of the store under
+/// the same `apply_policy_scope` as `/Items`, so the two cannot disagree.
+async fn policy_visible_ids(
+    state: &AppState,
+    user: &User,
+    ids: &[MediaId],
+) -> Result<std::collections::HashSet<MediaId>, ItemHidden> {
+    let mut shown = std::collections::HashSet::new();
+    for chunk in ids.chunks(IDS_PER_QUERY) {
+        let mut mq = MediaQuery {
+            filters: MediaFilters {
+                ids: chunk.to_vec(),
+                ids_present: true,
+                ..MediaFilters::default()
+            },
+            ..MediaQuery::default()
+        };
+        crate::api::jellyfin::items::apply_policy_scope(
+            &mut mq,
+            &user.policy,
+            &state.parental_ratings,
+        );
+        let (items, _) = state
+            .stores
+            .query(&mq)
+            .await
+            .map_err(|e| ItemHidden::Unavailable(e.to_string()))?;
+        shown.extend(items.iter().map(|i| i.id));
+    }
+    Ok(shown)
 }
 
 /// The user behind `token` on a route that serves an item's files to
@@ -136,9 +254,10 @@ pub async fn authenticate(
 /// Keeps the entries of `items` whose item `user` may reach, `id` naming
 /// each entry's item. For lists built outside a `MediaQuery` (similar items,
 /// instant mixes, playlist entries, a series' episodes), which
-/// `apply_policy_scope` never sees. One store call per allowed library for a
-/// restricted user, none otherwise. The dropped count is logged, not each
-/// item: a list is not a request for any one of them.
+/// `apply_policy_scope` never sees (see [`allowed_ids`] for the store calls;
+/// none for an unrestricted user). The
+/// dropped count is logged, not each item: a list is not a request for any
+/// one of them.
 pub async fn retain_visible<T>(
     state: &AppState,
     user: &User,
@@ -146,32 +265,62 @@ pub async fn retain_visible<T>(
     id: impl Fn(&T) -> MediaId,
     route: &'static str,
 ) -> Result<(), ItemHidden> {
-    let policy = &user.policy;
-    if policy.enable_all_folders {
+    if hides_nothing(&user.policy) {
         return Ok(());
     }
-    let mut allowed = std::collections::HashSet::new();
-    for library in &policy.enabled_folders {
-        let ids = state
-            .stores
-            .item_ids_for_library(library)
-            .await
-            .map_err(|e| {
-                let hidden = ItemHidden::Unavailable(e.to_string());
-                metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
-                    .increment(1);
-                tracing::warn!(user = %user.name, route, detail = %hidden, "item list withheld");
-                hidden
-            })?;
-        allowed.extend(ids);
-    }
+    let ids: Vec<MediaId> = items.iter().map(&id).collect();
+    let allowed = allowed_ids(state, user, &ids)
+        .await
+        .map_err(|hidden| list_withheld(user, route, hidden))?;
     let before = items.len();
     items.retain(|item| allowed.contains(&id(item)));
     let dropped = before - items.len();
     if dropped > 0 {
-        tracing::debug!(user = %user.name, route, dropped, "items outside the user's libraries left out");
+        tracing::debug!(user = %user.name, route, dropped, "items the user's policy hides left out");
     }
     Ok(())
+}
+
+/// The ids among `ids` that `user` may reach. A policy that restricts only
+/// libraries reads each allowed library's ids; one with a parental cap or a
+/// tag list asks the scoped query, by id for a short list and for the whole
+/// visible library for a long one.
+async fn allowed_ids(
+    state: &AppState,
+    user: &User,
+    ids: &[MediaId],
+) -> Result<std::collections::HashSet<MediaId>, ItemHidden> {
+    let policy = &user.policy;
+    if policy.max_parental_rating.is_none()
+        && policy.blocked_tags.is_empty()
+        && policy.allowed_tags.is_empty()
+    {
+        let mut allowed = std::collections::HashSet::new();
+        for library in &policy.enabled_folders {
+            let library_ids = state
+                .stores
+                .item_ids_for_library(library)
+                .await
+                .map_err(|e| ItemHidden::Unavailable(e.to_string()))?;
+            allowed.extend(library_ids);
+        }
+        return Ok(allowed);
+    }
+    if ids.len() <= IDS_PER_QUERY {
+        return policy_visible_ids(state, user, ids).await;
+    }
+    match crate::services::library::visible_items(state, user).await {
+        Ok(Some(visible)) => Ok(visible.iter().map(|i| i.id).collect()),
+        Ok(None) => Ok(ids.iter().copied().collect()),
+        Err(e) => Err(ItemHidden::Unavailable(e.to_string())),
+    }
+}
+
+/// Count and log a list the store could not scope, and pass `hidden` on.
+fn list_withheld(user: &User, route: &'static str, hidden: ItemHidden) -> ItemHidden {
+    metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label()).increment(1);
+    tracing::warn!(user = %user.name, route, detail = %hidden, "item list withheld");
+    hidden
 }
 
 /// The cached item list narrowed to what `user` may reach. Routes that
@@ -184,12 +333,19 @@ pub async fn visible_items(
     all: Arc<Vec<MediaItem>>,
     route: &'static str,
 ) -> Result<Arc<Vec<MediaItem>>, ItemHidden> {
-    if user.policy.enable_all_folders {
+    if hides_nothing(&user.policy) {
         return Ok(all);
     }
-    let mut kept: Vec<&MediaItem> = all.iter().collect();
-    retain_visible(state, user, &mut kept, |i| i.id, route).await?;
-    Ok(Arc::new(kept.into_iter().cloned().collect()))
+    let ids: Vec<MediaId> = all.iter().map(|i| i.id).collect();
+    let allowed = allowed_ids(state, user, &ids)
+        .await
+        .map_err(|hidden| list_withheld(user, route, hidden))?;
+    Ok(Arc::new(
+        all.iter()
+            .filter(|i| allowed.contains(&i.id))
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// What a caller wants of a playlist: `Read` lists it, `Write` changes or
@@ -273,6 +429,9 @@ mod tests {
         let labels = [
             ItemHidden::LibraryNotAllowed.label(),
             ItemHidden::NoLibrary.label(),
+            ItemHidden::ParentalRating.label(),
+            ItemHidden::Tag.label(),
+            ItemHidden::NotFound.label(),
             ItemHidden::Unavailable(String::new()).label(),
             ItemHidden::Unauthenticated.label(),
         ];
