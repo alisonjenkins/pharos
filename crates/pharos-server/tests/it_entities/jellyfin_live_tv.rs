@@ -31,6 +31,10 @@ const SAMPLE_XMLTV: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 async fn seed_state_with_live_tv() -> (web::Data<AppState>, String, TempDir) {
+    seed_state_with_m3u(SAMPLE_M3U).await
+}
+
+async fn seed_state_with_m3u(m3u: &str) -> (web::Data<AppState>, String, TempDir) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -49,7 +53,7 @@ async fn seed_state_with_live_tv() -> (web::Data<AppState>, String, TempDir) {
     let td = TempDir::new().unwrap();
     let m3u_path = td.path().join("p.m3u");
     let xml_path = td.path().join("epg.xml");
-    tokio::fs::write(&m3u_path, SAMPLE_M3U).await.unwrap();
+    tokio::fs::write(&m3u_path, m3u).await.unwrap();
     tokio::fs::write(&xml_path, SAMPLE_XMLTV).await.unwrap();
     let backend = M3uXmltvBackend::new();
     backend.load_m3u(&m3u_path).await.unwrap();
@@ -126,24 +130,139 @@ async fn single_channel_404_for_unknown_id() {
     assert_eq!(resp.status(), 404);
 }
 
+/// A fake IPTV provider: `/live/ts` answers the stream only to the
+/// credentials the playlist URL carries, `/live/m3u8` answers an HLS
+/// playlist and `/live/gone` a 503.
+fn fake_provider() -> actix_test::TestServer {
+    actix_test::start(|| {
+        App::new()
+            .route(
+                "/live/ts",
+                web::get().to(|req: actix_web::HttpRequest| async move {
+                    let auth = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    // base64("prov-user:prov-pass")
+                    if auth != "Basic cHJvdi11c2VyOnByb3YtcGFzcw=="
+                        || req.query_string() != "password=prov-pass"
+                    {
+                        return actix_web::HttpResponse::Unauthorized().body("no creds");
+                    }
+                    actix_web::HttpResponse::Ok()
+                        .insert_header(("content-type", "video/mp2t"))
+                        .insert_header(("set-cookie", "provider=prov-pass"))
+                        .body(&b"TS-PAYLOAD"[..])
+                }),
+            )
+            .route(
+                "/live/m3u8",
+                web::get().to(|| async {
+                    actix_web::HttpResponse::Ok()
+                        .insert_header(("content-type", "application/vnd.apple.mpegurl"))
+                        .body("#EXTM3U\nseg-prov-pass-1.ts\n")
+                }),
+            )
+            .route(
+                "/live/gone",
+                web::get().to(|| async {
+                    actix_web::HttpResponse::ServiceUnavailable().body("prov-pass down")
+                }),
+            )
+    })
+}
+
+fn stream_outcomes(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        if key.key().name() != "pharos_live_tv_stream_total" {
+            continue;
+        }
+        let outcome = key
+            .key()
+            .labels()
+            .find(|l| l.key() == "outcome")
+            .map(|l| l.value().to_string())
+            .unwrap_or_default();
+        if let metrics_util::debugging::DebugValue::Counter(n) = value {
+            *out.entry(outcome).or_default() += n;
+        }
+    }
+    out
+}
+
+/// B267: the stream is relayed, never redirected, so the provider
+/// credentials in the playlist URL reach the provider and nothing else: no
+/// `Location`, no provider header, no credential anywhere in the reply. An
+/// HLS playlist upstream and an upstream error answer 502 without the
+/// upstream body. Each outcome counts under `pharos_live_tv_stream_total`.
+/// Disarm check: with the old 302 restored, the relayed request answers 302
+/// with the credentialed URL in `Location`.
 #[actix_web::test]
-async fn channel_stream_redirects_to_upstream_url() {
-    let (state, token, _td) = seed_state_with_live_tv().await;
-    let app = test::init_service(build_app(state)).await;
-    let req = test::TestRequest::get()
-        .uri("/LiveTv/Channels/bbc1/Stream")
-        .insert_header(("X-Emby-Token", token.as_str()))
-        .to_request();
-    let resp = test::call_service(&app, req).await;
-    assert_eq!(resp.status(), 302);
-    assert_eq!(
-        resp.headers()
-            .get(actix_web::http::header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "http://example/bbc1.ts",
+async fn channel_stream_relays_without_leaking_provider_credentials() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let provider = fake_provider();
+    let addr = provider.addr();
+    let m3u = format!(
+        "#EXTM3U\n\
+         #EXTINF:-1 tvg-id=\"ts\",TS\nhttp://prov-user:prov-pass@{addr}/live/ts?password=prov-pass\n\
+         #EXTINF:-1 tvg-id=\"hls\",HLS\nhttp://prov-user:prov-pass@{addr}/live/m3u8\n\
+         #EXTINF:-1 tvg-id=\"down\",Down\nhttp://prov-user:prov-pass@{addr}/live/gone\n"
     );
+    let (state, token, _td) = seed_state_with_m3u(&m3u).await;
+    let app = test::init_service(build_app(state)).await;
+
+    let mut leaks = Vec::new();
+    let mut statuses = Vec::new();
+    for channel in ["ts", "hls", "down", "nope"] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/LiveTv/Channels/{channel}/Stream"))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        statuses.push((channel, resp.status().as_u16()));
+        for (name, value) in resp.headers() {
+            let value = value.to_str().unwrap_or_default();
+            if value.contains("prov-")
+                || name.as_str() == "location"
+                || name.as_str() == "set-cookie"
+            {
+                leaks.push(format!("{channel}: header {name}: {value}"));
+            }
+        }
+        let body = test::read_body(resp).await;
+        if channel == "ts" {
+            assert_eq!(&body[..], b"TS-PAYLOAD");
+        } else if String::from_utf8_lossy(&body).contains("prov-") {
+            leaks.push(format!("{channel}: body {body:?}"));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "provider details reached the client:\n{}",
+        leaks.join("\n")
+    );
+    assert_eq!(
+        statuses,
+        vec![("ts", 200), ("hls", 502), ("down", 502), ("nope", 404)]
+    );
+    let expected: std::collections::BTreeMap<String, u64> = [
+        ("relayed", 1),
+        ("playlist_unsupported", 1),
+        ("upstream_status", 1),
+        ("unknown_channel", 1),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    assert_eq!(stream_outcomes(&snapshotter), expected);
 }
 
 #[actix_web::test]
