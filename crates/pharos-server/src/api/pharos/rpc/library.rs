@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_id, item_summary, items_result, library as wire, Kind,
+    home_result, item_id, item_summary, items_result, library as wire, user_state, Kind,
     LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
@@ -207,31 +207,7 @@ impl server::library::Handler for Library {
         let (item, user_data) = match library::detail(state, &user, id).await {
             Ok(found) => found,
             Err(e) => {
-                use crate::services::access::ItemHidden;
-                let (denial, detail) = match &e {
-                    DetailError::Hidden(ItemHidden::Unavailable(detail)) => (
-                        Denial::Unavailable {
-                            dependency: "media store",
-                        },
-                        detail.clone(),
-                    ),
-                    // A hidden item answers as a missing one, so its id says
-                    // nothing about what exists.
-                    DetailError::Hidden(hidden) => (item_not_found, hidden.label().to_owned()),
-                    DetailError::NotFound => (item_not_found, "not_found".to_owned()),
-                    DetailError::Store(e) => (
-                        Denial::Unavailable {
-                            dependency: "media store",
-                        },
-                        e.to_string(),
-                    ),
-                };
-                if matches!(denial, Denial::Unavailable { .. }) {
-                    tracing::warn!(media.id = id, error = %detail, "native library: detail unavailable");
-                } else {
-                    tracing::debug!(media.id = id, reason = %detail, "native library: detail refused");
-                }
-                denial.write(results.get().init_result().init_error());
+                item_denial(id, &e, "detail").write(results.get().init_result().init_error());
                 return Ok(());
             }
         };
@@ -445,7 +421,7 @@ fn kind_filter(kinds: capnp::enum_list::Reader<'_, Kind>) -> KindFilter {
     }
 }
 
-fn read_item_id(id: item_id::Reader<'_>) -> Result<WireId, capnp::Error> {
+pub(super) fn read_item_id(id: item_id::Reader<'_>) -> Result<WireId, capnp::Error> {
     Ok(match id.which()? {
         item_id::Real(id) => WireId::Real(id),
         item_id::Synth(id) => WireId::Synth(id),
@@ -466,6 +442,36 @@ fn wire_kind(kind: MediaKind) -> Kind {
         MediaKind::Audio => Kind::Audio,
         MediaKind::Book => Kind::Book,
     }
+}
+
+/// Why a call on stored item `id` has no item to answer with, as the denial
+/// it sends, logged. A hidden item answers as a missing one, so its id says
+/// nothing about what exists.
+pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denial {
+    use crate::services::access::ItemHidden;
+    let item_not_found = Denial::NotFound { what: "item" };
+    let unavailable = Denial::Unavailable {
+        dependency: "media store",
+    };
+    let (denial, detail) = match e {
+        DetailError::Hidden(ItemHidden::Unavailable(detail)) => (unavailable, detail.clone()),
+        DetailError::Hidden(hidden) => (item_not_found, hidden.label().to_owned()),
+        DetailError::NotFound => (item_not_found, "not_found".to_owned()),
+        DetailError::Store(e) => (unavailable, e.to_string()),
+    };
+    if matches!(denial, Denial::Unavailable { .. }) {
+        tracing::warn!(media.id = id, call, error = %detail, "native item call: store unavailable");
+    } else {
+        tracing::debug!(media.id = id, call, reason = %detail, "native item call: refused");
+    }
+    denial
+}
+
+pub(super) fn write_user_state(mut out: user_state::Builder<'_>, data: UserItemData) {
+    out.set_played(data.played);
+    out.set_favorite(data.is_favorite);
+    out.set_position_ms(data.last_played_position_ticks / 10_000);
+    out.set_play_count(data.play_count);
 }
 
 /// One stored item as an `ItemSummary`. The display fields come from the
@@ -492,11 +498,7 @@ fn write_item(
         image.set_tag(tag);
         image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto.id).as_str());
     }
-    let mut state = out.reborrow().init_user_state();
-    state.set_played(user_data.played);
-    state.set_favorite(user_data.is_favorite);
-    state.set_position_ms(user_data.last_played_position_ticks / 10_000);
-    state.set_play_count(user_data.play_count);
+    write_user_state(out.reborrow().init_user_state(), user_data);
     if let Some(parent) = dto.parent_id.as_deref().and_then(WireId::parse) {
         set_item_id(out.reborrow().init_parent_id(), parent);
     }
