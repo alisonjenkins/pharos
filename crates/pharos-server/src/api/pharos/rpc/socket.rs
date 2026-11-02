@@ -8,6 +8,7 @@
 //! backpressure.
 
 use std::cell::Cell;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,9 @@ use pharos_core::UserId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::broadcast;
 
-use super::limits::{ConnectionLimits, AUTH_DEADLINE, MAX_UNAUTHENTICATED};
+use super::limits::{
+    ConnectionLimits, Refusal, AUTH_DEADLINE, MAX_UNAUTHENTICATED, MAX_UNAUTHENTICATED_PER_IP,
+};
 use super::{bootstrap_client, origin, ConnectionCtx};
 use crate::config::NativeApiConfig;
 use crate::services::auth::{user_for_token, TokenRefusal};
@@ -49,6 +52,9 @@ pub enum Refused {
     Origin(origin::OriginRefusal),
     /// [`super::limits::MAX_UNAUTHENTICATED`] connections are already open.
     TooManyUnauthenticated,
+    /// [`super::limits::MAX_UNAUTHENTICATED_PER_IP`] connections from this
+    /// client address are already open.
+    TooManyUnauthenticatedFromAddress(IpAddr),
 }
 
 impl Refused {
@@ -56,6 +62,9 @@ impl Refused {
         match self {
             Refused::Origin(o) => o.label(),
             Refused::TooManyUnauthenticated => "too_many_unauthenticated",
+            Refused::TooManyUnauthenticatedFromAddress(_) => {
+                "too_many_unauthenticated_from_address"
+            }
         }
     }
 }
@@ -64,15 +73,29 @@ impl Refused {
 /// connection cap is also a limit (FR-010).
 pub fn record_refused(refused: Refused, origin: Option<&str>, peer: &str) {
     metrics::counter!("pharos_rpc_refused_total", "reason" => refused.label()).increment(1);
-    if refused == Refused::TooManyUnauthenticated {
-        metrics::counter!(LIMIT_TOTAL, "limit" => "unauthenticated_connections").increment(1);
-        tracing::warn!(
-            limit = "unauthenticated_connections",
-            value = MAX_UNAUTHENTICATED,
-            max = MAX_UNAUTHENTICATED,
-            peer,
-            "native api limit reached"
-        );
+    match refused {
+        Refused::Origin(_) => {}
+        Refused::TooManyUnauthenticated => {
+            metrics::counter!(LIMIT_TOTAL, "limit" => "unauthenticated_connections").increment(1);
+            tracing::warn!(
+                limit = "unauthenticated_connections",
+                value = MAX_UNAUTHENTICATED,
+                max = MAX_UNAUTHENTICATED,
+                peer,
+                "native api limit reached"
+            );
+        }
+        Refused::TooManyUnauthenticatedFromAddress(address) => {
+            metrics::counter!(LIMIT_TOTAL, "limit" => "unauthenticated_connections_per_address")
+                .increment(1);
+            tracing::warn!(
+                limit = "unauthenticated_connections_per_address",
+                value = MAX_UNAUTHENTICATED_PER_IP,
+                max = MAX_UNAUTHENTICATED_PER_IP,
+                client_ip = %address,
+                "native api limit reached"
+            );
+        }
     }
     tracing::warn!(
         reason = refused.label(),
@@ -283,16 +306,23 @@ pub(super) async fn upgrade(
     }
     let cookie = req.cookie(SESSION_COOKIE).map(|c| c.value().to_owned());
     let client_ip = crate::client_ip::client_ip(&req, &state.trusted_proxies);
-    let Some(ctx) = ConnectionCtx::admit(
+    let ctx = match ConnectionCtx::admit(
         cookie,
         client_ip,
         &limits,
         cfg.max_connections_per_user.get(),
-    ) else {
-        record_refused(Refused::TooManyUnauthenticated, origin_header, &peer);
-        return Ok(HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "5"))
-            .body(Refused::TooManyUnauthenticated.label()));
+    ) {
+        Ok(ctx) => ctx,
+        Err(refusal) => {
+            let refused = match refusal {
+                Refusal::Global => Refused::TooManyUnauthenticated,
+                Refusal::PerAddress => Refused::TooManyUnauthenticatedFromAddress(client_ip),
+            };
+            record_refused(refused, origin_header, &peer);
+            return Ok(HttpResponse::TooManyRequests()
+                .insert_header(("Retry-After", "5"))
+                .body(refused.label()));
+        }
     };
     let (response, session, stream) = actix_ws::handle(&req, body)?;
     let stream = stream
@@ -494,6 +524,7 @@ mod tests {
             Refused::Origin(origin::OriginRefusal::NotAllowed),
             Refused::Origin(origin::OriginRefusal::Malformed),
             Refused::TooManyUnauthenticated,
+            Refused::TooManyUnauthenticatedFromAddress(std::net::Ipv4Addr::LOCALHOST.into()),
         ];
         let labels: std::collections::HashSet<_> = refused.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), refused.len());
