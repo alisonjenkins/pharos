@@ -178,10 +178,48 @@ async fn deliver_attachment(
     let bytes = tokio::fs::read(dir.join(stream_index.to_string()))
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
-    Ok(HttpResponse::Ok()
-        .content_type(content_type)
+    let inline = is_font(&content_type);
+    let mut resp = HttpResponse::Ok();
+    resp.content_type(content_type.as_str())
         .insert_header((header::CACHE_CONTROL, "private, max-age=86400"))
-        .body(bytes))
+        .insert_header((header::CONTENT_SECURITY_POLICY, ATTACHMENT_CSP));
+    if !inline {
+        resp.insert_header((header::CONTENT_DISPOSITION, "attachment"));
+    }
+    tracing::debug!(
+        mime = %content_type,
+        disposition = if inline { "inline" } else { "attachment" },
+        "attachment served"
+    );
+    Ok(resp.body(bytes))
+}
+
+/// An attachment's type comes from the media file, so whoever made the file
+/// chooses it. A sandboxed, script-less CSP keeps an HTML or SVG attachment
+/// from running on pharos's origin even if a browser renders it (B254).
+const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
+
+/// Font mimetypes Matroska muxers write. Only these are served inline,
+/// for SubtitlesOctopus; anything else is a download (V194).
+fn is_font(mime: &str) -> bool {
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    mime.starts_with("font/")
+        || matches!(
+            mime.as_str(),
+            "application/x-truetype-font"
+                | "application/x-font-ttf"
+                | "application/x-font-otf"
+                | "application/x-font-opentype"
+                | "application/vnd.ms-opentype"
+                | "application/font-sfnt"
+                | "application/font-woff"
+                | "application/x-font-woff"
+        )
 }
 
 async fn stream_ass(
