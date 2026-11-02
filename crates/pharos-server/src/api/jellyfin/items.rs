@@ -2479,8 +2479,24 @@ async fn playback_info(
     );
     negotiated.record();
 
+    // V224: the MediaSource advertises the 3D layout of the bytes its delivery
+    // produces. Direct play and direct stream serve the file as-is; any other
+    // delivery goes through the transcoder, which flattens MVC (no H.264 MVC
+    // decoder in ffmpeg) and a Mono2D packed source.
+    let source_serves_file = direct_play || supports_direct_stream;
+    let output_3d_of = |fmt: pharos_core::Video3DFormat, serves_file: bool| {
+        if serves_file {
+            pharos_transcode::Output3D::Preserved
+        } else {
+            pharos_transcode::Output3D::of(fmt, stereo_output)
+        }
+    };
+
+    let output_3d = |fmt: pharos_core::Video3DFormat| output_3d_of(fmt, source_serves_file);
+
     if is_video {
         if let Some(fmt) = probe.video_3d_format {
+            let output_3d_label = output_3d(fmt).label();
             let decision_3d_label = if direct_play {
                 "direct_play"
             } else if supports_direct_stream {
@@ -2504,6 +2520,7 @@ async fn playback_info(
                 "format" => fmt.wire_name(),
                 "decision" => decision_3d_label,
                 "stereo_output" => stereo_output.label(),
+                "output" => output_3d_label,
                 "reason" => reason_3d_label,
             )
             .increment(1);
@@ -2513,6 +2530,10 @@ async fn playback_info(
                 video_3d_format = fmt.wire_name(),
                 decision = decision_3d_label,
                 stereo_output = stereo_output.label(),
+                output = output_3d_label,
+                advertised_video_3d_format = output_3d(fmt)
+                    .format(fmt)
+                    .map_or("none", |f| f.wire_name()),
                 reason = reason_3d_label,
                 "resolved 3D playback decision"
             );
