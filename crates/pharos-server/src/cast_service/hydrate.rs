@@ -30,6 +30,13 @@ pub(super) struct ResumeParams {
     owner_member: MemberId,
 }
 
+impl ResumeParams {
+    /// The user whose seat is being resumed.
+    pub(super) fn owner(&self) -> UserId {
+        self.owner
+    }
+}
+
 /// A resume's connect task reporting back to the actor.
 pub(super) struct Resumed<T> {
     tv: String,
@@ -149,6 +156,11 @@ impl<F: TransportFactory> Actor<F> {
                 self.resuming
                     .get(&tv_name)
                     .map(|p| (p.group.group_id, p.seat.name.clone()))
+            })
+            .or_else(|| {
+                self.pending
+                    .get(&tv_name)
+                    .map(|p| (p.params.group.group_id, p.params.req.user_name.clone()))
             });
         if let Some((other_group, other_owner)) = held_by {
             let detail = format!(
@@ -159,7 +171,7 @@ impl<F: TransportFactory> Actor<F> {
                 .drop_seat(&group, &seat, Some(owner), CastReason::TvBusy, &detail)
                 .await;
         }
-        if let Some(existing) = self.by_user.get(&owner) {
+        if let Some(existing) = self.seat_held_by(owner) {
             let detail = format!(
                 "user {:?} already has a seat on {existing:?}; ending the seat on {tv_name:?} \
                  in group {group_label}",

@@ -778,3 +778,55 @@ async fn a_resume_is_refused_while_another_replica_holds_the_tv() {
     assert!(b.service.snapshot().await.is_empty());
     assert!(snapshot_of(&group_b).await.cast_seats.is_empty());
 }
+
+/// While a restarted replica is still resuming a user's seat, that user cannot
+/// start a second one: a start and a resume would otherwise both connect, and
+/// the second to finish would overwrite the first's cast without tearing it
+/// down.
+#[tokio::test]
+async fn an_owner_cannot_start_a_second_seat_while_their_first_is_resuming() {
+    let (snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let a = Process::boot(
+        &stores,
+        &snapshots,
+        &Locks::default(),
+        1,
+        config(&[TV, "Den"]),
+        &[TV, "Den"],
+    );
+    let (group_a, owner) = running_cast(&stores, &snapshots, &a).await;
+
+    let b_snapshots = restart_snapshots(&snapshots, group_a.group_id);
+    let b = Process::boot(
+        &stores,
+        &b_snapshots,
+        &Locks::default(),
+        2,
+        config(&[TV, "Den"]),
+        &[TV, "Den"],
+    );
+    // The resume keeps retrying the unreachable TV for the reconnect grace.
+    b.factory.set_unreachable(TV, true);
+    let group_b = b.registry.get_or_create(group_a.group_id).await.unwrap();
+
+    // The owner's player comes back on the new replica and asks for the Den.
+    let (tx, _rx) = mpsc::channel(256);
+    let reg = b.hub.register(owner.key.clone(), "ali".into(), tx.clone());
+    b.hub.attach_group(&owner.key, group_b.clone());
+    b.sinks.insert(reg.member_id, reg.gen, tx);
+    let err = b
+        .service
+        .start(StartCast {
+            user_id: owner.id,
+            user_name: "ali".into(),
+            owner_sync_key: owner.key.clone(),
+            tv_name: "Den".into(),
+        })
+        .await
+        .expect_err("the owner's seat on the first TV is still resuming");
+    assert_eq!(err.reason, CastRejectReason::UserHasSeat, "{err}");
+    assert!(err.message.contains(TV), "names the resuming TV: {err}");
+    assert_eq!(seat_total(&snap, "rejected", "user_has_seat"), 1);
+}

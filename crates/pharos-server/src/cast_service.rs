@@ -737,15 +737,7 @@ impl<F: TransportFactory> Actor<F> {
         };
         let group_label = group.group_id.to_string();
 
-        let in_flight = self
-            .pending
-            .values()
-            .find(|p| p.params.req.user_id == req.user_id);
-        if let Some(existing) = self
-            .by_user
-            .get(&req.user_id)
-            .or_else(|| in_flight.map(|p| &p.params.tv.name))
-        {
+        if let Some(existing) = self.seat_held_by(req.user_id) {
             return Err(self.reject(
                 &req,
                 &group_label,
@@ -1001,6 +993,25 @@ impl<F: TransportFactory> Actor<F> {
 
     fn owner_of(&self, tv: &str, id: u64) -> Option<UserId> {
         self.casts.get(tv).filter(|c| c.id == id).map(|c| c.owner)
+    }
+
+    /// The TV `user` already has a seat on, or is connecting or resuming one
+    /// on: a user holds at most one seat, however far along it is.
+    fn seat_held_by(&self, user: UserId) -> Option<&String> {
+        self.by_user
+            .get(&user)
+            .or_else(|| {
+                self.pending
+                    .values()
+                    .find(|p| p.params.req.user_id == user)
+                    .map(|p| &p.params.tv.name)
+            })
+            .or_else(|| {
+                self.resuming
+                    .iter()
+                    .find(|(_, r)| r.owner() == user)
+                    .map(|(tv, _)| tv)
+            })
     }
 
     async fn on_state(&mut self, tv: &str, state: ConnState) {
