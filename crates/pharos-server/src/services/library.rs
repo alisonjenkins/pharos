@@ -206,9 +206,11 @@ pub async fn resume(
         .map_err(ListError::Hidden)?;
     let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
     for id in &ids {
-        // A row deleted since it was resumed is skipped, not an error.
-        if let Ok(item) = state.stores.get(*id).await {
-            items.push(item);
+        match state.stores.get(*id).await {
+            Ok(item) => items.push(item),
+            // Deleted since it was resumed: skipped, not an error.
+            Err(DomainError::NotFound(_)) => {}
+            Err(e) => return Err(ListError::Store(e)),
         }
     }
     let items = kinds.keep(items);
