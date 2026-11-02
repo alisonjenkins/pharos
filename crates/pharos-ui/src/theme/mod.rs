@@ -51,6 +51,7 @@ pub mod contrast;
 pub mod css;
 pub mod device;
 pub mod doc;
+pub mod format;
 pub mod resolve;
 pub mod signal;
 pub mod value;
@@ -71,6 +72,21 @@ pub const SHIPPED: [&str; 7] = [
     include_str!("../../themes/daylight.pharos-theme.toml"),
     include_str!("../../themes/high-contrast.pharos-theme.toml"),
 ];
+
+const SHIPPED_NAMES: [&str; 7] = [
+    "Pharos Night",
+    "Marquee",
+    "Kali Dark",
+    "Kali Purple",
+    "Neon Grid",
+    "Daylight",
+    "High Contrast",
+];
+
+/// Whether `name` is one of the seven built-in themes.
+pub fn is_shipped(name: &str) -> bool {
+    SHIPPED_NAMES.contains(&name)
+}
 
 /// A catalogue holding the shipped themes.
 pub fn shipped() -> Catalogue {
@@ -114,6 +130,18 @@ mod tests {
             assert_eq!(resolved.theme.name, name);
             assert!(contrast::failures(&resolved.theme).is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn the_shipped_name_list_matches_the_shipped_sources() {
+        let names: Vec<String> = SHIPPED
+            .iter()
+            .map(|source| format::read(source).unwrap().0.name().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, SHIPPED_NAMES);
+        assert!(SHIPPED_NAMES.iter().all(|n| is_shipped(n)));
+        assert!(!is_shipped("Mine"));
+        assert!(!is_shipped("pharos night"));
     }
 
     #[test]
