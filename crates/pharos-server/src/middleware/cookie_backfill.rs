@@ -7,11 +7,14 @@
 //! the user signs out and back in.
 //!
 //! The auth extractors leave a [`HeaderCredential`] in the request extensions
-//! once the token store accepted a header or `api_key` token. A 2xx response
-//! to such a request that arrives with no `JellyfinAuth` cookie, or one
-//! holding another token, gets the cookie for the validated token. A cookie
-//! alone never produces one: only a credential the store has just accepted is
-//! echoed.
+//! once the token store accepted a header token. A 2xx response to such a
+//! request gets the cookie for that token only when the browser says the
+//! request came from pharos's own page (`Sec-Fetch-Site: same-origin`) and it
+//! holds no `JellyfinAuth` cookie yet (B253, V193). An `api_key` in the URL
+//! never counts: any page on a sibling host can put one in an `<img>`, and
+//! echoing it would plant the attacker's session in the victim's browser.
+//! For the same reason a cookie holding another token is never overwritten;
+//! signing in is what replaces it.
 
 use actix_web::{
     body::MessageBody,
@@ -27,33 +30,47 @@ use std::{
 
 use crate::api::jellyfin::auth_extractor::{auth_cookie, HeaderCredential, AUTH_COOKIE};
 
-/// Why the cookie was sent; the `reason` label of
-/// `pharos_auth_cookie_backfilled_total`.
+/// Whether a header-authenticated 2xx response gets the cookie; the
+/// `outcome` label of `pharos_auth_cookie_backfill_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackfillReason {
-    /// The request carried no `JellyfinAuth` cookie.
-    Absent,
-    /// The request's cookie held a token other than the one it authenticated with.
-    Different,
+pub enum BackfillOutcome {
+    /// Same-origin request with no `JellyfinAuth` cookie: the cookie is set.
+    Set,
+    /// The request already holds the cookie for this token.
+    Held,
+    /// `Sec-Fetch-Site` is absent or not `same-origin`: a native client, or a
+    /// request another site's page made.
+    NotSameOrigin,
+    /// The request holds a cookie for another token; never overwritten.
+    OtherCookie,
 }
 
-impl BackfillReason {
-    pub const ALL: [Self; 2] = [Self::Absent, Self::Different];
+impl BackfillOutcome {
+    pub const ALL: [Self; 4] = [
+        Self::Set,
+        Self::Held,
+        Self::NotSameOrigin,
+        Self::OtherCookie,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Absent => "absent",
-            Self::Different => "different",
+            Self::Set => "set",
+            Self::Held => "held",
+            Self::NotSameOrigin => "not_same_origin",
+            Self::OtherCookie => "other_cookie",
         }
     }
 }
 
-/// `None` when the request's cookie already holds `token`.
-fn reason(cookie: Option<&str>, token: &str) -> Option<BackfillReason> {
+fn outcome(fetch_site: Option<&str>, cookie: Option<&str>, token: &str) -> BackfillOutcome {
+    if fetch_site.map(str::trim) != Some("same-origin") {
+        return BackfillOutcome::NotSameOrigin;
+    }
     match cookie.map(str::trim) {
-        None | Some("") => Some(BackfillReason::Absent),
-        Some(held) if held == token => None,
-        Some(_) => Some(BackfillReason::Different),
+        None | Some("") => BackfillOutcome::Set,
+        Some(held) if held == token => BackfillOutcome::Held,
+        Some(_) => BackfillOutcome::OtherCookie,
     }
 }
 
@@ -116,31 +133,39 @@ where
                 return Ok(res);
             }
             let held = request.cookie(AUTH_COOKIE);
-            let Some(why) = reason(held.as_ref().map(|c| c.value()), &token) else {
-                return Ok(res);
-            };
-            match res
-                .response_mut()
-                .add_cookie(&auth_cookie(&request, &token))
-            {
-                Ok(()) => {
-                    metrics::counter!(
-                        "pharos_auth_cookie_backfilled_total",
-                        "reason" => why.label()
-                    )
-                    .increment(1);
-                    tracing::debug!(
-                        reason = why.label(),
-                        path = request.path(),
-                        "JellyfinAuth cookie backfilled for a header-authenticated request"
-                    );
+            let fetch_site = request
+                .headers()
+                .get("Sec-Fetch-Site")
+                .and_then(|v| v.to_str().ok());
+            let verdict = outcome(fetch_site, held.as_ref().map(|c| c.value()), &token);
+            let verdict = if verdict == BackfillOutcome::Set {
+                match res
+                    .response_mut()
+                    .add_cookie(&auth_cookie(&request, &token))
+                {
+                    Ok(()) => verdict,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "JellyfinAuth cookie backfill failed: token is not a valid cookie value"
+                        );
+                        return Ok(res);
+                    }
                 }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    reason = why.label(),
-                    "JellyfinAuth cookie backfill failed: token is not a valid cookie value"
-                ),
-            }
+            } else {
+                verdict
+            };
+            metrics::counter!(
+                "pharos_auth_cookie_backfill_total",
+                "outcome" => verdict.label()
+            )
+            .increment(1);
+            tracing::debug!(
+                outcome = verdict.label(),
+                fetch_site,
+                path = request.path(),
+                "JellyfinAuth cookie backfill decided for a header-authenticated request"
+            );
             Ok(res)
         })
     }
@@ -152,17 +177,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reason_distinguishes_absent_different_and_matching() {
-        assert_eq!(reason(None, "t"), Some(BackfillReason::Absent));
-        assert_eq!(reason(Some(""), "t"), Some(BackfillReason::Absent));
-        assert_eq!(reason(Some("old"), "t"), Some(BackfillReason::Different));
-        assert_eq!(reason(Some("t"), "t"), None);
+    fn only_a_same_origin_request_without_a_cookie_gets_one() {
+        use BackfillOutcome::*;
+        let same = Some("same-origin");
+        assert_eq!(outcome(same, None, "t"), Set);
+        assert_eq!(outcome(same, Some(""), "t"), Set);
+        assert_eq!(outcome(same, Some("t"), "t"), Held);
+        assert_eq!(outcome(same, Some("old"), "t"), OtherCookie);
+        for site in [None, Some("same-site"), Some("cross-site"), Some("none")] {
+            assert_eq!(outcome(site, None, "t"), NotSameOrigin, "{site:?}");
+        }
     }
 
     #[test]
     fn labels_are_distinct() {
         let labels: std::collections::HashSet<_> =
-            BackfillReason::ALL.iter().map(|r| r.label()).collect();
-        assert_eq!(labels.len(), BackfillReason::ALL.len());
+            BackfillOutcome::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), BackfillOutcome::ALL.len());
     }
 }

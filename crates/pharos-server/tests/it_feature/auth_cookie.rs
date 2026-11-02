@@ -189,6 +189,10 @@ fn set_auth_cookies(
         .collect()
 }
 
+fn same_origin(req: test::TestRequest) -> test::TestRequest {
+    req.insert_header(("Sec-Fetch-Site", "same-origin"))
+}
+
 /// A browser that signed in before the cookie existed still holds its token
 /// in localStorage and sends it as a header. Its next authenticated request
 /// must hand it the cookie, or every poster and subtitle 401s until it signs
@@ -213,7 +217,7 @@ async fn header_authenticated_request_without_the_cookie_gets_it() {
             )),
         ),
     ] {
-        let resp = test::call_service(&app, req.to_request()).await;
+        let resp = test::call_service(&app, same_origin(req).to_request()).await;
         assert_eq!(resp.status().as_u16(), 200, "{name}");
         let set = set_auth_cookies(&resp);
         assert_eq!(set.len(), 1, "{name}: one JellyfinAuth Set-Cookie");
@@ -234,20 +238,22 @@ async fn header_authenticated_request_without_the_cookie_gets_it() {
     }
 }
 
+/// A cookie for another token is never overwritten: a page that can make
+/// the browser send someone else's token must not be able to swap the
+/// victim's session for it (B253). Signing in replaces the cookie. Disarm
+/// check: with `OtherCookie` answering `Set` this fails.
 #[actix_web::test]
-async fn a_stale_cookie_holding_another_token_is_replaced() {
+async fn a_cookie_holding_another_token_is_kept() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
-    let req = test::TestRequest::get()
+    let req = same_origin(test::TestRequest::get())
         .uri("/Users/Me")
         .insert_header(("X-Emby-Token", f.user_token.as_str()))
         .insert_header(cookie(&f.admin_token))
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status().as_u16(), 200);
-    let set = set_auth_cookies(&resp);
-    assert_eq!(set.len(), 1);
-    assert_eq!(set[0].value(), f.user_token);
+    assert!(set_auth_cookies(&resp).is_empty());
 }
 
 /// Session fixation (B253): a page on a sibling host embeds
@@ -278,11 +284,32 @@ async fn an_api_key_never_sets_the_cookie() {
     }
 }
 
+/// Only pharos's own page gets the cookie. A native client sends no
+/// `Sec-Fetch-Site` and has no cookie jar; another site's page sends
+/// `same-site` or `cross-site`. Disarm check: with the `Sec-Fetch-Site`
+/// gate in `outcome` removed, this fails.
+#[actix_web::test]
+async fn a_header_token_from_anywhere_but_the_same_origin_gets_no_cookie() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    for site in [None, Some("same-site"), Some("cross-site"), Some("none")] {
+        let mut req = test::TestRequest::get()
+            .uri("/Users/Me")
+            .insert_header(("X-Emby-Token", f.user_token.as_str()));
+        if let Some(site) = site {
+            req = req.insert_header(("Sec-Fetch-Site", site));
+        }
+        let resp = test::call_service(&app, req.to_request()).await;
+        assert_eq!(resp.status().as_u16(), 200, "{site:?}");
+        assert!(set_auth_cookies(&resp).is_empty(), "{site:?}");
+    }
+}
+
 #[actix_web::test]
 async fn a_matching_cookie_is_left_alone() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
-    let req = test::TestRequest::get()
+    let req = same_origin(test::TestRequest::get())
         .uri("/Users/Me")
         .insert_header(("X-Emby-Token", f.user_token.as_str()))
         .insert_header(cookie(&f.user_token))
@@ -323,7 +350,7 @@ async fn no_cookie_is_set_without_a_validated_token_or_a_success() {
                 .insert_header(("X-Emby-Token", f.user_token.as_str())),
         ),
     ] {
-        let resp = test::call_service(&app, req.to_request()).await;
+        let resp = test::call_service(&app, same_origin(req).to_request()).await;
         assert!(set_auth_cookies(&resp).is_empty(), "{label}");
     }
     let req = test::TestRequest::get()
@@ -337,7 +364,7 @@ async fn no_cookie_is_set_without_a_validated_token_or_a_success() {
 async fn logout_clears_rather_than_backfills() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
-    let req = test::TestRequest::post()
+    let req = same_origin(test::TestRequest::post())
         .uri("/Sessions/Logout")
         .insert_header(("X-Emby-Token", f.user_token.as_str()))
         .to_request();
@@ -352,7 +379,7 @@ async fn logout_clears_rather_than_backfills() {
 async fn the_backfilled_cookie_fetches_an_image_without_a_header() {
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
-    let req = test::TestRequest::get()
+    let req = same_origin(test::TestRequest::get())
         .uri("/Users/Me")
         .insert_header(("X-Emby-Token", f.user_token.as_str()))
         .to_request();
@@ -366,30 +393,35 @@ async fn the_backfilled_cookie_fetches_an_image_without_a_header() {
     assert_eq!(test::call_service(&app, req).await.status().as_u16(), 200);
 }
 
-/// The decision is countable by reason. Disarm check: with the counter
-/// increment removed from `cookie_backfill.rs` this fails.
+/// Every decision is countable by outcome, refusals included. Disarm check:
+/// with the counter increment removed from `cookie_backfill.rs` this fails.
 #[actix_web::test]
-async fn backfills_are_counted_by_reason() {
+async fn backfill_decisions_are_counted_by_outcome() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     let f = seed_rich().await;
     let app = test::init_service(build_app(f.state.clone())).await;
     let recorder = DebuggingRecorder::new();
     let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _metrics = metrics::set_default_local_recorder(&recorder);
-    for stale in [
-        None,
-        Some(f.admin_token.as_str()),
-        Some(f.user_token.as_str()),
+    for (site, held) in [
+        (Some("same-origin"), None),
+        (Some("same-origin"), Some(f.user_token.as_str())),
+        (Some("same-origin"), Some(f.admin_token.as_str())),
+        (Some("same-site"), None),
+        (None, None),
     ] {
         let mut req = test::TestRequest::get()
             .uri("/Users/Me")
             .insert_header(("X-Emby-Token", f.user_token.as_str()));
-        if let Some(t) = stale {
+        if let Some(site) = site {
+            req = req.insert_header(("Sec-Fetch-Site", site));
+        }
+        if let Some(t) = held {
             req = req.insert_header(cookie(t));
         }
         test::call_service(&app, req.to_request()).await;
     }
-    let count = |reason: &str| -> u64 {
+    let count = |outcome: &str| -> u64 {
         snapshotter
             .snapshot()
             .into_vec()
@@ -398,11 +430,10 @@ async fn backfills_are_counted_by_reason() {
                 let labelled = key
                     .key()
                     .labels()
-                    .any(|l| l.key() == "reason" && l.value() == reason);
+                    .any(|l| l.key() == "outcome" && l.value() == outcome);
                 match value {
                     DebugValue::Counter(n)
-                        if key.key().name() == "pharos_auth_cookie_backfilled_total"
-                            && labelled =>
+                        if key.key().name() == "pharos_auth_cookie_backfill_total" && labelled =>
                     {
                         Some(n)
                     }
@@ -411,5 +442,13 @@ async fn backfills_are_counted_by_reason() {
             })
             .unwrap_or(0)
     };
-    assert_eq!((count("absent"), count("different")), (1, 1));
+    assert_eq!(
+        [
+            count("set"),
+            count("held"),
+            count("other_cookie"),
+            count("not_same_origin")
+        ],
+        [1, 1, 1, 2]
+    );
 }
