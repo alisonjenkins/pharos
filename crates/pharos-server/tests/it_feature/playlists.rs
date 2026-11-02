@@ -427,3 +427,32 @@ async fn items_by_id_answers_another_users_playlist_as_nothing() {
         "/Items/{{id}} tells another's playlist from nothing"
     );
 }
+
+/// V197: a playlist's `ChildCount` counts only the entries its reader may
+/// open, on the header and on `/Items/{id}`.
+#[actix_web::test]
+async fn a_playlists_child_count_is_what_its_reader_may_open() {
+    use actix_web::http::Method;
+    use pharos_core::{UserPolicy, UserStore as _};
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let theirs = users_playlist(&f).await;
+    f.state
+        .stores
+        .set_policy(
+            f.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![f.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    for uri in [format!("/Playlists/{theirs}"), format!("/Items/{theirs}")] {
+        let resp =
+            test::call_service(&app, call(Method::GET, &uri, &f.user_token).to_request()).await;
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["ChildCount"], 1, "{uri}: {body}");
+    }
+}

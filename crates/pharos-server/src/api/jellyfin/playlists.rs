@@ -103,12 +103,7 @@ async fn get_playlist(
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
     let playlist = playlist_for(&state, &user, &wire_id, PlaylistAccess::Read).await?;
-    let count = state
-        .stores
-        .playlist_entries(&wire_id)
-        .await
-        .map(|e| e.len() as u32)
-        .unwrap_or(0);
+    let count = visible_entry_count(&state, &user.0, &wire_id).await?;
     Ok(crate::api::jellyfin::wire::json(&playlist_dto(
         &state, &playlist, count,
     )))
@@ -289,6 +284,24 @@ async fn playlist_for(
         Some(p) if check_playlist(state, &user.0, &p, access, "playlist").await => Ok(p),
         _ => Err(error::ErrorNotFound("playlist not found")),
     }
+}
+
+/// How many of a playlist's entries `user` may open: its `ChildCount`.
+/// Entries from a library the user cannot open are not counted (V197).
+pub(crate) async fn visible_entry_count(
+    state: &AppState,
+    user: &pharos_core::User,
+    wire_id: &str,
+) -> Result<u32, actix_web::Error> {
+    let mut entries = state
+        .stores
+        .playlist_entries(wire_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    crate::services::access::retain_visible(state, user, &mut entries, |e| e.item_id, "playlist")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
+    Ok(u32::try_from(entries.len()).unwrap_or(u32::MAX))
 }
 
 /// The playlist header `BaseItemDto`. A Jellyfin playlist is an `IsFolder`
