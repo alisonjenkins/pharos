@@ -297,6 +297,11 @@ fn is_playlist(content_type: &str) -> bool {
     )
 }
 
+fn starts_like_playlist(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    bytes.trim_ascii_start().starts_with(b"#EXTM3U")
+}
+
 fn stream_refused(outcome: StreamOutcome, response: HttpResponse) -> HttpResponse {
     metrics::counter!("pharos_live_tv_stream_total", "outcome" => outcome.label()).increment(1);
     response
@@ -362,7 +367,25 @@ async fn stream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("video/mp2t")
         .to_string();
-    if is_playlist(&content_type) {
+    let mut resp = resp;
+    // A playlist served under a generic type (text/plain, octet-stream) is
+    // caught by its first bytes.
+    let first = match resp.chunk().await {
+        Ok(first) => first,
+        Err(e) => {
+            tracing::warn!(
+                channel = %id,
+                user = %user.0.name,
+                error = %e.without_url(),
+                "live tv upstream sent no stream"
+            );
+            return stream_refused(
+                StreamOutcome::UpstreamUnreachable,
+                HttpResponse::BadGateway().finish(),
+            );
+        }
+    };
+    if is_playlist(&content_type) || first.as_deref().is_some_and(starts_like_playlist) {
         tracing::warn!(
             channel = %id,
             content_type,
@@ -376,8 +399,9 @@ async fn stream(
     metrics::counter!("pharos_live_tv_stream_total", "outcome" => StreamOutcome::Relayed.label())
         .increment(1);
     tracing::info!(channel = %id, user = %user.0.name, content_type, "live tv stream relayed");
-    let body = futures_util::stream::unfold(Some(resp), move |resp| {
-        let id = id.clone();
+    let id: std::sync::Arc<str> = id.into();
+    let rest = futures_util::stream::unfold(Some(resp), move |resp| {
+        let id = std::sync::Arc::clone(&id);
         async move {
             let mut resp = resp?;
             match resp.chunk().await {
@@ -391,6 +415,7 @@ async fn stream(
             }
         }
     });
+    let body = futures_util::StreamExt::chain(futures_util::stream::iter(first.map(Ok)), rest);
     HttpResponse::Ok()
         .insert_header((header::CONTENT_TYPE, content_type))
         .streaming(body)
@@ -565,5 +590,7 @@ mod stream_tests {
         assert!(is_playlist("application/vnd.apple.mpegurl"));
         assert!(is_playlist("Application/X-MpegURL; charset=utf-8"));
         assert!(!is_playlist("video/mp2t"));
+        assert!(starts_like_playlist(b"\xEF\xBB\xBF\n#EXTM3U\nseg.ts"));
+        assert!(!starts_like_playlist(b"\x47\x40\x00"));
     }
 }

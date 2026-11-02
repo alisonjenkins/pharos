@@ -132,7 +132,8 @@ async fn single_channel_404_for_unknown_id() {
 
 /// A fake IPTV provider: `/live/ts` answers the stream only to the
 /// credentials the playlist URL carries, `/live/m3u8` answers an HLS
-/// playlist and `/live/gone` a 503.
+/// playlist, `/live/plain` the same playlist as text/plain and `/live/gone`
+/// a 503.
 fn fake_provider() -> actix_test::TestServer {
     actix_test::start(|| {
         App::new()
@@ -163,6 +164,14 @@ fn fake_provider() -> actix_test::TestServer {
                     actix_web::HttpResponse::Ok()
                         .insert_header(("content-type", "application/vnd.apple.mpegurl"))
                         .body("#EXTM3U\nseg-prov-pass-1.ts\n")
+                }),
+            )
+            .route(
+                "/live/plain",
+                web::get().to(|| async {
+                    actix_web::HttpResponse::Ok()
+                        .insert_header(("content-type", "text/plain"))
+                        .body("#EXTM3U\nhttp://prov-user:prov-pass@cdn/seg-1.ts\n")
                 }),
             )
             .route(
@@ -214,6 +223,7 @@ async fn channel_stream_relays_without_leaking_provider_credentials() {
         "#EXTM3U\n\
          #EXTINF:-1 tvg-id=\"ts\",TS\nhttp://prov-user:prov-pass@{addr}/live/ts?password=prov-pass\n\
          #EXTINF:-1 tvg-id=\"hls\",HLS\nhttp://prov-user:prov-pass@{addr}/live/m3u8\n\
+         #EXTINF:-1 tvg-id=\"plain\",Plain\nhttp://prov-user:prov-pass@{addr}/live/plain\n\
          #EXTINF:-1 tvg-id=\"down\",Down\nhttp://prov-user:prov-pass@{addr}/live/gone\n"
     );
     let (state, token, _td) = seed_state_with_m3u(&m3u).await;
@@ -221,7 +231,7 @@ async fn channel_stream_relays_without_leaking_provider_credentials() {
 
     let mut leaks = Vec::new();
     let mut statuses = Vec::new();
-    for channel in ["ts", "hls", "down", "nope"] {
+    for channel in ["ts", "hls", "plain", "down", "nope"] {
         let req = test::TestRequest::get()
             .uri(&format!("/LiveTv/Channels/{channel}/Stream"))
             .insert_header(("X-Emby-Token", token.as_str()))
@@ -251,11 +261,17 @@ async fn channel_stream_relays_without_leaking_provider_credentials() {
     );
     assert_eq!(
         statuses,
-        vec![("ts", 200), ("hls", 502), ("down", 502), ("nope", 404)]
+        vec![
+            ("ts", 200),
+            ("hls", 502),
+            ("plain", 502),
+            ("down", 502),
+            ("nope", 404)
+        ]
     );
     let expected: std::collections::BTreeMap<String, u64> = [
         ("relayed", 1),
-        ("playlist_unsupported", 1),
+        ("playlist_unsupported", 2),
         ("upstream_status", 1),
         ("unknown_channel", 1),
     ]
