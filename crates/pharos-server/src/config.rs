@@ -317,7 +317,7 @@ pub struct ServerConfig {
     #[serde(default = "default_server_name")]
     pub name: String,
     /// Directory containing the built Dioxus UI bundle. When set, the
-    /// server serves it at `/` and redirects `/ui/*` there (spec 009
+    /// server serves it at `/ui/` (ADR-0038, spec 009
     /// contracts/serving.md). Run `dx build` in `crates/pharos-ui` to
     /// produce one; the OCI image carries one at `/share/pharos-ui`.
     #[serde(default)]

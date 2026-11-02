@@ -1,6 +1,6 @@
-//! pharos-ui served at the root (spec 009 contracts/serving.md, V204): the
-//! SPA's routes fall back to `index.html` for a browser, never shadow an API
-//! route, and `/ui/*` moves to `/*`.
+//! pharos-ui served under `/ui/` (spec 009 contracts/serving.md, V204, V210):
+//! the SPA's routes fall back to `index.html` for a browser, `/ui` moves to
+//! `/ui/`, and `/` stays the core root.
 
 use actix_web::{http::header, test, App};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -81,36 +81,42 @@ fn served_total(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, outcom
         .sum()
 }
 
-/// Every first segment the UI routes (spec 009 data-model §Route) reaches the
-/// SPA through the whole API router, in any case. Disarm check: register
-/// `/title/{id}` as an API route and this names it.
+/// A browser's deep link under `/ui/` gets the SPA; `/ui/` is the index. The
+/// same path outside the mount is no UI route. Disarm check: record nothing
+/// in `index` and the counter assertion reads 0.
 #[actix_web::test]
-async fn no_api_route_shadows_a_ui_route() {
+async fn the_spa_is_served_under_ui_only() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
     let dir = tempfile::tempdir().unwrap();
     let app = app!(bundle(dir.path()));
-    let mut shadowed = Vec::new();
-    for first in ui::UI_ROUTES {
-        for uri in [
-            format!("/{first}"),
-            format!("/{first}/123?sort=name"),
-            format!("/{}/ABC", first.to_uppercase()),
-        ] {
-            let resp = test::call_service(&app, html(&uri).to_request()).await;
-            let status = resp.status();
-            let body = test::read_body(resp).await;
-            if status != 200 || body != INDEX.as_bytes() {
-                shadowed.push(format!("{uri}: {status}"));
-            }
-        }
+    for uri in [
+        "/ui/",
+        "/ui/browse/x",
+        "/ui/title/123?sort=name",
+        "/UI/Browse/ABC",
+    ] {
+        let resp = test::call_service(&app, html(uri).to_request()).await;
+        assert_eq!(resp.status(), 200, "{uri}");
+        assert_eq!(cache_control(&resp), "no-cache", "{uri}");
+        assert_eq!(test::read_body(resp).await, INDEX.as_bytes(), "{uri}");
     }
+    assert_eq!(served_total(&snapshotter, "index"), 4);
+
+    // `/` is the core root, not the UI, and a root deep link is no UI route.
     let resp = test::call_service(&app, html("/").to_request()).await;
-    assert_eq!(cache_control(&resp), "no-cache");
-    assert_eq!(test::read_body(resp).await, INDEX.as_bytes());
-    assert!(shadowed.is_empty(), "{}", shadowed.join("\n"));
+    assert_eq!(resp.status(), 200);
+    assert_eq!(test::read_body(resp).await, "pharos".as_bytes());
+    let resp = test::call_service(&app, html("/browse/x").to_request()).await;
+    assert_eq!(resp.status(), 404);
+    assert_ne!(test::read_body(resp).await, INDEX.as_bytes());
+    assert_eq!(served_total(&snapshotter, "index"), 4);
 }
 
-/// The fallback never answers an API route or an API client with HTML.
-/// Disarm check: drop the `Accept` test and `/title/1` as JSON reads 200.
+/// The fallback never answers an API client, a non-GET or a file-shaped path
+/// with HTML, and an API route keeps answering itself. Disarm check: drop the
+/// `Accept` test and `/ui/title/1` as JSON reads 200.
 #[actix_web::test]
 async fn api_routes_and_api_clients_never_get_the_spa() {
     let recorder = DebuggingRecorder::new();
@@ -119,19 +125,22 @@ async fn api_routes_and_api_clients_never_get_the_spa() {
     let dir = tempfile::tempdir().unwrap();
     let app = app!(bundle(dir.path()));
 
-    let resp = test::call_service(&app, json("/title/1").to_request()).await;
+    let resp = test::call_service(&app, json("/ui/title/1").to_request()).await;
     assert_eq!(resp.status(), 404);
-    let resp = test::call_service(&app, html("/no/such/thing.json").to_request()).await;
+    let resp = test::call_service(&app, html("/ui/no/such/thing.json").to_request()).await;
     assert_eq!(
         resp.status(),
         404,
         "a path with an extension is a file, not a route"
     );
-    let resp = test::call_service(&app, html("/assets/missing.js").to_request()).await;
+    let resp = test::call_service(&app, html("/ui/assets/missing.js").to_request()).await;
     assert_eq!(resp.status(), 404);
-    let resp =
-        test::call_service(&app, test::TestRequest::post().uri("/title/1").to_request()).await;
-    assert_ne!(resp.status(), 200);
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post().uri("/ui/title/1").to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 404);
     // An API route keeps answering itself, even to a browser.
     let resp = test::call_service(&app, html("/metrics").to_request()).await;
     assert_eq!(resp.status(), 200);
@@ -170,7 +179,7 @@ async fn assets_are_immutable_and_survive_lowercasing() {
     let resp = test::call_service(
         &app,
         test::TestRequest::get()
-            .uri("/assets/pharos-ui_bg-dxhA1b2.wasm")
+            .uri("/ui/assets/pharos-ui_bg-dxhA1b2.wasm")
             .to_request(),
     )
     .await;
@@ -184,7 +193,7 @@ async fn assets_are_immutable_and_survive_lowercasing() {
 
     let resp = test::call_service(
         &app,
-        test::TestRequest::get().uri("/favicon.ico").to_request(),
+        test::TestRequest::get().uri("/ui/favicon.ico").to_request(),
     )
     .await;
     assert_eq!(resp.status(), 200);
@@ -193,7 +202,7 @@ async fn assets_are_immutable_and_survive_lowercasing() {
     let resp = test::call_service(
         &app,
         test::TestRequest::get()
-            .uri("/assets/pharos.css")
+            .uri("/ui/assets/pharos.css")
             .to_request(),
     )
     .await;
@@ -203,20 +212,21 @@ async fn assets_are_immutable_and_survive_lowercasing() {
     assert_eq!(served_total(&snapshotter, "file"), 2);
 }
 
-/// The old mount moves: `/ui/<rest>` answers 308 to `/<rest>`, query kept.
+/// `/ui` answers 308 to `/ui/`, query kept. Disarm check: drop `record` from
+/// `redirect` and the counter reads 0.
 #[actix_web::test]
-async fn the_ui_mount_redirects_to_the_root() {
+async fn the_bare_mount_redirects_to_the_slash() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
     let dir = tempfile::tempdir().unwrap();
     let app = app!(bundle(dir.path()));
-    for (from, to) in [
-        ("/ui", "/"),
-        ("/ui/", "/"),
-        ("/ui/title/7?t=30", "/title/7?t=30"),
-    ] {
+    for (from, to) in [("/ui", "/ui/"), ("/ui?t=30", "/ui/?t=30")] {
         let resp = test::call_service(&app, html(from).to_request()).await;
         assert_eq!(resp.status(), 308, "{from}");
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), to, "{from}");
     }
+    assert_eq!(served_total(&snapshotter, "redirect"), 2);
 }
 
 /// A path outside the bundle is never read, however it is spelled.
@@ -228,9 +238,9 @@ async fn a_path_outside_the_bundle_is_not_served() {
     std::fs::create_dir_all(&dir).unwrap();
     let app = app!(bundle(&dir));
     for uri in [
-        "/../secret.txt",
-        "/%2e%2e/secret.txt",
-        "/assets/..%2f..%2fsecret.txt",
+        "/ui/../secret.txt",
+        "/ui/%2e%2e/secret.txt",
+        "/ui/assets/..%2f..%2fsecret.txt",
     ] {
         let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
         let body = test::read_body(resp).await;
@@ -270,7 +280,7 @@ async fn ui_responses_carry_a_strict_content_security_policy() {
         "'sha256-{}'",
         base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(loader))
     );
-    for uri in ["/", "/title/1", "/assets/app.js"] {
+    for uri in ["/ui/", "/ui/title/1", "/ui/assets/app.js"] {
         let resp = test::call_service(&app, html(uri).to_request()).await;
         let h = resp.headers();
         let csp = h
@@ -302,10 +312,10 @@ async fn redirects_and_not_found_carry_the_security_headers() {
     let dir = tempfile::tempdir().unwrap();
     let app = app!(bundle(dir.path()));
     let replies = [
-        ("308 redirect", html("/ui/title/7").to_request(), 308),
+        ("308 redirect", html("/ui").to_request(), 308),
         (
             "404",
-            test::TestRequest::get().uri("/missing.js").to_request(),
+            test::TestRequest::get().uri("/ui/missing.js").to_request(),
             404,
         ),
     ];

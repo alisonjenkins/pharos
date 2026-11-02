@@ -83,7 +83,7 @@ async fn metrics(state: Option<web::Data<crate::state::AppState>>) -> impl Respo
 }
 
 /// Every route the server answers, in precedence order: pharos-ui first
-/// when a bundle is configured (its `/` and its fallback), then the core and
+/// when a bundle is configured (its `/ui` scope), then the core and
 /// Jellyfin routes, then the native API. `main` and the tests both build
 /// the app from this, so a reordering is caught by `it_wire::ui_serving`.
 pub fn configure_app(

@@ -1,14 +1,14 @@
-//! pharos-ui served at the root (spec 009 contracts/serving.md, V204).
+//! pharos-ui served under `/ui/` (spec 009 contracts/serving.md, V204, V210).
 //!
 //! The bundle's files are indexed once at startup and only indexed files are
 //! ever opened, so no request path reaches the filesystem. Keys are
 //! lowercase because [`LowercasePath`](crate::middleware::LowercasePath)
 //! folds every path before routing.
 //!
-//! [`configure`] goes before every other route: its `/` replaces the plain
-//! `"pharos"` answer, and its default service only sees paths no API route
-//! claimed. A browser navigating to a UI route gets `index.html`; an API
-//! client, a non-GET, or a path that names a file gets 404.
+//! [`configure`] mounts a `/ui` scope and nothing else; every other path
+//! falls through to the server's own routes and its 404. A browser
+//! navigating to a UI route gets `index.html`; an API client, a non-GET, or
+//! a path that names a file gets 404.
 //!
 //! [`router::configure_app`](crate::router::configure_app) does the ordering;
 //! `main` and the tests share it.
@@ -20,11 +20,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The first path segment of every route the UI owns (spec 009 data-model
-/// §Route). No API route may claim one; `it_wire::ui_serving` checks each.
-pub const UI_ROUTES: &[&str] = &[
-    "browse", "title", "watch", "find", "together", "settings", "manage", "signin",
-];
+/// The path prefix the bundle is mounted under.
+const MOUNT: &str = "/ui";
 
 /// A year: the longest `max-age` caches honour. Only content-hashed assets
 /// get it (see [`is_hashed_asset`]).
@@ -177,19 +174,12 @@ fn record(outcome: Outcome) {
     metrics::counter!("pharos_ui_requests_total", "outcome" => outcome.label()).increment(1);
 }
 
-/// Mount the UI. Register it before every other route.
+/// Mount the UI under `/ui`.
 pub fn configure(bundle: Arc<UiBundle>) -> impl FnOnce(&mut web::ServiceConfig) {
     move |sc| {
         sc.app_data(web::Data::from(bundle))
-            .route("/", web::get().to(root))
-            .route("/ui", web::get().to(redirect))
-            .route("/ui/{tail:.*}", web::get().to(redirect))
-            .default_service(web::to(fallback));
+            .service(web::scope(MOUNT).default_service(web::to(serve)));
     }
-}
-
-async fn root(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
-    index(&req, &bundle).await
 }
 
 async fn index(req: &HttpRequest, bundle: &UiBundle) -> HttpResponse {
@@ -248,16 +238,11 @@ fn secured(mut resp: HttpResponse, csp: &HeaderValue) -> HttpResponse {
     resp
 }
 
-/// `/ui/<rest>` → `308 /<rest>`, keeping the query.
-async fn redirect(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
-    let rest = req
-        .path()
-        .strip_prefix("/ui")
-        .unwrap_or("")
-        .trim_start_matches('/');
+/// `/ui` → `308 /ui/`, keeping the query.
+fn redirect(req: &HttpRequest, bundle: &UiBundle) -> HttpResponse {
     let location = match req.query_string() {
-        "" => format!("/{rest}"),
-        q => format!("/{rest}?{q}"),
+        "" => format!("{MOUNT}/"),
+        q => format!("{MOUNT}/?{q}"),
     };
     record(Outcome::Redirect);
     secured(
@@ -282,13 +267,20 @@ fn wants_html(req: &HttpRequest) -> bool {
         .is_some_and(|v| v.contains("text/html"))
 }
 
-async fn fallback(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
+async fn serve(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
     let is_read = matches!(
         *req.method(),
         actix_web::http::Method::GET | actix_web::http::Method::HEAD
     );
-    let key = req.path().trim_start_matches('/');
+    let rest = req.path().strip_prefix(MOUNT).unwrap_or("");
     if is_read {
+        if rest.is_empty() {
+            return redirect(&req, &bundle);
+        }
+        let key = rest.trim_start_matches('/');
+        if key.is_empty() {
+            return index(&req, &bundle).await;
+        }
         if let Some(path) = bundle.files.get(key) {
             let outcome = if is_hashed_asset(key) {
                 Outcome::Asset
