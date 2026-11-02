@@ -2,11 +2,22 @@
 
 **Feature directory**: `specs/010-ui-theming/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: planned 2026-11-02 (next: `/speckit-tasks`)
 **Input**: "Take inspiration from UIs like Netflix + Kali's prettiest themes …
 themeable by the user." (Alison, 2026-11-01)
 **Depends on**: 009 (design tokens FR-007, GPU layer FR-005)
 **Replaces**: jellyfin-web Branding custom-CSS (gap assessment D6)
+
+## Clarifications
+
+### Session 2026-11-02
+
+Answered with the defaults below and sent to the owner to redirect; a change
+from them edits the palettes, not the design.
+
+- Q: Which file format is a theme? → A: TOML for import/export, matching `config.toml`. The stored and resolved form is a platform-neutral token set, not CSS, so 017's phone and TV apps can read it too.
+- Q: Which Kali themes does "prettiest" mean? → A: Kali Dark (the default Xfce/GNOME dark), Kali Purple, and the green-phosphor "hacker" look, shipped as Kali Dark, Kali Purple and Neon Grid. Palettes are pharos's own, from those references; no Kali artwork.
+- Q: Where do themes live before the server's `Prefs` interface exists? → A: In the browser (`localStorage`), per device. The server `Prefs` implementation (017) is its own first piece; US3, FR-004 and FR-008 wait for it.
 
 ## Goal
 
@@ -16,8 +27,7 @@ create, import and export themes, and an admin can set the server default.
 
 ## Theme model
 
-A theme is a versioned, declarative document (TOML or JSON `[NEEDS
-CLARIFICATION: format — recommend TOML to match config.toml]`) with:
+A theme is a versioned, declarative document (TOML) with:
 
 1. **Metadata** — name, author, version, schema version, light/dark, base theme
    it extends.
@@ -53,9 +63,7 @@ user-shared themes safe to import.
 | **Daylight** | — | Light theme meeting AA, for bright rooms |
 | **High Contrast** | — | WCAG AAA, no effects, thick focus ring |
 
-`[NEEDS CLARIFICATION: which Kali themes do you mean by "prettiest" — default
-Kali dark (Xfce/GNOME), Kali Purple, or community themes? Screenshots or names
-would let 010's palette match.]` Names above are pharos's own; no Kali or
+Names above are pharos's own; no Kali or
 Netflix trademarks or artwork are shipped.
 
 ## User Stories
