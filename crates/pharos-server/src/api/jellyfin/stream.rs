@@ -635,6 +635,22 @@ async fn stream_video(
     deliver_stream(&state, &req, path.id_str()).await
 }
 
+/// The 3D output of a progressive WebM stream: 2D only when the client asked
+/// for it. A burned subtitle does not downmix a packed source (V223).
+fn progressive_stereo_output(qs: &str) -> pharos_transcode::StereoOutput {
+    let qs_mono = qs.split('&').any(|kv| {
+        kv.split_once('=').is_some_and(|(k, v)| {
+            k.eq_ignore_ascii_case("StereoMode")
+                && (v.eq_ignore_ascii_case("mono") || v.eq_ignore_ascii_case("mono2d"))
+        })
+    });
+    if qs_mono {
+        pharos_transcode::StereoOutput::Mono2D
+    } else {
+        pharos_transcode::StereoOutput::Preserve
+    }
+}
+
 /// Live progressive VP9/WebM transcode. VP9 + Opus in a WebM container is
 /// decodable by every modern browser (Firefox included) without any system
 /// H.264 codec. Streamed straight from ffmpeg's stdout — no segmenting.
@@ -676,23 +692,7 @@ async fn stream_transcoded_webm(
     // subtitle is BURNED IN (only possible because VP9 re-encodes the frames).
     let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
         .and_then(|abs| codec_relative_index(&sub_abs, abs));
-    let qs_mono = qs.split('&').any(|kv| {
-        kv.split_once('=').is_some_and(|(k, v)| {
-            k.eq_ignore_ascii_case("StereoMode")
-                && (v.eq_ignore_ascii_case("mono") || v.eq_ignore_ascii_case("mono2d"))
-        })
-    });
-    let stereo_output = if qs_mono
-        || (sub_rel.is_some()
-            && item
-                .probe
-                .video_3d_format
-                .is_some_and(|f| f.is_packed_sbs_or_tab()))
-    {
-        pharos_transcode::StereoOutput::Mono2D
-    } else {
-        pharos_transcode::StereoOutput::Preserve
-    };
+    let stereo_output = progressive_stereo_output(qs);
     let opts = TranscodeOptions {
         source_frame_rate: None,
         container: Container::WebM,
@@ -1324,6 +1324,23 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pharos_core::{MediaItem, MediaKind, MediaProbe};
+
+    /// V223 — a burned subtitle on a packed source no longer downmixes the
+    /// progressive stream; only an explicit 2D request does.
+    #[test]
+    fn progressive_stereo_output_is_2d_only_when_asked() {
+        use pharos_transcode::StereoOutput::{Mono2D, Preserve};
+        assert_eq!(progressive_stereo_output("SubtitleStreamIndex=3"), Preserve);
+        assert_eq!(
+            progressive_stereo_output("SubtitleStreamIndex=3&StereoMode=preserve"),
+            Preserve
+        );
+        assert_eq!(progressive_stereo_output("StereoMode=mono"), Mono2D);
+        assert_eq!(
+            progressive_stereo_output("SubtitleStreamIndex=3&stereomode=Mono2D"),
+            Mono2D
+        );
+    }
 
     /// 008 — a URL-backed item is refused by the byte routes, and the refusal
     /// is NOT filed under the reason that means "media has gone from disk".
