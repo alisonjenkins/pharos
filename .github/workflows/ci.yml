@@ -180,6 +180,13 @@ jobs:
       # (PLAYWRIGHT_BROWSERS_PATH, exported by the devShell). No
       # `npx playwright install` — the @playwright/test version is pinned
       # to match playwright-driver so the store path has the right rev.
+      # `pharosTestBins` reuses the flake check's `ci`-profile deps from the
+      # shared store, so only the workspace crates compile, instead of a cold
+      # `cargo build` of the whole tree in this job.
+      - name: Build pharos test binaries
+        run: |
+          out="$(nix build .#pharosTestBins --no-link --print-out-paths)"
+          echo "PHAROS_BIN_DIR=$out/bin" >> "$GITHUB_ENV"
       - name: Run Playwright crawl
         run: nix develop --command bash -c 'just compat-playwright-full'
       - name: Upload Playwright report on failure
