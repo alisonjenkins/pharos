@@ -78,3 +78,4 @@ optional **Alternatives considered** / **References**).
 | [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Accepted |
 | [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
 | [0035](0035-native-ui-vendors-hlsjs.md) | The native web UI plays HLS through a vendored, pinned hls.js 1.7.4 served from `'self'`, loaded only where the browser lacks native HLS | Accepted |
+| [0036](0036-themes-are-toml-over-a-token-model.md) | Themes are TOML documents over a typed, platform-neutral token model; the web UI renders them as `--px-*` custom properties and `pharos.css` reads nothing else | Accepted |
