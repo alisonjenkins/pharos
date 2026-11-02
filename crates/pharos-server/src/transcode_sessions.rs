@@ -285,6 +285,23 @@ where
             .map_err(|_| TranscodeSessionError::ActorDown)
     }
 
+    /// End `session_id` if `user` holds it. Answers whether it was ended: a
+    /// session someone else holds, or none at all, is left alone, so knowing
+    /// another user's PlaySessionId is not enough to stop their playback.
+    pub async fn end_held(
+        &self,
+        session_id: &str,
+        user: pharos_core::UserId,
+    ) -> Result<bool, TranscodeSessionError> {
+        match self.get(session_id).await? {
+            Some(session) if session.holder.user_id == user => {
+                self.remove(session_id).await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Drop durable rows idle past `DB_RETENTION_SECS`. Idempotent + cheap;
     /// safe to run on every replica. Returns rows removed.
     pub async fn prune_store(&self) -> u64 {
