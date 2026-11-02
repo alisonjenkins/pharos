@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    item_id, item_summary, library as wire, Kind, LibraryKind as WireKind,
+    item_id, item_summary, items_result, library as wire, Kind, LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, User, UserItemData};
@@ -13,7 +13,7 @@ use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 use super::bootstrap::token_denial;
 use super::session::Session;
 use crate::services::auth::{user_for_token, TokenRefusal};
-use crate::services::library::{self, KindFilter, LibraryView, ListError};
+use crate::services::library::{self, KindFilter, LibraryView, ListError, ListPage};
 
 pub(super) struct Library {
     session: Rc<Session>,
@@ -97,32 +97,115 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
-        let rows = match library::latest(state, &user, parent.as_deref(), &KindFilter::Unset, limit)
+        let listed = library::latest(state, &user, parent.as_deref(), &KindFilter::Unset, limit)
             .await
-        {
-            Ok(rows) => rows,
-            Err(e) => {
-                let detail = match &e {
-                    ListError::Hidden(hidden) => hidden.label().to_owned(),
-                    ListError::Store(e) => e.to_string(),
-                };
-                tracing::warn!(error = %detail, "native library: latest unavailable");
-                Denial::Unavailable {
-                    dependency: "media store",
+            .map(|items| {
+                let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                ListPage {
+                    items,
+                    total,
+                    start: 0,
                 }
-                .write(results.get().init_result().init_error());
+            });
+        write_listing(
+            results.get().init_result(),
+            listed,
+            "latest",
+            &state.server_id,
+        );
+        Ok(())
+    }
+
+    async fn resume(
+        self: Rc<Self>,
+        params: wire::ResumeParams,
+        results: &mut wire::ResumeResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let kinds = kind_filter(params.get_kinds()?);
+        // 0 is the field's default: the caller asked for no particular limit.
+        let limit = Some(params.get_limit()).filter(|&n| n > 0);
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
                 return Ok(());
             }
         };
-        let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
-        let mut page = results.get().init_result().init_page();
-        page.set_total(count);
-        page.set_start(0);
-        let mut items = page.init_items(count);
-        for (i, (item, user_data)) in (0..count).zip(&rows) {
-            write_item(items.reborrow().get(i), item, *user_data, &state.server_id);
-        }
+        let state = &self.session.state;
+        let listed = library::resume(state, &user, &kinds, 0, limit).await;
+        write_listing(
+            results.get().init_result(),
+            listed,
+            "resume",
+            &state.server_id,
+        );
         Ok(())
+    }
+}
+
+/// A listing's page, or `unavailable` with its cause logged.
+fn write_listing(
+    out: items_result::Builder<'_>,
+    listed: Result<ListPage, ListError>,
+    method: &'static str,
+    server_id: &str,
+) {
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(e) => {
+            let detail = match &e {
+                ListError::Hidden(hidden) => hidden.label().to_owned(),
+                ListError::Store(e) => e.to_string(),
+            };
+            tracing::warn!(method, error = %detail, "native library: listing unavailable");
+            Denial::Unavailable {
+                dependency: "media store",
+            }
+            .write(out.init_error());
+            return;
+        }
+    };
+    let count = u32::try_from(listed.items.len()).unwrap_or(u32::MAX);
+    let mut page = out.init_page();
+    page.set_total(listed.total);
+    page.set_start(listed.start);
+    let mut items = page.init_items(count);
+    for (i, (item, user_data)) in (0..count).zip(&listed.items) {
+        write_item(items.reborrow().get(i), item, *user_data, server_id);
+    }
+}
+
+/// The stored kinds a `kinds` list names; an empty list names none, so
+/// keeps every kind. Kinds pharos only synthesises (series, album…) are never
+/// stored, so a list of only those matches nothing (B153).
+fn kind_filter(kinds: capnp::enum_list::Reader<'_, Kind>) -> KindFilter {
+    if kinds.is_empty() {
+        return KindFilter::Unset;
+    }
+    let mut stored: Vec<MediaKind> = kinds
+        .iter()
+        .filter_map(|k| match k.ok()? {
+            Kind::Movie => Some(MediaKind::Movie),
+            Kind::Episode => Some(MediaKind::Episode),
+            Kind::Audio => Some(MediaKind::Audio),
+            Kind::Book => Some(MediaKind::Book),
+            Kind::Series
+            | Kind::Season
+            | Kind::Album
+            | Kind::Artist
+            | Kind::Person
+            | Kind::Collection
+            | Kind::Playlist
+            | Kind::Channel
+            | Kind::Library => None,
+        })
+        .collect();
+    stored.dedup();
+    if stored.is_empty() {
+        KindFilter::MatchesNothing
+    } else {
+        KindFilter::Kinds(stored)
     }
 }
 

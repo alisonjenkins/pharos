@@ -269,7 +269,6 @@ async fn wire_latest(
     session: &session::Client,
     parent: Option<pharos_jellyfin_api::dto::WireId>,
 ) -> Vec<serde_json::Value> {
-    use pharos_api::pharos_capnp::{item_id, opt_u16, opt_u32};
     use pharos_jellyfin_api::dto::WireId;
     let library = session.library_request().send().pipeline.get_library();
     let mut req = library.latest_request();
@@ -282,11 +281,18 @@ async fn wire_latest(
         }
     }
     let reply = req.send().promise.await.expect("latest");
-    let result = reply.get().unwrap().get_result().unwrap();
+    summaries(reply.get().unwrap().get_result().unwrap()).1
+}
+
+/// The page's total and its items as the Jellyfin fields the tests compare.
+fn summaries(result: items_result::Reader<'_>) -> (u32, Vec<serde_json::Value>) {
+    use pharos_api::pharos_capnp::{item_id, opt_u16, opt_u32};
+    use pharos_jellyfin_api::dto::WireId;
     let items_result::Page(page) = result.which().unwrap() else {
-        panic!("latest answered an error");
+        panic!("the listing answered an error");
     };
-    let items = page.unwrap().get_items().unwrap();
+    let page = page.unwrap();
+    let items = page.get_items().unwrap();
     let opt16 = |o: opt_u16::Reader<'_>| match o.which().unwrap() {
         opt_u16::Some(n) => Some(u32::from(n)),
         opt_u16::None(()) => None,
@@ -295,7 +301,7 @@ async fn wire_latest(
         opt_u32::Some(n) => Some(n),
         opt_u32::None(()) => None,
     };
-    items
+    let items = items
         .iter()
         .map(|item| {
             let id = match item.get_id().unwrap().which().unwrap() {
@@ -311,6 +317,24 @@ async fn wire_latest(
                 "IndexNumber": item.has_index_number().then(|| opt32(item.get_index_number().unwrap())).flatten(),
                 "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
                 "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
+            })
+        })
+        .collect();
+    (page.get_total(), items)
+}
+
+/// A Jellyfin `BaseItemDto` list reduced to the fields `summaries` reads.
+fn project(dtos: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    dtos.iter()
+        .map(|d| {
+            serde_json::json!({
+                "Id": d["Id"],
+                "Name": d["Name"],
+                "ProductionYear": d.get("ProductionYear").cloned().unwrap_or_default(),
+                "SeriesName": d.get("SeriesName").cloned().unwrap_or_default(),
+                "IndexNumber": d.get("IndexNumber").cloned().unwrap_or_default(),
+                "ParentIndexNumber": d.get("ParentIndexNumber").cloned().unwrap_or_default(),
+                "Primary": d["ImageTags"].get("Primary").cloned().unwrap_or_default(),
             })
         })
         .collect()
@@ -364,35 +388,17 @@ async fn native_latest_agrees_with_the_jellyfin_latest_route() {
             .insert_header(("X-Emby-Token", fx.user_token.as_str()))
             .to_request()
     };
-    let project = |body: serde_json::Value| -> Vec<serde_json::Value> {
-        body.as_array()
-            .unwrap()
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "Id": d["Id"],
-                    "Name": d["Name"],
-                    "ProductionYear": d.get("ProductionYear").cloned().unwrap_or_default(),
-                    "SeriesName": d.get("SeriesName").cloned().unwrap_or_default(),
-                    "IndexNumber": d.get("IndexNumber").cloned().unwrap_or_default(),
-                    "ParentIndexNumber": d.get("ParentIndexNumber").cloned().unwrap_or_default(),
-                    "Primary": d["ImageTags"].get("Primary").cloned().unwrap_or_default(),
-                })
-            })
-            .collect()
-    };
-
     let native = wire_latest(&session, None).await;
     assert!(!native.is_empty());
     let web: serde_json::Value = test::call_and_read_body_json(&app, jellyfin(None)).await;
-    assert_eq!(native, project(web));
+    assert_eq!(native, project(web.as_array().unwrap()));
 
     // The id `Library.views` hands out scopes `latest` to that library.
     let lib_a = WireId::parse(&fx.lib_a_wire).unwrap();
     let scoped = wire_latest(&session, Some(lib_a)).await;
     let web: serde_json::Value =
         test::call_and_read_body_json(&app, jellyfin(Some(&fx.lib_a_wire))).await;
-    assert_eq!(scoped, project(web));
+    assert_eq!(scoped, project(web.as_array().unwrap()));
     let mut ids: Vec<_> = scoped.iter().map(|i| i["Id"].clone()).collect();
     ids.sort_by_key(|v| v.to_string());
     assert_eq!(
@@ -525,4 +531,95 @@ async fn resume_lists_what_the_user_started_that_the_policy_allows() {
     let mut seen = ids(&a);
     seen.sort_unstable();
     assert_eq!((seen, a.total), (vec![fx.rich_item_id, 300], 2));
+}
+
+/// `Library.resume` on `session` for `kinds`, as its total and items.
+async fn wire_resume(session: &session::Client, kinds: &[Kind]) -> (u32, Vec<serde_json::Value>) {
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.resume_request();
+    req.get().init_ctx();
+    let mut list = req.get().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    let reply = req.send().promise.await.expect("resume");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// T031 over the wire: `Library.resume` lists what the Jellyfin Resume route
+/// lists for the same user and media types, with the same total; kinds that
+/// are never stored match nothing; a policy change applies to the next call.
+/// Disarm check: with `kind_filter` reading an empty list as `MatchesNothing`,
+/// the unfiltered call lists nothing and the agreement fails.
+#[actix_web::test]
+async fn native_resume_agrees_with_the_jellyfin_resume_route() {
+    use actix_web::test;
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 300,
+            path: "/libA/song.flac".into(),
+            title: "Song".into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    start_watching(&fx, &[fx.rich_item_id, fx.other_item_id, 300]).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let uid = fx.user_id.0.simple();
+    let jellyfin = |media_types: &str| {
+        test::TestRequest::get()
+            .uri(&format!(
+                "/Users/{uid}/Items/Resume?MediaTypes={media_types}"
+            ))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request()
+    };
+
+    for (kinds, media_types) in [
+        (&[][..], ""),
+        (&[Kind::Movie, Kind::Episode][..], "Video"),
+        (&[Kind::Audio][..], "Audio"),
+    ] {
+        let (total, native) = wire_resume(&session, kinds).await;
+        let web: serde_json::Value =
+            test::call_and_read_body_json(&app, jellyfin(media_types)).await;
+        assert_eq!(
+            native,
+            project(web["Items"].as_array().unwrap()),
+            "{media_types}"
+        );
+        assert_eq!(u64::from(total), web["TotalRecordCount"].as_u64().unwrap());
+    }
+    assert_eq!(wire_resume(&session, &[]).await.0, 3);
+    assert_eq!(
+        wire_resume(&session, &[Kind::Series, Kind::Album]).await,
+        (0, Vec::new())
+    );
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (total, items) = wire_resume(&session, &[]).await;
+    assert_eq!(total, 1);
+    assert_eq!(
+        items[0]["Id"],
+        pharos_jellyfin_api::dto::WireId::Real(fx.other_item_id).to_string()
+    );
 }
