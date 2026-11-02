@@ -971,6 +971,26 @@ impl PreferenceStore for AnyStore {
     }
 }
 
+impl pharos_core::UserPrefStore for AnyStore {
+    async fn get_user_pref(&self, user: UserId, key: &str) -> DomainResult<Option<Vec<u8>>> {
+        match self {
+            AnyStore::Sqlite(s) => pharos_core::UserPrefStore::get_user_pref(s, user, key).await,
+            AnyStore::Postgres(p) => pharos_core::UserPrefStore::get_user_pref(p, user, key).await,
+        }
+    }
+
+    async fn set_user_pref(&self, user: UserId, key: &str, value: &[u8]) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                pharos_core::UserPrefStore::set_user_pref(s, user, key, value).await
+            }
+            AnyStore::Postgres(p) => {
+                pharos_core::UserPrefStore::set_user_pref(p, user, key, value).await
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // TranscodeSessionStore
 // ---------------------------------------------------------------------

@@ -16,7 +16,7 @@ use pharos_core::{
     MediaStore, PersistedSyncGroup, PersistedTranscodeSession, PersonKind, PersonRef, PersonStore,
     PlaylistStore, PreferenceStore, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
     StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -60,6 +60,7 @@ where
         + pharos_core::TokenStore
         + pharos_core::UserDataStore
         + pharos_core::PreferenceStore
+        + pharos_core::UserPrefStore
         + pharos_core::GenreStore
         + pharos_core::TagStore
         + pharos_core::PersonStore
@@ -719,6 +720,48 @@ where
             .unwrap()
             .as_deref(),
         Some(r#"{"x":1}"#)
+    );
+
+    // UserPrefStore: absent, set, overwrite, bytes verbatim, per-user, per-key.
+    let other = user_record("pref-other");
+    let other_id = other.id;
+    UserStore::create(&store, other).await.unwrap();
+    assert!(
+        UserPrefStore::get_user_pref(&store, uid, "diagnostics.opt_in")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    UserPrefStore::set_user_pref(&store, uid, "diagnostics.opt_in", b"true")
+        .await
+        .unwrap();
+    UserPrefStore::set_user_pref(&store, uid, "diagnostics.opt_in", b"false")
+        .await
+        .unwrap();
+    UserPrefStore::set_user_pref(&store, uid, "binary", &[0, 255, 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        UserPrefStore::get_user_pref(&store, uid, "diagnostics.opt_in")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"false"[..]),
+        "a second set replaces the first"
+    );
+    assert_eq!(
+        UserPrefStore::get_user_pref(&store, uid, "binary")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&[0u8, 255, 1][..])
+    );
+    assert!(
+        UserPrefStore::get_user_pref(&store, other_id, "diagnostics.opt_in")
+            .await
+            .unwrap()
+            .is_none(),
+        "one user's pref is not another's"
     );
 
     // -----------------------------------------------------------------
