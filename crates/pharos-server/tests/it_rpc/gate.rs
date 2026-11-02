@@ -31,10 +31,13 @@ async fn status(enabled: bool, method: &str, path: &str) -> u16 {
 async fn native_routes_do_not_exist_when_disabled() {
     assert_eq!(status(false, "GET", "/pharos/rpc").await, 404);
     assert_eq!(status(false, "POST", "/pharos/session").await, 404);
+    assert_eq!(status(false, "GET", "/pharos/session").await, 404);
 }
 
 #[actix_web::test]
 async fn native_routes_exist_when_enabled() {
     // A plain GET is not a WebSocket upgrade: refused, but routed.
     assert_ne!(status(true, "GET", "/pharos/rpc").await, 404);
+    // pharos-ui's probe: the resource exists but has no GET.
+    assert_eq!(status(true, "GET", "/pharos/session").await, 405);
 }
