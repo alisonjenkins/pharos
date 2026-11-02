@@ -651,6 +651,7 @@ async fn join_group(
     hub: web::Data<SessionHub>,
     sinks: web::Data<MemberSinks>,
     registry: web::Data<GroupRegistry>,
+    state: web::Data<crate::state::AppState>,
     body: web::Json<JoinGroupBody>,
 ) -> HttpResponse {
     let Some(dev) = auth.sync_key() else {
@@ -660,6 +661,26 @@ async fn join_group(
         tracing::error!("syncplay: group registry unreachable on Join");
         return no_content();
     };
+    let queue = handle
+        .snapshot()
+        .await
+        .map(|s| s.queue_item_ids)
+        .unwrap_or_default();
+    if !may_see_queue(&state, &auth.user, &queue).await {
+        group_hidden(
+            GroupHiddenRoute::Join,
+            &auth.user,
+            &handle.group_id.to_string(),
+        );
+        // Jellyfin-web leaves group mode on NotInGroup rather than waiting.
+        if let Some(sess) = hub.resolve(&dev) {
+            let _ = sess
+                .sink
+                .send(pharos_sync::messages::ServerMsg::NotInGroup)
+                .await;
+        }
+        return no_content();
+    }
     tracing::info!(device_id = %dev, group = %handle.group_id, "syncplay: Join group");
     add_caller_to_group(&hub, &sinks, &dev, handle).await;
     no_content()
@@ -1117,8 +1138,55 @@ fn play_state_str(s: pharos_sync::messages::GroupPlayState) -> &'static str {
     }
 }
 
+/// Where a group was withheld from a user: the `route` label of
+/// `pharos_syncplay_group_hidden_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupHiddenRoute {
+    List,
+    Join,
+}
+
+impl GroupHiddenRoute {
+    fn label(self) -> &'static str {
+        match self {
+            GroupHiddenRoute::List => "list",
+            GroupHiddenRoute::Join => "join",
+        }
+    }
+}
+
+fn group_hidden(route: GroupHiddenRoute, user: &pharos_core::User, group: &str) {
+    metrics::counter!("pharos_syncplay_group_hidden_total", "route" => route.label()).increment(1);
+    tracing::warn!(user = %user.name, group, route = route.label(), "syncplay group withheld: its queue holds an item the user may not see");
+}
+
+/// Whether `user` may see every item in a group's queue, and so the group
+/// itself: its name, its members and what it plays (V201). An entry that
+/// names no stored item hides the group.
+async fn may_see_queue(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    queue: &[String],
+) -> bool {
+    if user.policy.enable_all_folders || queue.is_empty() {
+        return true;
+    }
+    let Some(mut ids) = queue
+        .iter()
+        .map(|w| pharos_jellyfin_api::dto::parse_item_id(w))
+        .collect::<Option<Vec<u64>>>()
+    else {
+        return false;
+    };
+    let wanted = ids.len();
+    crate::services::access::retain_visible(state, user, &mut ids, |id| *id, "syncplay")
+        .await
+        .is_ok()
+        && ids.len() == wanted
+}
+
 async fn list_groups(
-    _user: AuthUser,
+    user: AuthUser,
     registry: web::Data<GroupRegistry>,
     state: web::Data<crate::state::AppState>,
 ) -> impl Responder {
@@ -1135,6 +1203,10 @@ async fn list_groups(
             continue;
         };
         seen.insert(snap.id.to_string());
+        if !may_see_queue(&state, &user.0, &snap.queue_item_ids).await {
+            group_hidden(GroupHiddenRoute::List, &user.0, &snap.id.to_string());
+            continue;
+        }
         out.push(GroupInfoDto {
             group_id: snap.id.to_string(),
             group_name: snap.group_name,
@@ -1160,6 +1232,10 @@ async fn list_groups(
                 let Some(summary) = pharos_sync::group::snapshot_summary(&row.state_json) else {
                     continue;
                 };
+                if !may_see_queue(&state, &user.0, &summary.queue_item_ids).await {
+                    group_hidden(GroupHiddenRoute::List, &user.0, &row.group_id);
+                    continue;
+                }
                 out.push(GroupInfoDto {
                     group_id: row.group_id,
                     group_name: summary.group_name,
@@ -1564,6 +1640,13 @@ mod tests {
                 && waited <= SOCKET_REGISTRATION_WAIT + std::time::Duration::from_millis(10),
             "gave up at the deadline, not before or long after: {waited:?}"
         );
+    }
+
+    #[actix_web::test]
+    async fn group_hidden_route_labels_are_distinct() {
+        assert_eq!(GroupHiddenRoute::List.label(), "list");
+        assert_eq!(GroupHiddenRoute::Join.label(), "join");
+        assert_ne!(GroupHiddenRoute::List.label(), GroupHiddenRoute::Join.label());
     }
 
     #[actix_web::test]

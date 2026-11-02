@@ -796,3 +796,125 @@ async fn a_box_set_answers_only_through_visible_members() {
         leaked.join("\n")
     );
 }
+
+fn syncplay_hidden_total(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    route: &str,
+) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_syncplay_group_hidden_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "route" && l.value() == route)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
+
+/// B265: a SyncPlay group is listed to, and joined by, only a user who may
+/// see every item in its queue (V201): its name, its members and what it
+/// plays are otherwise another library's. Disarm check: with `may_see_queue`
+/// answering true, the library A group lists for a user restricted to
+/// library B and neither route counts a refusal.
+#[actix_web::test]
+async fn a_syncplay_group_answers_only_a_user_who_may_see_its_queue() {
+    use pharos_sync::group::GroupMsg;
+    use pharos_sync::messages::MemberId;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let sinks = pharos_sync::MemberSinks::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    // A group playing library A's item, kept alive by its leader.
+    let group = registry.create().await.unwrap();
+    let (tx, _leader_rx) = tokio::sync::mpsc::channel(64);
+    let leader = MemberId::new();
+    sinks.insert(leader, 1, tx);
+    let (reply, joined) = tokio::sync::oneshot::channel();
+    group
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: leader,
+            name: "admin".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+    joined.await.unwrap();
+    group
+        .tx
+        .send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec![pharos_jellyfin_api::dto::wire_item_id(f.rich_item_id)],
+            item_runtimes_ms: vec![None],
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(group.snapshot().await.unwrap().queue_item_ids.len(), 1);
+
+    let app = test::init_service(
+        build_app(f.state.clone())
+            .app_data(actix_web::web::Data::new(registry))
+            .app_data(actix_web::web::Data::new(sinks))
+            .app_data(actix_web::web::Data::new(pharos_sync::SessionHub::new())),
+    )
+    .await;
+    let list = || {
+        test::TestRequest::get()
+            .uri("/SyncPlay/List")
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+    let group_id = group.group_id.to_string();
+
+    restrict_to_library_a(&f).await;
+    let body: serde_json::Value = test::call_and_read_body_json(&app, list()).await;
+    assert_eq!(body[0]["GroupId"], group_id, "{body}");
+
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    let mut leaked = Vec::new();
+    let body: serde_json::Value = test::call_and_read_body_json(&app, list()).await;
+    if body.as_array().is_none_or(|a| !a.is_empty()) {
+        leaked.push(format!("/SyncPlay/List: {body}"));
+    }
+    if syncplay_hidden_total(&snapshotter, "list") != 1 {
+        leaked.push("list refusal not counted".into());
+    }
+    let join = test::TestRequest::post()
+        .uri("/SyncPlay/Join")
+        .insert_header(("X-Emby-Token", f.user_token.as_str()))
+        .insert_header((
+            "X-Emby-Authorization",
+            "MediaBrowser Client=\"t\", Device=\"t\", DeviceId=\"d1\", Version=\"1\"",
+        ))
+        .set_json(serde_json::json!({ "GroupId": group_id }))
+        .to_request();
+    let status = test::call_service(&app, join).await.status();
+    if syncplay_hidden_total(&snapshotter, "join") != 1 {
+        leaked.push(format!("join ({status}) refusal not counted"));
+    }
+    assert!(
+        leaked.is_empty(),
+        "library A's group leaked:\n{}",
+        leaked.join("\n")
+    );
+}
