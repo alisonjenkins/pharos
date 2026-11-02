@@ -285,8 +285,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let mut lock = stdout.lock();
     writeln!(
         lock,
-        "seeded: user='playwright' password='playwright-test-pw' (admin), 11 items \
-         (incl. 3-episode series + multitrack + epub + cbz + pdf), fixture={}",
+        "seeded: user='playwright' password='playwright-test-pw' (admin), 12 items \
+         (incl. 3-episode series + a second show + multitrack + epub + cbz + pdf), fixture={}",
         paths.movie.display()
     )?;
     Ok(())
@@ -302,6 +302,8 @@ struct SeedPaths {
     episode_legacy: std::path::PathBuf,
     audio: std::path::PathBuf,
     series_eps: [std::path::PathBuf; 3],
+    /// One episode of a second show, so a TV library has two series to sort.
+    other_show_ep: std::path::PathBuf,
     multitrack: std::path::PathBuf,
     /// 004-books — a real, minimal epub so `books.spec.ts` can drive
     /// jellyfin-web's `bookPlayer` (epub.js) against unmodified client code.
@@ -325,7 +327,7 @@ struct SeedPaths {
 /// the dual-audio / 2-subtitle clip (for the audio/subtitle-swap test).
 #[cfg(debug_assertions)]
 async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), AppError> {
-    use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
 
     let legacy: [(u64, MediaKind, &std::path::PathBuf); 4] = [
         (1, MediaKind::Movie, &paths.movie),
@@ -344,25 +346,26 @@ async fn register_seed_items(stores: &Stores, paths: &SeedPaths) -> Result<(), A
         let _ = stores.put(item).await;
     }
 
-    // 3-episode series (ids 5-7). `series_folder` gives a stable series_key so
-    // pharos synthesises one Series + Season with three ordered episodes.
-    let series_folder = paths.series_eps[0]
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned());
-    for (idx, path) in paths.series_eps.iter().enumerate() {
-        let ep = (idx + 1) as u32;
+    // 3-episode series (ids 5-7) and one episode of a second show (id 12),
+    // laid out `TV/<Show>/Season 01/<Show> - S01E0N` so the startup rescan
+    // parses the same name, season and folder the seed records here.
+    let episodes = paths
+        .series_eps
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| (5 + idx as u64, path))
+        .chain([(12, &paths.other_show_ep)]);
+    for (id, path) in episodes {
+        let series = pharos_scanner::fs::parse_series_info(path);
+        let title = path
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let item = MediaItem {
-            id: 5 + idx as u64,
+            id,
             path: path.clone(),
-            title: format!("Playwright Show S01E0{ep}"),
+            title,
             kind: MediaKind::Episode,
-            series: Some(SeriesInfo {
-                series_name: "Playwright Show".into(),
-                season_number: Some(1),
-                episode_number: Some(ep),
-                series_folder: series_folder.clone(),
-                series_year: Some(2026),
-            }),
+            series,
             ..Default::default()
         };
         let _ = stores.put(item).await;
@@ -736,19 +739,23 @@ async fn generate_seed_fixtures(
     .await?;
 
     // Copy the base into every single-track path (UNIQUE(path) needs distinct
-    // files). Order: movie, movie2, episode_legacy, audio, s01e01..03.
+    // files). Order: movie, movie2, episode_legacy, audio, s01e01..03, other show.
     let single_names = [
         "fixture-1.webm",
         "fixture-2.webm",
         "fixture-3.webm",
         "fixture-4.webm",
-        "show-s01e01.webm",
-        "show-s01e02.webm",
-        "show-s01e03.webm",
+        "TV/Playwright Show/Season 01/Playwright Show - S01E01.webm",
+        "TV/Playwright Show/Season 01/Playwright Show - S01E02.webm",
+        "TV/Playwright Show/Season 01/Playwright Show - S01E03.webm",
+        "TV/Another Show/Season 01/Another Show - S01E01.webm",
     ];
     let mut singles: Vec<std::path::PathBuf> = Vec::with_capacity(single_names.len());
     for name in single_names {
         let dst = target_dir.join(name);
+        if let Some(dir) = dst.parent() {
+            tokio::fs::create_dir_all(dir).await.map_err(AppError::Io)?;
+        }
         tokio::fs::copy(&base, &dst).await.map_err(AppError::Io)?;
         singles.push(dst);
     }
@@ -835,6 +842,7 @@ async fn generate_seed_fixtures(
         episode_legacy: singles[2].clone(),
         audio: singles[3].clone(),
         series_eps: [singles[4].clone(), singles[5].clone(), singles[6].clone()],
+        other_show_ep: singles[7].clone(),
         multitrack,
         epub,
         cbz,
@@ -2225,10 +2233,11 @@ mod seed_tests {
             episode_legacy: p("fixture-3.webm"),
             audio: p("fixture-4.webm"),
             series_eps: [
-                p("show/show-s01e01.webm"),
-                p("show/show-s01e02.webm"),
-                p("show/show-s01e03.webm"),
+                p("TV/Playwright Show/Season 01/Playwright Show - S01E01.webm"),
+                p("TV/Playwright Show/Season 01/Playwright Show - S01E02.webm"),
+                p("TV/Playwright Show/Season 01/Playwright Show - S01E03.webm"),
             ],
+            other_show_ep: p("TV/Another Show/Season 01/Another Show - S01E01.webm"),
             epub: p("Playwright Book.epub"),
             cbz: p("Playwright Comic.cbz"),
             pdf: p("Playwright Manual.pdf"),
@@ -2246,7 +2255,16 @@ mod seed_tests {
             assert_eq!(s.series_name, "Playwright Show");
             assert_eq!(s.season_number, Some(1));
             assert_eq!(s.episode_number, Some(ep));
+            assert_eq!(s.series_folder.as_deref(), Some("/seed/TV/Playwright Show"));
         }
+        // A second show, so a TV library lists two series.
+        let other = stores
+            .get(12)
+            .await
+            .unwrap()
+            .series
+            .expect("SeriesInfo set");
+        assert_eq!(other.series_name, "Another Show");
         // The multitrack clip is registered as a Movie.
         assert_eq!(stores.get(8).await.unwrap().kind, MediaKind::Movie);
 
