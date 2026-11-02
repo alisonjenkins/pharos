@@ -1,25 +1,58 @@
 /* pharos minimum stylesheet. T26/T27 grow this. */
 
 :root {
-  color-scheme: dark light;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  --bg: #0e1116;
-  --fg: #e6e8eb;
-  --muted: #8b95a5;
-  --accent: #4cb4ff;
-  --tile-bg: #1a2030;
-  --error: #ff6b6b;
+  color-scheme: dark;
+  --px-color-bg: #0e1116;
+  --px-color-surface: #1a2030;
+  --px-color-surface-raised: #222a3b;
+  --px-color-overlay: #11151c;
+  --px-color-border: #2a3142;
+  --px-color-fg: #e6e8eb;
+  --px-color-fg-muted: #8b95a5;
+  --px-color-accent: #4cb4ff;
+  --px-color-accent-fg: #001e2e;
+  --px-color-focus: #8fd0ff;
+  --px-color-success: #3ddc97;
+  --px-color-warning: #ffb454;
+  --px-color-danger: #ff6b6b;
+  --px-color-progress: #4cb4ff;
+  --px-color-badge: #ff8a3d;
+  --px-color-kind-movie: #ff8a5b;
+  --px-color-kind-show: #7c9cff;
+  --px-color-kind-music: #3ddc97;
+  --px-color-kind-book: #e0b252;
+  --px-color-kind-live: #ff6b6b;
+  --px-font-ui: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --px-font-display: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --px-type-base: 16px;
+  --px-type-scale: 1.2;
+  --px-type-step--1: 0.8333rem;
+  --px-type-step-0: 1rem;
+  --px-type-step-1: 1.2rem;
+  --px-type-step-2: 1.44rem;
+  --px-type-step-3: 1.728rem;
+  --px-type-step-4: 2.0736rem;
+  --px-space-unit: 8px;
+  --px-radius: 8px;
+  --px-border: 1px;
+  --px-motion-duration: 180ms;
+  --px-motion-easing: cubic-bezier(0.2, 0, 0, 1);
+  --px-motion-focus-scale: 1.05;
+  --px-effect-blur: 24px;
+  --px-effect-vignette: 0.3;
+  --px-effect-glow: 0.4;
 }
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--fg);
+  font-family: var(--px-font-ui);
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
 }
 
 .pharos-banner {
   padding: 1rem 1.5rem;
-  border-bottom: 1px solid #1f2530;
+  border-bottom: 1px solid var(--px-color-border);
 }
 .pharos-banner h1 {
   margin: 0;
@@ -39,26 +72,26 @@ body {
   display: grid;
   gap: 0.25rem;
   font-size: 0.875rem;
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
 }
 .pharos-login input {
   padding: 0.5rem 0.75rem;
   border-radius: 4px;
-  border: 1px solid #2a3142;
-  background: #11151c;
-  color: var(--fg);
+  border: 1px solid var(--px-color-border);
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
 }
 .pharos-login button {
   padding: 0.6rem;
   border: 0;
   border-radius: 4px;
-  background: var(--accent);
-  color: #001e2e;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
   font-weight: 600;
   cursor: pointer;
 }
 .pharos-error {
-  color: var(--error);
+  color: var(--px-color-danger);
   font-size: 0.875rem;
   margin: 0;
 }
@@ -72,7 +105,7 @@ body {
   gap: 1rem;
 }
 .pharos-tile {
-  background: var(--tile-bg);
+  background: var(--px-color-surface);
   border-radius: 8px;
   padding: 0.75rem;
   cursor: pointer;
@@ -83,7 +116,7 @@ body {
 }
 .pharos-tile-kind {
   font-size: 0.75rem;
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
@@ -92,7 +125,7 @@ body {
   font-size: 1rem;
 }
 .pharos-empty {
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
 }
 
 /* native UI (009) */
@@ -100,7 +133,7 @@ body {
 a:focus-visible,
 button:focus-visible,
 input:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--px-color-accent);
   outline-offset: 2px;
 }
 
@@ -142,7 +175,7 @@ input:focus-visible {
   max-width: 32rem;
   margin: 4rem auto;
   padding: 1.5rem;
-  background: var(--tile-bg);
+  background: var(--px-color-surface);
   border-radius: 8px;
   text-align: center;
 }
@@ -150,22 +183,22 @@ input:focus-visible {
   margin: 0 0 0.5rem;
 }
 .pharos-status p {
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
   margin: 0 0 1.5rem;
 }
 .pharos-status button {
   padding: 0.6rem 1.25rem;
   border: 0;
   border-radius: 4px;
-  background: var(--accent);
-  color: #001e2e;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
   font-weight: 600;
   cursor: pointer;
 }
 
 .pharos-loading,
 .pharos-muted {
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
 }
 
 .pharos-rail {
@@ -223,7 +256,7 @@ input:focus-visible {
   position: relative;
   aspect-ratio: 2 / 3;
   border-radius: 6px;
-  background: var(--tile-bg);
+  background: var(--px-color-surface);
   overflow: hidden;
 }
 .pharos-poster-art img {
@@ -241,7 +274,7 @@ input:focus-visible {
   height: 100%;
   font-size: 3rem;
   font-weight: 600;
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
   user-select: none;
 }
 
@@ -254,8 +287,8 @@ input:focus-visible {
   font-weight: 600;
   line-height: 1;
   border-radius: 9999px;
-  background: var(--bg);
-  color: var(--fg);
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
 }
 
 .pharos-progress {
@@ -263,7 +296,7 @@ input:focus-visible {
   bottom: 0;
   left: 0;
   height: 4px;
-  background: var(--accent);
+  background: var(--px-color-accent);
 }
 
 .pharos-poster-name {
@@ -279,7 +312,7 @@ input:focus-visible {
 .pharos-poster-sub {
   display: block;
   font-size: 0.75rem;
-  color: var(--muted);
+  color: var(--px-color-fg-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -317,8 +350,8 @@ input:focus-visible {
   display: inline-block;
   padding: 0.6rem 1.25rem;
   border-radius: 4px;
-  background: var(--accent);
-  color: #001e2e;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
   font-weight: 600;
   text-decoration: none;
   cursor: pointer;
@@ -356,7 +389,7 @@ input:focus-visible {
   display: block;
   width: 100%;
   max-height: 80vh;
-  background: black;
+  background: black; /* not themed: the letterbox around video is black in every theme */
   border-radius: 8px;
 }
 
@@ -370,3 +403,8 @@ input:focus-visible {
   }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --px-motion-duration: 0ms;
+  }
+}
