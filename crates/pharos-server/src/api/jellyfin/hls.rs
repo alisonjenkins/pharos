@@ -126,7 +126,7 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// anyway. Always 204, matching Jellyfin (jellyfin-web ignores the body).
 async fn stop_active_encodings(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     req: HttpRequest,
 ) -> HttpResponse {
     // PlaySessionId is a query param; match case-insensitively (clients send
@@ -142,7 +142,9 @@ async fn stop_active_encodings(
         // stopping the current item to play the next (episode swap), so the
         // abandoned segments stop transcoding instead of stealing encoder slots.
         state.prefetch_tasks.cancel(&psid);
-        if let Err(e) = state.transcode_sessions.remove(&psid).await {
+        // Only the session's holder may end it (B256), the same rule as
+        // /Sessions/Playing/Stopped.
+        if let Err(e) = state.transcode_sessions.end_held(&psid, user.0.id).await {
             tracing::warn!(
                 error = %e,
                 psid = %pharos_core::secret_prefix(&psid),
