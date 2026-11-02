@@ -20,7 +20,7 @@ async fn wire_set(session: &session::Client, id: WireId, set: Set) -> Result<Sta
         WireId::Real(n) => out.set_real(n),
         WireId::Synth(n) => out.set_synth(n),
     };
-    let reply = match set {
+    match set {
         Set::Played(played) => {
             let mut req = user_data.set_played_request();
             req.get().init_ctx();
@@ -37,8 +37,7 @@ async fn wire_set(session: &session::Client, id: WireId, set: Set) -> Result<Sta
             let reply = req.send().promise.await.expect("setFavorite");
             read_state(reply.get().unwrap().get_result().unwrap())
         }
-    };
-    reply
+    }
 }
 
 fn read_state(result: user_state_result::Reader<'_>) -> Result<State, String> {
@@ -77,8 +76,9 @@ fn jellyfin_state(user_data: &serde_json::Value) -> State {
 /// T036 over the wire: each native write answers the state the Jellyfin
 /// item route then reads, a Jellyfin write is what the next native write
 /// starts from, and every write reaches the user's jellyfin-web sockets.
-/// Disarm check: with `set_played` ignoring its `played` argument, or
-/// `update` not announcing the change, the agreement fails.
+/// Disarm check: with `set_played` ignoring its `played` argument,
+/// `apply_played` keeping the resume position, or `update` not announcing
+/// the change, the agreement fails.
 #[actix_web::test]
 async fn native_user_data_agrees_with_the_jellyfin_routes() {
     use actix_web::test;
@@ -107,6 +107,15 @@ async fn native_user_data_agrees_with_the_jellyfin_routes() {
         other => panic!("expected a UserDataChanged broadcast, got {other:?}"),
     };
 
+    // A resume position the writes must clear (B176): playing from the
+    // start resets it, and so does unmarking.
+    let (stores, user_id) = (&fx.state.stores, fx.user_id);
+    let resume_at = |ticks: u64| async move {
+        let mut data = stores.get_user_data(user_id, id).await.unwrap();
+        data.last_played_position_ticks = ticks;
+        stores.set_user_data(user_id, id, data).await.unwrap();
+    };
+    resume_at(600_000_000).await;
     let played = wire_set(&session, WireId::Real(id), Set::Played(true)).await;
     assert_eq!(played, Ok((true, false, 1, 0)));
     assert_eq!(Ok(announced()), played);
@@ -120,6 +129,7 @@ async fn native_user_data_agrees_with_the_jellyfin_routes() {
     assert_eq!(jellyfin_state(&web), (true, true, 1, 0));
     announced();
 
+    resume_at(700_000_000).await;
     let unplayed = wire_set(&session, WireId::Real(id), Set::Played(false)).await;
     assert_eq!(unplayed, Ok((false, true, 1, 0)));
     assert_eq!(Ok(announced()), unplayed);
@@ -128,6 +138,11 @@ async fn native_user_data_agrees_with_the_jellyfin_routes() {
     assert_eq!(Ok(announced()), unfavourite);
     let web: serde_json::Value = test::call_and_read_body_json(&app, read()).await;
     assert_eq!(Ok(jellyfin_state(&web["UserData"])), unfavourite);
+
+    // Each play counts.
+    let replayed = wire_set(&session, WireId::Real(id), Set::Played(true)).await;
+    assert_eq!(replayed, Ok((true, false, 2, 0)));
+    announced();
 }
 
 /// T036: writing to an item the policy hides answers `notFound` exactly like
