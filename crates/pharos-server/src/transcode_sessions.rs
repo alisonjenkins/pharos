@@ -187,14 +187,14 @@ where
                     .await
                 {
                     tracing::warn!(
-                        psid = %session_id,
+                        psid = %pharos_core::secret_prefix(&session_id),
                         error = %e,
                         "transcode session write-through failed; failover unavailable for this session"
                     );
                 }
             }
             Err(e) => tracing::warn!(
-                psid = %session_id,
+                psid = %pharos_core::secret_prefix(&session_id),
                 error = %e,
                 "transcode session serialize failed; not persisted"
             ),
@@ -250,7 +250,7 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(
-                        psid = %session_id,
+                        psid = %pharos_core::secret_prefix(session_id),
                         error = %e,
                         "persisted transcode session failed to decode; ignoring"
                     );
@@ -260,7 +260,7 @@ where
             Ok(None) => Ok(None),
             Err(e) => {
                 tracing::warn!(
-                    psid = %session_id,
+                    psid = %pharos_core::secret_prefix(session_id),
                     error = %e,
                     "transcode session store lookup failed; treating as expired"
                 );
@@ -272,7 +272,7 @@ where
     pub async fn remove(&self, session_id: &str) -> Result<(), TranscodeSessionError> {
         if let Err(e) = self.store.remove_transcode_session(session_id).await {
             tracing::warn!(
-                psid = %session_id,
+                psid = %pharos_core::secret_prefix(session_id),
                 error = %e,
                 "transcode session store delete failed"
             );

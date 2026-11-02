@@ -143,7 +143,11 @@ async fn stop_active_encodings(
         // abandoned segments stop transcoding instead of stealing encoder slots.
         state.prefetch_tasks.cancel(&psid);
         if let Err(e) = state.transcode_sessions.remove(&psid).await {
-            tracing::warn!(error = %e, psid, "stop_active_encodings: session remove failed");
+            tracing::warn!(
+                error = %e,
+                psid = %pharos_core::secret_prefix(&psid),
+                "stop_active_encodings: session remove failed"
+            );
         }
     }
     HttpResponse::NoContent().finish()

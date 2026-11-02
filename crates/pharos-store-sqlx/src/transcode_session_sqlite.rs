@@ -16,7 +16,7 @@ fn media_id_i64(id: MediaId) -> DomainResult<i64> {
 type SessionRow = crate::TranscodeSessionRow;
 
 impl TranscodeSessionStore for SqliteStore {
-    #[tracing::instrument(skip(self, session), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id, session), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn upsert_transcode_session(
         &self,
         play_session_id: &str,
@@ -57,7 +57,7 @@ impl TranscodeSessionStore for SqliteStore {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn get_transcode_session(
         &self,
         play_session_id: &str,
@@ -74,7 +74,7 @@ impl TranscodeSessionStore for SqliteStore {
         Ok(row.map(crate::session_from_row))
     }
 
-    #[tracing::instrument(skip(self), fields(psid = %play_session_id))]
+    #[tracing::instrument(skip(self, play_session_id), fields(psid = %pharos_core::secret_prefix(play_session_id)))]
     async fn remove_transcode_session(&self, play_session_id: &str) -> DomainResult<()> {
         sqlx::query("DELETE FROM transcode_sessions WHERE play_session_id = ?")
             .bind(play_session_id)

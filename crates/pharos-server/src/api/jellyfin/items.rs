@@ -3151,7 +3151,7 @@ async fn playback_info(
     tracing::info!(
         media.id = id,
         user.name = %user.0.name,
-        play_session_id = %play_session_id,
+        play_session_id = %pharos_core::secret_prefix(&play_session_id),
         is_video,
         is_web_client,
         renditions = %renditions_param,

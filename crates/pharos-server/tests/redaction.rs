@@ -197,3 +197,101 @@ async fn query_token_is_masked_in_the_request_span() {
         "target not masked:\n{captured}"
     );
 }
+
+/// B256: a PlaySessionId authorizes a stream on its own, so it is a
+/// credential and the logs carry only its first 8 characters. Negotiating,
+/// streaming with it and stopping it leaves the decision line joinable by
+/// that prefix and the whole id nowhere.
+/// Disarm check: logging the full id in the decision line, or letting the
+/// sqlite store spans record their `play_session_id` argument, puts it in the
+/// captured log.
+#[actix_web::test]
+async fn play_session_id_is_logged_by_prefix_only() {
+    use actix_web::test;
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore as _, TokenStore as _};
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(VecWriter(buf.clone()))
+            .with_ansi(false)
+            // Span fields too: the store spans name the session they act on.
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let uid = UserId::new();
+    stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: SecretString::new("x"),
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose();
+    stores
+        .put(MediaItem {
+            id: 1,
+            path: "/m/1.mp4".into(),
+            title: "V".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                container: Some("mp4".into()),
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "pharos-redact".into()));
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(tracing_actix_web::TracingLogger::<
+                pharos_server::obs::StatusRootSpanBuilder,
+            >::new())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let profile = serde_json::json!({ "DeviceProfile": {
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac"}
+        ],
+    }});
+    let info: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::post()
+            .uri("/Items/1/PlaybackInfo")
+            .insert_header(("X-Emby-Token", token))
+            .insert_header(("User-Agent", "Jellyfin Android TV/0.19.9 (OkHttp/4.12.0)"))
+            .set_json(profile)
+            .to_request(),
+    )
+    .await;
+    let psid = info["PlaySessionId"].as_str().unwrap().to_owned();
+    let stream = test::TestRequest::get()
+        .uri(&format!("/videos/1/stream?static=true&tag={psid}"))
+        .to_request();
+    test::call_service(&app, stream).await;
+    let stop = test::TestRequest::post()
+        .uri("/Sessions/Playing/Stopped")
+        .insert_header(("X-Emby-Token", token))
+        .set_json(serde_json::json!({ "PlaySessionId": psid, "ItemId": "1" }))
+        .to_request();
+    assert!(test::call_service(&app, stop).await.status().is_success());
+
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap().clone()).into_owned();
+    assert!(
+        captured.contains(&format!("play_session_id={}", &psid[..8])),
+        "no decision line joinable by the prefix:\n{captured}"
+    );
+    assert!(!captured.contains(&psid), "PlaySessionId in the log:\n{captured}");
+}
