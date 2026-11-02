@@ -450,7 +450,8 @@ async fn create_user(
     let password = SecretString::new(body.password.unwrap_or_default());
     let auth = BuiltinAuth::new(state.stores.clone());
     let hash = auth
-        .hash_password(&password)
+        .hash_password_off_worker(&password)
+        .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let record = UserRecord {
         id: UserId::new(),
@@ -652,7 +653,8 @@ async fn change_password(
         SecretString::new(body.new_pw)
     };
     let hash = auth
-        .hash_password(&new_password)
+        .hash_password_off_worker(&new_password)
+        .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // Atomic single-UPDATE password swap. The previous delete+create
     // path could irreversibly destroy the account (+ cascaded tokens /

@@ -42,8 +42,8 @@ const FALLBACK_DUMMY_HASH: &str =
     "$argon2id$v=19$m=19456,t=2,p=1$cGhhcm9zZHVtbXlzYWx0MA$EKDomuO8hGAGCl/dbiaNGLsNHz0FAvuuDQQ8+KYw65c";
 const DUMMY_PASSWORD: &[u8] = b"pharos-dummy-password";
 
-/// Each verify allocates `Argon2::default()`'s 19 MiB; four at once keep the
-/// peak near 76 MiB however many logins arrive.
+/// Each hash or verify allocates `Argon2::default()`'s 19 MiB; four at once keep
+/// the peak near 76 MiB however many logins or password changes arrive.
 const MAX_CONCURRENT_VERIFIES: usize = 4;
 /// How long a login waits for a verify slot before it is refused as busy.
 const VERIFY_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,8 +63,8 @@ fn busy_refusal() -> AuthError {
     AuthError::Backend("password check busy".into())
 }
 
-/// Counts a verify while it runs on a blocking thread. Drop runs on panic too,
-/// so the gauge cannot drift upward.
+/// Counts an argon2 hash or verify while it runs on a blocking thread. Drop
+/// runs on panic too, so the gauge cannot drift upward.
 struct InFlight;
 
 impl InFlight {
@@ -78,6 +78,17 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         metrics::gauge!("pharos_password_verify_in_flight").decrement(1.0);
     }
+}
+
+/// Runs on a blocking thread. Argon2 picks a fresh random salt of the
+/// recommended length (password-hash's `getrandom` feature), so no salt is
+/// passed in.
+fn hash_blocking(argon: &Argon2<'static>, password: &SecretString) -> AuthResult<SecretString> {
+    let hash = argon
+        .hash_password(password.expose().as_bytes())
+        .map_err(|e| AuthError::Backend(format!("hash: {e}")))?
+        .to_string();
+    Ok(SecretString::new(hash))
 }
 
 /// Runs on a blocking thread. `Ok(false)` is a wrong password; a hash that
@@ -117,16 +128,37 @@ impl<U: UserStore> BuiltinAuth<U> {
 
     /// Hash a plaintext password with a fresh random salt. Use this to
     /// build a `UserRecord` before calling `UserStore::create`.
+    ///
+    /// Blocks the calling thread for the whole hash. Async callers use
+    /// [`Self::hash_password_off_worker`]; this one is for the CLI and tests.
     pub fn hash_password(&self, password: &SecretString) -> AuthResult<SecretString> {
-        // password-hash 0.6's `hash_password` generates its own fresh random
-        // salt of the recommended length via the `getrandom` feature — no
-        // reason to hand-roll that ourselves as the pre-0.6 API required.
-        let hash = self
-            .argon
-            .hash_password(password.expose().as_bytes())
-            .map_err(|e| AuthError::Backend(format!("hash: {e}")))?
-            .to_string();
-        Ok(SecretString::new(hash))
+        hash_blocking(&self.argon, password)
+    }
+
+    /// Hash on a blocking thread under the same slot bound as verify (B280),
+    /// so password changes and logins draw on one memory budget.
+    pub async fn hash_password_off_worker(
+        &self,
+        password: &SecretString,
+    ) -> AuthResult<SecretString> {
+        self.hash_password_with(password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
+            .await
+    }
+
+    /// The injection seam for [`Self::hash_password_off_worker`]: tests pass
+    /// their own slot pool and wait.
+    async fn hash_password_with(
+        &self,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> AuthResult<SecretString> {
+        let argon = self.argon.clone();
+        let password = password.clone();
+        match Self::run_bounded(slots, wait, move || hash_blocking(&argon, &password)).await? {
+            Bounded::Busy => Err(busy_refusal()),
+            Bounded::Done(hash) => hash,
+        }
     }
 
     /// The names of the records whose stored hash accepts the empty password
@@ -272,7 +304,7 @@ impl<U: UserStore> BuiltinAuth<U> {
         password: &SecretString,
         admin: bool,
     ) -> AuthResult<CreateUserOutcome> {
-        let hash = self.hash_password(password)?;
+        let hash = self.hash_password_off_worker(password).await?;
         let record = UserRecord {
             id: UserId::new(),
             name: name.to_string(),
@@ -883,6 +915,46 @@ mod tests {
             .authenticate_with("ali", &SecretString::new("hunter2"), &one, wait)
             .await
             .is_ok());
+        assert_eq!(one.available_permits(), 1);
+    }
+
+    /// Hashing draws on the same slots as verifying: with none free it is
+    /// refused as busy, counted, and no hash is computed.
+    #[tokio::test]
+    async fn busy_hash_is_a_backend_refusal_and_is_counted() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        let no_slots = Arc::new(Semaphore::new(0));
+
+        match auth
+            .hash_password_with(
+                &SecretString::new("hunter2"),
+                &no_slots,
+                Duration::from_millis(50),
+            )
+            .await
+        {
+            Err(AuthError::Backend(msg)) => assert_eq!(msg, "password check busy"),
+            other => panic!("expected busy Backend, got {other:?}"),
+        }
+        assert_eq!(counter_value(&rec, "pharos_password_verify_busy_total"), 1);
+    }
+
+    /// With slots free the async hash returns a real argon2 hash that verifies,
+    /// and gives its slot back.
+    #[tokio::test]
+    async fn hash_off_worker_returns_a_hash_that_verifies_and_releases_its_slot() {
+        let auth = fresh().await;
+        let one = Arc::new(Semaphore::new(1));
+
+        let hash = auth
+            .hash_password_with(&SecretString::new("hunter2"), &one, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let parsed = PasswordHash::new(hash.expose()).unwrap();
+        assert!(auth.argon.verify_password(b"hunter2", &parsed).is_ok());
+        assert!(auth.argon.verify_password(b"wrong", &parsed).is_err());
         assert_eq!(one.available_permits(), 1);
     }
 
