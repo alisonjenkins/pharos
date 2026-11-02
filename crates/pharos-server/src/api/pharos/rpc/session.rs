@@ -9,6 +9,7 @@ use pharos_core::{AuthError, User};
 
 use super::bootstrap::token_denial;
 use super::library::Library;
+use super::playback::Playback;
 use super::user_data::UserData;
 use super::ConnectionCtx;
 use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
@@ -47,6 +48,16 @@ impl Session {
         self.ctx.has_ended(&self.token).then_some(Denial::Revoked {
             reason: "logged out",
         })
+    }
+
+    pub(super) fn conn(&self) -> Rc<Connection> {
+        Rc::clone(&self.conn)
+    }
+
+    /// Whether the client reached the server over a non-private address,
+    /// the same test a Jellyfin request gets.
+    pub(super) fn client_is_remote(&self) -> bool {
+        crate::api::jellyfin::items::ip_is_remote(&self.ctx.client_ip)
     }
 
     /// The session's user as the store has them now, so a policy change or
@@ -108,6 +119,20 @@ impl server::session::Handler for Session {
         results
             .get()
             .set_user_data(server::user_data::client(UserData::new(self), &conn));
+        Ok(())
+    }
+
+    /// Never refused, like `library`; each `Playback` call checks the
+    /// session itself.
+    async fn playback(
+        self: Rc<Self>,
+        _params: wire::PlaybackParams,
+        results: &mut wire::PlaybackResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_playback(server::playback::client(Playback::new(self), &conn));
         Ok(())
     }
 

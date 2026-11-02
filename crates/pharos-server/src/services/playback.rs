@@ -1079,6 +1079,202 @@ pub(crate) fn resolve_audio_pick(
     }
 }
 
+/// What a native player says it can play (`Playback.negotiate`).
+#[derive(Debug, Default)]
+pub struct Capabilities {
+    pub video_codecs: Vec<String>,
+    pub audio_codecs: Vec<String>,
+    pub containers: Vec<String>,
+    /// Bits per second; 0 is "no limit".
+    pub max_bitrate: u64,
+}
+
+impl Capabilities {
+    /// The capabilities as the profile the negotiator reads: one direct-play
+    /// and one transcoding profile per media type. The transcoding profiles
+    /// name the HLS surfaces pharos serves: video on the master, audio on the
+    /// universal endpoint.
+    pub fn profile(&self) -> DeviceProfile {
+        use pharos_jellyfin_api::device_profile::{DirectPlayProfile, TranscodingProfile};
+        let csv = |v: &[String]| v.join(",");
+        let (containers, video, audio) = (
+            csv(&self.containers),
+            csv(&self.video_codecs),
+            csv(&self.audio_codecs),
+        );
+        DeviceProfile {
+            direct_play_profiles: vec![
+                DirectPlayProfile {
+                    container: containers.clone(),
+                    video_codec: video.clone(),
+                    audio_codec: audio.clone(),
+                    kind: "Video".into(),
+                },
+                DirectPlayProfile {
+                    container: containers,
+                    video_codec: String::new(),
+                    audio_codec: audio.clone(),
+                    kind: "Audio".into(),
+                },
+            ],
+            transcoding_profiles: vec![
+                TranscodingProfile {
+                    container: "ts".into(),
+                    video_codec: video,
+                    audio_codec: audio.clone(),
+                    protocol: "hls".into(),
+                    kind: "Video".into(),
+                },
+                TranscodingProfile {
+                    container: "ts".into(),
+                    video_codec: String::new(),
+                    audio_codec: audio,
+                    protocol: "hls".into(),
+                    kind: "Audio".into(),
+                },
+            ],
+            max_streaming_bitrate: (self.max_bitrate > 0).then_some(self.max_bitrate),
+            ..DeviceProfile::default()
+        }
+    }
+}
+
+/// A native player's request to play one item.
+pub struct GrantRequest<'a> {
+    pub capabilities: &'a Capabilities,
+    /// `None` takes the source's default audio track.
+    pub audio_stream_index: Option<u32>,
+    /// `-1` is "off", `None` the container's default.
+    pub subtitle_stream_index: Option<i64>,
+    /// The session's device token: the playback ends with it (B256).
+    pub token: &'a str,
+    pub client_is_remote: bool,
+}
+
+/// A playback a native player may start: the stream capability and the
+/// decision behind it.
+pub struct Grant {
+    pub play_session_id: String,
+    /// The item as the player names it in progress reports.
+    pub item_wire_id: String,
+    pub negotiated: Negotiated,
+    /// The raw file for a direct play, else the transcoding URL.
+    pub stream_url: String,
+}
+
+#[derive(Debug)]
+pub enum GrantError {
+    /// The item is hidden, missing, or could not be read.
+    Item(crate::services::library::DetailError),
+    /// A book is read, not streamed (004-books).
+    NotPlayable,
+}
+
+/// Negotiates `id` for a native player and registers the session that
+/// authorizes its stream, as `/Items/{id}/PlaybackInfo` does for a
+/// Jellyfin client: the same access check, decision, metric and session.
+pub async fn grant(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+    r: &GrantRequest<'_>,
+) -> Result<Grant, GrantError> {
+    let (item, user_data) = crate::services::library::detail(state, user, id)
+        .await
+        .map_err(GrantError::Item)?;
+    if matches!(item.kind, MediaKind::Book) {
+        return Err(GrantError::NotPlayable);
+    }
+    let profile = r.capabilities.profile();
+    let negotiated = negotiate(
+        state,
+        &item,
+        &NegotiateRequest {
+            profile: &profile,
+            switches: PlaybackSwitches::default(),
+            explicit_subtitle_index: r.subtitle_stream_index,
+            stereo_mode: None,
+            client_is_remote: r.client_is_remote,
+            is_web_client: false,
+        },
+    );
+    let play_session_id = uuid::Uuid::new_v4().simple().to_string();
+    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
+    let resume_ticks = if user_data.played {
+        0
+    } else {
+        user_data.last_played_position_ticks
+    };
+    // The same start track PlaybackInfo picks: the user's remembered track,
+    // else their language rules. Subtitle URLs are not built here, so the
+    // streams need no subtitle context.
+    let streams = pharos_jellyfin_api::dto::build_media_streams_with_subtitles(
+        &item.probe,
+        negotiated.is_video,
+        None,
+    );
+    let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
+    let stream_url = match negotiated.decision {
+        Decision::DirectPlay => format!(
+            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
+            if negotiated.is_video {
+                "videos"
+            } else {
+                "audio"
+            },
+        ),
+        _ => delivery(
+            &negotiated,
+            &DeliveryRequest {
+                profile: &profile,
+                probe: &item.probe,
+                item_wire_id: &item_wire_id,
+                source_param: "",
+                play_session_id: &play_session_id,
+                api_key: None,
+                audio_stream_index: r.audio_stream_index.map(|i| i.to_string()),
+                explicit_subtitle_index: r.subtitle_stream_index,
+                is_web_client: false,
+                resume_ticks,
+                transcoding: true,
+            },
+        )
+        .transcoding_url
+        .and_then(|url| ensure_audio_index_param(Some(url), audio.index))
+        .unwrap_or_default(),
+    };
+    let holder = pharos_core::SessionHolder {
+        user_id: user.id,
+        token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
+    };
+    register(
+        state,
+        &play_session_id,
+        id,
+        &negotiated,
+        &item.probe,
+        holder,
+    )
+    .await;
+    negotiated.record();
+    tracing::info!(
+        media.id = id,
+        user.name = %user.name,
+        play_session_id = %pharos_core::secret_prefix(&play_session_id),
+        decision = negotiated.decision_kind(),
+        direct_play_block = negotiated.direct_play_block.label(),
+        downgrade = negotiated.downgrade.unwrap_or("none"),
+        client_is_remote = r.client_is_remote,
+        "native playback negotiated"
+    );
+    Ok(Grant {
+        play_session_id,
+        item_wire_id,
+        negotiated,
+        stream_url,
+    })
+}
+
 /// Convert the boot-resolved server encode capabilities into the negotiator's
 /// codec-support DTO (canonical codec names, hw flag, cost tier). An empty
 /// capability set (tests / not-yet-wired) yields an empty support list, so the
