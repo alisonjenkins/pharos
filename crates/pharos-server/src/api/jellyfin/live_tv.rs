@@ -73,7 +73,8 @@ async fn channel_image_primary(
 /// or the user's `EnableLiveTvAccess` is off, so a denied user meets the same
 /// "not configured" answers (empty lists, 404 by id) jellyfin-web already
 /// renders. A denial counts under
-/// `pharos_live_tv_access_denied_total{route}` and logs a WARN.
+/// `pharos_live_tv_access_denied_total{route}` and logs a WARN (DEBUG for
+/// `info`).
 fn backend_for<'a>(
     state: &'a AppState,
     user: &AuthUser,
@@ -82,7 +83,13 @@ fn backend_for<'a>(
     let backend = state.live_tv.as_ref()?;
     if !user.0.policy.enable_live_tv_access {
         metrics::counter!("pharos_live_tv_access_denied_total", "route" => route).increment(1);
-        tracing::warn!(user = %user.0.name, route, "live tv withheld: EnableLiveTvAccess is off");
+        // jellyfin-web asks for info on every page load; the data routes
+        // are what a denied user reaching for live TV hits.
+        if route == "info" {
+            tracing::debug!(user = %user.0.name, route, "live tv withheld: EnableLiveTvAccess is off");
+        } else {
+            tracing::warn!(user = %user.0.name, route, "live tv withheld: EnableLiveTvAccess is off");
+        }
         return None;
     }
     Some(backend)
@@ -318,6 +325,7 @@ async fn stream(
     path: web::Path<String>,
 ) -> impl Responder {
     let Some(backend) = backend_for(&state, &user, "stream") else {
+        tracing::info!(user = %user.0.name, "live tv stream asked for with no live tv to serve");
         return stream_refused(
             StreamOutcome::NotConfigured,
             HttpResponse::NotFound().finish(),
@@ -329,6 +337,7 @@ async fn stream(
         Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
     };
     let Some(ch) = chs.into_iter().find(|c| c.id == id) else {
+        tracing::info!(channel = %id, user = %user.0.name, "live tv stream asked for an unknown channel");
         return stream_refused(
             StreamOutcome::UnknownChannel,
             HttpResponse::NotFound().finish(),
