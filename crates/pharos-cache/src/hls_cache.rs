@@ -2941,6 +2941,7 @@ impl HlsSegmentCache {
             .resolve(|c| {
                 self.ensure_continuous_audio_covering(
                     source,
+                    key.source_gen,
                     media_id,
                     opts.audio_source_stream_index,
                     c.bitrate_bps,
@@ -4312,18 +4313,23 @@ impl HlsSegmentCache {
     // MPEG-TS rather than ADTS or a growing MP4: it is self-framing AND
     // carries absolute PTS, so the segment's `-ss` lands on the global grid.
 
-    /// Where the continuous encode for one `(media, track, bitrate)` lives.
+    /// Where the continuous encode for one `(media, track, bitrate, source
+    /// generation)` lives.
     fn continuous_audio_root(
         &self,
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
+        source_gen: SourceGen,
     ) -> PathBuf {
         let a = audio_index.unwrap_or(0);
         let br = audio_bitrate_bps.map(|b| b / 1000).unwrap_or(0);
+        // An edition shares its primary's media id, so without the generation
+        // the two would share one encode and its audio.
+        let gen = source_gen.key_suffix();
         self.root
             .join("_contaudio")
-            .join(format!("{media_id}-a{a}-b{br}"))
+            .join(format!("{media_id}-a{a}-b{br}{gen}"))
     }
 
     /// Start position of the session that can serve a segment starting at
@@ -4449,16 +4455,21 @@ impl HlsSegmentCache {
     /// session that was producing it exits — an encode that ran to completion
     /// without reaching the request has hit the end of the source, and its
     /// output is as complete as it will ever be.
+    ///
+    /// `source_gen` is the generation of the segment the audio is for, so the
+    /// two read the same file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn ensure_continuous_audio_covering(
         &self,
         source: &Path,
+        source_gen: SourceGen,
         media_id: u64,
         audio_index: Option<u32>,
         audio_bitrate_bps: Option<u64>,
         want_start_secs: f64,
         want_end_secs: f64,
     ) -> Result<pharos_transcode::MuxedAudio, HlsCacheError> {
-        let root = self.continuous_audio_root(media_id, audio_index, audio_bitrate_bps);
+        let root = self.continuous_audio_root(media_id, audio_index, audio_bitrate_bps, source_gen);
         let start_secs = Self::continuous_audio_session_start_secs(want_start_secs);
         // A whole-file session that has already got this far serves the
         // request without spawning anything; prefer it so ordinary sequential
