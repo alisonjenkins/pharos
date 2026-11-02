@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 3;
+const schemaVersion :UInt32 = 4;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -148,8 +148,33 @@ interface Library {
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
 }
-struct ItemDetail { summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter); }
+struct ItemDetail {
+  summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
+  audioTracks @4 :List(Track);
+  subtitleTracks @5 :List(Track);
+  trickplay @6 :List(Trickplay);    # one per width the server renders; empty when off or unprobed
+  segments @7 :List(Segment);
+}
 struct Chapter { name @0 :Text; startMs @1 :UInt64; }
+# An audio or subtitle stream. `index` is what Playback.negotiate takes.
+struct Track {
+  index @0 :UInt32; language @1 :Text; title @2 :Text; codec @3 :Text;
+  isDefault @4 :Bool; isForced @5 :Bool; isHearingImpaired @6 :Bool;
+  delivery @7 :SubtitleDelivery;    # subtitles only
+  url @8 :Text;                     # WebVTT for an `external` subtitle (HTTP, 017 §Scope), else empty
+}
+# `external`: the player renders the WebVTT at Track.url itself. `burn`: an
+# image subtitle the server draws into the video, so choosing it renegotiates.
+enum SubtitleDelivery { external @0; burn @1; }
+# A trickplay sprite set: tiles of grid × grid thumbnails, one every intervalMs.
+# tileUrl holds `{tile}`, the 0-based tile number. A tile the server has not
+# generated yet answers 404.
+struct Trickplay {
+  width @0 :UInt32; height @1 :UInt32; intervalMs @2 :UInt32;
+  thumbCount @3 :UInt32; tileCount @4 :UInt32; grid @5 :UInt32; tileUrl @6 :Text;
+}
+enum SegmentKind { intro @0; outro @1; recap @2; preview @3; commercial @4; }
+struct Segment { kind @0 :SegmentKind; startMs @1 :UInt64; endMs @2 :UInt64; }
 struct DetailResult { union { detail @0 :ItemDetail; error @1 :Error; } }
 
 interface UserData {
@@ -166,11 +191,15 @@ struct Decision {
   downgrade @2 :Text;
   streamUrl @3 :Text;          # HLS master or direct stream (HTTP, 017 §Scope)
   playSession @4 :PlaySessionId;
+  audio @5 :OptU32;            # the audio track this playback starts on
+  subtitle @6 :OptU32;         # the subtitle it starts with; none = off
 }
 struct DecisionResult { union { decision @0 :Decision; error @1 :Error; } }
 interface PlaybackGrant {
   decision @0 (ctx :CallContext) -> (result :DecisionResult);
-  report @1 (ctx :CallContext, positionMs :UInt64, paused :Bool) -> (result :Done);
+  # audio/subtitle: the tracks playing now, after any switch the player made
+  # without renegotiating; `default` says nothing and keeps the stored choice.
+  report @1 (ctx :CallContext, positionMs :UInt64, paused :Bool, audio :StreamChoice, subtitle :StreamChoice) -> (result :Done);
   stop @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
