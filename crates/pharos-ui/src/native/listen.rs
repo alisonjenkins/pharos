@@ -173,9 +173,10 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
         None => ("webgl2", "none"),
         Some(f) => ("fallback", f.label()),
     };
+    // A GLSL info log spans lines; keep the decision on one log line.
     let detail = match fallback {
-        Some(Fallback::Shader(log)) => log.as_str(),
-        _ => "",
+        Some(Fallback::Shader(log)) => log.split_whitespace().collect::<Vec<_>>().join(" "),
+        _ => String::new(),
     };
     let line = format!(
         "pharos: renderer mode={mode} reason={reason} style={} detail={detail}",
@@ -315,9 +316,14 @@ mod tests {
     }
 
     #[test]
-    fn a_shader_failure_carries_the_compiler_log() {
-        let f = Fallback::Shader("compile: ERROR 0:3".into());
+    fn a_shader_failure_carries_the_compiler_log_on_one_line() {
+        let f = Fallback::Shader("compile: ERROR 0:3 'x'\nERROR 0:4 'y'\n".into());
         let (line, _) = renderer_signals(Style::Spectrum, Some(&f));
-        assert!(line.ends_with("reason=shader style=spectrum detail=compile: ERROR 0:3"));
+        assert!(
+            line.ends_with(
+                "reason=shader style=spectrum detail=compile: ERROR 0:3 'x' ERROR 0:4 'y'"
+            ),
+            "{line}"
+        );
     }
 }
