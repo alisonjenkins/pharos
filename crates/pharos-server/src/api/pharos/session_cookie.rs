@@ -19,6 +19,7 @@ use pharos_core::{SecretString, TokenStore};
 use serde::Deserialize;
 
 use super::rpc::{origin, SESSION_COOKIE};
+use crate::api::jellyfin::auth_extractor::MEDIA_COOKIE;
 use crate::auth::LoginRefusal;
 use crate::config::NativeApiConfig;
 use crate::services::auth::{
@@ -49,6 +50,19 @@ pub struct SignIn {
 fn cookie(value: String, max_age: CookieDuration) -> Cookie<'static> {
     Cookie::build(SESSION_COOKIE, value)
         .path("/pharos")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict)
+        .max_age(max_age)
+        .finish()
+}
+
+/// [`MEDIA_COOKIE`]: the same token on `/`, so `<img>` and `<video>` fetches
+/// of item bytes authenticate (ADR-0034). Only GET and HEAD on those routes
+/// read it (V191).
+fn media_cookie(value: String, max_age: CookieDuration) -> Cookie<'static> {
+    Cookie::build(MEDIA_COOKIE, value)
+        .path("/")
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)
@@ -115,6 +129,7 @@ pub async fn sign_in(
             Ok((_user, token)) => HttpResponse::NoContent()
                 .insert_header((CACHE_CONTROL, "no-store"))
                 .cookie(cookie(token.0.expose().to_owned(), COOKIE_MAX_AGE))
+                .cookie(media_cookie(token.0.expose().to_owned(), COOKIE_MAX_AGE))
                 .finish(),
             Err(PasswordLoginError::Refused(LoginRefusal::Throttled(retry))) => {
                 HttpResponse::TooManyRequests()
@@ -159,7 +174,7 @@ fn record_logout(outcome: LogoutOutcome) {
 }
 
 /// `DELETE /pharos/session`: revoke the cookie's token, which closes the
-/// connections it opened (T025), and clear the cookie. A missing or unknown
+/// connections it opened (T025), and clear it and the media cookie. A missing or unknown
 /// cookie is still cleared. When the store fails the cookie is kept and the
 /// answer is 503: clearing it would leave a live token the browser can no
 /// longer revoke.
@@ -198,6 +213,7 @@ pub async fn sign_out(
     HttpResponse::NoContent()
         .insert_header((CACHE_CONTROL, "no-store"))
         .cookie(cookie(String::new(), CookieDuration::ZERO))
+        .cookie(media_cookie(String::new(), CookieDuration::ZERO))
         .finish()
 }
 

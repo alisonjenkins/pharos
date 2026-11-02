@@ -8,6 +8,7 @@ use actix_web::cookie::SameSite;
 use actix_web::dev::ServiceResponse;
 use actix_web::{http::StatusCode, test, App};
 use pharos_core::TokenStore;
+use pharos_server::api::jellyfin::auth_extractor::MEDIA_COOKIE;
 use pharos_server::api::pharos::rpc;
 use pharos_server::config::NativeApiConfig;
 
@@ -41,9 +42,17 @@ fn login(name: &str, password: &str) -> test::TestRequest {
 }
 
 fn session_cookie(resp: &ServiceResponse) -> Option<actix_web::cookie::Cookie<'static>> {
+    named_cookie(resp, rpc::SESSION_COOKIE)
+}
+
+fn media_cookie(resp: &ServiceResponse) -> Option<actix_web::cookie::Cookie<'static>> {
+    named_cookie(resp, MEDIA_COOKIE)
+}
+
+fn named_cookie(resp: &ServiceResponse, name: &str) -> Option<actix_web::cookie::Cookie<'static>> {
     resp.response()
         .cookies()
-        .find(|c| c.name() == rpc::SESSION_COOKIE)
+        .find(|c| c.name() == name)
         .map(|c| c.into_owned())
 }
 
@@ -68,6 +77,22 @@ async fn a_right_password_sets_a_cookie_scripts_cannot_read() {
         fx.state.stores.resolve(cookie.value()).await.unwrap(),
         fx.user_id
     );
+}
+
+/// ADR-0034: `<img>` and `<video>` fetches cannot send the `/pharos`-scoped
+/// session cookie, so sign-in also sets `pharos_media` on `/` with the same
+/// token, which only element-byte GETs read (V191).
+#[actix_web::test]
+async fn sign_in_also_sets_a_media_cookie_for_element_urls() {
+    let fx = seed_rich().await;
+    let resp = call(&fx, login("guest", "hunter2")).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let session = session_cookie(&resp).expect("pharos_session cookie");
+    let media = media_cookie(&resp).expect("pharos_media cookie");
+    assert_eq!(media.value(), session.value());
+    assert_eq!(media.path(), Some("/"));
+    assert_eq!(media.http_only(), Some(true));
+    assert_eq!(media.same_site(), Some(SameSite::Strict));
 }
 
 #[actix_web::test]
@@ -154,6 +179,9 @@ async fn delete_revokes_the_cookie_clears_it_and_announces_the_user() {
         Some(actix_web::cookie::time::Duration::ZERO)
     );
     assert_eq!(cleared.path(), Some("/pharos"));
+    let cleared = media_cookie(&resp).expect("a clearing Set-Cookie for pharos_media");
+    assert_eq!(cleared.value(), "");
+    assert_eq!(cleared.path(), Some("/"));
     assert!(fx.state.stores.resolve(&token).await.is_err());
     assert_eq!(announced.try_recv().unwrap(), fx.user_id);
 }
@@ -170,6 +198,7 @@ async fn delete_without_a_cookie_still_clears_it() {
     .await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(session_cookie(&resp).is_some());
+    assert!(media_cookie(&resp).is_some());
 }
 
 #[actix_web::test]
