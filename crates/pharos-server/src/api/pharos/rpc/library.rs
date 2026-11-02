@@ -179,6 +179,7 @@ impl server::library::Handler for Library {
                 results.get().init_result(),
                 listed,
                 grouping,
+                parent.as_deref(),
                 query.start_index,
             );
             return Ok(());
@@ -492,6 +493,7 @@ fn write_grouped(
     out: items_result::Builder<'_>,
     listed: Result<SynthPage, GroupError>,
     grouping: Grouping,
+    parent: Option<&str>,
     start: u32,
 ) {
     record_query(grouping.label(), listed.is_ok());
@@ -500,6 +502,7 @@ fn write_grouped(
         Err(GroupError::SeasonsOutsideSeries) => {
             tracing::info!(
                 shape = grouping.label(),
+                parent = parent.unwrap_or("none"),
                 "native library: seasons asked for outside a series; refused"
             );
             Denial::NotPermitted {
@@ -509,7 +512,7 @@ fn write_grouped(
             return;
         }
         Err(GroupError::Store(error)) => {
-            tracing::warn!(shape = grouping.label(), %error, "native library: grouped listing unavailable");
+            tracing::warn!(shape = grouping.label(), parent = parent.unwrap_or("none"), %error, "native library: grouped listing unavailable");
             Denial::Unavailable {
                 dependency: "media store",
             }
