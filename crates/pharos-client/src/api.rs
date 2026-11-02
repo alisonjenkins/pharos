@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, home_result, item_id, item_summary, items_result, library,
-    negotiate_result, playback, playback_grant, session, stream_choice, Kind,
+    negotiate_result, opt_u16, opt_u32, playback, playback_grant, session, stream_choice, Kind,
 };
 
 use crate::{CallInfo, ClientError};
@@ -40,9 +40,15 @@ impl FromStr for ItemRef {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let bad = || BadItemRef(s.to_owned());
+        // Digits only: `parse` would also take a sign, and one item would
+        // then have two URLs.
+        let number = |n: &str| match n.bytes().all(|b| b.is_ascii_digit()) {
+            true => n.parse::<u64>().map_err(|_| bad()),
+            false => Err(bad()),
+        };
         match s.strip_prefix('s') {
-            Some(n) => n.parse().map(ItemRef::Synth).map_err(|_| bad()),
-            None => s.parse().map(ItemRef::Real).map_err(|_| bad()),
+            Some(n) => number(n).map(ItemRef::Synth),
+            None => number(s).map(ItemRef::Real),
         }
     }
 }
@@ -62,6 +68,8 @@ pub enum ItemKind {
     Playlist,
     Channel,
     Library,
+    /// A kind added to the schema after this client was built.
+    Other,
 }
 
 impl ItemKind {
@@ -149,7 +157,8 @@ pub struct Decision {
 impl Decision {
     /// Whether `stream_url` is an HLS playlist rather than a file.
     pub fn is_hls(&self) -> bool {
-        self.method != "direct_play"
+        let path = self.stream_url.split('?').next().unwrap_or_default();
+        path.ends_with(".m3u8")
     }
 }
 
@@ -455,7 +464,10 @@ fn read_item_ref(id: item_id::Reader<'_>) -> Result<ItemRef, capnp::Error> {
     })
 }
 
-fn read_kind(kind: Kind) -> ItemKind {
+fn read_kind(kind: Result<Kind, capnp::NotInSchema>) -> ItemKind {
+    let Ok(kind) = kind else {
+        return ItemKind::Other;
+    };
     match kind {
         Kind::Movie => ItemKind::Movie,
         Kind::Episode => ItemKind::Episode,
@@ -473,6 +485,13 @@ fn read_kind(kind: Kind) -> ItemKind {
     }
 }
 
+fn read_opt_u32(o: opt_u32::Reader<'_>) -> Result<Option<u32>, capnp::Error> {
+    Ok(match o.which()? {
+        opt_u32::Some(n) => Some(n),
+        opt_u32::None(()) => None,
+    })
+}
+
 fn read_items(
     list: capnp::struct_list::Reader<'_, item_summary::Owned>,
 ) -> Result<Vec<Item>, capnp::Error> {
@@ -480,16 +499,9 @@ fn read_items(
 }
 
 fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
-    let opt_u32 =
-        |o: pharos_api::pharos_capnp::opt_u32::Reader<'_>| -> Result<Option<u32>, capnp::Error> {
-            Ok(match o.which()? {
-                pharos_api::pharos_capnp::opt_u32::Some(n) => Some(n),
-                pharos_api::pharos_capnp::opt_u32::None(()) => None,
-            })
-        };
     let year = match item.get_year()?.which()? {
-        pharos_api::pharos_capnp::opt_u16::Some(y) => Some(y),
-        pharos_api::pharos_capnp::opt_u16::None(()) => None,
+        opt_u16::Some(y) => Some(y),
+        opt_u16::None(()) => None,
     };
     let image = item
         .get_images()?
@@ -502,7 +514,7 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
     let state = item.get_user_state()?;
     Ok(Item {
         id: read_item_ref(item.get_id()?)?,
-        kind: read_kind(item.get_kind()?),
+        kind: read_kind(item.get_kind()),
         name: text(item.get_name())?,
         year,
         runtime_ms: item.get_runtime_ms(),
@@ -511,8 +523,8 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
         favorite: state.get_favorite(),
         position_ms: state.get_position_ms(),
         series_name,
-        season: opt_u32(item.get_parent_index_number()?)?,
-        episode: opt_u32(item.get_index_number()?)?,
+        season: read_opt_u32(item.get_parent_index_number()?)?,
+        episode: read_opt_u32(item.get_index_number()?)?,
     })
 }
 
@@ -528,8 +540,28 @@ mod tests {
             assert_eq!(id.to_string().parse::<ItemRef>().unwrap(), id);
         }
         assert_eq!(ItemRef::Synth(7).to_string(), "s7");
-        for bad in ["", "s", "x1", "-1", "s-1", "1.5"] {
+        for bad in ["", "s", "x1", "-1", "s-1", "1.5", "+42", "s+7", " 1"] {
             assert!(bad.parse::<ItemRef>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn only_a_playlist_url_is_hls() {
+        let decision = |method: &str, url: &str| Decision {
+            method: method.into(),
+            direct_play_block: String::new(),
+            downgrade: String::new(),
+            stream_url: url.into(),
+            play_session: String::new(),
+        };
+        assert!(decision("transcode", "/videos/1/master.m3u8?PlaySessionId=p").is_hls());
+        assert!(!decision("direct_play", "/videos/1/stream?static=true").is_hls());
+        assert!(!decision("", "/videos/1/stream?static=true&x=.m3u8").is_hls());
+    }
+
+    #[test]
+    fn a_kind_newer_than_the_client_reads_as_other() {
+        assert_eq!(read_kind(Err(capnp::NotInSchema(99))), ItemKind::Other);
+        assert_eq!(read_kind(Ok(Kind::Movie)), ItemKind::Movie);
     }
 }
