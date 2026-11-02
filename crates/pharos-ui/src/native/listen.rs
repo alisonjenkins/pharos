@@ -10,7 +10,9 @@ use super::platform;
 use super::playback::MediaEvent;
 use super::views::VIDEO_ID;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
-use crate::render::{self, Fallback, Frame};
+use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+
+use crate::render::{self, Fallback, Frame, Surface};
 
 pub const CANVAS_ID: &str = "pharos-visualiser";
 const PREFERS_REDUCED_MOTION: &str = "(prefers-reduced-motion: reduce)";
@@ -133,16 +135,20 @@ fn Visualiser(
     use_effect(move || {
         let tap = tap.clone();
         spawn(async move {
-            if let Err(f) = run(style, program, &tap).await {
-                let detail = match &f {
-                    Fallback::Shader(log) => log.as_str(),
-                    _ => "",
-                };
-                platform::info(&format!(
-                    "pharos: renderer mode=fallback reason={} style={} detail={detail}",
-                    f.label(),
-                    style.label()
-                ));
+            let opened = render::open(
+                CANVAS_ID,
+                program,
+                platform::prefers(PREFERS_REDUCED_MOTION),
+            );
+            let outcome = match opened {
+                Ok(surface) => {
+                    report(style, None);
+                    draw(surface, &tap).await
+                }
+                Err(f) => Err(f),
+            };
+            if let Err(f) = outcome {
+                report(style, Some(&f));
                 on_fallback.call(f);
             }
         });
@@ -152,15 +158,53 @@ fn Visualiser(
     }
 }
 
+/// Log the renderer decision and send it as client events (016
+/// `renderer_mode`, and `webgl_context_lost` when that is the reason).
+fn report(style: Style, fallback: Option<&Fallback>) {
+    let (line, events) = renderer_signals(style, fallback);
+    platform::info(&line);
+    for event in events {
+        platform::report_event(event);
+    }
+}
+
+fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<ClientEvent>) {
+    let (mode, reason) = match fallback {
+        None => ("webgl2", "none"),
+        Some(f) => ("fallback", f.label()),
+    };
+    let detail = match fallback {
+        Some(Fallback::Shader(log)) => log.as_str(),
+        _ => "",
+    };
+    let line = format!(
+        "pharos: renderer mode={mode} reason={reason} style={} detail={detail}",
+        style.label()
+    );
+    let mut events = vec![ClientEvent {
+        kind: ClientEventKind::RendererMode,
+        level: ClientLevel::Info,
+        route: String::new(),
+        fields: vec![
+            ("mode", mode.to_owned()),
+            ("reason", reason.to_owned()),
+            ("style", style.label().to_owned()),
+        ],
+    }];
+    if fallback == Some(&Fallback::ContextLost) {
+        events.push(ClientEvent {
+            kind: ClientEventKind::WebglContextLost,
+            level: ClientLevel::Warn,
+            route: String::new(),
+            fields: vec![("phase", "lost".to_owned())],
+        });
+    }
+    (line, events)
+}
+
 /// Draw every animation frame until the component unmounts (which drops
 /// this future) or the surface fails.
-async fn run(style: Style, program: render::Program, tap: &Tap) -> Result<(), Fallback> {
-    let reduced = platform::prefers(PREFERS_REDUCED_MOTION);
-    let mut surface = render::open(CANVAS_ID, program, reduced)?;
-    platform::info(&format!(
-        "pharos: renderer mode=webgl2 style={}",
-        style.label()
-    ));
+async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> {
     let start = platform::now_ms();
     let mut palette = platform::theme_palette();
     let mut palette_at = start;
@@ -229,5 +273,45 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("♪"));
+    }
+
+    #[test]
+    fn each_renderer_decision_is_logged_and_sent_with_its_reason() {
+        let (line, events) = renderer_signals(Style::Halo, None);
+        assert_eq!(
+            line,
+            "pharos: renderer mode=webgl2 reason=none style=halo detail="
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ClientEventKind::RendererMode);
+        assert!(events[0].fields.contains(&("mode", "webgl2".to_owned())));
+
+        let (line, events) = renderer_signals(Style::Scope, Some(&Fallback::ReducedMotion));
+        assert!(line.contains("mode=fallback reason=reduced_motion style=scope"));
+        assert!(events[0]
+            .fields
+            .contains(&("reason", "reduced_motion".to_owned())));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn a_lost_context_also_sends_its_own_warning() {
+        let (_, events) = renderer_signals(Style::Plasma, Some(&Fallback::ContextLost));
+        let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ClientEventKind::RendererMode,
+                ClientEventKind::WebglContextLost
+            ]
+        );
+        assert_eq!(events[1].level, ClientLevel::Warn);
+    }
+
+    #[test]
+    fn a_shader_failure_carries_the_compiler_log() {
+        let f = Fallback::Shader("compile: ERROR 0:3".into());
+        let (line, _) = renderer_signals(Style::Spectrum, Some(&f));
+        assert!(line.ends_with("reason=shader style=spectrum detail=compile: ERROR 0:3"));
     }
 }
