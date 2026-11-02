@@ -120,7 +120,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 
 - [x] T029 [US4] `services/library.rs::views` ← `api/jellyfin` views handler; `Library.views` — **COMMIT**
 - [x] T030 [US4] `services/library.rs::latest` ← `items.rs latest_items`; `Library.latest` — **COMMIT** — Done; `KindFilter` moved into `services::library` with it, and the native `ItemSummary` encoder (`rpc/library.rs write_item`) reads the Jellyfin projection, checked field by field against `/Users/{id}/Items/Latest` in `it_rpc/library.rs`
-- [ ] T031 [US4] `services/library.rs::resume` ← `items.rs resume_items` (typed `Vec<MediaKind>` instead of raw query parsing); `Library.resume` — **COMMIT**
+- [x] T031 [US4] `services/library.rs::resume` ← `items.rs resume_items` (typed `Vec<MediaKind>` instead of raw query parsing); `Library.resume` — **COMMIT** — Done; the typed filter is `KindFilter` (so naming only unknown types still matches nothing, B153), and `MediaTypes=` parsing stays in the Jellyfin layer (`items::media_types_filter`)
 - [ ] T032 [US4] `services/library.rs::next_up`; `Library.nextUp` — **COMMIT**
 - [ ] T033 [US4] `services/library.rs::query` (parent, kinds, sort, name prefix, filters, paging); `Library.query` — **COMMIT**
 - [ ] T034 [US4] `services/library.rs::detail`; `Library.detail` — **COMMIT**
