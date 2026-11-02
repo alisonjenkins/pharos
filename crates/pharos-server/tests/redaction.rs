@@ -201,7 +201,8 @@ async fn query_token_is_masked_in_the_request_span() {
 /// B256: a PlaySessionId authorizes a stream on its own, so it is a
 /// credential and the logs carry only its first 8 characters. Negotiating,
 /// streaming with it and stopping it leaves the decision line joinable by
-/// that prefix and the whole id nowhere.
+/// that prefix and the whole id nowhere, and so does a playback superseded
+/// on the same device.
 /// Disarm check: logging the full id in the decision line, or letting the
 /// sqlite store spans record their `play_session_id` argument, puts it in the
 /// captured log.
@@ -287,11 +288,35 @@ async fn play_session_id_is_logged_by_prefix_only() {
         .set_json(serde_json::json!({ "PlaySessionId": psid, "ItemId": "1" }))
         .to_request();
     assert!(test::call_service(&app, stop).await.status().is_success());
+    // A new playback on the same device supersedes the old session, and
+    // that line names both.
+    let superseded = "supersededplaysessionone";
+    let superseding = "supersedingplaysessiontwo";
+    for id in [superseded, superseding] {
+        let start = test::TestRequest::post()
+            .uri("/Sessions/Playing")
+            .insert_header(("X-Emby-Token", token))
+            .set_json(serde_json::json!({ "PlaySessionId": id, "ItemId": "1" }))
+            .to_request();
+        assert!(test::call_service(&app, start).await.status().is_success());
+    }
+    // The registry applies events in order, so a read answers after both.
+    let list = test::TestRequest::get()
+        .uri("/Sessions")
+        .insert_header(("X-Emby-Token", token))
+        .to_request();
+    test::call_service(&app, list).await;
 
     let captured = String::from_utf8_lossy(&buf.lock().unwrap().clone()).into_owned();
     assert!(
         captured.contains(&format!("play_session_id={}", &psid[..8])),
         "no decision line joinable by the prefix:\n{captured}"
     );
-    assert!(!captured.contains(&psid), "PlaySessionId in the log:\n{captured}");
+    assert!(
+        captured.contains("superseded by new playback"),
+        "no supersede line:\n{captured}"
+    );
+    for id in [psid.as_str(), superseded, superseding] {
+        assert!(!captured.contains(id), "PlaySessionId {id} in the log:\n{captured}");
+    }
 }

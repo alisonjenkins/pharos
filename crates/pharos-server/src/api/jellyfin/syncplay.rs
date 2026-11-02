@@ -624,7 +624,7 @@ async fn new_group(
         tracing::info!(
             device_id = %dev, group = %handle.group_id,
             item_id = %seed.item_id, position_ms = seed.position_ms, is_paused = seed.is_paused,
-            session_id = %seed.session_id, candidates = seed.candidates,
+            session_id = %pharos_core::secret_prefix(&seed.session_id), candidates = seed.candidates,
             since_activity_ms = seed.since_activity_ms,
             "syncplay: seeding new group from creator's now-playing item"
         );
