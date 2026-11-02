@@ -9,5 +9,6 @@ mod platform;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 #[path = "web.rs"]
 mod platform;
+pub mod playback;
 pub mod route;
 pub mod views;
