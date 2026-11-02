@@ -68,11 +68,6 @@ async fn add_remote_item(
     user: AuthUser,
     body: web::Json<AddRemoteBody>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let Some(resolver) = state.remote.as_ref() else {
-        return Err(error::ErrorServiceUnavailable(
-            ResolveError::Disabled.to_string(),
-        ));
-    };
     let url = body.url.trim();
     // Cataloguing makes the server fetch a caller-chosen URL (V188).
     if !user.0.policy.admin {
@@ -84,15 +79,20 @@ async fn add_remote_item(
         );
         return Err(error::ErrorForbidden("cataloguing a URL is admin-only"));
     }
+    let Some(resolver) = state.remote.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            ResolveError::Disabled.to_string(),
+        ));
+    };
     if url.is_empty() {
         return Err(error::ErrorBadRequest("url is required"));
     }
-    if let Err(e) = resolver.check_target(url).await {
-        refused(&user.0.name, url, e.label(), &e.to_string());
-        return Err(error::ErrorBadRequest(e.to_string()));
-    }
 
     let resolved = resolver.describe(url).await.map_err(|e| {
+        if let ResolveError::Target(refusal) = &e {
+            refused(&user.0.name, url, refusal.label(), &e.to_string());
+            return error::ErrorBadRequest(e.to_string());
+        }
         tracing::warn!(url, error = %e, "could not catalogue a URL");
         // The resolver's message carries the site's own reason; a bare class
         // would leave a person guessing why their link was refused.
