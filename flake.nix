@@ -611,7 +611,7 @@
         # and binaryen supplies wasm-opt. Output is the `dx` web `public/`
         # dir (index.html + /assets/{wasm,js}); pharos.css is copied in
         # (dx 0.7's legacy [web.resource].style no longer copies it). pharos
-        # serves it at the root from the OCI image (ADR-0033).
+        # serves it at /ui/ from the OCI image (ADR-0038).
         uiSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = path: _type:

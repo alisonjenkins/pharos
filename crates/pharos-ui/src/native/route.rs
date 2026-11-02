@@ -1,7 +1,7 @@
 //! The native UI's routes (009 contracts/serving.md): one typed value per
-//! URL, so a link cannot name a page that does not exist. Every first
-//! segment is in `pharos_server::ui::UI_ROUTES`, which keeps the server
-//! from claiming it; [`FIRST_SEGMENTS`] is checked against that list.
+//! URL, so a link cannot name a page that does not exist. The server mounts
+//! the app under [`MOUNT`] (ADR-0038); [`Route::path`] puts the prefix on and
+//! [`Route::parse`] takes it off.
 
 use pharos_client::api::ItemRef;
 
@@ -24,17 +24,19 @@ pub enum Route {
     NotFound(String),
 }
 
-/// The first path segment of every route but `Home`, lowercase.
-pub const FIRST_SEGMENTS: &[&str] = &[
-    "browse", "title", "watch", "find", "signin", "manage", "settings",
-];
+/// Where the server mounts the app, and Dioxus.toml's `base_path`.
+pub const MOUNT: &str = "/ui";
 
 impl Route {
-    /// The route for a URL path. Case-insensitive, as the server lowercases
-    /// paths before routing; a trailing slash is ignored.
+    /// The route for a URL path, with or without the [`MOUNT`] prefix.
+    /// Case-insensitive, as the server lowercases paths before routing; a
+    /// trailing slash is ignored.
     pub fn parse(path: &str) -> Route {
         let lower = path.to_ascii_lowercase();
-        let segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+        let mut segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.first() == Some(&MOUNT.trim_start_matches('/')) {
+            segments.remove(0);
+        }
         let id = |s: &str| s.parse::<ItemRef>().ok();
         match segments.as_slice() {
             [] => Route::Home,
@@ -52,14 +54,14 @@ impl Route {
     /// The URL path for this route; `parse(route.path()) == route`.
     pub fn path(&self) -> String {
         match self {
-            Route::Home => "/".into(),
-            Route::Browse(id) => format!("/browse/{id}"),
-            Route::Title(id) => format!("/title/{id}"),
-            Route::Watch(id) => format!("/watch/{id}"),
-            Route::SignIn => "/signin".into(),
-            Route::Manage => "/manage".into(),
-            Route::Appearance => "/settings/appearance".into(),
-            Route::Find => "/find".into(),
+            Route::Home => format!("{MOUNT}/"),
+            Route::Browse(id) => format!("{MOUNT}/browse/{id}"),
+            Route::Title(id) => format!("{MOUNT}/title/{id}"),
+            Route::Watch(id) => format!("{MOUNT}/watch/{id}"),
+            Route::SignIn => format!("{MOUNT}/signin"),
+            Route::Manage => format!("{MOUNT}/manage"),
+            Route::Appearance => format!("{MOUNT}/settings/appearance"),
+            Route::Find => format!("{MOUNT}/find"),
             Route::NotFound(path) => path.clone(),
         }
     }
@@ -118,22 +120,19 @@ mod tests {
         }
     }
 
-    /// Each route's first segment is listed, so the server-side check sees
-    /// every one.
     #[test]
-    fn first_segments_cover_every_route() {
-        for route in [
-            Route::Browse(ItemRef::Real(1)),
-            Route::Title(ItemRef::Real(1)),
-            Route::Watch(ItemRef::Real(1)),
-            Route::SignIn,
-            Route::Manage,
-            Route::Appearance,
-            Route::Find,
-        ] {
-            let path = route.path();
-            let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
-            assert!(FIRST_SEGMENTS.contains(&first), "{first}");
-        }
+    fn paths_carry_the_mount_prefix() {
+        assert_eq!(Route::Home.path(), "/ui/");
+        assert_eq!(Route::Title(ItemRef::Real(3)).path(), "/ui/title/3");
+        assert_eq!(Route::Appearance.path(), "/ui/settings/appearance");
+    }
+
+    #[test]
+    fn the_prefix_is_optional_and_case_insensitive_on_parse() {
+        assert_eq!(Route::parse("/ui"), Route::Home);
+        assert_eq!(Route::parse("/UI/"), Route::Home);
+        assert_eq!(Route::parse("/Ui/Find"), Route::Find);
+        assert_eq!(Route::parse("/find"), Route::Find);
+        assert_eq!(Route::parse("/ui/ui"), Route::NotFound("/ui/ui".into()));
     }
 }

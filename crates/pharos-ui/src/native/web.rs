@@ -358,7 +358,7 @@ impl Drop for NativeVideo {
 
 /// The vendored hls.js (ADR-0035), served from this origin so the CSP's
 /// `script-src 'self'` covers it.
-const HLSJS_SRC: &str = "/assets/vendor/hls.min.js";
+const HLSJS_SRC: &str = "/ui/assets/vendor/hls.min.js";
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
