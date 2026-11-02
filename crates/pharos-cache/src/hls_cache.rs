@@ -8812,6 +8812,35 @@ mod tests {
         }
     }
 
+    /// A grouped edition shares its primary's media id. Its muxed segments
+    /// must still read its own AAC encode, and the primary's stays where it
+    /// was.
+    #[test]
+    fn an_edition_and_its_primary_read_distinct_continuous_audio() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let primary = cache.continuous_audio_root(
+            7,
+            None,
+            Some(128_000),
+            SourceGen::for_read(Path::new("/media/film.mkv"), None),
+        );
+        let edition = cache.continuous_audio_root(
+            7,
+            None,
+            Some(128_000),
+            SourceGen::for_read(Path::new("/media/film-3d.mkv"), Some("3d")),
+        );
+        assert!(
+            primary.ends_with("_contaudio/7-a0-b128"),
+            "a local primary's directory must not move: {primary:?}"
+        );
+        assert_ne!(
+            primary, edition,
+            "an edition must not read its primary's audio"
+        );
+    }
+
     #[test]
     fn a_continuous_audio_session_is_source_anchored() {
         // `-ss X` and `-output_ts_offset X` cancel exactly, so every sample
