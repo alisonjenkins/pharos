@@ -1068,6 +1068,17 @@ pub async fn pick_audio(
     }
 }
 
+/// The audio track a player starts a file on: the default-flagged one, else
+/// the first.
+fn first_audio(streams: &[pharos_jellyfin_api::dto::MediaStreamDto]) -> Option<u32> {
+    let mut audio = streams.iter().filter(|s| s.kind == "Audio");
+    audio
+        .clone()
+        .find(|s| s.is_default)
+        .or_else(|| audio.next())
+        .map(|s| s.index)
+}
+
 /// Picks the subtitle `item` starts with for the audio in `audio`; `None` is
 /// no subtitle. `explicit` is the client's pick on this request (`-1` off).
 pub fn pick_subtitle(
@@ -1303,13 +1314,31 @@ pub async fn grant(
         return Err(GrantError::NotPlayable);
     }
     let profile = r.capabilities.profile();
+    // The same start tracks PlaybackInfo picks: the user's remembered track,
+    // else their language rules.
+    let streams = crate::services::watch::streams(&item).await;
+    let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
+    let subtitle = pick_subtitle(
+        &audio,
+        &streams,
+        &item.probe,
+        &profile.subtitle_profiles,
+        r.subtitle_stream_index,
+    );
+    // The decision names these tracks, so the stream must carry them: the
+    // picked subtitle (or none) is what gets burned, and an audio track other
+    // than the one a player starts on cannot direct play.
+    let switches = PlaybackSwitches {
+        direct_play: audio.index.is_none() || audio.index == first_audio(&streams),
+        ..PlaybackSwitches::default()
+    };
     let negotiated = negotiate(
         state,
         &item,
         &NegotiateRequest {
             profile: &profile,
-            switches: PlaybackSwitches::default(),
-            explicit_subtitle_index: r.subtitle_stream_index,
+            switches,
+            explicit_subtitle_index: Some(subtitle.map_or(-1, i64::from)),
             stereo_mode: None,
             client_is_remote: r.client_is_remote,
             is_web_client: false,
@@ -1322,17 +1351,6 @@ pub async fn grant(
     } else {
         user_data.last_played_position_ticks
     };
-    // The same start tracks PlaybackInfo picks: the user's remembered track,
-    // else their language rules.
-    let streams = crate::services::watch::streams(&item).await;
-    let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
-    let subtitle = pick_subtitle(
-        &audio,
-        &streams,
-        &item.probe,
-        &profile.subtitle_profiles,
-        r.subtitle_stream_index,
-    );
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
             "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
@@ -1351,7 +1369,7 @@ pub async fn grant(
                 source_param: "",
                 play_session_id: &play_session_id,
                 api_key: None,
-                audio_stream_index: r.audio_stream_index.map(|i| i.to_string()),
+                audio_stream_index: audio.index.map(|i| i.to_string()),
                 explicit_subtitle_index: r.subtitle_stream_index,
                 is_web_client: false,
                 resume_ticks,
@@ -1384,6 +1402,8 @@ pub async fn grant(
         direct_play_block = negotiated.direct_play_block.label(),
         downgrade = negotiated.downgrade.unwrap_or("none"),
         client_is_remote = r.client_is_remote,
+        audio_index = audio.index.map(i64::from).unwrap_or(-1),
+        subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
         "native playback negotiated"
     );
     Ok(Grant {

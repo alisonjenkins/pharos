@@ -78,6 +78,8 @@ struct Decided {
     downgrade: String,
     url: String,
     psid: String,
+    audio: Option<u32>,
+    subtitle: Option<u32>,
 }
 
 fn denial(e: error::Reader<'_>) -> String {
@@ -102,9 +104,18 @@ fn read_decision(result: decision_result::Reader<'_>) -> Result<Decided, String>
                 downgrade: text(d.get_downgrade()),
                 url: text(d.get_stream_url()),
                 psid: text(d.get_play_session().unwrap().get_value()),
+                audio: opt(d.get_audio().unwrap()),
+                subtitle: opt(d.get_subtitle().unwrap()),
             })
         }
         decision_result::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+fn opt(o: pharos_api::pharos_capnp::opt_u32::Reader<'_>) -> Option<u32> {
+    match o.which().unwrap() {
+        pharos_api::pharos_capnp::opt_u32::Some(v) => Some(v),
+        pharos_api::pharos_capnp::opt_u32::None(()) => None,
     }
 }
 
@@ -447,4 +458,95 @@ async fn hidden_missing_and_unplayable_items_are_refused() {
     )
     .await
     .is_ok());
+}
+
+/// 017 T067: the decision names the tracks the playback starts on, and a
+/// report carries a switch the player made without renegotiating, so the
+/// next playback starts on it.
+/// Disarm check: with `Grant::at` sending no tracks, the remembered
+/// subtitle stays unset; with `write_decision` leaving the picks out, the
+/// decision names none.
+#[actix_web::test]
+async fn the_decision_names_its_tracks_and_reports_remember_a_switch() {
+    use pharos_core::{AudioTrack, SubtitleTrack};
+
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    item.probe.audio_tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("aac".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.subtitle_tracks = vec![SubtitleTrack {
+        stream_index: 3,
+        codec: Some("subrip".into()),
+        ..SubtitleTrack::default()
+    }];
+    fx.state.stores.put(item).await.unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, decided) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Index(2),
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_eq!((decided.audio, decided.subtitle), (Some(2), None));
+    assert_ne!(
+        decided.method, "direct_play",
+        "a player starts the file on track 1, so track 2 must be streamed: {decided:?}"
+    );
+    assert!(decided.url.contains("AudioStreamIndex=2"), "{decided:?}");
+    let (_grant, first) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Index(1),
+        Choice::Off,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.method, "direct_play", "{first:?}");
+
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(10_000);
+    set_choice(req.get().init_audio(), Choice::Default);
+    set_choice(req.get().init_subtitle(), Choice::Index(3));
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    assert_eq!(data.subtitle_stream_index, Some(3));
+
+    let (_grant, again) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.subtitle, Some(3), "{again:?}");
 }

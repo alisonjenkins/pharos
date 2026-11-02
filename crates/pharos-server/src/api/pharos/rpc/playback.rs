@@ -5,7 +5,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    capabilities, decision, done, playback as wire, playback_grant as grant_wire, stream_choice,
+    capabilities, decision, done, opt_u32, playback as wire, playback_grant as grant_wire,
+    stream_choice,
 };
 use pharos_api::{server, Denial};
 use pharos_jellyfin_api::dto::WireId;
@@ -85,6 +86,8 @@ impl server::playback::Handler for Playback {
                     direct_play_block: grant.negotiated.direct_play_block.label(),
                     downgrade: grant.negotiated.downgrade.unwrap_or("none"),
                     stream_url: grant.stream_url,
+                    audio: grant.audio_stream_index,
+                    subtitle: grant.subtitle_stream_index,
                 };
                 let conn = self.session.conn();
                 out.set_grant(server::playback_grant::client(grant, &conn));
@@ -104,19 +107,38 @@ struct Grant {
     direct_play_block: &'static str,
     downgrade: &'static str,
     stream_url: String,
+    audio: Option<u32>,
+    subtitle: Option<u32>,
+}
+
+/// The tracks a report names: `None` says nothing about that track.
+#[derive(Default, Clone, Copy)]
+struct Playing {
+    audio: Option<i32>,
+    subtitle: Option<i32>,
 }
 
 impl Grant {
-    fn at(&self, position_ms: u64, is_paused: bool) -> Report<'_> {
+    fn at(&self, position_ms: u64, is_paused: bool, playing: Playing) -> Report<'_> {
         Report {
             play_session_id: Some(&self.play_session_id),
             item_wire_id: Some(&self.item_wire_id),
             position_ticks: position_ms.saturating_mul(TICKS_PER_MS),
             is_paused,
-            audio_stream_index: None,
-            subtitle_stream_index: None,
+            audio_stream_index: playing.audio,
+            subtitle_stream_index: playing.subtitle,
         }
     }
+}
+
+/// A report's track: an index, `-1` for "none", nothing for `default` or for
+/// an index no stream can have, which must not overwrite a remembered pick.
+fn reported(choice: stream_choice::Reader<'_>) -> Result<Option<i32>, capnp::Error> {
+    Ok(match choice.which()? {
+        stream_choice::Index(i) => i32::try_from(i).ok(),
+        stream_choice::None(()) => Some(-1),
+        stream_choice::Default(()) => None,
+    })
 }
 
 impl server::playback_grant::Handler for Grant {
@@ -139,7 +161,11 @@ impl server::playback_grant::Handler for Grant {
         results: &mut grant_wire::ReportResults,
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
-        let report = self.at(params.get_position_ms(), params.get_paused());
+        let playing = Playing {
+            audio: reported(params.get_audio()?)?,
+            subtitle: reported(params.get_subtitle()?)?,
+        };
+        let report = self.at(params.get_position_ms(), params.get_paused(), playing);
         let reported = match self.session.current_user().await {
             Ok(user) => play_state::report(&self.session.state, &user, report)
                 .await
@@ -155,7 +181,7 @@ impl server::playback_grant::Handler for Grant {
         params: grant_wire::StopParams,
         results: &mut grant_wire::StopResults,
     ) -> Result<(), capnp::Error> {
-        let report = self.at(params.get()?.get_position_ms(), false);
+        let report = self.at(params.get()?.get_position_ms(), false, Playing::default());
         let stopped = match self.session.current_user().await {
             Ok(user) => play_state::stop(&self.session.state, &user, report)
                 .await
@@ -184,8 +210,18 @@ fn write_decision(mut out: decision::Builder<'_>, grant: &Grant) {
     out.set_direct_play_block(grant.direct_play_block);
     out.set_downgrade(grant.downgrade);
     out.set_stream_url(grant.stream_url.as_str());
-    out.init_play_session()
+    out.reborrow()
+        .init_play_session()
         .set_value(grant.play_session_id.as_str());
+    set_opt(out.reborrow().init_audio(), grant.audio);
+    set_opt(out.init_subtitle(), grant.subtitle);
+}
+
+fn set_opt(mut out: opt_u32::Builder<'_>, value: Option<u32>) {
+    match value {
+        Some(v) => out.set_some(v),
+        None => out.set_none(()),
+    }
 }
 
 fn report_denial(e: play_state::ReportError) -> Denial {
