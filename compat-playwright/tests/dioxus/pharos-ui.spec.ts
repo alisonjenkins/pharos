@@ -413,5 +413,83 @@ test.describe("pharos Dioxus UI", () => {
         errors.join("\n"),
       ).toBe(true);
     });
+
+    test("the Appearance page applies, keeps, imports, refuses and exports themes", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const lines: string[] = [];
+      page.on("console", (m) => {
+        if (m.text().startsWith("pharos: theme")) lines.push(m.text());
+      });
+      const rootToken = (name: string) =>
+        page.evaluate(
+          (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim(),
+          name,
+        );
+
+      await page.goto("/");
+      await page.evaluate(() => localStorage.removeItem("pharos.theme.custom"));
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await page.locator(".pharos-shell-nav").getByRole("link", { name: "Appearance" }).click();
+      await expect(page).toHaveURL(/\/settings\/appearance$/);
+      await expect(page.locator("li.pharos-theme-card")).toHaveCount(7);
+
+      // Apply switches without a reload, and the pick survives one.
+      await page.locator("#theme-apply-kali-dark").click();
+      await expect.poll(() => rootToken("--px-color-bg")).toBe("#0b0f19");
+      await page.reload();
+      await expect.poll(() => rootToken("--px-color-bg")).toBe("#0b0f19");
+      await expect
+        .poll(() => lines.join("\n"))
+        .toMatch(/pharos: theme applied name="Kali Dark"/);
+
+      // Paste a theme: it is saved, listed as custom, and exports byte for byte.
+      const pasted =
+        '[meta]\nname = "Pasted"\nschema = 1\nextends = "Neon Grid"\n\n[palette]\naccent = "#33ee11"\n';
+      const paste = async (text: string) => {
+        await page.locator("#theme-import-paste").fill(text);
+        await page.locator("#theme-import-paste-go").click();
+      };
+      await paste(pasted);
+      await expect(page.getByRole("status")).toContainText("Imported Pasted");
+      await expect(page.locator("#theme-delete-pasted")).toBeVisible();
+      const download = page.waitForEvent("download");
+      await page.locator("#theme-export-pasted").click();
+      const file = await download;
+      expect(file.suggestedFilename()).toBe("pasted.pharos-theme.toml");
+      const fs = await import("node:fs/promises");
+      expect(await fs.readFile((await file.path()) ?? "", "utf8")).toBe(pasted);
+
+      // Hostile input is refused naming the field, and never reaches CSS.
+      lines.length = 0;
+      await paste(
+        '[meta]\nname = "Evil"\nschema = 1\n\n[palette]\naccent = "red; background: url(x)"\n',
+      );
+      await expect(page.getByRole("alert")).toContainText("palette.accent");
+      await expect
+        .poll(() => lines.join("\n"))
+        .toMatch(/pharos: theme fallback name=Evil source=import reason=bad_value path=palette.accent/);
+      await expect(page.locator("#theme-apply-evil")).toHaveCount(0);
+
+      // A theme that fails contrast is refused with the pair and its ratio.
+      lines.length = 0;
+      await paste(
+        '[meta]\nname = "Murky"\nschema = 1\n\n[palette]\nfg = "#101318"\n',
+      );
+      await expect(page.getByRole("alert")).toContainText("contrast is too low");
+      await expect
+        .poll(() => lines.join("\n"))
+        .toMatch(/pharos: theme rejected name=Murky source=import reason=contrast pair=fg\/bg/);
+    });
   });
 });
