@@ -70,7 +70,9 @@ config:
     bind: "0.0.0.0:8096"
     name: "pharos"
     # pharos-ui bundle baked into the image (ADR-0033), served at `/`.
-    # null serves no UI; `/` then answers "pharos".
+    # null serves no UI; `/` then answers "pharos". A set path with no
+    # index.html stops pharos at startup, so clear it on a custom image
+    # built without the bundle.
     uiDir: "/share/pharos-ui"
     # Caches live under the cache volume (see persistence.cache).
     imageCacheDir: "/var/lib/pharos/cache/images"

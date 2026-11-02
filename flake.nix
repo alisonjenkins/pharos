@@ -39,7 +39,7 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # `dx build` requires wasm-bindgen-cli to EXACTLY match the
-        # wasm-bindgen crate the project locks (dioxus 0.7.9 → 0.2.122),
+        # wasm-bindgen crate the project locks (0.2.128 in Cargo.lock),
         # but the pinned nixpkgs ships 0.2.121. Build the matching version
         # from crates.io. (Bump version + both hashes together when dioxus
         # bumps its wasm-bindgen pin.)
@@ -607,13 +607,11 @@
 
         # The pharos Dioxus UI compiled to a static WASM bundle via `dx`.
         # Built reproducibly in the nix sandbox: cargo deps are vendored from
-        # Cargo.lock (offline), the wasm-bindgen-cli is the pinned 0.2.122,
+        # Cargo.lock (offline), wasm-bindgen-cli is `wasmBindgenCli` above,
         # and binaryen supplies wasm-opt. Output is the `dx` web `public/`
-        # dir (index.html + /ui/assets/{wasm,js}); pharos.css is copied in
-        # (dx 0.7's legacy [web.resource].style no longer copies it). The
-        # app is built with base_path = "ui" so every asset URL is /ui/-
-        # rooted and the angie pod can serve it under /ui/ without colliding
-        # with the proxied REST API.
+        # dir (index.html + /assets/{wasm,js}); pharos.css is copied in
+        # (dx 0.7's legacy [web.resource].style no longer copies it). pharos
+        # serves it at the root from the OCI image (ADR-0033).
         uiSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = path: _type:
