@@ -13,7 +13,7 @@ use pharos_core::{
     genre_wire_id, CollectionStore, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem,
     MediaKind, MediaMetadata, MediaProbe, PersonKind, PersonRef, PersonStore, PlaylistStore,
     PreferenceStore, SecretString, StudioStore, TagStore, TokenStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore,
 };
 use pharos_store_sqlx::postgres::PostgresStore;
 use pharos_store_sqlx::sqlite::SqliteStore;
@@ -242,6 +242,9 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .await
         .expect("connect in-memory sqlite");
     let (uid1, uid2, item1) = seed(&sqlite).await;
+    UserPrefStore::set_user_pref(&sqlite, uid1, "diagnostics.opt_in", b"true")
+        .await
+        .unwrap();
     // Tagged tracks, to check the target's language index afterwards.
     let mut tagged = media_item(9_001, "Tagged Movie", MediaKind::Movie);
     tagged.probe.audio_tracks = vec![pharos_core::AudioTrack {
@@ -312,6 +315,7 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         "user_data",
         "user_configuration",
         "display_preferences",
+        "user_prefs",
         "artwork",
         "item_genres",
         "item_people",
@@ -425,4 +429,13 @@ async fn migrate_sqlite_to_postgres_round_trip() {
 
     let pg_user2 = UserStore::get(&postgres, uid2).await.unwrap();
     assert_eq!(pg_user2.name, "migrate-user-2");
+
+    let pref = UserPrefStore::get_user_pref(&postgres, uid1, "diagnostics.opt_in")
+        .await
+        .unwrap();
+    assert_eq!(
+        pref.as_deref(),
+        Some(b"true".as_slice()),
+        "migrated user pref must read back through the postgres UserPrefStore"
+    );
 }
