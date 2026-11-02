@@ -38,8 +38,10 @@ pub enum ConnectError {
     /// policy such as CSP `connect-src`).
     #[error("websocket refused by the browser: {0}")]
     Create(String),
-    /// The socket closed before it opened: the server refused the upgrade
-    /// (native API off, origin not allowed) or the network failed.
+    /// The socket closed before it opened. Browsers hide why: a refused
+    /// upgrade (native API off, origin not allowed) and a network failure
+    /// all arrive as code 1006 with no reason, so ask `GET /pharos/session`
+    /// (404 off, 405 on) to tell them apart.
     #[error("websocket closed before opening (code {}: {})", .0.code, .0.reason)]
     NotOpened(Closed),
 }
