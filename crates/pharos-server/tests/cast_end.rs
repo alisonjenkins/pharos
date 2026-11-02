@@ -118,7 +118,7 @@ async fn the_owner_stopping_on_the_tv_session_ends_the_cast_and_revokes_the_toke
 
     assert!(rig.service.snapshot().await.is_empty());
     assert_eq!(seat_total("ended", "user_stop"), before + 1);
-    assert_eq!(rig.token_status(&token).await, 401, "V175");
+    assert_eq!(rig.token_status(&token).await, 401, "V222");
     eventually("the TV is told to stop", || {
         rig.receiver
             .commands()
@@ -152,7 +152,7 @@ async fn a_tv_that_drops_off_the_network_past_the_grace_ends_the_cast() {
         "grace is 1 s; the end must not wait out anything longer"
     );
     assert_eq!(seat_total("ended", "grace_expired"), ended + 1);
-    assert_eq!(rig.token_status(&token).await, 401, "V175");
+    assert_eq!(rig.token_status(&token).await, 401, "V222");
     rig.assert_players_not_frozen(&[rig.bob.member, rig.alice.member])
         .await;
 }
@@ -196,7 +196,7 @@ async fn a_dissolved_group_ends_the_cast_with_group_gone_and_revokes_the_token()
     rig.wait_cast_gone().await;
 
     assert_eq!(seat_total("ended", "group_gone"), before + 1);
-    assert_eq!(rig.token_status(&token).await, 401, "V175");
+    assert_eq!(rig.token_status(&token).await, 401, "V222");
 }
 
 fn restart_messages(msgs: &[ServerMsg]) -> Vec<&'static str> {
@@ -301,6 +301,7 @@ async fn roster_seen_by_bob(rig: &mut CastRig) -> Vec<pharos_sync::messages::Mem
         .tx
         .send(GroupMsg::ResyncMember {
             member_id: rig.bob.member,
+            user: None,
         })
         .await
         .unwrap();
@@ -350,6 +351,7 @@ async fn the_owners_socket_dropping_leaves_the_cast_following_and_the_owner_list
         .tx
         .send(GroupMsg::ResyncMember {
             member_id: rig.alice.member,
+            user: None,
         })
         .await
         .unwrap();
@@ -523,7 +525,7 @@ async fn the_owner_removed_by_another_replica_ends_the_cast_with_owner_left() {
 
     rig.wait_cast_gone().await;
     assert_eq!(seat_total("ended", "owner_left"), before + 1);
-    assert_eq!(rig.token_status(&token).await, 401, "V175");
+    assert_eq!(rig.token_status(&token).await, 401, "V222");
 }
 
 #[actix_web::test]

@@ -330,6 +330,7 @@ impl<F: TransportFactory> Actor<F> {
             .tx
             .send(GroupMsg::ResyncMember {
                 member_id: cast.seat_member,
+                user: None,
             })
             .await;
         obs::record_cast_event(

@@ -108,6 +108,7 @@ async fn join(
         .send(GroupMsg::AddMember {
             member_id: reg.member_id,
             name: name.into(),
+            user: None,
             reply,
         })
         .await
@@ -211,6 +212,7 @@ impl Rig {
             .tx
             .send(GroupMsg::ResyncMember {
                 member_id: person.member,
+                user: None,
             })
             .await
             .unwrap();

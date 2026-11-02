@@ -988,7 +988,12 @@ impl<F: TransportFactory> Actor<F> {
                     .await;
             }
             (ConnState::Lost, ConnState::Following) => {
-                let _ = group.send(GroupMsg::ResyncMember { member_id: seat }).await;
+                let _ = group
+                    .send(GroupMsg::ResyncMember {
+                        member_id: seat,
+                        user: None,
+                    })
+                    .await;
             }
             _ => {}
         }
@@ -1160,6 +1165,7 @@ impl<F: TransportFactory> Actor<F> {
                 .tx
                 .send(GroupMsg::ResyncMember {
                     member_id: cast.owner_member,
+                    user: Some(cast.owner),
                 })
                 .await;
         }

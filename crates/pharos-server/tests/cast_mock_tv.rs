@@ -261,7 +261,7 @@ async fn a_late_joiner_and_a_buffering_occupant_never_hold_the_tv_up() {
     .await;
     clock.observe(&mut rig.bob.rx);
 
-    // A gate opens on the Players' acks alone; nothing waits on the TV (V172),
+    // A gate opens on the Players' acks alone; nothing waits on the TV (V219),
     // and the TV still lands on the seek.
     rig.assert_players_not_frozen(&[rig.bob.member, rig.carol.member])
         .await;
@@ -340,5 +340,5 @@ async fn stopping_on_the_tv_ends_the_cast_as_user_stop_and_revokes_the_token() {
 
     rig.wait_cast_gone().await;
     assert_eq!(seat_total("ended", "user_stop"), before + 1);
-    assert_eq!(rig.token_status(&token).await, 401, "V175");
+    assert_eq!(rig.token_status(&token).await, 401, "V222");
 }

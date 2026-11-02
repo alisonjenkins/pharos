@@ -15,7 +15,6 @@ use crate::{
 };
 use actix_web::{error, http::StatusCode, web, HttpRequest, HttpResponse, Responder};
 use pharos_cast::events::CastReason;
-use pharos_core::{MediaStore, PlaybackProgress, UserDataStore};
 use pharos_sync::{
     group::GroupMsg,
     messages::{GroupPlayState, MemberId},
@@ -381,7 +380,7 @@ async fn capabilities(
 /// the receiving WS handler decides how to interpret it.
 ///
 /// A configured TV's id is applied to the caller's SyncPlay group instead
-/// ([`tv_transport`]); nothing is relayed to a player (V173).
+/// ([`tv_transport`]); nothing is relayed to a player (V220).
 async fn session_playstate_command(
     state: web::Data<AppState>,
     auth: AuthSession,

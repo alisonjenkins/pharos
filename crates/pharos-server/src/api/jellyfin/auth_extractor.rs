@@ -428,10 +428,11 @@ impl FromRequest for MediaUser {
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let state = req.app_data::<web::Data<AppState>>().cloned();
+        let route = RouteKey::of(req);
         let req = req.clone();
         Box::pin(async move {
             let token = media_token(state.as_ref().map(|s| s.get_ref()), &req).await;
-            let user = authenticate(state, token).await?;
+            let user = authenticate(state, token, route).await?;
             note_header_credential(&req);
             Ok(MediaUser(user))
         })

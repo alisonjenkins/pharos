@@ -444,6 +444,7 @@ async fn add(h: &GroupHandle, member: MemberId, name: &str) {
     h.tx.send(GroupMsg::AddMember {
         member_id: member,
         name: name.into(),
+        user: None,
         reply: tx,
     })
     .await

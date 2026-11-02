@@ -133,6 +133,7 @@ async fn person(
             .send(GroupMsg::AddMember {
                 member_id: reg.member_id,
                 name: name.into(),
+                user: Some(id),
                 reply,
             })
             .await

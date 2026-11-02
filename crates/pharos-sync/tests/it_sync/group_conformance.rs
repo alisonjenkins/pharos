@@ -519,6 +519,7 @@ async fn channel_attached_sink_receives_the_same_stream_as_a_socket_sink() {
     h.tx.send(GroupMsg::AddMember {
         member_id: adapter,
         name: "tv".into(),
+        user: None,
         reply,
     })
     .await
@@ -581,6 +582,7 @@ async fn join_roster(
     h.tx.send(GroupMsg::AddMember {
         member_id: mid,
         name: name.into(),
+        user: None,
         reply,
     })
     .await
@@ -676,6 +678,7 @@ async fn add_member_with_id(
     h.tx.send(GroupMsg::AddMember {
         member_id: id,
         name: name.into(),
+        user: None,
         reply,
     })
     .await
@@ -938,6 +941,7 @@ async fn cast_seat_channel_sink_gets_the_group_commands_and_never_extends_a_gate
     h.tx.send(GroupMsg::AddMember {
         member_id: seat,
         name: "tv".into(),
+        user: None,
         reply,
     })
     .await

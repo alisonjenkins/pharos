@@ -228,6 +228,7 @@ async fn running_cast(
         .send(GroupMsg::AddMember {
             member_id: reg.member_id,
             name: "ali".into(),
+            user: None,
             reply,
         })
         .await
@@ -594,6 +595,7 @@ async fn join_on(process: &Process, group: &GroupHandle, who: &str) -> Owner {
         .send(GroupMsg::AddMember {
             member_id: reg.member_id,
             name: who.into(),
+            user: None,
             reply,
         })
         .await
