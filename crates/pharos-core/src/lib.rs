@@ -20,7 +20,7 @@ pub use auth::{
     UserId, UserPolicy, UserRecord, UserStore, API_KEY_DEVICE_PREFIX,
 };
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
-pub use secret::SecretString;
+pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
 
 use serde::{Deserialize, Serialize};
