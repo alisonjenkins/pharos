@@ -722,15 +722,23 @@ impl<P: Prober> FsScanner<P> {
                             && state.file_size == size
                             && state.probe_schema_version == expected_schema_version(&primary)
                         {
-                            if let Some((reason, edition)) =
-                                edition_drift_for(store, row, &alts).await?
-                            {
-                                record_edition_drift(row, &primary, reason, &edition, "skipped");
+                            // B289 — the primary file is unchanged, but the editions
+                            // grouped under it live on its row too. A deleted, added
+                            // or resized edition must re-put the row, or its
+                            // alternate_sources and has_3d go stale.
+                            match edition_drift_for(store, row, &alts).await? {
+                                None => {
+                                    seen_batch.push((row, mtime, size));
+                                    seen += 1;
+                                    outcome.skipped += 1;
+                                    continue;
+                                }
+                                Some((reason, edition)) => {
+                                    record_edition_drift(
+                                        row, &primary, reason, &edition, "reprobed",
+                                    );
+                                }
                             }
-                            seen_batch.push((row, mtime, size));
-                            seen += 1;
-                            outcome.skipped += 1;
-                            continue;
                         }
                     }
                     pending.push(Pending {
