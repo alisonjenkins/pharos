@@ -372,3 +372,83 @@ async fn recommended_programs_is_registered_because_home_dies_on_its_404() {
     assert_eq!(v["TotalRecordCount"], 0);
     assert!(v["Items"].as_array().is_some_and(|a| a.is_empty()));
 }
+
+/// B267: a user whose `EnableLiveTvAccess` is off meets live TV as if none
+/// were configured: `IsEnabled` false, empty channel and programme lists,
+/// 404 for a channel and its stream. Each route counts once under
+/// `pharos_live_tv_access_denied_total{route}`; a permitted user is served.
+/// Disarm check: with `backend_for` ignoring the policy, the denied user is
+/// shown the channels.
+#[actix_web::test]
+async fn live_tv_access_off_reads_as_not_configured() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let (state, allowed_token, _td) = seed_state_with_live_tv().await;
+    let uid = UserId::new();
+    state
+        .stores
+        .create(UserRecord {
+            id: uid,
+            name: "no-tv".into(),
+            password_hash: SecretString::new("x"),
+            policy: UserPolicy {
+                enable_live_tv_access: false,
+                ..UserPolicy::default()
+            },
+        })
+        .await
+        .unwrap();
+    let denied_token = state.stores.issue(uid, "t").await.unwrap();
+    let denied_token = denied_token.0.expose().to_string();
+    let app = test::init_service(build_app(state)).await;
+
+    let get = |uri: &str, token: &str| {
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token))
+            .to_request()
+    };
+    let info: serde_json::Value =
+        test::call_and_read_body_json(&app, get("/LiveTv/Info", &denied_token)).await;
+    assert_eq!(info["IsEnabled"], false);
+    assert_eq!(info["Services"], serde_json::json!([]));
+    for uri in [
+        "/LiveTv/Channels",
+        "/LiveTv/Programs?minStartDate=2024-01-01T00:00:00Z&maxEndDate=2024-01-02T00:00:00Z",
+    ] {
+        let v: serde_json::Value =
+            test::call_and_read_body_json(&app, get(uri, &denied_token)).await;
+        assert_eq!(v["TotalRecordCount"], 0, "{uri}: {v}");
+    }
+    for uri in ["/LiveTv/Channels/bbc1", "/LiveTv/Channels/bbc1/Stream"] {
+        let resp = test::call_service(&app, get(uri, &denied_token)).await;
+        assert_eq!(resp.status(), 404, "{uri}");
+    }
+    let shown: serde_json::Value =
+        test::call_and_read_body_json(&app, get("/LiveTv/Channels", &allowed_token)).await;
+    assert_eq!(shown["TotalRecordCount"], 2);
+
+    let mut denied = std::collections::BTreeMap::new();
+    for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+        if key.key().name() != "pharos_live_tv_access_denied_total" {
+            continue;
+        }
+        let route = key
+            .key()
+            .labels()
+            .find(|l| l.key() == "route")
+            .map(|l| l.value().to_string())
+            .unwrap_or_default();
+        if let metrics_util::debugging::DebugValue::Counter(n) = value {
+            *denied.entry(route).or_insert(0) += n;
+        }
+    }
+    let expected: std::collections::BTreeMap<String, u64> =
+        ["channel", "channels", "info", "programs", "stream"]
+            .into_iter()
+            .map(|r| (r.to_string(), 1))
+            .collect();
+    assert_eq!(denied, expected);
+}

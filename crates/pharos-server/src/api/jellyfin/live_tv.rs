@@ -10,6 +10,7 @@ use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{http::header, web, HttpResponse, Responder};
 use pharos_core::TunerBackend;
+use pharos_discovery::live_tv::M3uXmltvBackend;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -68,8 +69,27 @@ async fn channel_image_primary(
         .finish()
 }
 
-async fn info(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
-    let enabled = state.live_tv.is_some();
+/// The live TV backend as `user` may see it: `None` when none is configured
+/// or the user's `EnableLiveTvAccess` is off, so a denied user meets the same
+/// "not configured" answers (empty lists, 404 by id) jellyfin-web already
+/// renders. A denial counts under
+/// `pharos_live_tv_access_denied_total{route}` and logs a WARN.
+fn backend_for<'a>(
+    state: &'a AppState,
+    user: &AuthUser,
+    route: &'static str,
+) -> Option<&'a M3uXmltvBackend> {
+    let backend = state.live_tv.as_ref()?;
+    if !user.0.policy.enable_live_tv_access {
+        metrics::counter!("pharos_live_tv_access_denied_total", "route" => route).increment(1);
+        tracing::warn!(user = %user.0.name, route, "live tv withheld: EnableLiveTvAccess is off");
+        return None;
+    }
+    Some(backend)
+}
+
+async fn info(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
+    let enabled = backend_for(&state, &user, "info").is_some();
     // B78/V38 — `Services` is `List<LiveTvServiceInfo>` in the SDK, NOT a list
     // of strings: a native client fails `LiveTvInfo` decode on the old
     // `["M3U/XMLTV"]` shape. Emit one properly-typed service entry when live-tv
@@ -156,8 +176,8 @@ struct LiveTvProgramDto {
     is_sports: bool,
 }
 
-async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder {
-    let Some(backend) = state.live_tv.as_ref() else {
+async fn channels(state: web::Data<AppState>, user: AuthUser) -> impl Responder {
+    let Some(backend) = backend_for(&state, &user, "channels") else {
         return crate::api::jellyfin::wire::json(&empty_items_result_value());
     };
     let chs = match backend.channels().await {
@@ -191,10 +211,10 @@ async fn channels(state: web::Data<AppState>, _user: AuthUser) -> impl Responder
 
 async fn channel(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> impl Responder {
-    let Some(backend) = state.live_tv.as_ref() else {
+    let Some(backend) = backend_for(&state, &user, "channel") else {
         return HttpResponse::NotFound().body("");
     };
     let id = path.into_inner();
@@ -292,7 +312,7 @@ async fn stream(
     user: AuthUser,
     path: web::Path<String>,
 ) -> impl Responder {
-    let Some(backend) = state.live_tv.as_ref() else {
+    let Some(backend) = backend_for(&state, &user, "stream") else {
         return stream_refused(
             StreamOutcome::NotConfigured,
             HttpResponse::NotFound().finish(),
@@ -394,10 +414,10 @@ fn default_window_hours() -> u64 {
 
 async fn programs(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<ProgramsQuery>,
 ) -> impl Responder {
-    let Some(backend) = state.live_tv.as_ref() else {
+    let Some(backend) = backend_for(&state, &user, "programs") else {
         return crate::api::jellyfin::wire::json(&empty_items_result_value());
     };
     let now_ms = unix_ms_now();
