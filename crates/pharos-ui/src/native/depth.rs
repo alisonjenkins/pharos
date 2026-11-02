@@ -2,7 +2,8 @@
 //! on rails. Both write straight to the element (a style property, a scroll
 //! offset) instead of a signal, so moving the pointer never re-renders.
 //!
-//! Host builds have no DOM; there every function is a no-op.
+//! Host builds have no DOM; there the handlers are no-ops. The arithmetic
+//! they share is plain functions, tested on the host.
 
 use dioxus::prelude::*;
 
@@ -62,8 +63,8 @@ pub fn tilt(evt: &Event<PointerData>) {
         return;
     }
     let at = evt.client_coordinates();
-    let x = ((at.x - origin.left()) / w * 2.0 - 1.0).clamp(-1.0, 1.0);
-    let y = ((at.y - origin.top()) / h * 2.0 - 1.0).clamp(-1.0, 1.0);
+    let x = tilt_fraction(at.x, origin.left(), w);
+    let y = tilt_fraction(at.y, origin.top(), h);
     let style = el.style();
     let _ = style.set_property("--px-tilt-x", &format!("{x:.3}"));
     let _ = style.set_property("--px-tilt-y", &format!("{y:.3}"));
@@ -101,10 +102,6 @@ pub fn rail_wheel(evt: &Event<WheelData>) {
         WheelDelta::Lines(v) => (v.x * LINE_PX, v.y * LINE_PX),
         WheelDelta::Pages(_) => return,
     };
-    if dy.abs() <= dx.abs() {
-        // Trackpads and tilt wheels already scroll sideways.
-        return;
-    }
     let Some(web) = evt.try_as_web_event() else {
         return;
     };
@@ -112,14 +109,66 @@ pub fn rail_wheel(evt: &Event<WheelData>) {
         return;
     };
     let max = f64::from(el.scroll_width() - el.client_width());
-    let left = el.scroll_left() as f64;
-    let at_end = (dy < 0.0 && left <= 0.0) || (dy > 0.0 && left >= max - 1.0);
-    if max <= 0.0 || at_end {
+    let Some(step) = wheel_step(dx, dy, f64::from(el.scroll_left()), max) else {
         return;
-    }
+    };
     web.prevent_default();
-    el.scroll_by_with_x_and_y(dy, 0.0);
+    el.scroll_by_with_x_and_y(step, 0.0);
 }
 
 #[cfg(not(feature = "web"))]
 pub fn rail_wheel(_evt: &Event<WheelData>) {}
+
+/// How far a wheel turn of `dx`, `dy` should move a rail scrolled to `left`
+/// of `max`, or `None` to leave the turn to the page. Only a purely
+/// vertical turn is taken, as a mouse wheel gives: a trackpad swipe has
+/// some sideways motion and already scrolls the rail, or the page, itself.
+/// At either end of the rail the turn goes to the page.
+pub fn wheel_step(dx: f64, dy: f64, left: f64, max: f64) -> Option<f64> {
+    if dx != 0.0 || dy == 0.0 || max <= 0.0 {
+        return None;
+    }
+    let at_end = (dy < 0.0 && left <= 0.0) || (dy > 0.0 && left >= max - 1.0);
+    (!at_end).then_some(dy)
+}
+
+/// Where `at` falls across a box starting at `origin` of length `size`,
+/// from -1 at one edge to 1 at the other, clamped.
+pub fn tilt_fraction(at: f64, origin: f64, size: f64) -> f64 {
+    ((at - origin) / size * 2.0 - 1.0).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mouse_wheel_moves_the_rail_by_its_turn() {
+        assert_eq!(wheel_step(0.0, 100.0, 0.0, 500.0), Some(100.0));
+        assert_eq!(wheel_step(0.0, -100.0, 250.0, 500.0), Some(-100.0));
+    }
+
+    #[test]
+    fn a_trackpad_swipe_with_sideways_motion_is_left_alone() {
+        assert_eq!(wheel_step(3.0, 4.0, 100.0, 500.0), None);
+        assert_eq!(wheel_step(-1.0, 40.0, 100.0, 500.0), None);
+    }
+
+    #[test]
+    fn at_either_end_or_with_nothing_to_scroll_the_page_gets_the_turn() {
+        assert_eq!(wheel_step(0.0, -100.0, 0.0, 500.0), None);
+        assert_eq!(wheel_step(0.0, 100.0, 500.0, 500.0), None);
+        assert_eq!(wheel_step(0.0, 100.0, 499.5, 500.0), None);
+        assert_eq!(wheel_step(0.0, 100.0, 0.0, 0.0), None);
+        assert_eq!(wheel_step(0.0, 0.0, 100.0, 500.0), None);
+    }
+
+    #[test]
+    fn tilt_runs_edge_to_edge_and_clamps_outside() {
+        assert_eq!(tilt_fraction(100.0, 100.0, 200.0), -1.0);
+        assert_eq!(tilt_fraction(200.0, 100.0, 200.0), 0.0);
+        assert_eq!(tilt_fraction(300.0, 100.0, 200.0), 1.0);
+        assert_eq!(tilt_fraction(900.0, 100.0, 200.0), 1.0);
+        assert_eq!(tilt_fraction(0.0, 100.0, 200.0), -1.0);
+    }
+}
