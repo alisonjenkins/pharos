@@ -60,6 +60,19 @@ impl Refused {
     }
 }
 
+/// The longest Origin written to a log line. The header is client-chosen, so
+/// an unbounded one would let any caller fill the log.
+const MAX_LOGGED_ORIGIN: usize = 256;
+
+/// `s` cut to at most `max` bytes, backed off to a char boundary.
+fn truncate_for_log(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    s.get(..end).unwrap_or_default()
+}
+
 /// Counts and logs a refused upgrade, naming the offending value. The
 /// connection cap is also a limit (FR-010).
 pub fn record_refused(refused: Refused, origin: Option<&str>, peer: &str) {
@@ -76,7 +89,7 @@ pub fn record_refused(refused: Refused, origin: Option<&str>, peer: &str) {
     }
     tracing::warn!(
         reason = refused.label(),
-        origin = origin.unwrap_or(""),
+        origin = truncate_for_log(origin.unwrap_or(""), MAX_LOGGED_ORIGIN),
         peer,
         "native api upgrade refused"
     );
@@ -468,6 +481,25 @@ async fn run<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_origin_is_cut_to_the_limit_on_a_char_boundary() {
+        let long = "a".repeat(MAX_LOGGED_ORIGIN + 10);
+        assert_eq!(
+            truncate_for_log(&long, MAX_LOGGED_ORIGIN).len(),
+            MAX_LOGGED_ORIGIN
+        );
+        // "é" is two bytes, so a cut at byte 256 would split it: back off to 255.
+        let multi = format!("{}é", "a".repeat(MAX_LOGGED_ORIGIN - 1));
+        assert_eq!(
+            truncate_for_log(&multi, MAX_LOGGED_ORIGIN),
+            "a".repeat(MAX_LOGGED_ORIGIN - 1)
+        );
+        assert_eq!(
+            truncate_for_log("https://ok.example", MAX_LOGGED_ORIGIN),
+            "https://ok.example"
+        );
+    }
 
     #[test]
     fn close_cause_and_refusal_labels_are_distinct() {
