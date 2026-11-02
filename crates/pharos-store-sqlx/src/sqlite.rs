@@ -899,6 +899,25 @@ impl MediaStore for SqliteStore {
         ))
     }
 
+    #[tracing::instrument(skip(self), fields(media.id = %id))]
+    async fn alternate_sources(
+        &self,
+        id: MediaId,
+    ) -> DomainResult<Vec<pharos_core::AlternateMediaSource>> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let row = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT alternate_sources_json FROM media_items WHERE id = ?",
+        )
+        .bind(id_i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(crate::alternate_source_json::decode(
+            row.and_then(|(json,)| json).as_deref(),
+        ))
+    }
+
     #[tracing::instrument(skip(self))]
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         let root_str = root.to_str();

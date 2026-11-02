@@ -3141,6 +3141,24 @@ pub trait MediaStore: Send + Sync {
         id: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<Option<ScanState>>> + Send;
 
+    /// The grouped editions stored on row `id` (empty when the row is absent
+    /// or has none). The scanner compares this to the editions on disk before
+    /// it skips an unchanged primary (B289). The default reads the whole item;
+    /// the SQL backends override it with a single-column select, because the
+    /// scanner asks once per skipped file.
+    fn alternate_sources(
+        &self,
+        id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<AlternateMediaSource>>> + Send {
+        async move {
+            match self.get(id).await {
+                Ok(item) => Ok(item.probe.alternate_sources),
+                Err(DomainError::NotFound(_)) => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
     /// B257 — the id of the row whose `path` is `path`, or `None` when no row
     /// holds it. A row's id is the path-derived one unless it was seeded or
     /// rebound after a move, so the scanner asks this when a lookup by the
