@@ -4,7 +4,7 @@
 // Mirrors the browser module's surface; some of it only the browser uses.
 #![allow(dead_code)]
 
-use pharos_client::api::{Capabilities, NativeApi};
+use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
@@ -94,6 +94,11 @@ pub fn warn(message: &str) {
 }
 
 pub fn info(_message: &str) {}
+
+/// No server to submit to on the host: client events are dropped.
+pub fn install_telemetry(_api: &NativeApi) {}
+
+pub fn report_event(_event: ClientEvent) {}
 
 pub fn stored_theme(_key: &str) -> Result<Option<String>, String> {
     Ok(None)
