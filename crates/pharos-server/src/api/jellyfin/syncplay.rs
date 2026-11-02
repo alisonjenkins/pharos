@@ -11,7 +11,7 @@
 //! group, is a `204` no-op.
 
 use crate::api::jellyfin::auth_extractor::{AuthSession, AuthUser};
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpResponse};
 use pharos_sync::group::{GroupHandle, GroupMsg, QueueMode, MAX_QUEUE_LEN};
 use pharos_sync::messages::{GroupId, MemberId};
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
@@ -582,6 +582,9 @@ async fn new_group(
     state: web::Data<crate::state::AppState>,
     body: web::Bytes,
 ) -> HttpResponse {
+    if !sync_play_allows(&auth.user, SyncPlayNeed::Create, "new") {
+        return HttpResponse::Forbidden().finish();
+    }
     let Some(dev) = auth.sync_key() else {
         tracing::warn!("syncplay: New with no deviceId — cannot form a group");
         return no_content();
@@ -654,6 +657,9 @@ async fn join_group(
     state: web::Data<crate::state::AppState>,
     body: web::Json<JoinGroupBody>,
 ) -> HttpResponse {
+    if !sync_play_allows(&auth.user, SyncPlayNeed::Join, "join") {
+        return HttpResponse::Forbidden().finish();
+    }
     let Some(dev) = auth.sync_key() else {
         return no_content();
     };
@@ -1141,7 +1147,7 @@ pub(crate) enum GroupHiddenRoute {
 }
 
 impl GroupHiddenRoute {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             GroupHiddenRoute::List => "list",
             GroupHiddenRoute::Join => "join",
@@ -1154,6 +1160,48 @@ impl GroupHiddenRoute {
 fn group_hidden(route: GroupHiddenRoute, user: &pharos_core::User, group: &str) {
     metrics::counter!("pharos_syncplay_group_hidden_total", "route" => route.label()).increment(1);
     tracing::warn!(user = %user.name, group, route = route.label(), "syncplay group withheld: its queue holds an item the user may not see");
+}
+
+/// What a SyncPlay request asks of `UserPolicy.sync_play_access`: the `need`
+/// label of `pharos_syncplay_access_denied_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncPlayNeed {
+    /// List or join a group.
+    Join,
+    /// Create a group.
+    Create,
+}
+
+impl SyncPlayNeed {
+    fn label(self) -> &'static str {
+        match self {
+            SyncPlayNeed::Join => "join",
+            SyncPlayNeed::Create => "create",
+        }
+    }
+}
+
+/// Whether `user`'s `SyncPlayAccess` grants `need`, as in Jellyfin:
+/// `CreateAndJoinGroups` grants both, `JoinGroups` joining only, `None`
+/// neither. An empty value reads as Jellyfin's default, `CreateAndJoinGroups`;
+/// any other value Jellyfin does not define grants nothing. A refusal counts
+/// under `pharos_syncplay_access_denied_total{need}` and logs a WARN naming
+/// the user, their access and `via`, the route that asked.
+pub(crate) fn sync_play_allows(user: &pharos_core::User, need: SyncPlayNeed, via: &str) -> bool {
+    let access = user.policy.sync_play_access.as_str();
+    let allowed = if access.is_empty() || access.eq_ignore_ascii_case("CreateAndJoinGroups") {
+        true
+    } else if access.eq_ignore_ascii_case("JoinGroups") {
+        need == SyncPlayNeed::Join
+    } else {
+        false
+    };
+    if !allowed {
+        metrics::counter!("pharos_syncplay_access_denied_total", "need" => need.label())
+            .increment(1);
+        tracing::warn!(user = %user.name, access, need = need.label(), via, "syncplay request refused by the user's SyncPlayAccess");
+    }
+    allowed
 }
 
 /// Whether `user` may see every item in a group's queue, and so the group
@@ -1181,7 +1229,8 @@ async fn may_see_queue(
         && ids.len() == wanted
 }
 
-/// Whether `user` may join `handle`'s group (V201), counting a refusal under
+/// Whether `user` may join `handle`'s group (V201): their `SyncPlayAccess`
+/// lets them join, and they may see its queue, counting a refusal under
 /// `route`. The queue comes from the group's actor, or from its persisted
 /// snapshot when the actor answers nothing (it lives on another replica). A
 /// queue that cannot be read refuses a restricted user.
@@ -1191,6 +1240,9 @@ pub(crate) async fn may_join(
     handle: &GroupHandle,
     route: GroupHiddenRoute,
 ) -> bool {
+    if !sync_play_allows(user, SyncPlayNeed::Join, route.label()) {
+        return false;
+    }
     if crate::services::library::hides_nothing(&user.policy) {
         return true;
     }
@@ -1231,7 +1283,10 @@ async fn list_groups(
     user: AuthUser,
     registry: web::Data<GroupRegistry>,
     state: web::Data<crate::state::AppState>,
-) -> impl Responder {
+) -> HttpResponse {
+    if !sync_play_allows(&user.0, SyncPlayNeed::Join, "list") {
+        return HttpResponse::Forbidden().finish();
+    }
     let Ok(handles) = registry.list().await else {
         // Actor unreachable: return empty rather than 500 so the UI
         // renders an "no active groups" pane instead of an error.
@@ -1682,6 +1737,12 @@ mod tests {
                 && waited <= SOCKET_REGISTRATION_WAIT + std::time::Duration::from_millis(10),
             "gave up at the deadline, not before or long after: {waited:?}"
         );
+    }
+
+    #[actix_web::test]
+    async fn sync_play_need_labels_are_distinct() {
+        assert_eq!(SyncPlayNeed::Join.label(), "join");
+        assert_eq!(SyncPlayNeed::Create.label(), "create");
     }
 
     #[actix_web::test]
