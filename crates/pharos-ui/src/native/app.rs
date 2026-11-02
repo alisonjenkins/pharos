@@ -62,7 +62,7 @@ pub fn Root() -> Element {
 /// which theme and, on a fallback, why.
 fn apply_device_theme() {
     let stored = platform::stored_theme(theme::device::ACTIVE_KEY);
-    let startup = match theme::device::startup(&theme::shipped(), stored) {
+    let startup = match theme::device::startup(&theme::shipped(), stored, false, false) {
         Ok(startup) => startup,
         Err(e) => {
             platform::warn(&format!(
