@@ -7,13 +7,15 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    Detail, Home, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _, PlaybackGrant as _,
+    Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _,
+    PlaybackGrant as _,
 };
 use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
+use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
@@ -1060,6 +1062,8 @@ fn TitleScreen(id: ItemRef) -> Element {
 /// A negotiated playback, ready for the player.
 struct Playing {
     title: String,
+    kind: ItemKind,
+    image: Option<String>,
     url: String,
     start_ms: u64,
     engine: Engine,
@@ -1123,6 +1127,8 @@ fn WatchScreen(id: ItemRef) -> Element {
                     };
                     Ok(PlayingRef(Rc::new(Playing {
                         title: detail.item.name,
+                        kind: detail.item.kind,
+                        image: detail.item.image,
                         url: decision.stream_url,
                         start_ms,
                         engine,
@@ -1249,7 +1255,11 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
         if let Some(message) = failed() {
             ErrorNote { message }
         }
-        WatchView { title: p.title.clone(), on_media }
+        if p.kind == ItemKind::Audio {
+            ListenView { title: p.title.clone(), image: p.image.clone(), on_media }
+        } else {
+            WatchView { title: p.title.clone(), on_media }
+        }
     }
 }
 
