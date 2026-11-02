@@ -167,6 +167,9 @@ async fn playing_started(
     body: web::Json<PlayingBody>,
 ) -> Result<impl Responder, actix_web::Error> {
     let body = body.into_inner();
+    if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&body.item_id) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "playback").await?;
+    }
     // Bump the item being played to the front of the trickplay/subtitle
     // pre-generator. PlaybackInfo already nudges, but not every client calls
     // it (and a pod restarted mid-episode would otherwise never re-learn what's
@@ -219,7 +222,7 @@ async fn playing_progress(
     };
     play_state::report(&state, &user.0, report)
         .await
-        .map_err(error::ErrorInternalServerError)?;
+        .map_err(report_error)?;
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -239,8 +242,16 @@ async fn playing_stopped(
     };
     play_state::stop(&state, &user.0, report)
         .await
-        .map_err(error::ErrorInternalServerError)?;
+        .map_err(report_error)?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// A withheld item answers as a missing one (V187); anything else is a 500.
+fn report_error(e: play_state::ReportError) -> actix_web::Error {
+    match e {
+        play_state::ReportError::Withheld(hidden) => crate::api::jellyfin::access_error(hidden),
+        other => error::ErrorInternalServerError(other),
+    }
 }
 
 /// Minimal, infallible percent-decode of a query value (`+`→space, `%XX`→byte).
