@@ -599,3 +599,82 @@ test.describe("pharos Dioxus UI", () => {
     });
   });
 });
+
+// 013 US7 / ADR-0039: a song opens the now-playing screen with a visualiser.
+// The seeded media tree carries 05-carefree.mp3. Headless CI may have no
+// WebGL2, so either renderer mode passes; the decision line must be there.
+test.describe("pharos Dioxus UI now playing", () => {
+  test("a song plays on the listening screen and logs its renderer decision", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+
+    await page.goto("/ui/");
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    const tile = page.locator(".pharos-poster").first();
+    await expect(tile).toBeVisible({ timeout: 15_000 });
+    await tile.click();
+    // The click on Play is the gesture Web Audio needs.
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+
+    await expect(page.locator(".pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            () =>
+              (
+                document.getElementById(
+                  "pharos-video",
+                ) as HTMLMediaElement | null
+              )?.currentTime ?? 0,
+          ),
+        {
+          timeout: 30_000,
+        },
+      )
+      .toBeGreaterThan(1);
+    await expect
+      .poll(
+        () =>
+          lines.find((l) =>
+            /pharos: renderer mode=(webgl2|fallback) /.test(l),
+          ) ?? "",
+        {
+          timeout: 15_000,
+        },
+      )
+      .toMatch(/style=spectrum/);
+
+    await page.getByRole("button", { name: "Halo" }).click();
+    await expect(page.getByRole("button", { name: "Halo" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect
+      .poll(() =>
+        page.evaluate(() => localStorage.getItem("pharos.visualiser")),
+      )
+      .toBe("halo");
+  });
+});
