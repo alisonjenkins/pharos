@@ -562,9 +562,14 @@ async fn authorize_media(
     let qs = req.query_string();
     for key in ["tag", "PlaySessionId"] {
         if let Some(cap) = query_value_ci(qs, key) {
-            if let Ok(Some(session)) = state.transcode_sessions.get(&cap).await {
-                if session.media_id == media_id {
+            match state.transcode_sessions.get_stored(&cap).await {
+                Ok(Some(session)) if session.media_id == media_id => {
                     return capability_holder_allowed(state, &session.holder, media_id).await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(media.id = media_id, error = %e, "stream capability: session store unavailable");
+                    return Err(error::ErrorServiceUnavailable("session store unavailable"));
                 }
             }
         }

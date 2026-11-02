@@ -458,3 +458,38 @@ async fn a_capability_ends_when_its_holder_drops_the_encoding() {
             .to_request()
     });
 }
+
+/// B256: a capability is checked against the stored session, not this
+/// replica's cache, so one kept warm by a request every few minutes still
+/// ends six hours after it was written, and a stop on another replica (which
+/// deletes the row) ends it here too.
+/// Disarm check: with `authorize_media` reading `transcode_sessions.get`, the
+/// cached session keeps authorizing.
+#[actix_web::test]
+async fn a_capability_is_checked_against_the_stored_session() {
+    use pharos_core::TranscodeSessionStore as _;
+    let (state, token) = seed().await;
+    let app = init_app!(state.clone());
+    let tag = negotiate_tag!(&app, token.as_str(), 1);
+    let uri = format!("/videos/1/stream?static=true&tag={tag}");
+    assert_ne!(tokenless_stream!(&app, &uri), 401);
+
+    let row = state.stores.get_transcode_session(&tag, 0).await.unwrap().unwrap();
+    let seven_hours_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 7 * 60 * 60;
+    state
+        .stores
+        .upsert_transcode_session(&tag, &row, seven_hours_ago)
+        .await
+        .unwrap();
+    assert_eq!(tokenless_stream!(&app, &uri), 401);
+
+    let tag = negotiate_tag!(&app, token.as_str(), 1);
+    let uri = format!("/videos/1/stream?static=true&tag={tag}");
+    assert_ne!(tokenless_stream!(&app, &uri), 401);
+    state.stores.remove_transcode_session(&tag).await.unwrap();
+    assert_eq!(tokenless_stream!(&app, &uri), 401);
+}

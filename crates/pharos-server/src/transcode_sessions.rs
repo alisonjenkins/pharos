@@ -70,8 +70,9 @@ const EXPIRY: Duration = Duration::from_secs(5 * 60);
 /// failed-over stream can resume well past the 5-minute window, and `get`
 /// does not refresh `updated_at`, so the row ages from negotiation time.
 /// Six hours comfortably covers a long film plus a pause. It is also the
-/// capability's absolute limit once it leaves the cache: `get` ignores an
-/// older row rather than waiting for the hourly prune (B256).
+/// capability's absolute limit: `get` and `get_stored` ignore an older row
+/// rather than waiting for the hourly prune, and a capability is always
+/// checked against the row (B256).
 const DB_RETENTION_SECS: i64 = 6 * 60 * 60;
 
 fn now_unix_secs() -> i64 {
@@ -275,6 +276,34 @@ where
         }
     }
 
+    /// The session as the store holds it, skipping this replica's cache. A
+    /// stream capability is checked here: a stop on any replica deletes the
+    /// row, and the cutoff applies however recently the cache was touched, so
+    /// a PlaySessionId polled every few minutes cannot outlive either (B256).
+    pub async fn get_stored(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<TranscodeSession>, pharos_core::DomainError> {
+        let Some(persisted) = self
+            .store
+            .get_transcode_session(session_id, now_unix_secs() - DB_RETENTION_SECS)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match Self::from_persisted(&persisted) {
+            Ok(session) => Ok(session),
+            Err(e) => {
+                tracing::warn!(
+                    psid = %pharos_core::secret_prefix(session_id),
+                    error = %e,
+                    "persisted transcode session failed to decode; ignoring"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn remove(&self, session_id: &str) -> Result<(), TranscodeSessionError> {
         if let Err(e) = self.store.remove_transcode_session(session_id).await {
             tracing::warn!(
@@ -394,6 +423,32 @@ mod tests {
         let r = TranscodeSessionRegistry::spawn(store);
         assert!(r.get("stale").await.unwrap().is_none());
         assert!(r.get("fresh").await.unwrap().is_some());
+    }
+
+    /// B256: a stop on one replica ends the capability on another that still
+    /// has the session cached, and a cached session past retention is no
+    /// capability either.
+    #[tokio::test]
+    async fn the_stored_row_is_the_capability() {
+        let shared = store().await;
+        let a = TranscodeSessionRegistry::spawn(shared.clone());
+        let b = TranscodeSessionRegistry::spawn(shared.clone());
+        let session = sample_session();
+        let holder = session.holder.user_id;
+        a.insert("s".into(), session.clone()).await.unwrap();
+        assert!(a.get_stored("s").await.unwrap().is_some());
+        assert!(b.end_held("s", holder).await.unwrap());
+        assert!(a.get("s").await.unwrap().is_some(), "a's cache is untouched");
+        assert!(a.get_stored("s").await.unwrap().is_none());
+
+        a.insert("old".into(), session).await.unwrap();
+        let row = shared.get_transcode_session("old", 0).await.unwrap().unwrap();
+        shared
+            .upsert_transcode_session("old", &row, now_unix_secs() - DB_RETENTION_SECS - 1)
+            .await
+            .unwrap();
+        assert!(a.get("old").await.unwrap().is_some(), "still cached");
+        assert!(a.get_stored("old").await.unwrap().is_none());
     }
 
     #[tokio::test]
