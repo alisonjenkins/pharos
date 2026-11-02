@@ -211,8 +211,13 @@ fn extract_header_token(req: &HttpRequest) -> Option<String> {
 /// and media-element fetches authenticate without a header.
 pub const AUTH_COOKIE: &str = "JellyfinAuth";
 
-/// [`extract_token`], falling back to the `JellyfinAuth` cookie on a GET or
-/// HEAD. Only routes that serve an item's bytes to element URLs (images,
+/// The native web UI's twin of [`AUTH_COOKIE`] (ADR-0034): `POST
+/// /pharos/session` sets it on `/` with the session's token so element URLs
+/// authenticate. Its own name keeps jellyfin-web's sign-out from clearing it.
+pub const MEDIA_COOKIE: &str = "pharos_media";
+
+/// [`extract_token`], falling back to the `JellyfinAuth` cookie, then the
+/// native [`MEDIA_COOKIE`], on a GET or HEAD. Only routes that serve an item's bytes to element URLs (images,
 /// subtitles, fonts, streams, HLS, trickplay) read it, through
 /// [`MediaUser`] or `require_bearer` (V191). A browser attaches the cookie
 /// to any same-site request, including one from a sibling subdomain that
@@ -228,9 +233,13 @@ pub fn extract_media_token(req: &HttpRequest) -> Option<String> {
     ) {
         return None;
     }
-    req.cookie(AUTH_COOKIE)
-        .map(|c| c.value().trim().to_owned())
-        .filter(|v| !v.is_empty())
+    // jellyfin-web's cookie first, so a browser signed in to both keeps
+    // jellyfin-web's existing behaviour.
+    [AUTH_COOKIE, MEDIA_COOKIE].into_iter().find_map(|name| {
+        req.cookie(name)
+            .map(|c| c.value().trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// [`AuthUser`] for the routes that serve an item's bytes to element URLs:
