@@ -124,9 +124,9 @@ impl KindFilter {
 /// The most a "latest" listing returns, whatever the caller asks for.
 pub const LATEST_MAX: u32 = 100;
 
-/// Why a "latest" listing could not be built.
+/// Why an item listing could not be built.
 #[derive(Debug)]
-pub enum LatestError {
+pub enum ListError {
     /// The user's library allow-list could not be applied.
     Hidden(ItemHidden),
     /// The item list or the user's play state could not be read.
@@ -143,14 +143,11 @@ pub async fn latest(
     parent_id: Option<&str>,
     kinds: &KindFilter,
     limit: Option<u32>,
-) -> Result<Vec<(MediaItem, UserItemData)>, LatestError> {
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(LatestError::Store)?;
+) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
+    let all = state.list_items_cached().await.map_err(ListError::Store)?;
     let all = crate::services::access::visible_items(state, user, all, "latest")
         .await
-        .map_err(LatestError::Hidden)?;
+        .map_err(ListError::Hidden)?;
     // Home-page "Latest" rows must match the library the user clicked into,
     // and jellyfin-web's "Latest Movies" row filters to Type=Movie.
     let scoped = restrict_to_parent(state, &all, parent_id).await;
@@ -170,7 +167,7 @@ pub async fn latest(
         .stores
         .user_data_bulk(user.id, &ids)
         .await
-        .map_err(LatestError::Store)?;
+        .map_err(ListError::Store)?;
     Ok(typed
         .into_iter()
         .enumerate()
