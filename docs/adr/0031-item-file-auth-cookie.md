@@ -1,6 +1,6 @@
 # ADR-0031: Item file routes require auth; jellyfin-web authenticates them with a narrowly scoped cookie
 
-- **Status:** Accepted
+- **Status:** Superseded in part by ADR-0040 (item images only)
 - **Date:** 2026-11-01T23:30:00Z
 - **Deciders:** Alison Jenkins
 
