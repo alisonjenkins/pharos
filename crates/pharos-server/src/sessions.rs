@@ -248,9 +248,9 @@ impl SessionRegistry {
                         if !superseded.is_empty() {
                             for (old_session_id, old_item_id) in &superseded {
                                 tracing::info!(
-                                    old_session_id = %old_session_id,
+                                    old_session_id = %pharos_core::secret_prefix(old_session_id),
                                     old_item_id = old_item_id.as_deref().unwrap_or(""),
-                                    new_session_id = %session_id,
+                                    new_session_id = %pharos_core::secret_prefix(&session_id),
                                     user_id = %uid,
                                     device_id = %device_id,
                                     "session: superseded by new playback on the same device"
