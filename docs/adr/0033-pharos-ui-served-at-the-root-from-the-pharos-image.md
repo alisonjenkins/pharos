@@ -35,6 +35,9 @@ This supersedes the "build wiring" serving paragraph of ADR-0012, which is other
 - One image and one origin serve the UI, the Jellyfin API and the native API, so the WebSocket needs no proxy hop of its own.
 - The UI ships and rolls back with the server, so they can never be on different versions.
 - The image grows by the bundle's size (a few MB). The `oci` CI job now also runs `dx build`, which lengthens it.
+- A configured `ui_dir` without a bundle stops startup instead of serving the API without a UI. An image built without the bundle must clear `uiDir`.
+- The CSP's `connect-src 'self'` means the UI talks only to the server that served it. The old server picker could switch to another server's URL, and it no longer can. A UI for a different server is that server's own UI.
+- Only content-hashed assets (`-dxh<hex>` in the name) are immutable. Unhashed files such as `assets/pharos.css` revalidate.
 - UI routes and API routes share one namespace. The collision test catches a new API route that would shadow a UI route. Because Jellyfin routes are matched case-insensitively, a UI route must never take a Jellyfin path's name.
 
 ## Alternatives considered
