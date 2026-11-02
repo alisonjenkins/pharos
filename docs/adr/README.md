@@ -74,3 +74,4 @@ optional **Alternatives considered** / **References**).
 | [0029](0029-native-api-transport-and-session.md) | Native API transport: per-worker Cap'n Proto RPC over a WebSocket, sessions resumed from a cookie or device token, off by default | Accepted |
 | [0030](0030-edition-full-probe.md) | Each grouped edition keeps its full probe in `alternate_sources_json` | Accepted |
 | [0031](0031-item-file-auth-cookie.md) | Item file routes require auth; the `JellyfinAuth` cookie authenticates only GET/HEAD byte routes | Accepted |
+| [0032](0032-syncplay-members-record-their-user.md) | SyncPlay group members record their user (persisted and on the bus, absent = sees nothing); a queue change needs every member to see it | Accepted |
