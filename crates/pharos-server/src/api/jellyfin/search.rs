@@ -76,7 +76,7 @@ async fn search_hints(
     q: CiQuery<SearchQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
-    use crate::services::library::{parent_has_visible_items, visible_items};
+    use crate::services::library::{parent_has_visible_items, search_hits, visible_items};
     use std::collections::HashSet;
     let user = &user.0;
 
@@ -116,11 +116,6 @@ async fn search_hints(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?,
     };
-    let visible_ids: HashSet<u64> = if restricted {
-        all.iter().map(|i| i.id).collect()
-    } else {
-        HashSet::new()
-    };
     // A person, studio, box set or tag is visible only through its items.
     let entity_visible = |wire_id: String| {
         let state = state.clone();
@@ -154,9 +149,6 @@ async fn search_hints(
             .cloned()
             .collect()
     } else {
-        use pharos_core::SearchQuery;
-        let item_kinds = kinds.clone().unwrap_or_default();
-        let term = q.search_term.clone().unwrap_or_default();
         // Pull a generous window so aggregate hints + the result page can
         // both draw from it; bounded so a one-letter query can't load the
         // whole library. The handler re-paginates the combined hint list.
@@ -165,31 +157,16 @@ async fn search_hints(
             .saturating_add(q.limit)
             .saturating_add(200)
             .max(200);
-        // Hits outside the user's libraries are dropped below; fetching the
-        // whole visible corpus keeps them from crowding out the page.
-        let fetch = if restricted {
-            fetch.max(u32::try_from(all.len()).unwrap_or(u32::MAX))
-        } else {
-            fetch
-        };
-        let (items, _total) = state
-            .stores
-            .search(&SearchQuery {
-                term: term.trim().to_string(),
-                kinds: item_kinds,
-                limit: fetch,
-                offset: 0,
-            })
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        if restricted {
-            items
-                .into_iter()
-                .filter(|i| visible_ids.contains(&i.id))
-                .collect()
-        } else {
-            items
-        }
+        let scope = restricted.then_some(all.as_slice());
+        search_hits(
+            &state,
+            scope,
+            q.search_term.as_deref().unwrap_or(""),
+            kinds.clone(),
+            fetch,
+        )
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
     };
     for i in &term_items {
         hints.push(SearchHint {

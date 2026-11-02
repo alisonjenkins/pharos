@@ -831,6 +831,46 @@ pub async fn visible_items(
     Ok(Some(items))
 }
 
+/// The stored items whose title, overview or other FTS text matches `term`,
+/// ranked by the store, within `visible` when the caller's policy narrows
+/// the library (`None` means every stored item). Blank `term` matches
+/// nothing. Returns up to `limit`, widened to the visible corpus size when
+/// that is larger, so hits outside the user's libraries cannot crowd out
+/// the ones inside.
+pub async fn search_hits(
+    state: &AppState,
+    visible: Option<&[MediaItem]>,
+    term: &str,
+    kinds: Option<Vec<MediaKind>>,
+    limit: u32,
+) -> Result<Vec<MediaItem>, DomainError> {
+    use pharos_core::SearchQuery;
+    let term = term.trim();
+    if term.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fetch = match visible {
+        Some(visible) => limit.max(u32::try_from(visible.len()).unwrap_or(u32::MAX)),
+        None => limit,
+    };
+    let (items, _total) = state
+        .stores
+        .search(&SearchQuery {
+            term: term.to_string(),
+            kinds: kinds.unwrap_or_default(),
+            limit: fetch,
+            offset: 0,
+        })
+        .await?;
+    Ok(match visible {
+        Some(visible) => {
+            let ids: std::collections::HashSet<u64> = visible.iter().map(|i| i.id).collect();
+            items.into_iter().filter(|i| ids.contains(&i.id)).collect()
+        }
+        None => items,
+    })
+}
+
 /// Whether `/Items?ParentId={parent_wire_id}` lists anything `user` may see.
 /// A person, studio, tag or box set has no library of its own: it is
 /// visible through its items, and only through them.
