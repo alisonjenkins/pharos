@@ -351,6 +351,7 @@ mod tests {
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
+                user: None,
                 member_id: mid,
                 name: "x".into(),
                 reply: rtx,
@@ -395,6 +396,7 @@ mod tests {
         let (rtx, rrx) = oneshot::channel();
         h1.tx
             .send(GroupMsg::AddMember {
+                user: None,
                 member_id: mid,
                 name: "x".into(),
                 reply: rtx,

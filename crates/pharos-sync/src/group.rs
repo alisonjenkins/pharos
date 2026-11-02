@@ -14,6 +14,7 @@ use super::messages::{
     ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
 };
 use super::persistence::GroupPersistence;
+use pharos_core::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -223,6 +224,10 @@ pub enum GroupMsg {
     AddMember {
         member_id: MemberId,
         name: String,
+        /// The signed-in user behind the member. A queue change is judged by
+        /// what every member's user may see; `None` (a member admitted by a
+        /// replica that predates this field) can see nothing.
+        user: Option<UserId>,
         reply: oneshot::Sender<Joined>,
     },
     RemoveMember {
@@ -390,6 +395,9 @@ pub enum GroupMsg {
     /// on a new replica after a deploy resyncs through here.
     ResyncMember {
         member_id: MemberId,
+        /// Fills in the user of a member that has none recorded (one restored
+        /// from a snapshot written before members recorded their user).
+        user: Option<UserId>,
     },
     /// Liveness beacon (T83): the member's `/socket` KeepAlive (every ~30s in
     /// jellyfin-web) and its periodic `/SyncPlay/Ping` both refresh the
@@ -432,12 +440,17 @@ pub enum RemoteCommand {
     AddMember {
         member_id: MemberId,
         name: String,
+        /// `default`: a replica that predates the field sends none.
+        #[serde(default)]
+        user: Option<UserId>,
     },
     RemoveMember {
         member_id: MemberId,
     },
     Resync {
         member_id: MemberId,
+        #[serde(default)]
+        user: Option<UserId>,
     },
     LeaderPlay {
         sender: MemberId,
@@ -556,16 +569,21 @@ impl RemoteCommand {
     /// the member via delivery.
     pub fn into_group_msg(self) -> GroupMsg {
         match self {
-            RemoteCommand::AddMember { member_id, name } => {
+            RemoteCommand::AddMember {
+                member_id,
+                name,
+                user,
+            } => {
                 let (reply, _rx) = oneshot::channel();
                 GroupMsg::AddMember {
                     member_id,
                     name,
+                    user,
                     reply,
                 }
             }
             RemoteCommand::RemoveMember { member_id } => GroupMsg::RemoveMember { member_id },
-            RemoteCommand::Resync { member_id } => GroupMsg::ResyncMember { member_id },
+            RemoteCommand::Resync { member_id, user } => GroupMsg::ResyncMember { member_id, user },
             RemoteCommand::LeaderPlay {
                 sender,
                 position_ms,
@@ -723,6 +741,8 @@ pub struct GroupSnapshot {
     pub group_name: String,
     /// Member display names — the `Participants` the join dialog renders.
     pub participants: Vec<String>,
+    /// Each member's user, `None` where none is recorded.
+    pub member_users: Vec<Option<UserId>>,
     /// Wire item id of the queue entry currently playing (T87 — lets the
     /// HTTP seek handler prewarm that item's segments). None on an empty
     /// queue.
@@ -736,6 +756,7 @@ pub struct GroupSnapshot {
 
 struct MemberRec {
     name: String,
+    user: Option<UserId>,
     offset: ClockOffset,
     buffering: bool,
     /// Jellyfin `/SyncPlay/SetIgnoreWait` — the client halted its own playback
@@ -2321,6 +2342,7 @@ impl GroupState {
                 .map(|(id, m)| PersistMember {
                     id: *id,
                     name: m.name.clone(),
+                    user: m.user,
                     ignore_wait: m.ignore_wait,
                 })
                 .collect(),
@@ -2386,6 +2408,7 @@ impl GroupState {
                     m.id,
                     MemberRec {
                         name: m.name,
+                        user: m.user,
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
@@ -2466,6 +2489,10 @@ impl GroupState {
 struct PersistMember {
     id: MemberId,
     name: String,
+    /// `default`: a snapshot written before members recorded their user
+    /// loads with none, which can see nothing.
+    #[serde(default)]
+    user: Option<UserId>,
     /// `default` keeps older snapshots deserializable.
     #[serde(default)]
     ignore_wait: bool,
@@ -2548,6 +2575,8 @@ pub fn snapshot_contains_member(state_json: &str, member_id: MemberId) -> bool {
 pub struct SnapshotSummary {
     pub group_name: String,
     pub participants: Vec<String>,
+    /// Each member's user, `None` where the snapshot recorded none.
+    pub member_users: Vec<Option<UserId>>,
     pub play_state: GroupPlayState,
     /// Wire item id of every queue entry, in order.
     pub queue_item_ids: Vec<String>,
@@ -2567,6 +2596,7 @@ pub fn snapshot_summary(state_json: &str) -> Option<SnapshotSummary> {
     };
     Some(SnapshotSummary {
         group_name: ps.group_name,
+        member_users: ps.members.iter().map(|m| m.user).collect(),
         participants: ps.members.into_iter().map(|m| m.name).collect(),
         play_state,
         queue_item_ids: ps.queue_items.into_iter().map(|q| q.item_id).collect(),
@@ -2994,7 +3024,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::BufferingEnd { member_id }
         | GroupMsg::ObserveClock { member_id, .. }
         | GroupMsg::SetIgnoreWait { member_id, .. }
-        | GroupMsg::ResyncMember { member_id } => Some(*member_id),
+        | GroupMsg::ResyncMember { member_id, .. } => Some(*member_id),
         GroupMsg::LeaderPlay { sender, .. }
         | GroupMsg::LeaderPause { sender }
         | GroupMsg::LeaderSeek { sender, .. }
@@ -3070,6 +3100,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
         GroupMsg::AddMember {
             member_id,
             name,
+            user,
             reply,
         } => {
             // B57 — idempotent re-add: a duplicate New/Join for a member already
@@ -3081,6 +3112,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // skip the roster-wide MemberJoined broadcast.
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.name = name.clone();
+                rec.user = user.or(rec.user);
                 rec.last_seen = tokio::time::Instant::now();
                 // The socket is back — the member is a gate follower again.
                 rec.connected = true;
@@ -3111,6 +3143,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 member_id,
                 MemberRec {
                     name: name.clone(),
+                    user,
                     offset: ClockOffset::default(),
                     buffering: false,
                     ignore_wait: false,
@@ -3174,7 +3207,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // `playing_index` (A6: a join must not advance the group).
             state.send_catch_up(member_id);
         }
-        GroupMsg::ResyncMember { member_id } => {
+        GroupMsg::ResyncMember { member_id, user } => {
             // A reconnected socket for an existing member (its fresh sink is
             // already in the replica's MemberSinks): re-send the catch-up so it
             // immediately re-syncs. The member (and its place in any readiness
@@ -3183,6 +3216,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 // The socket is back — the member is a gate follower again.
                 let outage_secs = state.members.get_mut(&member_id).and_then(|rec| {
                     rec.connected = true;
+                    rec.user = rec.user.or(user);
                     record_socket_return(rec)
                 });
                 // A reconnect (page reload / deploy rollover) hands a FRESH
@@ -4189,6 +4223,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .into_iter()
                     .map(|s| s.name)
                     .collect(),
+                member_users: state.members.values().map(|m| m.user).collect(),
                 current_item_id: state
                     .queue
                     .items
@@ -4309,6 +4344,7 @@ mod tests {
         sinks.insert(member, 1, sink_tx);
         let (rtx, rrx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
+            user: None,
             member_id: member,
             name: "alison".into(),
             reply: rtx,
@@ -4384,6 +4420,7 @@ mod tests {
         sinks.insert(mid, 1, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
+            user: None,
             member_id: mid,
             name: name.into(),
             reply: reply_tx,
@@ -4469,9 +4506,12 @@ mod tests {
         );
 
         // The late reconnect lands and heals the member.
-        h.tx.send(GroupMsg::ResyncMember { member_id: dropped })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: dropped,
+            user: None,
+        })
+        .await
+        .unwrap();
         let _ = snapshot_of(&h).await;
         for _ in 0..8 {
             tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
@@ -4531,9 +4571,12 @@ mod tests {
         );
 
         // And the seat is still there to come back to.
-        h.tx.send(GroupMsg::ResyncMember { member_id: gone })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: gone,
+            user: None,
+        })
+        .await
+        .unwrap();
         let _ = snapshot_of(&h).await;
         assert_eq!(
             snapshot_of(&h).await.participants.len(),
@@ -4564,9 +4607,12 @@ mod tests {
         while rx_evicted.try_recv().is_ok() {}
 
         // The client's socket returns, still attached to this group.
-        h.tx.send(GroupMsg::ResyncMember { member_id: evicted })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: evicted,
+            user: None,
+        })
+        .await
+        .unwrap();
         let _ = snapshot_of(&h).await;
 
         let mut told = false;
@@ -4845,9 +4891,12 @@ mod tests {
         // past the graces here would be asserting two things and would race
         // the prune tick.
         tokio::time::advance(Duration::from_secs(120)).await;
-        h.tx.send(GroupMsg::ResyncMember { member_id: m2 })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: m2,
+            user: None,
+        })
+        .await
+        .unwrap();
         let _ = snapshot_of(&h).await;
 
         let found = snapshotter
@@ -5281,6 +5330,7 @@ mod tests {
         sinks.insert(mid, 1, tx);
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
+            user: None,
             member_id: mid,
             name: "ali".into(),
             reply: reply_tx,
@@ -5613,6 +5663,7 @@ mod tests {
         let m = MemberId::new();
         assert!(matches!(
             RemoteCommand::AddMember {
+                user: None,
                 member_id: m,
                 name: "x".into()
             }
@@ -5620,8 +5671,8 @@ mod tests {
             GroupMsg::AddMember { member_id, .. } if member_id == m
         ));
         assert!(matches!(
-            RemoteCommand::Resync { member_id: m }.into_group_msg(),
-            GroupMsg::ResyncMember { member_id } if member_id == m
+            RemoteCommand::Resync { member_id: m, user: None }.into_group_msg(),
+            GroupMsg::ResyncMember { member_id, .. } if member_id == m
         ));
         assert!(matches!(
             RemoteCommand::PauseShared { sender: m }.into_group_msg(),
@@ -5743,9 +5794,12 @@ mod tests {
 
         // Now simulate the reconnect: its fresh sink is already swapped in, the
         // actor re-sends the catch-up.
-        h.tx.send(GroupMsg::ResyncMember { member_id: gf })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: gf,
+            user: None,
+        })
+        .await
+        .unwrap();
         let _ = snapshot_of(&h).await; // flush the actor
 
         let first = gf_rx.try_recv().expect("catch-up must send something");
@@ -6097,6 +6151,7 @@ mod tests {
         let member = MemberId::new();
         let ps = PersistState {
             members: vec![PersistMember {
+                user: None,
                 id: member,
                 name: "one".into(),
                 ignore_wait: false,
@@ -7352,6 +7407,7 @@ mod tests {
         // Re-add m2 (a duplicate join).
         let (reply_tx, reply_rx) = oneshot::channel();
         h.tx.send(GroupMsg::AddMember {
+            user: None,
             member_id: m2,
             name: "second".into(),
             reply: reply_tx,
@@ -8012,6 +8068,7 @@ mod tests {
             MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let live = MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
         let mk = |last_seen| MemberRec {
+            user: None,
             socket_gone_since: None,
             name: "m".into(),
             offset: ClockOffset::default(),
@@ -8707,9 +8764,12 @@ mod tests {
         let (gf, mut gf_rx) = add_member(&h, &sinks, "gf").await;
         let _ = snapshot_of(&h).await;
         while gf_rx.try_recv().is_ok() {}
-        h.tx.send(GroupMsg::ResyncMember { member_id: gf })
-            .await
-            .unwrap();
+        h.tx.send(GroupMsg::ResyncMember {
+            member_id: gf,
+            user: None,
+        })
+        .await
+        .unwrap();
         let t_catch_up = next_queue_ts(&mut gf_rx).await;
         assert_eq!(
             t_catch_up, t_queue,
@@ -10092,6 +10152,93 @@ mod tests {
             assert_eq!(ids, ["10"]);
             assert_eq!(new_plis, plis[..1]);
             assert_eq!(playing, 0);
+        }
+    }
+
+    /// A member records the user behind it: on the snapshot the HTTP layer
+    /// reads, in the persisted state, and across the bus. A snapshot or bus
+    /// command written before the field existed still decodes, with no user,
+    /// and a reconnect fills the user in.
+    /// Disarm check: with `ResyncMember` ignoring its user, the restored
+    /// member stays unknown.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_records_its_user_and_old_state_loads_without_one() {
+        let user = UserId::new();
+        let member = MemberId::new();
+        let h = GroupHandle::spawn(
+            GroupId::new(),
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+        );
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            member_id: member,
+            name: "one".into(),
+            user: Some(user),
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap();
+        assert_eq!(snapshot_of(&h).await.member_users, vec![Some(user)]);
+
+        let mut old = serde_json::to_value(PersistState {
+            members: vec![PersistMember {
+                user: Some(user),
+                id: member,
+                name: "one".into(),
+                ignore_wait: false,
+            }],
+            leader: Some(member),
+            group_paused_due_to_buffering: false,
+            buffering_resume_playing: false,
+            playback: PersistPlayback::Idle,
+            queue_items: Vec::new(),
+            playing_index: 0,
+            repeat_mode: String::new(),
+            shuffle_mode: String::new(),
+            queue_updated_unix_ms: 1,
+            waiting: None,
+            group_name: "g".into(),
+        })
+        .unwrap();
+        old["members"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("user")
+            .unwrap();
+        let old = old.to_string();
+        let summary = snapshot_summary(&old).expect("an old snapshot still loads");
+        assert_eq!(summary.member_users, vec![None]);
+
+        let restored = GroupHandle::spawn_persistent(
+            GroupId::new(),
+            1_000,
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+            Arc::new(CapturePersistence::default()),
+            Some(&old),
+        );
+        assert_eq!(snapshot_of(&restored).await.member_users, vec![None]);
+        restored
+            .tx
+            .send(GroupMsg::ResyncMember {
+                member_id: member,
+                user: Some(user),
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot_of(&restored).await.member_users, vec![Some(user)]);
+
+        for old_wire in [
+            serde_json::json!({ "AddMember": { "member_id": member, "name": "one" } }),
+            serde_json::json!({ "Resync": { "member_id": member } }),
+        ] {
+            let cmd: RemoteCommand = serde_json::from_value(old_wire).unwrap();
+            match cmd.into_group_msg() {
+                GroupMsg::AddMember { user, .. } | GroupMsg::ResyncMember { user, .. } => {
+                    assert_eq!(user, None);
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 }
