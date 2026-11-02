@@ -144,6 +144,44 @@ where
     let got_admin = UserStore::get(&store, uid).await.unwrap();
     assert!(got_admin.policy.admin, "set_policy must flip admin flag");
 
+    // Login lookup: case-insensitive, every case variant returned, exact first.
+    UserStore::create(&store, user_record("Mixed-Case"))
+        .await
+        .unwrap();
+    UserStore::create(&store, user_record("mixed-case"))
+        .await
+        .unwrap();
+    let names = |found: Vec<UserRecord>| found.into_iter().map(|u| u.name).collect::<Vec<_>>();
+    assert_eq!(
+        names(
+            UserStore::lookup_by_name_ignore_case(&store, "MIXED-CASE")
+                .await
+                .unwrap()
+        ),
+        ["Mixed-Case", "mixed-case"]
+    );
+    assert_eq!(
+        names(
+            UserStore::lookup_by_name_ignore_case(&store, "mixed-case")
+                .await
+                .unwrap()
+        ),
+        ["mixed-case", "Mixed-Case"],
+        "the exact match comes first"
+    );
+    assert_eq!(
+        names(
+            UserStore::lookup_by_name_ignore_case(&store, "CONFORMANCE-USER")
+                .await
+                .unwrap()
+        ),
+        ["conformance-user"]
+    );
+    assert!(UserStore::lookup_by_name_ignore_case(&store, "nobody-here")
+        .await
+        .unwrap()
+        .is_empty());
+
     // -----------------------------------------------------------------
     // 3. TokenStore
     // -----------------------------------------------------------------

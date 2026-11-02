@@ -1200,6 +1200,13 @@ impl UserStore for AnyStore {
         }
     }
 
+    async fn lookup_by_name_ignore_case(&self, name: &str) -> AuthResult<Vec<UserRecord>> {
+        match self {
+            AnyStore::Sqlite(s) => s.lookup_by_name_ignore_case(name).await,
+            AnyStore::Postgres(p) => p.lookup_by_name_ignore_case(name).await,
+        }
+    }
+
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         match self {
             AnyStore::Sqlite(s) => UserStore::get(s, id).await,

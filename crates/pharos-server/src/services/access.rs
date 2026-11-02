@@ -212,7 +212,7 @@ async fn policy_visible_ids(
 /// a missing token, WARN for one that does not resolve. A restricted token
 /// (a cast TV's) is checked against `method` on the matched route `pattern`
 /// and refused with [`ItemHidden::OutOfScope`] where its scope does not reach
-/// (V220).
+/// (V225).
 pub async fn authenticate(
     state: &AppState,
     token: Option<&str>,

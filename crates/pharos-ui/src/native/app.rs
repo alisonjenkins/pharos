@@ -993,6 +993,22 @@ fn HomeScreen() -> Element {
     })
 }
 
+/// What a browse screen shows when its title cannot be fetched.
+const BROWSE_TITLE_FALLBACK: &str = "Browse";
+
+/// The title of a browse screen. The listing is the point of the screen, so
+/// a title that cannot be fetched is logged and replaced, not a reason to
+/// show no listing.
+fn browse_title(id: ItemRef, detail: Result<Detail, ClientError>) -> String {
+    match detail {
+        Ok(detail) => detail.item.name,
+        Err(e) => {
+            platform::warn(&format!("pharos: browse {id}: title unavailable: {e}"));
+            BROWSE_TITLE_FALLBACK.to_owned()
+        }
+    }
+}
+
 #[component]
 fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
@@ -1002,9 +1018,9 @@ fn BrowseScreen(id: ItemRef) -> Element {
             let api = api?;
             let info = call("browse", "load");
             let result = async {
-                let detail = api.detail(&info, id).await?;
+                let title = browse_title(id, api.detail(&info, id).await);
                 let page = api.browse(&info, id, 0, BROWSE_PAGE).await?;
-                Ok::<_, ClientError>((detail.item.name, page))
+                Ok::<_, ClientError>((title, page))
             }
             .await;
             Some(settle(ctx.machine, result))
@@ -1242,6 +1258,44 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn not_found() -> ClientError {
+        ClientError::Api {
+            kind: "notFound",
+            reason: "item not found".into(),
+            trace_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_browse_screen_without_a_title_still_shows_its_listing() {
+        let title = browse_title(ItemRef::Synth(7), Err(not_found()));
+        assert_eq!(title, BROWSE_TITLE_FALLBACK);
+    }
+
+    #[test]
+    fn a_browse_screen_is_titled_by_its_detail() {
+        let detail = Detail {
+            item: pharos_client::api::Item {
+                id: ItemRef::Synth(7),
+                kind: pharos_client::api::ItemKind::Library,
+                name: "TV".into(),
+                year: None,
+                runtime_ms: 0,
+                image: None,
+                played: false,
+                favorite: false,
+                position_ms: 0,
+                series_name: None,
+                season: None,
+                episode: None,
+            },
+            overview: String::new(),
+            genres: Vec::new(),
+            chapters: Vec::new(),
+        };
+        assert_eq!(browse_title(ItemRef::Synth(7), Ok(detail)), "TV");
+    }
 
     #[test]
     fn the_app_starts_by_connecting() {

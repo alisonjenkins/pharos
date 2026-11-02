@@ -218,6 +218,77 @@ test.describe("pharos Dioxus UI", () => {
       );
     });
 
+    // Library views, series and seasons are synthesised ids, which the server
+    // once refused to describe; the browse screen fetched that description
+    // first, so every one of them showed "notFound: item not found".
+    test("browse opens a library from home, then a series and its season", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-browse-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const json = async (path: string) =>
+        (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+      // A synthesised wire id is the same 63-bit hash in both halves; the
+      // native route spells it `s` and that number in decimal.
+      const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+      // The seed registers a three-episode show (the startup rescan names it
+      // from the file); its episodes carry the synthesised series and season
+      // ids.
+      const episodes = await json(
+        `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode&Fields=SeriesId,SeasonId`,
+      );
+      const episode = episodes.Items?.find(
+        (i: { SeriesId?: string; SeasonId?: string }) => i.SeriesId && i.SeasonId,
+      );
+      expect(episode, "the seed has an episode with a series and season").toBeTruthy();
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await page.locator("section.pharos-rail h2 a").first().click();
+      await expect(page).toHaveURL(/\/ui\/browse\/s\d+$/);
+      await expect(page.locator("section.pharos-browse h2")).toBeVisible({
+        timeout: 15_000,
+      });
+      await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
+      await expect(page.locator("section.pharos-browse h2")).toHaveText(episode.SeriesName, {
+        timeout: 15_000,
+      });
+      await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      await page.goto(`/ui/browse/${nativeSynth(episode.SeasonId)}`);
+      await expect(page.locator("section.pharos-browse h2")).toHaveText(/^Season 1$/, {
+        timeout: 15_000,
+      });
+      await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+    });
+
     test("unknown route renders a message, not a blank page", async ({
       page,
       request,

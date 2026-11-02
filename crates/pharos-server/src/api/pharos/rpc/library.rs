@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_id, item_summary, items_result, library as wire, user_state, Kind,
-    LibraryKind as WireKind,
+    home_result, item_detail, item_id, item_summary, items_result, library as wire, user_state,
+    Kind, LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
@@ -16,6 +16,7 @@ use crate::services::library::{
     self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QueryPage,
     QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::state::AppState;
 
 pub(super) struct Library {
     session: Rc<Session>,
@@ -238,13 +239,19 @@ impl server::library::Handler for Library {
                 return Ok(());
             }
         };
-        let item_not_found = Denial::NotFound { what: "item" };
-        // Synthesised items (series, season, album…) have no detail here yet.
-        let WireId::Real(id) = id else {
-            item_not_found.write(results.get().init_result().init_error());
-            return Ok(());
-        };
         let state = &self.session.state;
+        let id = match id {
+            WireId::Real(id) => id,
+            synth @ WireId::Synth(_) => {
+                match synth_detail(state, &user, synth).await {
+                    Ok(dto) => {
+                        write_synth_detail(results.get().init_result().init_detail(), synth, &dto)
+                    }
+                    Err(denial) => denial.write(results.get().init_result().init_error()),
+                }
+                return Ok(());
+            }
+        };
         let (item, user_data) = match library::detail(state, &user, id).await {
             Ok(found) => found,
             Err(e) => {
@@ -485,8 +492,171 @@ fn wire_kind(kind: MediaKind) -> Kind {
     }
 }
 
+/// Why a native call on an item answered with a denial. The `reason` label of
+/// `pharos_rpc_item_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The policy withholds the item; carries `ItemHidden::label`.
+    Hidden(&'static str),
+    /// No item has the id.
+    NotFound,
+    /// The store could not say.
+    StoreUnavailable,
+    /// A synthesised item the user's policy withholds.
+    SynthHidden,
+}
+
+impl RefusalReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            RefusalReason::Hidden(label) => label,
+            RefusalReason::NotFound => "not_found",
+            RefusalReason::StoreUnavailable => "store_unavailable",
+            RefusalReason::SynthHidden => "synth_hidden",
+        }
+    }
+}
+
+/// The `id_kind` label of `pharos_rpc_item_refused_total`: `real` for a store
+/// row, `synth` for a synthesised group id.
+fn id_kind_label(id: WireId) -> &'static str {
+    match id {
+        WireId::Real(_) => "real",
+        WireId::Synth(_) => "synth",
+    }
+}
+
+/// Records that native `call` refused item `id`: one INFO line carrying the
+/// id and the reason (WARN when the store was the cause), and a count under
+/// `pharos_rpc_item_refused_total{call,id_kind,reason}`.
+pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReason, detail: &str) {
+    let id_kind = id_kind_label(id);
+    metrics::counter!(
+        "pharos_rpc_item_refused_total",
+        "call" => call,
+        "id_kind" => id_kind,
+        "reason" => reason.label()
+    )
+    .increment(1);
+    if reason == RefusalReason::StoreUnavailable {
+        tracing::warn!(item.id = %id, call, id_kind, reason = reason.label(), error = %detail, "native item call: store unavailable");
+    } else {
+        tracing::info!(item.id = %id, call, id_kind, reason = reason.label(), detail, "native item call: refused");
+    }
+}
+
+/// The synthesised item `id` (library view, series, season, album…) as the
+/// Jellyfin `/Items/{id}` projection, resolved by the same
+/// `synth_item_json` so the two APIs agree and apply the same access rules.
+/// A refusal is recorded and answers like an id that names nothing.
+async fn synth_detail(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: WireId,
+) -> Result<serde_json::Value, Denial> {
+    let item_not_found = Denial::NotFound { what: "item" };
+    match crate::api::jellyfin::items::synth_item_json(state, user, &id.to_string()).await {
+        Ok(Some(dto)) => Ok(dto),
+        Ok(None) => {
+            record_refusal(
+                "detail",
+                id,
+                RefusalReason::NotFound,
+                "no such synthesised item",
+            );
+            Err(item_not_found)
+        }
+        Err(e) if e.as_response_error().status_code().is_server_error() => {
+            record_refusal(
+                "detail",
+                id,
+                RefusalReason::StoreUnavailable,
+                &e.to_string(),
+            );
+            Err(Denial::Unavailable {
+                dependency: "media store",
+            })
+        }
+        Err(e) => {
+            record_refusal("detail", id, RefusalReason::SynthHidden, &e.to_string());
+            Err(item_not_found)
+        }
+    }
+}
+
+/// The text field `key` of a Jellyfin DTO, empty when absent.
+fn dto_str<'a>(dto: &'a serde_json::Value, key: &str) -> &'a str {
+    dto.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+}
+
+fn synth_kind(dto: &serde_json::Value) -> Kind {
+    match dto_str(dto, "Type") {
+        "Series" => Kind::Series,
+        "Season" => Kind::Season,
+        "MusicAlbum" => Kind::Album,
+        "MusicArtist" => Kind::Artist,
+        "Playlist" => Kind::Playlist,
+        "CollectionFolder" | "UserView" => Kind::Library,
+        _ => Kind::Collection,
+    }
+}
+
+/// A synthesised item's `ItemDetail` from its Jellyfin DTO: name, kind,
+/// overview, genres, year, Primary image and parentage, whichever it has.
+fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
+    let kind = synth_kind(dto);
+    let mut summary = out.reborrow().init_summary();
+    set_item_id(summary.reborrow().init_id(), id);
+    summary.set_kind(kind);
+    summary.set_name(dto_str(dto, "Name"));
+    if kind == Kind::Library {
+        summary.set_library_kind(match dto_str(dto, "CollectionType") {
+            "movies" => WireKind::Movies,
+            "tvshows" => WireKind::TvShows,
+            "music" => WireKind::Music,
+            "books" => WireKind::Books,
+            _ => WireKind::Mixed,
+        });
+    }
+    if let Some(year) = dto
+        .get("ProductionYear")
+        .and_then(|y| y.as_u64())
+        .and_then(|y| u16::try_from(y).ok())
+    {
+        summary.reborrow().init_year().set_some(year);
+    }
+    if let Some(tag) = dto.pointer("/ImageTags/Primary").and_then(|t| t.as_str()) {
+        let mut image = summary.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_tag(tag);
+        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto_str(dto, "Id")).as_str());
+    }
+    if let Some(parent) = WireId::parse(dto_str(dto, "ParentId")) {
+        set_item_id(summary.reborrow().init_parent_id(), parent);
+    }
+    summary.set_series_name(dto_str(dto, "SeriesName"));
+    if let Some(n) = dto
+        .get("IndexNumber")
+        .and_then(|n| n.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        summary.init_index_number().set_some(n);
+    }
+    out.set_overview(dto_str(dto, "Overview"));
+    let genres: Vec<&str> = dto
+        .get("Genres")
+        .and_then(|g| g.as_array())
+        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
+        .unwrap_or_default();
+    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
+    let mut list = out.init_genres(count);
+    for (i, genre) in (0..count).zip(&genres) {
+        list.set(i, genre);
+    }
+}
+
 /// Why a call on stored item `id` has no item to answer with, as the denial
-/// it sends, logged. A hidden item answers as a missing one, so its id says
+/// it sends, recorded. A hidden item answers as a missing one, so its id says
 /// nothing about what exists.
 pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denial {
     use crate::services::access::ItemHidden;
@@ -494,17 +664,23 @@ pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denia
     let unavailable = Denial::Unavailable {
         dependency: "media store",
     };
-    let (denial, detail) = match e {
-        DetailError::Hidden(ItemHidden::Unavailable(detail)) => (unavailable, detail.clone()),
-        DetailError::Hidden(hidden) => (item_not_found, hidden.label().to_owned()),
-        DetailError::NotFound => (item_not_found, "not_found".to_owned()),
-        DetailError::Store(e) => (unavailable, e.to_string()),
+    let (denial, reason, detail) = match e {
+        DetailError::Hidden(ItemHidden::Unavailable(detail)) => {
+            (unavailable, RefusalReason::StoreUnavailable, detail.clone())
+        }
+        DetailError::Hidden(hidden) => (
+            item_not_found,
+            RefusalReason::Hidden(hidden.label()),
+            hidden.label().to_owned(),
+        ),
+        DetailError::NotFound => (
+            item_not_found,
+            RefusalReason::NotFound,
+            "not_found".to_owned(),
+        ),
+        DetailError::Store(e) => (unavailable, RefusalReason::StoreUnavailable, e.to_string()),
     };
-    if matches!(denial, Denial::Unavailable { .. }) {
-        tracing::warn!(media.id = id, call, error = %detail, "native item call: store unavailable");
-    } else {
-        tracing::debug!(media.id = id, call, reason = %detail, "native item call: refused");
-    }
+    record_refusal(call, WireId::Real(id), reason, &detail);
     denial
 }
 
@@ -574,5 +750,37 @@ fn wire_library_kind(kind: LibraryKind) -> WireKind {
         LibraryKind::TvShows => WireKind::TvShows,
         LibraryKind::Music => WireKind::Music,
         LibraryKind::Books => WireKind::Books,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefusalReason;
+    use crate::services::access::ItemHidden;
+
+    /// A renamed or merged label breaks dashboards silently.
+    #[test]
+    fn refusal_reason_labels_are_distinct() {
+        let hidden = [
+            ItemHidden::LibraryNotAllowed,
+            ItemHidden::NoLibrary,
+            ItemHidden::ParentalRating,
+            ItemHidden::Tag,
+            ItemHidden::Unauthenticated,
+        ];
+        let mut labels: Vec<&str> = hidden
+            .iter()
+            .map(|h| RefusalReason::Hidden(h.label()).label())
+            .collect();
+        labels.extend(
+            [
+                RefusalReason::NotFound,
+                RefusalReason::StoreUnavailable,
+                RefusalReason::SynthHidden,
+            ]
+            .map(RefusalReason::label),
+        );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
     }
 }

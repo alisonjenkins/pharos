@@ -265,30 +265,87 @@ impl<U: UserStore> BuiltinAuth<U> {
         slots: &Arc<Semaphore>,
         wait: Duration,
     ) -> AuthResult<User> {
-        let record = match self.users.lookup_by_name(name).await {
-            Ok(r) => r,
-            Err(AuthError::UserNotFound) => {
-                self.dummy_verify(password, slots, wait).await?;
-                return Err(AuthError::InvalidCredentials);
-            }
-            Err(other) => return Err(other),
+        self.judge_with(name, password, slots, wait)
+            .await
+            .map_err(|denial| match denial {
+                Denial::Refused { .. } => AuthError::InvalidCredentials,
+                Denial::Backend(e) => e,
+            })
+    }
+
+    /// Like [`AuthBackend::authenticate`], but a refusal says why. The reason
+    /// is for the server's own log and metric only; the caller still answers
+    /// every refusal alike (T68, V177).
+    pub async fn judge(&self, name: &str, password: &SecretString) -> Result<User, Denial> {
+        self.judge_with(name, password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
+            .await
+    }
+
+    async fn judge_with(
+        &self,
+        name: &str,
+        password: &SecretString,
+        slots: &Arc<Semaphore>,
+        wait: Duration,
+    ) -> Result<User, Denial> {
+        let typed = name;
+        let name = typed.trim();
+        let mut found = self
+            .users
+            .lookup_by_name_ignore_case(name)
+            .await
+            .map_err(Denial::Backend)?;
+        // Matches arrive exact-first. Several accounts differing only by case
+        // are ambiguous unless one is exactly what was typed.
+        let ambiguous = found.len() > 1 && found.first().is_some_and(|r| r.name != name);
+        let record = if ambiguous {
+            None
+        } else {
+            found.drain(..).next()
         };
+        let Some(record) = record else {
+            self.dummy_verify(password, slots, wait)
+                .await
+                .map_err(Denial::Backend)?;
+            let reason = if ambiguous {
+                tracing::warn!(
+                    reason = LoginFailure::AmbiguousName.label(),
+                    name_len = name.chars().count(),
+                    "login refused: the name matches several accounts that differ only by case"
+                );
+                LoginFailure::AmbiguousName
+            } else {
+                LoginFailure::UnknownUser
+            };
+            return Err(Denial::Refused {
+                reason,
+                name_mismatch: NameMismatch::None,
+            });
+        };
+        let name_mismatch = NameMismatch::between(typed, &record.name);
         let matched = match self
             .verify_off_worker(record.password_hash.expose(), password, slots, wait)
-            .await?
+            .await
+            .map_err(Denial::Backend)?
         {
-            Bounded::Busy => return Err(busy_refusal()),
-            Bounded::Done(verdict) => verdict?,
+            Bounded::Busy => return Err(Denial::Backend(busy_refusal())),
+            Bounded::Done(verdict) => verdict.map_err(Denial::Backend)?,
         };
         if !matched {
-            return Err(AuthError::InvalidCredentials);
+            return Err(Denial::Refused {
+                reason: LoginFailure::BadPassword,
+                name_mismatch,
+            });
         }
         // T68 — a disabled user must not authenticate even with valid
         // credentials. Checked after the password verify so a disabled account
         // is indistinguishable from a wrong password (no account-state
         // enumeration): both yield InvalidCredentials → 401.
         if record.policy.is_disabled {
-            return Err(AuthError::InvalidCredentials);
+            return Err(Denial::Refused {
+                reason: LoginFailure::Disabled,
+                name_mismatch,
+            });
         }
         Ok(record.into_user())
     }
@@ -328,6 +385,87 @@ impl<U: UserStore> AuthBackend for BuiltinAuth<U> {
         self.authenticate_with(name, password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
             .await
     }
+}
+
+/// Why a password attempt got no user. The label is a dashboard contract
+/// (`pharos_login_failed_total{reason}`) and a log field; keep the strings
+/// stable. It never reaches a response: every refusal answers alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginFailure {
+    UnknownUser,
+    BadPassword,
+    Disabled,
+    /// Refused by the throttle before any password check.
+    Throttled,
+    /// Several accounts match the typed name ignoring case, and none matches
+    /// it exactly.
+    AmbiguousName,
+    /// The attempt was dropped before a verdict (the request was cancelled).
+    Unjudged,
+}
+
+impl LoginFailure {
+    pub const ALL: [Self; 6] = [
+        Self::UnknownUser,
+        Self::BadPassword,
+        Self::Disabled,
+        Self::Throttled,
+        Self::AmbiguousName,
+        Self::Unjudged,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnknownUser => "unknown_user",
+            Self::BadPassword => "bad_password",
+            Self::Disabled => "disabled",
+            Self::Throttled => "throttled",
+            Self::AmbiguousName => "ambiguous_name",
+            Self::Unjudged => "unjudged",
+        }
+    }
+}
+
+/// How the typed name differs from the stored name of the account it found.
+/// `None` also covers "no account found": there is nothing to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameMismatch {
+    None,
+    Case,
+    Whitespace,
+    CaseAndWhitespace,
+}
+
+impl NameMismatch {
+    pub fn between(typed: &str, stored: &str) -> Self {
+        let trimmed = typed.trim();
+        match (trimmed != typed, trimmed != stored) {
+            (false, false) => Self::None,
+            (false, true) => Self::Case,
+            (true, false) => Self::Whitespace,
+            (true, true) => Self::CaseAndWhitespace,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Case => "case",
+            Self::Whitespace => "whitespace",
+            Self::CaseAndWhitespace => "case_and_whitespace",
+        }
+    }
+}
+
+/// Why [`BuiltinAuth::judge`] returned no user.
+#[derive(Debug)]
+pub enum Denial {
+    Refused {
+        reason: LoginFailure,
+        name_mismatch: NameMismatch,
+    },
+    /// No verdict: the store failed or no verify slot freed in time.
+    Backend(AuthError),
 }
 
 /// Which counter refused a login attempt. The label is a dashboard contract
@@ -564,11 +702,15 @@ impl LoginThrottle {
                 ip_key: ik,
                 client_ip: ip,
                 counts,
+                name_len: user.chars().count(),
+                failure: None,
                 settled: false,
             }),
             Err((reason, wait)) => {
                 let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
                 metrics::counter!("pharos_login_throttled_total", "reason" => reason.label())
+                    .increment(1);
+                metrics::counter!("pharos_login_failed_total", "reason" => LoginFailure::Throttled.label())
                     .increment(1);
                 tracing::warn!(
                     reason = reason.label(),
@@ -586,9 +728,9 @@ impl LoginThrottle {
     /// with `auth`, and settle it. A wrong password or unknown user stays
     /// counted; a store failure is given back, because the password was never
     /// judged.
-    pub async fn verify<A: AuthBackend>(
+    pub async fn verify<U: UserStore>(
         &self,
-        auth: &A,
+        auth: &BuiltinAuth<U>,
         user: &str,
         password: &SecretString,
         ip: IpAddr,
@@ -596,17 +738,20 @@ impl LoginThrottle {
         let attempt = self
             .begin(user, ip, Instant::now())
             .map_err(LoginRefusal::Throttled)?;
-        match auth.authenticate(user, password).await {
+        match auth.judge(user, password).await {
             Ok(u) => {
                 attempt.succeeded();
                 Ok(u)
             }
-            Err(AuthError::InvalidCredentials | AuthError::UserNotFound) => {
+            Err(Denial::Refused {
+                reason,
+                name_mismatch,
+            }) => {
                 // Dropped unsettled: stays counted as a failed login.
-                drop(attempt);
+                attempt.fail(reason, name_mismatch);
                 Err(LoginRefusal::Invalid)
             }
-            Err(e) => {
+            Err(Denial::Backend(e)) => {
                 attempt.abandon();
                 Err(LoginRefusal::Backend(e))
             }
@@ -647,10 +792,19 @@ pub struct Attempt<'a> {
     ip_key: IpAddr,
     client_ip: IpAddr,
     counts: FailureCounts,
+    /// Characters the client typed, for the "login failed" log (never the name).
+    name_len: usize,
+    failure: Option<(LoginFailure, NameMismatch)>,
     settled: bool,
 }
 
 impl Attempt<'_> {
+    /// The password was judged and refused: leave it counted and say why in
+    /// the "login failed" log and `pharos_login_failed_total{reason}`.
+    pub fn fail(mut self, reason: LoginFailure, name_mismatch: NameMismatch) {
+        self.failure = Some((reason, name_mismatch));
+    }
+
     /// Running counts including this attempt.
     pub fn counts(&self) -> FailureCounts {
         self.counts
@@ -679,8 +833,15 @@ impl Attempt<'_> {
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         if !self.settled {
+            let (reason, name_mismatch) = self
+                .failure
+                .unwrap_or((LoginFailure::Unjudged, NameMismatch::None));
+            metrics::counter!("pharos_login_failed_total", "reason" => reason.label()).increment(1);
             tracing::info!(
                 user = %self.user_key,
+                name_len = self.name_len,
+                reason = reason.label(),
+                name_mismatch = name_mismatch.label(),
                 client_ip = %self.client_ip,
                 user_failures = self.counts.user,
                 ip_failures = self.counts.ip,
@@ -756,6 +917,19 @@ mod tests {
                 .get(name)
                 .cloned()
                 .ok_or(AuthError::UserNotFound)
+        }
+        async fn lookup_by_name_ignore_case(&self, name: &str) -> AuthResult<Vec<UserRecord>> {
+            let want = name.to_lowercase();
+            let mut found: Vec<UserRecord> = self
+                .by_name
+                .lock()
+                .await
+                .values()
+                .filter(|r| r.name.to_lowercase() == want)
+                .cloned()
+                .collect();
+            found.sort_by_key(|r| (r.name != name, r.name.clone()));
+            Ok(found)
         }
         async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
             self.by_name
@@ -892,6 +1066,156 @@ mod tests {
             0,
             "a refused unknown-user login burned no verify"
         );
+    }
+
+    /// Jellyfin matches the user name without regard to case or surrounding
+    /// whitespace; a phone keyboard capitalises and pads the name.
+    #[tokio::test]
+    async fn login_matches_the_name_ignoring_case_and_surrounding_whitespace() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let pw = SecretString::new("hunter2");
+        for typed in ["Ali", "ALI", " ali", "ali\t", "  Ali "] {
+            let user = auth.judge(typed, &pw).await.unwrap_or_else(|d| {
+                panic!("{typed:?} should sign in: {d:?}");
+            });
+            assert_eq!(user.name, "ali", "{typed:?}");
+        }
+        assert!(matches!(
+            auth.judge("Ali", &wrong()).await,
+            Err(Denial::Refused {
+                reason: LoginFailure::BadPassword,
+                name_mismatch: NameMismatch::Case
+            })
+        ));
+        assert!(matches!(
+            auth.judge(" ALI", &wrong()).await,
+            Err(Denial::Refused {
+                name_mismatch: NameMismatch::CaseAndWhitespace,
+                ..
+            })
+        ));
+    }
+
+    /// Two accounts that differ only by case: a name that is neither exactly
+    /// is refused rather than guessed, and the refusal still pays a verify.
+    /// An exact match still wins, so nobody who could sign in before is
+    /// locked out.
+    #[tokio::test]
+    async fn names_differing_only_by_case_are_ambiguous_unless_typed_exactly() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let auth = fresh().await;
+        seed(&auth, "Sam", "pw-upper").await;
+        seed(&auth, "sam", "pw-lower").await;
+
+        match auth.judge("SAM", &SecretString::new("pw-upper")).await {
+            Err(Denial::Refused {
+                reason: LoginFailure::AmbiguousName,
+                ..
+            }) => {}
+            other => panic!("expected ambiguous_name, got {other:?}"),
+        }
+        assert_eq!(
+            dummy_verify_count(&rec),
+            1,
+            "ambiguous refusal burns a verify"
+        );
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warn = log
+            .lines()
+            .find(|l| l.contains("ambiguous_name"))
+            .unwrap_or_else(|| panic!("no WARN in {log}"));
+        assert!(
+            warn.contains("WARN") && warn.contains("name_len=3"),
+            "{warn}"
+        );
+        assert!(!log.contains("SAM"), "typed name echoed: {log}");
+
+        assert_eq!(
+            auth.judge("Sam", &SecretString::new("pw-upper"))
+                .await
+                .unwrap()
+                .name,
+            "Sam"
+        );
+        assert_eq!(
+            auth.judge("sam", &SecretString::new("pw-lower"))
+                .await
+                .unwrap()
+                .name,
+            "sam"
+        );
+        // The exact match wins even when the other account's password is typed.
+        assert!(auth
+            .judge("sam", &SecretString::new("pw-upper"))
+            .await
+            .is_err());
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    /// V177 — every refusal pays an argon2 verify through the shared slots
+    /// before it answers. With no slot free each one is a busy backend fault,
+    /// not an `InvalidCredentials` that came back without verifying.
+    #[tokio::test]
+    async fn every_refusal_path_waits_for_a_verify_slot() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let off = seed(&auth, "off", "hunter2").await;
+        auth.users()
+            .set_policy(
+                off.id,
+                UserPolicy {
+                    is_disabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        seed(&auth, "Sam", "hunter2").await;
+        seed(&auth, "sam", "hunter2").await;
+        let no_slots = Arc::new(Semaphore::new(0));
+        let wait = Duration::from_millis(20);
+
+        for (case, name, password) in [
+            ("ambiguous name", "SAM", "hunter2"),
+            ("unknown user", "nobody", "hunter2"),
+            ("wrong password", "ali", "wrong"),
+            ("disabled user", "off", "hunter2"),
+        ] {
+            match auth
+                .judge_with(name, &SecretString::new(password), &no_slots, wait)
+                .await
+            {
+                Err(Denial::Backend(AuthError::Backend(msg))) => {
+                    assert_eq!(msg, "password check busy", "{case}");
+                }
+                other => panic!("{case}: refused without waiting for a slot: {other:?}"),
+            }
+        }
     }
 
     /// The slot is handed back when the verify finishes, so one slot serves
@@ -1476,6 +1800,127 @@ mod tests {
                 assert!(warn.contains(want), "missing {want} in {warn}");
             }
             assert_eq!(throttled_count(&rec, "user"), 1);
+        }
+
+        #[test]
+        fn failure_labels_are_distinct_and_stable() {
+            let labels: Vec<_> = LoginFailure::ALL.iter().map(|f| f.label()).collect();
+            assert_eq!(
+                labels,
+                [
+                    "unknown_user",
+                    "bad_password",
+                    "disabled",
+                    "throttled",
+                    "ambiguous_name",
+                    "unjudged"
+                ]
+            );
+            let mut sorted = labels.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), labels.len(), "labels collide");
+        }
+
+        #[test]
+        fn name_mismatch_compares_the_typed_name_with_the_stored_one() {
+            let m = NameMismatch::between;
+            assert_eq!(m("ali", "ali"), NameMismatch::None);
+            assert_eq!(m("Ali", "ali"), NameMismatch::Case);
+            assert_eq!(m(" ali ", "ali"), NameMismatch::Whitespace);
+            assert_eq!(m(" Ali", "ali"), NameMismatch::CaseAndWhitespace);
+            let labels = [
+                NameMismatch::None.label(),
+                NameMismatch::Case.label(),
+                NameMismatch::Whitespace.label(),
+                NameMismatch::CaseAndWhitespace.label(),
+            ];
+            assert_eq!(
+                labels,
+                ["none", "case", "whitespace", "case_and_whitespace"]
+            );
+        }
+
+        /// One snapshot: reading a `DebuggingRecorder` resets its counters.
+        fn failed_counts(rec: &DebuggingRecorder) -> HashMap<String, u64> {
+            rec.snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(key, ..)| key.key().name() == "pharos_login_failed_total")
+                .filter_map(|(key, _, _, v)| {
+                    let reason = key.key().labels().find(|l| l.key() == "reason")?;
+                    match v {
+                        DebugValue::Counter(n) => Some((reason.value().to_owned(), n)),
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+
+        /// Each refusal kind is counted under its own reason and logged with
+        /// the reason and the typed length, never the typed name.
+        #[tokio::test]
+        async fn a_failed_login_says_why_without_echoing_the_name() {
+            let rec = DebuggingRecorder::new();
+            let _m = metrics::set_default_local_recorder(&rec);
+            let buf = Buf::default();
+            let sub = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            let _g = tracing::subscriber::set_default(sub);
+
+            let auth = super::fresh().await;
+            super::seed(&auth, "ali", "hunter2").await;
+            let off = super::seed(&auth, "off", "hunter2").await;
+            auth.users()
+                .set_policy(
+                    off.id,
+                    pharos_core::UserPolicy {
+                        is_disabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let t = LoginThrottle::new(cfg());
+            let pw = SecretString::new("hunter2");
+            let bad = SecretString::new("nope");
+
+            for (name, password) in [("Nobody", &pw), ("ali", &bad), ("off", &pw)] {
+                let r = t.verify(&auth, name, password, ip(1)).await;
+                assert!(matches!(r, Err(LoginRefusal::Invalid)), "{name}: {r:?}");
+            }
+            let t0 = Instant::now();
+            for _ in 0..3 {
+                fail(&t, "mallory", ip(2), t0);
+            }
+            let r = t.verify(&auth, "mallory", &pw, ip(2)).await;
+            assert!(matches!(r, Err(LoginRefusal::Throttled(_))), "{r:?}");
+
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let line = |reason: &str| {
+                log.lines()
+                    .find(|l| {
+                        l.contains("login failed") && l.contains(&format!("reason=\"{reason}\""))
+                    })
+                    .unwrap_or_else(|| panic!("no login failed line for {reason} in {log}"))
+                    .to_owned()
+            };
+            assert!(line("unknown_user").contains("name_len=6"), "{log}");
+            assert!(
+                line("unknown_user").contains("name_mismatch=\"none\""),
+                "{log}"
+            );
+            assert!(line("bad_password").contains("name_len=3"), "{log}");
+            line("disabled");
+            assert!(!log.contains("Nobody"), "typed name echoed: {log}");
+            let counts = failed_counts(&rec);
+            for reason in ["unknown_user", "bad_password", "disabled", "throttled"] {
+                assert_eq!(counts.get(reason), Some(&1), "{reason}: {counts:?}");
+            }
         }
 
         #[test]
