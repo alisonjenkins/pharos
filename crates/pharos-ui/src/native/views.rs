@@ -263,9 +263,11 @@ pub fn FindView(text: String, hits: Hits, on_input: EventHandler<String>) -> Ele
 /// title page.
 pub fn open_route(item: &Item) -> Route {
     match item.kind {
-        ItemKind::Library | ItemKind::Series | ItemKind::Season | ItemKind::Album => {
-            Route::Browse(item.id)
-        }
+        ItemKind::Library
+        | ItemKind::Series
+        | ItemKind::Season
+        | ItemKind::Album
+        | ItemKind::Artist => Route::Browse(item.id),
         _ => Route::Title(item.id),
     }
 }
@@ -436,6 +438,8 @@ mod tests {
             series_name: None,
             season: None,
             episode: None,
+            parent: None,
+            library_kind: None,
         }
     }
 
@@ -627,6 +631,7 @@ mod tests {
             ItemKind::Series,
             ItemKind::Season,
             ItemKind::Album,
+            ItemKind::Artist,
         ] {
             assert!(
                 matches!(open_route(&item(kind)), Route::Browse(_)),
