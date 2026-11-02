@@ -1740,95 +1740,22 @@ async fn shows_next_up(
     user: AuthUser,
     q: CiQuery<NextUpQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let all = crate::services::access::visible_items(&state, &user.0, all, "next_up")
-        .await
-        .map_err(crate::api::jellyfin::access_error)?;
-    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.0.id, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // Group episodes by series; pick the lowest unwatched per series.
-    use crate::api::jellyfin::dto::series_id_for_key;
-    use std::collections::HashMap;
-    // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
-    let series_id_want = q
-        .series_id
-        .as_deref()
-        .map(|s| canonical_wire_id(s).into_owned());
-    let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
-    for (idx, item) in all.iter().enumerate() {
-        if !matches!(item.kind, MediaKind::Episode) {
-            continue;
-        }
-        let Some(series) = item.series.as_ref() else {
-            continue;
-        };
-        // A Series-page request scopes to that series (`SeriesId`); the
-        // home-screen row leaves it unset and gets one pick per series.
-        // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
-        // sends, else Next Up on that page comes back empty.
-        if let Some(want) = series_id_want.as_deref() {
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
-                != want
-            {
-                continue;
-            }
-        }
-        // Skip already-played episodes.
-        if user_data.get(idx).copied().unwrap_or_default().played {
-            continue;
-        }
-        // LIB-C11 — bucket by the folder-keyed identity, not the bare
-        // name, so two same-name shows in distinct folders stay separate
-        // and don't interleave into one NextUp pick.
-        buckets
-            .entry(series.series_key().to_string())
-            .or_default()
-            .push((idx, item));
-    }
-    // Sort each bucket by (season_number, episode_number) ascending,
-    // pick the head.
-    let mut picks: Vec<(usize, &MediaItem)> = buckets
-        .into_values()
-        .filter_map(|mut eps| {
-            eps.sort_by_key(|(_, e)| {
-                let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
-                let n = e
-                    .series
-                    .as_ref()
-                    .and_then(|s| s.episode_number)
-                    .unwrap_or(0);
-                (s, n)
-            });
-            eps.into_iter().next()
-        })
-        .collect();
-    // Stable series-name sort across the result set.
-    picks.sort_by(|a, b| {
-        let an =
-            a.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        let bn =
-            b.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        an.cmp(bn)
-    });
-    picks.truncate(q.limit.max(1) as usize);
-    let dtos: Vec<BaseItemDto> = picks
+    let page =
+        crate::services::library::next_up(&state, &user.0, q.series_id.as_deref(), Some(q.limit))
+            .await
+            .map_err(|e| match e {
+                crate::services::library::ListError::Hidden(hidden) => {
+                    crate::api::jellyfin::access_error(hidden)
+                }
+                crate::services::library::ListError::Store(e) => {
+                    error::ErrorInternalServerError(e.to_string())
+                }
+            })?;
+    let dtos: Vec<BaseItemDto> = page
+        .items
         .iter()
-        .map(|(idx, item)| {
-            let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        .map(|(item, ud)| {
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, *ud)
                 .with_converted_book(
                     crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
                 )
@@ -1839,9 +1766,10 @@ async fn shows_next_up(
                 )
         })
         .collect();
-    let total = dtos.len() as u32;
     let _ = q.user_id; // kept for future per-user scoping
-    Ok(crate::api::jellyfin::wire::query_result(dtos, total, 0))
+    Ok(crate::api::jellyfin::wire::query_result(
+        dtos, page.total, page.start,
+    ))
 }
 
 #[derive(Debug, Deserialize, Default)]

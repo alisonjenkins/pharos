@@ -239,6 +239,114 @@ pub async fn resume(
     })
 }
 
+/// How many series a "next up" listing covers when the caller names no limit.
+pub const NEXT_UP_DEFAULT: u32 = 100;
+
+/// For each series `user` may see (or only `series_id`, a series wire id),
+/// the lowest-numbered episode the user has not played, ordered by series
+/// name, each with the user's play state. At most `limit` (at least 1);
+/// `None` means [`NEXT_UP_DEFAULT`].
+pub async fn next_up(
+    state: &AppState,
+    user: &User,
+    series_id: Option<&str>,
+    limit: Option<u32>,
+) -> Result<ListPage, ListError> {
+    let all = state.list_items_cached().await.map_err(ListError::Store)?;
+    let all = crate::services::access::visible_items(state, user, all, "next_up")
+        .await
+        .map_err(ListError::Hidden)?;
+    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.id, &ids)
+        .await
+        .map_err(ListError::Store)?;
+    // Group episodes by series; pick the lowest unwatched per series.
+    use crate::api::jellyfin::dto::series_id_for_key;
+    use std::collections::HashMap;
+    // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
+    let series_id_want =
+        series_id.map(|s| crate::api::jellyfin::items::canonical_wire_id(s).into_owned());
+    let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
+    for (idx, item) in all.iter().enumerate() {
+        if !matches!(item.kind, MediaKind::Episode) {
+            continue;
+        }
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        // A Series-page request scopes to that series (`SeriesId`); the
+        // home-screen row leaves it unset and gets one pick per series.
+        // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
+        // sends, else Next Up on that page comes back empty.
+        if let Some(want) = series_id_want.as_deref() {
+            if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
+                != want
+            {
+                continue;
+            }
+        }
+        // Skip already-played episodes.
+        if user_data.get(idx).copied().unwrap_or_default().played {
+            continue;
+        }
+        // LIB-C11 — bucket by the folder-keyed identity, not the bare
+        // name, so two same-name shows in distinct folders stay separate
+        // and don't interleave into one NextUp pick.
+        buckets
+            .entry(series.series_key().to_string())
+            .or_default()
+            .push((idx, item));
+    }
+    // Sort each bucket by (season_number, episode_number) ascending,
+    // pick the head.
+    let mut picks: Vec<(usize, &MediaItem)> = buckets
+        .into_values()
+        .filter_map(|mut eps| {
+            eps.sort_by_key(|(_, e)| {
+                let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
+                let n = e
+                    .series
+                    .as_ref()
+                    .and_then(|s| s.episode_number)
+                    .unwrap_or(0);
+                (s, n)
+            });
+            eps.into_iter().next()
+        })
+        .collect();
+    // Stable series-name sort across the result set.
+    picks.sort_by(|a, b| {
+        let an =
+            a.1.series
+                .as_ref()
+                .map(|s| s.series_name.as_str())
+                .unwrap_or("");
+        let bn =
+            b.1.series
+                .as_ref()
+                .map(|s| s.series_name.as_str())
+                .unwrap_or("");
+        an.cmp(bn)
+    });
+    picks.truncate(limit.unwrap_or(NEXT_UP_DEFAULT).max(1) as usize);
+    let total = u32::try_from(picks.len()).unwrap_or(u32::MAX);
+    Ok(ListPage {
+        items: picks
+            .into_iter()
+            .map(|(idx, item)| {
+                (
+                    item.clone(),
+                    user_data.get(idx).copied().unwrap_or_default(),
+                )
+            })
+            .collect(),
+        total,
+        start: 0,
+    })
+}
+
 /// Drop items that don't live under the configured root / series /
 /// season mapped to `parent_id`. Unknown `parent_id` → empty list.
 /// The All-Media placeholder + `None` pass everything through.
