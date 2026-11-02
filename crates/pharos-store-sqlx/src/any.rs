@@ -209,6 +209,16 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn alternate_sources(
+        &self,
+        id: MediaId,
+    ) -> DomainResult<Vec<pharos_core::AlternateMediaSource>> {
+        match self {
+            AnyStore::Sqlite(s) => s.alternate_sources(id).await,
+            AnyStore::Postgres(p) => p.alternate_sources(id).await,
+        }
+    }
+
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         match self {
             AnyStore::Sqlite(s) => s.begin_scan(root).await,
