@@ -22,7 +22,9 @@
 //! thing lost is failover for that one session, never the stream itself.
 
 use crate::api::jellyfin::device_profile::Decision;
-use pharos_core::{MediaId, MediaProbe, PersistedTranscodeSession, TranscodeSessionStore};
+use pharos_core::{
+    MediaId, MediaProbe, PersistedTranscodeSession, SessionHolder, TranscodeSessionStore,
+};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -53,6 +55,10 @@ pub struct TranscodeSession {
     /// needed burning — so a browser that renders `subrip` natively got a
     /// filter graph on every segment anyway.
     pub burn_subtitle_indices: std::collections::BTreeSet<u32>,
+    /// Who negotiated the session, and with which token. The PlaySessionId
+    /// authorizes a stream on its own (B75), so each such use checks that
+    /// this token is still live and this user may still see the item.
+    pub holder: SessionHolder,
 }
 
 /// Drop in-memory sessions idle for longer than this. Five minutes covers a
@@ -145,19 +151,25 @@ where
             decision_json: serde_json::to_string(&session.decision)?,
             source_probe_json: serde_json::to_string(&session.source_probe)?,
             burn_subtitle_indices_json: serde_json::to_string(&session.burn_subtitle_indices)?,
-            holder: None,
+            holder: Some(session.holder.clone()),
         })
     }
 
+    /// `None` when the row has no holder: it was written before sessions
+    /// recorded one, and a session nobody holds authorizes nothing.
     fn from_persisted(
         p: &PersistedTranscodeSession,
-    ) -> Result<TranscodeSession, serde_json::Error> {
-        Ok(TranscodeSession {
+    ) -> Result<Option<TranscodeSession>, serde_json::Error> {
+        let Some(holder) = p.holder.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(TranscodeSession {
             media_id: p.media_id,
             decision: serde_json::from_str(&p.decision_json)?,
             source_probe: serde_json::from_str(&p.source_probe_json)?,
             burn_subtitle_indices: serde_json::from_str(&p.burn_subtitle_indices_json)?,
-        })
+            holder,
+        }))
     }
 
     /// Cache the session locally and write it through to the store so other
@@ -219,7 +231,13 @@ where
 
         match self.store.get_transcode_session(session_id).await {
             Ok(Some(persisted)) => match Self::from_persisted(&persisted) {
-                Ok(session) => {
+                Ok(None) => {
+                    tracing::info!(
+                        "persisted transcode session has no holder; treating as expired"
+                    );
+                    Ok(None)
+                }
+                Ok(Some(session)) => {
                     // Re-cache so subsequent segment GETs hit memory, not the DB.
                     let _ = self
                         .tx
@@ -316,7 +334,27 @@ mod tests {
             },
             source_probe: MediaProbe::default(),
             burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
         }
+    }
+
+    /// B256: a row written before sessions recorded a holder authorizes
+    /// nothing; it reads as expired.
+    #[tokio::test]
+    async fn a_stored_session_without_a_holder_is_expired() {
+        let store = store().await;
+        let mut row =
+            TranscodeSessionRegistry::<SqliteStore>::to_persisted(&sample_session()).unwrap();
+        row.holder = None;
+        store
+            .upsert_transcode_session("old", &row, now_unix_secs())
+            .await
+            .unwrap();
+        let r = TranscodeSessionRegistry::spawn(store);
+        assert!(r.get("old").await.unwrap().is_none());
     }
 
     #[tokio::test]

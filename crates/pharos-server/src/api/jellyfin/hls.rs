@@ -4708,6 +4708,10 @@ mod tests {
             },
             source_probe: item.probe.clone(),
             burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
         };
         let opts = build_segment_opts(Some(session), &item, 0, None, None);
         assert!(matches!(
@@ -4744,6 +4748,10 @@ mod tests {
             },
             source_probe: item.probe.clone(),
             burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
         }
     }
 
@@ -5554,6 +5562,10 @@ mod prewarm_edition_tests {
             },
             source_probe: MediaProbe::default(),
             burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
         };
 
         // The demuxed CMAF rendition: its segments are video-only, so the stub

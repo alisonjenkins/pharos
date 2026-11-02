@@ -294,3 +294,102 @@ async fn web_client_keeps_true_direct_play() {
         ms["TranscodingUrl"]
     );
 }
+
+/// The ETag a direct-playing native client gets for item `$id`.
+macro_rules! negotiate_tag {
+    ($app:expr, $token:expr, $id:expr) => {{
+        let body = serde_json::json!({
+            "DeviceProfile": serde_json::from_str::<serde_json::Value>(PROFILE_DIRECTPLAY).unwrap()["DeviceProfile"],
+        });
+        let raw = test::call_and_read_body(
+            $app,
+            test::TestRequest::post()
+                .uri(&format!("/Items/{}/PlaybackInfo", $id))
+                .insert_header(("X-Emby-Token", $token))
+                .insert_header(("User-Agent", UA_ANDROID_TV))
+                .insert_header(("content-type", "application/json"))
+                .set_payload(body.to_string())
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        v["MediaSources"][0]["ETag"].as_str().unwrap().to_owned()
+    }};
+}
+
+/// The status of a stream request carrying no credential, as ExoPlayer sends.
+macro_rules! tokenless_stream {
+    ($app:expr, $uri:expr) => {
+        test::call_service(
+            $app,
+            test::TestRequest::get()
+                .uri($uri)
+                .insert_header(("User-Agent", "okhttp/4.12.0"))
+                .to_request(),
+        )
+        .await
+        .status()
+    };
+}
+
+/// B256: a capability ends with the token that negotiated it, so signing out
+/// (or an admin revoking the device) stops a URL carrying it.
+/// Disarm check: with `capability_holder_allowed` answering `Ok(())`, the
+/// revoked token's tag still authorizes the stream.
+#[actix_web::test]
+async fn a_capability_ends_when_its_token_is_revoked() {
+    let (state, token) = seed().await;
+    let app = init_app!(state.clone());
+    let tag = negotiate_tag!(&app, token.as_str(), 1);
+    let uri = format!("/videos/1/stream?static=true&tag={tag}");
+    assert_ne!(tokenless_stream!(&app, &uri), 401);
+    state.stores.revoke(&token).await.unwrap();
+    assert_eq!(tokenless_stream!(&app, &uri), 401);
+}
+
+/// B256: the holder's current policy applies to every use, not only to the
+/// negotiation, so a library taken away stops a capability already handed out.
+/// Disarm check: with `capability_holder_allowed` skipping the item access
+/// check, the stream still authorizes after the policy change.
+#[actix_web::test]
+async fn a_capability_follows_its_holders_policy() {
+    let (state, token) = seed().await;
+    // A real file, so the stream answers 200 while the capability holds and
+    // the 404 after the policy change can only be the refusal.
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("1.mp4");
+    std::fs::write(&file, b"not really an mp4").unwrap();
+    let mut item = MediaStore::get(&state.stores, 1).await.unwrap();
+    item.path = file;
+    state.stores.put(item).await.unwrap();
+    let app = init_app!(state.clone());
+    let tag = negotiate_tag!(&app, token.as_str(), 1);
+    let uri = format!("/videos/1/stream?static=true&tag={tag}");
+    assert_eq!(tokenless_stream!(&app, &uri), 200);
+    let uid = state.stores.resolve(&token).await.unwrap();
+    state
+        .stores
+        .set_policy(
+            uid,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: Vec::new(),
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(tokenless_stream!(&app, &uri), 404);
+}
+
+/// A capability names one item: the tag for item 1 does not open item 2.
+#[actix_web::test]
+async fn a_capability_opens_only_its_own_item() {
+    let (state, token) = seed().await;
+    let app = init_app!(state);
+    let tag = negotiate_tag!(&app, token.as_str(), 1);
+    assert_eq!(
+        tokenless_stream!(&app, &format!("/audio/2/stream?static=true&tag={tag}")),
+        401
+    );
+}
