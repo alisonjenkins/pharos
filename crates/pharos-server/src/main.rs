@@ -2076,7 +2076,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     let ui_bundle = match cfg.server.ui_dir.as_deref() {
         Some(dir) => {
             let bundle = std::sync::Arc::new(pharos_server::ui::UiBundle::load(dir)?);
-            tracing::info!(ui_dir = %dir.display(), files = bundle.file_count(), "pharos-ui served at /");
+            tracing::info!(ui_dir = %dir.display(), files = bundle.file_count(), "pharos-ui served at /ui/");
             Some(bundle)
         }
         None => None,
