@@ -6,7 +6,9 @@
 use awc::ws;
 use futures_util::{SinkExt as _, StreamExt as _};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-use pharos_server::api::pharos::rpc::socket::{record_closed, record_refused, CloseCause, Refused};
+use pharos_server::api::pharos::rpc::socket::{
+    record_closed, record_refused, CloseCause, Refused, INBOUND_MESSAGE_BURST,
+};
 
 use crate::connect::{start, ws_url};
 
@@ -59,6 +61,19 @@ async fn an_oversized_message_closes_with_size() {
     let reason = close_after(vec![ws::Message::Binary(vec![0u8; (1 << 20) + 1].into())]).await;
     assert_eq!(reason.code, ws::CloseCode::Size);
     assert_eq!(reason.description.as_deref(), Some("message_too_large"));
+}
+
+/// Twice the burst, sent at once, closes the socket with `Policy` and the
+/// `rate_limited` label. The frames are empty, so the RPC system never reads
+/// them and the close can only come from the rate.
+#[actix_web::test]
+async fn a_flood_of_messages_closes_with_rate_limited() {
+    let flood = (0..INBOUND_MESSAGE_BURST * 2)
+        .map(|_| ws::Message::Binary(Vec::new().into()))
+        .collect();
+    let reason = close_after(flood).await;
+    assert_eq!(reason.code, ws::CloseCode::Policy);
+    assert_eq!(reason.description.as_deref(), Some("rate_limited"));
 }
 
 /// Continuation frames each under the cap but adding up past it hit the same
