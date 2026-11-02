@@ -686,3 +686,113 @@ async fn an_entity_by_id_answers_only_through_visible_items() {
         leaked.join("\n")
     );
 }
+
+/// B264: a box set is shared by every user and has no library of its own,
+/// so it answers only through members the bearer may see (V200): listed by
+/// `/Collections`, `/Items?IncludeItemTypes=BoxSet` and
+/// `/Items/{id}/Collections` with its count over those members, and
+/// `/Items/{collection id}` answers one with none as an unknown id does.
+/// Disarm check: with the box set routes back on the store-wide rows,
+/// library A's box set lists for a user restricted to library B, "Mixed"
+/// counts both members, and nothing is counted.
+#[actix_web::test]
+async fn a_box_set_answers_only_through_visible_members() {
+    use pharos_core::CollectionStore as _;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let (rich, other) = (f.rich_item_id, f.other_item_id);
+    let only_a = f
+        .state
+        .stores
+        .create_collection("Only A", &[rich])
+        .await
+        .unwrap()
+        .wire_id;
+    f.state
+        .stores
+        .create_collection("Mixed", &[rich, other])
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let get = |uri: &str| {
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+    let rows = |body: &serde_json::Value| -> Vec<(String, u64)> {
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["Name"].as_str().unwrap().to_string(),
+                    i["ChildCount"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let listings = [
+        "/Collections".to_string(),
+        "/Items?IncludeItemTypes=BoxSet".to_string(),
+    ];
+
+    // Restricted to library A: both box sets list, Mixed with its one
+    // visible member.
+    restrict_to_library_a(&f).await;
+    for uri in &listings {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, get(uri)).await;
+        let mut got = rows(&body);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("Mixed".to_string(), 1), ("Only A".to_string(), 1)],
+            "{uri}"
+        );
+    }
+    let resp = test::call_service(&app, get(&format!("/Items/{only_a}"))).await;
+    assert_eq!(resp.status(), 200);
+
+    // Restricted to library B: Only A is gone everywhere, Mixed counts only
+    // library B's member.
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    let mut leaked = Vec::new();
+    for uri in listings
+        .iter()
+        .cloned()
+        .chain([format!("/Items/{other}/Collections")])
+    {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, get(&uri)).await;
+        let got = rows(&body);
+        if got != vec![("Mixed".to_string(), 1)] {
+            leaked.push(format!("{uri}: {got:?}"));
+        }
+    }
+    let bogus = "f".repeat(32);
+    let want = test::call_service(&app, get(&format!("/Items/{bogus}")))
+        .await
+        .status();
+    let status = test::call_service(&app, get(&format!("/Items/{only_a}")))
+        .await
+        .status();
+    if status != want {
+        leaked.push(format!("/Items/{{only A}}: {status} (missing: {want})"));
+    }
+    if entity_hidden_total(&snapshotter, "collection") == 0 {
+        leaked.push("nothing counted under kind=collection".into());
+    }
+    assert!(
+        leaked.is_empty(),
+        "library A leaked:\n{}",
+        leaked.join("\n")
+    );
+}

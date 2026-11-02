@@ -856,7 +856,7 @@ pub async fn parent_has_visible_items(
 }
 
 /// A listing of things that have no library of their own (`/Genres`,
-/// `/Studios`, `/Tags`, `/Persons`). The `kind` label of
+/// `/Studios`, `/Tags`, `/Persons`, box sets). The `kind` label of
 /// `pharos_entity_hidden_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityKind {
@@ -864,6 +864,7 @@ pub enum EntityKind {
     Studio,
     Tag,
     Person,
+    Collection,
 }
 
 impl EntityKind {
@@ -873,6 +874,7 @@ impl EntityKind {
             EntityKind::Studio => "studio",
             EntityKind::Tag => "tag",
             EntityKind::Person => "person",
+            EntityKind::Collection => "collection",
         }
     }
 }
@@ -932,7 +934,7 @@ pub enum EntityView {
     Hidden,
 }
 
-/// One genre or person asked for by id (V200). No query for a user whose
+/// One genre, person or box set asked for by id (V200). No query for a user whose
 /// policy hides nothing; otherwise one `apply_policy_scope` query over the
 /// entity's items. An entity whose items are all hidden from `user` counts
 /// under `pharos_entity_hidden_total{kind}` and logs a WARN.
@@ -951,6 +953,7 @@ pub async fn visible_entity(
         EntityKind::Studio => mq.studio_wire_id = Some(wire_id.to_string()),
         EntityKind::Tag => mq.tag_wire_ids = vec![wire_id.to_string()],
         EntityKind::Person => mq.person_wire_id = Some(wire_id.to_string()),
+        EntityKind::Collection => mq.collection_wire_id = Some(wire_id.to_string()),
     }
     let mut scoped = mq.clone();
     crate::api::jellyfin::items::apply_policy_scope(
@@ -982,10 +985,11 @@ mod tests {
             EntityKind::Studio,
             EntityKind::Tag,
             EntityKind::Person,
+            EntityKind::Collection,
         ]
         .map(EntityKind::label)
         .into_iter()
         .collect();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
     }
 }

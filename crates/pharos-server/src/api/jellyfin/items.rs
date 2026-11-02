@@ -1550,6 +1550,30 @@ fn person_dto(state: &AppState, person: pharos_core::Person, item_count: u32) ->
     .unwrap_or(serde_json::Value::Null)
 }
 
+/// Every box set with its member count as `user` sees it; one with no
+/// visible member is left out (V200).
+async fn visible_collections(
+    state: &web::Data<AppState>,
+    user: &pharos_core::User,
+) -> Result<Vec<(pharos_core::CollectionCount, u32)>, actix_web::Error> {
+    use pharos_core::CollectionStore;
+    let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+    let rows = state.stores.collections_with_counts().await.map_err(ise)?;
+    visible_entity_rows(
+        state,
+        user,
+        EntityKind::Collection,
+        rows,
+        |cc| (&cc.collection.wire_id, cc.item_count),
+        |w| {
+            let state = state.clone();
+            async move { state.stores.collection_items(&w).await }
+        },
+    )
+    .await
+    .map_err(ise)
+}
+
 /// `GET /Collections` — LIB-C5: collections / box sets as entity rows.
 /// Lists every box set with its member count, name-ordered, `Id` = the
 /// 32-hex collection wire id (= `collections.wire_id` =
@@ -1558,17 +1582,12 @@ fn person_dto(state: &AppState, person: pharos_core::Person, item_count: u32) ->
 /// via the `collection_items` indexed join (members in `sort_order`).
 async fn list_collections(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    use pharos_core::CollectionStore;
-    let rows = state
-        .stores
-        .collections_with_counts()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let items: Vec<serde_json::Value> = rows
+    let items: Vec<serde_json::Value> = visible_collections(&state, &user.0)
+        .await?
         .iter()
-        .map(|cc| collection_dto(&state, &cc.collection, cc.item_count))
+        .map(|(cc, count)| collection_dto(&state, &cc.collection, *count))
         .collect();
     let total = items.len() as u32;
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
@@ -1595,19 +1614,14 @@ async fn item_collections(
             pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
             other => error::ErrorInternalServerError(other.to_string()),
         })?;
-        let rows = state
-            .stores
-            .collections_with_counts()
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        for cc in &rows {
+        for (cc, count) in &visible_collections(&state, &user.0).await? {
             let members = state
                 .stores
                 .collection_items(&cc.collection.wire_id)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             if members.contains(&id) {
-                items.push(collection_dto(&state, &cc.collection, cc.item_count));
+                items.push(collection_dto(&state, &cc.collection, *count));
             }
         }
     }
@@ -3443,18 +3457,14 @@ fn boxset_only_request(q: &ListQuery) -> bool {
 /// request, honouring StartIndex / Limit. Shared by `/Items` and
 /// `/Users/{u}/Items`.
 async fn list_boxsets_page(
-    state: &AppState,
+    state: &web::Data<AppState>,
+    user: &pharos_core::User,
     q: &ListQuery,
 ) -> Result<serde_json::Value, actix_web::Error> {
-    use pharos_core::CollectionStore;
-    let rows = state
-        .stores
-        .collections_with_counts()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let all: Vec<serde_json::Value> = rows
+    let all: Vec<serde_json::Value> = visible_collections(state, user)
+        .await?
         .iter()
-        .map(|cc| collection_dto(state, &cc.collection, cc.item_count))
+        .map(|(cc, count)| collection_dto(state, &cc.collection, *count))
         .collect();
     let total = all.len() as u32;
     let start = q.start_index as usize;
@@ -3910,7 +3920,7 @@ async fn list_items(
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
         return Ok(crate::api::jellyfin::wire::json(
-            &list_boxsets_page(&state, &q).await?,
+            &list_boxsets_page(&state, &user.0, &q).await?,
         ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
@@ -3944,7 +3954,7 @@ async fn list_user_items(
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
     if boxset_only_request(&q) {
         return Ok(crate::api::jellyfin::wire::json(
-            &list_boxsets_page(&state, &q).await?,
+            &list_boxsets_page(&state, &user.0, &q).await?,
         ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
@@ -5303,17 +5313,29 @@ async fn fetch_item_dto(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
         {
-            let count = state
-                .stores
-                .collection_items(id_str)
+            // A box set is visible only through members the user may see (V200).
+            let count = match visible_entity(state, user, EntityKind::Collection, id_str)
                 .await
-                .map(|m| m.len() as u32)
-                .unwrap_or(0);
-            return Ok(crate::api::jellyfin::wire::json(&collection_dto(
-                state,
-                &collection,
-                count,
-            )));
+                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+            {
+                EntityView::All => Some(
+                    state
+                        .stores
+                        .collection_items(id_str)
+                        .await
+                        .map(|m| m.len() as u32)
+                        .unwrap_or(0),
+                ),
+                EntityView::Visible(items) => Some(u32::try_from(items.len()).unwrap_or(u32::MAX)),
+                EntityView::Hidden => None,
+            };
+            if let Some(count) = count {
+                return Ok(crate::api::jellyfin::wire::json(&collection_dto(
+                    state,
+                    &collection,
+                    count,
+                )));
+            }
         }
         // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
         // `/Items/{id}` on a playlist returns the folder item. Another user's
