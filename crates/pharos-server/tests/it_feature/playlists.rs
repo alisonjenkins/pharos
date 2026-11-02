@@ -224,8 +224,8 @@ fn playlist_denied(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, act
         .sum()
 }
 
-/// B259: a playlist answers only its owner. Another signed-in user gets 404
-/// on every playlist route, as for a playlist that does not exist, and
+/// B259: a playlist answers only its owner. Another signed-in user gets what
+/// a playlist that does not exist answers on every playlist route, and
 /// cannot read, change or delete it. A server-owned playlist (no owner) is
 /// readable by everyone and changed only by an admin. Each refusal counts
 /// under `pharos_playlist_access_denied_total{action}`.
@@ -283,7 +283,10 @@ async fn a_playlist_answers_only_its_owner() {
             .await
             .status()
             .as_u16();
-        if status != 404 {
+        // `/Items/{id}` answers another user's playlist as an id that names
+        // nothing: 400 "invalid id" (playlist_edges_answer_like_a_missing_playlist).
+        let refused = if uri.starts_with("/Items/") { 400 } else { 404 };
+        if status != refused {
             answered.push(format!("{method} {uri} → {status}"));
         }
     }
@@ -397,5 +400,30 @@ async fn an_admin_manages_only_an_orphaned_playlist() {
         status.as_u16(),
         204,
         "an admin could not delete an orphaned playlist"
+    );
+}
+
+/// B259: `/Items/{id}` answers another user's playlist exactly as an id that
+/// names nothing, so it does not confirm the playlist exists.
+#[actix_web::test]
+async fn items_by_id_answers_another_users_playlist_as_nothing() {
+    use actix_web::http::Method;
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let theirs = users_playlist(&f).await;
+    let missing = "0123456789abcdef0123456789abcdef";
+    let mut answers = Vec::new();
+    for id in [theirs.as_str(), missing] {
+        let resp = test::call_service(
+            &app,
+            call(Method::GET, &format!("/Items/{id}"), &f.admin_token).to_request(),
+        )
+        .await;
+        let status = resp.status().as_u16();
+        answers.push((status, test::read_body(resp).await));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "/Items/{{id}} tells another's playlist from nothing"
     );
 }
