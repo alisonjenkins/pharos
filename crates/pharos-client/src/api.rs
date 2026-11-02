@@ -9,7 +9,8 @@ use std::str::FromStr;
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, item_id, item_summary, items_result,
     library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs,
-    session, stream_choice, telemetry, Kind, LibraryKind as WireLibraryKind,
+    session, stream_choice, telemetry, track, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
@@ -142,12 +143,81 @@ pub struct Detail {
     pub overview: String,
     pub genres: Vec<String>,
     pub chapters: Vec<Chapter>,
+    pub audio_tracks: Vec<Track>,
+    pub subtitle_tracks: Vec<Track>,
+    /// One sprite set per width the server renders, narrowest first as the
+    /// server lists them.
+    pub trickplay: Vec<Trickplay>,
+    pub segments: Vec<Segment>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
     pub name: String,
     pub start_ms: u64,
+}
+
+/// An audio or subtitle stream; `index` is what [`TrackChoice::Index`] names.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Track {
+    pub index: u32,
+    pub language: String,
+    pub title: String,
+    pub codec: String,
+    pub is_default: bool,
+    pub is_forced: bool,
+    pub is_hearing_impaired: bool,
+    /// A text subtitle's same-origin WebVTT, which the player renders
+    /// itself. `None` for a subtitle the server must burn in, so choosing it
+    /// renegotiates; always `None` for audio.
+    pub vtt_url: Option<String>,
+}
+
+/// Trickplay sprites: `tile_url` with `{tile}` replaced fetches tile n, a
+/// `grid` × `grid` sheet of thumbnails, one every `interval_ms`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Trickplay {
+    pub width: u32,
+    pub height: u32,
+    pub interval_ms: u32,
+    pub thumb_count: u32,
+    pub tile_count: u32,
+    pub grid: u32,
+    pub tile_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    Intro,
+    Outro,
+    Recap,
+    Preview,
+    Commercial,
+}
+
+/// A span the player offers to skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Segment {
+    pub kind: SegmentKind,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Which track to play: the server's pick, none, or a stream index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackChoice {
+    #[default]
+    Default,
+    Off,
+    Index(u32),
+}
+
+/// The audio and subtitle a playback asks for, or a report says are playing.
+/// `Default` in a report says nothing about that track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrackPicks {
+    pub audio: TrackChoice,
+    pub subtitle: TrackChoice,
 }
 
 /// What the player can decode, for the server to choose a delivery.
@@ -170,6 +240,10 @@ pub struct Decision {
     /// Same-origin URL: a direct stream, or an HLS master playlist.
     pub stream_url: String,
     pub play_session: String,
+    /// The audio track the playback starts on.
+    pub audio: Option<u32>,
+    /// The subtitle it starts with; `None` is off.
+    pub subtitle: Option<u32>,
 }
 
 impl Decision {
@@ -217,24 +291,27 @@ pub trait PharosApi {
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
-    /// Negotiate playback of `id` with the default audio track and no
-    /// subtitles.
+    /// Negotiate playback of `id` with the tracks in `picks`.
     async fn play(
         &self,
         call: &CallInfo,
         id: ItemRef,
         caps: &Capabilities,
+        picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
 }
 
 /// One negotiated playback, for progress reports.
 #[allow(async_fn_in_trait)]
 pub trait PlaybackGrant {
+    /// `playing` names a track the player switched to without
+    /// renegotiating, so the server remembers it.
     async fn report(
         &self,
         call: &CallInfo,
         position_ms: u64,
         paused: bool,
+        playing: TrackPicks,
     ) -> Result<(), ClientError>;
     async fn stop(&self, call: &CallInfo, position_ms: u64) -> Result<(), ClientError>;
 }
@@ -466,6 +543,40 @@ impl PharosApi for NativeApi {
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,
+                    audio_tracks: read_tracks(d.get_audio_tracks()?)?,
+                    subtitle_tracks: read_tracks(d.get_subtitle_tracks()?)?,
+                    trickplay: d
+                        .get_trickplay()?
+                        .iter()
+                        .map(|t| {
+                            Ok(Trickplay {
+                                width: t.get_width(),
+                                height: t.get_height(),
+                                interval_ms: t.get_interval_ms(),
+                                thumb_count: t.get_thumb_count(),
+                                tile_count: t.get_tile_count(),
+                                grid: t.get_grid(),
+                                tile_url: text(t.get_tile_url())?,
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                    segments: d
+                        .get_segments()?
+                        .iter()
+                        .map(|s| {
+                            Ok(Segment {
+                                kind: match s.get_kind()? {
+                                    WireSegmentKind::Intro => SegmentKind::Intro,
+                                    WireSegmentKind::Outro => SegmentKind::Outro,
+                                    WireSegmentKind::Recap => SegmentKind::Recap,
+                                    WireSegmentKind::Preview => SegmentKind::Preview,
+                                    WireSegmentKind::Commercial => SegmentKind::Commercial,
+                                },
+                                start_ms: s.get_start_ms(),
+                                end_ms: s.get_end_ms(),
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -477,6 +588,7 @@ impl PharosApi for NativeApi {
         call: &CallInfo,
         id: ItemRef,
         caps: &Capabilities,
+        picks: TrackPicks,
     ) -> Result<(Decision, NativeGrant), ClientError> {
         let mut req = self.playback.negotiate_request();
         {
@@ -497,9 +609,8 @@ impl PharosApi for NativeApi {
                 &caps.containers,
             );
             c.set_max_bitrate(caps.max_bitrate);
-            p.reborrow().init_audio().set_default(());
-            let mut subtitle: stream_choice::Builder<'_> = p.init_subtitle();
-            subtitle.set_none(());
+            set_choice(p.reborrow().init_audio(), picks.audio);
+            set_choice(p.init_subtitle(), picks.subtitle);
         }
         let reply = req.send().promise.await?;
         let grant = match reply
@@ -528,6 +639,8 @@ impl PharosApi for NativeApi {
                     downgrade: text(d.get_downgrade())?,
                     stream_url: text(d.get_stream_url())?,
                     play_session: text(d.get_play_session()?.get_value())?,
+                    audio: read_opt_u32(d.get_audio()?)?,
+                    subtitle: read_opt_u32(d.get_subtitle()?)?,
                 }
             }
             decision_result::Error(e) => return Err(ClientError::from_api(e?)),
@@ -549,6 +662,7 @@ impl PlaybackGrant for NativeGrant {
         call: &CallInfo,
         position_ms: u64,
         paused: bool,
+        playing: TrackPicks,
     ) -> Result<(), ClientError> {
         let mut req = self.0.report_request();
         {
@@ -556,6 +670,8 @@ impl PlaybackGrant for NativeGrant {
             call.write(p.reborrow().init_ctx());
             p.set_position_ms(position_ms);
             p.set_paused(paused);
+            set_choice(p.reborrow().init_audio(), playing.audio);
+            set_choice(p.init_subtitle(), playing.subtitle);
         }
         let reply = req.send().promise.await?;
         crate::read_done(reply.get()?.get_result()?)
@@ -571,6 +687,36 @@ impl PlaybackGrant for NativeGrant {
         let reply = req.send().promise.await?;
         crate::read_done(reply.get()?.get_result()?)
     }
+}
+
+fn set_choice(mut out: stream_choice::Builder<'_>, choice: TrackChoice) {
+    match choice {
+        TrackChoice::Default => out.set_default(()),
+        TrackChoice::Off => out.set_none(()),
+        TrackChoice::Index(i) => out.set_index(i),
+    }
+}
+
+fn read_tracks(
+    list: capnp::struct_list::Reader<'_, track::Owned>,
+) -> Result<Vec<Track>, capnp::Error> {
+    list.iter()
+        .map(|t| {
+            Ok(Track {
+                index: t.get_index(),
+                language: text(t.get_language())?,
+                title: text(t.get_title())?,
+                codec: text(t.get_codec())?,
+                is_default: t.get_is_default(),
+                is_forced: t.get_is_forced(),
+                is_hearing_impaired: t.get_is_hearing_impaired(),
+                vtt_url: match t.get_delivery()? {
+                    SubtitleDelivery::External => Some(text(t.get_url())?),
+                    SubtitleDelivery::Burn => None,
+                },
+            })
+        })
+        .collect()
 }
 
 fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
@@ -747,6 +893,8 @@ mod tests {
             downgrade: String::new(),
             stream_url: url.into(),
             play_session: String::new(),
+            audio: None,
+            subtitle: None,
         };
         assert!(decision("transcode", "/videos/1/master.m3u8?PlaySessionId=p").is_hls());
         assert!(!decision("direct_play", "/videos/1/stream?static=true").is_hls());

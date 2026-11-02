@@ -1,7 +1,9 @@
 //! 009 `PharosApi` over the native API: the calls pharos-ui makes, through
 //! `pharos_client::api::NativeApi`, against a real server.
 
-use pharos_client::api::{Capabilities, ItemKind, ItemRef, NativeApi, PharosApi, PlaybackGrant};
+use pharos_client::api::{
+    Capabilities, ItemKind, ItemRef, NativeApi, PharosApi, PlaybackGrant, TrackPicks,
+};
 use pharos_client::{CallInfo, ClientError};
 use pharos_core::UserDataStore as _;
 
@@ -113,8 +115,15 @@ async fn play_negotiates_and_reports_progress() {
         containers: vec!["mp4".into()],
         max_bitrate: 0,
     };
+    let detail = api
+        .detail(&call, ItemRef::Real(MOVIE))
+        .await
+        .expect("detail");
+    let audio: Vec<_> = detail.audio_tracks.iter().map(|t| t.index).collect();
+    assert_eq!(audio, [1]);
+    assert!(detail.subtitle_tracks.is_empty() && detail.segments.is_empty());
     let (decision, grant) = api
-        .play(&call, ItemRef::Real(MOVIE), &caps)
+        .play(&call, ItemRef::Real(MOVIE), &caps, TrackPicks::default())
         .await
         .expect("negotiate");
     assert_eq!(decision.method, "direct_play");
@@ -125,8 +134,12 @@ async fn play_negotiates_and_reports_progress() {
         decision.stream_url
     );
     assert!(!decision.play_session.is_empty());
+    assert_eq!((decision.audio, decision.subtitle), (Some(1), None));
 
-    grant.report(&call, 10_000, false).await.expect("report");
+    grant
+        .report(&call, 10_000, false, TrackPicks::default())
+        .await
+        .expect("report");
     grant.stop(&call, 20_000).await.expect("stop");
     let data = fx
         .state

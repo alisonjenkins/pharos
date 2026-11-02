@@ -583,7 +583,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant};
+    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant, TrackPicks};
 
     use super::*;
     use crate::native::views::Nav;
@@ -613,6 +613,10 @@ mod tests {
             overview: String::new(),
             genres: Vec::new(),
             chapters: Vec::new(),
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            trickplay: Vec::new(),
+            segments: Vec::new(),
         }
     }
 
@@ -626,7 +630,13 @@ mod tests {
 
     struct NoGrant;
     impl PlaybackGrant for NoGrant {
-        async fn report(&self, _: &CallInfo, _: u64, _: bool) -> Result<(), ClientError> {
+        async fn report(
+            &self,
+            _: &CallInfo,
+            _: u64,
+            _: bool,
+            _: TrackPicks,
+        ) -> Result<(), ClientError> {
             Ok(())
         }
         async fn stop(&self, _: &CallInfo, _: u64) -> Result<(), ClientError> {
@@ -686,6 +696,7 @@ mod tests {
             _: &CallInfo,
             _: ItemRef,
             _: &Capabilities,
+            _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
             Err(refused())
         }

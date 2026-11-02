@@ -8,6 +8,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _, PlaybackGrant as _,
+    TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -1089,7 +1090,9 @@ fn WatchScreen(id: ItemRef) -> Element {
             let info = call("watch", "play");
             let result = async {
                 let detail = api.detail(&info, id).await?;
-                let (decision, grant) = api.play(&info, id, &platform::capabilities()).await?;
+                let (decision, grant) = api
+                    .play(&info, id, &platform::capabilities(), TrackPicks::default())
+                    .await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
             .await;
@@ -1234,7 +1237,9 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
             let grant = p.grant.clone();
             let at = last_ms.get();
             spawn(async move {
-                let result = grant.report(&call("watch", "report"), at, paused).await;
+                let result = grant
+                    .report(&call("watch", "report"), at, paused, TrackPicks::default())
+                    .await;
                 if let Err(e) = settle(ctx.machine, result) {
                     platform::warn(&format!("pharos: progress report failed: {e}"));
                 }

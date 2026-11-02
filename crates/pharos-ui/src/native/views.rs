@@ -548,6 +548,10 @@ mod tests {
             overview: "A heist.".into(),
             genres: vec!["Crime".into()],
             chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -565,6 +569,10 @@ mod tests {
             overview: String::new(),
             genres: vec![],
             chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -577,6 +585,10 @@ mod tests {
             overview: String::new(),
             genres: vec![],
             chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("/watch/"), "{html}");
