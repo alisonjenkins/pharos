@@ -47,7 +47,8 @@ easing = "standard"
 focus_scale = 1.05
 
 [effects]
-background = "gradient"
+background = "shader"
+shader = "aurora"
 blur_px = 24
 vignette = 0.3
 grain = 0.0

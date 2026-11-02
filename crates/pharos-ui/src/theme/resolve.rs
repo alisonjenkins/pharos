@@ -861,20 +861,19 @@ mod tests {
     fn a_shader_is_resolved_only_for_a_shader_background() {
         let neon = shipped().resolve("Neon Grid").unwrap().theme;
         assert_eq!(neon.effects.background, Background::Shader);
-        assert_eq!(neon.effects.shader, Some(ShaderName::Scanlines));
-        assert_eq!(night().effects.shader, None);
+        assert_eq!(neon.effects.shader, Some(ShaderName::MatrixRain));
+        assert_eq!(night().effects.shader, Some(ShaderName::Aurora));
+        let contrast = shipped().resolve("High Contrast").unwrap().theme;
+        assert_eq!(contrast.effects.shader, None);
 
         let solid =
             resolve_child("[effects]\nbackground = \"solid\"\nshader = \"aurora\"\n").unwrap();
         assert_eq!(solid.theme.effects.shader, None);
 
-        let missing_name = resolve_child("[effects]\nbackground = \"shader\"\n").unwrap_err();
-        assert_eq!(
-            missing_name,
-            ThemeError::MissingKey {
-                path: "effects.shader".into()
-            }
-        );
+        // Every chain ends at Pharos Night, which names a shader, so a theme
+        // that asks for a shader background without naming one gets it.
+        let unnamed = resolve_child("[effects]\nbackground = \"shader\"\n").unwrap();
+        assert_eq!(unnamed.theme.effects.shader, Some(ShaderName::Aurora));
 
         let bad_name = resolve_child("[effects]\nshader = \"plasma\"\n").unwrap_err();
         assert!(

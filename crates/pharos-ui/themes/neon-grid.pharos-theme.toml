@@ -29,7 +29,7 @@ radius_px = 0
 
 [effects]
 background = "shader"
-shader = "scanlines"
+shader = "matrix-rain"
 vignette = 0.4
 grain = 0.15
 glow = 0.8

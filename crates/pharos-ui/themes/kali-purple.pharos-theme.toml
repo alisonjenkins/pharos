@@ -20,6 +20,7 @@ focus = "#ff5fd2"
 progress = "#b06cff"
 
 [effects]
-background = "gradient"
+background = "shader"
+shader = "aurora"
 blur_px = 28
 glow = 0.7
