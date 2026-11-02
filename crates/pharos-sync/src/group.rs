@@ -3442,15 +3442,20 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             name,
             cast,
             reply,
-        } => add_member(
-            state,
-            member_id,
-            name,
-            None,
-            MemberKind::CastSeat,
-            Some(cast),
-            reply,
-        ),
+        } => {
+            // The seat plays for its owner: it is the owner's user, so the
+            // per-member access checks (V201) judge it as that user.
+            let owner = Uuid::parse_str(&cast.owner).ok().map(UserId);
+            add_member(
+                state,
+                member_id,
+                name,
+                owner,
+                MemberKind::CastSeat,
+                Some(cast),
+                reply,
+            )
+        }
         GroupMsg::ResyncMember { member_id, user } => {
             // A reconnected socket for an existing member (its fresh sink is
             // already in the replica's MemberSinks): re-send the catch-up so it
@@ -10423,6 +10428,33 @@ mod tests {
             assert_eq!(new_plis, plis[..1]);
             assert_eq!(playing, 0);
         }
+    }
+
+    /// A cast seat plays for its owner, so it records the owner's user. A seat
+    /// with no user reads as an unknown member, and every queue change in its
+    /// group is then refused (V201).
+    /// Disarm check: with the seat added with no user, the snapshot holds `None`.
+    #[tokio::test(start_paused = true)]
+    async fn a_cast_seat_records_its_owners_user() {
+        let owner = UserId::new();
+        let h = GroupHandle::spawn(
+            GroupId::new(),
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+        );
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(GroupMsg::AddCastSeat {
+            member_id: MemberId::new(),
+            name: "owner".into(),
+            cast: CastBinding {
+                tv: "Living Room".into(),
+                owner: owner.0.simple().to_string(),
+            },
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap();
+        assert_eq!(snapshot_of(&h).await.member_users, vec![Some(owner)]);
     }
 
     /// A member records the user behind it: on the snapshot the HTTP layer
