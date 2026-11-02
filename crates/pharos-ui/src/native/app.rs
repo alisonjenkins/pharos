@@ -995,7 +995,9 @@ fn HomeScreen() -> Element {
 #[component]
 fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
-    let listing = use_resource(move || {
+    // The screen stays mounted when a tile or season tab opens another
+    // parent, so the load follows `id` instead of running once.
+    let listing = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         async move {
             let api = api?;
@@ -1005,7 +1007,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
             .await;
             Some(settle(ctx.machine, result))
         }
-    });
+    }));
     let state = listing.read();
     loaded(
         state.as_ref().and_then(Option::as_ref),
