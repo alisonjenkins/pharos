@@ -38,6 +38,7 @@ async fn add_member_with_cap(
     sinks.insert(mid, 1, tx);
     let (reply_tx, reply_rx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
+        user: None,
         member_id: mid,
         name: name.into(),
         reply: reply_tx,

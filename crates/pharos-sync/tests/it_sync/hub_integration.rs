@@ -54,6 +54,7 @@ async fn add_to_group(hub: &SessionHub, sinks: &MemberSinks, handle: &GroupHandl
     handle
         .tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: sess.member_id,
             name: sess.name,
             reply: reply_tx,
@@ -341,6 +342,7 @@ async fn socket_reconnect_keeps_membership_and_resyncs() {
     group
         .tx
         .send(GroupMsg::ResyncMember {
+            user: None,
             member_id: b.member_id,
         })
         .await

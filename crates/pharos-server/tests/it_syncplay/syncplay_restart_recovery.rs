@@ -66,6 +66,7 @@ async fn persisted_snapshot_for(device: &str) -> (GroupId, String) {
     sinks.insert(member, 1, sink_tx);
     let (rtx, rrx) = oneshot::channel();
     h.tx.send(GroupMsg::AddMember {
+        user: None,
         member_id: member,
         name: "alison".into(),
         reply: rtx,
@@ -458,6 +459,7 @@ async fn leave_with_group_acknowledges_the_leaver() {
     handle
         .tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: reg.member_id,
             name: "lace".into(),
             reply: rtx,

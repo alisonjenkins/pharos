@@ -150,6 +150,7 @@ async fn join(
     handle
         .tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: member,
             name: name.into(),
             reply: reply_tx,
@@ -322,6 +323,7 @@ async fn get_or_create_upgrades_remote_handle_to_owned_after_lock_frees() {
     let (rtx, rrx) = oneshot::channel();
     h2.tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: m,
             name: "alison".into(),
             reply: rtx,

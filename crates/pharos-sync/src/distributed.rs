@@ -61,7 +61,7 @@ pub struct Distributed {
 pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
     Some(match msg {
         GroupMsg::RemoveMember { member_id } => RemoteCommand::RemoveMember { member_id },
-        GroupMsg::ResyncMember { member_id } => RemoteCommand::Resync { member_id },
+        GroupMsg::ResyncMember { member_id, user } => RemoteCommand::Resync { member_id, user },
         GroupMsg::LeaderPlay {
             sender,
             position_ms,
@@ -223,11 +223,14 @@ pub(crate) fn spawn_remote_handle(
             // forwarding, so callers awaiting the reply don't hang.
             match &msg {
                 GroupMsg::AddMember {
-                    member_id, name, ..
+                    member_id,
+                    name,
+                    user,
+                    ..
                 } => {
                     // Forward the join, then synthesize a reply. The authoritative
                     // roster + GroupJoined arrive over delivery.
-                    let (member_id, name) = (*member_id, name.clone());
+                    let (member_id, name, user) = (*member_id, name.clone(), *user);
                     if let GroupMsg::AddMember { reply, .. } = msg {
                         let _ = reply.send(crate::group::Joined {
                             group_id,
@@ -239,7 +242,14 @@ pub(crate) fn spawn_remote_handle(
                             }],
                         });
                     }
-                    commands.submit(group_id, RemoteCommand::AddMember { member_id, name });
+                    commands.submit(
+                        group_id,
+                        RemoteCommand::AddMember {
+                            member_id,
+                            name,
+                            user,
+                        },
+                    );
                 }
                 GroupMsg::Snapshot { .. } => {
                     // A remote handle can't answer from the actor; the list

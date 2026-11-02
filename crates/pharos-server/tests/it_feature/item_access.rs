@@ -846,6 +846,7 @@ async fn a_syncplay_group_answers_only_a_user_who_may_see_its_queue() {
     group
         .tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: leader,
             name: "admin".into(),
             reply,
@@ -989,6 +990,7 @@ async fn a_native_sync_join_needs_a_visible_queue() {
     group
         .tx
         .send(GroupMsg::AddMember {
+            user: None,
             member_id: leader,
             name: "admin".into(),
             reply,

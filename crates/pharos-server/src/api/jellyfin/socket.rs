@@ -309,7 +309,13 @@ async fn handle_connection<S>(
         current_group_id = Some(group.group_id);
         // Sink already refreshed in MemberSinks above; ask the actor to re-send
         // the catch-up so the reconnected client re-syncs to current state.
-        let _ = group.tx.send(GroupMsg::ResyncMember { member_id }).await;
+        let _ = group
+            .tx
+            .send(GroupMsg::ResyncMember {
+                member_id,
+                user: Some(user.id),
+            })
+            .await;
         tracing::info!(device_id = %device_key, %member_id, group = %group.group_id, "syncplay: /socket reconnected into existing group");
     } else {
         tracing::info!(
@@ -720,7 +726,7 @@ async fn handle_inbound(
                 Ok(h) => h,
                 Err(_) => return,
             };
-            join_via_handle(handle, current_group, member_id, member_name).await;
+            join_via_handle(handle, current_group, member_id, member_name, gate.user.id).await;
         }
         "SyncPlayJoinGroup" => {
             let Ok(data) = serde_json::from_value::<SyncPlayJoinData>(inbound.data) else {
@@ -742,7 +748,7 @@ async fn handle_inbound(
                 let _ = gate.out.send(ServerMsg::NotInGroup).await;
                 return;
             }
-            join_via_handle(handle, current_group, member_id, member_name).await;
+            join_via_handle(handle, current_group, member_id, member_name, gate.user.id).await;
         }
         "SyncPlayLeaveGroup" => {
             if let Some(h) = current_group.take() {
@@ -811,6 +817,7 @@ async fn join_via_handle(
     current_group: &mut Option<GroupHandle>,
     member_id: MemberId,
     member_name: &str,
+    user: pharos_core::UserId,
 ) {
     // The member's sink is already in the replica's MemberSinks (registered on
     // socket connect), so AddMember carries no sink — it just admits the member.
@@ -820,6 +827,7 @@ async fn join_via_handle(
         .send(GroupMsg::AddMember {
             member_id,
             name: member_name.to_string(),
+            user: Some(user),
             reply: reply_tx,
         })
         .await
@@ -1764,6 +1772,7 @@ mod tests {
         group
             .tx
             .send(GroupMsg::AddMember {
+                user: None,
                 member_id: leader,
                 name: "leader".into(),
                 reply,

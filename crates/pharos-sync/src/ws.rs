@@ -123,6 +123,7 @@ async fn handle_connection<S>(
         .send(GroupMsg::AddMember {
             member_id,
             name: member_name.clone(),
+            user: Some(user_id),
             reply: reply_tx,
         })
         .await

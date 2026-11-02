@@ -311,6 +311,7 @@ async fn add_caller_to_group(
     hub: &SessionHub,
     sinks: &MemberSinks,
     device_id: &str,
+    user: pharos_core::UserId,
     handle: GroupHandle,
 ) {
     let Some(sess) = resolve_with_retry(hub, device_id).await else {
@@ -334,6 +335,7 @@ async fn add_caller_to_group(
         .send(GroupMsg::AddMember {
             member_id,
             name: sess.name.clone(),
+            user: Some(user),
             reply: reply_tx,
         })
         .await
@@ -606,7 +608,7 @@ async fn new_group(
     // terminates the moment it processes a message and finds no members, so a
     // brand-new (member-less) group must receive AddMember before anything else
     // (e.g. SetGroupName) — otherwise it dies before the creator ever joins.
-    add_caller_to_group(&hub, &sinks, &dev, handle.clone()).await;
+    add_caller_to_group(&hub, &sinks, &dev, auth.user.id, handle.clone()).await;
     let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
     // Seed the group's queue from the creator's already-active playback. Stock
     // jellyfin-web does NOT re-send its play queue when SyncPlay is enabled on
@@ -678,7 +680,7 @@ async fn join_group(
         return no_content();
     }
     tracing::info!(device_id = %dev, group = %handle.group_id, "syncplay: Join group");
-    add_caller_to_group(&hub, &sinks, &dev, handle).await;
+    add_caller_to_group(&hub, &sinks, &dev, auth.user.id, handle).await;
     no_content()
 }
 
@@ -1814,6 +1816,7 @@ mod tests {
         actor
             .tx
             .send(GroupMsg::AddMember {
+                user: None,
                 member_id: member,
                 name: "leader".into(),
                 reply,
