@@ -12,6 +12,7 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::backdrop::Backdrop;
 use super::browse;
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
@@ -67,7 +68,10 @@ pub fn Root() -> Element {
     });
     match route() {
         Route::Manage => rsx! { RootApp {} },
-        route => rsx! { NativeApp { route } },
+        route => rsx! {
+            Backdrop {}
+            NativeApp { route }
+        },
     }
 }
 
@@ -93,6 +97,13 @@ pub struct Themes {
 }
 
 impl Themes {
+    /// The theme applied now, resolved from the catalogue; reading it
+    /// subscribes the caller to theme changes.
+    pub fn applied_theme(&self) -> Option<Theme> {
+        let name = self.applied.read();
+        self.catalogue.read().resolve(&name).ok().map(|r| r.theme)
+    }
+
     /// Apply the active choice and record the name applied. `auto` resolves
     /// against the system's preferences at this moment.
     fn apply_active(mut self) {

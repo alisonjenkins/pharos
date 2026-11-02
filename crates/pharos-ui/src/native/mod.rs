@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod appearance;
+pub mod backdrop;
 pub mod browse;
 pub mod depth;
 pub mod diagnostics;

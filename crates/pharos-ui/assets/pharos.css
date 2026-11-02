@@ -960,3 +960,21 @@ body::before {
     display: none;
   }
 }
+
+/* Backdrop shader (010 effects): a theme's animated background, under the
+   CSS light and vignette. Drawn at half size and scaled up, since a soft
+   backdrop shows no detail a headset should pay fill rate for. */
+.pharos-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 50vw;
+  height: 50vh;
+  transform: scale(2);
+  transform-origin: 0 0;
+  z-index: -2;
+  pointer-events: none;
+}
+.pharos-backdrop[hidden] {
+  display: none;
+}
