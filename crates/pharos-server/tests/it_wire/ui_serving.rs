@@ -24,13 +24,16 @@ fn bundle(dir: &Path) -> Arc<ui::UiBundle> {
 /// The production app's routes, from the composition `main` uses.
 macro_rules! app {
     ($bundle:expr) => {
+        app!($bundle, true)
+    };
+    ($bundle:expr, $native_api:expr) => {
         test::init_service(
             App::new()
                 .wrap(LowercasePath)
                 .configure(router::configure_app(
                     Some($bundle),
                     NativeApiConfig {
-                        enabled: true,
+                        enabled: $native_api,
                         ..NativeApiConfig::default()
                     },
                     pharos_server::api::pharos::rpc::limits::ConnectionLimits::default(),
@@ -136,6 +139,20 @@ async fn api_routes_and_api_clients_never_get_the_spa() {
     let resp = test::call_service(&app, html("/pharos/rpc").to_request()).await;
     assert_ne!(test::read_body(resp).await, INDEX.as_bytes());
     assert_eq!(served_total(&snapshotter, "not_found"), 4);
+}
+
+/// pharos-ui tells "native API off" from "on, but the socket was refused"
+/// by `GET /pharos/session`: 404 off, 405 on. Its probe asks for JSON, so the
+/// SPA fallback never answers it. Disarm check: route `GET /pharos/session`
+/// and the enabled arm stops reading 405.
+#[actix_web::test]
+async fn the_session_probe_says_whether_the_native_api_is_on() {
+    for (enabled, want) in [(false, 404), (true, 405)] {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app!(bundle(dir.path()), enabled);
+        let resp = test::call_service(&app, json("/pharos/session").to_request()).await;
+        assert_eq!(resp.status(), want, "native api enabled = {enabled}");
+    }
 }
 
 /// Content-hashed assets cache forever; everything else, unhashed files
