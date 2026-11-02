@@ -528,7 +528,7 @@ async fn a_private_url_is_never_catalogued() {
             "http://192.168.1.244:3100/loki/api/v1/labels",
             "refused_private",
         ),
-        ("http://localhost/x", "refused_private"),
+        ("http://127.1/x", "refused_private"),
         ("http://user@127.0.0.1/x", "refused_malformed"),
         ("file:///etc/passwd", "refused_scheme"),
         ("ytsearch:anything", "refused_scheme"),
