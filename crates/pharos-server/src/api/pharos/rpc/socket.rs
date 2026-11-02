@@ -34,6 +34,12 @@ pub const SESSION_COOKIE: &str = "pharos_session";
 /// Largest inbound WebSocket message; capnp's own decode limit
 /// ([`super::TRAVERSAL_LIMIT_WORDS`]) bounds a whole RPC message.
 const MAX_FRAME: usize = 1 << 20;
+/// Sustained inbound binary messages per connection per second. The UI sends
+/// a few per second at its busiest, so this is far above its need.
+pub const INBOUND_MESSAGES_PER_SECOND: u32 = 50;
+/// Inbound binary messages a connection may send at once before the sustained
+/// rate applies. Far above the UI's need, so a page load is never refused.
+pub const INBOUND_MESSAGE_BURST: u32 = 200;
 /// In-memory pipe between the socket and the `RpcSystem`.
 const PIPE_BYTES: usize = 64 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(30);
@@ -116,6 +122,9 @@ pub enum CloseCause {
     ReadError(String),
     /// An inbound message over [`MAX_FRAME`] bytes (FR-010).
     MessageTooLarge,
+    /// More inbound messages than [`INBOUND_MESSAGE_BURST`] and the sustained
+    /// [`INBOUND_MESSAGES_PER_SECOND`] allow.
+    RateLimited,
     SendFailed,
     /// A text frame: this endpoint speaks binary capnp only.
     TextFrame,
@@ -137,6 +146,7 @@ impl CloseCause {
             CloseCause::StreamEnd => "stream_end",
             CloseCause::ReadError(_) => "read_error",
             CloseCause::MessageTooLarge => "message_too_large",
+            CloseCause::RateLimited => "rate_limited",
             CloseCause::SendFailed => "send_failed",
             CloseCause::TextFrame => "text_frame",
             CloseCause::AuthDeadline => "auth_deadline",
@@ -160,6 +170,7 @@ impl CloseCause {
         let code = match self {
             CloseCause::TextFrame => CloseCode::Unsupported,
             CloseCause::MessageTooLarge => CloseCode::Size,
+            CloseCause::RateLimited => CloseCode::Policy,
             CloseCause::AuthDeadline => CloseCode::Policy,
             CloseCause::IdleTimeout => CloseCode::Away,
             CloseCause::Revoked(_) => CloseCode::Policy,
@@ -197,6 +208,39 @@ impl Recheck {
     }
 }
 
+/// Token bucket over one connection's inbound binary messages. It refills at
+/// [`INBOUND_MESSAGES_PER_SECOND`] and holds at most [`INBOUND_MESSAGE_BURST`];
+/// each message takes one token. Time is passed in so tests use synthetic
+/// instants.
+#[derive(Debug)]
+struct MessageBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl MessageBucket {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: f64::from(INBOUND_MESSAGE_BURST),
+            last: now,
+        }
+    }
+
+    /// Whether a message arriving at `now` is within the rate.
+    fn admit(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = self.last.max(now);
+        let refilled = self.tokens + elapsed * f64::from(INBOUND_MESSAGES_PER_SECOND);
+        self.tokens = refilled.min(f64::from(INBOUND_MESSAGE_BURST));
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Counts and logs a closed connection with its cause and lifetime.
 pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived: Duration) {
     metrics::counter!("pharos_rpc_closed_total", "cause" => cause.label()).increment(1);
@@ -208,6 +252,9 @@ pub fn record_closed(cause: &CloseCause, connection: u64, signed_in: bool, lived
             max = MAX_FRAME,
             "native api limit reached"
         );
+    }
+    if *cause == CloseCause::RateLimited {
+        metrics::counter!(LIMIT_TOTAL, "limit" => "inbound_messages").increment(1);
     }
     tracing::info!(
         connection,
@@ -380,15 +427,33 @@ async fn run<S>(
     let last_seen = Rc::new(Cell::new(Instant::now()));
     let mut ponger = session.clone();
     let seen = Rc::clone(&last_seen);
+    let connection = conn.id();
+    let client_ip = ctx.client_ip;
     let inbound = async move {
+        let mut bucket = MessageBucket::new(Instant::now());
+        let mut binaries: u64 = 0;
         loop {
             let msg = inbound.next().await;
-            seen.set(Instant::now());
+            let now = Instant::now();
+            seen.set(now);
             match msg {
                 None => return CloseCause::StreamEnd,
                 Some(Err(e)) if is_oversized(&e) => return CloseCause::MessageTooLarge,
                 Some(Err(e)) => return CloseCause::ReadError(e.to_string()),
                 Some(Ok(AggregatedMessage::Binary(bytes))) => {
+                    binaries = binaries.saturating_add(1);
+                    if !bucket.admit(now) {
+                        tracing::warn!(
+                            connection,
+                            client_ip = %client_ip,
+                            messages = binaries,
+                            per_second = INBOUND_MESSAGES_PER_SECOND,
+                            burst = INBOUND_MESSAGE_BURST,
+                            limit = "inbound_messages",
+                            "native api inbound message rate exceeded"
+                        );
+                        return CloseCause::RateLimited;
+                    }
                     if to_rpc.write_all(&bytes).await.is_err() {
                         return CloseCause::RpcEnded("rpc input closed".into());
                     }
@@ -506,6 +571,7 @@ mod tests {
             CloseCause::StreamEnd,
             CloseCause::ReadError(String::new()),
             CloseCause::MessageTooLarge,
+            CloseCause::RateLimited,
             CloseCause::SendFailed,
             CloseCause::TextFrame,
             CloseCause::AuthDeadline,
@@ -528,5 +594,42 @@ mod tests {
         ];
         let labels: std::collections::HashSet<_> = refused.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), refused.len());
+    }
+
+    #[test]
+    fn message_bucket_admits_a_burst_then_refuses() {
+        let t0 = Instant::now();
+        let mut bucket = MessageBucket::new(t0);
+        let verdicts: Vec<bool> = (0..=INBOUND_MESSAGE_BURST)
+            .map(|_| bucket.admit(t0))
+            .collect();
+        assert_eq!(
+            verdicts.iter().filter(|ok| **ok).count(),
+            INBOUND_MESSAGE_BURST as usize
+        );
+        assert_eq!(verdicts.last(), Some(&false));
+    }
+
+    #[test]
+    fn message_bucket_refills_at_the_sustained_rate_and_no_further() {
+        let t0 = Instant::now();
+        let mut bucket = MessageBucket::new(t0);
+        let _burst: Vec<bool> = (0..INBOUND_MESSAGE_BURST)
+            .map(|_| bucket.admit(t0))
+            .collect();
+        assert!(!bucket.admit(t0));
+
+        let one_second = t0 + Duration::from_secs(1);
+        let refilled = (0..=INBOUND_MESSAGES_PER_SECOND)
+            .filter(|_| bucket.admit(one_second))
+            .count();
+        assert_eq!(refilled, INBOUND_MESSAGES_PER_SECOND as usize);
+
+        // An idle stretch refills to the burst and no higher.
+        let much_later = t0 + Duration::from_secs(1000);
+        let refilled = (0..=INBOUND_MESSAGE_BURST)
+            .filter(|_| bucket.admit(much_later))
+            .count();
+        assert_eq!(refilled, INBOUND_MESSAGE_BURST as usize);
     }
 }
