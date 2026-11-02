@@ -189,12 +189,12 @@ async fn policy_visible_ids(
             &user.policy,
             &state.parental_ratings,
         );
-        let (items, _) = state
+        let visible = state
             .stores
-            .query(&mq)
+            .query_ids(&mq)
             .await
             .map_err(|e| ItemHidden::Unavailable(e.to_string()))?;
-        shown.extend(items.iter().map(|i| i.id));
+        shown.extend(visible);
     }
     Ok(shown)
 }
@@ -309,11 +309,14 @@ async fn allowed_ids(
     if ids.len() <= IDS_PER_QUERY {
         return policy_visible_ids(state, user, ids).await;
     }
-    match crate::services::library::visible_items(state, user).await {
-        Ok(Some(visible)) => Ok(visible.iter().map(|i| i.id).collect()),
-        Ok(None) => Ok(ids.iter().copied().collect()),
-        Err(e) => Err(ItemHidden::Unavailable(e.to_string())),
-    }
+    let mut mq = MediaQuery::default();
+    crate::api::jellyfin::items::apply_policy_scope(&mut mq, policy, &state.parental_ratings);
+    let visible = state
+        .stores
+        .query_ids(&mq)
+        .await
+        .map_err(|e| ItemHidden::Unavailable(e.to_string()))?;
+    Ok(visible.into_iter().collect())
 }
 
 /// Count and log a list the store could not scope, and pass `hidden` on.
