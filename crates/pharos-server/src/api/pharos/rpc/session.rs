@@ -12,6 +12,7 @@ use pharos_core::{AuthError, User};
 use super::bootstrap::token_denial;
 use super::library::Library;
 use super::playback::Playback;
+use super::prefs::Prefs;
 use super::socket::MessageBucket;
 use super::telemetry::{Telemetry, TELEMETRY_BATCHES_PER_SECOND, TELEMETRY_BATCH_BURST};
 use super::user_data::UserData;
@@ -144,6 +145,20 @@ impl server::session::Handler for Session {
         results
             .get()
             .set_telemetry(server::telemetry::client(Telemetry::new(self), &conn));
+        Ok(())
+    }
+
+    /// Never refused, like `library`; each `Prefs` call checks the
+    /// session itself.
+    async fn prefs(
+        self: Rc<Self>,
+        _params: wire::PrefsParams,
+        results: &mut wire::PrefsResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_prefs(server::prefs::client(Prefs::new(self), &conn));
         Ok(())
     }
 
