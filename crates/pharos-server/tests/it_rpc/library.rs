@@ -1188,6 +1188,55 @@ async fn a_hidden_item_answers_like_a_missing_one() {
     );
 }
 
+/// A refused item call is visible: one INFO line with the call, the id kind,
+/// the reason and the id, and a count under
+/// `pharos_rpc_item_refused_total{call,id_kind,reason}`; a real and a synth
+/// refusal count under distinct series.
+/// Disarm check: with `record_refusal` not incrementing the counter (or not
+/// logging), this fails.
+#[actix_web::test]
+async fn refused_item_calls_are_logged_and_counted() {
+    use crate::telemetry::{connect, counter, session_for, subscriber, Captured};
+    use pharos_jellyfin_api::dto::WireId;
+
+    let fx = crate::common::seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let synth = WireId::parse(&fx.lib_a_wire).unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            assert!(wire_detail(&session, synth).await.is_err());
+            assert!(wire_detail(&session, WireId::Real(987_654_321))
+                .await
+                .is_err());
+        })
+        .await;
+    let series = |id_kind, reason| {
+        counter(
+            &snapshotter,
+            "pharos_rpc_item_refused_total",
+            &[("call", "detail"), ("id_kind", id_kind), ("reason", reason)],
+        )
+    };
+    assert_eq!(series("synth", "synth_unsupported"), 1);
+    assert_eq!(series("real", "not_found"), 1);
+    assert_eq!(series("real", "synth_unsupported"), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("INFO")
+            && text.contains("native item call: refused")
+            && text.contains("id_kind=\"synth\"")
+            && text.contains("reason=\"synth_unsupported\"")
+            && text.contains(&format!("item.id={synth}")),
+        "{text}"
+    );
+}
+
 /// How many rpc `Call` messages `bytes` (whole capnp messages, back to back)
 /// carries.
 fn calls_in(bytes: &[u8]) -> usize {

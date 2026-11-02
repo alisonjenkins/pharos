@@ -241,6 +241,12 @@ impl server::library::Handler for Library {
         let item_not_found = Denial::NotFound { what: "item" };
         // Synthesised items (series, season, album…) have no detail here yet.
         let WireId::Real(id) = id else {
+            record_refusal(
+                "detail",
+                id,
+                RefusalReason::SynthUnsupported,
+                "synthesised items have no detail yet",
+            );
             item_not_found.write(results.get().init_result().init_error());
             return Ok(());
         };
@@ -485,8 +491,61 @@ fn wire_kind(kind: MediaKind) -> Kind {
     }
 }
 
+/// Why a native call on an item answered with a denial. The `reason` label of
+/// `pharos_rpc_item_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The policy withholds the item; carries `ItemHidden::label`.
+    Hidden(&'static str),
+    /// No item has the id.
+    NotFound,
+    /// The store could not say.
+    StoreUnavailable,
+    /// The call has no answer for a synthesised id.
+    SynthUnsupported,
+}
+
+impl RefusalReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            RefusalReason::Hidden(label) => label,
+            RefusalReason::NotFound => "not_found",
+            RefusalReason::StoreUnavailable => "store_unavailable",
+            RefusalReason::SynthUnsupported => "synth_unsupported",
+        }
+    }
+}
+
+/// The `id_kind` label of `pharos_rpc_item_refused_total`: `real` for a store
+/// row, `synth` for a synthesised group id.
+fn id_kind_label(id: WireId) -> &'static str {
+    match id {
+        WireId::Real(_) => "real",
+        WireId::Synth(_) => "synth",
+    }
+}
+
+/// Records that native `call` refused item `id`: one INFO line carrying the
+/// id and the reason (WARN when the store was the cause), and a count under
+/// `pharos_rpc_item_refused_total{call,id_kind,reason}`.
+pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReason, detail: &str) {
+    let id_kind = id_kind_label(id);
+    metrics::counter!(
+        "pharos_rpc_item_refused_total",
+        "call" => call,
+        "id_kind" => id_kind,
+        "reason" => reason.label()
+    )
+    .increment(1);
+    if reason == RefusalReason::StoreUnavailable {
+        tracing::warn!(item.id = %id, call, id_kind, reason = reason.label(), error = %detail, "native item call: store unavailable");
+    } else {
+        tracing::info!(item.id = %id, call, id_kind, reason = reason.label(), detail, "native item call: refused");
+    }
+}
+
 /// Why a call on stored item `id` has no item to answer with, as the denial
-/// it sends, logged. A hidden item answers as a missing one, so its id says
+/// it sends, recorded. A hidden item answers as a missing one, so its id says
 /// nothing about what exists.
 pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denial {
     use crate::services::access::ItemHidden;
@@ -494,17 +553,23 @@ pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denia
     let unavailable = Denial::Unavailable {
         dependency: "media store",
     };
-    let (denial, detail) = match e {
-        DetailError::Hidden(ItemHidden::Unavailable(detail)) => (unavailable, detail.clone()),
-        DetailError::Hidden(hidden) => (item_not_found, hidden.label().to_owned()),
-        DetailError::NotFound => (item_not_found, "not_found".to_owned()),
-        DetailError::Store(e) => (unavailable, e.to_string()),
+    let (denial, reason, detail) = match e {
+        DetailError::Hidden(ItemHidden::Unavailable(detail)) => {
+            (unavailable, RefusalReason::StoreUnavailable, detail.clone())
+        }
+        DetailError::Hidden(hidden) => (
+            item_not_found,
+            RefusalReason::Hidden(hidden.label()),
+            hidden.label().to_owned(),
+        ),
+        DetailError::NotFound => (
+            item_not_found,
+            RefusalReason::NotFound,
+            "not_found".to_owned(),
+        ),
+        DetailError::Store(e) => (unavailable, RefusalReason::StoreUnavailable, e.to_string()),
     };
-    if matches!(denial, Denial::Unavailable { .. }) {
-        tracing::warn!(media.id = id, call, error = %detail, "native item call: store unavailable");
-    } else {
-        tracing::debug!(media.id = id, call, reason = %detail, "native item call: refused");
-    }
+    record_refusal(call, WireId::Real(id), reason, &detail);
     denial
 }
 
@@ -574,5 +639,37 @@ fn wire_library_kind(kind: LibraryKind) -> WireKind {
         LibraryKind::TvShows => WireKind::TvShows,
         LibraryKind::Music => WireKind::Music,
         LibraryKind::Books => WireKind::Books,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RefusalReason;
+    use crate::services::access::ItemHidden;
+
+    /// A renamed or merged label breaks dashboards silently.
+    #[test]
+    fn refusal_reason_labels_are_distinct() {
+        let hidden = [
+            ItemHidden::LibraryNotAllowed,
+            ItemHidden::NoLibrary,
+            ItemHidden::ParentalRating,
+            ItemHidden::Tag,
+            ItemHidden::Unauthenticated,
+        ];
+        let mut labels: Vec<&str> = hidden
+            .iter()
+            .map(|h| RefusalReason::Hidden(h.label()).label())
+            .collect();
+        labels.extend(
+            [
+                RefusalReason::NotFound,
+                RefusalReason::StoreUnavailable,
+                RefusalReason::SynthUnsupported,
+            ]
+            .map(RefusalReason::label),
+        );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
     }
 }
