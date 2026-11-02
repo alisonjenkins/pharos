@@ -1108,13 +1108,6 @@ async fn serve_segment(
     if let Some(so) = qs_stereo_output(req.query_string()) {
         opts.stereo_output = so;
     }
-    if opts.burn_subtitle_stream_index.is_some()
-        && opts
-            .video_3d_format
-            .is_some_and(|f| f.is_packed_sbs_or_tab())
-    {
-        opts.stereo_output = pharos_transcode::StereoOutput::Mono2D;
-    }
     // W3 — variant overrides the video-bitrate cap negotiated by
     // PlaybackInfo. P2 — clamp the override against the session cap so
     // a 4 Mbps 1080p rung never outruns a 1 Mbps mobile profile.
@@ -1498,13 +1491,6 @@ fn build_segment_opts(
         item.probe.duration_ms.map(|ms| ms as f64 / 1000.0),
     );
     let video_3d_format = item.probe.video_3d_format;
-    let default_stereo_output = if subtitle_stream_index.is_some()
-        && video_3d_format.is_some_and(|f| f.is_packed_sbs_or_tab())
-    {
-        pharos_transcode::StereoOutput::Mono2D
-    } else {
-        pharos_transcode::StereoOutput::Preserve
-    };
     use crate::api::jellyfin::device_profile::Decision;
 
     // `AudioStreamIndex` / `SubtitleStreamIndex` arrive as ABSOLUTE ffprobe
@@ -1644,7 +1630,7 @@ fn build_segment_opts(
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
                     video_3d_format,
-                    stereo_output: default_stereo_output,
+                    stereo_output: pharos_transcode::StereoOutput::Preserve,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1680,7 +1666,7 @@ fn build_segment_opts(
                     burn_subtitle_ass_path: None,
                     burn_fonts_dir: None,
                     video_3d_format,
-                    stereo_output: default_stereo_output,
+                    stereo_output: pharos_transcode::StereoOutput::Preserve,
                 };
             }
             _ => {}
@@ -1716,7 +1702,7 @@ fn build_segment_opts(
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
         video_3d_format,
-        stereo_output: default_stereo_output,
+        stereo_output: pharos_transcode::StereoOutput::Preserve,
     }
 }
 
@@ -3499,13 +3485,6 @@ async fn fmp4_segment_opts(
     if let Some(so) = qs_stereo_output(req.query_string()) {
         opts.stereo_output = so;
     }
-    if opts.burn_subtitle_stream_index.is_some()
-        && opts
-            .video_3d_format
-            .is_some_and(|f| f.is_packed_sbs_or_tab())
-    {
-        opts.stereo_output = pharos_transcode::StereoOutput::Mono2D;
-    }
     opts
 }
 
@@ -3616,16 +3595,7 @@ fn fmp4_segment_opts_resolved(
         burn_subtitle_ass_path: None,
         burn_fonts_dir: None,
         video_3d_format: item.probe.video_3d_format,
-        stereo_output: if sub_rel.is_some()
-            && item
-                .probe
-                .video_3d_format
-                .is_some_and(|f| f.is_packed_sbs_or_tab())
-        {
-            pharos_transcode::StereoOutput::Mono2D
-        } else {
-            pharos_transcode::StereoOutput::Preserve
-        },
+        stereo_output: pharos_transcode::StereoOutput::Preserve,
     }
 }
 
@@ -4950,6 +4920,46 @@ mod tests {
         assert_eq!(prewarm_base_segment(ticks, None, fps), None);
         // ...but a from-the-start play still warms the opening.
         assert_eq!(prewarm_base_segment(0, None, fps), Some(0));
+    }
+
+    /// V234 — burning a subtitle into a packed 3D source keeps the layout at
+    /// every segment-opts default, and a client that asked for 2D still gets 2D.
+    #[::core::prelude::v1::test]
+    fn a_burned_subtitle_on_packed_3d_keeps_the_layout() {
+        use pharos_core::Video3DFormat as F;
+        use pharos_transcode::StereoOutput::{Mono2D, Preserve};
+        for format in [
+            F::HalfSideBySide,
+            F::FullSideBySide,
+            F::HalfTopAndBottom,
+            F::FullTopAndBottom,
+        ] {
+            // TEXT burn through the MPEG-TS/native builder.
+            let mut text = item_with_subs();
+            text.probe.video_3d_format = Some(format);
+            let opts = build_segment_opts(None, &text, 0, None, Some(3));
+            assert!(opts.burn_subtitle_stream_index.is_some(), "{format:?}");
+            assert_eq!(opts.stereo_output, Preserve, "{format:?} ts");
+
+            // IMAGE burn through the CMAF builder.
+            let mut image = item_with_video_codec(Some("h264"));
+            image.probe.video_3d_format = Some(format);
+            image
+                .probe
+                .subtitle_tracks
+                .push(pharos_core::SubtitleTrack {
+                    stream_index: 3,
+                    codec: Some("hdmv_pgs_subtitle".into()),
+                    ..Default::default()
+                });
+            let opts =
+                fmp4_segment_opts_resolved(&image, 0, SegmentVideo::H264, Some(3), None, None);
+            assert!(opts.burn_subtitle_stream_index.is_some(), "{format:?}");
+            assert_eq!(opts.stereo_output, Preserve, "{format:?} cmaf");
+        }
+        // The client's own request is what downmixes.
+        assert_eq!(qs_stereo_output("StereoMode=mono"), Some(Mono2D));
+        assert_eq!(qs_stereo_output("StereoMode=preserve"), Some(Preserve));
     }
 
     #[::core::prelude::v1::test]
