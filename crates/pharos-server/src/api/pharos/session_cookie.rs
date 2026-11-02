@@ -48,21 +48,24 @@ pub struct SignIn {
 /// `pharos_session` with the attributes every response sets it with: a
 /// clearing cookie only clears when name, path and domain match.
 fn cookie(value: String, max_age: CookieDuration) -> Cookie<'static> {
-    Cookie::build(SESSION_COOKIE, value)
-        .path("/pharos")
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
-        .max_age(max_age)
-        .finish()
+    scoped(SESSION_COOKIE, "/pharos", value, max_age)
 }
 
 /// [`MEDIA_COOKIE`]: the same token on `/`, so `<img>` and `<video>` fetches
 /// of item bytes authenticate (ADR-0034). Only GET and HEAD on those routes
 /// read it (V191).
 fn media_cookie(value: String, max_age: CookieDuration) -> Cookie<'static> {
-    Cookie::build(MEDIA_COOKIE, value)
-        .path("/")
+    scoped(MEDIA_COOKIE, "/", value, max_age)
+}
+
+fn scoped(
+    name: &'static str,
+    path: &'static str,
+    value: String,
+    max_age: CookieDuration,
+) -> Cookie<'static> {
+    Cookie::build(name, value)
+        .path(path)
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict)

@@ -93,6 +93,8 @@ async fn sign_in_also_sets_a_media_cookie_for_element_urls() {
     assert_eq!(media.path(), Some("/"));
     assert_eq!(media.http_only(), Some(true));
     assert_eq!(media.same_site(), Some(SameSite::Strict));
+    assert_eq!(media.secure(), Some(true));
+    assert_eq!(media.max_age(), session.max_age());
 }
 
 #[actix_web::test]
