@@ -94,3 +94,11 @@ pub fn warn(message: &str) {
 }
 
 pub fn info(_message: &str) {}
+
+pub fn stored_theme(_key: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+pub fn apply_tokens(_declarations: &[(String, String)]) -> Result<(), String> {
+    Ok(())
+}

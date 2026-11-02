@@ -47,6 +47,10 @@ pub enum ThemeError {
         ratio: f64,
         min: f64,
     },
+    #[error("no theme is named {name:?}")]
+    UnknownTheme { name: String },
+    #[error("theme storage unreadable: {message}")]
+    Storage { message: String },
 }
 
 impl ThemeError {
@@ -61,6 +65,8 @@ impl ThemeError {
             Self::ExtendsCycle { .. } => "extends_cycle",
             Self::TooLarge { .. } => "too_large",
             Self::Contrast { .. } => "contrast",
+            Self::UnknownTheme { .. } => "unknown_theme",
+            Self::Storage { .. } => "storage",
         }
     }
 
@@ -76,6 +82,8 @@ impl ThemeError {
             Self::ExtendsCycle { chain } => (none(), chain.join(">")),
             Self::TooLarge { bytes } => (none(), bytes.to_string()),
             Self::Contrast { pair, ratio, .. } => (none(), format!("{pair}={ratio:.2}")),
+            Self::UnknownTheme { name } => (none(), name.clone()),
+            Self::Storage { message } => (none(), message.clone()),
         }
     }
 }

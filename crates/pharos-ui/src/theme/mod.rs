@@ -49,6 +49,7 @@ macro_rules! label_enum {
 
 pub mod contrast;
 pub mod css;
+pub mod device;
 pub mod doc;
 pub mod resolve;
 pub mod signal;
