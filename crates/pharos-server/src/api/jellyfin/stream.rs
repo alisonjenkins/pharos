@@ -550,7 +550,7 @@ async fn authorize_media(
     media_id: pharos_core::MediaId,
 ) -> Result<(), actix_web::Error> {
     // 1. Normal credential: its user's library policy applies (V187).
-    if let Some(token) = crate::api::jellyfin::auth_extractor::extract_media_token(req) {
+    if let Some(token) = crate::api::jellyfin::auth_extractor::media_token(Some(state), req).await {
         if let Ok(user) = crate::services::auth::user_for_token(&state.stores, &token).await {
             return crate::api::jellyfin::require_item_access(state, &user, media_id, "stream")
                 .await;

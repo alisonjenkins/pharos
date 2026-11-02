@@ -167,7 +167,7 @@ pub fn device_id_from_request(req: &HttpRequest) -> Option<String> {
 /// Lookup order: `X-Emby-Token` → `X-MediaBrowser-Token` →
 /// MediaBrowser/Emby `Authorization` parse → `api_key` query param (used
 /// by media-element `src=` playback where headers can't be injected).
-/// Never the `JellyfinAuth` cookie: see [`extract_media_token`].
+/// Never a cookie: see [`media_token`].
 pub fn extract_token(req: &HttpRequest) -> Option<String> {
     extract_header_token(req).or_else(|| {
         req.query_string()
@@ -216,14 +216,18 @@ pub const AUTH_COOKIE: &str = "JellyfinAuth";
 /// authenticate. Its own name keeps jellyfin-web's sign-out from clearing it.
 pub const MEDIA_COOKIE: &str = "pharos_media";
 
-/// [`extract_token`], falling back to the `JellyfinAuth` cookie, then the
-/// native [`MEDIA_COOKIE`], on a GET or HEAD. Only routes that serve an item's bytes to element URLs (images,
-/// subtitles, fonts, streams, HLS, trickplay) read it, through
-/// [`MediaUser`] or `require_bearer` (V191). A browser attaches the cookie
-/// to any same-site request, including one from a sibling subdomain that
-/// `SameSite` cannot tell apart, so it must never authorize a write or a
-/// JSON API read.
-pub fn extract_media_token(req: &HttpRequest) -> Option<String> {
+/// The credential a route serving an item's bytes to element URLs (images,
+/// subtitles, fonts, streams, HLS, trickplay) authenticates, through
+/// [`MediaUser`] or `require_bearer` (V191): [`extract_token`], else on a GET
+/// or HEAD the `JellyfinAuth` cookie, else the native [`MEDIA_COOKIE`]. A
+/// browser attaches these cookies to any same-site request, including one
+/// from a sibling subdomain that `SameSite` cannot tell apart, so they must
+/// never authorize a write or a JSON API read.
+///
+/// When both cookies are present and differ, the first that resolves wins, so
+/// a stale one left by the other UI cannot shadow a live one (ADR-0034). That
+/// costs a token lookup only in that case.
+pub async fn media_token(state: Option<&AppState>, req: &HttpRequest) -> Option<String> {
     if let Some(token) = extract_token(req) {
         return Some(token);
     }
@@ -233,18 +237,31 @@ pub fn extract_media_token(req: &HttpRequest) -> Option<String> {
     ) {
         return None;
     }
-    // jellyfin-web's cookie first, so a browser signed in to both keeps
-    // jellyfin-web's existing behaviour.
-    [AUTH_COOKIE, MEDIA_COOKIE].into_iter().find_map(|name| {
+    let cookie = |name| {
         req.cookie(name)
             .map(|c| c.value().trim().to_owned())
             .filter(|v| !v.is_empty())
-    })
+    };
+    // jellyfin-web's cookie first, so a browser signed in to both keeps
+    // jellyfin-web's existing behaviour.
+    match (cookie(AUTH_COOKIE), cookie(MEDIA_COOKIE)) {
+        (Some(web), Some(native)) if web != native => match state {
+            Some(state)
+                if matches!(
+                    crate::services::auth::user_for_token(&state.stores, &web).await,
+                    Err(TokenRefusal::InvalidToken | TokenRefusal::UserRevoked)
+                ) =>
+            {
+                Some(native)
+            }
+            _ => Some(web),
+        },
+        (web, native) => web.or(native),
+    }
 }
 
 /// [`AuthUser`] for the routes that serve an item's bytes to element URLs:
-/// the token may also come from the `JellyfinAuth` cookie on a GET or HEAD
-/// ([`extract_media_token`]).
+/// the token may also come from a cookie on a GET or HEAD ([`media_token`]).
 pub struct MediaUser(pub User);
 
 impl FromRequest for MediaUser {
@@ -252,10 +269,10 @@ impl FromRequest for MediaUser {
     type Future = Pin<Box<dyn Future<Output = Result<Self, actix_web::Error>>>>;
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
-        let token = extract_media_token(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
         let req = req.clone();
         Box::pin(async move {
+            let token = media_token(state.as_ref().map(|s| s.get_ref()), &req).await;
             let user = authenticate(state, token).await?;
             note_header_credential(&req);
             Ok(MediaUser(user))

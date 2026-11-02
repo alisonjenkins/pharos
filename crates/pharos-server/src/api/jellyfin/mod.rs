@@ -110,7 +110,7 @@ pub(crate) async fn require_bearer(
     id: &str,
     route: &'static str,
 ) -> Result<pharos_core::User, actix_web::Error> {
-    let token = auth_extractor::extract_media_token(req);
+    let token = auth_extractor::media_token(Some(state), req).await;
     let user = crate::services::access::authenticate(state, token.as_deref(), id, route)
         .await
         .map_err(access_error)?;
