@@ -484,6 +484,16 @@ mod tests {
         ) -> DomainResult<pharos_core::MediaFacets> {
             Ok(pharos_core::MediaFacets::default())
         }
+        async fn id_at_path(&self, path: &Path) -> DomainResult<Option<MediaId>> {
+            Ok(self
+                .0
+                .items
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .values()
+                .find(|item| item.path == path)
+                .map(|item| item.id))
+        }
         async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
             Ok(self
                 .0

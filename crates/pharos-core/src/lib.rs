@@ -3140,6 +3140,15 @@ pub trait MediaStore: Send + Sync {
         id: MediaId,
     ) -> impl std::future::Future<Output = DomainResult<Option<ScanState>>> + Send;
 
+    /// B257 — the id of the row whose `path` is `path`, or `None` when no row
+    /// holds it. A row's id is the path-derived one unless it was seeded or
+    /// rebound after a move, so the scanner asks this when a lookup by the
+    /// path-derived id misses, rather than inserting a second row for the path.
+    fn id_at_path(
+        &self,
+        path: &std::path::Path,
+    ) -> impl std::future::Future<Output = DomainResult<Option<MediaId>>> + Send;
+
     /// LIB-A1 — open a scan run against `root`, recording the start
     /// time. Returns the new `scan_runs.id` used as the mark-and-sweep
     /// token for `mark_seen` / `sweep_unseen` / `finish_scan`.

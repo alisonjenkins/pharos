@@ -255,6 +255,21 @@ where
     let listed_items = MediaStore::list(&store).await.unwrap();
     assert!(listed_items.iter().any(|i| i.id == item_id));
 
+    // B257 — the row holding a path is found by the path, whatever its id.
+    assert_eq!(
+        MediaStore::id_at_path(&store, &item.path).await.unwrap(),
+        Some(item_id)
+    );
+    assert_eq!(
+        MediaStore::id_at_path(
+            &store,
+            std::path::Path::new("/media/conformance/absent.mkv")
+        )
+        .await
+        .unwrap(),
+        None
+    );
+
     let q = MediaQuery::default();
     let (page, total) = MediaStore::query(&store, &q).await.unwrap();
     assert!(total >= 1);

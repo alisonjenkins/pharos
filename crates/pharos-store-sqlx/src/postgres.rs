@@ -836,6 +836,19 @@ impl MediaStore for PostgresStore {
         self.facets_impl(base, req).await
     }
 
+    #[tracing::instrument(skip(self), fields(media.path = %path.display()))]
+    async fn id_at_path(&self, path: &std::path::Path) -> DomainResult<Option<MediaId>> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM media_items WHERE path = $1")
+            .bind(path.to_string_lossy().as_ref())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        id.map(|id| {
+            u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+        })
+        .transpose()
+    }
+
     #[tracing::instrument(skip(self), fields(media.id = %id))]
     async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
         let id_i64 = media_id_i64(id)?;

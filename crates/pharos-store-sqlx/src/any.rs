@@ -195,6 +195,13 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn id_at_path(&self, path: &std::path::Path) -> DomainResult<Option<MediaId>> {
+        match self {
+            AnyStore::Sqlite(s) => s.id_at_path(path).await,
+            AnyStore::Postgres(p) => p.id_at_path(path).await,
+        }
+    }
+
     async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
         match self {
             AnyStore::Sqlite(s) => s.scan_state(id).await,
