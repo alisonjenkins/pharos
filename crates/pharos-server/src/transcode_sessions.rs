@@ -20,6 +20,7 @@
 //! Store write-through is best-effort: a DB hiccup is logged (with the
 //! underlying cause) and playback continues on the local replica — the only
 //! thing lost is failover for that one session, never the stream itself.
+//! The actor loop does no store I/O, so a slow store cannot stall `get`.
 
 use crate::api::jellyfin::device_profile::Decision;
 use pharos_core::{
@@ -121,6 +122,16 @@ struct Minted {
     held: usize,
     /// Session ids ended from memory to stay within the cap, oldest first.
     evicted: Vec<String>,
+}
+
+async fn delete_durable_row<S: TranscodeSessionStore>(store: &S, session_id: &str) {
+    if let Err(e) = store.remove_transcode_session(session_id).await {
+        tracing::warn!(
+            psid = %pharos_core::secret_prefix(session_id),
+            error = %e,
+            "transcode session store delete failed"
+        );
+    }
 }
 
 struct Entry {
@@ -250,10 +261,24 @@ where
     /// Cache the session locally and write it through to the store so other
     /// replicas can fail over to it. Store failures are logged, not fatal.
     ///
-    /// Enforces [`MAX_LIVE_PLAY_SESSIONS_PER_USER`] for the session's holder:
-    /// the oldest of that user's sessions on this replica are ended, and their
-    /// ids returned so the caller can stop what else they drive. Ending an
-    /// evicted session takes the same store path as [`Self::remove`].
+    /// Enforces [`MAX_LIVE_PLAY_SESSIONS_PER_USER`] for the session's holder
+    /// twice over. In memory, the actor ends the oldest of that user's
+    /// sessions on this replica. In the durable store, the holder's live rows
+    /// are trimmed across every replica (B279), since a row keeps authorizing
+    /// after its memory entry expires. Ending either takes the same store path
+    /// as [`Self::remove`]. The ids ended are returned so the caller can stop
+    /// what else they drive.
+    ///
+    /// All store I/O runs here, on the caller's task: the actor also serves
+    /// every `get`, so a slow store must never be awaited inside it.
+    ///
+    /// Without the actor to serialize them, racing mints may each trim. That is
+    /// safe: the trim keeps the newest `keep` rows plus the caller's own, so
+    /// the end state is at most the cap, and a session ended by both the
+    /// in-memory eviction and a trim is returned once. The trim orders by
+    /// `updated_at` (unix seconds) then id, while eviction uses mint order, so
+    /// a user minting more than the cap within one second can lose a different
+    /// session from the durable store than from memory.
     pub async fn insert(
         &self,
         session_id: String,
@@ -280,6 +305,7 @@ where
                 "transcode session serialize failed; not persisted"
             ),
         }
+        let minted_id = session_id.clone();
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Mint {
@@ -305,7 +331,50 @@ where
                 "play session cap: ended oldest"
             );
         }
-        Ok(minted.evicted)
+        let trimmed = match self
+            .store
+            .trim_transcode_sessions_for_holder(
+                user,
+                &minted_id,
+                MAX_LIVE_PLAY_SESSIONS_PER_USER,
+                now_unix_secs() - DB_RETENTION_SECS,
+            )
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(
+                    user.id = %user,
+                    error = %e,
+                    "durable play session cap: trim failed; other replicas may hold extra sessions"
+                );
+                Vec::new()
+            }
+        };
+        if !trimmed.is_empty() {
+            for id in &trimmed {
+                // Their rows are gone; drop any memory entry so it stops authorizing.
+                self.tx
+                    .send(Msg::Remove {
+                        session_id: id.clone(),
+                    })
+                    .await
+                    .map_err(|_| TranscodeSessionError::ActorDown)?;
+            }
+            metrics::counter!("pharos_play_sessions_trimmed_total").increment(trimmed.len() as u64);
+            tracing::info!(
+                user.id = %user,
+                trimmed = trimmed.len(),
+                "durable play session cap: trimmed oldest"
+            );
+        }
+        let mut ended = minted.evicted;
+        for id in trimmed {
+            if !ended.contains(&id) {
+                ended.push(id);
+            }
+        }
+        Ok(ended)
     }
 
     /// Local cache first; on a miss fall back to the store (the failover /
@@ -402,13 +471,7 @@ where
     }
 
     async fn delete_durable(&self, session_id: &str) {
-        if let Err(e) = self.store.remove_transcode_session(session_id).await {
-            tracing::warn!(
-                psid = %pharos_core::secret_prefix(session_id),
-                error = %e,
-                "transcode session store delete failed"
-            );
-        }
+        delete_durable_row(&self.store, session_id).await;
     }
 
     pub async fn remove(&self, session_id: &str) -> Result<(), TranscodeSessionError> {
@@ -697,9 +760,10 @@ mod tests {
         );
     }
 
-    /// Concurrent mints are serialised by the actor: 40 racing mints for one
-    /// user leave exactly the cap live, never cap + overshoot.
-    #[tokio::test]
+    /// Racing mints for one user each trim outside the actor, so exact eviction
+    /// counts are not defined. The bounds are: never more than the cap live in
+    /// the store, and no more than the cap still authorizing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_mints_never_leave_more_than_the_cap_live() {
         let r = TranscodeSessionRegistry::spawn(store().await);
         let alice = pharos_core::UserId::new();
@@ -714,15 +778,127 @@ mod tests {
                 r.insert(id, session_for(alice)).await.unwrap()
             }));
         }
-        let mut evicted = 0;
         for t in tasks {
-            evicted += t.await.unwrap().len();
+            t.await.unwrap();
         }
-        assert_eq!(
-            evicted, 8,
-            "each mint past the cap ends exactly one session"
+        assert!(
+            live(&r, &ids).await <= MAX_LIVE_PLAY_SESSIONS_PER_USER,
+            "durable rows past the cap"
         );
-        assert_eq!(live(&r, &ids).await, MAX_LIVE_PLAY_SESSIONS_PER_USER);
+        let mut cached = 0;
+        for id in &ids {
+            if r.get(id).await.unwrap().is_some() {
+                cached += 1;
+            }
+        }
+        assert!(
+            cached <= MAX_LIVE_PLAY_SESSIONS_PER_USER,
+            "{cached} sessions still authorize"
+        );
+    }
+
+    /// A store that parks on a gate that is never opened, to show a hung store
+    /// cannot stall the registry actor (and so every `get` on the replica).
+    #[derive(Clone)]
+    struct GatedStore {
+        inner: SqliteStore,
+        armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        never: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl GatedStore {
+        async fn park(&self) {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                self.never.notified().await;
+            }
+        }
+    }
+
+    impl TranscodeSessionStore for GatedStore {
+        async fn upsert_transcode_session(
+            &self,
+            play_session_id: &str,
+            session: &PersistedTranscodeSession,
+            now_unix_secs: i64,
+        ) -> pharos_core::DomainResult<()> {
+            self.inner
+                .upsert_transcode_session(play_session_id, session, now_unix_secs)
+                .await
+        }
+        async fn get_transcode_session(
+            &self,
+            play_session_id: &str,
+            updated_since_unix_secs: i64,
+        ) -> pharos_core::DomainResult<Option<PersistedTranscodeSession>> {
+            self.inner
+                .get_transcode_session(play_session_id, updated_since_unix_secs)
+                .await
+        }
+        async fn remove_transcode_session(
+            &self,
+            play_session_id: &str,
+        ) -> pharos_core::DomainResult<()> {
+            self.park().await;
+            self.inner.remove_transcode_session(play_session_id).await
+        }
+        async fn prune_transcode_sessions(
+            &self,
+            cutoff_unix_secs: i64,
+        ) -> pharos_core::DomainResult<u64> {
+            self.inner.prune_transcode_sessions(cutoff_unix_secs).await
+        }
+        async fn trim_transcode_sessions_for_holder(
+            &self,
+            holder: pharos_core::UserId,
+            except_play_session_id: &str,
+            keep: usize,
+            updated_since_unix_secs: i64,
+        ) -> pharos_core::DomainResult<Vec<String>> {
+            self.park().await;
+            self.inner
+                .trim_transcode_sessions_for_holder(
+                    holder,
+                    except_play_session_id,
+                    keep,
+                    updated_since_unix_secs,
+                )
+                .await
+        }
+    }
+
+    /// The actor also serves every `get`, so a mint stuck on a hung store must
+    /// leave an already-cached session resolving at once.
+    #[tokio::test]
+    async fn a_hung_store_during_mint_does_not_block_get() {
+        let gated = GatedStore {
+            inner: store().await,
+            armed: Default::default(),
+            never: Default::default(),
+        };
+        let r = TranscodeSessionRegistry::spawn(gated.clone());
+        let alice = pharos_core::UserId::new();
+        r.insert("cached".into(), session_for(alice)).await.unwrap();
+
+        gated.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stuck = {
+            let r = r.clone();
+            tokio::spawn(async move { r.insert("stuck".into(), session_for(alice)).await })
+        };
+        // Let the mint reach the parked trim.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !stuck.is_finished(),
+            "the mint should be parked on the trim"
+        );
+
+        let got = tokio::time::timeout(Duration::from_secs(1), r.get("cached"))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("get stalled behind a hung store: the actor is doing store I/O")
+            })
+            .unwrap();
+        assert!(got.is_some());
+        stuck.abort();
     }
 
     /// The eviction is counted once and logged with the user, the number
@@ -793,5 +969,118 @@ mod tests {
             !log.contains("log-0"),
             "a session id must not reach the log: {log}"
         );
+    }
+
+    /// B279: the durable rows count too. Another replica's rows keep
+    /// authorizing after their memory expired or was never here, so a mint
+    /// here trims the holder's oldest durable rows, including one this replica
+    /// still holds in memory, which must drop with it. A trimmed row is counted
+    /// and logged by id-free fields only.
+    #[tokio::test]
+    async fn durable_rows_past_the_cap_are_trimmed_on_mint() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let buf = Buf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _log = tracing::subscriber::set_default(sub);
+
+        let store = store().await;
+        let alice = pharos_core::UserId::new();
+        let r = TranscodeSessionRegistry::spawn(store.clone());
+        // Oldest: minted here, so it is also in this replica's memory.
+        r.insert("mem-old".into(), session_for(alice))
+            .await
+            .unwrap();
+
+        // Newer rows minted elsewhere, with timestamps after `mem-old`'s so the
+        // trim order does not depend on how many seconds the test takes.
+        let now = now_unix_secs();
+        let row =
+            TranscodeSessionRegistry::<SqliteStore>::to_persisted(&session_for(alice)).unwrap();
+        let mut seeds = Vec::new();
+        for i in 0..MAX_LIVE_PLAY_SESSIONS_PER_USER {
+            let id = format!("seed-{i:02}");
+            let ts = now
+                .saturating_add(100)
+                .saturating_add(i64::try_from(i).unwrap_or(0));
+            store.upsert_transcode_session(&id, &row, ts).await.unwrap();
+            seeds.push(id);
+        }
+
+        let evicted = r
+            .insert("mint-new".into(), session_for(alice))
+            .await
+            .unwrap();
+        assert_eq!(
+            evicted,
+            vec!["mem-old".to_string(), "seed-00".to_string()],
+            "the two oldest durable rows are ended, oldest first"
+        );
+        assert!(
+            r.get("mem-old").await.unwrap().is_none(),
+            "a trimmed session must leave this replica's memory too"
+        );
+        assert!(r.get_stored("seed-00").await.unwrap().is_none());
+        assert!(r.get_stored("seed-01").await.unwrap().is_some());
+        assert!(r.get_stored("mint-new").await.unwrap().is_some());
+
+        let mut ids = vec!["mem-old".to_string(), "mint-new".to_string()];
+        ids.extend(seeds.iter().cloned());
+        assert_eq!(
+            live(&r, &ids).await,
+            MAX_LIVE_PLAY_SESSIONS_PER_USER,
+            "the user keeps exactly the cap of authorizing rows"
+        );
+
+        let count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                (ck.key().name() == "pharos_play_sessions_trimmed_total").then_some(v)
+            })
+            .unwrap();
+        assert!(
+            matches!(count, DebugValue::Counter(2)),
+            "two trims counted — got {count:?}"
+        );
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("durable play session cap: trimmed oldest"))
+            .unwrap_or_else(|| panic!("no durable cap log line in {log}"));
+        assert!(line.contains("trimmed=2"), "missing trimmed=2 in {line}");
+        for id in ["mem-old", "seed-00", "mint-new"] {
+            assert!(
+                !log.contains(id),
+                "a session id must not reach the log: {log}"
+            );
+        }
     }
 }
