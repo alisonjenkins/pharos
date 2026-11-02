@@ -466,3 +466,25 @@ async fn backfill_decisions_are_counted_by_outcome() {
         [1, 1, 1, 2]
     );
 }
+
+/// ADR-0034: a stale `JellyfinAuth` left by an earlier jellyfin-web sign-in
+/// must not shadow a live `pharos_media`, or the native UI's posters 401
+/// until jellyfin-web signs out. The reverse holds too. Disarm check: with
+/// `media_token` taking the first cookie unresolved, both requests answer 401.
+#[actix_web::test]
+async fn a_stale_cookie_does_not_shadow_a_live_one() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let uri = format!("/Items/{}/Images", f.rich_item_id);
+    for pair in [
+        format!("JellyfinAuth=revoked; pharos_media={}", f.user_token),
+        format!("JellyfinAuth={}; pharos_media=revoked", f.user_token),
+    ] {
+        let req = test::TestRequest::get()
+            .uri(&uri)
+            .insert_header((header::COOKIE, pair.clone()))
+            .to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        assert_ne!(status, 401, "{pair}");
+    }
+}
