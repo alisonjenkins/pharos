@@ -210,19 +210,23 @@ impl PlaylistAccess {
 }
 
 /// Whether `user` may `access` `playlist`. A playlist answers its owner; a
-/// server-owned one (no owner) is read by everyone and changed only by an
-/// admin. A wire layer answers a refusal as "not found", so another user's
-/// playlist is indistinguishable from a missing one. Each refusal counts
-/// under `pharos_playlist_access_denied_total{action}`.
-pub fn check_playlist(
+/// server-owned one (no owner), or one whose owner has been deleted, is
+/// read by everyone and changed only by an admin. A wire layer answers a
+/// refusal as "not found", so another user's playlist is indistinguishable
+/// from a missing one. Each refusal counts under
+/// `pharos_playlist_access_denied_total{action}`.
+pub async fn check_playlist(
+    state: &AppState,
     user: &User,
     playlist: &pharos_core::Playlist,
     access: PlaylistAccess,
     route: &'static str,
 ) -> bool {
+    let server_owned = access == PlaylistAccess::Read || user.policy.admin;
     let allowed = match playlist.owner_user_id.as_deref() {
-        Some(owner) => owner == user.id.0.simple().to_string(),
-        None => access == PlaylistAccess::Read || user.policy.admin,
+        Some(owner) if owner == user.id.0.simple().to_string() => true,
+        Some(owner) => server_owned && owner_is_gone(state, owner).await,
+        None => server_owned,
     };
     if !allowed {
         metrics::counter!("pharos_playlist_access_denied_total", "action" => access.label())
@@ -237,6 +241,22 @@ pub fn check_playlist(
         );
     }
     allowed
+}
+
+/// Whether a playlist's recorded owner no longer names a user. A store
+/// failure answers `false`, so the playlist stays its owner's.
+async fn owner_is_gone(state: &AppState, owner: &str) -> bool {
+    let Ok(id) = uuid::Uuid::parse_str(owner) else {
+        return true;
+    };
+    match pharos_core::UserStore::get(&state.stores, pharos_core::UserId(id)).await {
+        Err(pharos_core::AuthError::UserNotFound) => true,
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!(owner, error = %e, "playlist owner lookup failed; playlist withheld");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

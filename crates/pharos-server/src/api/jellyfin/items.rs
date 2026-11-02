@@ -6153,11 +6153,14 @@ async fn fetch_item_dto(
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
         {
             if !crate::services::access::check_playlist(
+                state,
                 user,
                 &playlist,
                 crate::services::access::PlaylistAccess::Read,
                 "item",
-            ) {
+            )
+            .await
+            {
                 return Err(error::ErrorNotFound("not found"));
             }
             let count = state

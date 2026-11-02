@@ -326,3 +326,76 @@ async fn a_playlist_answers_only_its_owner() {
         204
     );
 }
+
+/// A request as `token`.
+fn call(method: actix_web::http::Method, uri: &str, token: &str) -> test::TestRequest {
+    test::TestRequest::default()
+        .method(method)
+        .uri(uri)
+        .insert_header(("X-Emby-Token", token))
+}
+
+/// A playlist owned by the fixture's non-admin user, holding one item from
+/// each library.
+async fn users_playlist(f: &common::Fixture) -> String {
+    use pharos_core::PlaylistStore as _;
+    let owner = f.user_id.0.simple().to_string();
+    f.state
+        .stores
+        .create_playlist(
+            "Theirs",
+            Some(&owner),
+            "Video",
+            &[f.rich_item_id, f.other_item_id],
+        )
+        .await
+        .unwrap()
+        .wire_id
+}
+
+/// B259: an admin does not read another user's playlist, but manages one
+/// whose owner has been deleted; a non-admin may not.
+#[actix_web::test]
+async fn an_admin_manages_only_an_orphaned_playlist() {
+    use actix_web::http::Method;
+    use pharos_core::PlaylistStore as _;
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let theirs = users_playlist(&f).await;
+    let admin = f.admin_token.as_str();
+    for uri in [
+        format!("/Playlists/{theirs}"),
+        format!("/Playlists/{theirs}/Items"),
+    ] {
+        let status = test::call_service(&app, call(Method::GET, &uri, admin).to_request())
+            .await
+            .status();
+        assert_eq!(status.as_u16(), 404, "admin read {uri}");
+    }
+
+    let gone = pharos_core::UserId::new().0.simple().to_string();
+    let orphan = f
+        .state
+        .stores
+        .create_playlist("Orphan", Some(&gone), "Video", &[])
+        .await
+        .unwrap()
+        .wire_id;
+    let uri = format!("/Playlists/{orphan}");
+    let status = test::call_service(&app, call(Method::DELETE, &uri, &f.user_token).to_request())
+        .await
+        .status();
+    assert_eq!(
+        status.as_u16(),
+        404,
+        "a non-admin deleted an orphaned playlist"
+    );
+    let status = test::call_service(&app, call(Method::DELETE, &uri, admin).to_request())
+        .await
+        .status();
+    assert_eq!(
+        status.as_u16(),
+        204,
+        "an admin could not delete an orphaned playlist"
+    );
+}
