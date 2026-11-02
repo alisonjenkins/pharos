@@ -121,16 +121,16 @@ pub struct ConnectionCtx {
 }
 
 impl ConnectionCtx {
-    /// A new connection's context, or `None` when the server already holds
-    /// [`limits::MAX_UNAUTHENTICATED`] connections that have not signed in.
+    /// A new connection's context, or why the server refuses it: too many
+    /// connections that have not signed in, server-wide or from `client_ip`.
     pub fn admit(
         cookie_token: Option<String>,
         client_ip: std::net::IpAddr,
         limits: &limits::ConnectionLimits,
         max_per_user: u32,
-    ) -> Option<Rc<Self>> {
-        let slot = limits.admit()?;
-        Some(Rc::new(Self {
+    ) -> Result<Rc<Self>, limits::Refusal> {
+        let slot = limits.admit(client_ip)?;
+        Ok(Rc::new(Self {
             cookie_token,
             client_ip,
             limits: limits.clone(),

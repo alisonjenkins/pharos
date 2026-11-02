@@ -1823,11 +1823,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
-    state = state.with_login_throttle(
-        cfg.server.login_throttle,
+    let trusted_proxies =
         pharos_server::client_ip::TrustedProxies::parse(&cfg.server.trusted_proxies)
-            .map_err(pharos_server::config::ConfigError::TrustedProxies)?,
-    );
+            .map_err(pharos_server::config::ConfigError::TrustedProxies)?;
+    let per_address_limits = !trusted_proxies.is_empty();
+    state = state.with_login_throttle(cfg.server.login_throttle, trusted_proxies);
     state.login_throttle.record_state();
     let app_state = web::Data::new(state);
 
@@ -2073,7 +2073,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // are shared by every worker, so they are built once here.
     pharos_server::api::pharos::rpc::record_state(&cfg.server.native_api);
     let native_api = cfg.server.native_api.clone();
-    let native_limits = pharos_server::api::pharos::rpc::limits::ConnectionLimits::default();
+    let native_limits = pharos_server::api::pharos::rpc::limits::ConnectionLimits::default()
+        .with_per_ip(per_address_limits);
     let server = HttpServer::new(move || {
         // Permissive CORS so browser-hosted Jellyfin clients (jellyfin-web,
         // Dioxus UI served from a separate origin) can reach the API.
