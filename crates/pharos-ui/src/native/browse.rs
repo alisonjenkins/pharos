@@ -14,7 +14,7 @@ use super::route::Route;
 use super::views::{progress_percent, runtime, Link, PosterTile};
 
 /// Most children one browse page lists.
-pub const BROWSE_PAGE: u32 = 200;
+pub const BROWSE_PAGE: u32 = 100;
 
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
