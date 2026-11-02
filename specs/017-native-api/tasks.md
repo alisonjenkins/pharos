@@ -125,7 +125,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 - [x] T033 [US4] `services/library.rs::query` (parent, kinds, sort, name prefix, filters, paging); `Library.query` — **COMMIT** — Done; `/Items` and `Library.query` share `services::library::query` over an `ItemQuery` in Jellyfin's token vocabulary (one parser, one `build_media_query`, one policy scope). A limit of 0 is a page of `QUERY_DEFAULT` (100); a named limit is capped at `QUERY_MAX` (1000). Kinds pharos only synthesises match nothing natively (B153); `/Items` collapses series/season/album/artist/box-set/playlist browses in its own paths, which T061 brings to the native call.
 - [x] T034 [US4] `services/library.rs::detail`; `Library.detail` — **COMMIT** — Done for stored items: `/Items/{id}` and `Library.detail` share `services::library::detail` (access check, item, play state). A hidden item answers `notFound`, as a missing one does. Synthesised ids answer `notFound`; T062 gives them a native detail.
 - [x] T035 [US1] `Library.home` aggregate over T029–T032; test `home_in_one_batch` pipelines `resume → session.library → library.home` over native TCP and asserts one flight after bootstrap — **COMMIT** — Done; `services::library::home` composes views, latest, resume and next up. `home_in_one_batch` decodes the client's frames up to the server's first reply and counts three rpc `Call`s there (a non-pipelined client counts one).
-- [ ] T036 [US4] `services/user_data.rs` set played / favorite; `UserData.*` — **COMMIT**
+- [x] T036 [US4] `services/user_data.rs` set played / favorite; `UserData.*` — **COMMIT** — Done for stored items: the Jellyfin played/favourite routes and `UserData.setPlayed`/`setFavorite` share `services::user_data::update` (access check, item, read-modify-write, `UserDataChanged` to the user's jellyfin-web sockets). A hidden item answers `notFound` and is not written. Synthesised ids answer `notFound`; T063 gives them the cascade.
 - [ ] T037 [US4] `services/playback.rs` negotiate → `PlaybackGrant` (decision labels identical to `pharos_playback_decision_total`); report/stop — **COMMIT**
 - [ ] T038 [US1] [P] `Library.search` over the existing search path — **COMMIT**
 - [ ] T039 [US4] Review checklist from US4 applied to every wire adapter: no branching business logic in `api/jellyfin/*` or `api/pharos/rpc/*` for migrated behaviours; record the result in the PR
@@ -174,6 +174,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 - [ ] T060 After deploy: run quickstart §6 queries and record real output (SC-004)
 - [ ] T061 [US4] Native `Library.query` for synthesised kinds: move `/Items`' box-set, playlist, music (album/artist) and virtual series/season paths behind `services::library` so `kinds=[series]` and the like list what `/Items` lists; agreement test per kind — **COMMIT**
 - [ ] T062 [US4] Native `Library.detail` for synthesised ids (library, series, season, album, artist, genre, box set, playlist): move `/Items/{id}`' synth branches behind `services::library::detail`; agreement test per kind — **COMMIT**
+- [ ] T063 [US4] `UserData.setPlayed` / `setFavorite` on a synthesised series or season id: cascade over its visible episodes as the Jellyfin routes do (B36), instead of `notFound`; agreement test with the Jellyfin cascade — **COMMIT**
 
 ---
 
