@@ -12,9 +12,10 @@ use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 
 use super::session::Session;
+use crate::api::jellyfin::items::SynthPage;
 use crate::services::library::{
-    self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QueryPage,
-    QUERY_DEFAULT, QUERY_MAX,
+    self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
+    ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
 use crate::state::AppState;
 
@@ -163,6 +164,7 @@ impl server::library::Handler for Library {
             filters: (!filters.is_empty()).then(|| filters.join(",")),
             ..ItemQuery::default()
         };
+        let grouping = grouping_of(q.get_kinds()?);
         let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
@@ -171,11 +173,22 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
+        if let Some(grouping) = grouping {
+            let listed = library::grouped(state, &user, parent.as_deref(), grouping, &query).await;
+            write_grouped(
+                results.get().init_result(),
+                listed,
+                grouping,
+                query.start_index,
+            );
+            return Ok(());
+        }
         let listed = match library::query(state, &user, parent.as_deref(), &query).await {
             Ok(page) => library::with_user_data(state, &user, page).await,
             Err(e) => Err(e),
         }
         .map_err(ListError::Store);
+        record_query(QUERY_SHAPE_STORED, listed.is_ok());
         write_listing(
             results.get().init_result(),
             listed,
@@ -436,6 +449,98 @@ fn write_listing(
     );
 }
 
+/// The grouping a `kinds` list asks for: exactly one kind pharos only
+/// synthesises (series, season, album, artist), named once or more. Any
+/// other list is a stored-row listing, filtered by [`kind_filter`].
+fn grouping_of(kinds: capnp::enum_list::Reader<'_, Kind>) -> Option<Grouping> {
+    let mut found = None;
+    for kind in kinds.iter() {
+        let grouping = match kind.ok()? {
+            Kind::Series => Grouping::Series,
+            Kind::Season => Grouping::Season,
+            Kind::Album => Grouping::Album,
+            Kind::Artist => Grouping::Artist,
+            _ => return None,
+        };
+        if found.is_some_and(|g| g != grouping) {
+            return None;
+        }
+        found = Some(grouping);
+    }
+    found
+}
+
+/// The `shape` label of `pharos_rpc_query_total` for a stored-row listing;
+/// a grouped one carries [`Grouping::label`].
+const QUERY_SHAPE_STORED: &str = "stored";
+
+/// Counts one native `Library.query` under
+/// `pharos_rpc_query_total{shape,outcome}`: which listing answered it, and
+/// whether it had a page to send.
+fn record_query(shape: &'static str, ok: bool) {
+    metrics::counter!(
+        "pharos_rpc_query_total",
+        "shape" => shape,
+        "outcome" => if ok { "ok" } else { "error" }
+    )
+    .increment(1);
+}
+
+/// A grouped listing's page, each group read from its Jellyfin DTO the way
+/// `Library.detail` reads it; or the refusal, logged and counted.
+fn write_grouped(
+    out: items_result::Builder<'_>,
+    listed: Result<SynthPage, GroupError>,
+    grouping: Grouping,
+    start: u32,
+) {
+    record_query(grouping.label(), listed.is_ok());
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(GroupError::SeasonsOutsideSeries) => {
+            tracing::info!(
+                shape = grouping.label(),
+                "native library: seasons asked for outside a series; refused"
+            );
+            Denial::NotPermitted {
+                what: "seasons outside a series",
+            }
+            .write(out.init_error());
+            return;
+        }
+        Err(GroupError::Store(error)) => {
+            tracing::warn!(shape = grouping.label(), %error, "native library: grouped listing unavailable");
+            Denial::Unavailable {
+                dependency: "media store",
+            }
+            .write(out.init_error());
+            return;
+        }
+    };
+    let groups: Vec<(WireId, &serde_json::Value)> = listed
+        .items
+        .iter()
+        .filter_map(|dto| match WireId::parse(dto_str(dto, "Id")) {
+            Some(id) => Some((id, dto)),
+            None => {
+                tracing::warn!(
+                    shape = grouping.label(),
+                    id = dto_str(dto, "Id"),
+                    "native library: group id is not a wire id; skipped"
+                );
+                None
+            }
+        })
+        .collect();
+    let mut page = out.init_page();
+    page.set_total(listed.total);
+    page.set_start(start);
+    let mut items = page.init_items(len_u32(&groups));
+    for (i, (id, dto)) in (0..items.len()).zip(&groups) {
+        write_synth_summary(items.reborrow().get(i), *id, dto);
+    }
+}
+
 /// The stored kinds a `kinds` list names; an empty list names none, so
 /// keeps every kind. Kinds pharos only synthesises (series, album…) are never
 /// stored, so a list of only those matches nothing (B153).
@@ -601,11 +706,32 @@ fn synth_kind(dto: &serde_json::Value) -> Kind {
     }
 }
 
-/// A synthesised item's `ItemDetail` from its Jellyfin DTO: name, kind,
-/// overview, genres, year, Primary image and parentage, whichever it has.
+/// A synthesised item's `ItemDetail` from its Jellyfin DTO: its summary,
+/// overview and genres, whichever it has.
 fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
+    write_synth_summary(out.reborrow().init_summary(), id, dto);
+    out.set_overview(dto_str(dto, "Overview"));
+    let genres: Vec<&str> = dto
+        .get("Genres")
+        .and_then(|g| g.as_array())
+        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
+        .unwrap_or_default();
+    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
+    let mut list = out.init_genres(count);
+    for (i, genre) in (0..count).zip(&genres) {
+        list.set(i, genre);
+    }
+}
+
+/// A synthesised item's `ItemSummary` from its Jellyfin DTO: name, kind,
+/// year, Primary image, parentage and index, whichever it has. A season's
+/// parent is its series (`SeriesId`: season DTOs carry no `ParentId`).
+fn write_synth_summary(
+    mut summary: item_summary::Builder<'_>,
+    id: WireId,
+    dto: &serde_json::Value,
+) {
     let kind = synth_kind(dto);
-    let mut summary = out.reborrow().init_summary();
     set_item_id(summary.reborrow().init_id(), id);
     summary.set_kind(kind);
     summary.set_name(dto_str(dto, "Name"));
@@ -631,7 +757,9 @@ fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde
         image.set_tag(tag);
         image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto_str(dto, "Id")).as_str());
     }
-    if let Some(parent) = WireId::parse(dto_str(dto, "ParentId")) {
+    if let Some(parent) =
+        WireId::parse(dto_str(dto, "ParentId")).or_else(|| WireId::parse(dto_str(dto, "SeriesId")))
+    {
         set_item_id(summary.reborrow().init_parent_id(), parent);
     }
     summary.set_series_name(dto_str(dto, "SeriesName"));
@@ -641,17 +769,6 @@ fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde
         .and_then(|n| u32::try_from(n).ok())
     {
         summary.init_index_number().set_some(n);
-    }
-    out.set_overview(dto_str(dto, "Overview"));
-    let genres: Vec<&str> = dto
-        .get("Genres")
-        .and_then(|g| g.as_array())
-        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
-        .unwrap_or_default();
-    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
-    let mut list = out.init_genres(count);
-    for (i, genre) in (0..count).zip(&genres) {
-        list.set(i, genre);
     }
 }
 

@@ -702,6 +702,86 @@ pub async fn query(
     })
 }
 
+/// What a listing folds the stored rows under its parent into when it asks
+/// for a kind pharos never stores, only synthesises: a TV library's series,
+/// a series' seasons, a music library's albums or artists, an artist's
+/// albums (V230).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grouping {
+    Series,
+    Season,
+    Album,
+    Artist,
+}
+
+impl Grouping {
+    /// The `shape` label of `pharos_rpc_query_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Grouping::Series => "series",
+            Grouping::Season => "season",
+            Grouping::Album => "album",
+            Grouping::Artist => "artist",
+        }
+    }
+}
+
+/// Why [`grouped`] has no page to show.
+#[derive(Debug)]
+pub enum GroupError {
+    /// Seasons were asked for under something that is not a series. Season
+    /// tiles are keyed by number alone, so under a library every show's
+    /// "Season 1" would fold into one tile.
+    SeasonsOutsideSeries,
+    /// The store could not answer; carries its error.
+    Store(String),
+}
+
+/// The synthesised groups under `parent_id`, one page of them as Jellyfin
+/// DTOs: the same folding `/Items?IncludeItemTypes=Series` (and `Season`,
+/// `MusicAlbum`) and `/Artists` answer with, scoped to what `user` may see.
+pub(crate) async fn grouped(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    grouping: Grouping,
+    q: &ItemQuery,
+) -> Result<crate::api::jellyfin::items::SynthPage, GroupError> {
+    use crate::api::jellyfin::items::{
+        music_groups_page, resolve_parent_filter, virtual_shows_page, MusicGrouping,
+        ParentResolution, ShowFolderKind,
+    };
+    let store = |e: actix_web::Error| GroupError::Store(e.to_string());
+    // The groups are asked for by kind; the stored-kind filter that kind
+    // maps to (none) must not also narrow the rows they fold.
+    let q = &ItemQuery {
+        kinds: KindFilter::Unset,
+        ..q.clone()
+    };
+    let shows = |mode| virtual_shows_page(state, user.id, &user.policy, parent_id, mode, q);
+    match grouping {
+        Grouping::Series => shows(ShowFolderKind::Series).await.map_err(store),
+        Grouping::Season => {
+            let parent = resolve_parent_filter(state, parent_id)
+                .await
+                .map_err(|e| GroupError::Store(e.to_string()))?;
+            if !matches!(
+                parent,
+                ParentResolution::Filter(pharos_core::ParentFilter::Series { .. })
+            ) {
+                return Err(GroupError::SeasonsOutsideSeries);
+            }
+            shows(ShowFolderKind::Season).await.map_err(store)
+        }
+        Grouping::Album => music_groups_page(state, user, parent_id, MusicGrouping::Album, q)
+            .await
+            .map_err(store),
+        Grouping::Artist => music_groups_page(state, user, parent_id, MusicGrouping::Artist, q)
+            .await
+            .map_err(store),
+    }
+}
+
 /// `page` with the user's play state for each item, read in one batch.
 pub async fn with_user_data(
     state: &AppState,
