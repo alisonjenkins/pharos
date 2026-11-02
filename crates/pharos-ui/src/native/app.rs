@@ -12,6 +12,7 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
@@ -883,6 +884,9 @@ fn AppearanceScreen() -> Element {
     let notice = use_signal(|| None::<Notice>);
     let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
+    // Bumped when a save fails: the box is keyed on it, so the browser's
+    // flipped checkbox is rebuilt from the server value.
+    let mut diagnostics_gen = use_signal(|| 0_u32);
     // The box shows the server's choice, not whatever was cached at sign-in.
     use_future(move || async move {
         let api = ctx.api.peek().clone();
@@ -912,6 +916,7 @@ fn AppearanceScreen() -> Element {
         .map(|state| editor_view(state, &themes.catalogue.read()));
     let notice_now = notice.read().clone();
     let diagnostics_on = *diagnostics.read();
+    let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
         AppearanceView {
@@ -920,21 +925,24 @@ fn AppearanceScreen() -> Element {
             editor,
             notice: notice_now,
             diagnostics: diagnostics_on,
+            diagnostics_key,
             on_diagnostics: move |on: bool| {
                 let api = ctx.api.peek().clone();
+                let server_before = *diagnostics.peek();
                 spawn(async move {
                     let saved = match api {
-                        Some(api) => platform::set_opted_in(&api, on).await,
+                        Some(api) => platform::set_opted_in(&api, on).await.map(|()| on),
                         None => Err("not signed in".to_owned()),
                     };
-                    match saved {
-                        Ok(()) => diagnostics.set(on),
-                        Err(e) => notify(
+                    if let Err(e) = &saved {
+                        notify(
                             notice,
                             format!("Could not save the diagnostics choice: {e}"),
                             true,
-                        ),
+                        );
+                        diagnostics_gen.with_mut(|g| *g = g.wrapping_add(1));
                     }
+                    diagnostics.set(diagnostics::shown_after_save(saved, server_before));
                 });
             },
             on_pick: move |name: String| {
