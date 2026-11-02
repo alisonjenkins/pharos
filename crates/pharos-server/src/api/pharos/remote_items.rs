@@ -65,20 +65,34 @@ pub fn routes(cfg: &mut web::ServiceConfig) {
 /// locator is resolved fresh at playback because it is signed and rotates.
 async fn add_remote_item(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     body: web::Json<AddRemoteBody>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let url = body.url.trim();
+    // Cataloguing makes the server fetch a caller-chosen URL (V188).
+    if !user.0.policy.admin {
+        refused(
+            &user.0.name,
+            url,
+            "not_admin",
+            "cataloguing a URL is admin-only",
+        );
+        return Err(error::ErrorForbidden("cataloguing a URL is admin-only"));
+    }
     let Some(resolver) = state.remote.as_ref() else {
         return Err(error::ErrorServiceUnavailable(
             ResolveError::Disabled.to_string(),
         ));
     };
-    let url = body.url.trim();
     if url.is_empty() {
         return Err(error::ErrorBadRequest("url is required"));
     }
 
     let resolved = resolver.describe(url).await.map_err(|e| {
+        if let ResolveError::Target(refusal) = &e {
+            refused(&user.0.name, url, refusal.label(), &e.to_string());
+            return error::ErrorBadRequest(e.to_string());
+        }
         tracing::warn!(url, error = %e, "could not catalogue a URL");
         // The resolver's message carries the site's own reason; a bare class
         // would leave a person guessing why their link was refused.
@@ -151,6 +165,17 @@ async fn add_remote_item(
         run_time_ticks: resolved.probe.duration_ms.map(|ms| ms * 10_000),
         already_present,
     }))
+}
+
+/// Count and log a URL the endpoint would not catalogue.
+fn refused(user: &str, url: &str, outcome: &'static str, reason: &str) {
+    tracing::warn!(user, url, outcome, reason, "refused to catalogue a URL");
+    metrics::counter!(
+        "pharos_remote_ingest_total",
+        "extractor" => "unknown",
+        "outcome" => outcome,
+    )
+    .increment(1);
 }
 
 #[cfg(test)]

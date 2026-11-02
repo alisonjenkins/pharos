@@ -1557,7 +1557,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 resolver,
                 std::time::Duration::from_secs(cfg.remote.resolve_ttl_secs),
                 evict_into,
-            ),
+            )
+            .with_allowed_private_hosts(cfg.remote.allow_private_hosts.clone()),
         ));
     }
     state = state.with_hw_encode_session_budget(hw_session_budget);
