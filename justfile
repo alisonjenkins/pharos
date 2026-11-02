@@ -160,6 +160,83 @@ compat-playwright:
 compat-dioxus:
     nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.dioxus.config.ts'
 
+# `native=on` writes `[server.native_api]` (native sign-in cases run); `native=off`
+# omits it (the not-enabled case runs). Pharos is stopped by PID in the trap.
+# Seeded pharos + Dioxus Playwright suite; native=on|off selects the mode.
+compat-dioxus-full native="on":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ native }}" in
+      on|off) ;;
+      *) echo "compat-dioxus-full: native must be on or off, got '{{ native }}'" >&2; exit 2 ;;
+    esac
+    TMP=$(mktemp -d)
+    cleanup() {
+      status=$?
+      if [[ -f "$TMP/pharos.pid" ]]; then
+        pid=$(cat "$TMP/pharos.pid")
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+      fi
+      if [[ $status -ne 0 && -f "$TMP/pharos.log" ]]; then
+        echo "compat-dioxus-full: pharos log tail:" >&2
+        tail -n 50 "$TMP/pharos.log" >&2 || true
+      fi
+      rm -rf "$TMP"
+      exit "$status"
+    }
+    trap cleanup EXIT
+    UI_DIR=$(nix build --no-link --print-out-paths .#pharosUiBundle)
+    MEDIA_SRC=$(nix build --no-link --print-out-paths .#testMediaTree)
+    # The seed writes fixture-*.webm into the media root; a store path is
+    # read-only, so copy the tree into a writable directory.
+    mkdir -p "$TMP/media"
+    cp -rL --no-preserve=mode "$MEDIA_SRC/." "$TMP/media/"
+    NATIVE_BLOCK=""
+    if [[ "{{ native }}" == "on" ]]; then
+      NATIVE_BLOCK=$(cat <<NATIVE
+
+    [server.native_api]
+    enabled = true
+    allowed_origins = ["http://127.0.0.1:8096"]
+    NATIVE
+    )
+    fi
+    cat > "$TMP/pharos.toml" <<EOF
+    [server]
+    bind = "127.0.0.1:8096"
+    name = "pharos-playwright"
+    ui_dir = "$UI_DIR"
+    image_cache_dir = "$TMP/images"
+    trickplay_cache_dir = "$TMP/trickplay"
+    transcode_cache_dir = "$TMP/transcode"
+    image_seek_seconds = 1
+
+    [obs]
+    log_level = "warn"
+
+    [media]
+    roots = ["$TMP/media"]
+
+    [database]
+    url = "sqlite://$TMP/pharos.db?mode=rwc"
+    $NATIVE_BLOCK
+    EOF
+    PHAROS_CONFIG="$TMP/pharos.toml"
+    nix develop --command cargo build -q --bin pharos --bin transcode-worker
+    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # The shell writes its own PID, then execs pharos, so the PID file names pharos.
+    nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
+    for _ in $(seq 1 120); do
+      if curl -fsS -o /dev/null http://127.0.0.1:8096/ 2>/dev/null; then ready=1; break; fi
+      sleep 1
+    done
+    if [[ -z "${ready:-}" ]]; then
+      echo "compat-dioxus-full: pharos not ready on 127.0.0.1:8096 after 120s" >&2
+      exit 1
+    fi
+    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:8096 npx playwright test --config playwright.dioxus.config.ts'
+
 # Convenience: spin up pharos with seeded data + run Playwright in one
 # shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
 compat-playwright-full:
