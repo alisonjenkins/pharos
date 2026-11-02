@@ -2629,7 +2629,18 @@ async fn playback_info(
         burn_text_indices: burn_text_indices.clone(),
         media_source_id: item.edition.as_ref().map(|_| source_id.clone()),
     };
-    let streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
+    let mut streams = build_media_streams_with_subtitles(probe, is_video, Some(&ctx));
+    let advertised_3d_format = |source_format: Option<pharos_core::Video3DFormat>,
+                                serves_file: bool| {
+        if !is_video {
+            return None;
+        }
+        source_format.and_then(|f| output_3d_of(f, serves_file).format(f))
+    };
+    let primary_3d_format = advertised_3d_format(probe.video_3d_format, source_serves_file);
+    for stream in streams.iter_mut().filter(|s| s.kind == "Video") {
+        stream.video_3d_format = primary_3d_format;
+    }
     // Embedded fonts → MediaAttachments so jellyfin-web hands them to
     // SubtitlesOctopus and ASS/SSA subtitles render.
     let media_attachments = build_media_attachments(
@@ -2805,11 +2816,7 @@ async fn playback_info(
         default_audio_stream_index,
         default_subtitle_stream_index,
         start_position_ticks: resume_ticks,
-        video_3d_format: if is_video {
-            probe.video_3d_format
-        } else {
-            None
-        },
+        video_3d_format: primary_3d_format,
         ..Default::default()
     };
 
@@ -2824,6 +2831,8 @@ async fn playback_info(
     media_sources.push(primary_source);
     for alt in &probe.alternate_sources {
         let alt_id = format!("{id_str}-{}", alt.id);
+        // An alternate is never direct play (`Default`), so it is transcoded.
+        let alt_3d_format = advertised_3d_format(alt.video_3d_format, false);
         let alt_container = alt
             .container
             .clone()
@@ -2838,12 +2847,21 @@ async fn playback_info(
             run_time_ticks: alt.duration_ms.map(|ms| ms.saturating_mul(10_000)),
             size: alt.size_bytes.or(probe.size_bytes),
             name: alt.name.clone().unwrap_or_else(|| item.title.clone()),
-            media_streams: streams.clone(),
+            media_streams: streams
+                .iter()
+                .cloned()
+                .map(|mut s| {
+                    if s.kind == "Video" {
+                        s.video_3d_format = alt_3d_format;
+                    }
+                    s
+                })
+                .collect(),
             media_attachments: media_attachments.clone(),
             bitrate: alt.bitrate_bps.or(probe.bitrate_bps),
             default_audio_stream_index,
             default_subtitle_stream_index,
-            video_3d_format: if is_video { alt.video_3d_format } else { None },
+            video_3d_format: alt_3d_format,
             ..Default::default()
         });
     }

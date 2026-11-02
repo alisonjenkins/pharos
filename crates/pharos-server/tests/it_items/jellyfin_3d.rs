@@ -238,6 +238,49 @@ fn video_stream(source: &serde_json::Value) -> &serde_json::Value {
         .unwrap()
 }
 
+/// B285 / V224. A transcode of Blu-ray 3D is 2D (ffmpeg decodes only the
+/// base view), so the source must not claim MVC. Disarm check: advertising
+/// `probe.video_3d_format` unconditionally fails the assertions.
+#[actix_web::test]
+async fn mvc_transcode_advertises_no_3d_format() {
+    let (state, token) = seed_with(transcode_fixtures()).await;
+    let app = app!(state);
+    let src = playback_source!(app, token, 10, "", MP4_ONLY_PLAYER);
+    assert_eq!(src["SupportsDirectPlay"], false);
+    assert!(src["TranscodingUrl"].as_str().is_some());
+    assert!(src.get("Video3DFormat").is_none(), "{src}");
+    assert!(video_stream(&src).get("Video3DFormat").is_none(), "{src}");
+}
+
+#[actix_web::test]
+async fn mvc_direct_play_keeps_mvc() {
+    let (state, token) = seed_with(transcode_fixtures()).await;
+    let app = app!(state);
+    let src = playback_source!(app, token, 10, "", MKV_PLAYER);
+    assert_eq!(src["SupportsDirectPlay"], true);
+    assert_eq!(src["Video3DFormat"], "MVC");
+    assert_eq!(video_stream(&src)["Video3DFormat"], "MVC");
+}
+
+#[actix_web::test]
+async fn packed_transcode_keeps_its_format_unless_flattened_to_mono() {
+    let (state, token) = seed_with(transcode_fixtures()).await;
+    let app = app!(state);
+    let kept = playback_source!(app, token, 11, "", MP4_ONLY_PLAYER);
+    assert_eq!(kept["SupportsDirectPlay"], false);
+    assert_eq!(kept["Video3DFormat"], "HalfSideBySide");
+    assert_eq!(video_stream(&kept)["Video3DFormat"], "HalfSideBySide");
+
+    let mono = playback_source!(app, token, 11, "?StereoMode=mono", MKV_PLAYER);
+    assert_eq!(mono["SupportsDirectPlay"], false);
+    assert!(mono["TranscodingUrl"]
+        .as_str()
+        .unwrap()
+        .contains("StereoMode=mono"));
+    assert!(mono.get("Video3DFormat").is_none(), "{mono}");
+    assert!(video_stream(&mono).get("Video3DFormat").is_none(), "{mono}");
+}
+
 /// The signal for B285: how often a transcode flattens 3D, and why.
 /// Disarm check: dropping the `output` label from the counter fails this.
 #[actix_web::test]
