@@ -317,6 +317,9 @@ async fn play_session_id_is_logged_by_prefix_only() {
         "no supersede line:\n{captured}"
     );
     for id in [psid.as_str(), superseded, superseding] {
-        assert!(!captured.contains(id), "PlaySessionId {id} in the log:\n{captured}");
+        assert!(
+            !captured.contains(id),
+            "PlaySessionId {id} in the log:\n{captured}"
+        );
     }
 }

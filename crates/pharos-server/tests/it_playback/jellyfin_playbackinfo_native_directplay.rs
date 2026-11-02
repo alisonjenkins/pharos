@@ -422,9 +422,15 @@ macro_rules! only_the_holder_ends {
         let uri = format!("/videos/1/stream?static=true&tag={tag}");
         let end = $end;
 
-        assert!(test::call_service(&app, end(&other, &tag)).await.status().is_success());
+        assert!(test::call_service(&app, end(&other, &tag))
+            .await
+            .status()
+            .is_success());
         assert_ne!(tokenless_stream!(&app, &uri), 401);
-        assert!(test::call_service(&app, end(&token, &tag)).await.status().is_success());
+        assert!(test::call_service(&app, end(&token, &tag))
+            .await
+            .status()
+            .is_success());
         assert_eq!(tokenless_stream!(&app, &uri), 401);
     }};
 }
@@ -474,7 +480,12 @@ async fn a_capability_is_checked_against_the_stored_session() {
     let uri = format!("/videos/1/stream?static=true&tag={tag}");
     assert_ne!(tokenless_stream!(&app, &uri), 401);
 
-    let row = state.stores.get_transcode_session(&tag, 0).await.unwrap().unwrap();
+    let row = state
+        .stores
+        .get_transcode_session(&tag, 0)
+        .await
+        .unwrap()
+        .unwrap();
     let seven_hours_ago = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
