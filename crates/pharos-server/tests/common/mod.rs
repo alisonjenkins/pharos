@@ -219,6 +219,7 @@ pub fn build_app(
 > {
     App::new()
         .app_data(state)
+        .wrap(pharos_server::middleware::nosniff())
         .wrap(pharos_server::middleware::CookieBackfill)
         .wrap(LowercasePath)
         .configure(jellyfin::configure)
