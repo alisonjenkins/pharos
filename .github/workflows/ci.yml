@@ -5,10 +5,12 @@ on:
   push:
     branches: [main]
 
-# Cancel in-flight runs on the same ref when a newer push lands.
+# Cancel in-flight runs on the same ref when a newer push lands, except on
+# main: there a cancelled run can be mid-publish, and the image never ships
+# (B283). A newer main push queues behind the running one instead.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
