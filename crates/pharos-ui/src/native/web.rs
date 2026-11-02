@@ -2,6 +2,9 @@
 //! and timers. Every result comes back as data for
 //! [`Machine`](super::machine::Machine); no state lives here.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gloo_net::http::Request;
 use pharos_client::api::{Capabilities, NativeApi};
 use pharos_client::browser::{self, Connection};
@@ -10,7 +13,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, PlaybackEngine};
+use super::playback::{Engine, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
 
 const SESSION: &str = "/pharos/session";
 
@@ -271,11 +274,39 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
 #[derive(Default)]
 struct NativeVideo {
     video: Option<web_sys::HtmlMediaElement>,
+    on_error: Option<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 impl PlaybackEngine for NativeVideo {
-    fn attach(&mut self, video_id: &str, url: &str, start_ms: u64) -> Result<(), String> {
+    fn attach(
+        &mut self,
+        video_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: OnFatal,
+    ) -> Result<(), String> {
         let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
+        let on_error = {
+            let (target, url) = (video.clone(), url.to_owned());
+            Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                // An error after the src is removed on drop is not playback failing.
+                if target.get_attribute("src").is_none() {
+                    return;
+                }
+                let (code, message) = target
+                    .error()
+                    .map_or((0, String::new()), |e| (e.code(), e.message()));
+                warn(&format!(
+                    "pharos: playback error engine=native code={code} message={message} action=fail url={url}"
+                ));
+                on_fatal(format!(
+                    "the browser could not play this stream (code {code}) {message}"
+                ));
+            })
+        };
+        video
+            .add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
+            .map_err(|e| format!("error listener: {e:?}"))?;
         if start_ms > 0 {
             let target = video.clone();
             let seek = Closure::once_into_js(move || {
@@ -294,12 +325,17 @@ impl PlaybackEngine for NativeVideo {
         }
         video.set_src(url);
         self.video = Some(video);
+        self.on_error = Some(on_error);
         Ok(())
     }
 }
 
 impl Drop for NativeVideo {
     fn drop(&mut self) {
+        if let (Some(video), Some(on_error)) = (self.video.as_ref(), self.on_error.take()) {
+            let _ = video
+                .remove_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+        }
         if let Some(video) = self.video.take() {
             let _ = video.pause();
             let _ = video.remove_attribute("src");
@@ -315,6 +351,7 @@ const HLSJS_SRC: &str = "/assets/vendor/hls.min.js";
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_name = Hls)]
+    #[derive(Clone)]
     type HlsPlayer;
     #[wasm_bindgen(constructor, js_class = "Hls")]
     fn new(config: &JsValue) -> HlsPlayer;
@@ -326,6 +363,10 @@ extern "C" {
     fn on(this: &HlsPlayer, event: &str, listener: &js_sys::Function);
     #[wasm_bindgen(method, js_class = "Hls")]
     fn destroy(this: &HlsPlayer);
+    #[wasm_bindgen(method, js_class = "Hls", js_name = startLoad)]
+    fn start_load(this: &HlsPlayer);
+    #[wasm_bindgen(method, js_class = "Hls", js_name = recoverMediaError)]
+    fn recover_media_error(this: &HlsPlayer);
 }
 
 /// Add hls.js's `<script>` once and wait for it.
@@ -360,11 +401,17 @@ async fn load_hlsjs() -> Result<(), String> {
 #[derive(Default)]
 struct HlsJs {
     player: Option<HlsPlayer>,
-    _on_error: Option<Closure<dyn FnMut(JsValue, JsValue)>>,
+    _listeners: Vec<Closure<dyn FnMut(JsValue, JsValue)>>,
 }
 
 impl PlaybackEngine for HlsJs {
-    fn attach(&mut self, video_id: &str, url: &str, start_ms: u64) -> Result<(), String> {
+    fn attach(
+        &mut self,
+        video_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: OnFatal,
+    ) -> Result<(), String> {
         let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
         let config = js_sys::Object::new();
         #[allow(clippy::cast_precision_loss)]
@@ -376,28 +423,49 @@ impl PlaybackEngine for HlsJs {
         js_sys::Reflect::set(&config, &"startPosition".into(), &start.into())
             .map_err(|e| format!("{e:?}"))?;
         let player = HlsPlayer::new(&config);
-        let on_error = Closure::<dyn FnMut(JsValue, JsValue)>::new(|_event, data: JsValue| {
-            let field = |name: &str| {
-                js_sys::Reflect::get(&data, &name.into())
-                    .ok()
-                    .and_then(|v| v.as_string().or_else(|| v.as_bool().map(|b| b.to_string())))
-                    .unwrap_or_default()
-            };
-            web_sys::console::warn_1(
-                &format!(
-                    "pharos: hls.js error type={} details={} fatal={}",
-                    field("type"),
-                    field("details"),
-                    field("fatal")
-                )
-                .into(),
-            );
-        });
+        let budget = Rc::new(RefCell::new(RecoveryBudget::new()));
+        let on_error = {
+            let (player, budget, url) = (player.clone(), Rc::clone(&budget), url.to_owned());
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_event, data: JsValue| {
+                let field = |name: &str| {
+                    js_sys::Reflect::get(&data, &name.into())
+                        .ok()
+                        .and_then(|v| v.as_string().or_else(|| v.as_bool().map(|b| b.to_string())))
+                        .unwrap_or_default()
+                };
+                let (kind, details, fatal) = (field("type"), field("details"), field("fatal"));
+                if fatal != "true" {
+                    warn(&format!(
+                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=false url={url}"
+                    ));
+                    return;
+                }
+                let mut budget = budget.borrow_mut();
+                let action = budget.on_fatal(&kind, &details);
+                warn(&format!(
+                    "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={} url={url}",
+                    action.label(),
+                    budget.attempts(&kind),
+                ));
+                match action {
+                    Recovery::StartLoad => player.start_load(),
+                    Recovery::RecoverMedia => player.recover_media_error(),
+                    Recovery::Fail => on_fatal(format!("the stream failed ({kind}: {details})")),
+                }
+            })
+        };
+        let on_fragment = {
+            let budget = Rc::clone(&budget);
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
+                budget.borrow_mut().progressed()
+            })
+        };
         player.on("hlsError", on_error.as_ref().unchecked_ref());
+        player.on("hlsFragLoaded", on_fragment.as_ref().unchecked_ref());
         player.load_source(url);
         player.attach_media(&video);
         self.player = Some(player);
-        self._on_error = Some(on_error);
+        self._listeners = vec![on_error, on_fragment];
         Ok(())
     }
 }

@@ -29,6 +29,7 @@ required-features = ["web"]
 [dependencies]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
+futures-util = "0.3"
 gloo-net = { workspace = true, optional = true }
 # Pulled in by the `web` feature so PlayerView's wasm path can read
 # `<video>.currentTime` from the underlying `web_sys::HtmlMediaElement`.
@@ -48,6 +49,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "AddEventListenerOptions",
     "HtmlHeadElement",
     "HtmlScriptElement",
+    "MediaError",
     "MediaSource",
     "console",
 ] }
