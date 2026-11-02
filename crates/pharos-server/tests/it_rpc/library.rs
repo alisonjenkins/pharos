@@ -1269,3 +1269,149 @@ async fn home_in_one_batch() {
     assert_eq!(home.get_resume().unwrap().len(), 1);
     assert!(!home.get_next_up().unwrap().is_empty());
 }
+
+/// Stores `n` movies titled `Zeta 1`… in libA; the search tests share the term.
+async fn seed_zeta(fx: &crate::common::Fixture, n: u64) {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _};
+    for i in 1..=n {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id: 300 + i,
+                path: format!("/libA/Zeta {i}.mkv").into(),
+                title: format!("Zeta {i}"),
+                kind: MediaKind::Movie,
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+}
+
+/// One `Library.search` call on `session`.
+async fn wire_search(
+    session: &session::Client,
+    text: &str,
+    limit: u32,
+) -> (u32, Vec<serde_json::Value>) {
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.search_request();
+    req.get().init_ctx();
+    req.get().set_text(text);
+    req.get().set_limit(limit);
+    let reply = req.send().promise.await.expect("search");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// T038: `Library.search` answers the items whose title matches, encoded as
+/// `Library.query` encodes them, and blank text answers nothing.
+/// Disarm check: with `search` not reading `text`, the first assertion sees
+/// every movie, not just Alpha.
+#[actix_web::test]
+async fn native_search_finds_matches_encoded_like_query() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+
+    let (total, found) = wire_search(&session, "Alpha", 0).await;
+    let (_, listed) = wire_query(&session, None, &[], "SortName", false, "", &[], 0, 0).await;
+    let alpha: Vec<_> = listed
+        .into_iter()
+        .filter(|s| s["Name"] == "Alpha")
+        .collect();
+    assert_eq!(alpha.len(), 1);
+    assert_eq!(
+        (total, &found),
+        (1, &alpha),
+        "search must encode like query"
+    );
+
+    assert_eq!(wire_search(&session, "   ", 0).await, (0, vec![]));
+    assert_eq!(wire_search(&session, "", 0).await, (0, vec![]));
+}
+
+/// T038 security: a term that matches an item in a library the user may not
+/// see answers nothing, while the same term in a visible library still does.
+/// Disarm check: with the visibility filter removed from
+/// `services::library::search_hits`, the first assertion finds Alpha.
+#[actix_web::test]
+async fn native_search_leaves_out_a_hidden_library() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(wire_search(&session, "Alpha", 0).await, (0, vec![]));
+    let (_, gamma) = wire_search(&session, "Gamma", 0).await;
+    assert_eq!(
+        gamma.iter().map(|s| s["Name"].clone()).collect::<Vec<_>>(),
+        [serde_json::json!("Gamma")]
+    );
+}
+
+/// T038: `limit` caps the answer and the total counts what was answered;
+/// 0 is the default page, which holds all five here.
+#[actix_web::test]
+async fn native_search_honours_the_limit() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_zeta(&fx, 5).await;
+
+    let (total, two) = wire_search(&session, "Zeta", 2).await;
+    assert_eq!((total, two.len()), (2, 2));
+    let (total, all) = wire_search(&session, "Zeta", 0).await;
+    assert_eq!((total, all.len()), (5, 5));
+}
+
+/// T038 parity: `Library.search` lists the same item ids, in the same order,
+/// as `/Search/Hints` lists as item hints (its aggregate hints come after).
+/// Disarm check: a `search` that reverses the store order breaks the
+/// comparison.
+#[actix_web::test]
+async fn native_search_agrees_with_the_jellyfin_search_hints_route() {
+    use actix_web::test;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    seed_zeta(&fx, 5).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+
+    for term in ["Zeta", "a"] {
+        let (_, native) = wire_search(&session, term, 3).await;
+        let req = test::TestRequest::get()
+            .uri(&format!("/Search/Hints?searchTerm={term}&Limit=3"))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request();
+        let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        let hinted: Vec<String> = web["SearchHints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| h["IsFolder"] == false)
+            .map(|h| h["ItemId"].as_str().unwrap().to_owned())
+            .collect();
+        let ids: Vec<String> = native
+            .iter()
+            .map(|s| s["Id"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!ids.is_empty(), "{term}: the term must match something");
+        assert_eq!(ids, hinted, "{term}");
+    }
+}

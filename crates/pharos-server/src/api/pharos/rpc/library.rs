@@ -13,8 +13,8 @@ use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 
 use super::session::Session;
 use crate::services::library::{
-    self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QUERY_DEFAULT,
-    QUERY_MAX,
+    self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QueryPage,
+    QUERY_DEFAULT, QUERY_MAX,
 };
 
 pub(super) struct Library {
@@ -179,6 +179,47 @@ impl server::library::Handler for Library {
             results.get().init_result(),
             listed,
             "query",
+            &state.server_id,
+        );
+        Ok(())
+    }
+
+    async fn search(
+        self: Rc<Self>,
+        params: wire::SearchParams,
+        results: &mut wire::SearchResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let text = params.get_text()?.to_str()?;
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let listed = match library::search(state, &user, text, params.get_limit()).await {
+            Ok(items) => {
+                let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+                library::with_user_data(
+                    state,
+                    &user,
+                    QueryPage {
+                        items,
+                        total,
+                        start: 0,
+                    },
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
+        .map_err(ListError::Store);
+        write_listing(
+            results.get().init_result(),
+            listed,
+            "search",
             &state.server_id,
         );
         Ok(())
