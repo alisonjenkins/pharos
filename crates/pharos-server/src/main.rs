@@ -1412,7 +1412,6 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     obs::register_static_series();
 
     let stores = Stores::connect(&cfg.database.url).await?;
-    let token_resolver: TokenResolverData = sync_resolver::build(stores.clone());
     // LIB-C1 — reconcile the typed `libraries` table from config (one row
     // per configured root/typed-library, with its kind + stable wire id),
     // then backfill `media_items.library_id` by path-prefix so the
@@ -1993,6 +1992,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // Bridges the HTTP `/SyncPlay/*` command surface (keyed by deviceId) to the
     // per-`/socket` group member sinks. One instance shared across workers.
     let session_hub = web::Data::new(pharos_sync::SessionHub::new());
+    let token_resolver: TokenResolverData = sync_resolver::build(app_state.clone().into_inner());
     let token_resolver_data = web::Data::new(token_resolver);
 
     // Probes whose readiness must flip true before /readyz returns 200.
