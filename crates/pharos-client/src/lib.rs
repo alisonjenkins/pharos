@@ -6,13 +6,14 @@
 //! from a WebSocket to `/pharos/rpc`. [`resume`] turns the connection into a
 //! signed-in `Session` from the cookie `POST /pharos/session` set.
 
+pub mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 pub mod byte_stream;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use futures::io::{AsyncRead, AsyncWrite};
-use pharos_api::pharos_capnp::{bootstrap, call_context, error, session};
+use pharos_api::pharos_capnp::{bootstrap, call_context, done, error, session};
 
 /// What the client stamps on every call (`CallContext`).
 #[derive(Debug, Clone, Default)]
@@ -91,6 +92,14 @@ impl ClientError {
     }
 }
 
+/// A `Done` result: ok, or the server's `Error`.
+pub(crate) fn read_done(result: done::Reader<'_>) -> Result<(), ClientError> {
+    match result.which().map_err(capnp::Error::from)? {
+        done::Ok(()) => Ok(()),
+        done::Error(e) => Err(ClientError::from_api(e?)),
+    }
+}
+
 /// Run capnp RPC over a byte stream. The returned future must be driven
 /// (spawned) for the connection to make progress; it finishes when the
 /// stream closes.
@@ -119,10 +128,7 @@ pub async fn resume(
     }
     let reply = req.send().promise.await?;
     let result = reply.get()?.get_result()?;
-    let status = result.get_status()?.which().map_err(capnp::Error::from)?;
-    if let pharos_api::pharos_capnp::done::Which::Error(e) = status {
-        return Err(ClientError::from_api(e?));
-    }
+    read_done(result.get_status()?)?;
     Ok(result.get_session()?)
 }
 
