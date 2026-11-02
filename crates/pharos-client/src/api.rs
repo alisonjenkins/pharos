@@ -8,8 +8,8 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, item_id, item_summary, items_result,
-    library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, session, stream_choice,
-    telemetry, Kind,
+    library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs,
+    session, stream_choice, telemetry, Kind,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
@@ -211,6 +211,7 @@ pub trait PlaybackGrant {
 pub struct NativeApi {
     library: library::Client,
     playback: playback::Client,
+    prefs: prefs::Client,
     telemetry: telemetry::Client,
 }
 
@@ -229,7 +230,55 @@ impl NativeApi {
         Self {
             library: session.library_request().send().pipeline.get_library(),
             playback: session.playback_request().send().pipeline.get_playback(),
+            prefs: session.prefs_request().send().pipeline.get_prefs(),
             telemetry: session.telemetry_request().send().pipeline.get_telemetry(),
+        }
+    }
+
+    /// The signed-in user's stored value for `key`, `None` when never set.
+    pub async fn pref(&self, call: &CallInfo, key: &str) -> Result<Option<Vec<u8>>, ClientError> {
+        let mut req = self.prefs.get_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_key(key);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            pref_result::Value(v) => Ok(Some(v?.to_vec())),
+            pref_result::NotSet(()) => Ok(None),
+            pref_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Stores `value` under `key` for the signed-in user.
+    pub async fn set_pref(
+        &self,
+        call: &CallInfo,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), ClientError> {
+        let mut req = self.prefs.set_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_key(key);
+            p.set_value(value);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
