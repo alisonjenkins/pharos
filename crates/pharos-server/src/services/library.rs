@@ -779,33 +779,26 @@ pub async fn home(
     resume_limit: Option<u32>,
     next_up_limit: Option<u32>,
 ) -> Result<Home, ListError> {
-    let mut rails = Vec::new();
-    for view in views(state, &user.policy).await {
-        let items = latest(
-            state,
-            user,
-            Some(&view.id),
-            &KindFilter::Unset,
-            Some(latest_per_view.unwrap_or(HOME_LATEST_DEFAULT)),
-        )
-        .await?;
-        rails.push((view, items));
-    }
+    let latest_n = Some(latest_per_view.unwrap_or(HOME_LATEST_DEFAULT));
+    let views = views(state, &user.policy).await;
+    let rails = futures_util::future::try_join_all(views.into_iter().map(|view| async move {
+        let items = latest(state, user, Some(&view.id), &KindFilter::Unset, latest_n).await?;
+        Ok::<_, ListError>((view, items))
+    }));
     let resume = resume(
         state,
         user,
         &KindFilter::Unset,
         0,
         Some(resume_limit.unwrap_or(HOME_RESUME_DEFAULT)),
-    )
-    .await?;
+    );
     let next_up = next_up(
         state,
         user,
         None,
         Some(next_up_limit.unwrap_or(HOME_NEXT_UP_DEFAULT)),
-    )
-    .await?;
+    );
+    let (rails, resume, next_up) = futures_util::try_join!(rails, resume, next_up)?;
     Ok(Home {
         rails,
         resume,
