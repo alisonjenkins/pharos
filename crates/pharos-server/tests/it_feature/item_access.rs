@@ -478,4 +478,17 @@ async fn search_hints_answer_only_visible_items() {
 
     let body: serde_json::Value = test::call_and_read_body_json(&app, hints("Other")).await;
     assert_eq!(body["SearchHints"][0]["Name"], "Other Movie", "{body}");
+    let browse: serde_json::Value = test::call_and_read_body_json(&app, hints("")).await;
+    assert!(!browse.to_string().contains("Rich Movie"), "{browse}");
+
+    // Restricted to the library that holds them, the same names answer.
+    restrict_to_library_a(&f).await;
+    let mut missing = Vec::new();
+    for term in ["Rich", "Pharos", "award", "Jane"] {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, hints(term)).await;
+        if body["SearchHints"].as_array().unwrap().is_empty() {
+            missing.push(term);
+        }
+    }
+    assert!(missing.is_empty(), "visible names missing: {missing:?}");
 }
