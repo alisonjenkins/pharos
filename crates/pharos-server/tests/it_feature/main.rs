@@ -4,6 +4,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod attachment_headers;
 mod auth_cookie;
 mod item_access;
 mod jellyfin_feature_inventory;
