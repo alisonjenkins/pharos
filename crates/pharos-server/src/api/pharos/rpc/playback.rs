@@ -37,9 +37,14 @@ impl server::playback::Handler for Playback {
         let params = params.get()?;
         let id = read_item_id(params.get_id()?)?;
         let capabilities = read_capabilities(params.get_caps()?)?;
+        // Negotiation always plays an audio track; "none" is refused rather
+        // than read as the default.
         let audio_stream_index = match params.get_audio()?.which()? {
-            stream_choice::Index(i) => Some(i),
-            stream_choice::Default(()) | stream_choice::None(()) => None,
+            stream_choice::Index(i) => Ok(Some(i)),
+            stream_choice::Default(()) => Ok(None),
+            stream_choice::None(()) => Err(Denial::NotPermitted {
+                what: "playing with no audio track",
+            }),
         };
         let subtitle_stream_index = match params.get_subtitle()?.which()? {
             stream_choice::Index(i) => Some(i64::from(i)),
@@ -47,9 +52,9 @@ impl server::playback::Handler for Playback {
             stream_choice::Default(()) => None,
         };
         let session = &self.session;
-        let granted = match (session.current_user().await, id) {
-            (Err(denial), _) => Err(denial),
-            (Ok(user), WireId::Real(id)) => {
+        let granted = match (session.current_user().await, id, audio_stream_index) {
+            (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
+            (Ok(user), WireId::Real(id), Ok(audio_stream_index)) => {
                 let request = GrantRequest {
                     capabilities: &capabilities,
                     audio_stream_index,
@@ -66,7 +71,7 @@ impl server::playback::Handler for Playback {
                         },
                     })
             }
-            (Ok(_), WireId::Synth(_)) => Err(Denial::NotFound { what: "item" }),
+            (Ok(_), WireId::Synth(_), Ok(_)) => Err(Denial::NotFound { what: "item" }),
         };
         let mut out = results.get().init_result();
         match granted {

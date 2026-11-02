@@ -413,6 +413,17 @@ async fn hidden_missing_and_unplayable_items_are_refused() {
     assert_eq!(refused(WireId::Real(987_654_321)).await, "not found: item");
     let synth = WireId::parse(&fx.lib_b_wire).unwrap();
     assert_eq!(refused(synth).await, "not found: item");
+    let no_audio = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &any,
+        Choice::Off,
+        Choice::Off,
+    )
+    .await
+    .map(|(_, d)| d)
+    .unwrap_err();
+    assert_eq!(no_audio, "not permitted: playing with no audio track");
 
     fx.state
         .stores
