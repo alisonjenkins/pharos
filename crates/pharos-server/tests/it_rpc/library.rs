@@ -260,3 +260,165 @@ async fn latest_lists_the_newest_items_the_policy_allows() {
         .unwrap();
     assert_eq!(capped.len(), LATEST_MAX as usize);
 }
+
+/// `Library.latest` on `session`, as the Jellyfin fields the test compares.
+async fn wire_latest(
+    session: &session::Client,
+    parent: Option<pharos_jellyfin_api::dto::WireId>,
+) -> Vec<serde_json::Value> {
+    use pharos_api::pharos_capnp::{item_id, opt_u16, opt_u32};
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.latest_request();
+    req.get().init_ctx();
+    if let Some(parent) = parent {
+        let mut id = req.get().init_parent_id();
+        match parent {
+            WireId::Real(n) => id.set_real(n),
+            WireId::Synth(n) => id.set_synth(n),
+        }
+    }
+    let reply = req.send().promise.await.expect("latest");
+    let result = reply.get().unwrap().get_result().unwrap();
+    let items_result::Page(page) = result.which().unwrap() else {
+        panic!("latest answered an error");
+    };
+    let items = page.unwrap().get_items().unwrap();
+    let opt16 = |o: opt_u16::Reader<'_>| match o.which().unwrap() {
+        opt_u16::Some(n) => Some(u32::from(n)),
+        opt_u16::None(()) => None,
+    };
+    let opt32 = |o: opt_u32::Reader<'_>| match o.which().unwrap() {
+        opt_u32::Some(n) => Some(n),
+        opt_u32::None(()) => None,
+    };
+    items
+        .iter()
+        .map(|item| {
+            let id = match item.get_id().unwrap().which().unwrap() {
+                item_id::Real(n) => WireId::Real(n),
+                item_id::Synth(n) => WireId::Synth(n),
+            };
+            let images = item.get_images().unwrap();
+            serde_json::json!({
+                "Id": id.to_string(),
+                "Name": item.get_name().unwrap().to_str().unwrap(),
+                "ProductionYear": item.has_year().then(|| opt16(item.get_year().unwrap())).flatten(),
+                "SeriesName": Some(item.get_series_name().unwrap().to_str().unwrap()).filter(|s| !s.is_empty()),
+                "IndexNumber": item.has_index_number().then(|| opt32(item.get_index_number().unwrap())).flatten(),
+                "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
+                "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
+            })
+        })
+        .collect()
+}
+
+/// T030 over the wire: `Library.latest` lists what the Jellyfin Latest route
+/// lists for the same user and parent, in the same order with the same
+/// display fields; a library id taken from `Library.views` scopes it; a
+/// forbidden library lists nothing.
+/// Disarm check: with `write_item` skipping the Primary image, the year or
+/// the series name, the agreement assertion fails.
+#[actix_web::test]
+async fn native_latest_agrees_with_the_jellyfin_latest_route() {
+    use actix_web::test;
+    use pharos_core::{LibraryStore as _, MediaStore as _};
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    // An episode, so the series name and index fields are compared too.
+    let episode: u64 = 150;
+    fx.state
+        .stores
+        .put(pharos_core::MediaItem {
+            id: episode,
+            path: "/libA/Show/Season 01/show-s01e02.mkv".into(),
+            title: "Second".into(),
+            kind: pharos_core::MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Show".into(),
+                season_number: Some(1),
+                episode_number: Some(2),
+                series_folder: Some("/libA/Show".into()),
+                series_year: Some(2001),
+            }),
+            ..pharos_core::MediaItem::default()
+        })
+        .await
+        .unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let uid = fx.user_id.0.simple();
+    let jellyfin = |parent: Option<&str>| {
+        let uri = match parent {
+            Some(p) => format!("/Users/{uid}/Items/Latest?ParentId={p}"),
+            None => format!("/Users/{uid}/Items/Latest"),
+        };
+        test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request()
+    };
+    let project = |body: serde_json::Value| -> Vec<serde_json::Value> {
+        body.as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "Id": d["Id"],
+                    "Name": d["Name"],
+                    "ProductionYear": d.get("ProductionYear").cloned().unwrap_or_default(),
+                    "SeriesName": d.get("SeriesName").cloned().unwrap_or_default(),
+                    "IndexNumber": d.get("IndexNumber").cloned().unwrap_or_default(),
+                    "ParentIndexNumber": d.get("ParentIndexNumber").cloned().unwrap_or_default(),
+                    "Primary": d["ImageTags"].get("Primary").cloned().unwrap_or_default(),
+                })
+            })
+            .collect()
+    };
+
+    let native = wire_latest(&session, None).await;
+    assert!(!native.is_empty());
+    let web: serde_json::Value = test::call_and_read_body_json(&app, jellyfin(None)).await;
+    assert_eq!(native, project(web));
+
+    // The id `Library.views` hands out scopes `latest` to that library.
+    let lib_a = WireId::parse(&fx.lib_a_wire).unwrap();
+    let scoped = wire_latest(&session, Some(lib_a)).await;
+    let web: serde_json::Value =
+        test::call_and_read_body_json(&app, jellyfin(Some(&fx.lib_a_wire))).await;
+    assert_eq!(scoped, project(web));
+    let mut ids: Vec<_> = scoped.iter().map(|i| i["Id"].clone()).collect();
+    ids.sort_by_key(|v| v.to_string());
+    assert_eq!(
+        ids,
+        [fx.rich_item_id, episode].map(|n| serde_json::json!(WireId::Real(n).to_string()))
+    );
+    assert!(
+        scoped
+            .iter()
+            .any(|i| i["SeriesName"] == "Show" && i["IndexNumber"] == 2),
+        "{scoped:?}"
+    );
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(wire_latest(&session, Some(lib_a)).await.is_empty());
+    let all = wire_latest(&session, None).await;
+    assert_eq!(
+        all.iter().map(|i| i["Id"].clone()).collect::<Vec<_>>(),
+        [serde_json::json!(WireId::Real(fx.other_item_id).to_string())]
+    );
+}
