@@ -979,10 +979,11 @@ impl TranscodeSessionStore for AnyStore {
     async fn get_transcode_session(
         &self,
         play_session_id: &str,
+        updated_since_unix_secs: i64,
     ) -> DomainResult<Option<PersistedTranscodeSession>> {
         match self {
-            AnyStore::Sqlite(s) => s.get_transcode_session(play_session_id).await,
-            AnyStore::Postgres(p) => p.get_transcode_session(play_session_id).await,
+            AnyStore::Sqlite(s) => s.get_transcode_session(play_session_id, updated_since_unix_secs).await,
+            AnyStore::Postgres(p) => p.get_transcode_session(play_session_id, updated_since_unix_secs).await,
         }
     }
 

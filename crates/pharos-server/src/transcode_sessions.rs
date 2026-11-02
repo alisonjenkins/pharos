@@ -69,7 +69,9 @@ const EXPIRY: Duration = Duration::from_secs(5 * 60);
 /// Durable rows outlive the in-memory cache generously: a paused or
 /// failed-over stream can resume well past the 5-minute window, and `get`
 /// does not refresh `updated_at`, so the row ages from negotiation time.
-/// Six hours comfortably covers a long film plus a pause.
+/// Six hours comfortably covers a long film plus a pause. It is also the
+/// capability's absolute limit once it leaves the cache: `get` ignores an
+/// older row rather than waiting for the hourly prune (B256).
 const DB_RETENTION_SECS: i64 = 6 * 60 * 60;
 
 fn now_unix_secs() -> i64 {
@@ -229,7 +231,11 @@ where
             return Ok(local);
         }
 
-        match self.store.get_transcode_session(session_id).await {
+        match self
+            .store
+            .get_transcode_session(session_id, now_unix_secs() - DB_RETENTION_SECS)
+            .await
+        {
             Ok(Some(persisted)) => match Self::from_persisted(&persisted) {
                 Ok(None) => {
                     tracing::info!(
@@ -372,6 +378,22 @@ mod tests {
             .unwrap();
         let r = TranscodeSessionRegistry::spawn(store);
         assert!(r.get("old").await.unwrap().is_none());
+    }
+
+    /// B256: a stored session past `DB_RETENTION_SECS` authorizes nothing,
+    /// even before the hourly prune removes it.
+    /// Disarm check: with `get` passing 0 as the cutoff, the stale row
+    /// resolves.
+    #[tokio::test]
+    async fn a_stored_session_past_retention_is_expired() {
+        let store = store().await;
+        let row = TranscodeSessionRegistry::<SqliteStore>::to_persisted(&sample_session()).unwrap();
+        let written = now_unix_secs() - DB_RETENTION_SECS;
+        store.upsert_transcode_session("stale", &row, written - 1).await.unwrap();
+        store.upsert_transcode_session("fresh", &row, written + 60).await.unwrap();
+        let r = TranscodeSessionRegistry::spawn(store);
+        assert!(r.get("stale").await.unwrap().is_none());
+        assert!(r.get("fresh").await.unwrap().is_some());
     }
 
     #[tokio::test]

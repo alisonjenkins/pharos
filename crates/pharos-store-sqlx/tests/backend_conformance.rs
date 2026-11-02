@@ -874,7 +874,7 @@ where
     // -----------------------------------------------------------------
     let psid = "conformance-play-session";
     assert!(
-        TranscodeSessionStore::get_transcode_session(&store, psid)
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
             .await
             .unwrap()
             .is_none(),
@@ -895,7 +895,7 @@ where
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 100)
         .await
         .unwrap();
-    let got = TranscodeSessionStore::get_transcode_session(&store, psid)
+    let got = TranscodeSessionStore::get_transcode_session(&store, psid, 0)
         .await
         .unwrap()
         .expect("session must round-trip");
@@ -914,13 +914,25 @@ where
         .await
         .unwrap();
     assert_eq!(
-        TranscodeSessionStore::get_transcode_session(&store, psid)
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
             .await
             .unwrap()
             .unwrap(),
         sess2,
         "upsert must overwrite an existing play session"
     );
+    // A row last written before the caller's cutoff reads as absent.
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 201)
+            .await
+            .unwrap()
+            .is_none(),
+        "a row written before the cutoff must not be returned"
+    );
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 200)
+        .await
+        .unwrap()
+        .is_some());
 
     // Prune below the row's updated_at (200) is a no-op; above it removes.
     let pruned_none = TranscodeSessionStore::prune_transcode_sessions(&store, 150)
@@ -930,7 +942,7 @@ where
         pruned_none, 0,
         "prune cutoff below updated_at removes nothing"
     );
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
         .await
         .unwrap()
         .is_some());
@@ -938,7 +950,7 @@ where
         .await
         .unwrap();
     assert_eq!(pruned, 1, "prune cutoff above updated_at removes the row");
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
         .await
         .unwrap()
         .is_none());
@@ -950,7 +962,7 @@ where
     TranscodeSessionStore::remove_transcode_session(&store, psid)
         .await
         .unwrap();
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid)
+    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
         .await
         .unwrap()
         .is_none());
