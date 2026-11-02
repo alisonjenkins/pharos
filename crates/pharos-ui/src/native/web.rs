@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gloo_net::http::Request;
-use pharos_client::api::{Capabilities, NativeApi};
+use pharos_client::api::{Capabilities, ClientEvent, ClientEventKind, ClientLevel, NativeApi};
 use pharos_client::browser::{self, Connection};
 use pharos_client::CallInfo;
 use wasm_bindgen::closure::Closure;
@@ -299,6 +299,17 @@ impl PlaybackEngine for NativeVideo {
                 warn(&format!(
                     "pharos: playback error engine=native code={code} message={message} action=fail url={url}"
                 ));
+                report_event(ClientEvent {
+                    kind: ClientEventKind::PlaybackError,
+                    level: ClientLevel::Error,
+                    route: current_path(),
+                    fields: vec![
+                        ("engine", "native".to_owned()),
+                        ("code", code.to_string()),
+                        ("message", message.clone()),
+                        ("action", "fail".to_owned()),
+                    ],
+                });
                 on_fatal(format!(
                     "the browser could not play this stream (code {code}) {message}"
                 ));
@@ -438,14 +449,22 @@ impl PlaybackEngine for HlsJs {
                     warn(&format!(
                         "pharos: playback error engine=hlsjs type={kind} details={details} fatal=false url={url}"
                     ));
+                    report_event(hls_event(ClientLevel::Warn, &kind, &details, "none", 0));
                     return;
                 }
                 let mut budget = budget.borrow_mut();
                 let action = budget.on_fatal(&kind, &details);
+                let attempt = budget.attempts(&kind);
                 warn(&format!(
-                    "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={} url={url}",
+                    "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={attempt} url={url}",
                     action.label(),
-                    budget.attempts(&kind),
+                ));
+                report_event(hls_event(
+                    ClientLevel::Error,
+                    &kind,
+                    &details,
+                    action.label(),
+                    attempt,
                 ));
                 match action {
                     Recovery::StartLoad => player.start_load(),
@@ -480,6 +499,90 @@ impl Drop for HlsJs {
 
 pub fn warn(message: &str) {
     web_sys::console::warn_1(&message.into());
+}
+
+/// Events raised before the session opens wait here, bounded, and go out
+/// with the first batch once it does.
+const MAX_PENDING_EVENTS: usize = 32;
+
+#[derive(Default)]
+struct Telemetry {
+    api: Option<NativeApi>,
+    pending: Vec<ClientEvent>,
+    failure_logged: bool,
+}
+
+thread_local! {
+    static TELEMETRY: RefCell<Telemetry> = RefCell::new(Telemetry::default());
+}
+
+/// Sends the session's client events from now on, and the held ones.
+pub fn install_telemetry(api: &NativeApi) {
+    let held = TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        t.api = Some(api.clone());
+        std::mem::take(&mut t.pending)
+    });
+    if !held.is_empty() {
+        send(api.clone(), held);
+    }
+}
+
+/// Submits one client event without waiting for it. Before the session
+/// opens it is held, up to [`MAX_PENDING_EVENTS`], and the rest are dropped.
+pub fn report_event(event: ClientEvent) {
+    let api = TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(api) = t.api.clone() {
+            return Some(api);
+        }
+        if t.pending.len() < MAX_PENDING_EVENTS {
+            t.pending.push(event.clone());
+        }
+        None
+    });
+    if let Some(api) = api {
+        send(api, vec![event]);
+    }
+}
+
+fn send(api: NativeApi, events: Vec<ClientEvent>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let call = pharos_client::CallInfo {
+            ui_route: "telemetry".into(),
+            ui_action: "submit".into(),
+            ..Default::default()
+        };
+        if let Err(e) = api.submit_events(&call, &events).await {
+            // Logged once: a dead socket fails every later batch the same way.
+            let first =
+                TELEMETRY.with(|t| !std::mem::replace(&mut t.borrow_mut().failure_logged, true));
+            if first {
+                warn(&format!("pharos: client event submit failed: {e}"));
+            }
+        }
+    });
+}
+
+fn hls_event(
+    level: ClientLevel,
+    kind: &str,
+    details: &str,
+    action: &str,
+    attempt: u32,
+) -> ClientEvent {
+    ClientEvent {
+        kind: ClientEventKind::PlaybackError,
+        level,
+        route: current_path(),
+        fields: vec![
+            ("engine", "hlsjs".to_owned()),
+            ("type", kind.to_owned()),
+            ("details", details.to_owned()),
+            ("action", action.to_owned()),
+            ("attempt", attempt.to_string()),
+        ],
+    }
 }
 
 pub fn info(message: &str) {

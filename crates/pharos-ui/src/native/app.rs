@@ -225,7 +225,17 @@ fn log_lines(lines: &[device::Line]) {
     for line in lines {
         match line {
             device::Line::Info(l) => platform::info(l),
-            device::Line::Warn(l) => platform::warn(l),
+            device::Line::Warn(l) => {
+                platform::warn(l);
+                if l.starts_with("pharos: theme fallback") {
+                    platform::report_event(pharos_client::api::ClientEvent {
+                        kind: pharos_client::api::ClientEventKind::ThemeFallback,
+                        level: pharos_client::api::ClientLevel::Warn,
+                        route: String::new(),
+                        fields: vec![("line", l.clone())],
+                    });
+                }
+            }
         }
     }
 }
@@ -768,6 +778,7 @@ async fn connect(
     let event = match platform::open(&call("connect", "resume")).await {
         Ok(mut open) => {
             api.set(Some(open.api.clone()));
+            platform::install_telemetry(&open.api);
             machine.write().apply(Event::Resumed { epoch });
             let reason = platform::closed(&mut open.conn).await;
             Event::Closed { epoch, reason }
