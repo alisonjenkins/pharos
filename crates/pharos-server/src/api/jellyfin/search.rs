@@ -72,10 +72,12 @@ struct SearchHintsResult {
 
 async fn search_hints(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<SearchQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
+    use crate::services::library::{parent_has_visible_items, visible_items};
+    let user = &user.0;
     use std::collections::HashSet;
 
     // Unicode-aware lowercase so accented titles match queries typed
@@ -99,11 +101,39 @@ async fn search_hints(
         })
         .unwrap_or(true);
 
-    let all = state
-        .stores
-        .list()
+    // A restricted user's hints, aggregates included, come only from the
+    // items their policy lets them see; the store's own lists and FTS are
+    // library-wide.
+    let visible = visible_items(&state, user)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let restricted = visible.is_some();
+    let all = match visible {
+        Some(items) => items,
+        None => state
+            .stores
+            .list()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?,
+    };
+    let visible_ids: HashSet<u64> = if restricted {
+        all.iter().map(|i| i.id).collect()
+    } else {
+        HashSet::new()
+    };
+    // A person, studio, box set or tag is visible only through its items.
+    let entity_visible = |wire_id: String| {
+        let state = state.clone();
+        async move {
+            !restricted
+                || parent_has_visible_items(&state, user, &wire_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, wire_id, "search hint visibility check failed");
+                        false
+                    })
+        }
+    };
 
     let mut hints: Vec<SearchHint> = Vec::new();
     // 1. Title (+ overview) matches on real items.
@@ -135,6 +165,13 @@ async fn search_hints(
             .saturating_add(q.limit)
             .saturating_add(200)
             .max(200);
+        // Hits outside the user's libraries are dropped below; fetching the
+        // whole visible corpus keeps them from crowding out the page.
+        let fetch = if restricted {
+            fetch.max(u32::try_from(all.len()).unwrap_or(u32::MAX))
+        } else {
+            fetch
+        };
         let (items, _total) = state
             .stores
             .search(&SearchQuery {
@@ -145,7 +182,14 @@ async fn search_hints(
             })
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        items
+        if restricted {
+            items
+                .into_iter()
+                .filter(|i| visible_ids.contains(&i.id))
+                .collect()
+        } else {
+            items
+        }
     };
     for i in &term_items {
         hints.push(SearchHint {
@@ -225,7 +269,9 @@ async fn search_hints(
             use pharos_core::PersonStore;
             if let Ok(people) = state.stores.people_with_counts().await {
                 for pc in &people {
-                    if pc.person.name.to_lowercase().contains(&needle) {
+                    if pc.person.name.to_lowercase().contains(&needle)
+                        && entity_visible(pc.person.wire_id.clone()).await
+                    {
                         hints.push(SearchHint {
                             item_id: pc.person.wire_id.clone(),
                             id: pc.person.wire_id.clone(),
@@ -248,7 +294,9 @@ async fn search_hints(
             use pharos_core::StudioStore;
             if let Ok(studios) = state.stores.studios_with_counts().await {
                 for sc in &studios {
-                    if sc.studio.name.to_lowercase().contains(&needle) {
+                    if sc.studio.name.to_lowercase().contains(&needle)
+                        && entity_visible(sc.studio.wire_id.clone()).await
+                    {
                         hints.push(SearchHint {
                             item_id: sc.studio.wire_id.clone(),
                             id: sc.studio.wire_id.clone(),
@@ -271,7 +319,9 @@ async fn search_hints(
             use pharos_core::CollectionStore;
             if let Ok(collections) = state.stores.collections_with_counts().await {
                 for cc in &collections {
-                    if cc.collection.name.to_lowercase().contains(&needle) {
+                    if cc.collection.name.to_lowercase().contains(&needle)
+                        && entity_visible(cc.collection.wire_id.clone()).await
+                    {
                         hints.push(SearchHint {
                             item_id: cc.collection.wire_id.clone(),
                             id: cc.collection.wire_id.clone(),
@@ -293,7 +343,9 @@ async fn search_hints(
             use pharos_core::TagStore;
             if let Ok(tags) = state.stores.tags_with_counts().await {
                 for tc in &tags {
-                    if tc.tag.name.to_lowercase().contains(&needle) {
+                    if tc.tag.name.to_lowercase().contains(&needle)
+                        && entity_visible(tc.tag.wire_id.clone()).await
+                    {
                         hints.push(SearchHint {
                             item_id: tc.tag.wire_id.clone(),
                             id: tc.tag.wire_id.clone(),

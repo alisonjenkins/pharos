@@ -805,3 +805,46 @@ pub async fn home(
         next_up,
     })
 }
+
+/// The stored items `user` may see, or `None` when their policy hides
+/// nothing (every library, no parental cap).
+pub async fn visible_items(
+    state: &AppState,
+    user: &User,
+) -> Result<Option<Vec<MediaItem>>, DomainError> {
+    let policy = &user.policy;
+    if policy.enable_all_folders && policy.max_parental_rating.is_none() {
+        return Ok(None);
+    }
+    let mut mq = pharos_core::MediaQuery::default();
+    crate::api::jellyfin::items::apply_policy_scope(&mut mq, policy, &state.parental_ratings);
+    let (items, _total) = state.stores.query(&mq).await?;
+    Ok(Some(items))
+}
+
+/// Whether `/Items?ParentId={parent_wire_id}` lists anything `user` may see.
+/// A person, studio, tag or box set has no library of its own: it is
+/// visible through its items, and only through them.
+pub async fn parent_has_visible_items(
+    state: &AppState,
+    user: &User,
+    parent_wire_id: &str,
+) -> Result<bool, DomainError> {
+    use crate::api::jellyfin::items::{
+        apply_policy_scope, resolve_parent_filter, ParentResolution,
+    };
+    let mut mq = pharos_core::MediaQuery {
+        limit: Some(1),
+        ..pharos_core::MediaQuery::default()
+    };
+    match resolve_parent_filter(state, Some(parent_wire_id)).await? {
+        ParentResolution::Empty => return Ok(false),
+        ParentResolution::All => {}
+        ParentResolution::Filter(pf) => mq.parent = Some(pf),
+        ParentResolution::PathPrefix(p) => mq.filters.path_prefix = Some(p),
+        ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t),
+    }
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    let (items, total) = state.stores.query(&mq).await?;
+    Ok(total > 0 || !items.is_empty())
+}

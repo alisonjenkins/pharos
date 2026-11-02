@@ -434,3 +434,48 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// B258: `/Search/Hints` answers only what the bearer may see. A user
+/// restricted to library B searching for library A's title, studio, tag or
+/// cast gets no hint for any of them, and still finds library B's item.
+/// Disarm check: with `search_hints` ignoring the policy again, every
+/// hidden term below returns a hint.
+#[actix_web::test]
+async fn search_hints_answer_only_visible_items() {
+    let f = seed_rich().await;
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let hints = |term: &str| {
+        test::TestRequest::get()
+            .uri(&format!("/Search/Hints?searchTerm={term}"))
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+
+    let mut leaked = Vec::new();
+    for term in ["Rich", "Pharos", "award", "Jane", "Action"] {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, hints(term)).await;
+        let names: Vec<&str> = body["SearchHints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|h| h["Name"].as_str())
+            .collect();
+        if !names.is_empty() {
+            leaked.push(format!("{term}: {names:?}"));
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "hidden library A leaked:\n{}",
+        leaked.join("\n")
+    );
+
+    let body: serde_json::Value = test::call_and_read_body_json(&app, hints("Other")).await;
+    assert_eq!(body["SearchHints"][0]["Name"], "Other Movie", "{body}");
+}
