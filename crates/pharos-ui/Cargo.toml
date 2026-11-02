@@ -53,6 +53,7 @@ js-sys = { version = "0.3", optional = true }
 # Pinned to 0.2: 0.3+ replaced `js` with `wasm_js` and would not unify with
 # the transitive copy.
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+pharos-client = { path = "../pharos-client" }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
