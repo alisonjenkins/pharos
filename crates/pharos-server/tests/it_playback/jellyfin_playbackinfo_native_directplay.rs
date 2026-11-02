@@ -444,3 +444,17 @@ async fn a_capability_ends_when_its_holder_stops() {
             .to_request()
     });
 }
+
+/// B256: jellyfin-web's `DELETE /Videos/ActiveEncodings` (a track switch, or
+/// the next episode) ends the session under the same rule.
+/// Disarm check: with `stop_active_encodings` calling `remove`, the other
+/// user's DELETE ends it.
+#[actix_web::test]
+async fn a_capability_ends_when_its_holder_drops_the_encoding() {
+    only_the_holder_ends!(|by: &str, tag: &str| {
+        test::TestRequest::delete()
+            .uri(&format!("/Videos/ActiveEncodings?PlaySessionId={tag}"))
+            .insert_header(("X-Emby-Token", by.to_owned()))
+            .to_request()
+    });
+}
