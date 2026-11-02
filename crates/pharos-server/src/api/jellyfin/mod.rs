@@ -122,25 +122,40 @@ pub(crate) async fn require_bearer(
 /// GETs stay anonymous like Jellyfin's: jellyfin-web's `<img>` tags and the
 /// native apps' image loaders send no credential (B286, V225). A token that
 /// does not resolve counts as anonymous too, so a stale cookie or revoked
-/// token cannot cost a client its artwork; 503 only when the store could
-/// not say.
+/// token cannot cost a client its artwork, and neither counts as a refusal;
+/// 503 only when the store could not say.
 pub(crate) async fn optional_bearer(
     state: &crate::state::AppState,
     req: &actix_web::HttpRequest,
     id: &str,
     route: &'static str,
 ) -> Result<Option<pharos_core::User>, actix_web::Error> {
+    use crate::services::{access::ItemHidden, auth::TokenRefusal};
     let Some(token) = auth_extractor::media_token(Some(state), req).await else {
         tracing::debug!(item_id = id, route, "anonymous image request");
         return Ok(None);
     };
-    match crate::services::access::authenticate(state, Some(&token), id, route).await {
+    match crate::services::auth::user_for_token(&state.stores, &token).await {
         Ok(user) => {
             auth_extractor::note_header_credential(req);
             Ok(Some(user))
         }
-        Err(crate::services::access::ItemHidden::Unauthenticated) => Ok(None),
-        Err(hidden) => Err(access_error(hidden)),
+        Err(TokenRefusal::Unavailable(detail)) => {
+            let hidden = ItemHidden::Unavailable(detail);
+            metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
+                .increment(1);
+            tracing::warn!(item_id = id, route, reason = hidden.label(), detail = %hidden, "item withheld: credential not checked");
+            Err(access_error(hidden))
+        }
+        Err(refusal) => {
+            tracing::debug!(
+                item_id = id,
+                route,
+                credential = refusal.label(),
+                "image request served anonymously: credential did not resolve"
+            );
+            Ok(None)
+        }
     }
 }
 
