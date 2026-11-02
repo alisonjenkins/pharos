@@ -484,7 +484,7 @@ pub async fn register(
     probe: &pharos_core::MediaProbe,
     holder: pharos_core::SessionHolder,
 ) {
-    let _ = state
+    match state
         .transcode_sessions
         .insert(
             play_session_id.to_owned(),
@@ -500,7 +500,32 @@ pub async fn register(
                 holder,
             },
         )
-        .await;
+        .await
+    {
+        Ok(evicted) => {
+            // Stop what the cap ended the way a client's Stopped report does,
+            // minus the final UserData write: its prefetch and its record go.
+            for id in &evicted {
+                state.prefetch_tasks.cancel(id);
+                if let Err(e) = state
+                    .sessions
+                    .apply(crate::sessions::SessionEvent::Stopped {
+                        session_id: id.clone(),
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "play session cap: ending the evicted session's record failed"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e,
+            "transcode session insert failed; this playback has no stream capability"
+        ),
+    }
 }
 
 /// Fold the request's switches into the negotiated decision. A remux that
