@@ -18,12 +18,16 @@ pub enum Route {
     Manage,
     /// The theme picker and editor, under `/settings`.
     Appearance,
+    /// The search screen, `/find`: matches from `Library.search` as you type.
+    Find,
     /// No route matched; carries the path for the message.
     NotFound(String),
 }
 
 /// The first path segment of every route but `Home`, lowercase.
-pub const FIRST_SEGMENTS: &[&str] = &["browse", "title", "watch", "signin", "manage", "settings"];
+pub const FIRST_SEGMENTS: &[&str] = &[
+    "browse", "title", "watch", "find", "signin", "manage", "settings",
+];
 
 impl Route {
     /// The route for a URL path. Case-insensitive, as the server lowercases
@@ -39,6 +43,7 @@ impl Route {
             ["watch", s] => id(s).map_or_else(|| not_found(path), Route::Watch),
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
+            ["find"] => Route::Find,
             ["settings", "appearance"] => Route::Appearance,
             _ => not_found(path),
         }
@@ -54,6 +59,7 @@ impl Route {
             Route::SignIn => "/signin".into(),
             Route::Manage => "/manage".into(),
             Route::Appearance => "/settings/appearance".into(),
+            Route::Find => "/find".into(),
             Route::NotFound(path) => path.clone(),
         }
     }
@@ -68,6 +74,7 @@ impl Route {
             Route::SignIn => "signin",
             Route::Manage => "manage",
             Route::Appearance => "appearance",
+            Route::Find => "find",
             Route::NotFound(_) => "not_found",
         }
     }
@@ -92,6 +99,7 @@ mod tests {
             Route::SignIn,
             Route::Manage,
             Route::Appearance,
+            Route::Find,
         ] {
             assert_eq!(Route::parse(&route.path()), route, "{route:?}");
         }
@@ -121,6 +129,7 @@ mod tests {
             Route::SignIn,
             Route::Manage,
             Route::Appearance,
+            Route::Find,
         ] {
             let path = route.path();
             let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
