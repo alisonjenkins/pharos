@@ -647,6 +647,10 @@
             mkdir -p $out
             cp -r target/dx/pharos-ui-web/release/web/public/. $out/
             install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
+            # hls.js, vendored and pinned (ADR-0035); the watch page loads it
+            # from 'self' only where the browser lacks native HLS.
+            install -Dm644 crates/pharos-ui/assets/vendor/hls.min.js $out/assets/vendor/hls.min.js
+            install -Dm644 crates/pharos-ui/assets/vendor/hls.js.LICENSE $out/assets/vendor/hls.js.LICENSE
             runHook postInstall
           '';
           dontFixup = true;
