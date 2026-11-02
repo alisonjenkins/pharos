@@ -171,11 +171,15 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
+        let target = browse_target(state, parent.as_deref()).await;
         let listed = match library::query(state, &user, parent.as_deref(), &query).await {
             Ok(page) => library::with_user_data(state, &user, page).await,
             Err(e) => Err(e),
         }
         .map_err(ListError::Store);
+        if let Ok(page) = &listed {
+            record_browse(parent.as_deref(), target, page);
+        }
         write_listing(
             results.get().init_result(),
             listed,
@@ -545,6 +549,118 @@ pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReas
     }
 }
 
+/// What a native browse is listing the children of. The `level` label of
+/// `pharos_rpc_browse_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseLevel {
+    /// A library view.
+    Library,
+    /// A series: its seasons.
+    Series,
+    /// A season: its episodes.
+    Season,
+    /// Anything else: no parent, a genre, a collection, an unknown id.
+    Other,
+}
+
+impl BrowseLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowseLevel::Library => "library",
+            BrowseLevel::Series => "series",
+            BrowseLevel::Season => "season",
+            BrowseLevel::Other => "other",
+        }
+    }
+}
+
+/// The `kind` label of `pharos_rpc_browse_total`: the library kind browsed,
+/// `tvshows` for the levels under a TV library, `none` for a parent that is
+/// no library.
+fn browse_kind_label(kind: Option<LibraryKind>) -> &'static str {
+    kind.map_or("none", LibraryKind::collection_type)
+}
+
+/// The level and library kind a `Library.query` parent names, resolved by
+/// the same `resolve_parent_filter` the listing uses. A store error counts as
+/// `other`: the listing reports it itself.
+async fn browse_target(
+    state: &AppState,
+    parent: Option<&str>,
+) -> (BrowseLevel, Option<LibraryKind>) {
+    use crate::api::jellyfin::items::{resolve_parent_filter, ParentResolution};
+    use pharos_core::ParentFilter;
+    let kind_of = |wire_id: &str| {
+        state
+            .libraries()
+            .iter()
+            .find(|l| l.wire_id == wire_id)
+            .map(|l| l.kind)
+    };
+    match resolve_parent_filter(state, parent).await {
+        Ok(ParentResolution::Filter(ParentFilter::Library { wire_id })) => {
+            (BrowseLevel::Library, kind_of(&wire_id))
+        }
+        Ok(ParentResolution::PathPrefix(root)) => {
+            let kind = state
+                .libraries()
+                .iter()
+                .find(|l| l.root_path == root)
+                .map_or(LibraryKind::Mixed, |l| l.kind);
+            (BrowseLevel::Library, Some(kind))
+        }
+        Ok(ParentResolution::Filter(ParentFilter::Series { .. })) => {
+            (BrowseLevel::Series, Some(LibraryKind::TvShows))
+        }
+        Ok(ParentResolution::Filter(ParentFilter::Season { .. })) => {
+            (BrowseLevel::Season, Some(LibraryKind::TvShows))
+        }
+        _ => (BrowseLevel::Other, None),
+    }
+}
+
+/// Records a native browse: a count under `pharos_rpc_browse_total{level,kind}`
+/// and a line with the parent, level and result count. Empty containers log
+/// at INFO (a library, series or season that lists nothing is the symptom of a
+/// browse that cannot reach its children); everything else at DEBUG.
+fn record_browse(
+    parent: Option<&str>,
+    target: (BrowseLevel, Option<LibraryKind>),
+    page: &ListPage,
+) {
+    let (level, kind) = target;
+    let kind = browse_kind_label(kind);
+    metrics::counter!(
+        "pharos_rpc_browse_total",
+        "level" => level.label(),
+        "kind" => kind
+    )
+    .increment(1);
+    let parent = parent.unwrap_or("");
+    let (count, total, start) = (page.items.len(), page.total, page.start);
+    if count == 0 && level != BrowseLevel::Other {
+        tracing::info!(
+            parent,
+            level = level.label(),
+            kind,
+            count,
+            total,
+            start,
+            "native browse: empty listing"
+        );
+    } else {
+        tracing::debug!(
+            parent,
+            level = level.label(),
+            kind,
+            count,
+            total,
+            start,
+            "native browse"
+        );
+    }
+}
+
 /// The synthesised item `id` (library view, series, season, album…) as the
 /// Jellyfin `/Items/{id}` projection, resolved by the same
 /// `synth_item_json` so the two APIs agree and apply the same access rules.
@@ -755,7 +871,7 @@ fn wire_library_kind(kind: LibraryKind) -> WireKind {
 
 #[cfg(test)]
 mod tests {
-    use super::RefusalReason;
+    use super::{BrowseLevel, RefusalReason};
     use crate::services::access::ItemHidden;
 
     /// A renamed or merged label breaks dashboards silently.
@@ -780,6 +896,20 @@ mod tests {
             ]
             .map(RefusalReason::label),
         );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+    }
+
+    /// A renamed or merged label breaks dashboards silently.
+    #[test]
+    fn browse_level_labels_are_distinct() {
+        let labels = [
+            BrowseLevel::Library,
+            BrowseLevel::Series,
+            BrowseLevel::Season,
+            BrowseLevel::Other,
+        ]
+        .map(BrowseLevel::label);
         let distinct: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(distinct.len(), labels.len(), "{labels:?}");
     }

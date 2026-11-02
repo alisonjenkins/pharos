@@ -1429,6 +1429,85 @@ async fn synthesised_detail_follows_library_access_and_the_parental_cap() {
     assert!(refused("not_found") >= 2, "missing ids are counted");
 }
 
+/// A native browse is visible: one count per call under
+/// `pharos_rpc_browse_total{level,kind}` and a line with the parent, level
+/// and result count; an empty container logs at INFO.
+/// Disarm check: with `record_browse` not incrementing the counter (or not
+/// logging), this fails.
+#[actix_web::test]
+async fn native_browses_are_counted_by_level_and_kind() {
+    use crate::telemetry::{connect, counter, session_for, subscriber, Captured};
+    use pharos_core::{LibraryKind, LibraryStore as _};
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+
+    let fx = crate::common::seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let tv = seed_tv_library(&fx).await;
+    let empty = "d".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("Empty TV", "/libEmpty", LibraryKind::TvShows, &empty)
+        .await
+        .unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    let series = series_id_for_key(Some("/libTV/Show"), "Show");
+    let season = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            for parent in [&fx.lib_a_wire, &tv, &empty, &series, &season] {
+                let _ = wire_query(
+                    &session,
+                    Some(parent),
+                    &[],
+                    "SortName",
+                    false,
+                    "",
+                    &[],
+                    0,
+                    0,
+                )
+                .await;
+            }
+            let _ = wire_query(&session, None, &[], "SortName", false, "", &[], 0, 0).await;
+        })
+        .await;
+    let browses = |level, kind| {
+        counter(
+            &snapshotter,
+            "pharos_rpc_browse_total",
+            &[("level", level), ("kind", kind)],
+        )
+    };
+    assert_eq!(browses("library", "movies"), 1);
+    assert_eq!(browses("library", "tvshows"), 2);
+    assert_eq!(browses("series", "tvshows"), 1);
+    assert_eq!(browses("season", "tvshows"), 1);
+    assert_eq!(browses("other", "none"), 1);
+    assert_eq!(browses("season", "movies"), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("INFO")
+            && text.contains("native browse: empty listing")
+            && text.contains(&format!("parent=\"{empty}\""))
+            && text.contains("level=\"library\"")
+            && text.contains("count=0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("DEBUG")
+            && text.contains(&format!("parent=\"{season}\""))
+            && text.contains("native browse"),
+        "{text}"
+    );
+}
+
 /// How many rpc `Call` messages `bytes` (whole capnp messages, back to back)
 /// carries.
 fn calls_in(bytes: &[u8]) -> usize {
