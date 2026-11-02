@@ -7,5 +7,6 @@ mod jellyfin_api;
 mod jellyfin_socket;
 mod jellyfin_socket_push;
 mod route_smoke;
+mod ui_serving;
 mod wire_baseline;
 mod wire_invariants;
