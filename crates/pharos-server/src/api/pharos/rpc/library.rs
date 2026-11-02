@@ -13,7 +13,9 @@ use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 use super::bootstrap::token_denial;
 use super::session::Session;
 use crate::services::auth::{user_for_token, TokenRefusal};
-use crate::services::library::{self, KindFilter, LibraryView, ListError, ListPage};
+use crate::services::library::{
+    self, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QUERY_DEFAULT, QUERY_MAX,
+};
 
 pub(super) struct Library {
     session: Rc<Session>,
@@ -138,6 +140,61 @@ impl server::library::Handler for Library {
             results.get().init_result(),
             listed,
             "resume",
+            &state.server_id,
+        );
+        Ok(())
+    }
+
+    async fn query(
+        self: Rc<Self>,
+        params: wire::QueryParams,
+        results: &mut wire::QueryResults,
+    ) -> Result<(), capnp::Error> {
+        let q = params.get()?.get_q()?;
+        let parent = if q.has_parent_id() {
+            Some(read_item_id(q.get_parent_id()?)?.to_string())
+        } else {
+            None
+        };
+        let text = |t: capnp::text::Reader<'_>| -> Result<Option<String>, capnp::Error> {
+            let t = t.to_str()?.trim();
+            Ok((!t.is_empty()).then(|| t.to_owned()))
+        };
+        let mut filters = Vec::new();
+        for f in q.get_filters()? {
+            filters.push(f?.to_str()?.to_owned());
+        }
+        let limit = match q.get_limit() {
+            0 => QUERY_DEFAULT,
+            n => n.min(QUERY_MAX),
+        };
+        let query = ItemQuery {
+            start_index: q.get_start(),
+            limit: Some(limit),
+            kinds: kind_filter(q.get_kinds()?),
+            sort_by: text(q.get_sort_by()?)?,
+            sort_order: q.get_descending().then(|| "Descending".to_owned()),
+            name_starts_with: text(q.get_name_starts_with()?)?,
+            filters: (!filters.is_empty()).then(|| filters.join(",")),
+            ..ItemQuery::default()
+        };
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let listed = match library::query(state, &user, parent.as_deref(), &query).await {
+            Ok(page) => library::with_user_data(state, &user, page).await,
+            Err(e) => Err(e),
+        }
+        .map_err(ListError::Store);
+        write_listing(
+            results.get().init_result(),
+            listed,
+            "query",
             &state.server_id,
         );
         Ok(())

@@ -634,6 +634,12 @@ pub struct ItemQuery {
     pub max_width: Option<u32>,
 }
 
+/// How many items a native `Library.query` page holds when the caller names
+/// no limit, and the most it holds when one is named: a page is one message,
+/// and 1000 summaries keep it well under capnp's default traversal limit.
+pub const QUERY_DEFAULT: u32 = 100;
+pub const QUERY_MAX: u32 = 1000;
+
 /// One page of stored items, with the number of matches before paging.
 #[derive(Debug)]
 pub struct QueryPage {
@@ -693,5 +699,25 @@ pub async fn query(
         items: filtered.into_iter().skip(start).take(take).collect(),
         total,
         start: q.start_index,
+    })
+}
+
+/// `page` with the user's play state for each item, read in one batch.
+pub async fn with_user_data(
+    state: &AppState,
+    user: &User,
+    page: QueryPage,
+) -> Result<ListPage, DomainError> {
+    let ids: Vec<u64> = page.items.iter().map(|i| i.id).collect();
+    let user_data = state.stores.user_data_bulk(user.id, &ids).await?;
+    Ok(ListPage {
+        items: page
+            .items
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| (item, user_data.get(i).copied().unwrap_or_default()))
+            .collect(),
+        total: page.total,
+        start: page.start,
     })
 }
