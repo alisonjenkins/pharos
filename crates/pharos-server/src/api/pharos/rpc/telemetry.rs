@@ -84,7 +84,7 @@ impl server::telemetry::Handler for Telemetry {
         .into_iter()
         .find(|(_, len, max)| len > max);
         if let Some((name, len, max)) = oversized {
-            count_dropped("batch_too_large", events.len());
+            count_dropped(DropReason::BatchTooLarge, events.len());
             tracing::warn!(
                 batch = name,
                 len,
@@ -105,7 +105,7 @@ impl server::telemetry::Handler for Telemetry {
             .borrow_mut()
             .admit(Instant::now())
         {
-            count_dropped("rate_limited", events.len());
+            count_dropped(DropReason::RateLimited, events.len());
             tracing::warn!(
                 events = events.len(),
                 "client telemetry batch refused: rate limited"
@@ -128,8 +128,25 @@ impl server::telemetry::Handler for Telemetry {
     }
 }
 
-fn count_dropped(reason: &'static str, events: u32) {
-    metrics::counter!("pharos_client_events_dropped_total", "reason" => reason)
+/// Why a batch's events were dropped: the `reason` label of
+/// `pharos_client_events_dropped_total`.
+#[derive(Clone, Copy, Debug)]
+enum DropReason {
+    BatchTooLarge,
+    RateLimited,
+}
+
+impl DropReason {
+    fn label(self) -> &'static str {
+        match self {
+            DropReason::BatchTooLarge => "batch_too_large",
+            DropReason::RateLimited => "rate_limited",
+        }
+    }
+}
+
+fn count_dropped(reason: DropReason, events: u32) {
+    metrics::counter!("pharos_client_events_dropped_total", "reason" => reason.label())
         .increment(u64::from(events));
 }
 
@@ -317,6 +334,19 @@ mod tests {
         let levels = [Level::Error, Level::Warn, Level::Info].map(level_label);
         assert_eq!(levels.iter().collect::<HashSet<_>>().len(), levels.len());
     }
+
+    /// Disarm check: a repeated label would merge two drop reasons under
+    /// one dashboard series.
+    #[test]
+    fn drop_reason_labels_are_distinct() {
+        let labels = ALL_DROP_REASONS.map(DropReason::label);
+        assert_eq!(
+            labels.iter().collect::<HashSet<_>>().len(),
+            ALL_DROP_REASONS.len()
+        );
+    }
+
+    const ALL_DROP_REASONS: [DropReason; 2] = [DropReason::BatchTooLarge, DropReason::RateLimited];
 
     #[test]
     fn credential_keys_are_recognised_whatever_their_case() {
