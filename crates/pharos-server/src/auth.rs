@@ -123,6 +123,13 @@ impl<U: UserStore> BuiltinAuth<U> {
 impl<U: UserStore> AuthBackend for BuiltinAuth<U> {
     #[tracing::instrument(skip(self, password), fields(user.name = %name))]
     async fn authenticate(&self, name: &str, password: &SecretString) -> AuthResult<User> {
+        // V211: no account may hold an empty password, so refuse it before
+        // any lookup. The answer does not depend on whether the name exists.
+        if password.expose().is_empty() {
+            metrics::counter!("pharos_login_empty_password_total").increment(1);
+            tracing::warn!(user.name = %name, reason = "empty_password", "sign-in refused");
+            return Err(AuthError::InvalidCredentials);
+        }
         let record = match self.users.lookup_by_name(name).await {
             Ok(r) => r,
             Err(AuthError::UserNotFound) => {
@@ -655,6 +662,49 @@ mod tests {
             Err(AuthError::InvalidCredentials) => {}
             other => panic!("expected InvalidCredentials, got {other:?}"),
         }
+    }
+
+    // V211 — the stored hash is hash(""), so only the empty-password check
+    // stands between this account and a sign-in.
+    #[tokio::test]
+    async fn empty_password_is_refused_even_when_the_stored_hash_is_for_empty() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "").await;
+        match auth.authenticate("ali", &SecretString::new("")).await {
+            Err(AuthError::InvalidCredentials) => {}
+            other => panic!("expected InvalidCredentials, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_password_refusal_is_counted_and_skips_argon2() {
+        use metrics_util::debugging::DebugValue;
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        seed(&auth, "ali", "").await;
+        let _ = auth.authenticate("ali", &SecretString::new("")).await;
+        let _ = auth.authenticate("nobody", &SecretString::new("")).await;
+        let refused = rec
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, v)| match v {
+                DebugValue::Counter(n)
+                    if key.key().name() == "pharos_login_empty_password_total" =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(refused, 2, "each empty-password sign-in must be counted");
+        assert_eq!(
+            dummy_verify_count(&rec),
+            0,
+            "an empty password is refused before any argon2 work"
+        );
     }
 
     fn dummy_verify_count(rec: &metrics_util::debugging::DebuggingRecorder) -> u64 {
