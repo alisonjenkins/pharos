@@ -184,3 +184,42 @@ async fn a_hidden_item_cannot_be_marked() {
         .unwrap();
     assert!(!stored.played && !stored.is_favorite);
 }
+
+/// Pipelined writes to one item both land: a native client can send
+/// setPlayed and setFavorite back to back, and the second must not write
+/// over the first with the state it read before the first was stored.
+/// Disarm check: without the write lock in `services::user_data::update`,
+/// one of the two is lost.
+#[actix_web::test]
+async fn pipelined_writes_to_one_item_both_land() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let id = WireId::Real(fx.rich_item_id);
+    for _ in 0..20 {
+        let (played, favorite) = futures_util::join!(
+            wire_set(&session, id, Set::Played(true)),
+            wire_set(&session, id, Set::Favorite(true)),
+        );
+        assert!(played.is_ok() && favorite.is_ok());
+        let stored = fx
+            .state
+            .stores
+            .get_user_data(fx.user_id, fx.rich_item_id)
+            .await
+            .unwrap();
+        assert!(stored.played && stored.is_favorite, "{stored:?}");
+        let (unplayed, unfavourite) = futures_util::join!(
+            wire_set(&session, id, Set::Played(false)),
+            wire_set(&session, id, Set::Favorite(false)),
+        );
+        assert!(unplayed.is_ok() && unfavourite.is_ok());
+        let stored = fx
+            .state
+            .stores
+            .get_user_data(fx.user_id, fx.rich_item_id)
+            .await
+            .unwrap();
+        assert!(!stored.played && !stored.is_favorite, "{stored:?}");
+    }
+}
