@@ -8,6 +8,7 @@ use std::time::Instant;
 use pharos_core::{MediaStore, PlaybackProgress, User, UserDataStore};
 
 use crate::progress_writes::{self, Decision, ProgressKey};
+use crate::services::access::{check_item, ItemHidden};
 use crate::sessions::SessionEvent;
 use crate::state::AppState;
 use crate::sync_recovery::now_unix_secs;
@@ -25,17 +26,28 @@ pub struct Report<'a> {
     pub subtitle_stream_index: Option<i32>,
 }
 
-/// The session registry (V18) is gone: nothing about the playback could be
-/// recorded.
+/// Why a playback report was not recorded.
 #[derive(Debug, thiserror::Error)]
-#[error("session registry: {0}")]
-pub struct RegistryDown(String);
+pub enum ReportError {
+    /// The item is outside the caller's policy (B277). Nothing was written.
+    #[error("item withheld from the caller: {0:?}")]
+    Withheld(ItemHidden),
+    /// The session registry (V18) is gone: nothing about the playback could
+    /// be recorded.
+    #[error("session registry: {0}")]
+    RegistryDown(String),
+}
 
 /// Records a progress report: the live session, the sockets' Currently
 /// Watching, and (coalesced by `progress_writes`) the resume position.
-pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), RegistryDown> {
+pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), ReportError> {
     let item_wire_id = r.item_wire_id.unwrap_or("");
     let parsed_item_id = pharos_jellyfin_api::dto::parse_item_id(item_wire_id);
+    if let Some(id) = parsed_item_id {
+        check_item(state, user, id, "playback")
+            .await
+            .map_err(ReportError::Withheld)?;
+    }
     // One read serves both the broadcast's kind and the DTO's runtime.
     let item = match parsed_item_id {
         Some(id) => state.stores.get(id).await.ok(),
@@ -52,7 +64,7 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
                 is_paused: r.is_paused,
             })
             .await
-            .map_err(|e| RegistryDown(e.to_string()))?;
+            .map_err(|e| ReportError::RegistryDown(e.to_string()))?;
         // P10 — fan out to /socket subscribers so the Currently
         // Watching sidebar updates live without polling.
         // Resolve the item's kind so the broadcast can stamp the
@@ -129,7 +141,15 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
 /// Records the end of a playback: ends its session and its stream
 /// capability, then stores the final position, or marks the item played
 /// when the player stopped near its end.
-pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), RegistryDown> {
+pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), ReportError> {
+    if let Some(id) = r
+        .item_wire_id
+        .and_then(pharos_jellyfin_api::dto::parse_item_id)
+    {
+        check_item(state, user, id, "playback")
+            .await
+            .map_err(ReportError::Withheld)?;
+    }
     if let Some(session_id) = r.play_session_id {
         // B256: the PlaySessionId authorizes streams on its own, so the
         // stop that ends the playback ends the capability too.
@@ -142,7 +162,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
                 session_id: session_id.to_owned(),
             })
             .await
-            .map_err(|e| RegistryDown(e.to_string()))?;
+            .map_err(|e| ReportError::RegistryDown(e.to_string()))?;
     }
 
     // Persist final UserData. If the client stopped within the last

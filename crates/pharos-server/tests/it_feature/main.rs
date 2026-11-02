@@ -11,5 +11,6 @@ mod jellyfin_feature_inventory;
 mod jellyfin_feature_library_options;
 mod jellyfin_feature_metadata;
 mod jellyfin_feature_user_policy;
+mod playback_access;
 mod playlists;
 mod thin_endpoints;
