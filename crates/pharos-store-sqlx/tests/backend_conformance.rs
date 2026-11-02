@@ -1208,13 +1208,24 @@ where
         };
         let (items, _) = MediaStore::query(&store, &scoped).await.unwrap();
         // query_ids answers the same ids in the same order, paged or not.
+        // Pinned to this block's ids: other tests write rows into the shared
+        // postgres database while this runs.
+        let own = MediaQuery {
+            filters: pharos_core::MediaFilters {
+                ids: (9701..=9704).collect(),
+                ids_present: true,
+                ..Default::default()
+            },
+            ..scoped.clone()
+        };
         let paged = MediaQuery {
             start_index: 1,
             limit: Some(2),
-            ..scoped.clone()
+            ..own.clone()
         };
+        let (whole, _) = MediaStore::query(&store, &own).await.unwrap();
         let (page, _) = MediaStore::query(&store, &paged).await.unwrap();
-        for (q, rows) in [(&scoped, &items), (&paged, &page)] {
+        for (q, rows) in [(&own, &whole), (&paged, &page)] {
             assert_eq!(
                 MediaStore::query_ids(&store, q).await.unwrap(),
                 rows.iter().map(|i| i.id).collect::<Vec<_>>(),
