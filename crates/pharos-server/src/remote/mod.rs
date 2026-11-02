@@ -35,6 +35,100 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 
+/// Why a URL was refused before the resolver saw it (B260). Cataloguing a
+/// URL makes the server fetch it, so the URL must name the public internet.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TargetRefused {
+    #[error("only http and https URLs can be catalogued, not {0:?}")]
+    Scheme(String),
+    #[error("{0:?} is not a URL pharos can check")]
+    Malformed(String),
+    #[error("{host} resolves to {addr}, a private address")]
+    Private {
+        host: String,
+        addr: std::net::IpAddr,
+    },
+    #[error("{host} does not resolve: {detail}")]
+    Unresolvable { host: String, detail: String },
+}
+
+impl TargetRefused {
+    /// The `outcome` label of `pharos_remote_ingest_total`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TargetRefused::Scheme(_) => "refused_scheme",
+            TargetRefused::Malformed(_) => "refused_malformed",
+            TargetRefused::Private { .. } => "refused_private",
+            TargetRefused::Unresolvable { .. } => "refused_unresolvable",
+        }
+    }
+}
+
+/// `Ok` when `url` is an http(s) URL whose host is in `allowed_hosts` or
+/// resolves only to public addresses. User info and backslashes are refused
+/// outright: they are where URL parsers disagree, and yt-dlp's parser is not
+/// this one.
+pub async fn check_target(url: &str, allowed_hosts: &[String]) -> Result<(), TargetRefused> {
+    let malformed = || TargetRefused::Malformed(url.to_string());
+    if url
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return Err(malformed());
+    }
+    let scheme = url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .ok_or_else(malformed)?;
+    let port = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return Err(TargetRefused::Scheme(scheme)),
+    };
+    let uri: actix_web::http::Uri = url.parse().map_err(|_| malformed())?;
+    let authority = uri.authority().ok_or_else(malformed)?;
+    if authority.as_str().contains('@') {
+        return Err(malformed());
+    }
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if host.is_empty() {
+        return Err(malformed());
+    }
+    if allowed_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+        return Ok(());
+    }
+    let addrs: Vec<std::net::IpAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => tokio::net::lookup_host((host, authority.port_u16().unwrap_or(port)))
+            .await
+            .map_err(|e| TargetRefused::Unresolvable {
+                host: host.to_string(),
+                detail: e.to_string(),
+            })?
+            .map(|a| a.ip())
+            .collect(),
+    };
+    if addrs.is_empty() {
+        return Err(TargetRefused::Unresolvable {
+            host: host.to_string(),
+            detail: "no addresses".to_string(),
+        });
+    }
+    match addrs
+        .into_iter()
+        .find(|a| !crate::api::jellyfin::items::ip_is_remote(a) || a.is_multicast())
+    {
+        Some(addr) => Err(TargetRefused::Private {
+            host: host.to_string(),
+            addr,
+        }),
+        None => Ok(()),
+    }
+}
+
 /// What a resolver failure was, carrying the value that caused it.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -340,6 +434,8 @@ pub struct ResolverCache {
     /// construction and not attached afterwards: with a setter, an unwired
     /// resolver and a cacheless one are the same object.
     evict_into: Option<std::sync::Arc<source_cache::SourceCache>>,
+    /// `[remote].allow_private_hosts`.
+    allowed_private_hosts: Vec<String>,
 }
 
 impl ResolverCache {
@@ -353,7 +449,19 @@ impl ResolverCache {
             ttl,
             entries: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             evict_into,
+            allowed_private_hosts: Vec::new(),
         }
+    }
+
+    /// Hosts exempt from the private-address check (`[remote].allow_private_hosts`).
+    pub fn with_allowed_private_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_private_hosts = hosts;
+        self
+    }
+
+    /// `Ok` when `url` may be catalogued: see [`check_target`].
+    pub async fn check_target(&self, url: &str) -> Result<(), TargetRefused> {
+        check_target(url, &self.allowed_private_hosts).await
     }
 
     /// Release the bytes held against locators nothing will ask for again.
@@ -567,6 +675,29 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn target_refusal_labels_are_distinct() {
+        let labels = [
+            TargetRefused::Scheme(String::new()).label(),
+            TargetRefused::Malformed(String::new()).label(),
+            TargetRefused::Private {
+                host: String::new(),
+                addr: std::net::Ipv4Addr::LOCALHOST.into(),
+            }
+            .label(),
+            TargetRefused::Unresolvable {
+                host: String::new(),
+                detail: String::new(),
+            }
+            .label(),
+            "not_admin",
+            "added",
+            "refreshed",
+        ];
+        let unique: std::collections::BTreeSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len());
+    }
 
     /// A captured `yt-dlp -J` document for an adaptive YouTube video, trimmed
     /// to the fields pharos reads.

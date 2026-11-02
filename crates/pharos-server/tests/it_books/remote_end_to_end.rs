@@ -177,11 +177,15 @@ async fn harness(vcodec: &str) -> (Harness, String) {
     );
     let port = pharos_server::remote::source_cache::server::spawn(cache.clone())
         .expect("the loopback range listener must start");
-    let resolver = Arc::new(ResolverCache::new(
-        RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
-        Duration::from_secs(600),
-        Some(cache.clone()),
-    ));
+    let resolver = Arc::new(
+        ResolverCache::new(
+            RemoteResolver::new(bin.to_string_lossy().to_string(), Duration::from_secs(10)),
+            Duration::from_secs(600),
+            Some(cache.clone()),
+        )
+        // The test has no DNS; the stub resolver never reaches this host.
+        .with_allowed_private_hosts(vec!["www.youtube.com".into()]),
+    );
     let state = web::Data::new(
         AppState::new(stores, "srv".into())
             .with_remote_resolver(resolver)
@@ -487,4 +491,66 @@ async fn only_an_admin_catalogues_a_url() {
         "a non-admin catalogued a URL"
     );
     assert_eq!(ingests(&snapshotter, "not_admin"), 1);
+}
+
+/// B260: a URL is never catalogued toward a private, loopback or link-local
+/// address, or through a scheme other than http(s), unless
+/// `[remote].allow_private_hosts` names its host (V199). Each refusal answers
+/// 400 and counts under `pharos_remote_ingest_total{outcome}`.
+/// Disarm check: with `remote::check_target` skipped, every refused URL below
+/// reaches the stub resolver and answers 200.
+#[actix_web::test]
+async fn a_private_url_is_never_catalogued() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let (h, _base) = harness("avc1.640028").await;
+    let app = test::init_service(app(h.state.clone())).await;
+    let post = |token: &str, url: &str| {
+        test::TestRequest::post()
+            .uri("/Pharos/Remote/Items")
+            .insert_header(auth_header!(token))
+            .set_json(serde_json::json!({ "url": url }))
+            .to_request()
+    };
+
+    let mut answered = Vec::new();
+    for (url, outcome) in [
+        ("http://127.0.0.1:9/x", "refused_private"),
+        (
+            "http://169.254.169.254/latest/meta-data/",
+            "refused_private",
+        ),
+        ("http://[::1]/x", "refused_private"),
+        ("http://10.0.0.5/x", "refused_private"),
+        (
+            "http://192.168.1.244:3100/loki/api/v1/labels",
+            "refused_private",
+        ),
+        ("http://localhost/x", "refused_private"),
+        ("http://user@127.0.0.1/x", "refused_malformed"),
+        ("file:///etc/passwd", "refused_scheme"),
+        ("ytsearch:anything", "refused_scheme"),
+        ("http://no-such-host.invalid/x", "refused_unresolvable"),
+    ] {
+        let before = ingests(&snapshotter, outcome);
+        let resp = test::call_service(&app, post(&h.token, url)).await;
+        if resp.status() != StatusCode::BAD_REQUEST || ingests(&snapshotter, outcome) != before + 1
+        {
+            answered.push(format!("{url} → {} (want 400, {outcome})", resp.status()));
+        }
+    }
+    assert!(
+        answered.is_empty(),
+        "private targets reached the resolver:\n{}",
+        answered.join("\n")
+    );
+
+    let resp = test::call_service(
+        &app,
+        post(&h.token, "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "an allowed host was refused");
 }
