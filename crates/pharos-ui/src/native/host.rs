@@ -100,6 +100,15 @@ pub fn install_telemetry(_api: &NativeApi) {}
 
 pub fn report_event(_event: ClientEvent) {}
 
+/// The host has no browser storage, so diagnostics are never opted in.
+pub fn opted_in() -> bool {
+    false
+}
+
+pub fn set_opted_in(_on: bool) -> Result<(), String> {
+    Err("browser storage is unavailable".to_owned())
+}
+
 pub fn stored_theme(_key: &str) -> Result<Option<String>, String> {
     Ok(None)
 }

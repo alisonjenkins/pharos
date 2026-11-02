@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod appearance;
+pub mod diagnostics;
 pub mod machine;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 #[path = "host.rs"]
