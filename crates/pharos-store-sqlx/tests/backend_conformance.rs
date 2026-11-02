@@ -1202,15 +1202,25 @@ where
             blocked_lc: blocked.iter().map(|t| t.to_lowercase()).collect(),
             allowed_lc: allowed.iter().map(|t| t.to_lowercase()).collect(),
         };
-        let (items, _) = MediaStore::query(
-            &store,
-            &MediaQuery {
-                tag_scope: Some(scope.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        let scoped = MediaQuery {
+            tag_scope: Some(scope.clone()),
+            ..Default::default()
+        };
+        let (items, _) = MediaStore::query(&store, &scoped).await.unwrap();
+        // query_ids answers the same ids in the same order, paged or not.
+        let paged = MediaQuery {
+            start_index: 1,
+            limit: Some(2),
+            ..scoped.clone()
+        };
+        let (page, _) = MediaStore::query(&store, &paged).await.unwrap();
+        for (q, rows) in [(&scoped, &items), (&paged, &page)] {
+            assert_eq!(
+                MediaStore::query_ids(&store, q).await.unwrap(),
+                rows.iter().map(|i| i.id).collect::<Vec<_>>(),
+                "query_ids {scope:?}"
+            );
+        }
         let mut got: Vec<MediaId> = items
             .iter()
             .map(|i| i.id)

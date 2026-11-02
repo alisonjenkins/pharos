@@ -763,6 +763,44 @@ impl MediaStore for PostgresStore {
     }
 
     #[tracing::instrument(skip(self, q))]
+    async fn query_ids(&self, q: &MediaQuery) -> DomainResult<Vec<MediaId>> {
+        use crate::media_query::{self, Param};
+        let user = media_query::user_data_user(q);
+        let join_active = media_query::needs_user_data_join(q);
+        let offset = usize::from(join_active);
+        let built = media_query::build(q, |n| format!("${}", n + offset), "ALL");
+        let join = if join_active {
+            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
+        } else {
+            ""
+        };
+        let where_clause = if built.where_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", built.where_sql)
+        };
+        let sql = format!(
+            "SELECT media_items.id FROM media_items {join} {where_clause} ORDER BY {} {}",
+            built.order_sql, built.limit_sql,
+        );
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql));
+        if let Some(uid) = user {
+            query = query.bind(uid.0.as_bytes().to_vec());
+        }
+        for p in &built.params {
+            query = match p {
+                Param::Text(s) => query.bind(s.clone()),
+                Param::Int(i) => query.bind(*i),
+            };
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
+    }
+
+    #[tracing::instrument(skip(self, q))]
     async fn search(&self, q: &pharos_core::SearchQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
         let tokens = pharos_core::search_tokens(&q.term);
         if tokens.is_empty() {

@@ -164,6 +164,16 @@ impl MediaStore for AnyStore {
         .await
     }
 
+    async fn query_ids(&self, q: &MediaQuery) -> DomainResult<Vec<MediaId>> {
+        timed("query_item_ids", async {
+            match self {
+                AnyStore::Sqlite(s) => s.query_ids(q).await,
+                AnyStore::Postgres(p) => p.query_ids(q).await,
+            }
+        })
+        .await
+    }
+
     async fn search(&self, q: &SearchQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
         timed("search_items", async {
             match self {
