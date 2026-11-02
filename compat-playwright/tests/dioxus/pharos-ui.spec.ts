@@ -244,6 +244,41 @@ test.describe("pharos Dioxus UI", () => {
       });
     });
 
+    test("find: a term in the seeded media shows tiles, nonsense says no matches", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await page.getByRole("link", { name: "Find" }).click();
+      await expect(page).toHaveURL(/\/find$/);
+      const box = page.getByLabel("Search");
+      // Every seeded title starts "Playwright …", so the term matches them.
+      await box.fill("Playwright");
+      await expect(page.locator(".pharos-poster").first()).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await box.fill("zzqx-no-such-title");
+      await expect(page.getByText("No matches")).toBeVisible({
+        timeout: 15_000,
+      });
+    });
+
     // The page is told it has neither WebM nor native HLS, as Firefox on a
     // WebM-less build would be, so the server remuxes the VP9 fixture to HLS
     // and the page plays it through the vendored hls.js. MediaSource answers
