@@ -103,6 +103,9 @@ pub struct Machine {
     /// Reconnects since the last successful resume.
     attempt: u32,
     signing_out: bool,
+    /// Connecting again after a signed-in socket dropped: the screens stay
+    /// up, so a playing video is not torn down by a network blip.
+    reconnecting: bool,
     /// A non-blocking message for the signed-in shell, e.g. a failed
     /// sign-out.
     notice: Option<String>,
@@ -121,6 +124,7 @@ impl Machine {
             epoch: 0,
             attempt: 0,
             signing_out: false,
+            reconnecting: false,
             notice: None,
         }
     }
@@ -140,6 +144,20 @@ impl Machine {
 
     pub fn signing_out(&self) -> bool {
         self.signing_out
+    }
+
+    pub fn reconnecting(&self) -> bool {
+        self.reconnecting
+    }
+
+    /// Whether the signed-in screens show: ready, or reconnecting after a
+    /// drop.
+    pub fn shows_screens(&self) -> bool {
+        match self.phase {
+            Phase::Ready => true,
+            Phase::Connecting => self.reconnecting,
+            _ => false,
+        }
     }
 
     /// How long to wait before this attempt connects: none for the first,
@@ -175,8 +193,10 @@ impl Machine {
                         .then(|| "Your session ended. Sign in again.".to_owned());
                     self.sign_in(error);
                 } else {
+                    let was_signed_in = self.shows_screens();
                     self.attempt = self.attempt.saturating_add(1);
                     self.connect();
+                    self.reconnecting = was_signed_in;
                 }
             }
             Event::NeedsSignIn if self.phase == Phase::Ready => {
@@ -216,6 +236,9 @@ impl Machine {
             }
             // A stale attempt's event, or one the current phase ignores.
             _ => {}
+        }
+        if self.phase != Phase::Connecting {
+            self.reconnecting = false;
         }
     }
 
@@ -368,6 +391,38 @@ mod tests {
         assert_eq!(
             sign_in_error_of(&m),
             Some("Your session ended. Sign in again.")
+        );
+    }
+
+    #[test]
+    fn a_dropped_socket_keeps_the_screens_until_the_reconnect_settles() {
+        let mut m = ready();
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        assert!(m.reconnecting() && m.shows_screens());
+        m.apply(Event::Closed {
+            epoch: 1,
+            reason: String::new(),
+        });
+        assert!(m.shows_screens(), "a second drop is still a reconnect");
+        m.apply(Event::Resumed { epoch: 2 });
+        assert!(!m.reconnecting() && m.shows_screens());
+
+        m.apply(Event::Closed {
+            epoch: 2,
+            reason: String::new(),
+        });
+        m.apply(Event::NotOpened {
+            epoch: 3,
+            probe: Probe::Failed("offline".into()),
+        });
+        assert!(!m.reconnecting() && !m.shows_screens());
+
+        assert!(
+            !Machine::new().shows_screens(),
+            "a first connect is not a reconnect"
         );
     }
 

@@ -83,7 +83,8 @@ fn NativeApp(route: Route) -> Element {
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
-                api.set(None);
+                // A reconnect keeps the old API until the new one resumes,
+                // so the screens keep what they loaded.
                 task.set(Some(spawn(connect(machine, api, epoch, delay))));
             }
             Phase::Connecting | Phase::Ready => {}
@@ -98,9 +99,39 @@ fn NativeApp(route: Route) -> Element {
         }
     });
 
+    // Ready and reconnecting render through this one node, so a dropped
+    // socket does not remount the screen (and its playing video).
+    if machine.read().shows_screens() {
+        let notice = {
+            let m = machine.read();
+            if m.reconnecting() {
+                Some("Connection lost. Reconnecting…".to_owned())
+            } else {
+                m.notice().map(str::to_owned)
+            }
+        };
+        return rsx! {
+            Shell {
+                on_sign_out: move |_| {
+                    if machine.peek().signing_out() {
+                        return;
+                    }
+                    machine.write().apply(Event::SignOutSubmitted);
+                    spawn(async move {
+                        let reply = platform::sign_out().await;
+                        machine.write().apply(Event::SignOutAnswered(reply));
+                    });
+                },
+                if let Some(message) = notice {
+                    ErrorNote { message }
+                }
+                Screen { route }
+            }
+        };
+    }
     let phase = machine.read().phase().clone();
     match phase {
-        Phase::Connecting => rsx! {
+        Phase::Connecting | Phase::Ready => rsx! {
             StatusView {
                 title: "Connecting…",
                 detail: "Opening a connection to the server.",
@@ -135,27 +166,6 @@ fn NativeApp(route: Route) -> Element {
                 },
             }
         },
-        Phase::Ready => {
-            let notice = machine.read().notice().map(str::to_owned);
-            rsx! {
-                Shell {
-                    on_sign_out: move |_| {
-                        if machine.peek().signing_out() {
-                            return;
-                        }
-                        machine.write().apply(Event::SignOutSubmitted);
-                        spawn(async move {
-                            let reply = platform::sign_out().await;
-                            machine.write().apply(Event::SignOutAnswered(reply));
-                        });
-                    },
-                    if let Some(message) = notice {
-                        ErrorNote { message }
-                    }
-                    Screen { route }
-                }
-            }
-        }
     }
 }
 
