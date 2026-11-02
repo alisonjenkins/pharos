@@ -21,16 +21,14 @@ fn bundle(dir: &Path) -> Arc<ui::UiBundle> {
     Arc::new(ui::UiBundle::load(dir).unwrap())
 }
 
-/// The production app's routes and middleware, with the UI configured first
-/// as `main` does.
+/// The production app's routes, from the composition `main` uses.
 macro_rules! app {
     ($bundle:expr) => {
         test::init_service(
             App::new()
                 .wrap(LowercasePath)
-                .configure(ui::configure($bundle))
-                .configure(router::configure)
-                .configure(pharos_server::api::pharos::rpc::configure(
+                .configure(router::configure_app(
+                    Some($bundle),
                     NativeApiConfig {
                         enabled: true,
                         ..NativeApiConfig::default()

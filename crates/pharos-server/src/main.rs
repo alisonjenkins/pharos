@@ -2084,7 +2084,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .allow_any_header()
             .expose_any_header()
             .max_age(3600);
-        let mut app = App::new()
+        App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
@@ -2105,12 +2105,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
             .wrap(RedMetrics)
             .wrap(LowercasePath)
-            .wrap(cors);
-        if let Some(bundle) = ui_bundle.as_ref() {
-            app = app.configure(pharos_server::ui::configure(bundle.clone()));
-        }
-        app.configure(router::configure)
-            .configure(pharos_server::api::pharos::rpc::configure(
+            .wrap(cors)
+            .configure(router::configure_app(
+                ui_bundle.clone(),
                 native_api.clone(),
                 native_limits.clone(),
             ))

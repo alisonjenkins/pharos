@@ -9,6 +9,9 @@
 //! `"pharos"` answer, and its default service only sees paths no API route
 //! claimed. A browser navigating to a UI route gets `index.html`; an API
 //! client, a non-GET, or a path that names a file gets 404.
+//!
+//! [`router::configure_app`](crate::router::configure_app) does the ordering;
+//! `main` and the tests share it.
 
 use actix_files::NamedFile;
 use actix_web::http::header::{self, CacheControl, CacheDirective, HeaderValue};

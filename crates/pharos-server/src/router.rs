@@ -82,6 +82,24 @@ async fn metrics(state: Option<web::Data<crate::state::AppState>>) -> impl Respo
         .body(crate::obs::render())
 }
 
+/// Every route the server answers, in precedence order: pharos-ui first
+/// when a bundle is configured (its `/` and its fallback), then the core and
+/// Jellyfin routes, then the native API. `main` and the tests both build
+/// the app from this, so a reordering is caught by `it_wire::ui_serving`.
+pub fn configure_app(
+    ui: Option<std::sync::Arc<crate::ui::UiBundle>>,
+    native_api: crate::config::NativeApiConfig,
+    limits: crate::api::pharos::rpc::limits::ConnectionLimits,
+) -> impl FnOnce(&mut web::ServiceConfig) {
+    move |cfg| {
+        if let Some(bundle) = ui {
+            cfg.configure(crate::ui::configure(bundle));
+        }
+        cfg.configure(configure)
+            .configure(crate::api::pharos::rpc::configure(native_api, limits));
+    }
+}
+
 /// Wire core routes. Health endpoints are wired separately via `health::configure`
 /// so they can be reused/mounted independently.
 pub fn configure(cfg: &mut web::ServiceConfig) {
