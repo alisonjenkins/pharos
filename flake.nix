@@ -629,6 +629,8 @@
             pkgs.dioxus-cli
             wasmBindgenCli
             pkgs.binaryen
+            # pharos-api's build script compiles the schema with `capnp`.
+            pkgs.capnproto
             pkgs.rustPlatform.cargoSetupHook
           ];
           cargoDeps = pkgs.rustPlatform.importCargoLock {
