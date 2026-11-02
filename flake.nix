@@ -45,12 +45,12 @@
         # bumps its wasm-bindgen pin.)
         wasmBindgenCli = pkgs.rustPlatform.buildRustPackage rec {
           pname = "wasm-bindgen-cli";
-          version = "0.2.122";
+          version = "0.2.128";
           src = pkgs.fetchCrate {
             inherit pname version;
-            hash = "sha256-vO4RSxi/sMWxmsEs3GuljdMfIRSu75A+Q+c5wgYToRU=";
+            hash = "sha256-a7lcXJnnZkYReja+iUO7NqqrWyv3toxnUgQb8s4IS5s=";
           };
-          cargoHash = "sha256-Inup6vvJSG5ghNyeDPyZbfZo4d0LsMG2OJfStoaeDBs=";
+          cargoHash = "sha256-R1Tas33Ursy8kqsxguAkG0ZhNed2n5uFTAhw1l2qlLY=";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.curl ];
