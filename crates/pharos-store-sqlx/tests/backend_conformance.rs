@@ -929,10 +929,12 @@ where
             .is_none(),
         "a row written before the cutoff must not be returned"
     );
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 200)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 200)
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     // Prune below the row's updated_at (200) is a no-op; above it removes.
     let pruned_none = TranscodeSessionStore::prune_transcode_sessions(&store, 150)
@@ -942,18 +944,22 @@ where
         pruned_none, 0,
         "prune cutoff below updated_at removes nothing"
     );
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let pruned = TranscodeSessionStore::prune_transcode_sessions(&store, 300)
         .await
         .unwrap();
     assert_eq!(pruned, 1, "prune cutoff above updated_at removes the row");
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Explicit remove path (re-insert, then delete).
     TranscodeSessionStore::upsert_transcode_session(&store, psid, &sess, 400)
@@ -962,10 +968,12 @@ where
     TranscodeSessionStore::remove_transcode_session(&store, psid)
         .await
         .unwrap();
-    assert!(TranscodeSessionStore::get_transcode_session(&store, psid, 0)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        TranscodeSessionStore::get_transcode_session(&store, psid, 0)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // -----------------------------------------------------------------
     // 11. SyncGroupStore (Phase B4 group-survives-deploy snapshot)

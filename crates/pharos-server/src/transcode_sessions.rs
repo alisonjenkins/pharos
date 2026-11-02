@@ -418,8 +418,14 @@ mod tests {
         let store = store().await;
         let row = TranscodeSessionRegistry::<SqliteStore>::to_persisted(&sample_session()).unwrap();
         let written = now_unix_secs() - DB_RETENTION_SECS;
-        store.upsert_transcode_session("stale", &row, written - 1).await.unwrap();
-        store.upsert_transcode_session("fresh", &row, written + 60).await.unwrap();
+        store
+            .upsert_transcode_session("stale", &row, written - 1)
+            .await
+            .unwrap();
+        store
+            .upsert_transcode_session("fresh", &row, written + 60)
+            .await
+            .unwrap();
         let r = TranscodeSessionRegistry::spawn(store);
         assert!(r.get("stale").await.unwrap().is_none());
         assert!(r.get("fresh").await.unwrap().is_some());
@@ -438,11 +444,18 @@ mod tests {
         a.insert("s".into(), session.clone()).await.unwrap();
         assert!(a.get_stored("s").await.unwrap().is_some());
         assert!(b.end_held("s", holder).await.unwrap());
-        assert!(a.get("s").await.unwrap().is_some(), "a's cache is untouched");
+        assert!(
+            a.get("s").await.unwrap().is_some(),
+            "a's cache is untouched"
+        );
         assert!(a.get_stored("s").await.unwrap().is_none());
 
         a.insert("old".into(), session).await.unwrap();
-        let row = shared.get_transcode_session("old", 0).await.unwrap().unwrap();
+        let row = shared
+            .get_transcode_session("old", 0)
+            .await
+            .unwrap()
+            .unwrap();
         shared
             .upsert_transcode_session("old", &row, now_unix_secs() - DB_RETENTION_SECS - 1)
             .await
