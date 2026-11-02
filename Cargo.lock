@@ -3393,6 +3393,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pharos-api",
  "pharos-cache",
+ "pharos-client",
  "pharos-core",
  "pharos-discovery",
  "pharos-jellyfin-api",

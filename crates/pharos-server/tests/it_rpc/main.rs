@@ -8,6 +8,7 @@
 mod common;
 
 mod bootstrap;
+mod client;
 mod connect;
 mod gate;
 mod library;
