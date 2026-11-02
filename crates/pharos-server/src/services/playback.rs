@@ -1068,6 +1068,94 @@ pub async fn pick_audio(
     }
 }
 
+/// Picks the subtitle `item` starts with for the audio in `audio`; `None` is
+/// no subtitle. `explicit` is the client's pick on this request (`-1` off).
+pub fn pick_subtitle(
+    audio: &AudioPick,
+    streams: &[pharos_jellyfin_api::dto::MediaStreamDto],
+    probe: &pharos_core::MediaProbe,
+    subtitle_profiles: &[SubtitleProfileDto],
+    explicit: Option<i64>,
+) -> Option<u32> {
+    // P12 — `DefaultSubtitleStreamIndex` resolution priority:
+    //   0. What the CLIENT asked for on THIS request, if it asked at all.
+    //   1. Any subtitle track flagged `is_default` (probed from the
+    //      container's disposition bits).
+    //   2. The first English-language track.
+    //   3. The first subtitle track of any kind.
+    // None when no subtitle tracks exist — client renders no default.
+    //
+    // Step 0 is what makes "subtitles off" STICK. This field is not a
+    // description of the file, it is pharos telling the client what to select
+    // for this playback — so computing it from the container alone answered a
+    // client that had just sent `SubtitleStreamIndex=-1` with "the default
+    // subtitle is 2", and the client obediently selected it. Measured live
+    // 2026-07-26, one second apart:
+    //
+    //   04:06:29  requested Some(-1) → resolved None
+    //   04:06:30  requested Some(2)  → resolved Some(2), delivery Burn
+    //
+    // The re-selection was the client obeying this field, which is why turning
+    // subtitles off appeared to do nothing on Google TV. An explicit pick is
+    // echoed back; explicit off answers None; only an absent field falls
+    // through to the container's own preference (so B44's forced-Na'vi track
+    // and B104's default ASS are untouched).
+    match explicit {
+        // The client stated a choice on THIS request — echo it back, including
+        // "off" (-1 → None). Filtered against the advertised streams so a stale
+        // index cannot name a track that isn't there.
+        Some(n) => u32::try_from(n).ok().filter(|idx| {
+            streams
+                .iter()
+                .any(|s| s.kind == "Subtitle" && s.index == *idx)
+        }),
+        // No choice stated on this request — a remembered one still counts,
+        // including a remembered -1 (subtitles OFF), which is a choice like
+        // any other and must survive a resume.
+        None if audio.prefs.remember_subtitle
+            && audio.remembered.subtitle_stream_index.is_some() =>
+        {
+            audio
+                .remembered
+                .subtitle_stream_index
+                .filter(|i| *i >= 0)
+                .and_then(|i| u32::try_from(i).ok())
+                .filter(|idx| {
+                    streams
+                        .iter()
+                        .any(|s| s.kind == "Subtitle" && s.index == *idx)
+                })
+        }
+        // Nothing chosen, ever — the user's SubtitleMode decides.
+        //
+        // This replaces a hand-rolled ladder (default flag → first English →
+        // ANY subtitle track). Its last rung is the reason subtitles appeared
+        // on titles nobody asked them for: a container with one non-default,
+        // non-forced track always selected it. Jellyfin's Default mode picks
+        // only external/default/forced, so B44's forced track and B104's
+        // default ASS still select — and still burn — while an incidental
+        // track no longer switches itself on.
+        // The ladder above is a faithful port of upstream's mode/language
+        // selection (stream_select.rs) and knows nothing of burn cost — it
+        // picked the container-default PGS "Signs & Songs" track for Code
+        // Geass live 2026-08-29 while the burn path separately declined to
+        // ever deliver it, so jellyfin-web pre-selected a subtitle that
+        // rendered nothing during dialogue. Route its answer through the same
+        // veto `resolve_selected_subtitle` applies to the container default,
+        // so `DefaultSubtitleStreamIndex` never points at a track this
+        // session will not actually burn.
+        None => crate::api::jellyfin::stream_select::default_subtitle_stream_index(
+            &crate::api::jellyfin::stream_select::subtitle_facts(streams),
+            &audio.prefs.subtitle_languages,
+            audio.prefs.subtitle_mode,
+            audio.language.as_deref(),
+        )
+        .and_then(|idx| probe.subtitle_tracks.iter().find(|t| t.stream_index == idx))
+        .and_then(|candidate| accept_or_decline_uninvited_burn(candidate, probe, subtitle_profiles))
+        .map(|t| t.stream_index),
+    }
+}
+
 /// Append `&AudioStreamIndex={idx}` to a transcode URL that doesn't already
 /// carry one, so the server's auto-selected audio track (the same absolute
 /// index that becomes `DefaultAudioStreamIndex`) rides the initial URL. Absent
