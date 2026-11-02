@@ -13,6 +13,7 @@ mod bootstrap;
 mod library;
 pub mod limits;
 pub mod origin;
+mod playback;
 mod session;
 pub mod socket;
 mod user_data;
