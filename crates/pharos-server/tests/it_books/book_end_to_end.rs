@@ -45,7 +45,7 @@ const OPF: &str = r#"<?xml version="1.0"?>
 </package>"#;
 
 /// A spec-shaped epub: uncompressed `mimetype` first, then container, then OPF.
-fn write_epub(path: &std::path::Path) {
+pub(crate) fn write_epub(path: &std::path::Path) {
     let f = std::fs::File::create(path).unwrap();
     let mut zw = zip::ZipWriter::new(f);
     let stored =
@@ -71,7 +71,7 @@ fn write_epub(path: &std::path::Path) {
 /// this proves SC-002 end to end rather than by counting: if anything routes a
 /// book to ffmpeg, the test dies rather than quietly succeeding.
 #[derive(Clone, Default)]
-struct NeverProber;
+pub(crate) struct NeverProber;
 
 impl pharos_core::Prober for NeverProber {
     async fn probe(

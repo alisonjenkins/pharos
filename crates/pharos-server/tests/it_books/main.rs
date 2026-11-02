@@ -8,3 +8,4 @@ mod book_read_progress;
 mod item_download;
 mod library_watch_fallback;
 mod remote_end_to_end;
+mod rescan_held_path;
