@@ -189,28 +189,6 @@ pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
     }
 }
 
-#[component]
-pub fn BrowseView(title: String, page: Page) -> Element {
-    rsx! {
-        section { class: "pharos-browse",
-            h2 { "{title}" }
-            if page.items.is_empty() {
-                p { class: "pharos-empty", "Nothing in here yet." }
-            }
-            ul { class: "pharos-grid",
-                for item in page.items.iter() {
-                    li { key: "{item.id}", PosterTile { item: item.clone() } }
-                }
-            }
-            if page.total as usize > page.items.len() {
-                p { class: "pharos-muted",
-                    "Showing {page.items.len()} of {page.total}."
-                }
-            }
-        }
-    }
-}
-
 /// What the find screen shows under its box.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Hits {
@@ -550,8 +528,9 @@ mod tests {
             total: 3,
             start: 0,
         };
-        let html =
-            render(move || rsx! { BrowseView { title: "Shows".to_string(), page: page.clone() } });
+        let html = render(
+            move || rsx! { crate::native::browse::GridView { title: "Shows".to_string(), page: page.clone() } },
+        );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
         assert!(html.contains("Showing 1 of 3."), "{html}");
     }
