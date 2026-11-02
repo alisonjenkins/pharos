@@ -16,6 +16,7 @@ pub mod origin;
 mod playback;
 mod session;
 pub mod socket;
+mod telemetry;
 mod user_data;
 
 use std::cell::RefCell;

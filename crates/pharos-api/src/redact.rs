@@ -38,7 +38,7 @@ pub fn is_secret(field: Field) -> bool {
 /// `t` cut to at most `max` bytes, with `…(<len> bytes)` appended when cut;
 /// text that is not UTF-8 renders as `<invalid utf-8: <len> bytes>` rather
 /// than vanishing.
-pub(crate) fn bounded_text(t: capnp::text::Reader<'_>, max: usize) -> String {
+pub fn bounded_text(t: capnp::text::Reader<'_>, max: usize) -> String {
     match t.to_str() {
         Ok(s) => format!("{}{}", cut(s, max), cut_note(s, max)),
         Err(_) => invalid_utf8(t),
