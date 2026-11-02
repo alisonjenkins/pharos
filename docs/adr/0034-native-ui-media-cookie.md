@@ -20,7 +20,8 @@ would answer 401 (T145).
 We will have `POST /pharos/session` also set a `pharos_media` cookie holding
 the same token: HttpOnly, SameSite=Strict, Secure, `Path=/`, the same 400-day
 lifetime. `DELETE /pharos/session` clears it alongside `pharos_session`.
-`extract_media_token` reads it after `JellyfinAuth`, so it has exactly
+`media_token` reads it after `JellyfinAuth`, and in place of a `JellyfinAuth`
+holding a different token that no longer resolves. It has exactly
 `JellyfinAuth`'s scope (V191): GET and HEAD on routes that serve item bytes to
 element URLs. Every write and every JSON API route still ignores it.
 
@@ -37,8 +38,10 @@ UI's sign-out cannot clear jellyfin-web's.
   bytes as the viewer (it cannot read them back), including starting
   transcode work through an HLS playlist.
 - A browser signed in to jellyfin-web and the native UI as different users
-  authorises element fetches as the jellyfin-web user, because
-  `JellyfinAuth` is read first. Signing out of jellyfin-web hands them to the
+  authorises element fetches as the jellyfin-web user, because a live
+  `JellyfinAuth` is read first. A stale one (a revoked device) does not
+  shadow a live `pharos_media`, at the cost of one extra token lookup when
+  the two cookies differ. Signing out of jellyfin-web hands them to the
   native UI's user.
 - T145's signed URLs remain the way to remove the cookie entirely. That needs
   a server key and signing every URL a playlist emits, which is more work
