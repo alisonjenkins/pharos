@@ -15,3 +15,4 @@ mod platform;
 pub mod playback;
 pub mod route;
 pub mod views;
+pub mod visualiser;
