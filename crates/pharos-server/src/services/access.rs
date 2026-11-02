@@ -192,9 +192,61 @@ pub async fn visible_items(
     Ok(Arc::new(kept.into_iter().cloned().collect()))
 }
 
+/// What a caller wants of a playlist: `Read` lists it, `Write` changes or
+/// deletes it. The `action` label of `pharos_playlist_access_denied_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaylistAccess {
+    Read,
+    Write,
+}
+
+impl PlaylistAccess {
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaylistAccess::Read => "read",
+            PlaylistAccess::Write => "write",
+        }
+    }
+}
+
+/// Whether `user` may `access` `playlist`. A playlist answers its owner; a
+/// server-owned one (no owner) is read by everyone and changed only by an
+/// admin. A wire layer answers a refusal as "not found", so another user's
+/// playlist is indistinguishable from a missing one. Each refusal counts
+/// under `pharos_playlist_access_denied_total{action}`.
+pub fn check_playlist(
+    user: &User,
+    playlist: &pharos_core::Playlist,
+    access: PlaylistAccess,
+    route: &'static str,
+) -> bool {
+    let allowed = match playlist.owner_user_id.as_deref() {
+        Some(owner) => owner == user.id.0.simple().to_string(),
+        None => access == PlaylistAccess::Read || user.policy.admin,
+    };
+    if !allowed {
+        metrics::counter!("pharos_playlist_access_denied_total", "action" => access.label())
+            .increment(1);
+        tracing::warn!(
+            playlist = %playlist.wire_id,
+            owner = playlist.owner_user_id.as_deref().unwrap_or("server"),
+            user = %user.name,
+            action = access.label(),
+            route,
+            "playlist withheld from a user who does not own it"
+        );
+    }
+    allowed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_action_labels_are_distinct() {
+        assert_ne!(PlaylistAccess::Read.label(), PlaylistAccess::Write.label());
+    }
 
     #[test]
     fn reason_labels_are_distinct() {
