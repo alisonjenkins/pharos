@@ -639,7 +639,9 @@
           buildPhase = ''
             runHook preBuild
             export HOME=$TMPDIR
-            dx build --package pharos-ui --release
+            # dx keeps DWARF by default, and binaryen aborts re-emitting it
+            # (wasm-opt SIGABRT), which ships the wasm unoptimised.
+            dx build --package pharos-ui --release --debug-symbols false
             runHook postBuild
           '';
           installPhase = ''
