@@ -32,6 +32,7 @@ the caller's `api_key` for clients without the cookie.
 ## Consequences
 
 - jellyfin-web posters and subtitle tracks work unmodified.
+- An existing header-token session regains the cookie on its next authenticated request, so a browser that signed in before this change needs no sign-out.
 - A cross-subdomain page can at most make the browser fetch an item's bytes
   as the viewer, which it cannot read back across origins. It cannot change
   data, but a GET of an HLS playlist or segment does start transcode work and
