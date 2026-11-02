@@ -16,6 +16,7 @@ use pharos_ui::client::{
     LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry,
     QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
+use pharos_ui::native::appearance::AppearanceView;
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
     LibraryView, LiveTvStatus, LiveTvView, LoginForm, PlayerView, PrefsTab, PrefsView,
@@ -1458,4 +1459,52 @@ fn find_view_shows_a_failed_search_as_an_alert() {
     let html = render_find("Alpha", Hits::Failed("the server is busy".into()));
     assert!(html.contains(r#"role="alert""#), "{html}");
     assert!(html.contains("the server is busy"), "{html}");
+}
+
+// ---- Appearance: diagnostics opt-in ------------------------------
+
+fn appearance_page() -> Element {
+    rsx! {
+        AppearanceView {
+            themes: Vec::new(),
+            auto: false,
+            editor: None,
+            notice: None,
+            diagnostics: false,
+            on_diagnostics: |_| {},
+            on_pick: |_| {},
+            on_auto: |_| {},
+            on_customise: |_| {},
+            on_edit_custom: |_| {},
+            on_delete: |_| {},
+            on_export: |_| {},
+            on_import_file: |_| {},
+            on_import_paste: |_| {},
+            on_edit: |_| {},
+            on_save: |_| {},
+            on_cancel: |_| {},
+        }
+    }
+}
+
+#[test]
+fn appearance_diagnostics_toggle_is_labelled_and_unchecked_by_default() {
+    let html = render_root(appearance_page);
+    assert!(
+        html.contains("Send diagnostics to this server"),
+        "missing toggle label: {html}"
+    );
+    let id_at = html
+        .find(r#"id="diagnostics-opt-in""#)
+        .unwrap_or_else(|| panic!("missing toggle input: {html}"));
+    let tag_start = html[..id_at].rfind("<input").unwrap_or(0);
+    let tag = &html[tag_start..id_at + html[id_at..].find('>').unwrap_or(0)];
+    assert!(
+        tag.contains(r#"type="checkbox""#),
+        "toggle is not a checkbox: {tag}"
+    );
+    assert!(
+        !tag.contains("checked"),
+        "toggle must be unchecked by default: {tag}"
+    );
 }

@@ -76,6 +76,8 @@ pub fn AppearanceView(
     auto: bool,
     editor: Option<EditorView>,
     notice: Option<Notice>,
+    diagnostics: bool,
+    on_diagnostics: EventHandler<bool>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -105,6 +107,22 @@ pub fn AppearanceView(
                 aria_pressed: if auto { "true" } else { "false" },
                 onclick: move |_| on_auto.call(()),
                 "Auto (follow the system)"
+            }
+            fieldset { class: "pharos-diagnostics",
+                legend { "Diagnostics" }
+                label {
+                    input {
+                        r#type: "checkbox",
+                        id: "diagnostics-opt-in",
+                        checked: diagnostics,
+                        aria_describedby: "diagnostics-help",
+                        onchange: move |ev| on_diagnostics.call(ev.checked()),
+                    }
+                    "Send diagnostics to this server"
+                }
+                p { id: "diagnostics-help",
+                    "Off by default. When on, playback errors and theme fallbacks are sent to this server's logs. Stream URLs and credentials are never sent."
+                }
             }
             ul { class: "pharos-theme-gallery",
                 for card in themes.iter() {
@@ -361,6 +379,8 @@ mod tests {
                     auto: false,
                     editor: editor.clone(),
                     notice: notice.clone(),
+                    diagnostics: false,
+                    on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
                     on_customise: |_| {},
