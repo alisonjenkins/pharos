@@ -3094,6 +3094,19 @@ pub trait MediaStore: Send + Sync {
         q: &MediaQuery,
     ) -> impl std::future::Future<Output = DomainResult<(Vec<MediaItem>, u64)>> + Send;
 
+    /// The ids of the items [`query`](Self::query) would return for `q`, in
+    /// the same order and page, without loading their rows. An access check
+    /// over a whole library asks for ids only; the default reads full rows.
+    fn query_ids(
+        &self,
+        q: &MediaQuery,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send {
+        async move {
+            let (items, _) = self.query(q).await?;
+            Ok(items.into_iter().map(|i| i.id).collect())
+        }
+    }
+
     /// LIB-B4 — full-text search over `title` + `overview` via the
     /// backend's native FTS (SQLite fts5 external-content vtable; postgres
     /// a GENERATED `tsvector` + GIN). Returns up to `limit` items ranked
