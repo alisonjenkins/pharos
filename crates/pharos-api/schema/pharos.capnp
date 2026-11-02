@@ -122,6 +122,10 @@ interface Session {
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
 
 # ---- library --------------------------------------------------------------
+# `kinds` naming exactly one kind pharos only synthesises (series, season,
+# album, artist) lists those groups under `parentId`, folded out of the
+# stored rows there; seasons need a series parent (V230). Any other list
+# filters stored rows by kind.
 struct ItemQuery {
   parentId @0 :ItemId;         # pointer field: absent means "no parent filter"
   kinds @1 :List(Kind); sortBy @2 :Text; descending @3 :Bool;
