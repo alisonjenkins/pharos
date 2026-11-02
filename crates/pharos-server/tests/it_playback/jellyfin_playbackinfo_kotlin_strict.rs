@@ -278,10 +278,18 @@ async fn playback_info_and_item_dto_serialize_video_3d_format_strictly() {
         assert!(!sources.is_empty(), "at least one MediaSource");
         for src in sources {
             assert_required(src, MEDIA_SOURCE_REQUIRED, "MediaSourceInfo");
+            // V233: a transcode of MVC is 2D, so it advertises no format.
+            let serves_file =
+                src["SupportsDirectPlay"] == true || src["SupportsDirectStream"] == true;
+            let wire = if *wire == "MVC" && !serves_file {
+                None
+            } else {
+                Some(*wire)
+            };
             assert_eq!(
                 src["Video3DFormat"].as_str(),
-                Some(*wire),
-                "MediaSourceInfo Video3DFormat must be exact string {wire}"
+                wire,
+                "MediaSourceInfo Video3DFormat must be exact string {wire:?}"
             );
             assert!(
                 src.get("Video3dFormat").is_none() || src["Video3dFormat"].is_null(),
@@ -296,8 +304,8 @@ async fn playback_info_and_item_dto_serialize_video_3d_format_strictly() {
                 if stream_type == "Video" {
                     assert_eq!(
                         s["Video3DFormat"].as_str(),
-                        Some(*wire),
-                        "Video MediaStream Video3DFormat must match {wire}"
+                        wire,
+                        "Video MediaStream Video3DFormat must match {wire:?}"
                     );
                     assert!(
                         s.get("Video3dFormat").is_none() || s["Video3dFormat"].is_null(),
