@@ -186,7 +186,13 @@ compat-dioxus-full native="on":
       exit "$status"
     }
     trap cleanup EXIT
-    UI_DIR=$(nix build --no-link --print-out-paths .#pharosUiBundle)
+    UI_SRC=$(nix build --no-link --print-out-paths .#pharosUiBundle)
+    # On CI the nix daemon is the host's, so no root under this pod's $TMP
+    # protects a store path: its auto-GC can delete the bundle before pharos
+    # reads it (B284). Serve a copy instead.
+    mkdir -p "$TMP/ui"
+    cp -rL --no-preserve=mode "$UI_SRC/." "$TMP/ui/"
+    UI_DIR="$TMP/ui"
     MEDIA_SRC=$(nix build --no-link --print-out-paths .#testMediaTree)
     # The seed writes fixture-*.webm into the media root; a store path is
     # read-only, so copy the tree into a writable directory.
@@ -225,10 +231,10 @@ compat-dioxus-full native="on":
     PHAROS_CONFIG="$TMP/pharos.toml"
     nix develop --command cargo build -q --bin pharos --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
-    echo "compat-dioxus-full: ui bundle $UI_DIR"
-    if [[ -d "$UI_DIR" ]]; then echo "  present"; else echo "  MISSING from this view of /nix/store"; fi
-    nix path-info "$UI_DIR" 2>&1 | sed 's/^/  path-info: /' || true
-    nix-store -q --roots "$UI_DIR" 2>&1 | sed 's/^/  root: /' || true
+    echo "compat-dioxus-full: ui bundle $UI_SRC, served from $UI_DIR"
+    if [[ -d "$UI_SRC" ]]; then echo "  present"; else echo "  MISSING from this view of /nix/store"; fi
+    nix path-info "$UI_SRC" 2>&1 | sed 's/^/  path-info: /' || true
+    nix-store -q --roots "$UI_SRC" 2>&1 | sed 's/^/  root: /' || true
     df -h /nix/store 2>&1 | tail -1 | sed 's/^/  df: /' || true
     if [[ -r /proc/self/mountinfo ]]; then grep -E ' /nix(/| )' /proc/self/mountinfo | sed 's/^/  mount: /' || true; fi
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
