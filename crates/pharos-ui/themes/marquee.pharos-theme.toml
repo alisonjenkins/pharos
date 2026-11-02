@@ -1,0 +1,31 @@
+[meta]
+name = "Marquee"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+extends = "Pharos Night"
+
+[palette]
+bg = "#000000"
+surface = "#141414"
+surface-raised = "#1f1f1f"
+overlay = "#0a0a0a"
+border = "#2b2b2b"
+fg = "#ffffff"
+fg-muted = "#a3a3a3"
+accent = "#c11119"
+accent-fg = "#ffffff"
+focus = "#ffffff"
+progress = "#e5303a"
+
+[type]
+display = "sans"
+
+[effects]
+blur_px = 32
+vignette = 0.6
+glow = 0.2
+
+[layout]
+rail_poster = "numbered"

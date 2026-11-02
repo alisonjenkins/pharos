@@ -64,6 +64,7 @@ getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optio
 pharos-client = { path = "../pharos-client" }
 serde = { workspace = true }
 serde_json.workspace = true
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde", "std"] }
 thiserror.workspace = true
 # NOTE: pharos-ui deliberately does NOT depend on workspace-hack — it builds
 # for wasm32 and the hack pulls the native-only stack (sqlx/tokio/mio). It is

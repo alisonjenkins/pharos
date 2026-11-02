@@ -1,0 +1,25 @@
+[meta]
+name = "Kali Purple"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+extends = "Pharos Night"
+
+[palette]
+bg = "#170f26"
+surface = "#23173a"
+surface-raised = "#2d1f4a"
+overlay = "#1c1230"
+border = "#3d2c63"
+fg = "#efe9ff"
+fg-muted = "#b3a6d4"
+accent = "#b06cff"
+accent-fg = "#1a0833"
+focus = "#ff5fd2"
+progress = "#b06cff"
+
+[effects]
+background = "gradient"
+blur_px = 28
+glow = 0.7
