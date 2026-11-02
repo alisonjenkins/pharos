@@ -753,3 +753,62 @@ pub async fn detail(
         .map_err(DetailError::Store)?;
     Ok((item, user_data))
 }
+
+/// Per-rail sizes the home page uses when the caller names none: the
+/// counts jellyfin-web's home sections request (16 latest per library,
+/// 12 to resume, 24 next up).
+pub const HOME_LATEST_DEFAULT: u32 = 16;
+pub const HOME_RESUME_DEFAULT: u32 = 12;
+pub const HOME_NEXT_UP_DEFAULT: u32 = 24;
+
+/// Everything the home page shows, in one answer: each library the user
+/// may see with its newest items, what to resume, and what is next up.
+#[derive(Debug)]
+pub struct Home {
+    pub rails: Vec<(LibraryView, Vec<(MediaItem, UserItemData)>)>,
+    pub resume: ListPage,
+    pub next_up: ListPage,
+}
+
+/// The home page for `user`, from [`views`], [`latest`], [`resume`] and
+/// [`next_up`]. A limit of `None` takes that rail's `HOME_*_DEFAULT`.
+pub async fn home(
+    state: &AppState,
+    user: &User,
+    latest_per_view: Option<u32>,
+    resume_limit: Option<u32>,
+    next_up_limit: Option<u32>,
+) -> Result<Home, ListError> {
+    let mut rails = Vec::new();
+    for view in views(state, &user.policy).await {
+        let items = latest(
+            state,
+            user,
+            Some(&view.id),
+            &KindFilter::Unset,
+            Some(latest_per_view.unwrap_or(HOME_LATEST_DEFAULT)),
+        )
+        .await?;
+        rails.push((view, items));
+    }
+    let resume = resume(
+        state,
+        user,
+        &KindFilter::Unset,
+        0,
+        Some(resume_limit.unwrap_or(HOME_RESUME_DEFAULT)),
+    )
+    .await?;
+    let next_up = next_up(
+        state,
+        user,
+        None,
+        Some(next_up_limit.unwrap_or(HOME_NEXT_UP_DEFAULT)),
+    )
+    .await?;
+    Ok(Home {
+        rails,
+        resume,
+        next_up,
+    })
+}

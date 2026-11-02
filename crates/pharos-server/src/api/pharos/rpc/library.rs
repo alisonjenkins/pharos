@@ -4,7 +4,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    item_id, item_summary, items_result, library as wire, Kind, LibraryKind as WireKind,
+    home_result, item_id, item_summary, items_result, library as wire, Kind,
+    LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, User, UserItemData};
@@ -276,6 +277,32 @@ impl server::library::Handler for Library {
         Ok(())
     }
 
+    async fn home(
+        self: Rc<Self>,
+        params: wire::HomeParams,
+        results: &mut wire::HomeResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        // 0 is each field's default: the caller asked for no particular size.
+        let size = |n: u32| Some(n).filter(|&n| n > 0);
+        let (latest, resume, next_up) = (
+            size(params.get_latest_per_view()),
+            size(params.get_resume_limit()),
+            size(params.get_next_up_limit()),
+        );
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let home = library::home(state, &user, latest, resume, next_up).await;
+        write_home(results.get().init_result(), home, &state.server_id);
+        Ok(())
+    }
+
     async fn next_up(
         self: Rc<Self>,
         params: wire::NextUpParams,
@@ -302,6 +329,79 @@ impl server::library::Handler for Library {
     }
 }
 
+/// The home page, or `unavailable` with its cause logged.
+fn write_home(
+    out: home_result::Builder<'_>,
+    home: Result<library::Home, ListError>,
+    server_id: &str,
+) {
+    let home = match home {
+        Ok(home) => home,
+        Err(e) => {
+            tracing::warn!(method = "home", error = %list_error_detail(&e), "native library: listing unavailable");
+            Denial::Unavailable {
+                dependency: "media store",
+            }
+            .write(out.init_error());
+            return;
+        }
+    };
+    let rails: Vec<(WireId, &LibraryView, &Rows)> = home
+        .rails
+        .iter()
+        .filter_map(|(view, items)| match WireId::parse(&view.id) {
+            Some(id) => Some((id, view, items.as_slice())),
+            None => {
+                tracing::warn!(id = %view.id, name = %view.name, "native library: view id is not a wire id; skipped");
+                None
+            }
+        })
+        .collect();
+    let mut out = out.init_home();
+    let count = u32::try_from(rails.len()).unwrap_or(u32::MAX);
+    let mut list = out.reborrow().init_rails(count);
+    for (i, (id, view, items)) in (0..count).zip(&rails) {
+        let mut rail = list.reborrow().get(i);
+        write_view(rail.reborrow().init_view(), *id, view);
+        write_items(rail.init_latest(len_u32(items)), items, server_id);
+    }
+    write_items(
+        out.reborrow().init_resume(len_u32(&home.resume.items)),
+        &home.resume.items,
+        server_id,
+    );
+    write_items(
+        out.init_next_up(len_u32(&home.next_up.items)),
+        &home.next_up.items,
+        server_id,
+    );
+}
+
+/// Listed items with the user's play state, as the services return them.
+type Rows = [(MediaItem, UserItemData)];
+
+fn len_u32<T>(items: &[T]) -> u32 {
+    u32::try_from(items.len()).unwrap_or(u32::MAX)
+}
+
+/// `items` into `out`, which holds `len_u32(items)` summaries.
+fn write_items(
+    mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
+    items: &Rows,
+    server_id: &str,
+) {
+    for (i, (item, user_data)) in (0..out.len()).zip(items) {
+        write_item(out.reborrow().get(i), item, *user_data, server_id);
+    }
+}
+
+fn list_error_detail(e: &ListError) -> String {
+    match e {
+        ListError::Hidden(hidden) => hidden.label().to_owned(),
+        ListError::Store(e) => e.to_string(),
+    }
+}
+
 /// A listing's page, or `unavailable` with its cause logged.
 fn write_listing(
     out: items_result::Builder<'_>,
@@ -312,11 +412,7 @@ fn write_listing(
     let listed = match listed {
         Ok(listed) => listed,
         Err(e) => {
-            let detail = match &e {
-                ListError::Hidden(hidden) => hidden.label().to_owned(),
-                ListError::Store(e) => e.to_string(),
-            };
-            tracing::warn!(method, error = %detail, "native library: listing unavailable");
+            tracing::warn!(method, error = %list_error_detail(&e), "native library: listing unavailable");
             Denial::Unavailable {
                 dependency: "media store",
             }
@@ -324,14 +420,14 @@ fn write_listing(
             return;
         }
     };
-    let count = u32::try_from(listed.items.len()).unwrap_or(u32::MAX);
     let mut page = out.init_page();
     page.set_total(listed.total);
     page.set_start(listed.start);
-    let mut items = page.init_items(count);
-    for (i, (item, user_data)) in (0..count).zip(&listed.items) {
-        write_item(items.reborrow().get(i), item, *user_data, server_id);
-    }
+    write_items(
+        page.init_items(len_u32(&listed.items)),
+        &listed.items,
+        server_id,
+    );
 }
 
 /// The stored kinds a `kinds` list names; an empty list names none, so

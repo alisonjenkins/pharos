@@ -1187,3 +1187,85 @@ async fn a_hidden_item_answers_like_a_missing_one() {
         Err("not found: item".to_owned())
     );
 }
+
+/// How many rpc `Call` messages `bytes` (whole capnp messages, back to back)
+/// carries.
+fn calls_in(bytes: &[u8]) -> usize {
+    use capnp_rpc::rpc_capnp::message;
+    let mut rest = bytes;
+    let mut calls = 0;
+    while !rest.is_empty() {
+        let msg = capnp::serialize::read_message_from_flat_slice(
+            &mut rest,
+            capnp::message::ReaderOptions::new(),
+        )
+        .expect("whole capnp messages");
+        let root: message::Reader<'_> = msg.get_root().unwrap();
+        if matches!(root.which(), Ok(message::Call(_))) {
+            calls += 1;
+        }
+    }
+    calls
+}
+
+/// T035 / SC-001 over native TCP: after the bootstrap, opening home is one
+/// flight. `resume → session.library → library.home` all leave the client
+/// before the server's first reply arrives, and the answer fills every rail.
+/// Disarm check: with `library.home` awaited after the resume instead of
+/// pipelined on it, the first flight carries one call, not three.
+#[actix_web::test]
+async fn home_in_one_batch() {
+    use pharos_api::pharos_capnp::home_result;
+
+    let (server, fx) = crate::revocation::start().await;
+    seed_movies(&fx).await;
+    seed_shows(&fx).await;
+    start_watching(&fx, &[fx.rich_item_id]).await;
+    let tap = crate::revocation::Tap::default();
+    let (client, _closed) =
+        crate::revocation::connect_tapped(&server, None, None, Some(tap.clone())).await;
+    // The bootstrap's own round trip, before the flight under test.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !tap.borrow().iter().any(|(sent, _)| !sent) {
+        assert!(std::time::Instant::now() < deadline, "no bootstrap reply");
+        actix_web::rt::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    tap.borrow_mut().clear();
+
+    let mut resume = client.resume_request();
+    resume.get().init_ctx();
+    resume.get().set_device_token(&fx.user_token);
+    let session = resume.send().pipeline.get_result().get_session();
+    let library = session.library_request().send().pipeline.get_library();
+    let mut home = library.home_request();
+    home.get().init_ctx();
+    let reply = home.send().promise.await.expect("home");
+
+    let first_flight: Vec<u8> = tap
+        .borrow()
+        .iter()
+        .take_while(|(sent, _)| *sent)
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
+    assert_eq!(
+        calls_in(&first_flight),
+        3,
+        "resume, library and home in one flight"
+    );
+
+    let home_result::Home(home) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("home answered an error");
+    };
+    let home = home.unwrap();
+    let rails = home.get_rails().unwrap();
+    assert_eq!(rails.len(), 2, "one rail per library");
+    for rail in rails.iter() {
+        assert!(
+            !rail.get_latest().unwrap().is_empty(),
+            "every rail lists its newest"
+        );
+    }
+    assert_eq!(home.get_resume().unwrap().len(), 1);
+    assert!(!home.get_next_up().unwrap().is_empty());
+}
