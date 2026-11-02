@@ -97,9 +97,10 @@ pub async fn views(state: &AppState, policy: &UserPolicy) -> Vec<LibraryView> {
 /// filter", so a request for music videos returned the ENTIRE library: 51.6 MB
 /// of JSON for a query whose honest answer is an empty list. "I asked for X"
 /// must never widen to "I asked for anything".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum KindFilter {
     /// No kind named: every kind is acceptable.
+    #[default]
     Unset,
     /// At least one named type is a kind pharos stores.
     Kinds(Vec<MediaKind>),
@@ -595,4 +596,102 @@ pub async fn restrict_to_parent(
     }
     // Unknown id — render an empty library.
     Vec::new()
+}
+
+/// What a stored-item listing asks for. The vocabulary is Jellyfin's
+/// (`SortBy` / `SortOrder` / `Filters` tokens, comma lists), so `/Items` and
+/// the native `Library.query` share one parser and one query builder
+/// (`items::build_media_query`). `limit: None` returns every match.
+#[derive(Debug, Clone, Default)]
+pub struct ItemQuery {
+    pub start_index: u32,
+    pub limit: Option<u32>,
+    pub search_term: Option<String>,
+    pub kinds: KindFilter,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+    pub filters: Option<String>,
+    pub ids: Option<String>,
+    pub sort_seed: Option<u64>,
+    pub genres: Option<String>,
+    pub tags: Option<String>,
+    pub name_starts_with: Option<String>,
+    pub name_starts_with_or_greater: Option<String>,
+    pub name_less_than: Option<String>,
+    pub exclude_item_types: Option<String>,
+    pub media_types: Option<String>,
+    pub is_favorite: Option<bool>,
+    pub is_played: Option<bool>,
+    pub min_index_number: Option<u32>,
+    pub max_index_number: Option<u32>,
+    pub has_subtitles: Option<bool>,
+    pub audio_languages: Option<String>,
+    pub subtitle_languages: Option<String>,
+    pub is_4k: Option<bool>,
+    pub is_hd: Option<bool>,
+    pub is_3d: Option<bool>,
+    pub min_width: Option<u32>,
+    pub max_width: Option<u32>,
+}
+
+/// One page of stored items, with the number of matches before paging.
+#[derive(Debug)]
+pub struct QueryPage {
+    pub items: Vec<MediaItem>,
+    pub total: u32,
+    pub start: u32,
+}
+
+/// The stored items `user` may see under `parent_id` that match `q`, one
+/// page of them. The library allow-list and parental rating narrow the SQL
+/// query itself, so `total` and the page offsets count only what the user
+/// may see. An unknown `parent_id` matches nothing.
+///
+/// `SortBy=Random` cannot be a stable SQL order: the filtered set is fetched
+/// unpaged, shuffled with a seed (the query's, else one from the user id, so
+/// paging does not reshuffle), then tag- and play-state-filtered and paged.
+pub async fn query(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<QueryPage, DomainError> {
+    use crate::api::jellyfin::items::{
+        apply_policy_scope, apply_tags_filter, apply_userdata_filter, build_media_query,
+        effective_sort_seed, resolve_parent_filter, shuffle_in_place, sort_primary,
+        ParentResolution, SortPrimary,
+    };
+    let parent = resolve_parent_filter(state, parent_id).await?;
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(QueryPage {
+            items: Vec::new(),
+            total: 0,
+            start: q.start_index,
+        });
+    }
+    let is_random = sort_primary(q.sort_by.as_deref()) == SortPrimary::Random;
+    let mut mq = build_media_query(user.id, q, &parent, is_random);
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    if !is_random {
+        let (items, total) = state.stores.query(&mq).await?;
+        return Ok(QueryPage {
+            items,
+            total: u32::try_from(total).unwrap_or(u32::MAX),
+            start: q.start_index,
+        });
+    }
+    // The legacy in-memory order: shuffle the kind/search/chip-filtered set,
+    // then apply the tag and play-state filters, then page.
+    let (mut items, _total) = state.stores.query(&mq).await?;
+    shuffle_in_place(&mut items, effective_sort_seed(q, user.id));
+    let tagged = apply_tags_filter(state, items, q).await?;
+    let filtered = apply_userdata_filter(state, user.id, tagged, q).await?;
+    let total = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
+    let start = q.start_index as usize;
+    let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    Ok(QueryPage {
+        items: filtered.into_iter().skip(start).take(take).collect(),
+        total,
+        start: q.start_index,
+    })
 }
