@@ -294,6 +294,9 @@ fn auth_failure(refusal: TokenRefusal) -> actix_web::Error {
         }
         TokenRefusal::InvalidToken => ErrorUnauthorized("invalid token"),
         TokenRefusal::UserRevoked => ErrorUnauthorized("user revoked"),
+        TokenRefusal::ScopeRestricted => {
+            actix_web::error::ErrorForbidden("token scope does not permit this route")
+        }
     }
 }
 

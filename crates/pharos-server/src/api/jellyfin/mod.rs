@@ -98,6 +98,9 @@ pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix
         | ItemHidden::Tag
         | ItemHidden::NotFound => actix_web::error::ErrorNotFound("not found"),
         ItemHidden::Unauthenticated => actix_web::error::ErrorUnauthorized("missing token"),
+        ItemHidden::OutOfScope => {
+            actix_web::error::ErrorForbidden("token scope does not permit this route")
+        }
     }
 }
 
@@ -111,9 +114,17 @@ pub(crate) async fn require_bearer(
     route: &'static str,
 ) -> Result<pharos_core::User, actix_web::Error> {
     let token = auth_extractor::media_token(Some(state), req).await;
-    let user = crate::services::access::authenticate(state, token.as_deref(), id, route)
-        .await
-        .map_err(access_error)?;
+    let pattern = req.match_pattern();
+    let user = crate::services::access::authenticate(
+        state,
+        token.as_deref(),
+        id,
+        route,
+        req.method().as_str(),
+        pattern.as_deref(),
+    )
+    .await
+    .map_err(access_error)?;
     auth_extractor::note_header_credential(req);
     Ok(user)
 }

@@ -16,6 +16,10 @@ pub enum TokenRefusal {
     /// The store could not answer (pool timeout, database down). Transient and
     /// ours, not the caller's: they keep their session and retry (B216).
     Unavailable(String),
+    /// The token is live but restricted (a cast TV's
+    /// [`TokenScope::Playback`]), and the caller needs a full credential: a
+    /// restricted token reaches only the allowlisted HTTP routes (V220).
+    ScopeRestricted,
 }
 
 impl TokenRefusal {
@@ -25,18 +29,29 @@ impl TokenRefusal {
             TokenRefusal::InvalidToken => "invalid_token",
             TokenRefusal::UserRevoked => "user_revoked",
             TokenRefusal::Unavailable(_) => "store_unavailable",
+            TokenRefusal::ScopeRestricted => "scope_restricted",
         }
     }
 }
 
-/// Resolves `token` to its user: one store call for an unknown token, two
-/// for a known one.
+/// Resolves a full-scope `token` to its user: one store call for an unknown
+/// token, two for a known one. A restricted token (a cast TV's) is refused
+/// with [`TokenRefusal::ScopeRestricted`]: every caller of this function
+/// grants the user's whole account, and a restricted token may only reach the
+/// routes [`scoped_user_for_token`]'s callers check it against.
 pub async fn user_for_token(stores: &Stores, token: &str) -> Result<User, TokenRefusal> {
-    let uid = stores
-        .resolve(token)
-        .await
-        .map_err(|e| classify(e, TokenRefusal::InvalidToken))?;
-    live_user(stores, uid).await
+    let (user, scope) = scoped_user_for_token(stores, token).await?;
+    if scope != TokenScope::Full {
+        metrics::counter!("pharos_token_scope_refused_total", "scope" => scope.label())
+            .increment(1);
+        tracing::warn!(
+            scope = scope.label(),
+            user.id = %user.id,
+            "token scope does not permit a full-account credential check; refusing"
+        );
+        return Err(TokenRefusal::ScopeRestricted);
+    }
+    Ok(user)
 }
 
 /// [`user_for_token`], with the scope the token was issued with: what an
@@ -612,6 +627,7 @@ mod tests {
             TokenRefusal::InvalidToken.label(),
             TokenRefusal::UserRevoked.label(),
             TokenRefusal::Unavailable(String::new()).label(),
+            TokenRefusal::ScopeRestricted.label(),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len());
@@ -651,5 +667,66 @@ mod tests {
             user_for_token(&stores, token.0.expose()).await.unwrap_err(),
             TokenRefusal::UserRevoked
         );
+    }
+
+    /// A cast TV's playback token is refused wherever a full credential is
+    /// checked (the native API's resume, session calls and socket re-check
+    /// all use `user_for_token`), and the refusal is counted; the scoped
+    /// lookup still resolves it for the allowlisted HTTP routes (V220).
+    #[actix_web::test]
+    async fn a_playback_token_is_not_a_full_credential() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_core::{SecretString, TokenStore, UserId, UserPolicy, UserRecord, UserStore};
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let hash = crate::auth::BuiltinAuth::new(stores.clone())
+            .hash_password(&SecretString::new("p"))
+            .unwrap();
+        let id = UserId::new();
+        stores
+            .create(UserRecord {
+                id,
+                name: "owner".into(),
+                password_hash: hash,
+                policy: UserPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let playback = stores
+            .issue_with_ttl(id, "cast:Den", 3600, TokenScope::Playback)
+            .await
+            .unwrap()
+            .secret;
+        let full = stores.issue(id, "web").await.unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let refused = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            user_for_token(&stores, playback.0.expose()).await
+        };
+        assert_eq!(refused.unwrap_err(), TokenRefusal::ScopeRestricted);
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == "pharos_token_scope_refused_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "scope" && l.value() == "playback")
+            });
+        assert!(
+            matches!(counted, Some((.., DebugValue::Counter(1)))),
+            "{counted:?}"
+        );
+
+        assert_eq!(
+            user_for_token(&stores, full.0.expose()).await.unwrap().id,
+            id
+        );
+        let (user, scope) = scoped_user_for_token(&stores, playback.0.expose())
+            .await
+            .unwrap();
+        assert_eq!((user.id, scope), (id, TokenScope::Playback));
     }
 }

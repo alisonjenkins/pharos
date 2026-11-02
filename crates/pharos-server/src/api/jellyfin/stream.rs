@@ -552,17 +552,15 @@ async fn authorize_media(
     // 1. Normal credential: its user's library policy applies (V187), and a
     //    scoped token (a cast TV's) reaches only the routes its scope allows.
     if let Some(token) = crate::api::jellyfin::auth_extractor::media_token(Some(state), req).await {
-        if let Ok((user, scope)) =
-            crate::services::auth::scoped_user_for_token(&state.stores, &token).await
+        let pattern = req.match_pattern();
+        if let Some(user) = media_credential(
+            &state.stores,
+            &token,
+            req.method().as_str(),
+            pattern.as_deref(),
+        )
+        .await?
         {
-            if let Some(refused) = crate::api::jellyfin::auth_extractor::scope_refusal(
-                scope,
-                user.id,
-                req.method().as_str(),
-                req.match_pattern().as_deref(),
-            ) {
-                return Err(refused);
-            }
             return crate::api::jellyfin::require_item_access(state, &user, media_id, "stream")
                 .await;
         }
@@ -616,24 +614,23 @@ async fn capability_holder_allowed(
     }
 }
 
-/// Whether `token` is a live credential allowed to call `method` on the matched
-/// `pattern`. A token the store does not know is `false` (fall through to the
-/// capability check); a known token whose scope forbids the route is a 403.
-#[cfg(test)]
-async fn credential_permits(
+/// The user behind `token` on a media route, `method` on the matched
+/// `pattern`: `None` when the token does not resolve to an enabled user (the
+/// caller falls through to the capability check); a 403 when the token is live
+/// but its scope (a cast TV's) does not permit the route.
+async fn media_credential(
     stores: &crate::state::Stores,
     token: &str,
     method: &str,
     pattern: Option<&str>,
-) -> Result<bool, actix_web::Error> {
-    use crate::api::jellyfin::auth_extractor::scope_refusal;
-    use pharos_core::TokenStore;
-    let Ok(resolved) = stores.resolve_scoped(token).await else {
-        return Ok(false);
+) -> Result<Option<pharos_core::User>, actix_web::Error> {
+    let Ok((user, scope)) = crate::services::auth::scoped_user_for_token(stores, token).await
+    else {
+        return Ok(None);
     };
-    match scope_refusal(resolved.scope, resolved.user, method, pattern) {
+    match crate::api::jellyfin::auth_extractor::scope_refusal(scope, user.id, method, pattern) {
         Some(refused) => Err(refused),
-        None => Ok(true),
+        None => Ok(Some(user)),
     }
 }
 
@@ -1908,25 +1905,28 @@ mod tests {
             ("HEAD", "/audio/{id}/stream"),
         ] {
             assert!(
-                credential_permits(&stores, &playback, method, Some(pattern))
+                media_credential(&stores, &playback, method, Some(pattern))
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .is_some(),
                 "{method} {pattern} must accept a playback token"
             );
         }
-        let err = credential_permits(&stores, &playback, "GET", Some("/brand/new/route"))
+        let err = media_credential(&stores, &playback, "GET", Some("/brand/new/route"))
             .await
             .expect_err("a route off the allowlist must refuse a playback token");
         assert_eq!(err.as_response_error().status_code(), 403);
         assert!(
-            credential_permits(&stores, &full, "GET", Some("/brand/new/route"))
+            media_credential(&stores, &full, "GET", Some("/brand/new/route"))
                 .await
                 .unwrap()
+                .is_some()
         );
         assert!(
-            !credential_permits(&stores, "no-such-token", "GET", Some("/videos/{id}/stream"))
+            media_credential(&stores, "no-such-token", "GET", Some("/videos/{id}/stream"))
                 .await
                 .unwrap()
+                .is_none()
         );
     }
 }

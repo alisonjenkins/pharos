@@ -35,6 +35,9 @@ pub enum ItemHidden {
     /// The request carried no credential, or one that resolves to no
     /// enabled user. Answered 401, not 404: the caller is not yet anyone.
     Unauthenticated,
+    /// The credential is live but its scope (a cast TV's playback token) does
+    /// not permit this route. Answered 403.
+    OutOfScope,
 }
 
 impl ItemHidden {
@@ -48,6 +51,7 @@ impl ItemHidden {
             ItemHidden::NotFound => "not_found",
             ItemHidden::Unavailable(_) => "store_unavailable",
             ItemHidden::Unauthenticated => "unauthenticated",
+            ItemHidden::OutOfScope => "scope_restricted",
         }
     }
 }
@@ -205,26 +209,45 @@ async fn policy_visible_ids(
 /// resolves to no enabled user, counts under
 /// `pharos_item_access_denied_total{reason="unauthenticated"}` and logs the
 /// item asked for (`item`, as the path spelled it) and `route`: at DEBUG for
-/// a missing token, WARN for one that does not resolve.
+/// a missing token, WARN for one that does not resolve. A restricted token
+/// (a cast TV's) is checked against `method` on the matched route `pattern`
+/// and refused with [`ItemHidden::OutOfScope`] where its scope does not reach
+/// (V220).
 pub async fn authenticate(
     state: &AppState,
     token: Option<&str>,
     item: &str,
     route: &'static str,
+    method: &str,
+    pattern: Option<&str>,
 ) -> Result<User, ItemHidden> {
     let refusal = match token {
         None => "missing",
-        Some(token) => match crate::services::auth::user_for_token(&state.stores, token).await {
-            Ok(user) => return Ok(user),
-            Err(crate::services::auth::TokenRefusal::Unavailable(detail)) => {
-                let hidden = ItemHidden::Unavailable(detail);
-                metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
+        Some(token) => {
+            match crate::services::auth::scoped_user_for_token(&state.stores, token).await {
+                Ok((user, scope)) => {
+                    if crate::api::jellyfin::auth_extractor::scope_refusal(
+                        scope, user.id, method, pattern,
+                    )
+                    .is_some()
+                    {
+                        let hidden = ItemHidden::OutOfScope;
+                        metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
+                        .increment(1);
+                        return Err(hidden);
+                    }
+                    return Ok(user);
+                }
+                Err(crate::services::auth::TokenRefusal::Unavailable(detail)) => {
+                    let hidden = ItemHidden::Unavailable(detail);
+                    metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
                     .increment(1);
-                tracing::warn!(item_id = item, route, reason = hidden.label(), detail = %hidden, "item withheld: credential not checked");
-                return Err(hidden);
+                    tracing::warn!(item_id = item, route, reason = hidden.label(), detail = %hidden, "item withheld: credential not checked");
+                    return Err(hidden);
+                }
+                Err(refusal) => refusal.label(),
             }
-            Err(refusal) => refusal.label(),
-        },
+        }
     };
     let hidden = ItemHidden::Unauthenticated;
     metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label()).increment(1);
