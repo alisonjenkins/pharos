@@ -280,13 +280,15 @@ async fn playlist_for(
     wire_id: &str,
     access: PlaylistAccess,
 ) -> Result<pharos_core::Playlist, actix_web::Error> {
-    state
+    let playlist = state
         .stores
         .playlist_by_wire_id(wire_id)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-        .filter(|p| check_playlist(&user.0, p, access, "playlist"))
-        .ok_or_else(|| error::ErrorNotFound("playlist not found"))
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    match playlist {
+        Some(p) if check_playlist(state, &user.0, &p, access, "playlist").await => Ok(p),
+        _ => Err(error::ErrorNotFound("playlist not found")),
+    }
 }
 
 /// The playlist header `BaseItemDto`. A Jellyfin playlist is an `IsFolder`
