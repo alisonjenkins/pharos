@@ -69,3 +69,49 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     waveform::register(cfg);
     stubs::register(cfg);
 }
+
+/// Answers an item `user` may not reach (V187) as 404, like a missing one,
+/// so a hidden item's existence does not leak; 503 when the store could not
+/// say.
+pub(crate) async fn require_item_access(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    id: pharos_core::MediaId,
+    route: &'static str,
+) -> Result<(), actix_web::Error> {
+    crate::services::access::check_item(state, user, id, route)
+        .await
+        .map_err(access_error)
+}
+
+/// The response for a withheld item: 404 when hidden, 503 when the store
+/// could not say.
+pub(crate) fn access_error(hidden: crate::services::access::ItemHidden) -> actix_web::Error {
+    use crate::services::access::ItemHidden;
+    match hidden {
+        ItemHidden::Unavailable(_) => {
+            actix_web::error::ErrorServiceUnavailable("store unavailable")
+        }
+        ItemHidden::LibraryNotAllowed | ItemHidden::NoLibrary => {
+            actix_web::error::ErrorNotFound("not found")
+        }
+        ItemHidden::Unauthenticated => actix_web::error::ErrorUnauthorized("missing token"),
+    }
+}
+
+/// The bearer of a request for an item's files (`id` as the path spelled
+/// it), from a header, `api_key` or, on a GET or HEAD, the `JellyfinAuth`
+/// cookie; 401 without one (V189, V191).
+pub(crate) async fn require_bearer(
+    state: &crate::state::AppState,
+    req: &actix_web::HttpRequest,
+    id: &str,
+    route: &'static str,
+) -> Result<pharos_core::User, actix_web::Error> {
+    let token = auth_extractor::extract_media_token(req);
+    let user = crate::services::access::authenticate(state, token.as_deref(), id, route)
+        .await
+        .map_err(access_error)?;
+    auth_extractor::note_header_credential(req, auth_extractor::extract_token(req));
+    Ok(user)
+}

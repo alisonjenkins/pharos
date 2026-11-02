@@ -7,10 +7,7 @@
 //! the `MediaStore` from elsewhere must validate root-prefix at the
 //! call site; tracked in §B if violated.
 
-use crate::{
-    api::jellyfin::auth_extractor::{auth_cookie_header, AuthUser},
-    state::AppState,
-};
+use crate::{api::jellyfin::auth_extractor::MediaUser, state::AppState};
 use actix_web::{
     body::MessageBody,
     error,
@@ -20,7 +17,7 @@ use actix_web::{
     },
     web, HttpRequest, HttpResponse,
 };
-use pharos_core::{MediaItem, TokenStore};
+use pharos_core::MediaItem;
 use pharos_transcode::{AudioCodec, Container, FfmpegTranscoder, TranscodeOptions, VideoCodec};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -319,12 +316,15 @@ fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool
 /// ffmpeg to the first acceptable target (typically AAC).
 async fn audio_universal(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
     // Audio playback is live too — stamp on entry, meter the body below (V35).
     state.note_playback_activity();
+    let id = pharos_jellyfin_api::dto::parse_item_id(path.id_str())
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "stream").await?;
     let item = load_item(&state, &req, path.id_str()).await?;
     let qs = req.query_string();
     let acceptable = parse_audio_codec_list(qs);
@@ -511,24 +511,6 @@ fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
     None
 }
 
-/// P24 — extract the `api_key` (or `ApiKey`) query value so the
-/// stream / audio handlers can echo it back as a JellyfinAuth cookie
-/// on the response. Returns None when the auth source was a header
-/// instead — no need to set a cookie when the client could already
-/// inject one.
-fn api_key_query_value(qs: &str) -> Option<String> {
-    for kv in qs.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey"))
-                && !v.is_empty()
-            {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
 /// First value of query key `key` (case-insensitive), empty values skipped.
 fn query_value_ci(qs: &str, key: &str) -> Option<String> {
     for kv in qs.split('&') {
@@ -567,13 +549,15 @@ async fn authorize_media(
     req: &HttpRequest,
     media_id: pharos_core::MediaId,
 ) -> Result<(), actix_web::Error> {
-    // 1. Normal credential.
-    if let Some(token) = crate::api::jellyfin::auth_extractor::extract_token(req) {
-        if state.stores.resolve(&token).await.is_ok() {
-            return Ok(());
+    // 1. Normal credential: its user's library policy applies (V187).
+    if let Some(token) = crate::api::jellyfin::auth_extractor::extract_media_token(req) {
+        if let Ok(user) = crate::services::auth::user_for_token(&state.stores, &token).await {
+            return crate::api::jellyfin::require_item_access(state, &user, media_id, "stream")
+                .await;
         }
     }
-    // 2. Capability token forwarded by a native app (tag == our ETag).
+    // 2. Capability token forwarded by a native app (tag == our ETag). The
+    //    session was opened through PlaybackInfo, which applied the policy.
     let qs = req.query_string();
     for key in ["tag", "PlaySessionId"] {
         if let Some(cap) = query_value_ci(qs, key) {
@@ -1047,13 +1031,6 @@ async fn deliver_stream(
         header::CONTENT_TYPE,
         super::seek::DeliveryMime::for_source(&item).header(),
     );
-    // P24 — echo the auth as a cookie so a follow-up `<video>`-style
-    // fetch can drop the `?api_key=` and still authenticate.
-    if let Some(token) = api_key_query_value(req.query_string()) {
-        if let Ok(hv) = HeaderValue::from_str(&auth_cookie_header(&token)) {
-            resp.headers_mut().insert(header::SET_COOKIE, hv);
-        }
-    }
     Ok(meter_body(
         resp,
         clock,
@@ -1177,14 +1154,6 @@ async fn serve_content_range(
         .insert_header((header::ACCEPT_RANGES, HeaderValue::from_static("bytes")));
     if let Some(lm) = last_modified_from_meta(meta_for_lm.as_ref()) {
         resp_builder.insert_header((header::LAST_MODIFIED, lm.as_str()));
-    }
-    // P24 — echo the auth as a cookie so a follow-up `<video>`-style fetch can
-    // drop the `?api_key=` and still authenticate (parity with the NamedFile
-    // branch of `deliver_stream`).
-    if let Some(token) = api_key_query_value(req.query_string()) {
-        if let Ok(hv) = HeaderValue::from_str(&auth_cookie_header(&token)) {
-            resp_builder.insert_header((header::SET_COOKIE, hv));
-        }
     }
     // Read EXACTLY `remaining` bytes — a capped window must NOT run to EOF, and a
     // 206 must carry a declared length (never chunked framing). Small windows

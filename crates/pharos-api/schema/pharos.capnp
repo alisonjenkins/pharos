@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 2;
+const schemaVersion :UInt32 = 3;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -57,7 +57,9 @@ struct Error {
 
 struct Done { union { ok @0 :Void; error @1 :Error; } }   # result for methods with no payload
 
-enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album @6; artist @7; person @8; collection @9; playlist @10; channel @11; }
+enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album @6; artist @7; person @8; collection @9; playlist @10; channel @11; library @12; }
+# What a `library` item holds; mirrors pharos_core::LibraryKind.
+enum LibraryKind { mixed @0; movies @1; tvShows @2; music @3; books @4; }
 
 struct ImageRef { kind @0 :Text; tag @1 :Text; url @2 :Text; blurhash @3 :Text; }
 
@@ -68,6 +70,7 @@ struct ItemSummary {
   runtimeMs @4 :UInt64; images @5 :List(ImageRef); userState @6 :UserState;
   parentId @7 :ItemId; seriesName @8 :Text;
   indexNumber @9 :OptU32; parentIndexNumber @10 :OptU32;   # season 0 / episode 0 are real
+  libraryKind @11 :LibraryKind;                            # kind == library only
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }

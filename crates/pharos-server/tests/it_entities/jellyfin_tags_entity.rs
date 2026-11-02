@@ -30,7 +30,11 @@ async fn seed() -> (web::Data<AppState>, String) {
             id: uid,
             name: "u".into(),
             password_hash: hash,
-            policy: UserPolicy::default(),
+            // Admin: editing an item's tags is admin-only (B245).
+            policy: UserPolicy {
+                admin: true,
+                ..UserPolicy::default()
+            },
         })
         .await
         .unwrap();

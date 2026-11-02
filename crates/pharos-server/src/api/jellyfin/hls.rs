@@ -12,7 +12,7 @@
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
-    api::jellyfin::auth_extractor::{extract_token, AuthUser},
+    api::jellyfin::auth_extractor::{extract_token, AuthUser, MediaUser},
     api::jellyfin::fmp4,
     state::AppState,
 };
@@ -151,12 +151,12 @@ async fn stop_active_encodings(
 
 async fn subtitle_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, idx) = path.into_inner();
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = playback_qs(&req);
     let duration_secs = item.duration_seconds.max(0.0);
     // VTT served by the existing subtitle handler. `0` stands in for
@@ -467,10 +467,12 @@ struct HlsItem {
 async fn load_hls_item(
     state: &AppState,
     req: &HttpRequest,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<HlsItem, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(state, user, id, "hls").await?;
     let item = super::media_source::load(
         state,
         super::media_source::Route::Hls,
@@ -728,12 +730,12 @@ fn push_h264_cmaf_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
 
 async fn master_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = playback_qs(&req);
     // Fold the live-session cap together with any URL-carried `VideoBitrate`
     // ceiling (Lace incident) so both the ladder filter AND the advertised
@@ -892,7 +894,7 @@ async fn session_burn_indices(
 
 async fn variant_playlist_main(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -902,7 +904,7 @@ async fn variant_playlist_main(
 
 async fn variant_playlist_named(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -915,12 +917,12 @@ async fn variant_playlist_named(
 
 async fn render_variant_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     id: String,
     variant: &str,
 ) -> Result<impl Responder, actix_web::Error> {
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = source_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 3,
@@ -974,7 +976,7 @@ where
 
 async fn segment_main(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -985,7 +987,7 @@ async fn segment_main(
 
 async fn segment_named(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -998,7 +1000,7 @@ async fn segment_named(
 
 async fn serve_segment(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     id: String,
     seg: u32,
@@ -1007,6 +1009,7 @@ async fn serve_segment(
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id_num, "hls").await?;
     // A client is actively pulling segments → tell the background backfill to
     // stand down so its whole-file decodes don't starve live transcoding.
     state.note_playback_activity();
@@ -1199,7 +1202,7 @@ async fn serve_segment(
                 .insert_header((actix_web::http::header::ETAG, etag.as_str()))
                 .insert_header((
                     actix_web::http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable",
+                    "private, max-age=31536000, immutable",
                 ))
                 .finish());
         }
@@ -1245,7 +1248,7 @@ async fn serve_segment(
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
             .insert_header((
                 actix_web::http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
+                "private, max-age=31536000, immutable",
             ))
             .body(bytes));
     }
@@ -1277,7 +1280,7 @@ async fn serve_segment(
                     .insert_header((actix_web::http::header::ETAG, etag.as_str()))
                     .insert_header((
                         actix_web::http::header::CACHE_CONTROL,
-                        "public, max-age=31536000, immutable",
+                        "private, max-age=31536000, immutable",
                     ))
                     .streaming(stream));
             }
@@ -1299,7 +1302,7 @@ async fn serve_segment(
         .insert_header((actix_web::http::header::ETAG, etag.as_str()))
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .streaming(stream.into_stream()))
 }
@@ -1916,7 +1919,7 @@ fn rendition_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&st
 /// parameter sets per segment, so it is exempt from the `#114` init hazard `g=`
 /// exists for, and it therefore never adopted `rendition_qs`. But `V132` is a
 /// different question with the same answer — `serve_segment` hands those `.ts`
-/// files back `public, max-age=31536000, immutable` like every other segment,
+/// files back `private, max-age=31536000, immutable` like every other segment,
 /// so a re-resolved source leaves a year of the PREVIOUS resolution's bytes in
 /// the browser regardless of which rung produced them.
 fn source_qs(req: &HttpRequest, source: &std::path::Path, edition: Option<&str>) -> String {
@@ -2017,12 +2020,12 @@ const VP9_HLS_CODECS: &str = "vp09.00.40.08,opus";
 /// the H.264 master. jellyfin-web loads this as the negotiated TranscodingUrl.
 async fn vp9_master(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = playback_qs(&req);
 
     // NOTE: text subtitles are delivered as an External rendition via
@@ -2049,7 +2052,7 @@ async fn vp9_master(
 /// as a separate rendition the player syncs the two by PTS.
 async fn vp9_audio_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2057,7 +2060,7 @@ async fn vp9_audio_playlist(
     let id = path.into_inner();
     let media_id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_req_item(&state, &req, media_id).await?;
+    let item = fetch_req_item(&state, &req, &user.0, media_id).await?;
     let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
@@ -2082,7 +2085,7 @@ async fn vp9_audio_playlist(
     // timeline to a single 6 s segment — the client could then only seek within
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
-    let duration = load_hls_item(&state, &req, &id)
+    let duration = load_hls_item(&state, &req, &user.0, &id)
         .await?
         .duration_seconds
         .max(0.0);
@@ -2114,7 +2117,7 @@ async fn vp9_audio_playlist(
 /// requested before the playlist still works.
 async fn vp9_audio_file(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
     q: CiQuery<SegmentQuery>,
@@ -2125,7 +2128,7 @@ async fn vp9_audio_file(
     let Some(cache) = state.hls.as_ref() else {
         return Err(error::ErrorNotFound("no cache"));
     };
-    let item = fetch_req_item(&state, &req, media_id).await?;
+    let item = fetch_req_item(&state, &req, &user.0, media_id).await?;
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
     // B42 — tell the cache WHICH segment this request needs: a deep seek
     // (segment far past the running from-0 session's progress) spawns a
@@ -2258,7 +2261,7 @@ async fn vp9_audio_file(
         .content_type(ctype)
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(bytes))
 }
@@ -2268,12 +2271,12 @@ async fn vp9_audio_file(
 /// duration, identical to the H.264 variant.
 async fn vp9_variant(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 7,
@@ -2295,14 +2298,14 @@ async fn vp9_variant(
 /// identical across a source's segments, so segment 0 is representative.
 async fn vp9_init(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_req_item(&state, &req, id_num).await?;
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
@@ -2337,7 +2340,7 @@ async fn vp9_init(
         .content_type("video/mp4")
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.init))
 }
@@ -2345,7 +2348,7 @@ async fn vp9_init(
 /// Serve one VP9 fMP4 media segment (`moof`+`mdat`, `tfdt`-corrected).
 async fn vp9_segment(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2355,7 +2358,7 @@ async fn vp9_segment(
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // Active playback → background backfill yields (see serve_segment).
     state.note_playback_activity();
-    let item = fetch_req_item(&state, &req, id_num).await?;
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     // Bounds-check against the VOD grid the playlist enumerated. An over-index
     // used to reach the encoder, produce no frames past EOF, and surface as a
@@ -2451,7 +2454,7 @@ async fn vp9_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.media))
 }
@@ -2464,12 +2467,12 @@ async fn vp9_segment(
 /// tracks — an audio switch reuses it instead of cold-re-transcoding.
 async fn h264cmaf_variant(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id = path.into_inner();
-    let item = load_hls_item(&state, &req, &id).await?;
+    let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
     let body = MediaPlaylist {
         version: 7,
@@ -2489,14 +2492,14 @@ async fn h264cmaf_variant(
 /// `GET /videos/{id}/h264cmaf/init.mp4` — shared h264 fMP4 init (`ftyp`+`moov`).
 async fn h264cmaf_init(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    let item = fetch_req_item(&state, &req, id_num).await?;
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
@@ -2530,7 +2533,7 @@ async fn h264cmaf_init(
         .content_type("video/mp4")
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.init))
 }
@@ -2539,7 +2542,7 @@ async fn h264cmaf_init(
 /// segment. Mirrors [`vp9_segment`] with the h264 output codec.
 async fn h264cmaf_segment(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2548,7 +2551,7 @@ async fn h264cmaf_segment(
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     state.note_playback_activity();
-    let item = fetch_req_item(&state, &req, id_num).await?;
+    let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
     let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
@@ -2612,7 +2615,7 @@ async fn h264cmaf_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
+            "private, max-age=31536000, immutable",
         ))
         .body(processed.media))
 }
@@ -3420,11 +3423,14 @@ fn burn_prefetch_targets(
 
 /// Load item `id` for a client request, as the file its `MediaSourceId`
 /// selects.
+/// Loads the edition `req` asks for, once `user` may reach the item (V187).
 async fn fetch_req_item(
     state: &AppState,
     req: &HttpRequest,
+    user: &pharos_core::User,
     id: u64,
 ) -> Result<pharos_core::MediaItem, actix_web::Error> {
+    crate::api::jellyfin::require_item_access(state, user, id, "hls").await?;
     super::media_source::load(
         state,
         super::media_source::Route::Hls,

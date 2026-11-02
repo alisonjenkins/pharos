@@ -59,7 +59,11 @@ async fn logout(
     revoke_token(&state, user.0.id, &token, RevokeCause::Logout)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    Ok(HttpResponse::NoContent().finish())
+    Ok(HttpResponse::NoContent()
+        .cookie(crate::api::jellyfin::auth_extractor::cleared_auth_cookie(
+            &req,
+        ))
+        .finish())
 }
 
 #[derive(Debug, Deserialize)]

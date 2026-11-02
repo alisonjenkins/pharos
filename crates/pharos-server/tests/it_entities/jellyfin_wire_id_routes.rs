@@ -216,7 +216,7 @@ async fn transcoding_url_round_trips_through_the_hls_routes() {
 #[actix_web::test]
 async fn person_primary_image_redirects_to_scraped_thumb() {
     use pharos_core::PersonStore;
-    let (state, _token, _uid) = seed().await;
+    let (state, token, _uid) = seed().await;
     let with_thumb = state
         .stores
         .upsert_person(
@@ -257,6 +257,7 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
     .await;
 
     let req = test::TestRequest::get()
+        .insert_header(("X-Emby-Token", token.clone()))
         .uri(&format!("/Items/{jane_wire}/Images/Primary"))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -267,6 +268,7 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
     );
 
     let req = test::TestRequest::get()
+        .insert_header(("X-Emby-Token", token.clone()))
         .uri(&format!("/Items/{bare_wire}/Images/Primary"))
         .to_request();
     let resp = test::call_service(&app, req).await;
@@ -281,6 +283,7 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
     // NOT redirect: a browser resolves it relative to pharos and 404s
     // uglier. Serve the placeholder 404 instead.
     let req = test::TestRequest::get()
+        .insert_header(("X-Emby-Token", token.clone()))
         .uri(&format!("/Items/{local_wire}/Images/Primary"))
         .to_request();
     let resp = test::call_service(&app, req).await;

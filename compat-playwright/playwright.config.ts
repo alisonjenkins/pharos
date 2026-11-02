@@ -30,6 +30,8 @@ export default defineConfig({
     "**/syncplay-group-matrix.spec.ts",
     "**/syncplay-h264-codec.spec.ts",
     "**/syncplay-h264-nextitem.spec.ts",
+    // Needs same-origin jellyfin-web: playwright.same-origin.config.ts.
+    "**/item-file-auth.spec.ts",
   ],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,

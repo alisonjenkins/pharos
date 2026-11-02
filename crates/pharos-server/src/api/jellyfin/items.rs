@@ -6,6 +6,7 @@
 //! today — moves to SQL-side once library sizes warrant it.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::services::library::KindFilter;
 use crate::{
     api::jellyfin::{
         auth_extractor::AuthUser,
@@ -193,13 +194,16 @@ async fn empty_items_result(_user: AuthUser) -> impl Responder {
 /// aggregate name counts (Artist/Album/Genre) for the music view.
 async fn items_counts(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use std::collections::HashSet;
     let all = state
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "counts")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut movies = 0u32;
     let mut episodes = 0u32;
     let mut audio = 0u32;
@@ -572,9 +576,10 @@ async fn items_similar(
         // pages put in "More Like This"); other synth families (library /
         // series / season / genre) keep the empty result.
         Err(_) => {
-            return music_similar(&state, &id_str, &q).await;
+            return music_similar(&state, &user.0, &id_str, &q).await;
         }
     };
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let all = state
         .list_items_cached()
         .await
@@ -593,6 +598,9 @@ async fn items_similar(
         .map(|i| (similarity_score(target, i), i))
         .filter(|(s, _)| *s > 0)
         .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut scored, |s| s.1.id, "similar")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.title.cmp(&b.1.title)));
     let picks: Vec<&MediaItem> = scored
         .iter()
@@ -633,15 +641,25 @@ async fn items_similar(
 /// overlap across their tracks. Unknown synth families → empty.
 async fn music_similar(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
     q: &SimilarQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
     let empty = || crate::api::jellyfin::wire::query_result(Vec::<serde_json::Value>::new(), 0, 0);
-    let all = state
+    let mut all = state
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    // Both the target and its neighbours come from tracks `user` may reach
+    // (V187).
+    if !user.policy.enable_all_folders {
+        let mut visible: Vec<MediaItem> = all.as_ref().clone();
+        crate::services::access::retain_visible(state, user, &mut visible, |t| t.id, "similar")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        all = std::sync::Arc::new(visible);
+    }
     // B92 — canonicalise the dashed synth album/artist id the kotlin SDK sends
     // so it matches the dashless `album_id_for`/`artist_id_for` hash below.
     let wanted = canonical_wire_id(id_str).to_ascii_lowercase();
@@ -933,7 +951,7 @@ async fn list_genres(
 /// [`genres_with_counts`]: pharos_core::GenreStore::genres_with_counts
 async fn list_music_genres(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::GenreStore;
     use std::collections::HashMap;
@@ -951,6 +969,9 @@ async fn list_music_genres(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "genres")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
 
     // Count each genre over audio items only. `probe.genre` is the raw tag
     // string and may pack several genres, so it is split on the same
@@ -990,7 +1011,7 @@ async fn list_music_genres(
 /// /Items?ParentId={id} which restrict_to_parent resolves.
 async fn list_artists(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::artist_id_for;
@@ -999,6 +1020,9 @@ async fn list_artists(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "artists")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     // A-Z letter picker filters by artist name.
     let name_prefix = q
         .name_starts_with
@@ -1048,7 +1072,7 @@ async fn list_artists(
 /// "Album • Artist" subtitle without a follow-up fetch.
 async fn list_albums(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -1057,6 +1081,9 @@ async fn list_albums(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "albums")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     // A-Z letter picker filters by album name.
     let name_prefix = q
         .name_starts_with
@@ -1206,10 +1233,11 @@ async fn list_tags(
 /// shape).
 async fn item_tags_add(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
     // V-spirit: reject a tag mutation against a non-existent item rather
@@ -1234,10 +1262,11 @@ async fn item_tags_add(
 /// no media item carries that id. Returns 204.
 async fn item_tags_remove(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<TagMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::{MediaStore, TagStore};
     let id = parse_media_id(&path.into_inner())?;
     state
@@ -1478,7 +1507,7 @@ async fn list_collections(
 /// box set) are never box-set members, so they yield an empty result.
 async fn item_collections(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::CollectionStore;
@@ -1486,6 +1515,7 @@ async fn item_collections(
     let canonical = canonical_wire_id(&raw);
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(canonical.as_ref()) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
         state.stores.get(id).await.map_err(|e| match e {
             pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
             other => error::ErrorInternalServerError(other.to_string()),
@@ -1714,6 +1744,9 @@ async fn shows_next_up(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(&state, &user.0, all, "next_up")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -1905,6 +1938,9 @@ async fn shows_episodes(
             })
         })
         .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut eps, |e| e.1.id, "series")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     eps.sort_by_key(|(_, e)| {
         let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
         let n = e
@@ -1967,7 +2003,7 @@ async fn shows_episodes(
 /// Season folder items, ordered by season number.
 async fn shows_seasons(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
@@ -1981,18 +2017,21 @@ async fn shows_seasons(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     // One representative SeriesInfo per season number (BTreeMap → ascending),
     // plus the episode count per season (B93 — the Season DTO's ChildCount).
+    let mut episodes: Vec<&MediaItem> = all
+        .iter()
+        .filter(|item| matches!(item.kind, MediaKind::Episode))
+        .filter(|item| {
+            item.series.as_ref().is_some_and(|s| {
+                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+            })
+        })
+        .collect();
+    crate::services::access::retain_visible(&state, &user.0, &mut episodes, |e| e.id, "series")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut seasons: BTreeMap<u32, &pharos_core::SeriesInfo> = BTreeMap::new();
     let mut episode_counts: BTreeMap<u32, u32> = BTreeMap::new();
-    for item in all.iter() {
-        if !matches!(item.kind, MediaKind::Episode) {
-            continue;
-        }
-        let Some(series) = item.series.as_ref() else {
-            continue;
-        };
-        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) != series_id {
-            continue;
-        }
+    for series in episodes.iter().filter_map(|e| e.series.as_ref()) {
         let Some(n) = series.season_number else {
             continue;
         };
@@ -2498,6 +2537,7 @@ async fn playback_info(
     // Canonical wire form regardless of which shape the caller sent —
     // TranscodingUrl / MediaSource.Id must round-trip consistently.
     let id_str = pharos_jellyfin_api::dto::wire_item_id(id);
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "playback").await?;
     let body = body.map(web::Json::into_inner);
     let requested_source = crate::api::jellyfin::media_source::requested_id(req.query_string())
         .or_else(|| body.as_ref().and_then(|b| b.media_source_id.clone()));
@@ -3669,6 +3709,27 @@ async fn playback_info(
         });
     }
 
+    // V189 — subtitle and font files answer only an authenticated request,
+    // and a `<track>` or font fetch cannot send a header: their URLs carry
+    // the caller's own token, as the transcode URLs above do.
+    if !api_key.is_empty() {
+        for source in &mut media_sources {
+            let streams = source
+                .media_streams
+                .iter_mut()
+                .filter_map(|s| s.delivery_url.as_mut());
+            let fonts = source
+                .media_attachments
+                .iter_mut()
+                .map(|a| &mut a.delivery_url);
+            for url in streams.chain(fonts) {
+                let sep = if url.contains('?') { '&' } else { '?' };
+                url.push(sep);
+                url.push_str("api_key=");
+                url.push_str(&api_key);
+            }
+        }
+    }
     // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep
     // a local copy of UserData.PlaybackPositionTicks.
     let playable = media_sources.first().is_some_and(|s| {
@@ -3724,42 +3785,26 @@ async fn latest_items(
     user: &AuthUser,
     q: &ListQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // Honour ParentId so home-page "Latest" rows match the library
-    // the user clicked into. Library / series / season ids all
-    // resolve via the shared restrict_to_parent helper.
-    let scoped = restrict_to_parent(state, &all, q.parent_id.as_deref()).await;
-    // Also honour IncludeItemTypes — jellyfin-web's "Latest Movies"
-    // row filters to Type=Movie.
-    let mut typed = filter_by_kinds(scoped, q.include_item_types.as_deref());
-    // B97 — "Latest" means most-recently-ADDED first (DateCreated desc). Without
-    // this sort the items came back in `list_items_cached` order (id/cache
-    // order), so a newly-scanned film — the one with the newest DateCreated —
-    // never surfaced in the home "Recently Added" row. Sort by `created_at`
-    // desc with id as a stable tiebreak; rows lacking a timestamp sort last.
-    typed.sort_by(|a, b| {
-        b.created_at
-            .unwrap_or(i64::MIN)
-            .cmp(&a.created_at.unwrap_or(i64::MIN))
-            .then(b.id.cmp(&a.id))
-    });
-    let limit = q.limit.unwrap_or(100).min(100) as usize;
-    let page: Vec<MediaItem> = typed.into_iter().take(limit).collect();
-    let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.0.id, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let dtos: Vec<BaseItemDto> = page
+    let latest = crate::services::library::latest(
+        state,
+        &user.0,
+        q.parent_id.as_deref(),
+        &parse_kind_filter(q.include_item_types.as_deref()),
+        q.limit,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::services::library::LatestError::Hidden(hidden) => {
+            crate::api::jellyfin::access_error(hidden)
+        }
+        crate::services::library::LatestError::Store(e) => {
+            error::ErrorInternalServerError(e.to_string())
+        }
+    })?;
+    let dtos: Vec<BaseItemDto> = latest
         .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        .map(|(item, ud)| {
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, *ud)
                 .with_converted_book(
                     crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
                 )
@@ -3772,28 +3817,6 @@ async fn latest_items(
         .collect();
     // /Items/Latest returns a raw array, not the ItemsResult envelope.
     Ok(crate::api::jellyfin::wire::json(&dtos))
-}
-
-/// What an `IncludeItemTypes=` parameter asks of the SQL list path.
-///
-/// B153 — the distinction that was missing. `MusicVideo` names a type pharos
-/// stores none of, and the old code read "zero recognised kinds" as "no kind
-/// filter", so a request for music videos returned the ENTIRE library: 51.6 MB
-/// of JSON for a query whose honest answer is an empty list. "I asked for X"
-/// must never widen to "I asked for anything".
-///
-/// Reaching this point already means every synth short-circuit (MusicAlbum,
-/// MusicArtist, Playlist, BoxSet, the show folders) has declined the request,
-/// and the SQL path can only ever return Movie / Episode / Audio rows — so if
-/// none of the named types is one of those, nothing can match, whichever
-/// unknown type it was.
-enum KindFilter {
-    /// No `IncludeItemTypes` at all — every kind is acceptable.
-    Unset,
-    /// At least one named type is a kind pharos stores.
-    Kinds(Vec<MediaKind>),
-    /// Types were named and none of them can appear in this result.
-    MatchesNothing,
 }
 
 /// Types pharos SYNTHESISES rather than stores: they are not a [`MediaKind`],
@@ -3826,6 +3849,11 @@ const SYNTHESISED_ITEM_TYPES: &[&str] = &[
     "recording",
 ];
 
+/// On the `/Items` path every synth short-circuit (MusicAlbum, MusicArtist,
+/// Playlist, BoxSet, the show folders) has declined the request before this
+/// runs, and the SQL path can only return stored kinds, so naming none of
+/// them matches nothing. Naming a synthesised type gives `Unset`, which on
+/// the Latest path (no short-circuits) lists every kind.
 fn parse_kind_filter(include: Option<&str>) -> KindFilter {
     let Some(raw) = include.map(str::trim).filter(|s| !s.is_empty()) else {
         return KindFilter::Unset;
@@ -3867,17 +3895,6 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-fn filter_by_kinds(items: Vec<MediaItem>, include: Option<&str>) -> Vec<MediaItem> {
-    match parse_kind_filter(include) {
-        KindFilter::Unset => items,
-        KindFilter::MatchesNothing => Vec::new(),
-        KindFilter::Kinds(wanted) => items
-            .into_iter()
-            .filter(|i| wanted.contains(&i.kind))
-            .collect(),
-    }
 }
 
 async fn user_views(
@@ -3971,90 +3988,31 @@ fn wire_collection_type(ct: &str) -> serde_json::Value {
     }
 }
 
-/// B241: the library views `policy` lets its user see. Item queries already
-/// honour `EnabledFolders` ([`apply_policy_scope`]); without the filter here
-/// the list of libraries still named every one of them. Libraries are dropped
-/// before their image lookup, so a hidden one costs nothing.
+/// The library views `policy` lets its user see (V184), as
+/// `CollectionFolder` DTOs.
 async fn visible_views(
     state: &AppState,
     policy: &pharos_core::UserPolicy,
 ) -> Vec<serde_json::Value> {
-    // LIB-C1 — prefer the typed libraries reconciled from config (each
-    // carries its own CollectionType). The wire_id is the same
-    // library_id_for_root hash a plain root would yield, so client URLs
-    // are stable whether or not a library is typed.
-    // Clone out of the guard in its own scope: the loop below awaits per
-    // library, and holding a std RwLock guard across an await can deadlock the
-    // executor.
-    let libs: Vec<pharos_core::Library> = {
-        let libraries = state.libraries();
-        libraries.iter().cloned().collect()
-    };
-    if !libs.is_empty() {
-        // Sequential rather than a `map`: each entry awaits its representative
-        // image. The first call warms the whole synth map, so the rest are memo
-        // hits — a handful of libraries, one scan.
-        let mut out = Vec::with_capacity(libs.len());
-        for lib in libs
-            .into_iter()
-            .filter(|l| policy.allows_library(&l.wire_id))
-        {
-            let image_tags =
-                crate::api::jellyfin::images::synth_primary_tag(state, &lib.wire_id).await;
-            out.push({
-                // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
-                serde_json::to_value(CollectionFolderDto {
-                    id: lib.wire_id.clone(),
-                    name: lib.name.clone(),
-                    server_id: state.server_id.clone(),
-                    kind: "CollectionFolder",
-                    collection_type: wire_collection_type(lib.kind.collection_type())
-                        .as_str()
-                        .map(str::to_string),
-                    media_type: "Unknown",
-                    is_folder: true,
-                    user_data: UserItemDataDto::folder(&lib.wire_id, false, 0, false),
-                    image_tags,
-                })
-                .unwrap_or(serde_json::Value::Null)
-            });
-        }
-        return out;
-    }
-    if state.media_roots.is_empty() {
-        let placeholder = all_media_placeholder(&state.server_id);
-        let allowed = placeholder["Id"]
-            .as_str()
-            .is_some_and(|id| policy.allows_library(id));
-        return if allowed {
-            vec![placeholder]
-        } else {
-            Vec::new()
-        };
-    }
-    // Fallback: synthesise one `mixed` library per configured root (the
-    // legacy shape — used by tests that only call `with_media_roots`).
-    state
-        .media_roots
-        .iter()
-        .filter(|root| policy.allows_library(&library_id_for_root(root)))
-        .map(|root| {
-            let id = library_id_for_root(root);
-            let name = root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Media")
-                .to_string();
+    crate::services::library::views(state, policy)
+        .await
+        .into_iter()
+        .map(|view| {
+            // B78/V38 — typed CollectionFolderDto (embeds the B68 UserData).
             serde_json::to_value(CollectionFolderDto {
-                id: id.clone(),
-                name,
+                user_data: UserItemDataDto::folder(&view.id, false, 0, false),
+                id: view.id,
+                name: view.name,
                 server_id: state.server_id.clone(),
                 kind: "CollectionFolder",
-                collection_type: None,
+                collection_type: wire_collection_type(view.kind.collection_type())
+                    .as_str()
+                    .map(str::to_string),
                 media_type: "Unknown",
                 is_folder: true,
-                user_data: UserItemDataDto::folder(&id, false, 0, false),
-                image_tags: None,
+                image_tags: view
+                    .primary_tag
+                    .map(|tag| std::collections::BTreeMap::from([("Primary".to_string(), tag)])),
             })
             .unwrap_or(serde_json::Value::Null)
         })
@@ -4062,7 +4020,7 @@ async fn visible_views(
 }
 
 fn all_media_placeholder(server_id: &str) -> serde_json::Value {
-    const ALL_MEDIA_ID: &str = "00000000000000000000000000000000";
+    use crate::services::library::ALL_MEDIA_ID;
     serde_json::to_value(CollectionFolderDto {
         image_tags: None,
         id: ALL_MEDIA_ID.to_string(),
@@ -4652,7 +4610,7 @@ fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]
 ///   loose tracks that have no album tag.
 async fn maybe_list_music(
     state: &AppState,
-    user_id: UserId,
+    user: &pharos_core::User,
     q: &ListQuery,
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -4675,6 +4633,9 @@ async fn maybe_list_music(
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let all = crate::services::access::visible_items(state, user, all, "music")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let orders = parse_sort_orders(q.sort_order.as_deref());
 
     if let Some(artist) = artist_parent {
@@ -4708,7 +4669,7 @@ async fn maybe_list_music(
             let ids: Vec<u64> = loose.iter().map(|i| i.id).collect();
             let ud = state
                 .stores
-                .user_data_bulk(user_id, &ids)
+                .user_data_bulk(user.id, &ids)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
             for (n, t) in loose.iter().enumerate() {
@@ -4820,7 +4781,7 @@ async fn list_items(
             &list_playlists_page(&state, user.0.id, &q).await?,
         ));
     }
-    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
         return Ok(resp);
     }
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
@@ -4854,7 +4815,7 @@ async fn list_user_items(
             &list_playlists_page(&state, user.0.id, &q).await?,
         ));
     }
-    if let Some(resp) = maybe_list_music(&state, user.0.id, &q).await? {
+    if let Some(resp) = maybe_list_music(&state, &user.0, &q).await? {
         return Ok(resp);
     }
     // Virtual Series/Season listing — pharos stores no Series/Season row, so a
@@ -5455,7 +5416,7 @@ fn sort_chain(
 /// ceiling (`MaxParentalRating`). Applied to the query (not a post-filter) so
 /// `TotalRecordCount` and paging stay honest. A no-op for an unrestricted
 /// (default) policy.
-fn apply_policy_scope(
+pub(crate) fn apply_policy_scope(
     mq: &mut pharos_core::MediaQuery,
     policy: &pharos_core::UserPolicy,
     ratings: &crate::parental::ParentalRatingMap,
@@ -6046,256 +6007,6 @@ async fn apply_tags_filter(
     Ok(items.into_iter().filter(|i| keep.contains(&i.id)).collect())
 }
 
-/// Drop items that don't live under the configured root / series /
-/// season mapped to `parent_id`. Unknown `parent_id` → empty list.
-/// The All-Media placeholder + `None` pass everything through.
-async fn restrict_to_parent(
-    state: &AppState,
-    items: &[MediaItem],
-    parent_id: Option<&str>,
-) -> Vec<MediaItem> {
-    use crate::api::jellyfin::dto::{
-        album_id_for, artist_id_for, genre_id_for, season_id_for_key, series_id_for_key,
-    };
-    use pharos_core::{
-        CollectionStore, GenreStore, LibraryStore, PersonStore, StudioStore, TagStore,
-    };
-    let Some(pid) = parent_id else {
-        return items.to_vec();
-    };
-    // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
-    // dashless form jellyfin-web echoes.
-    let canonical = canonical_wire_id(pid);
-    let pid: &str = canonical.as_ref();
-    if pid.is_empty() || pid == "00000000000000000000000000000000" {
-        return items.to_vec();
-    }
-    // 1) Library / root match. LIB-C1 — prefer the typed `libraries` table:
-    //    resolve the ParentId by wire_id to the set of item ids assigned
-    //    that library (backfilled by path-prefix at boot, kept current by
-    //    the scanner). Fall back to the legacy path-prefix scan over
-    //    `media_roots` for libraries not yet backfilled (or test states
-    //    wired only with `with_media_roots`).
-    let matched_lib = state
-        .libraries()
-        .iter()
-        .find(|l| l.wire_id == pid)
-        .map(|l| (l.wire_id.clone(), l.root_path.clone()));
-    if let Some((wire_id, root_path)) = matched_lib {
-        if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
-            if !ids.is_empty() {
-                let want: std::collections::HashSet<u64> = ids.into_iter().collect();
-                return items
-                    .iter()
-                    .filter(|i| want.contains(&i.id))
-                    .cloned()
-                    .collect();
-            }
-        }
-        // No backfilled rows yet → fall back to the path-prefix scan
-        // against this library's root so the view still resolves.
-        let root = std::path::PathBuf::from(&root_path);
-        return items
-            .iter()
-            .filter(|i| i.path.starts_with(&root))
-            .cloned()
-            .collect();
-    }
-    if let Some(root) = state
-        .media_roots
-        .iter()
-        .find(|r| library_id_for_root(r) == pid)
-    {
-        return items
-            .iter()
-            .filter(|i| i.path.starts_with(root))
-            .cloned()
-            .collect();
-    }
-    // 2) Series id → every episode whose folder-keyed series id matches
-    //    pid. LIB-C11: resolves via the show FOLDER (falling back to the
-    //    bare name for legacy rows), so a same-name show in another folder
-    //    isn't pulled in under the wrong series.
-    if items.iter().any(|i| {
-        i.series
-            .as_ref()
-            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
-    }) {
-        return items
-            .iter()
-            .filter(|i| {
-                i.series.as_ref().is_some_and(|s| {
-                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
-                })
-            })
-            .cloned()
-            .collect();
-    }
-    // 3) Season id → every episode in that (folder, season) pair.
-    if items.iter().any(|i| {
-        i.series.as_ref().is_some_and(|s| {
-            s.season_number.is_some_and(|n| {
-                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
-            })
-        })
-    }) {
-        return items
-            .iter()
-            .filter(|i| {
-                i.series.as_ref().is_some_and(|s| {
-                    s.season_number.is_some_and(|n| {
-                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
-                    })
-                })
-            })
-            .cloned()
-            .collect();
-    }
-    // 4) Artist id → every track whose artist or album_artist matches.
-    if items.iter().any(|i| {
-        i.probe
-            .artist
-            .as_deref()
-            .is_some_and(|a| artist_id_for(a) == pid)
-            || i.probe
-                .album_artist
-                .as_deref()
-                .is_some_and(|a| artist_id_for(a) == pid)
-    }) {
-        return items
-            .iter()
-            .filter(|i| {
-                i.probe
-                    .artist
-                    .as_deref()
-                    .is_some_and(|a| artist_id_for(a) == pid)
-                    || i.probe
-                        .album_artist
-                        .as_deref()
-                        .is_some_and(|a| artist_id_for(a) == pid)
-            })
-            .cloned()
-            .collect();
-    }
-    // 5) Album id → every track whose album hashes to pid.
-    if items.iter().any(|i| {
-        i.probe
-            .album
-            .as_deref()
-            .is_some_and(|a| album_id_for(a) == pid)
-    }) {
-        return items
-            .iter()
-            .filter(|i| {
-                i.probe
-                    .album
-                    .as_deref()
-                    .is_some_and(|a| album_id_for(a) == pid)
-            })
-            .cloned()
-            .collect();
-    }
-    // 6) Genre id → every item tagged with that genre. LIB-C4: resolve
-    //    via the genres.wire_id → item_genres → items indexed join when
-    //    the genre is a real row (the entity-backed exact pivot). If the
-    //    wire id matches no genre row yet (rows scanned before C4 and not
-    //    backfilled), fall back to the legacy in-memory probe.genre scan.
-    if let Ok(ids) = state.stores.item_ids_for_genre(pid).await {
-        if !ids.is_empty() {
-            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items
-                .iter()
-                .filter(|i| want.contains(&i.id))
-                .cloned()
-                .collect();
-        }
-    }
-    if items.iter().any(|i| {
-        i.probe
-            .genre
-            .as_deref()
-            .map(pharos_core::split_genre_field)
-            .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
-    }) {
-        return items
-            .iter()
-            .filter(|i| {
-                i.probe
-                    .genre
-                    .as_deref()
-                    .map(pharos_core::split_genre_field)
-                    .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
-            })
-            .cloned()
-            .collect();
-    }
-    // 7) Person id → every item crediting that person. LIB-C2: resolve
-    //    via people.wire_id → item_people → items indexed join. People
-    //    have no legacy probe column, so there is no in-memory fallback
-    //    (an unknown wire id simply yields no items → empty library).
-    if let Ok(ids) = state.stores.item_ids_for_person(pid).await {
-        if !ids.is_empty() {
-            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items
-                .iter()
-                .filter(|i| want.contains(&i.id))
-                .cloned()
-                .collect();
-        }
-    }
-    // 8) Studio id → every item tagged with that studio. LIB-C3: resolve
-    //    via studios.wire_id → item_studios → items indexed join. Studios
-    //    have no legacy probe column (the old /Studios stub borrowed
-    //    album_artist but never linked it), so there is no in-memory
-    //    fallback — an unknown wire id yields no items → empty library.
-    if let Ok(ids) = state.stores.item_ids_for_studio(pid).await {
-        if !ids.is_empty() {
-            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items
-                .iter()
-                .filter(|i| want.contains(&i.id))
-                .cloned()
-                .collect();
-        }
-    }
-    // 9) Collection / box set id → its members in curated sort_order.
-    //    LIB-C5: resolve via collections.wire_id → collection_items →
-    //    items, returning the members in the join's `sort_order` (NOT the
-    //    id order of `items`) so a curated box set renders in order. The
-    //    membership ids are the source of truth for both membership AND
-    //    order; we index `items` by id and emit in member order. A wire id
-    //    matching a *known but empty* collection still resolves (to an
-    //    empty list) so a freshly-created empty box set browses cleanly,
-    //    rather than falling through to the unknown-id empty Vec.
-    if let Ok(collection) = state.stores.collection_by_wire_id(pid).await {
-        if collection.is_some() {
-            let member_ids = state.stores.collection_items(pid).await.unwrap_or_default();
-            let mut by_id: std::collections::HashMap<pharos_core::MediaId, MediaItem> =
-                items.iter().map(|i| (i.id, i.clone())).collect();
-            return member_ids
-                .iter()
-                .filter_map(|id| by_id.remove(id))
-                .collect();
-        }
-    }
-    // 10) Tag id → every item carrying that tag. LIB-C6: resolve via
-    //     tags.wire_id → item_tags → items indexed join. Tags have no
-    //     legacy probe column, so there is no in-memory fallback — an
-    //     unknown wire id yields no items → empty library.
-    if let Ok(ids) = state.stores.item_ids_for_tag(pid).await {
-        if !ids.is_empty() {
-            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
-            return items
-                .iter()
-                .filter(|i| want.contains(&i.id))
-                .cloned()
-                .collect();
-        }
-    }
-    // Unknown id — render an empty library.
-    Vec::new()
-}
-
 /// xorshift64 Fisher–Yates. Deterministic for a given seed — same
 /// `(items, seed)` yields the same permutation. Caller threads a
 /// seed (from `?SortSeed=` or the bearer's user id) so /Items?
@@ -6379,8 +6090,11 @@ async fn synth_genre(
     ))
 }
 
+/// An album or artist is shown to `user` only through tracks they may reach
+/// (V187); with none, it answers 404 like an unknown id.
 async fn synth_album_or_artist(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
@@ -6394,10 +6108,16 @@ async fn synth_album_or_artist(
             .list_items_cached()
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        let tracks: Vec<_> = all
+        let mut tracks: Vec<_> = all
             .iter()
             .filter(|i| i.probe.album.as_deref() == Some(name.as_str()))
             .collect();
+        crate::services::access::retain_visible(state, user, &mut tracks, |t| t.id, "album")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        if tracks.is_empty() {
+            return Err(error::ErrorNotFound("not found"));
+        }
         let artist = tracks.iter().find_map(|i| {
             i.probe
                 .album_artist
@@ -6442,6 +6162,23 @@ async fn synth_album_or_artist(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if let Some(name) = artists.iter().find(|n| artist_id_for(n) == id_str) {
+        let all = state
+            .list_items_cached()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let mut tracks: Vec<_> = all
+            .iter()
+            .filter(|i| {
+                i.probe.artist.as_deref() == Some(name.as_str())
+                    || i.probe.album_artist.as_deref() == Some(name.as_str())
+            })
+            .collect();
+        crate::services::access::retain_visible(state, user, &mut tracks, |t| t.id, "artist")
+            .await
+            .map_err(crate::api::jellyfin::access_error)?;
+        if tracks.is_empty() {
+            return Err(error::ErrorNotFound("not found"));
+        }
         // B78/V38 — typed SynthItemDto.
         return Ok(Some(
             serde_json::to_value(SynthItemDto {
@@ -6530,7 +6267,7 @@ async fn fetch_item_dto(
         }
         // T-fix-18: synth Series + Season DTOs derived from any Episode item
         // whose series_id / season_id matches (one `store.list()`).
-        if let Some(view) = synth_series_or_season(state, id_str).await? {
+        if let Some(view) = synth_series_or_season(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
@@ -6579,7 +6316,7 @@ async fn fetch_item_dto(
         // single items — a 400 here broke the whole music play flow (the
         // detail view aborted before the play button was wired). Same
         // one-way-hash recovery as `resolve_parent_filter`.
-        if let Some(view) = synth_album_or_artist(state, id_str).await? {
+        if let Some(view) = synth_album_or_artist(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         if let Some(view) = synth_genre(state, id_str).await? {
@@ -6591,6 +6328,7 @@ async fn fetch_item_dto(
         // and answered 400 "invalid id", which killed the genre page.
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(state, user, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -6705,6 +6443,7 @@ async fn item_ancestors(
     // Wire ids of the ancestors, nearest first.
     let mut chain: Vec<String> = Vec::new();
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(id_str) {
+        crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
         let item = state.stores.get(id).await.map_err(|e| match e {
             pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
             other => internal(other),
@@ -6753,7 +6492,7 @@ async fn item_ancestors(
     for wire_id in &chain {
         let dto = match library_view_for_id(&state, &user.0.policy, wire_id).await {
             Some(view) => Some(view),
-            None => synth_series_or_season(&state, wire_id).await?,
+            None => synth_series_or_season(&state, &user.0, wire_id).await?,
         };
         out.extend(dto);
     }
@@ -7097,8 +6836,11 @@ async fn maybe_list_virtual_shows(
     )))
 }
 
+/// A series or season lives in one show folder, so one library: the episode
+/// that matched decides whether `user` may see it (V187).
 async fn synth_series_or_season(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
@@ -7114,6 +6856,7 @@ async fn synth_series_or_season(
             continue;
         };
         if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
+            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
             // B93 — count the series' distinct seasons + total episodes so the
             // detail DTO advertises ChildCount / RecursiveItemCount.
             let mut seasons = std::collections::HashSet::new();
@@ -7162,6 +6905,7 @@ async fn synth_series_or_season(
             season_n,
         ) == id_str
         {
+            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
             // B93 — episodes in this season → the Season DTO's ChildCount.
             let episode_count = all
                 .iter()
@@ -7382,11 +7126,14 @@ async fn resume_items(
         pharos_core::MediaKind::Book => "book",
         pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode => "video",
     };
-    let ids = state
+    let mut ids = state
         .stores
         .resumable_items(user.0.id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    crate::services::access::retain_visible(state, &user.0, &mut ids, |id| *id, "resume")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
     let mut ids_kept: Vec<pharos_core::MediaId> = Vec::with_capacity(ids.len());
     for id in &ids {
@@ -7448,10 +7195,13 @@ async fn resume_items(
     }))
 }
 
+/// Admin only, as in Jellyfin (`RequiresElevation`): it names every library
+/// and its root path whatever the caller's `EnabledFolders` (B243, V186).
 async fn virtual_folders(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     // LIB-C1 — one VirtualFolderInfoDto per real typed library, with its
     // root path as the single `Locations` entry and the per-kind
     // CollectionType. Item id = the stable library wire id so client URLs

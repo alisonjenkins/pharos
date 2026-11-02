@@ -4,31 +4,35 @@ use std::rc::Rc;
 
 use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
-use pharos_api::{server, Denial};
+use pharos_api::{server, Connection, Denial};
 use pharos_core::{AuthError, User};
 
+use super::library::Library;
 use super::ConnectionCtx;
 use crate::services::auth::{revoke_token, RevokeCause};
 use crate::state::AppState;
 
 pub(super) struct Session {
-    state: web::Data<AppState>,
+    pub(super) state: web::Data<AppState>,
     ctx: Rc<ConnectionCtx>,
+    conn: Rc<Connection>,
     user: User,
     /// The device token this session was opened with; `logout` revokes it.
-    token: String,
+    pub(super) token: String,
 }
 
 impl Session {
     pub(super) fn new(
         state: web::Data<AppState>,
         ctx: Rc<ConnectionCtx>,
+        conn: Rc<Connection>,
         user: User,
         token: String,
     ) -> Self {
         Self {
             state,
             ctx,
+            conn,
             user,
             token,
         }
@@ -37,7 +41,7 @@ impl Session {
     /// `Some` once `logout` ended this session's token on the connection:
     /// every call (and, as they land, every capability getter's calls)
     /// answers it instead of serving the user.
-    fn ended(&self) -> Option<Denial> {
+    pub(super) fn ended(&self) -> Option<Denial> {
         self.ctx.has_ended(&self.token).then_some(Denial::Revoked {
             reason: "logged out",
         })
@@ -58,6 +62,20 @@ impl server::session::Handler for Session {
         me.reborrow().init_id().set_uuid(self.user.id.0.as_bytes());
         me.set_name(self.user.name.as_str());
         me.set_is_admin(self.user.policy.admin);
+        Ok(())
+    }
+
+    /// Never refused: a getter answers at once so calls can pipeline on it;
+    /// each `Library` call checks the session itself.
+    async fn library(
+        self: Rc<Self>,
+        _params: wire::LibraryParams,
+        results: &mut wire::LibraryResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_library(server::library::client(Library::new(self), &conn));
         Ok(())
     }
 

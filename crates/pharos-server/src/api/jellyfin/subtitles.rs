@@ -18,7 +18,7 @@
 //! starting at `1_000_000` so their numeric IDs never collide with
 //! real ffprobe stream indices.
 
-use crate::{api::jellyfin::auth_extractor::AuthUser, bg_io::BgPermit, state::AppState};
+use crate::{bg_io::BgPermit, state::AppState};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_cache::subtitle_cache::{mtime_secs, SubtitleKind};
 use serde::Serialize;
@@ -95,24 +95,45 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     );
 }
 
+/// The bearer of a subtitle or attachment fetch, refused (401) without a
+/// credential and 404 for an item outside its libraries (V187, V189). The
+/// file routes below take the token from `api_key` or the `JellyfinAuth`
+/// cookie, since a `<track>` or font fetch cannot set a header.
+async fn bearer(
+    state: &AppState,
+    req: &HttpRequest,
+    id_str: &str,
+    route: &'static str,
+) -> Result<pharos_core::User, actix_web::Error> {
+    let user = crate::api::jellyfin::require_bearer(state, req, id_str, route).await?;
+    let id = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(state, &user, id, route).await?;
+    Ok(user)
+}
+
 async fn stream_attachment(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "attachment").await?;
     deliver_attachment(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_attachment_short(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "attachment").await?;
     deliver_attachment(&state, &id, None, stream_index).await
 }
 
 /// Extract + serve an embedded attachment (font) by stream index. Cached on
-/// disk after the first fetch. Public, like the subtitle + image routes.
+/// disk after the first fetch. Callers authenticate first (V189).
 #[tracing::instrument(skip(state), fields(media.id = %id_str, idx = stream_index, kind = "attachment"))]
 async fn deliver_attachment(
     state: &AppState,
@@ -159,23 +180,27 @@ async fn deliver_attachment(
         .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type(content_type)
-        .insert_header((header::CACHE_CONTROL, "public, max-age=86400"))
+        .insert_header((header::CACHE_CONTROL, "private, max-age=86400"))
         .body(bytes))
 }
 
 async fn stream_ass(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     deliver_ass(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_ass_short(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     deliver_ass(&state, &id, None, stream_index).await
 }
 
@@ -202,7 +227,7 @@ async fn deliver_ass(
     let ass_body = |bytes: Vec<u8>| {
         HttpResponse::Ok()
             .content_type("text/x-ssa; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
             .body(bytes)
     };
 
@@ -593,6 +618,7 @@ async fn stream_srt(
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     let forced_only = parse_forced_only(req.query_string());
     deliver_srt(&state, &id, Some(&msid), stream_index, forced_only).await
 }
@@ -603,6 +629,7 @@ async fn stream_srt_short(
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     let forced_only = parse_forced_only(req.query_string());
     deliver_srt(&state, &id, None, stream_index, forced_only).await
 }
@@ -658,7 +685,7 @@ async fn deliver_srt(
     let srt_response = |bytes: Vec<u8>| {
         HttpResponse::Ok()
             .content_type("application/x-subrip; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+            .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
             .body(bytes)
     };
 
@@ -746,36 +773,26 @@ async fn run_ffmpeg_embedded_srt(
 
 async fn stream_vtt(
     state: web::Data<AppState>,
-    user: Option<AuthUser>,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
+    let user = bearer(&state, &req, &id, "subtitle").await?;
     let forced_only = parse_forced_only(req.query_string());
-    let style = user_subtitle_style(&state, user).await;
+    let style = subtitle_style_for(&state, user.id).await;
     deliver_vtt(&state, &id, Some(&msid), stream_index, forced_only, style).await
 }
 
 async fn stream_vtt_short(
     state: web::Data<AppState>,
-    user: Option<AuthUser>,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
+    let user = bearer(&state, &req, &id, "subtitle").await?;
     let forced_only = parse_forced_only(req.query_string());
-    let style = user_subtitle_style(&state, user).await;
+    let style = subtitle_style_for(&state, user.id).await;
     deliver_vtt(&state, &id, None, stream_index, forced_only, style).await
-}
-
-/// Per-user subtitle style when the request is authenticated; default styling
-/// otherwise (subtitle routes are public — jellyfin-web's JS renderer fetches
-/// them without a token, like the image routes).
-async fn user_subtitle_style(state: &AppState, user: Option<AuthUser>) -> SubtitleStyle {
-    match user {
-        Some(u) => subtitle_style_for(state, u.0.id).await,
-        None => SubtitleStyle::default(),
-    }
 }
 
 fn parse_forced_only(qs: &str) -> bool {
@@ -908,25 +925,31 @@ async fn deliver_vtt(
 
 async fn stream_js(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     deliver_js(&state, &id, Some(&msid), stream_index).await
 }
 
 async fn stream_js_short(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     deliver_js(&state, &id, None, stream_index).await
 }
 
 async fn stream_js_ticks(
     state: web::Data<AppState>,
+    req: HttpRequest,
     path: web::Path<(String, String, u32, i64)>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index, _start_ticks) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle").await?;
     deliver_js(&state, &id, Some(&msid), stream_index).await
 }
 
@@ -971,7 +994,7 @@ async fn deliver_js(
     let body = webvtt_to_track_events_json(&vtt);
     Ok(HttpResponse::Ok()
         .content_type("application/json; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
         .body(body))
 }
 
@@ -1248,7 +1271,7 @@ fn vtt_response(mut body: Vec<u8>, style_lossy: bool, style: &SubtitleStyle) -> 
     let mut builder = HttpResponse::Ok();
     builder
         .content_type("text/vtt; charset=utf-8")
-        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"));
+        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"));
     if style_lossy {
         builder.insert_header(("X-Subtitle-Style-Lossy", "true"));
     }
@@ -1593,7 +1616,7 @@ async fn serve_sidecar(
                 .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
             Ok(HttpResponse::Ok()
                 .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                 .body(bytes))
         }
         SidecarKind::Convert => {
@@ -1609,7 +1632,7 @@ async fn serve_sidecar(
                 {
                     return Ok(HttpResponse::Ok()
                         .content_type("text/vtt; charset=utf-8")
-                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                         .body((*bytes).clone()));
                 }
                 let lock = cache
@@ -1622,7 +1645,7 @@ async fn serve_sidecar(
                 {
                     return Ok(HttpResponse::Ok()
                         .content_type("text/vtt; charset=utf-8")
-                        .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                         .body((*bytes).clone()));
                 }
                 let out = run_ffmpeg_srt_to_vtt(input).await?;
@@ -1631,13 +1654,13 @@ async fn serve_sidecar(
                     .await;
                 return Ok(HttpResponse::Ok()
                     .content_type("text/vtt; charset=utf-8")
-                    .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                    .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                     .body((*stored).clone()));
             }
             let out = run_ffmpeg_srt_to_vtt(input).await?;
             Ok(HttpResponse::Ok()
                 .content_type("text/vtt; charset=utf-8")
-                .insert_header((header::CACHE_CONTROL, "public, max-age=3600"))
+                .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
                 .body(out))
         }
     }

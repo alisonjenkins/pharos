@@ -113,11 +113,13 @@ struct MetadataEditorInfoDto {
 
 async fn metadata_editor(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -529,25 +531,27 @@ async fn remote_images_inner(
 /// `GET /Items/{id}/RemoteImages` — the Edit-Images dialog's candidate list.
 async fn remote_images(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<RemoteImagesQuery>,
-) -> impl Responder {
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let result = remote_images_inner(&state, &path.into_inner(), &q).await;
-    crate::api::jellyfin::wire::json(&result)
+    Ok(crate::api::jellyfin::wire::json(&result))
 }
 
 /// `GET /Items/{id}/RemoteImages/Providers` — the matched provider name(s).
 async fn remote_image_providers(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
-) -> impl Responder {
+) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let providers = match resolve_image_match(&state, &path.into_inner()).await {
         Some(m) => vec![provider_display(m.provider).to_string()],
         None => Vec::<String>::new(),
     };
-    crate::api::jellyfin::wire::json(&providers)
+    Ok(crate::api::jellyfin::wire::json(&providers))
 }
 
 /// Cap on a downloaded image's size — a sanity bound, not a security control
@@ -748,10 +752,11 @@ async fn apply_downloaded_art(
 /// `POST /Items/{id}/RemoteImages/Download` — download the user's chosen image.
 async fn remote_images_download(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<RemoteImageDownloadQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     remote_images_download_inner(&state, &path.into_inner(), q.into_inner()).await?;
     Ok(HttpResponse::NoContent().finish())
 }
@@ -772,11 +777,12 @@ async fn remote_subtitle_search(
 /// Start}] }`, `Start` in ticks).
 async fn get_lyrics(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
@@ -867,16 +873,18 @@ async fn instant_mix(
     use pharos_core::MediaQuery;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
     let seed = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
         other => error::ErrorInternalServerError(other.to_string()),
     })?;
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    let mq = MediaQuery {
+    let mut mq = MediaQuery {
         kinds: vec![seed.kind],
         limit: Some(limit + 1), // +1 so dropping the seed still fills the page
         ..Default::default()
     };
+    items::apply_policy_scope(&mut mq, &user.0.policy, &state.parental_ratings);
     let (rows, _total) = state
         .stores
         .query(&mq)
@@ -1026,9 +1034,10 @@ async fn remote_search_movie_inner(
 /// lists these candidates.
 async fn remote_search_movie(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let results = remote_search_movie_inner(&state, id).await?;
@@ -1066,9 +1075,10 @@ async fn remote_search_series_inner(
 /// lists these candidates.
 async fn remote_search_series(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let results = remote_search_series_inner(&state, id).await?;
@@ -1128,10 +1138,11 @@ async fn remote_search_apply_inner(
 /// posts the user's chosen candidate here.
 async fn remote_search_apply(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     body: web::Json<RemoteSearchApplyDto>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     remote_search_apply_inner(&state, id, body.into_inner()).await?;

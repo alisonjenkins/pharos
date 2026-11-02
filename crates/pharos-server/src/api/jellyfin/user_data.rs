@@ -10,7 +10,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{MediaStore, UserDataStore, UserId, UserItemData};
+use pharos_core::{MediaStore, UserDataStore, UserItemData};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -83,7 +83,7 @@ async fn mark_played_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, user.0.id, &path.into_inner(), op_mark_played).await
+    mutate(&state, &user.0, &path.into_inner(), op_mark_played).await
 }
 
 async fn unmark_played_me(
@@ -91,7 +91,7 @@ async fn unmark_played_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, user.0.id, &path.into_inner(), op_unmark_played).await
+    mutate(&state, &user.0, &path.into_inner(), op_unmark_played).await
 }
 
 async fn mark_favorite_me(
@@ -99,7 +99,7 @@ async fn mark_favorite_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, user.0.id, &path.into_inner(), op_mark_favorite).await
+    mutate(&state, &user.0, &path.into_inner(), op_mark_favorite).await
 }
 
 async fn unmark_favorite_me(
@@ -107,7 +107,7 @@ async fn unmark_favorite_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, user.0.id, &path.into_inner(), op_unmark_favorite).await
+    mutate(&state, &user.0, &path.into_inner(), op_unmark_favorite).await
 }
 
 async fn mark_played(
@@ -117,7 +117,7 @@ async fn mark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, op_mark_played).await
+    mutate(&state, &user.0, &item_id, op_mark_played).await
 }
 
 async fn unmark_played(
@@ -127,7 +127,7 @@ async fn unmark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, op_unmark_played).await
+    mutate(&state, &user.0, &item_id, op_unmark_played).await
 }
 
 async fn mark_favorite(
@@ -137,7 +137,7 @@ async fn mark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, op_mark_favorite).await
+    mutate(&state, &user.0, &item_id, op_mark_favorite).await
 }
 
 async fn unmark_favorite(
@@ -147,7 +147,7 @@ async fn unmark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, user.0.id, &item_id, op_unmark_favorite).await
+    mutate(&state, &user.0, &item_id, op_unmark_favorite).await
 }
 
 fn require_bearer_match(user: &AuthUser, uid_path: &str) -> Result<(), actix_web::Error> {
@@ -166,7 +166,7 @@ fn require_bearer_match(user: &AuthUser, uid_path: &str) -> Result<(), actix_web
 
 async fn mutate<F>(
     state: &AppState,
-    user_id: UserId,
+    user: &pharos_core::User,
     item_id_str: &str,
     f: F,
 ) -> Result<HttpResponse, actix_web::Error>
@@ -178,8 +178,10 @@ where
         // jellyfin-web's series/season pages offer mark-played /
         // favourite buttons, so cascade over the child episodes instead
         // of 400ing (B36).
-        return mutate_synth_folder(state, user_id, item_id_str, f).await;
+        return mutate_synth_folder(state, user, item_id_str, f).await;
     };
+    let user_id = user.id;
+    crate::api::jellyfin::require_item_access(state, user, item_id, "user_data").await?;
     // Confirm the item exists before writing a row that the cascade
     // would have to clean up later.
     let item = state.stores.get(item_id).await.map_err(|e| match e {
@@ -215,7 +217,7 @@ where
 /// and return the folder-level DTO the way real Jellyfin does.
 async fn mutate_synth_folder<F>(
     state: &AppState,
-    user_id: UserId,
+    user: &pharos_core::User,
     id_str: &str,
     f: F,
 ) -> Result<HttpResponse, actix_web::Error>
@@ -236,7 +238,8 @@ where
         .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let episodes: Vec<_> = all
+    let user_id = user.id;
+    let mut episodes: Vec<_> = all
         .iter()
         .filter(|item| {
             let Some(series) = item.series.as_ref() else {
@@ -250,6 +253,9 @@ where
             })
         })
         .collect();
+    crate::services::access::retain_visible(state, user, &mut episodes, |e| e.id, "user_data")
+        .await
+        .map_err(crate::api::jellyfin::access_error)?;
     if episodes.is_empty() {
         return Err(error::ErrorNotFound("item not found"));
     }

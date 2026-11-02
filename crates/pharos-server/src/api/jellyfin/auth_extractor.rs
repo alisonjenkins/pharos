@@ -11,7 +11,7 @@ use crate::services::auth::TokenRefusal;
 use crate::state::AppState;
 use actix_web::{
     dev::Payload, error::ErrorInternalServerError, error::ErrorUnauthorized, web, FromRequest,
-    HttpRequest,
+    HttpMessage, HttpRequest,
 };
 use pharos_core::User;
 use std::{future::Future, pin::Pin};
@@ -25,7 +25,25 @@ impl FromRequest for AuthUser {
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_token(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
-        Box::pin(async move { authenticate(state, token).await.map(AuthUser) })
+        let req = req.clone();
+        Box::pin(async move {
+            let user = authenticate(state, token.clone()).await?;
+            note_header_credential(&req, token);
+            Ok(AuthUser(user))
+        })
+    }
+}
+
+/// The token a request authenticated with by header or `api_key`, left in
+/// the request extensions once the store accepted it. The
+/// [`CookieBackfill`](crate::middleware::CookieBackfill) middleware reads it
+/// to give a browser that signed in before the cookie existed its
+/// `JellyfinAuth`. It has no `Debug` impl, so it cannot reach a log line.
+pub(crate) struct HeaderCredential(pub(crate) String);
+
+pub(crate) fn note_header_credential(req: &HttpRequest, token: Option<String>) {
+    if let Some(token) = token {
+        req.extensions_mut().insert(HeaderCredential(token));
     }
 }
 
@@ -84,8 +102,10 @@ impl FromRequest for AuthSession {
         let token = extract_token(req);
         let device_id = device_id_from_request(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
+        let req = req.clone();
         Box::pin(async move {
-            let user = authenticate(state, token).await?;
+            let user = authenticate(state, token.clone()).await?;
+            note_header_credential(&req, token);
             Ok(AuthSession { user, device_id })
         })
     }
@@ -144,6 +164,7 @@ pub fn device_id_from_request(req: &HttpRequest) -> Option<String> {
 /// Lookup order: `X-Emby-Token` → `X-MediaBrowser-Token` →
 /// MediaBrowser/Emby `Authorization` parse → `api_key` query param (used
 /// by media-element `src=` playback where headers can't be injected).
+/// Never the `JellyfinAuth` cookie: see [`extract_media_token`].
 pub fn extract_token(req: &HttpRequest) -> Option<String> {
     let h = req.headers();
 
@@ -176,35 +197,92 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             return Some(v.to_string());
         }
     }
-    // P24 — last-resort cookie fallback. Stream endpoints set a
-    // `JellyfinAuth` cookie after the first authenticated request so
-    // `<video src=…>` (which can't inject headers, and on Safari /
-    // tvOS can't trust query strings under strict CSP) keeps working.
-    if let Some(cookie_hdr) = h
-        .get(actix_web::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-    {
-        for entry in cookie_hdr.split(';') {
-            let entry = entry.trim();
-            if let Some((name, value)) = entry.split_once('=') {
-                if name.trim().eq_ignore_ascii_case("JellyfinAuth") {
-                    let v = value.trim();
-                    if !v.is_empty() {
-                        return Some(v.to_string());
-                    }
-                }
-            }
-        }
-    }
     None
 }
 
-/// P24 — Set-Cookie value emitted when a media-element-style URL
-/// successfully authenticated via `?api_key=`. Caller uses it on the
-/// stream / HLS response so subsequent fetches don't have to repeat
-/// the query string.
-pub fn auth_cookie_header(token: &str) -> String {
-    format!("JellyfinAuth={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400")
+/// The `JellyfinAuth` cookie, set at sign-in so `<img>`, `<track>`, font
+/// and media-element fetches authenticate without a header.
+pub const AUTH_COOKIE: &str = "JellyfinAuth";
+
+/// [`extract_token`], falling back to the `JellyfinAuth` cookie on a GET or
+/// HEAD. Only routes that serve an item's bytes to element URLs (images,
+/// subtitles, fonts, streams, HLS, trickplay) read it, through
+/// [`MediaUser`] or `require_bearer` (V191). A browser attaches the cookie
+/// to any same-site request, including one from a sibling subdomain that
+/// `SameSite` cannot tell apart, so it must never authorize a write or a
+/// JSON API read.
+pub fn extract_media_token(req: &HttpRequest) -> Option<String> {
+    if let Some(token) = extract_token(req) {
+        return Some(token);
+    }
+    if !matches!(
+        *req.method(),
+        actix_web::http::Method::GET | actix_web::http::Method::HEAD
+    ) {
+        return None;
+    }
+    req.cookie(AUTH_COOKIE)
+        .map(|c| c.value().trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// [`AuthUser`] for the routes that serve an item's bytes to element URLs:
+/// the token may also come from the `JellyfinAuth` cookie on a GET or HEAD
+/// ([`extract_media_token`]).
+pub struct MediaUser(pub User);
+
+impl FromRequest for MediaUser {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, actix_web::Error>>>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let token = extract_media_token(req);
+        // A cookie-borne token is not a credential to echo back.
+        let header_borne = extract_token(req).is_some();
+        let state = req.app_data::<web::Data<AppState>>().cloned();
+        let req = req.clone();
+        Box::pin(async move {
+            let user = authenticate(state, token.clone()).await?;
+            if header_borne {
+                note_header_credential(&req, token);
+            }
+            Ok(MediaUser(user))
+        })
+    }
+}
+
+/// How long a browser keeps [`AUTH_COOKIE`]: the longest browsers allow.
+/// The token behind it lives until revoked, and every request re-checks it,
+/// so the cookie outliving a sign-out grants nothing.
+const AUTH_COOKIE_MAX_AGE: actix_web::cookie::time::Duration =
+    actix_web::cookie::time::Duration::days(400);
+
+/// [`AUTH_COOKIE`] carrying `token`, set at sign-in and, by
+/// [`CookieBackfill`](crate::middleware::CookieBackfill), when a header or
+/// `api_key` request arrives without it. `Strict`, so no other site's page
+/// sends it; `Secure` when the request arrived over https.
+pub fn auth_cookie(req: &HttpRequest, token: &str) -> actix_web::cookie::Cookie<'static> {
+    auth_cookie_with(req, token.to_owned(), AUTH_COOKIE_MAX_AGE)
+}
+
+/// The Set-Cookie that removes [`AUTH_COOKIE`] at sign-out. Name, path and
+/// attributes match [`auth_cookie`], or the browser keeps the old one.
+pub fn cleared_auth_cookie(req: &HttpRequest) -> actix_web::cookie::Cookie<'static> {
+    auth_cookie_with(req, String::new(), actix_web::cookie::time::Duration::ZERO)
+}
+
+fn auth_cookie_with(
+    req: &HttpRequest,
+    value: String,
+    max_age: actix_web::cookie::time::Duration,
+) -> actix_web::cookie::Cookie<'static> {
+    actix_web::cookie::Cookie::build(AUTH_COOKIE, value)
+        .path("/")
+        .http_only(true)
+        .secure(req.connection_info().scheme() == "https")
+        .same_site(actix_web::cookie::SameSite::Strict)
+        .max_age(max_age)
+        .finish()
 }
 
 /// Parse `MediaBrowser Token="abc", Client="x", …` style headers.

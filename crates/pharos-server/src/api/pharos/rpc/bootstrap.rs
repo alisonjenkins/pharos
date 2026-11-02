@@ -55,7 +55,13 @@ impl Bootstrap {
             .sign_in(&mut self.ctx.slot.borrow_mut(), user.id, u32::MAX);
         self.ctx.remember_token(token.clone(), user.id);
         self.conn.set_user(&user.name);
-        let session = Session::new(self.state.clone(), Rc::clone(&self.ctx), user, token);
+        let session = Session::new(
+            self.state.clone(),
+            Rc::clone(&self.ctx),
+            Rc::clone(&self.conn),
+            user,
+            token,
+        );
         server::session::client(session, &self.conn)
     }
 }
@@ -97,6 +103,21 @@ enum Refusal {
     TooManyConnections { held: u32, max: u32 },
 }
 
+/// What a call answers when its token is refused: a fixed reason, never the
+/// store's error text.
+pub(super) fn token_denial(refusal: &TokenRefusal) -> Denial {
+    match refusal {
+        // B216: ours and transient; the client keeps its token and resumes
+        // again.
+        TokenRefusal::Unavailable(_) => Denial::Unavailable {
+            dependency: "token store",
+        },
+        other => Denial::Revoked {
+            reason: other.label(),
+        },
+    }
+}
+
 impl Refusal {
     /// What the refused session answers, in `status` and on every call. A
     /// fixed reason only: a store outage's own error text stays in the
@@ -106,14 +127,7 @@ impl Refusal {
             Refusal::NoCredential => Denial::Revoked {
                 reason: "no device token and no pharos_session cookie",
             },
-            // B216: ours and transient; the client keeps its token and
-            // resumes again.
-            Refusal::Token(TokenRefusal::Unavailable(_)) => Denial::Unavailable {
-                dependency: "token store",
-            },
-            Refusal::Token(other) => Denial::Revoked {
-                reason: other.label(),
-            },
+            Refusal::Token(refusal) => token_denial(refusal),
             Refusal::TooManyConnections { held, max } => Denial::Limit {
                 name: "connections_per_user",
                 value: u64::from(*held),

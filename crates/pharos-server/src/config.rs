@@ -448,6 +448,12 @@ pub struct ServerConfig {
     /// Optional XMLTV file for the EPG side of the live-TV backend.
     #[serde(default)]
     pub live_tv_xmltv: Option<PathBuf>,
+    /// Serve the DLNA / UPnP ContentDirectory routes under `/Dlna/`. UPnP
+    /// control points send no credentials, so a Browse lists the whole
+    /// library to anyone who can reach the server; leave this off on any
+    /// instance reachable from outside a trusted LAN. Default false (V190).
+    #[serde(default)]
+    pub dlna_enabled: bool,
     /// T48 phase 2 — enable SSDP UDP-multicast responder on
     /// 239.255.255.250:1900 so DLNA / UPnP control points discover
     /// pharos without manual configuration. Default false; flip on

@@ -1609,6 +1609,13 @@ pub trait LibraryStore: Send + Sync {
         &self,
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// The `wire_id` of the library `item` belongs to. `None` when the item
+    /// is in no library or does not exist.
+    fn library_wire_id_of(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<String>>> + Send;
 }
 
 /// Parent-show / season / episode metadata for items the scanner

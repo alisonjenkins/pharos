@@ -90,7 +90,7 @@ fn disposition_for(source: &std::path::Path, served: &std::path::Path) -> String
 
 async fn download(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -100,6 +100,7 @@ async fn download(
     // the filesystem.
     let id = pharos_jellyfin_api::dto::parse_item_id(&id_str)
         .ok_or_else(|| error::ErrorNotFound("unknown item"))?;
+    crate::api::jellyfin::require_item_access(&state, &user.0, id, "download").await?;
     let item = state.stores.get(id).await.map_err(|e| match e {
         pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("unknown item"),
         // Expose the cause: a store failure here is not a missing item, and

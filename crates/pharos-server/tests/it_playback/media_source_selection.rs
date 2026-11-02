@@ -270,9 +270,7 @@ async fn an_editions_subtitles_are_its_own() {
     );
 
     let app = app!(state);
-    let req = test::TestRequest::get()
-        .uri(&format!("{url}?api_key={token}"))
-        .to_request();
+    let req = test::TestRequest::get().uri(&url).to_request();
     let body = test::call_and_read_body(&app, req).await;
     let body = std::str::from_utf8(&body).unwrap();
     assert!(body.contains("edition cue"), "{body}");
