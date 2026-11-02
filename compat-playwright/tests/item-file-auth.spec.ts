@@ -1,7 +1,8 @@
-// V189 / V191 — item images and subtitles require a signed-in user, and
-// unmodified jellyfin-web still renders them: its `<img>` and `<track>`
-// fetches send no header and authenticate with the `JellyfinAuth` cookie
-// set at sign-in. An anonymous fetch of the same URLs answers 401.
+// V189 / V191 / V225 — subtitles require a signed-in user, and unmodified
+// jellyfin-web still renders them: its `<track>` fetches send no header and
+// authenticate with the `JellyfinAuth` cookie set at sign-in. An anonymous
+// subtitle fetch answers 401. Item images answer anonymous requests, as
+// Jellyfin's do, because native apps' image loaders send no credential.
 
 import { test, expect, Page, request } from "@playwright/test";
 
@@ -98,11 +99,11 @@ test("signed-in jellyfin-web loads posters and a subtitle track", async ({ page 
   expect(cues).toMatch(/^load:[1-9]/);
 });
 
-test("anonymous requests for an image or a subtitle answer 401", async () => {
+test("an anonymous image request is served and a subtitle answers 401", async () => {
   const anon = await request.newContext({ baseURL: PHAROS_URL });
-  for (const path of [IMAGE_PATH, SUBTITLE_PATH]) {
-    const resp = await anon.get(path);
-    expect(resp.status(), path).toBe(401);
-  }
+  const image = await anon.get(IMAGE_PATH);
+  expect(image.status(), IMAGE_PATH).toBe(200);
+  const subtitle = await anon.get(SUBTITLE_PATH);
+  expect(subtitle.status(), SUBTITLE_PATH).toBe(401);
   await anon.dispose();
 });
