@@ -807,13 +807,16 @@ pub async fn home(
 }
 
 /// Whether `policy` lets its user see every stored item (every library, no
-/// parental cap), so no query need narrow what they see.
+/// parental cap, no tag list), so no query need narrow what they see.
 pub fn hides_nothing(policy: &UserPolicy) -> bool {
-    policy.enable_all_folders && policy.max_parental_rating.is_none()
+    policy.enable_all_folders
+        && policy.max_parental_rating.is_none()
+        && policy.blocked_tags.is_empty()
+        && policy.allowed_tags.is_empty()
 }
 
 /// The stored items `user` may see, or `None` when their policy hides
-/// nothing (every library, no parental cap).
+/// nothing (see [`hides_nothing`]).
 pub async fn visible_items(
     state: &AppState,
     user: &User,
