@@ -1522,8 +1522,7 @@ fn build_args_for_pipeline(
                 .into_owned(),
         );
     }
-    if opts.effective_stereo_output() == StereoOutput::Mono2D
-        && opts.video_3d_format.is_some()
+    if opts.output_3d().is_some_and(Output3D::is_flattened)
         && opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
     {
@@ -3452,6 +3451,25 @@ mod tests {
             a.iter().any(|x| x == "h264_nvenc"),
             "keeps hw encoder: {a:?}"
         );
+    }
+
+    #[test]
+    fn mvc_preserve_transcode_clears_stereo_mode_but_packed_preserve_keeps_it() {
+        use pharos_core::Video3DFormat;
+
+        let mut o = opts();
+        o.video_3d_format = Some(Video3DFormat::Mvc);
+        o.stereo_output = StereoOutput::Preserve;
+        let a = build_args("/m/mvc.mkv", &o);
+        let meta_pos = a
+            .iter()
+            .position(|x| x == "-metadata:s:v:0")
+            .expect("MVC output is 2D and must not claim block_lr");
+        assert_eq!(a[meta_pos + 1], "stereo_mode=");
+
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        let a = build_args("/m/sbs.mkv", &o);
+        assert!(!a.iter().any(|x| x == "-metadata:s:v:0"), "{a:?}");
     }
 
     #[test]
