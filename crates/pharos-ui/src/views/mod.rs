@@ -36,11 +36,11 @@ pub use server_picker::{SavedServer, ServerPickerAction, ServerPickerView};
 
 use dioxus::prelude::*;
 
-/// Top-level mount point. Renders `RootApp` so the WASM entrypoint
-/// stays a one-liner.
+/// Top-level mount point: the native app, with the older panes at
+/// `/manage`. Keeps the WASM entrypoint a one-liner.
 #[component]
 pub fn App() -> Element {
-    rsx! { RootApp {} }
+    rsx! { crate::native::app::Root {} }
 }
 
 #[cfg(test)]
