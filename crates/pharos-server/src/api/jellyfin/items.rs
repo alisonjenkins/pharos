@@ -5278,6 +5278,114 @@ async fn get_user_item(
     fetch_item_dto(&state, &item_id, &user.0, q.0.fields.as_deref()).await
 }
 
+/// The item a synthesised or entity wire id names (library view, series,
+/// season, box set, playlist, album, artist, genre) as its Jellyfin JSON, with
+/// the access rules of `/Items/{id}`. `None` when the id names none of them.
+/// Shared by `/Items/{id}` and the native `Library.detail`, so the two APIs
+/// answer alike.
+pub(crate) async fn synth_item_json(
+    state: &AppState,
+    user: &pharos_core::User,
+    id_str: &str,
+) -> Result<Option<serde_json::Value>, actix_web::Error> {
+    // T-fix-7 follow-up: synthesised library CollectionFolder ids.
+    if let Some(view) = library_view_for_id(state, &user.policy, id_str).await {
+        return Ok(Some(view));
+    }
+    if id_str == "00000000000000000000000000000000" && user.policy.allows_library(id_str) {
+        return Ok(Some(all_media_placeholder(&state.server_id)));
+    }
+    // T-fix-18: synth Series + Season DTOs derived from any Episode item
+    // whose series_id / season_id matches (one `store.list()`).
+    if let Some(view) = synth_series_or_season(state, user, id_str).await? {
+        return Ok(Some(view));
+    }
+    // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
+    // `/Items/{id}` on a box set returns the folder item.
+    use pharos_core::CollectionStore;
+    if let Some(collection) = state
+        .stores
+        .collection_by_wire_id(id_str)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+    {
+        // A box set is visible only through members the user may see (V200).
+        let count = match visible_entity(state, user, EntityKind::Collection, id_str)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        {
+            EntityView::All => Some(
+                state
+                    .stores
+                    .collection_items(id_str)
+                    .await
+                    .map(|m| m.len() as u32)
+                    .unwrap_or(0),
+            ),
+            EntityView::Visible(items) => Some(u32::try_from(items.len()).unwrap_or(u32::MAX)),
+            EntityView::Hidden => None,
+        };
+        if let Some(count) = count {
+            return Ok(Some(to_json_value(&collection_dto(
+                state,
+                &collection,
+                count,
+            ))?));
+        }
+    }
+    // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
+    // `/Items/{id}` on a playlist returns the folder item. Another user's
+    // playlist falls through and answers as an id that names nothing.
+    use pharos_core::PlaylistStore;
+    let playlist = state
+        .stores
+        .playlist_by_wire_id(id_str)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let readable = match &playlist {
+        Some(p) => {
+            crate::services::access::check_playlist(
+                state,
+                user,
+                p,
+                crate::services::access::PlaylistAccess::Read,
+                "item",
+            )
+            .await
+        }
+        None => false,
+    };
+    if let (Some(playlist), true) = (playlist, readable) {
+        let count =
+            crate::api::jellyfin::playlists::visible_entry_count(state, user, id_str).await?;
+        return Ok(Some(to_json_value(
+            &crate::api::jellyfin::playlists::playlist_dto(state, &playlist, count),
+        )?));
+    }
+    // B32 — synth MusicAlbum / MusicArtist ids. Every list surface
+    // (grids, a track's AlbumId/ArtistItems) emits these, and
+    // jellyfin-web's audio detail page + playbackManager fetch them as
+    // single items — a 400 here broke the whole music play flow (the
+    // detail view aborted before the play button was wired). Same
+    // one-way-hash recovery as `resolve_parent_filter`.
+    if let Some(view) = synth_album_or_artist(state, user, id_str).await? {
+        return Ok(Some(view));
+    }
+    if let Some(view) = synth_genre(state, user, id_str).await? {
+        return Ok(Some(view));
+    }
+    // B156 — a genre wire id. `/Genres` and `/MusicGenres` hand these out
+    // as tile ids, and opening a tile fetches the item before listing its
+    // children; without this the fetch fell through to the numeric parse
+    // and answered 400 "invalid id", which killed the genre page.
+
+    Ok(None)
+}
+
+fn to_json_value<T: serde::Serialize>(v: &T) -> Result<serde_json::Value, actix_web::Error> {
+    serde_json::to_value(v).map_err(|e| error::ErrorInternalServerError(e.to_string()))
+}
+
 async fn fetch_item_dto(
     state: &AppState,
     id_str: &str,
@@ -5298,98 +5406,9 @@ async fn fetch_item_dto(
     // ~13k-row scan before reaching the cheap `get(id)` below.
     let numeric_id: Option<u64> = pharos_jellyfin_api::dto::parse_item_id(id_str);
     if numeric_id.is_none() {
-        // T-fix-7 follow-up: synthesised library CollectionFolder ids.
-        if let Some(view) = library_view_for_id(state, &user.policy, id_str).await {
+        if let Some(view) = synth_item_json(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
-        if id_str == "00000000000000000000000000000000" && user.policy.allows_library(id_str) {
-            return Ok(crate::api::jellyfin::wire::json(&all_media_placeholder(
-                &state.server_id,
-            )));
-        }
-        // T-fix-18: synth Series + Season DTOs derived from any Episode item
-        // whose series_id / season_id matches (one `store.list()`).
-        if let Some(view) = synth_series_or_season(state, user, id_str).await? {
-            return Ok(crate::api::jellyfin::wire::json(&view));
-        }
-        // LIB-C5 — a collection wire id resolves to its BoxSet BaseItemDto so
-        // `/Items/{id}` on a box set returns the folder item.
-        use pharos_core::CollectionStore;
-        if let Some(collection) = state
-            .stores
-            .collection_by_wire_id(id_str)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-        {
-            // A box set is visible only through members the user may see (V200).
-            let count = match visible_entity(state, user, EntityKind::Collection, id_str)
-                .await
-                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-            {
-                EntityView::All => Some(
-                    state
-                        .stores
-                        .collection_items(id_str)
-                        .await
-                        .map(|m| m.len() as u32)
-                        .unwrap_or(0),
-                ),
-                EntityView::Visible(items) => Some(u32::try_from(items.len()).unwrap_or(u32::MAX)),
-                EntityView::Hidden => None,
-            };
-            if let Some(count) = count {
-                return Ok(crate::api::jellyfin::wire::json(&collection_dto(
-                    state,
-                    &collection,
-                    count,
-                )));
-            }
-        }
-        // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
-        // `/Items/{id}` on a playlist returns the folder item. Another user's
-        // playlist falls through and answers as an id that names nothing.
-        use pharos_core::PlaylistStore;
-        let playlist = state
-            .stores
-            .playlist_by_wire_id(id_str)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        let readable = match &playlist {
-            Some(p) => {
-                crate::services::access::check_playlist(
-                    state,
-                    user,
-                    p,
-                    crate::services::access::PlaylistAccess::Read,
-                    "item",
-                )
-                .await
-            }
-            None => false,
-        };
-        if let (Some(playlist), true) = (playlist, readable) {
-            let count =
-                crate::api::jellyfin::playlists::visible_entry_count(state, user, id_str).await?;
-            return Ok(crate::api::jellyfin::wire::json(
-                &crate::api::jellyfin::playlists::playlist_dto(state, &playlist, count),
-            ));
-        }
-        // B32 — synth MusicAlbum / MusicArtist ids. Every list surface
-        // (grids, a track's AlbumId/ArtistItems) emits these, and
-        // jellyfin-web's audio detail page + playbackManager fetch them as
-        // single items — a 400 here broke the whole music play flow (the
-        // detail view aborted before the play button was wired). Same
-        // one-way-hash recovery as `resolve_parent_filter`.
-        if let Some(view) = synth_album_or_artist(state, user, id_str).await? {
-            return Ok(crate::api::jellyfin::wire::json(&view));
-        }
-        if let Some(view) = synth_genre(state, user, id_str).await? {
-            return Ok(crate::api::jellyfin::wire::json(&view));
-        }
-        // B156 — a genre wire id. `/Genres` and `/MusicGenres` hand these out
-        // as tile ids, and opening a tile fetches the item before listing its
-        // children; without this the fetch fell through to the numeric parse
-        // and answered 400 "invalid id", which killed the genre page.
     }
     let id: u64 = numeric_id.ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let (item, user_data) = crate::services::library::detail(state, user, id)
