@@ -211,6 +211,21 @@
             '';
           }
         );
+        # The two server binaries in the `ci` profile, for the Playwright jobs.
+        # `ci` inherits `dev`, so `debug_assertions` stays on and the test-only
+        # `admin seed-playwright-user` command is compiled in (release strips
+        # it). Reusing `pharosCiDeps`, which `nix flake check` already builds,
+        # means a CI run compiles only the workspace crates, once per commit,
+        # in the shared store instead of a cold `cargo build` per job.
+        pharosTestBins = craneLib.buildPackage (
+          ciArgs
+          // {
+            pname = "pharos-test-bins";
+            cargoArtifacts = pharosCiDeps;
+            cargoExtraArgs = "--package pharos-server --package pharos-transcode";
+            doCheck = false;
+          }
+        );
         pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
         # (the two binaries share one store path here, but the env var is the
@@ -1037,6 +1052,7 @@
         packages = {
           default = pharos;
           pharos = pharos;
+          pharosTestBins = pharosTestBins;
           integrationFixtures = pharosIntegrationFixtures;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # `oci` + `jellyfinWebOci` + compose only meaningful on
