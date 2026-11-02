@@ -29,10 +29,11 @@ ignore = [
     # bound with `.bind()`, which actix-http documents as HTTP/1.x only, so the
     # h2 server path is unreachable. Full argument in deny.toml.
     "RUSTSEC-2026-0258",
-    # RUSTSEC-2026-0367 / -0368 / -0369 — zip 8.6.0 `extract()` advisories
-    # (SUID/SGID kept, symlink escape). zip 8.6.0 is pinned by `boko`, which
+    # RUSTSEC-2026-0367 / -0368 / -0369 / -0429 — zip 8.6.0 `extract()`
+    # advisories (SUID/SGID kept, symlink escape, abort on a large symlink). zip 8.6.0 is pinned by `boko`, which
     # never calls `extract()`; no fixed 8.x exists. Full argument in deny.toml.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 ]
