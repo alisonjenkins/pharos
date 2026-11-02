@@ -2,23 +2,28 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
-use pharos_core::{AuthError, User};
+use pharos_core::{AuthError, DomainResult, User, UserId, UserPrefStore};
 
 use super::bootstrap::token_denial;
 use super::library::Library;
 use super::playback::Playback;
-use super::prefs::Prefs;
+use super::prefs::{Prefs, DIAGNOSTICS_OPT_IN};
 use super::socket::MessageBucket;
 use super::telemetry::{Telemetry, TELEMETRY_BATCHES_PER_SECOND, TELEMETRY_BATCH_BURST};
 use super::user_data::UserData;
 use super::ConnectionCtx;
 use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
 use crate::state::AppState;
+
+/// How long a session trusts the diagnostics opt-in it last read. A batch
+/// then costs no store read, and an opt-out made on another device still
+/// stops the next batch within this long (one made on this session at once).
+pub(super) const OPT_IN_CACHE_TTL: Duration = Duration::from_secs(5);
 
 pub(super) struct Session {
     pub(super) state: web::Data<AppState>,
@@ -29,6 +34,8 @@ pub(super) struct Session {
     pub(super) token: String,
     /// Paces this session's `Telemetry.submit` batches.
     pub(super) telemetry_bucket: RefCell<MessageBucket>,
+    /// The user's `diagnostics.opt_in` and when it was read.
+    opt_in_cache: RefCell<Option<(Instant, bool)>>,
 }
 
 impl Session {
@@ -50,6 +57,7 @@ impl Session {
                 TELEMETRY_BATCH_BURST,
                 TELEMETRY_BATCHES_PER_SECOND,
             )),
+            opt_in_cache: RefCell::new(None),
         }
     }
 
@@ -71,6 +79,30 @@ impl Session {
     /// WebSocket upgrade resolved through `trusted_proxies`.
     pub(super) fn client_is_remote(&self) -> bool {
         crate::api::jellyfin::items::ip_is_remote(&self.ctx.client_ip)
+    }
+
+    /// Whether `user` has opted in to sending diagnostics: the pref reads
+    /// `true`. Absent or anything else is off.
+    pub(super) async fn diagnostics_opted_in(&self, user: UserId) -> DomainResult<bool> {
+        let cached = *self.opt_in_cache.borrow();
+        if let Some((read_at, opted_in)) = cached {
+            if read_at.elapsed() < OPT_IN_CACHE_TTL {
+                return Ok(opted_in);
+            }
+        }
+        let opted_in = self
+            .state
+            .stores
+            .get_user_pref(user, DIAGNOSTICS_OPT_IN)
+            .await?
+            .is_some_and(|v| v == b"true");
+        *self.opt_in_cache.borrow_mut() = Some((Instant::now(), opted_in));
+        Ok(opted_in)
+    }
+
+    /// Drops the cached opt-in so the next batch reads the store.
+    pub(super) fn forget_opt_in(&self) {
+        *self.opt_in_cache.borrow_mut() = None;
     }
 
     /// The session's user as the store has them now, so a policy change or

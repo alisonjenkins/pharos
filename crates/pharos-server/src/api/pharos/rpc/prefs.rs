@@ -130,6 +130,10 @@ impl Prefs {
             .stores
             .set_user_pref(user.id, key, value)
             .await
-            .map_err(|e| store_denial("set", key, &e))
+            .map_err(|e| store_denial("set", key, &e))?;
+        if key == DIAGNOSTICS_OPT_IN {
+            self.session.forget_opt_in();
+        }
+        Ok(())
     }
 }
