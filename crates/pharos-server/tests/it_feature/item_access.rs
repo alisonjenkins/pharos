@@ -449,7 +449,7 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
 /// B286: jellyfin-web's `<img>` URL (`?fillHeight=…&quality=96&tag=…`) and the
 /// native apps' image loaders carry no credential, and a stale cookie or a
 /// revoked token must not cost a client its artwork either. None is answered
-/// 401, and an anonymous request is not counted as a refusal. Disarm check: with the image
+/// 401 or counted as a refusal. Disarm check: with the image
 /// routes back on `require_bearer`, every request here is 401.
 #[actix_web::test]
 async fn image_routes_serve_anonymous_requests() {
@@ -488,7 +488,7 @@ async fn image_routes_serve_anonymous_requests() {
                     .status()
                     .as_u16();
                 let counted = denied_total(&snapshotter, "unauthenticated") - before;
-                if status == 401 || (label == "anonymous" && counted != 0) {
+                if status == 401 || counted != 0 {
                     failures.push(format!("{label} {uri}: {status}, counted {counted}"));
                 }
             }
