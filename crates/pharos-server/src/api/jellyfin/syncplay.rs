@@ -1646,7 +1646,10 @@ mod tests {
     async fn group_hidden_route_labels_are_distinct() {
         assert_eq!(GroupHiddenRoute::List.label(), "list");
         assert_eq!(GroupHiddenRoute::Join.label(), "join");
-        assert_ne!(GroupHiddenRoute::List.label(), GroupHiddenRoute::Join.label());
+        assert_ne!(
+            GroupHiddenRoute::List.label(),
+            GroupHiddenRoute::Join.label()
+        );
     }
 
     #[actix_web::test]
