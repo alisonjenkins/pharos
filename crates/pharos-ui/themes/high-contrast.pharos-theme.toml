@@ -1,0 +1,48 @@
+[meta]
+name = "High Contrast"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+extends = "Pharos Night"
+
+[palette]
+bg = "#000000"
+surface = "#0a0a0a"
+surface-raised = "#141414"
+overlay = "#000000"
+border = "#ffffff"
+fg = "#ffffff"
+fg-muted = "#d0d0d0"
+accent = "#ffff00"
+accent-fg = "#000000"
+focus = "#ffffff"
+success = "#00ff7f"
+warning = "#ffd000"
+danger = "#ff8080"
+progress = "#ffff00"
+badge = "#00ffff"
+
+[palette.kind]
+movie = "#ff9f7a"
+show = "#9db4ff"
+music = "#00ff7f"
+book = "#ffd000"
+live = "#ff8080"
+
+[shape]
+border_px = 3
+
+[motion]
+duration_ms = 0
+focus_scale = 1.0
+
+[effects]
+background = "solid"
+blur_px = 0
+vignette = 0.0
+grain = 0.0
+glow = 0.0
+
+[contrast]
+level = "aaa"
