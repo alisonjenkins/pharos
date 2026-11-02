@@ -59,7 +59,9 @@ body {
   font-size: 1.5rem;
 }
 .pharos-main {
-  padding: 1.5rem;
+  /* Rails reach out into this gutter to scroll edge to edge. */
+  --px-gutter: 1.5rem;
+  padding: var(--px-gutter);
 }
 
 .pharos-login {
@@ -219,7 +221,9 @@ input:focus-visible {
   margin: 0;
   padding: 0;
   overflow-x: auto;
-  scroll-snap-type: x mandatory;
+  /* Proximity, not mandatory: mandatory turns each wheel notch into a
+     jump back to the nearest poster. */
+  scroll-snap-type: x proximity;
 }
 .pharos-rail-items > li {
   flex: 0 0 auto;
@@ -251,9 +255,10 @@ input:focus-visible {
 .pharos-poster-art {
   position: relative;
   aspect-ratio: 2 / 3;
-  border-radius: 6px;
+  /* Not clipped: the lift shadow sits outside the art. The image and
+     placeholder round their own corners. */
+  border-radius: var(--px-radius);
   background: var(--px-color-surface);
-  overflow: hidden;
 }
 .pharos-poster-art img {
   width: 100%;
@@ -808,13 +813,12 @@ input:focus-visible {
 .pharos-rail-items {
   /* Room for a lifted poster, its shadow and focus ring, which the
      scroller would otherwise clip; the negative margin keeps the layout. */
-  padding: 1rem 1.5rem 1.75rem;
-  margin: -1rem -1.5rem -1.75rem;
-  scroll-padding-inline: 1.5rem;
-  scroll-snap-type: x proximity;
+  padding: 1rem var(--px-gutter, 0) 1.75rem;
+  margin: -1rem calc(-1 * var(--px-gutter, 0)) -1.75rem;
+  scroll-padding-inline: var(--px-gutter, 0);
   scrollbar-width: none;
-  -webkit-mask-image: linear-gradient(to right, transparent, currentColor 1.5rem, currentColor calc(100% - 1.5rem), transparent);
-  mask-image: linear-gradient(to right, transparent, currentColor 1.5rem, currentColor calc(100% - 1.5rem), transparent);
+  -webkit-mask-image: linear-gradient(to right, transparent, currentColor var(--px-gutter, 0), currentColor calc(100% - var(--px-gutter, 0)), transparent);
+  mask-image: linear-gradient(to right, transparent, currentColor var(--px-gutter, 0), currentColor calc(100% - var(--px-gutter, 0)), transparent);
 }
 .pharos-rail-items::-webkit-scrollbar {
   display: none;
@@ -860,8 +864,6 @@ body::before {
   perspective: 40rem;
 }
 .pharos-poster-art {
-  overflow: visible;
-  border-radius: var(--px-radius);
   box-shadow:
     0 1px 2px color-mix(in srgb, var(--px-shade) 40%, transparent),
     0 4px 12px color-mix(in srgb, var(--px-shade) 25%, transparent);
