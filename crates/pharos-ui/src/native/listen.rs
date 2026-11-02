@@ -26,6 +26,8 @@ const PALETTE_REFRESH_MS: f64 = 1000.0;
 struct Tap {
     tap: Rc<RefCell<Option<Box<dyn AudioTap>>>>,
     tried: Rc<Cell<bool>>,
+    /// Why the last attempt waited, so each new reason is logged once.
+    waiting: Rc<Cell<Option<&'static str>>>,
 }
 
 impl PartialEq for Tap {
@@ -38,7 +40,20 @@ impl Tap {
     /// Route the media element through an analyser once it is playing and
     /// the page has had a gesture; one attempt per screen.
     fn connect(&self) {
-        if self.tried.get() || !platform::media_playing(VIDEO_ID) || !platform::user_activated() {
+        if self.tried.get() {
+            return;
+        }
+        let waiting = if !platform::media_playing(VIDEO_ID) {
+            Some("not_playing")
+        } else if !platform::user_activated() {
+            Some("no_activation")
+        } else {
+            None
+        };
+        if let Some(reason) = waiting {
+            if self.waiting.replace(Some(reason)) != Some(reason) {
+                platform::info(&format!("pharos: visualiser tap=waiting reason={reason}"));
+            }
             return;
         }
         self.tried.set(true);
