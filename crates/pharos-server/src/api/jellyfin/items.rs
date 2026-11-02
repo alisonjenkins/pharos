@@ -5624,12 +5624,12 @@ fn fill_parent_ids(state: &AppState, dtos: &mut [BaseItemDto], items: &[&MediaIt
 /// show folders — a mixed request (e.g. `Series,Movie`) falls through to the
 /// normal media query so real kinds still page from SQL.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ShowFolderKind {
+pub(crate) enum ShowFolderKind {
     Series,
     Season,
 }
 
-fn virtual_show_kind(include_item_types: Option<&str>) -> Option<ShowFolderKind> {
+pub(crate) fn virtual_show_kind(include_item_types: Option<&str>) -> Option<ShowFolderKind> {
     let raw = include_item_types?;
     let types: Vec<String> = raw
         .split(',')
@@ -5738,28 +5738,51 @@ async fn maybe_list_virtual_shows(
     policy: &pharos_core::UserPolicy,
     q: &ListQuery,
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
-    use std::collections::BTreeMap;
-
     let Some(mode) = virtual_show_kind(q.include_item_types.as_deref()) else {
         return Ok(None);
     };
+    let (page, total) = list_virtual_shows(
+        state,
+        user_id,
+        policy,
+        q.parent_id.as_deref(),
+        mode,
+        &q.into(),
+    )
+    .await?;
+    Ok(Some(crate::api::jellyfin::wire::query_result(
+        page,
+        total,
+        q.start_index,
+    )))
+}
+
+/// One page of synthetic Series (or Season) folder DTOs under `parent_id`,
+/// collapsed from the episodes `user_id` may see, with the number of tiles
+/// before paging. Shared by `/Items?IncludeItemTypes=Series|Season` and the
+/// native `Library.query` so both list the same tiles.
+pub(crate) async fn list_virtual_shows(
+    state: &AppState,
+    user_id: UserId,
+    policy: &pharos_core::UserPolicy,
+    parent_id: Option<&str>,
+    mode: ShowFolderKind,
+    q: &ItemQuery,
+) -> Result<(Vec<serde_json::Value>, u32), actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use std::collections::BTreeMap;
 
     // Reuse the full parent/search scoping the media query already implements:
     // fetch the matching EPISODES unpaged, then collapse them in memory. The
     // SearchTerm→series_name match means a `SearchTerm=Code Geass` browse
     // narrows to that show before collapsing.
-    let parent = resolve_parent_filter(state, q.parent_id.as_deref())
+    let parent = resolve_parent_filter(state, parent_id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if matches!(parent, ParentResolution::Empty) {
-        return Ok(Some(crate::api::jellyfin::wire::query_result(
-            Vec::<serde_json::Value>::new(),
-            0,
-            q.start_index,
-        )));
+        return Ok((Vec::new(), 0));
     }
-    let mut mq = build_media_query(user_id, &q.into(), &parent, true);
+    let mut mq = build_media_query(user_id, q, &parent, true);
     apply_policy_scope(&mut mq, policy, &state.parental_ratings);
     mq.kinds = vec![MediaKind::Episode];
     mq.limit = None;
@@ -5908,17 +5931,14 @@ async fn maybe_list_virtual_shows(
     let mut items: Vec<serde_json::Value> = rows.into_iter().map(|(_, dto)| dto).collect();
     let total = items.len() as u32;
     let start = q.start_index as usize;
-    let end = start.saturating_add(q.take_limit()).min(items.len());
+    let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    let end = start.saturating_add(take).min(items.len());
     let page: Vec<serde_json::Value> = if start >= items.len() {
         Vec::new()
     } else {
         items.drain(start..end).collect()
     };
-    Ok(Some(crate::api::jellyfin::wire::query_result(
-        page,
-        total,
-        q.start_index,
-    )))
+    Ok((page, total))
 }
 
 /// A series or season lives in one show folder, so one library: the episode
