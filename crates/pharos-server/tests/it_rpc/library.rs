@@ -255,6 +255,9 @@ async fn latest_lists_the_newest_items_the_policy_allows() {
             .await
             .unwrap();
     }
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
     let capped = library::latest(&fx.state, &user, None, &KindFilter::Unset, Some(500))
         .await
         .unwrap();
