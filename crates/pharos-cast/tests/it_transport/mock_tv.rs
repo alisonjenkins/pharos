@@ -1,7 +1,5 @@
 //! The production `CastV2Transport` against `MockTv` over real TLS.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::time::Duration;
 
 use pharos_cast::castv2::{CastV2Config, CastV2Transport, TlsPolicy};

@@ -36,7 +36,8 @@ rcgen.workspace = true
 tracing-subscriber.workspace = true
 
 [[test]]
-name = "mock_tv"
+name = "it_transport"
+path = "tests/it_transport/main.rs"
 required-features = ["testing"]
 
 [lints]
