@@ -269,10 +269,15 @@ where
             }
             Ok(handle)
         }
-        ClientMsg::CreateAndJoin => registry
-            .create()
-            .await
-            .map_err(|_| WsError::Protocol("registry actor down".into())),
+        ClientMsg::CreateAndJoin => {
+            if !resolver.may_create(user_id).await {
+                return Err(WsError::Protocol("group creation not allowed".into()));
+            }
+            registry
+                .create()
+                .await
+                .map_err(|_| WsError::Protocol("registry actor down".into()))
+        }
         _ => Err(WsError::Protocol("expected Join or CreateAndJoin".into())),
     }
 }

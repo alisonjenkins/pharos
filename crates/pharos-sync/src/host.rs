@@ -20,6 +20,9 @@ pub trait TokenResolver: Send + Sync + 'static {
         token: &'a SecretString,
     ) -> Pin<Box<dyn Future<Output = Option<UserId>> + Send + 'a>>;
 
+    /// Whether `user` may create a group, asked before `CreateAndJoin`.
+    fn may_create(&self, user: UserId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
     /// Whether `user` may join `group`, asked before a `Join` admits them. A
     /// refusal reads to the client as an unknown group.
     fn may_join<'a>(

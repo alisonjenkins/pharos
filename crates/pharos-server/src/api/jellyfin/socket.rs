@@ -235,8 +235,8 @@ async fn ws_entry(
     Ok(response)
 }
 
-/// What a `SyncPlayJoinGroup` frame needs to decide whether the socket's user
-/// may join (V201), and where to say no.
+/// What a `SyncPlayCreateGroup` or `SyncPlayJoinGroup` frame needs to decide
+/// whether the socket's user may create or join (V201), and where to say no.
 struct JoinGate<'a> {
     state: &'a AppState,
     user: &'a pharos_core::User,
@@ -706,6 +706,14 @@ async fn handle_inbound(
     match inbound.message_type.as_str() {
         "SyncPlayCreateGroup" => {
             if current_group.is_some() {
+                return;
+            }
+            if !super::syncplay::sync_play_allows(
+                gate.user,
+                super::syncplay::SyncPlayNeed::Create,
+                "socket",
+            ) {
+                let _ = gate.out.send(ServerMsg::NotInGroup).await;
                 return;
             }
             let handle = match registry.create().await {
@@ -1813,6 +1821,65 @@ mod tests {
             outcomes.push((all_folders, current.is_some(), not_in_group));
         }
         assert_eq!(outcomes, vec![(false, false, true), (true, true, false)]);
+    }
+
+    /// B266: a `SyncPlayCreateGroup` frame creates a group only for a user
+    /// whose `SyncPlayAccess` is `CreateAndJoinGroups` (or empty, Jellyfin's
+    /// default); a refused frame
+    /// answers NotInGroup and joins nothing.
+    /// Disarm check: with the frame's `sync_play_allows` gate removed, the
+    /// `JoinGroups` user creates a group.
+    #[actix_web::test]
+    async fn a_socket_create_frame_needs_create_access() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = AppState::new(stores, "t".into());
+        let registry = GroupRegistry::spawn(std::sync::Arc::new(pharos_sync::LocalDelivery::new(
+            MemberSinks::new(),
+        )));
+        let mut user = pharos_core::User {
+            id: pharos_core::UserId::new(),
+            name: "member".into(),
+            policy: pharos_core::UserPolicy::default(),
+            has_password: true,
+        };
+        let mut outcomes = Vec::new();
+        for access in ["None", "JoinGroups", "CreateAndJoinGroups", ""] {
+            user.policy.sync_play_access = access.into();
+            let frame: Inbound = serde_json::from_value(serde_json::json!({
+                "MessageType": "SyncPlayCreateGroup",
+                "Data": {},
+            }))
+            .unwrap();
+            let (out, mut out_rx) = mpsc::channel(4);
+            let mut current = None;
+            handle_inbound(
+                frame,
+                &mut current,
+                MemberId::new(),
+                "member",
+                &registry,
+                Instant::now(),
+                JoinGate {
+                    state: &state,
+                    user: &user,
+                    out: &out,
+                },
+            )
+            .await;
+            let not_in_group = matches!(out_rx.try_recv(), Ok(ServerMsg::NotInGroup));
+            outcomes.push((access, current.is_some(), not_in_group));
+        }
+        assert_eq!(
+            outcomes,
+            vec![
+                ("None", false, true),
+                ("JoinGroups", false, true),
+                ("CreateAndJoinGroups", true, false),
+                ("", true, false),
+            ]
+        );
     }
 
     #[actix_web::test]

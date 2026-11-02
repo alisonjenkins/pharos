@@ -926,6 +926,21 @@ async fn native_join_reply(
     token: &str,
     group_id: pharos_sync::messages::GroupId,
 ) -> String {
+    native_reply(
+        server,
+        token,
+        serde_json::json!({ "type": "join", "group_id": group_id }),
+    )
+    .await
+}
+
+/// The type of the native socket's answer to `join` (a `Join` or
+/// `CreateAndJoin`) after a `Hello` carrying `token`.
+async fn native_reply(
+    server: &actix_test::TestServer,
+    token: &str,
+    join: serde_json::Value,
+) -> String {
     use futures_util::{SinkExt as _, StreamExt as _};
     let url = server.url("/sync/v1/ws").replacen("http", "ws", 1);
     let (_resp, mut ws) = awc::Client::new().ws(url).connect().await.unwrap();
@@ -933,7 +948,7 @@ async fn native_join_reply(
         serde_json::json!({
             "type": "hello", "token": token, "client": "t", "device_id": "d", "name": "n",
         }),
-        serde_json::json!({ "type": "join", "group_id": group_id }),
+        join,
     ] {
         ws.send(awc::ws::Message::Text(msg.to_string().into()))
             .await
@@ -1190,5 +1205,137 @@ async fn the_parental_cap_and_tags_hide_an_item_everywhere() {
         failures.is_empty(),
         "item hidden by the parental cap or a tag was served:\n{}",
         failures.join("\n")
+    );
+}
+
+/// `pharos_syncplay_access_denied_total{need}` so far.
+fn syncplay_access_denied_total(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    need: &str,
+) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            k.key().name() == "pharos_syncplay_access_denied_total"
+                && k.key()
+                    .labels()
+                    .any(|l| l.key() == "need" && l.value() == need)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
+
+/// B266: `SyncPlayAccess` is enforced as in Jellyfin. `None` may not list,
+/// join or create a group, `JoinGroups` may not create one, and
+/// `CreateAndJoinGroups` may do all three. A refused HTTP request answers
+/// 403 and counts under `pharos_syncplay_access_denied_total{need}`; the
+/// native socket refuses `CreateAndJoin` as an error.
+/// Disarm check: with `sync_play_allows` answering true, every request is
+/// served and nothing is counted.
+#[actix_web::test]
+async fn sync_play_access_gates_listing_joining_and_creating() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let sinks = pharos_sync::MemberSinks::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    let group = registry.create().await.unwrap();
+    let app = test::init_service(
+        build_app(f.state.clone())
+            .app_data(actix_web::web::Data::new(registry.clone()))
+            .app_data(actix_web::web::Data::new(sinks.clone()))
+            .app_data(actix_web::web::Data::new(pharos_sync::SessionHub::new())),
+    )
+    .await;
+    let state = f.state.clone();
+    let server = actix_test::start(move || {
+        actix_web::App::new()
+            .app_data(state.clone())
+            .app_data(actix_web::web::Data::new(registry.clone()))
+            .app_data(actix_web::web::Data::new(sinks.clone()))
+            .app_data(actix_web::web::Data::new(
+                pharos_server::sync_resolver::build(state.clone().into_inner()),
+            ))
+            .configure(pharos_sync::ws::register)
+    });
+    let request = |method: Method, uri: &str| {
+        let req = test::TestRequest::default()
+            .method(method)
+            .uri(uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .insert_header((
+                "X-Emby-Authorization",
+                "MediaBrowser Client=\"t\", Device=\"t\", DeviceId=\"d1\", Version=\"1\"",
+            ));
+        match uri {
+            "/SyncPlay/Join" => {
+                req.set_json(serde_json::json!({ "GroupId": group.group_id.to_string() }))
+            }
+            "/SyncPlay/New" => req.set_json(serde_json::json!({ "GroupName": "g" })),
+            _ => req,
+        }
+        .to_request()
+    };
+
+    let mut got = Vec::new();
+    for access in ["None", "JoinGroups", "CreateAndJoinGroups"] {
+        let policy = UserPolicy {
+            sync_play_access: access.into(),
+            ..UserPolicy::default()
+        };
+        f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+        let (join_before, create_before) = (
+            syncplay_access_denied_total(&snapshotter, "join"),
+            syncplay_access_denied_total(&snapshotter, "create"),
+        );
+        let mut statuses = Vec::new();
+        for (method, uri) in [
+            (Method::GET, "/SyncPlay/List"),
+            (Method::POST, "/SyncPlay/Join"),
+            (Method::POST, "/SyncPlay/New"),
+        ] {
+            let status = test::call_service(&app, request(method, uri))
+                .await
+                .status();
+            statuses.push(status.as_u16());
+        }
+        let native = native_reply(
+            &server,
+            &f.user_token,
+            serde_json::json!({ "type": "create_and_join" }),
+        )
+        .await;
+        got.push((
+            access,
+            statuses,
+            native,
+            syncplay_access_denied_total(&snapshotter, "join") - join_before,
+            syncplay_access_denied_total(&snapshotter, "create") - create_before,
+        ));
+    }
+    // The native refusal is counted on the test server's thread, outside
+    // this thread's recorder, so only the HTTP refusals show here.
+    assert_eq!(
+        got,
+        vec![
+            ("None", vec![403, 403, 403], "error".to_string(), 2, 1),
+            ("JoinGroups", vec![200, 204, 403], "error".to_string(), 0, 1),
+            (
+                "CreateAndJoinGroups",
+                vec![200, 204, 204],
+                "joined".to_string(),
+                0,
+                0
+            ),
+        ]
     );
 }

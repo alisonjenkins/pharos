@@ -13,6 +13,19 @@ use std::sync::Arc;
 
 struct StoreTokenResolver(Arc<AppState>);
 
+impl StoreTokenResolver {
+    /// The user a socket authenticated as, with their current policy.
+    async fn user(&self, id: UserId) -> Option<pharos_core::User> {
+        match self.0.stores.get(id).await {
+            Ok(record) => Some(record.into_user()),
+            Err(e) => {
+                tracing::warn!(user = %id.0, error = %e, "sync ws: user not found");
+                None
+            }
+        }
+    }
+}
+
 impl TokenResolver for StoreTokenResolver {
     fn resolve<'a>(
         &'a self,
@@ -21,18 +34,27 @@ impl TokenResolver for StoreTokenResolver {
         Box::pin(async move { self.0.stores.resolve(token.expose()).await.ok() })
     }
 
+    fn may_create(&self, user: UserId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let Some(user) = self.user(user).await else {
+                return false;
+            };
+            crate::api::jellyfin::syncplay::sync_play_allows(
+                &user,
+                crate::api::jellyfin::syncplay::SyncPlayNeed::Create,
+                "native",
+            )
+        })
+    }
+
     fn may_join<'a>(
         &'a self,
         user: UserId,
         group: &'a GroupHandle,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            let user = match self.0.stores.get(user).await {
-                Ok(record) => record.into_user(),
-                Err(e) => {
-                    tracing::warn!(user = %user.0, error = %e, "sync ws: joining user not found");
-                    return false;
-                }
+            let Some(user) = self.user(user).await else {
+                return false;
             };
             crate::api::jellyfin::syncplay::may_join(
                 &self.0,
