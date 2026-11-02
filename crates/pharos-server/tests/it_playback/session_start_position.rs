@@ -87,6 +87,10 @@ async fn register_session(state: &AppState, psid: &str) {
                     ..Default::default()
                 },
                 burn_subtitle_indices: Default::default(),
+                holder: pharos_core::SessionHolder {
+                    user_id: pharos_core::UserId::new(),
+                    token_id: "test-token-id".into(),
+                },
             },
         )
         .await

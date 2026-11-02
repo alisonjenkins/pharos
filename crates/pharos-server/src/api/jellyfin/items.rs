@@ -2550,6 +2550,11 @@ async fn playback_info(
         _ => 0,
     };
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
+    // The session ends with the token that negotiated it (B256).
+    let holder = pharos_core::SessionHolder {
+        user_id: user.0.id,
+        token_id: pharos_core::TokenStore::token_id(&state.stores, &api_key),
+    };
     let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
     let probe = &item.probe;
 
@@ -3244,6 +3249,7 @@ async fn playback_info(
                 // SubtitleStreamIndex, so without carrying the verdict forward
                 // the segment handler must assume each one needs burning.
                 burn_subtitle_indices: burn_text_indices.clone(),
+                holder: holder.clone(),
             },
         )
         .await;
@@ -3280,6 +3286,7 @@ async fn playback_info(
                 // SubtitleStreamIndex, so without carrying the verdict forward
                 // the segment handler must assume each one needs burning.
                 burn_subtitle_indices: burn_text_indices.clone(),
+                holder: holder.clone(),
             },
             &play_session_id,
             audio_idx,

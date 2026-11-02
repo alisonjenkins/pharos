@@ -556,19 +556,48 @@ async fn authorize_media(
                 .await;
         }
     }
-    // 2. Capability token forwarded by a native app (tag == our ETag). The
-    //    session was opened through PlaybackInfo, which applied the policy.
+    // 2. Capability token forwarded by a native app (tag == our ETag): a
+    //    session for this item whose holder's token is still live and who may
+    //    still see it (B256). A capability outlives neither.
     let qs = req.query_string();
     for key in ["tag", "PlaySessionId"] {
         if let Some(cap) = query_value_ci(qs, key) {
             if let Ok(Some(session)) = state.transcode_sessions.get(&cap).await {
                 if session.media_id == media_id {
-                    return Ok(());
+                    return capability_holder_allowed(state, &session.holder, media_id).await;
                 }
             }
         }
     }
     Err(error::ErrorUnauthorized("missing token"))
+}
+
+/// Whether a session's holder may still stream `media_id`: their token is
+/// live, their account enabled, and the library policy lets them see it now.
+async fn capability_holder_allowed(
+    state: &AppState,
+    holder: &pharos_core::SessionHolder,
+    media_id: pharos_core::MediaId,
+) -> Result<(), actix_web::Error> {
+    use crate::services::auth::{user_for_token_id, TokenRefusal};
+    match user_for_token_id(&state.stores, &holder.token_id).await {
+        Ok(user) if user.id == holder.user_id => {
+            crate::api::jellyfin::require_item_access(state, &user, media_id, "stream").await
+        }
+        Ok(_) => Err(error::ErrorUnauthorized("session holder mismatch")),
+        Err(TokenRefusal::Unavailable(detail)) => {
+            tracing::warn!(media.id = media_id, error = %detail, "stream capability: token store unavailable");
+            Err(error::ErrorServiceUnavailable("token store unavailable"))
+        }
+        Err(refusal) => {
+            tracing::info!(
+                media.id = media_id,
+                reason = refusal.label(),
+                "stream capability: holder's token no longer live"
+            );
+            Err(error::ErrorUnauthorized("session ended"))
+        }
+    }
 }
 
 fn parse_max_audio_channels(qs: &str) -> Option<u32> {

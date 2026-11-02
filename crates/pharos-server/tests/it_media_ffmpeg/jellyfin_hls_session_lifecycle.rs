@@ -135,6 +135,10 @@ async fn segment_410s_after_session_removed_even_when_cached() {
                     ..Default::default()
                 },
                 burn_subtitle_indices: Default::default(),
+                holder: pharos_core::SessionHolder {
+                    user_id: pharos_core::UserId::new(),
+                    token_id: "test-token-id".into(),
+                },
             },
         )
         .await

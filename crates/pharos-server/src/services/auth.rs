@@ -36,6 +36,21 @@ pub async fn user_for_token(stores: &Stores, token: &str) -> Result<User, TokenR
         .resolve(token)
         .await
         .map_err(|e| classify(e, TokenRefusal::InvalidToken))?;
+    live_user(stores, uid).await
+}
+
+/// [`user_for_token`] for a token known only by its
+/// [`token_id`](TokenStore::token_id), as a play session holds it: refused
+/// once that token is revoked or expired, or its user is gone or disabled.
+pub async fn user_for_token_id(stores: &Stores, id: &str) -> Result<User, TokenRefusal> {
+    let uid = stores
+        .resolve_token_id(id)
+        .await
+        .map_err(|e| classify(e, TokenRefusal::InvalidToken))?;
+    live_user(stores, uid).await
+}
+
+async fn live_user(stores: &Stores, uid: UserId) -> Result<User, TokenRefusal> {
     let record = stores
         .get(uid)
         .await
