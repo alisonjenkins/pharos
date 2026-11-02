@@ -492,3 +492,97 @@ async fn search_hints_answer_only_visible_items() {
     }
     assert!(missing.is_empty(), "visible names missing: {missing:?}");
 }
+
+fn entity_hidden_total(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    kind: &str,
+) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_entity_hidden_total"
+                && key.labels().any(|l| l.key() == "kind" && l.value() == kind)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
+
+/// B262: `/Genres`, `/Studios`, `/Tags` and `/Persons` list a genre, studio,
+/// tag or person only through items the bearer may see, with counts over
+/// those items, and `/Persons/{id}` answers a person with none as 404.
+/// Disarm check: with the listings back on the store-wide rows, library A's
+/// names answer to a user restricted to library B and nothing is counted.
+#[actix_web::test]
+async fn entity_lists_answer_only_through_visible_items() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let get = |uri: &str| {
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+    let lists = [
+        ("/Genres", "genre", "Action"),
+        ("/Studios", "studio", "Pharos Studios"),
+        ("/Tags", "tag", "award-winner"),
+        ("/Persons", "person", "Jane Star"),
+    ];
+
+    // Restricted to library A, which holds them: each answers, counted once.
+    restrict_to_library_a(&f).await;
+    let mut jane = String::new();
+    for (uri, _, name) in lists {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, get(uri)).await;
+        let row = body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["Name"] == name)
+            .unwrap_or_else(|| panic!("{uri} lost visible {name}: {body}"))
+            .clone();
+        assert_eq!(row["ChildCount"], 1, "{uri}: {row}");
+        if uri == "/Persons" {
+            jane = row["Id"].as_str().unwrap().to_string();
+        }
+    }
+    let resp = test::call_service(&app, get(&format!("/Persons/{jane}"))).await;
+    assert_eq!(resp.status(), 200);
+
+    // Restricted to library B: none of library A's names answer.
+    let policy = UserPolicy {
+        enable_all_folders: false,
+        enabled_folders: vec![f.lib_b_wire.clone()],
+        ..UserPolicy::default()
+    };
+    f.state.stores.set_policy(f.user_id, policy).await.unwrap();
+    let mut leaked = Vec::new();
+    for (uri, kind, name) in lists {
+        let body: serde_json::Value = test::call_and_read_body_json(&app, get(uri)).await;
+        if body.to_string().contains(name) {
+            leaked.push(format!("{uri}: {body}"));
+        }
+        if entity_hidden_total(&snapshotter, kind) == 0 {
+            leaked.push(format!("{uri}: nothing counted under kind={kind}"));
+        }
+    }
+    let resp = test::call_service(&app, get(&format!("/Persons/{jane}"))).await;
+    if resp.status() != 404 {
+        leaked.push(format!("/Persons/{{id}}: {}", resp.status()));
+    }
+    assert!(
+        leaked.is_empty(),
+        "library A leaked:\n{}",
+        leaked.join("\n")
+    );
+}
