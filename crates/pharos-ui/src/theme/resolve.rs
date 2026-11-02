@@ -3,10 +3,10 @@
 //! of the first one that is wrong.
 
 use thiserror::Error;
-use toml::{Table, Value};
 
 use super::contrast::ContrastPair;
 use super::doc::{self, clip, ThemeDoc};
+use super::format;
 use super::value::{
     Background, Bounds, Choice, ContrastLevel, Density, Easing, FontStack, RailPoster, Rgba,
     Scheme, ShaderName, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -296,7 +296,7 @@ impl Catalogue {
     /// Parse `source` and store it under its `meta.name`, replacing a theme
     /// of the same name. Returns the warnings the document loaded with.
     pub fn insert(&mut self, source: String) -> Result<Vec<ThemeWarning>, ThemeError> {
-        let (doc, warnings) = doc::parse(&source)?;
+        let (doc, warnings) = format::read(&source)?;
         let name = doc
             .name()
             .ok_or_else(|| ThemeError::MissingKey {
@@ -321,6 +321,13 @@ impl Catalogue {
         self.find(name).map(|e| e.source.as_str())
     }
 
+    /// Drop `name`, returning whether it was there.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.name != name);
+        self.entries.len() != before
+    }
+
     /// Theme names in insertion order.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|e| e.name.as_str())
@@ -329,14 +336,10 @@ impl Catalogue {
     /// Resolve `name` through its `extends` chain.
     pub fn resolve(&self, name: &str) -> Result<Resolved, ThemeError> {
         let chain = self.chain(name)?;
-        let mut merged = Table::new();
+        let mut doc = ThemeDoc::default();
         for entry in chain.iter().rev() {
-            let layer = Table::try_from(&entry.doc).map_err(|e| ThemeError::Syntax {
-                message: e.to_string(),
-            })?;
-            merge(&mut merged, layer);
+            doc.overlay(&entry.doc);
         }
-        let doc = doc::from_table(merged)?;
 
         let mut warnings = chain
             .first()
@@ -372,22 +375,6 @@ impl Catalogue {
             match base {
                 Some(base) => current = base.to_owned(),
                 None => return Ok(entries),
-            }
-        }
-    }
-}
-
-fn merge(base: &mut Table, over: Table) {
-    for (key, value) in over {
-        match value {
-            Value::Table(over_table) => match base.get_mut(&key) {
-                Some(Value::Table(base_table)) => merge(base_table, over_table),
-                _ => {
-                    base.insert(key, Value::Table(over_table));
-                }
-            },
-            other => {
-                base.insert(key, other);
             }
         }
     }
@@ -1014,6 +1001,15 @@ mod tests {
         assert_eq!(catalogue.names().filter(|n| *n == "Marquee").count(), 1);
         assert_eq!(catalogue.names().nth(1), Some("Marquee"));
         assert_eq!(catalogue.resolve("Marquee").unwrap().theme.radius_px, 1);
+    }
+
+    #[test]
+    fn remove_drops_a_theme_and_says_whether_it_was_there() {
+        let mut catalogue = shipped();
+        assert!(catalogue.remove("Marquee"));
+        assert!(!catalogue.remove("Marquee"));
+        assert!(catalogue.get_source("Marquee").is_none());
+        assert_eq!(catalogue.names().count(), 6);
     }
 
     #[test]
