@@ -81,6 +81,9 @@ pub fn SignInView(
                         id: "signin-name",
                         name: "name",
                         autocomplete: "username",
+                        autocapitalize: "none",
+                        autocorrect: "off",
+                        spellcheck: "false",
                         required: true,
                         value: "{name}",
                         oninput: move |e| name.set(e.value()),
@@ -460,6 +463,25 @@ mod tests {
         });
         assert!(html.contains("Wrong name or password."), "{html}");
         assert!(html.contains("Signing in…"), "{html}");
+    }
+
+    /// A phone keyboard would capitalise or "correct" the name, and the
+    /// server then would not find the account.
+    #[test]
+    fn the_sign_in_name_is_left_as_typed() {
+        let html = render(|| rsx! { SignInView { error: None, busy: false, on_submit: |_| {} } });
+        let input = html
+            .split("<input")
+            .find(|i| i.contains(r#"id="signin-name""#))
+            .unwrap_or_else(|| panic!("no name input in {html}"));
+        for want in [
+            r#"autocomplete="username""#,
+            r#"autocapitalize="none""#,
+            r#"autocorrect="off""#,
+            r#"spellcheck="false""#,
+        ] {
+            assert!(input.contains(want), "missing {want} in {input}");
+        }
     }
 
     #[test]
