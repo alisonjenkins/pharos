@@ -7,12 +7,12 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _,
-    PlaybackGrant as _,
+    Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _, PlaybackGrant as _,
 };
 use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::browse;
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::listen::ListenView;
@@ -23,8 +23,8 @@ use super::playback::{
 };
 use super::route::Route;
 use super::views::{
-    BrowseView, ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView,
-    TitleView, WatchView, VIDEO_ID,
+    ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
+    WatchView, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -32,9 +32,6 @@ use crate::theme::signal::{self, Source};
 use crate::theme::value::{Density, FontStack, Rgba};
 use crate::theme::{self, contrast, css, device, doc, format, Catalogue, Theme, ThemeError};
 use crate::views::RootApp;
-
-/// Items a browse page asks for at once.
-const BROWSE_PAGE: u32 = 100;
 
 /// The page root: one route per URL, kept in step with history. `/manage`
 /// mounts the older REST panes and never opens the native socket.
@@ -995,22 +992,6 @@ fn HomeScreen() -> Element {
     })
 }
 
-/// What a browse screen shows when its title cannot be fetched.
-const BROWSE_TITLE_FALLBACK: &str = "Browse";
-
-/// The title of a browse screen. The listing is the point of the screen, so
-/// a title that cannot be fetched is logged and replaced, not a reason to
-/// show no listing.
-fn browse_title(id: ItemRef, detail: Result<Detail, ClientError>) -> String {
-    match detail {
-        Ok(detail) => detail.item.name,
-        Err(e) => {
-            platform::warn(&format!("pharos: browse {id}: title unavailable: {e}"));
-            BROWSE_TITLE_FALLBACK.to_owned()
-        }
-    }
-}
-
 #[component]
 fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
@@ -1018,12 +999,9 @@ fn BrowseScreen(id: ItemRef) -> Element {
         let api = ctx.api.read().clone();
         async move {
             let api = api?;
-            let info = call("browse", "load");
-            let result = async {
-                let title = browse_title(id, api.detail(&info, id).await);
-                let page = api.browse(&info, id, 0, BROWSE_PAGE).await?;
-                Ok::<_, ClientError>((title, page))
-            }
+            let result = browse::load(&api, &call("browse", "load"), id, |line| {
+                platform::warn(&line)
+            })
             .await;
             Some(settle(ctx.machine, result))
         }
@@ -1031,8 +1009,8 @@ fn BrowseScreen(id: ItemRef) -> Element {
     let state = listing.read();
     loaded(
         state.as_ref().and_then(Option::as_ref),
-        |(title, page): &(String, Page)| {
-            rsx! { BrowseView { title: title.clone(), page: page.clone() } }
+        |browse: &browse::Browse| {
+            rsx! { browse::BrowseLayout { browse: browse.clone() } }
         },
     )
 }
@@ -1268,44 +1246,6 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-
-    fn not_found() -> ClientError {
-        ClientError::Api {
-            kind: "notFound",
-            reason: "item not found".into(),
-            trace_id: String::new(),
-        }
-    }
-
-    #[test]
-    fn a_browse_screen_without_a_title_still_shows_its_listing() {
-        let title = browse_title(ItemRef::Synth(7), Err(not_found()));
-        assert_eq!(title, BROWSE_TITLE_FALLBACK);
-    }
-
-    #[test]
-    fn a_browse_screen_is_titled_by_its_detail() {
-        let detail = Detail {
-            item: pharos_client::api::Item {
-                id: ItemRef::Synth(7),
-                kind: pharos_client::api::ItemKind::Library,
-                name: "TV".into(),
-                year: None,
-                runtime_ms: 0,
-                image: None,
-                played: false,
-                favorite: false,
-                position_ms: 0,
-                series_name: None,
-                season: None,
-                episode: None,
-            },
-            overview: String::new(),
-            genres: Vec::new(),
-            chapters: Vec::new(),
-        };
-        assert_eq!(browse_title(ItemRef::Synth(7), Ok(detail)), "TV");
-    }
 
     #[test]
     fn the_app_starts_by_connecting() {
