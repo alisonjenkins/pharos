@@ -1242,6 +1242,193 @@ async fn refused_item_calls_are_logged_and_counted() {
     );
 }
 
+/// Adds a TV library at /libTV with "Show" (two seasons, G) and "Mature"
+/// (one season, R), and returns its wire id.
+async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
+    use pharos_core::{
+        LibraryKind, LibraryStore as _, MediaItem, MediaKind, MediaMetadata, MediaStore as _,
+        SeriesInfo,
+    };
+    let wire = "c".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("TV", "/libTV", LibraryKind::TvShows, &wire)
+        .await
+        .unwrap();
+    let episodes = [
+        (601, "Show", 1, 1, "G"),
+        (602, "Show", 1, 2, "G"),
+        (603, "Show", 2, 1, "G"),
+        (604, "Mature", 1, 1, "R"),
+    ];
+    for (id, show, season, ep, rating) in episodes {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libTV/{show}/Season {season:02}/e{ep}.mkv").into(),
+                title: format!("{show} {season}x{ep}"),
+                kind: MediaKind::Episode,
+                metadata: MediaMetadata {
+                    official_rating: Some(rating.into()),
+                    ..MediaMetadata::default()
+                },
+                series: Some(SeriesInfo {
+                    series_name: show.into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                    series_folder: Some(format!("/libTV/{show}")),
+                    series_year: None,
+                }),
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    wire
+}
+
+/// What the native UI does to open a library, a series and a season: detail
+/// for the title, then the listing. Both must answer at every level, as a
+/// seeded user, and name the same things the level above listed.
+/// Disarm check: with `Library.detail` refusing synthesised ids again, the
+/// first `wire_detail` fails.
+#[actix_web::test]
+async fn browsing_a_library_a_series_and_a_season_answers_detail_then_listing() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key, WireId};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+
+    let list = |parent: String| {
+        let session = &session;
+        async move {
+            let (_, items) = wire_query(
+                session,
+                Some(&parent),
+                &[],
+                "SortName",
+                false,
+                "",
+                &[],
+                0,
+                0,
+            )
+            .await;
+            items
+                .iter()
+                .map(|i| {
+                    (
+                        i["Id"].as_str().unwrap().to_owned(),
+                        i["Name"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let detail = |id: String| {
+        let session = &session;
+        async move {
+            wire_detail(session, WireId::parse(&id).unwrap())
+                .await
+                .unwrap_or_else(|e| panic!("detail {id}: {e}"))
+        }
+    };
+
+    assert_eq!(detail(tv.clone()).await["Name"], "TV");
+    let in_library = list(tv).await;
+    assert_eq!(in_library.len(), 4, "{in_library:?}");
+
+    // The ids a title screen reaches through an episode's parents.
+    let show_id = series_id_for_key(Some("/libTV/Show"), "Show");
+    assert_eq!(detail(show_id.clone()).await["Name"], "Show");
+    assert_eq!(list(show_id).await.len(), 3);
+
+    let season_id = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    let season = detail(season_id.clone()).await;
+    assert_eq!(season["Name"], "Season 1");
+    assert_eq!(season["SeriesName"], "Show");
+    assert_eq!(list(season_id).await.len(), 2);
+}
+
+/// A user who may not see a library, or whose parental cap rules out a
+/// series' episodes, is refused the synthesised detail exactly as for an id
+/// that names nothing, and the refusal is counted.
+/// Disarm check: with `synth_item_json` skipping its access checks, the
+/// restricted user reads the library's, series' and season's detail.
+#[actix_web::test]
+async fn synthesised_detail_follows_library_access_and_the_parental_cap() {
+    use crate::telemetry::counter;
+    use pharos_jellyfin_api::dto::{series_id_for_key, WireId};
+
+    let fx = crate::common::seed_rich().await;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let tv = seed_tv_library(&fx).await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = crate::telemetry::connect(&fx);
+            let session = crate::telemetry::session_for(&client, &fx.user_token).await;
+            let series = |name: &str| {
+                let folder = format!("/libTV/{name}");
+                WireId::parse(&series_id_for_key(Some(&folder), name)).unwrap()
+            };
+            let (show, mature) = (series("Show"), series("Mature"));
+            let missing = WireId::Synth(0x1234_5678);
+            let not_found = Err("not found: item".to_owned());
+
+            // Capped at G: the R series answers like a missing id, the G one stays.
+            fx.state
+                .stores
+                .set_policy(
+                    fx.user_id,
+                    UserPolicy {
+                        max_parental_rating: Some(0),
+                        ..UserPolicy::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(wire_detail(&session, show).await.is_ok());
+            assert_eq!(wire_detail(&session, mature).await, not_found);
+            assert_eq!(wire_detail(&session, missing).await, not_found);
+
+            // Limited to the movie libraries: the TV library and its series vanish.
+            fx.state
+                .stores
+                .set_policy(
+                    fx.user_id,
+                    UserPolicy {
+                        enable_all_folders: false,
+                        enabled_folders: vec![fx.lib_a_wire.clone()],
+                        ..UserPolicy::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let tv_view = WireId::parse(&tv).unwrap();
+            assert_eq!(wire_detail(&session, tv_view).await, not_found);
+            assert_eq!(wire_detail(&session, show).await, not_found);
+        })
+        .await;
+
+    let refused = |reason| {
+        counter(
+            &snapshotter,
+            "pharos_rpc_item_refused_total",
+            &[("call", "detail"), ("id_kind", "synth"), ("reason", reason)],
+        )
+    };
+    assert!(refused("synth_hidden") >= 2, "hidden series are counted");
+    assert!(refused("not_found") >= 2, "missing ids are counted");
+}
+
 /// How many rpc `Call` messages `bytes` (whole capnp messages, back to back)
 /// carries.
 fn calls_in(bytes: &[u8]) -> usize {
