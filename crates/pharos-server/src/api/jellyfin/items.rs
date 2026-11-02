@@ -6144,25 +6144,28 @@ async fn fetch_item_dto(
             )));
         }
         // T70 — a playlist wire id resolves to its Playlist BaseItemDto so
-        // `/Items/{id}` on a playlist returns the folder item.
+        // `/Items/{id}` on a playlist returns the folder item. Another user's
+        // playlist falls through and answers as an id that names nothing.
         use pharos_core::PlaylistStore;
-        if let Some(playlist) = state
+        let playlist = state
             .stores
             .playlist_by_wire_id(id_str)
             .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-        {
-            if !crate::services::access::check_playlist(
-                state,
-                user,
-                &playlist,
-                crate::services::access::PlaylistAccess::Read,
-                "item",
-            )
-            .await
-            {
-                return Err(error::ErrorNotFound("not found"));
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        let readable = match &playlist {
+            Some(p) => {
+                crate::services::access::check_playlist(
+                    state,
+                    user,
+                    p,
+                    crate::services::access::PlaylistAccess::Read,
+                    "item",
+                )
+                .await
             }
+            None => false,
+        };
+        if let (Some(playlist), true) = (playlist, readable) {
             let count = state
                 .stores
                 .playlist_entries(id_str)
