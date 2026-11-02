@@ -7104,80 +7104,41 @@ async fn resume_items(
     // Reading — from the SAME endpoint, distinguished only by a `MediaTypes`
     // filter (`Video` / `Audio` / `Book`). Honour it, else every row shows the
     // same items (e.g. movies under "Continue Reading"). Absent = no filter.
-    let media_types: Vec<String> = req
-        .query_string()
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| k.eq_ignore_ascii_case("MediaTypes"))
-        .map(|(_, v)| {
-            v.split(',')
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    // 004-books / FR-002 — the SECOND MediaType decision site (the first is in
-    // `dto.rs`, the third in `search.rs`). Was `_ => "video"`, so a book on the
-    // resume shelf reported itself as video and no reader would open it.
-    // EXHAUSTIVE on purpose: a wildcard is how three copies of this decision
-    // stayed out of sight until the R10 audit.
-    let media_type_of = |kind: pharos_core::MediaKind| match kind {
-        pharos_core::MediaKind::Audio => "audio",
-        pharos_core::MediaKind::Book => "book",
-        pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode => "video",
+    let query_param = |name: &str| -> Option<&str> {
+        req.query_string()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
     };
-    let mut ids = state
-        .stores
-        .resumable_items(user.0.id)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    crate::services::access::retain_visible(state, &user.0, &mut ids, |id| *id, "resume")
-        .await
-        .map_err(crate::api::jellyfin::access_error)?;
-    let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
-    let mut ids_kept: Vec<pharos_core::MediaId> = Vec::with_capacity(ids.len());
-    for id in &ids {
-        if let Ok(item) = state.stores.get(*id).await {
-            // pharos has no Book media, so a `MediaTypes=Book` row is correctly
-            // empty (hidden by the client).
-            if media_types.is_empty() || media_types.iter().any(|t| t == media_type_of(item.kind)) {
-                items.push(item);
-                ids_kept.push(*id);
-            }
-        }
-    }
-    let ids = ids_kept;
+    let kinds = media_types_filter(query_param("MediaTypes"));
     // B164 — honour `Limit`/`StartIndex`. This endpoint returned EVERY
     // resumable item however few the client asked for: jellyfin-web's home row
     // requests `Limit=12` and was served 86 items, 400 KB of JSON to render
     // twelve tiles. `TotalRecordCount` stays the unpaged total, which is what
     // Jellyfin means by it and what a client would page against.
-    let int_param = |name: &str| -> Option<usize> {
-        req.query_string()
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .and_then(|(_, v)| v.parse::<usize>().ok())
-    };
-    let total = items.len() as u32;
-    let start = int_param("StartIndex").unwrap_or(0).min(items.len());
-    let end = int_param("Limit")
-        .map_or(items.len(), |n| start.saturating_add(n))
-        .min(items.len());
-    let page_ids: Vec<pharos_core::MediaId> = ids[start..end].to_vec();
-    let items: Vec<MediaItem> = items[start..end].to_vec();
-    let ids = page_ids;
-    let user_data = state
-        .stores
-        .user_data_bulk(user.0.id, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let dtos: Vec<BaseItemDto> = items
+    let int_param = |name: &str| query_param(name).and_then(|v| v.parse::<u32>().ok());
+    let page = crate::services::library::resume(
+        state,
+        &user.0,
+        &kinds,
+        int_param("StartIndex").unwrap_or(0),
+        int_param("Limit"),
+    )
+    .await
+    .map_err(|e| match e {
+        crate::services::library::ListError::Hidden(hidden) => {
+            crate::api::jellyfin::access_error(hidden)
+        }
+        crate::services::library::ListError::Store(e) => {
+            error::ErrorInternalServerError(e.to_string())
+        }
+    })?;
+    let dtos: Vec<BaseItemDto> = page
+        .items
         .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+        .map(|(item, ud)| {
+            BaseItemDto::from_domain_with_user_data(item, &state.server_id, *ud)
                 .with_converted_book(
                     crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
                 )
@@ -7190,9 +7151,47 @@ async fn resume_items(
         .collect();
     Ok(crate::api::jellyfin::wire::json(&ItemsResultDto {
         items: dtos,
-        total_record_count: total,
-        start_index: start as u32,
+        total_record_count: page.total,
+        start_index: page.start,
     }))
+}
+
+/// The kinds a `MediaTypes=` list (`Video`, `Audio`, `Book`) names. Types
+/// pharos stores none of match nothing (B153), not everything.
+fn media_types_filter(raw: Option<&str>) -> KindFilter {
+    let named: Vec<String> = raw
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if named.is_empty() {
+        return KindFilter::Unset;
+    }
+    // 004-books / FR-002 — the SECOND MediaType decision site (the first is in
+    // `dto.rs`, the third in `search.rs`). Was `_ => "video"`, so a book on the
+    // resume shelf reported itself as video and no reader would open it.
+    // EXHAUSTIVE on purpose: a wildcard is how three copies of this decision
+    // stayed out of sight until the R10 audit.
+    let media_type_of = |kind: MediaKind| match kind {
+        MediaKind::Audio => "audio",
+        MediaKind::Book => "book",
+        MediaKind::Movie | MediaKind::Episode => "video",
+    };
+    let kinds: Vec<MediaKind> = [
+        MediaKind::Movie,
+        MediaKind::Episode,
+        MediaKind::Audio,
+        MediaKind::Book,
+    ]
+    .into_iter()
+    .filter(|k| named.iter().any(|t| t == media_type_of(*k)))
+    .collect();
+    if kinds.is_empty() {
+        KindFilter::MatchesNothing
+    } else {
+        KindFilter::Kinds(kinds)
+    }
 }
 
 /// Admin only, as in Jellyfin (`RequiresElevation`): it names every library

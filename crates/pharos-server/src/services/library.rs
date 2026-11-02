@@ -3,8 +3,8 @@
 //! drift apart.
 
 use pharos_core::{
-    DomainError, LibraryKind, MediaItem, MediaKind, User, UserDataStore as _, UserItemData,
-    UserPolicy,
+    DomainError, LibraryKind, MediaItem, MediaKind, MediaStore as _, User, UserDataStore as _,
+    UserItemData, UserPolicy,
 };
 
 use crate::services::access::ItemHidden;
@@ -176,6 +176,65 @@ pub async fn latest(
             (item, ud)
         })
         .collect())
+}
+
+/// One page of a listing, with the number of matching items before paging.
+#[derive(Debug)]
+pub struct ListPage {
+    pub items: Vec<(MediaItem, UserItemData)>,
+    pub total: u32,
+    pub start: u32,
+}
+
+/// The items `user` has started and not finished, of the kinds `kinds`
+/// keeps, in the store's resume order, each with the user's play state.
+/// `start` and `limit` page the list; `total` counts every match (B164).
+pub async fn resume(
+    state: &AppState,
+    user: &User,
+    kinds: &KindFilter,
+    start: u32,
+    limit: Option<u32>,
+) -> Result<ListPage, ListError> {
+    let mut ids = state
+        .stores
+        .resumable_items(user.id)
+        .await
+        .map_err(ListError::Store)?;
+    crate::services::access::retain_visible(state, user, &mut ids, |id| *id, "resume")
+        .await
+        .map_err(ListError::Hidden)?;
+    let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        // A row deleted since it was resumed is skipped, not an error.
+        if let Ok(item) = state.stores.get(*id).await {
+            items.push(item);
+        }
+    }
+    let items = kinds.keep(items);
+    let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+    let start = start.min(total);
+    let end = limit.map_or(total, |n| start.saturating_add(n)).min(total);
+    let page: Vec<MediaItem> = items
+        .into_iter()
+        .skip(start as usize)
+        .take((end - start) as usize)
+        .collect();
+    let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.id, &ids)
+        .await
+        .map_err(ListError::Store)?;
+    Ok(ListPage {
+        items: page
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| (item, user_data.get(i).copied().unwrap_or_default()))
+            .collect(),
+        total,
+        start,
+    })
 }
 
 /// Drop items that don't live under the configured root / series /

@@ -425,3 +425,104 @@ async fn native_latest_agrees_with_the_jellyfin_latest_route() {
         [serde_json::json!(WireId::Real(fx.other_item_id).to_string())]
     );
 }
+
+/// Marks `ids` part-watched for the fixture's user, the first most recent.
+async fn start_watching(fx: &crate::common::Fixture, ids: &[u64]) {
+    use pharos_core::UserDataStore as _;
+    for (n, id) in ids.iter().enumerate() {
+        fx.state
+            .stores
+            .set_user_data(
+                fx.user_id,
+                *id,
+                pharos_core::UserItemData {
+                    last_played_position_ticks: 600_000_000,
+                    last_played_at: 2_000_000_000 - n as i64,
+                    ..pharos_core::UserItemData::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// T031: what the user started and has not finished, of the kinds asked
+/// for, paged with the unpaged total, and only what the policy allows.
+#[actix_web::test]
+async fn resume_lists_what_the_user_started_that_the_policy_allows() {
+    use library::KindFilter;
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _};
+
+    let fx = seed_rich().await;
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 300,
+            path: "/libA/song.flac".into(),
+            title: "Song".into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    start_watching(&fx, &[fx.rich_item_id, fx.other_item_id, 300]).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids = |page: &library::ListPage| page.items.iter().map(|(i, _)| i.id).collect::<Vec<_>>();
+
+    let all = library::resume(&fx.state, &user, &KindFilter::Unset, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(all.total, 3);
+    let mut seen = ids(&all);
+    seen.sort_unstable();
+    assert_eq!(seen, [fx.rich_item_id, fx.other_item_id, 300]);
+    assert!(all
+        .items
+        .iter()
+        .all(|(_, ud)| ud.last_played_position_ticks == 600_000_000));
+
+    let audio = library::resume(
+        &fx.state,
+        &user,
+        &KindFilter::Kinds(vec![MediaKind::Audio]),
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!((ids(&audio), audio.total), (vec![300], 1));
+
+    let none = library::resume(&fx.state, &user, &KindFilter::MatchesNothing, 0, None)
+        .await
+        .unwrap();
+    assert_eq!((none.items.len(), none.total), (0, 0));
+
+    let second = library::resume(&fx.state, &user, &KindFilter::Unset, 1, Some(1))
+        .await
+        .unwrap();
+    assert_eq!((second.items.len(), second.total, second.start), (1, 3, 1));
+    assert_eq!(ids(&second), [ids(&all)[1]]);
+
+    let past_end = library::resume(&fx.state, &user, &KindFilter::Unset, 9, Some(5))
+        .await
+        .unwrap();
+    assert_eq!((past_end.items.len(), past_end.start), (0, 3));
+
+    let restricted = pharos_core::User {
+        policy: UserPolicy {
+            enable_all_folders: false,
+            enabled_folders: vec![fx.lib_a_wire.clone()],
+            ..UserPolicy::default()
+        },
+        ..user
+    };
+    let a = library::resume(&fx.state, &restricted, &KindFilter::Unset, 0, None)
+        .await
+        .unwrap();
+    let mut seen = ids(&a);
+    seen.sort_unstable();
+    assert_eq!((seen, a.total), (vec![fx.rich_item_id, 300], 2));
+}
