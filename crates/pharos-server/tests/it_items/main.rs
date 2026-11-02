@@ -21,6 +21,7 @@ mod name_prefix_audit;
 mod pagination_audit;
 mod parent_id_audit;
 mod random_sort_seed;
+mod rescan_3d_edition;
 mod resolution_filter_audit;
 mod sort_audit;
 mod type_filter_audit;
