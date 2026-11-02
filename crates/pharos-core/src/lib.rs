@@ -3497,10 +3497,13 @@ pub trait TranscodeSessionStore: Send + Sync {
         now_unix_secs: i64,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
-    /// Fetch a session by PlaySessionId. `None` = no such row.
+    /// Fetch a session by PlaySessionId. `None` = no such row, or one last
+    /// written before `updated_since_unix_secs`: an expired session must not
+    /// authorize anything while it waits for the pruner.
     fn get_transcode_session(
         &self,
         play_session_id: &str,
+        updated_since_unix_secs: i64,
     ) -> impl std::future::Future<Output = DomainResult<Option<PersistedTranscodeSession>>> + Send;
 
     fn remove_transcode_session(

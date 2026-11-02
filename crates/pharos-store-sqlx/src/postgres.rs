@@ -3730,13 +3730,15 @@ impl TranscodeSessionStore for PostgresStore {
     async fn get_transcode_session(
         &self,
         play_session_id: &str,
+        updated_since_unix_secs: i64,
     ) -> DomainResult<Option<PersistedTranscodeSession>> {
         let row: Option<SessionRow> = sqlx::query_as(
             "SELECT media_id, decision_json, source_probe_json, \
                     burn_subtitle_indices_json, holder_user_id, holder_token_id \
-             FROM transcode_sessions WHERE play_session_id = $1",
+             FROM transcode_sessions WHERE play_session_id = $1 AND updated_at >= $2",
         )
         .bind(play_session_id)
+        .bind(updated_since_unix_secs)
         .fetch_optional(self.pool())
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
