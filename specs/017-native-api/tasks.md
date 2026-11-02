@@ -122,7 +122,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 - [x] T030 [US4] `services/library.rs::latest` ← `items.rs latest_items`; `Library.latest` — **COMMIT** — Done; `KindFilter` moved into `services::library` with it, and the native `ItemSummary` encoder (`rpc/library.rs write_item`) reads the Jellyfin projection, checked field by field against `/Users/{id}/Items/Latest` in `it_rpc/library.rs`
 - [x] T031 [US4] `services/library.rs::resume` ← `items.rs resume_items` (typed `Vec<MediaKind>` instead of raw query parsing); `Library.resume` — **COMMIT** — Done; the typed filter is `KindFilter` (so naming only unknown types still matches nothing, B153), and `MediaTypes=` parsing stays in the Jellyfin layer (`items::media_types_filter`)
 - [x] T032 [US4] `services/library.rs::next_up`; `Library.nextUp` — **COMMIT** — Done; the native call has no series scope (the schema takes only `limit`), the Jellyfin `SeriesId` scope goes through the same service
-- [ ] T033 [US4] `services/library.rs::query` (parent, kinds, sort, name prefix, filters, paging); `Library.query` — **COMMIT**
+- [x] T033 [US4] `services/library.rs::query` (parent, kinds, sort, name prefix, filters, paging); `Library.query` — **COMMIT** — Done; `/Items` and `Library.query` share `services::library::query` over an `ItemQuery` in Jellyfin's token vocabulary (one parser, one `build_media_query`, one policy scope). A limit of 0 is a page of `QUERY_DEFAULT` (100); a named limit is capped at `QUERY_MAX` (1000). Kinds pharos only synthesises match nothing natively (B153); `/Items` collapses series/season/album/artist/box-set/playlist browses in its own paths, which T061 brings to the native call.
 - [ ] T034 [US4] `services/library.rs::detail`; `Library.detail` — **COMMIT**
 - [ ] T035 [US1] `Library.home` aggregate over T029–T032; test `home_in_one_batch` pipelines `resume → session.library → library.home` over native TCP and asserts one flight after bootstrap — **COMMIT**
 - [ ] T036 [US4] `services/user_data.rs` set played / favorite; `UserData.*` — **COMMIT**
@@ -172,6 +172,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 - [ ] T058 [P] `docs/jellyfin-mapping.md`: native ↔ Jellyfin method mapping — **COMMIT**
 - [ ] T059 Angie sidecar config for the `/pharos/rpc` upgrade and keep-alive below the ingress idle timeout — **COMMIT**
 - [ ] T060 After deploy: run quickstart §6 queries and record real output (SC-004)
+- [ ] T061 [US4] Native `Library.query` for synthesised kinds: move `/Items`' box-set, playlist, music (album/artist) and virtual series/season paths behind `services::library` so `kinds=[series]` and the like list what `/Items` lists; agreement test per kind — **COMMIT**
 
 ---
 
