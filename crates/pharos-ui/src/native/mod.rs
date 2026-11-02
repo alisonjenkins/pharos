@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod appearance;
+pub mod diagnostics;
 pub mod find;
 pub mod machine;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
