@@ -4520,6 +4520,7 @@ impl HlsSegmentCache {
                 tracing::info!(
                     media.id = media_id,
                     start_secs,
+                    audio.dir = %dir.display(),
                     "continuous audio: spawning AAC encode for muxed segments"
                 );
                 // Whole-title vs seek session. Worth separating: the two
