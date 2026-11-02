@@ -16,8 +16,9 @@
 
 ## R2 — consent gate (US9, Clarifications)
 
-- **Decision**: the consent flag is a per-user pref (`telemetry.enabled`,
-  default `false`), read through 017 `Prefs`. Until the flag is known (before
+- **Decision**: the consent flag is a per-user pref (`diagnostics.opt_in`,
+  default off; shipped under that name by 017 T068, not `telemetry.enabled`),
+  read through 017 `Prefs` and enforced by `Telemetry.submit`. Until the flag is known (before
   login, or before the first `Prefs` read) the facility is in `Unknown` and
   **buffers nothing for sending**: events go to the local overlay ring only.
   `Enabled` starts sending, and `Disabled` drops the send queue at once.
