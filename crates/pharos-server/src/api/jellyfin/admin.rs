@@ -1070,8 +1070,12 @@ async fn post_system_configuration_key(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// `Ok` for an admin. A refusal answers 403, logs a WARN naming the user and
+/// counts under `pharos_admin_required_total`.
 pub(super) fn require_admin(user: &AuthUser) -> Result<(), actix_web::Error> {
     if !user.0.policy.admin {
+        metrics::counter!("pharos_admin_required_total").increment(1);
+        tracing::warn!(user = %user.0.name, "refused an admin-only request");
         return Err(error::ErrorForbidden("admin required"));
     }
     Ok(())
