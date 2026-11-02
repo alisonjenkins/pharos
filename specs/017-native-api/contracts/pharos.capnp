@@ -23,7 +23,7 @@ struct ItemId {                # mirrors pharos_jellyfin_api::WireId
 }
 struct UserId        { uuid @0 :Data; }   # 16 bytes, pharos_core::auth::UserId(Uuid)
 struct GroupId       { value @0 :Text; }
-struct PlaySessionId { value @0 :Text; }
+struct PlaySessionId { value @0 :Text $secret; }   # a grant's capability: debug dumps redact it
 struct DeviceId      { value @0 :Text; }
 
 struct OptU32 { union { none @0 :Void; some @1 :UInt32; } }
@@ -216,7 +216,7 @@ struct TelemetryEvent {
   traceId @4 :Text; spanId @5 :Text; route @6 :Text; action @7 :Text;
   item @8 :ItemId; playSession @9 :PlaySessionId; group @10 :GroupId;   # pointer fields: absent when n/a
   repeat @11 :UInt32; fields @12 :List(Field);
-  struct Field { key @0 :Text; value @1 :Text; }
+  struct Field { key @0 :Text; value @1 :Text $secret; }   # free text from the client: never in a debug dump
 }
 struct ClientSpan {
   traceId @0 :Text; spanId @1 :Text; parentSpanId @2 :Text; name @3 :Text;
