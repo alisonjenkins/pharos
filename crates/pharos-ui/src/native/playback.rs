@@ -10,8 +10,18 @@ use pharos_client::api::Capabilities;
 /// engine is dropped when the player unmounts; dropping detaches it.
 pub trait PlaybackEngine {
     /// Start `url` on the `<video>` with id `video_id`, `start_ms` in.
-    fn attach(&mut self, video_id: &str, url: &str, start_ms: u64) -> Result<(), String>;
+    /// `on_fatal` gets the reason once playback has failed for good.
+    fn attach(
+        &mut self,
+        video_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: OnFatal,
+    ) -> Result<(), String>;
 }
+
+/// Told why playback stopped for good.
+pub type OnFatal = std::rc::Rc<dyn Fn(String)>;
 
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

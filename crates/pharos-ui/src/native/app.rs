@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dioxus::prelude::*;
+use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, ItemRef, NativeApi, NativeGrant, Page, PharosApi as _, PlaybackGrant as _,
 };
@@ -13,7 +14,7 @@ use pharos_client::{CallInfo, ClientError};
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, start_ms, Engine, MediaEvent, Outgoing, PlaybackEngine, ReportClock,
+    choose_engine, start_ms, Engine, MediaEvent, OnFatal, Outgoing, PlaybackEngine, ReportClock,
 };
 use super::route::Route;
 use super::views::{
@@ -441,13 +442,27 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
             stop();
         }
     });
+    // The engines call back from browser events, outside the Dioxus runtime.
+    let fatal = use_coroutine({
+        let stop = stop.clone();
+        move |mut reasons: UnboundedReceiver<String>| {
+            let stop = stop.clone();
+            async move {
+                while let Some(reason) = reasons.next().await {
+                    stop();
+                    failed.set(Some(format!("Playback failed: {reason}")));
+                }
+            }
+        }
+    });
     use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
         move || {
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
             spawn(async move {
+                let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
                 let attached = match platform::engine(p.engine).await {
-                    Ok(mut e) => e.attach(VIDEO_ID, &p.url, p.start_ms).map(|()| e),
+                    Ok(mut e) => e.attach(VIDEO_ID, &p.url, p.start_ms, on_fatal).map(|()| e),
                     Err(e) => Err(e),
                 };
                 match attached {
