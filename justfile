@@ -228,7 +228,7 @@ compat-dioxus-full native="on":
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
     nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
     for _ in $(seq 1 120); do
-      if curl -fsS -o /dev/null http://127.0.0.1:8096/ 2>/dev/null; then ready=1; break; fi
+      if curl -fsS -o /dev/null http://127.0.0.1:8096/ui/ 2>/dev/null; then ready=1; break; fi
       sleep 1
     done
     if [[ -z "${ready:-}" ]]; then

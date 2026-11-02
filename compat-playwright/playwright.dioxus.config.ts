@@ -4,7 +4,7 @@ import { defineConfig, devices } from "@playwright/test";
 //
 // This is a thin sibling of `playwright.config.ts` that drops the
 // `JELLYFIN_WEB_DIR` requirement + the local http-server fixture: the
-// Dioxus suite hits pharos's own root (`/`), which serves the WASM
+// Dioxus suite hits pharos's own mount (`/ui/`), which serves the WASM
 // bundle direct.
 //
 // Env contract:
