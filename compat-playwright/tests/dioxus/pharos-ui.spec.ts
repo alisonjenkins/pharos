@@ -120,6 +120,44 @@ test.describe("pharos Dioxus UI", () => {
       expect(errors, errors.join("\n")).toEqual([]);
     });
 
+    test("the stored theme is applied, and an unknown one falls back saying why", async ({
+      page,
+    }) => {
+      const lines: string[] = [];
+      page.on("console", (m) => {
+        if (m.text().startsWith("pharos: theme")) lines.push(m.text());
+      });
+      const rootToken = (name: string) =>
+        page.evaluate(
+          (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim(),
+          name,
+        );
+
+      await page.addInitScript(() => {
+        if (!sessionStorage.getItem("theme-step")) {
+          sessionStorage.setItem("theme-step", "1");
+          localStorage.setItem("pharos.theme.active", "Neon Grid");
+        } else {
+          localStorage.setItem("pharos.theme.active", "Glitter");
+        }
+      });
+
+      await page.goto("/");
+      await expect.poll(() => rootToken("--px-color-bg")).toBe("#000000");
+      await expect
+        .poll(() => lines.join("\n"))
+        .toMatch(/pharos: theme applied name="Neon Grid" source=shipped/);
+
+      lines.length = 0;
+      await page.reload();
+      await expect.poll(() => rootToken("--px-color-bg")).toBe("#0e1116");
+      await expect
+        .poll(() => lines.join("\n"))
+        .toMatch(
+          /pharos: theme fallback name=Glitter source=shipped reason=unknown_theme .*to="Pharos Night"/,
+        );
+    });
+
     test("not-enabled page links to Manage", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },
