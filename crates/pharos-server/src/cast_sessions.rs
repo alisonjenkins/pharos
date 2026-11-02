@@ -74,15 +74,6 @@ pub struct VirtualTvSession {
     pub is_paused: bool,
 }
 
-/// User ids are compared as bare lowercase hex so a dashed and a simple
-/// rendering of one id match.
-fn normalise_user_id(id: &str) -> String {
-    id.chars()
-        .filter(|c| *c != '-')
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
 /// The TVs `viewer` may see: configured, reachable, and permitted
 /// (`allowed_users` empty or naming the viewer; admins see every reachable TV).
 pub fn virtual_tv_sessions(
@@ -91,18 +82,10 @@ pub fn virtual_tv_sessions(
     viewer: &ViewerInfo,
     active: &[ActiveCastInfo],
 ) -> Vec<VirtualTvSession> {
-    let viewer_id = normalise_user_id(&viewer.user_id);
     cfg.tvs
         .iter()
         .filter(|tv| reachable.get(&tv.name).copied().unwrap_or(false))
-        .filter(|tv| {
-            viewer.is_admin
-                || tv.allowed_users.is_empty()
-                || tv
-                    .allowed_users
-                    .iter()
-                    .any(|u| normalise_user_id(u) == viewer_id)
-        })
+        .filter(|tv| tv.permits(&viewer.user_id, viewer.is_admin))
         .map(|tv| {
             let cast = active
                 .iter()

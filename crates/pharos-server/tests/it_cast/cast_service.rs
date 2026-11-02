@@ -187,6 +187,7 @@ impl Rig {
             user_name: p.name.clone(),
             owner_sync_key: p.key.clone(),
             tv_name: tv.into(),
+            is_admin: false,
         }
     }
 
@@ -373,7 +374,8 @@ async fn start_plays_the_group_item_on_the_tv_and_shows_the_owner_once() {
     assert_eq!(casts[0].tv, TV);
     assert_eq!(casts[0].seat_member, rig.seat_member());
     assert_eq!(casts[0].owner_member, rig.owner.member);
-    assert_eq!(rig.seat_total("started", "user_stop"), 1);
+    assert_eq!(rig.seat_total("started", "requested"), 1);
+    assert_eq!(rig.seat_total("started", "user_stop"), 0);
 }
 
 #[tokio::test]
@@ -416,6 +418,7 @@ async fn each_reject_carries_its_reason_and_is_recorded() {
             user_name: "loner".into(),
             owner_sync_key: key,
             tv_name: TV.into(),
+            is_admin: false,
         })
         .await
         .unwrap_err();

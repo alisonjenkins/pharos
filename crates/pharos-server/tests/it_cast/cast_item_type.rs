@@ -18,6 +18,7 @@ async fn play_now_item(kind: MediaKind) -> (String, String) {
             user_name: rig.alice.name.clone(),
             owner_sync_key: rig.alice.key.clone(),
             tv_name: cast_rig::TV.into(),
+            is_admin: false,
         })
         .await
         .unwrap();

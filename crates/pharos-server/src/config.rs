@@ -1002,6 +1002,25 @@ pub struct ConfiguredTv {
     pub allowed_users: Vec<String>,
 }
 
+impl ConfiguredTv {
+    /// Whether `user_id` (dashed or simple, any case) may see this TV in the
+    /// device picker and cast to it: an admin always, anyone else when
+    /// `allowed_users` is empty or names them. The picker and the start check
+    /// both ask this, so a listed TV is never refused as not permitted.
+    pub fn permits(&self, user_id: &str, is_admin: bool) -> bool {
+        fn normalise(id: &str) -> String {
+            id.chars()
+                .filter(|c| *c != '-')
+                .flat_map(char::to_lowercase)
+                .collect()
+        }
+        let wanted = normalise(user_id);
+        is_admin
+            || self.allowed_users.is_empty()
+            || self.allowed_users.iter().any(|u| normalise(u) == wanted)
+    }
+}
+
 /// A TV's control endpoint as written in config. Not resolved to IPs at load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CastAddress {
@@ -1967,6 +1986,25 @@ mod cast_config_tests {
         assert_eq!(c.cast.drift_threshold_ms, 1500);
         assert_eq!(c.cast.correction_cooldown_ms, 5000);
         assert!(c.cast.tv("anything").is_none());
+    }
+
+    /// The picker and the start check share one rule: admins always, others
+    /// when the list is empty or names them, however the id is written.
+    #[test]
+    fn a_tv_permits_admins_and_its_listed_users() {
+        let id = "4C1F3E5A-90B2-4D6E-8F70-1A2B3C4D5E6F";
+        let tv = |allowed: &[&str]| ConfiguredTv {
+            name: "Den".into(),
+            address: CastAddress {
+                host: "192.168.1.60".into(),
+                port: 8009,
+            },
+            allowed_users: allowed.iter().map(|s| s.to_string()).collect(),
+        };
+        assert!(tv(&[]).permits(id, false));
+        assert!(tv(&["4c1f3e5a90b24d6e8f701a2b3c4d5e6f"]).permits(id, false));
+        assert!(!tv(&["someone-else"]).permits(id, false));
+        assert!(tv(&["someone-else"]).permits(id, true));
     }
 
     #[test]

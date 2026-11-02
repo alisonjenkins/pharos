@@ -361,7 +361,7 @@ impl<F: TransportFactory> Actor<F> {
             .await;
         obs::record_cast_event(
             CastEvent::Resumed,
-            CastReason::UserStop,
+            CastReason::Restarted,
             &seat.name,
             "",
             &tv.name,

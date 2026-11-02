@@ -17,6 +17,7 @@ fn start_request(p: &cast_rig::Person) -> StartCast {
         user_name: p.name.clone(),
         owner_sync_key: p.key.clone(),
         tv_name: TV.into(),
+        is_admin: false,
     }
 }
 

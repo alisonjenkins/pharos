@@ -58,10 +58,17 @@ pub enum CastReason {
     TvRemoved,
     /// A start reached a replica that does not run the group.
     NotGroupOwner,
+    /// The owner asked for the cast (a `started` event).
+    Requested,
+    /// The server restarted or took the group over, and picked the seat up
+    /// from the persisted snapshot (a `resumed` event).
+    Restarted,
+    /// The TV token reached half its lifetime (a `token_renewed` event).
+    TokenLifetime,
 }
 
 impl CastReason {
-    pub const ALL: [CastReason; 12] = [
+    pub const ALL: [CastReason; 15] = [
         CastReason::NotInGroup,
         CastReason::TvBusy,
         CastReason::TvUnreachable,
@@ -74,6 +81,9 @@ impl CastReason {
         CastReason::TokenFailed,
         CastReason::TvRemoved,
         CastReason::NotGroupOwner,
+        CastReason::Requested,
+        CastReason::Restarted,
+        CastReason::TokenLifetime,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -90,6 +100,9 @@ impl CastReason {
             CastReason::TokenFailed => "token_failed",
             CastReason::TvRemoved => "tv_removed",
             CastReason::NotGroupOwner => "not_group_owner",
+            CastReason::Requested => "requested",
+            CastReason::Restarted => "restarted",
+            CastReason::TokenLifetime => "token_lifetime",
         }
     }
 }
@@ -156,7 +169,10 @@ mod tests {
                 "user_stop",
                 "token_failed",
                 "tv_removed",
-                "not_group_owner"
+                "not_group_owner",
+                "requested",
+                "restarted",
+                "token_lifetime"
             ]
         );
         assert_labels_bounded(&labels);

@@ -75,6 +75,8 @@ pub struct StartCast {
     /// The session-hub key of the owner's player, `"{user}:{device}"`.
     pub owner_sync_key: String,
     pub tv_name: String,
+    /// Admins may cast to any configured TV, as the picker shows them.
+    pub is_admin: bool,
 }
 
 /// Why a start was refused. Each variant is a stable metric label.
@@ -264,6 +266,7 @@ pub fn spawn<F: TransportFactory>(
         pending: HashMap::new(),
         resuming: HashMap::new(),
         next_id: 0,
+        next_start: 0,
         internal_tx,
         opened_tx,
         resumed_tx,
@@ -355,6 +358,8 @@ type OpenOutcome<T> = Result<Result<(T, Occupancy), CastError>, tokio::time::err
 /// A connect task reporting back to the actor.
 struct Opened<T> {
     tv: String,
+    /// The [`PendingStart::attempt`] this connect was made for.
+    attempt: u64,
     outcome: OpenOutcome<T>,
 }
 
@@ -370,6 +375,9 @@ struct StartParams {
 /// A start whose TV connect is in flight. Holding it reserves the TV and the
 /// user, so a concurrent start is refused instead of racing.
 struct PendingStart {
+    /// Tells this start's connect result from a cancelled earlier start's
+    /// result for the same TV, which may already be queued.
+    attempt: u64,
     params: StartParams,
     reply: oneshot::Sender<Result<(), CastReject>>,
     /// The task opening the TV; aborted when the start is cancelled.
@@ -386,6 +394,8 @@ struct Actor<F: TransportFactory> {
     /// Persisted seats whose TV is connecting, by TV name.
     resuming: HashMap<String, hydrate::ResumeParams>,
     next_id: u64,
+    /// Numbers each start's connect, see [`PendingStart::attempt`].
+    next_start: u64,
     internal_tx: mpsc::Sender<Internal>,
     opened_tx: mpsc::Sender<Opened<F::Transport>>,
     resumed_tx: mpsc::Sender<hydrate::Resumed<F::Transport>>,
@@ -396,15 +406,6 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-fn permitted(tv: &ConfiguredTv, user: UserId) -> bool {
-    let wanted = user.0.simple().to_string();
-    tv.allowed_users.is_empty()
-        || tv
-            .allowed_users
-            .iter()
-            .any(|u| u.replace('-', "").to_lowercase() == wanted)
 }
 
 fn reason_of(reject: CastRejectReason) -> CastReason {
@@ -562,11 +563,14 @@ impl<F: TransportFactory> Actor<F> {
         let factory = Arc::clone(&self.factory);
         let opened_tx = self.opened_tx.clone();
         let tv_name = tv.name.clone();
+        self.next_start = self.next_start.wrapping_add(1);
+        let attempt = self.next_start;
         let connect = tokio::spawn(async move {
             let outcome = tokio::time::timeout(OPEN_TIMEOUT, factory.open(&tv)).await;
             let _ = opened_tx
                 .send(Opened {
                     tv: tv.name,
+                    attempt,
                     outcome,
                 })
                 .await;
@@ -574,6 +578,7 @@ impl<F: TransportFactory> Actor<F> {
         self.pending.insert(
             tv_name,
             PendingStart {
+                attempt,
                 params,
                 reply,
                 connect,
@@ -597,6 +602,7 @@ impl<F: TransportFactory> Actor<F> {
             params,
             reply,
             connect,
+            ..
         }) = self.pending.remove(&tv)
         else {
             return;
@@ -628,6 +634,18 @@ impl<F: TransportFactory> Actor<F> {
     }
 
     async fn on_opened(&mut self, done: Opened<F::Transport>) {
+        if self
+            .pending
+            .get(&done.tv)
+            .is_none_or(|p| p.attempt != done.attempt)
+        {
+            tracing::debug!(
+                tv = %done.tv,
+                attempt = done.attempt,
+                "cast: dropping the connect result of a cancelled start"
+            );
+            return;
+        }
         let Some(PendingStart { params, reply, .. }) = self.pending.remove(&done.tv) else {
             return;
         };
@@ -709,7 +727,7 @@ impl<F: TransportFactory> Actor<F> {
                 format!("no TV named {:?} is configured", req.tv_name),
             ));
         };
-        if !permitted(&tv, req.user_id) {
+        if !tv.permits(&req.user_id.0.simple().to_string(), req.is_admin) {
             return Err(self.reject(
                 &req,
                 "",
@@ -944,7 +962,7 @@ impl<F: TransportFactory> Actor<F> {
 
         obs::record_cast_event(
             CastEvent::Started,
-            CastReason::UserStop,
+            CastReason::Requested,
             &req.user_name,
             &cast.sender_device,
             &tv.name,
@@ -1170,7 +1188,7 @@ impl<F: TransportFactory> Actor<F> {
         self.revoke_quietly(&old).await;
         obs::record_cast_event(
             CastEvent::TokenRenewed,
-            CastReason::UserStop,
+            CastReason::TokenLifetime,
             &owner_name,
             &device,
             tv,

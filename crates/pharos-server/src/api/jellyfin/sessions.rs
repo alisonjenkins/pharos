@@ -744,6 +744,7 @@ async fn start_cast(state: &AppState, auth: &AuthSession, tv_name: String) -> Ht
             user_name: auth.user.name.clone(),
             owner_sync_key: owner_sync_key.clone(),
             tv_name,
+            is_admin: auth.user.policy.admin,
         })
         .await;
     match started {

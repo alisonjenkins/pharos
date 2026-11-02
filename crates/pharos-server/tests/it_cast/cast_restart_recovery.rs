@@ -250,6 +250,7 @@ async fn running_cast(
             user_name: "ali".into(),
             owner_sync_key: key.clone(),
             tv_name: TV.into(),
+            is_admin: false,
         })
         .await
         .unwrap();
@@ -615,6 +616,7 @@ fn start_request(who: &Owner, name: &str, tv: &str) -> StartCast {
         user_name: name.into(),
         owner_sync_key: who.key.clone(),
         tv_name: tv.into(),
+        is_admin: false,
     }
 }
 
@@ -823,6 +825,7 @@ async fn an_owner_cannot_start_a_second_seat_while_their_first_is_resuming() {
             user_name: "ali".into(),
             owner_sync_key: owner.key.clone(),
             tv_name: "Den".into(),
+            is_admin: false,
         })
         .await
         .expect_err("the owner's seat on the first TV is still resuming");
