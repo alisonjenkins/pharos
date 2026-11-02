@@ -23,12 +23,20 @@ async fn connect(server: &actix_test::TestServer, cookie: &str) -> bootstrap::Cl
         .await
         .expect("upgrade");
     let (mut sink, stream) = framed.split();
-    let chunks = Box::pin(stream.filter_map(|frame| async move {
-        match frame {
-            Ok(ws::Frame::Binary(bytes)) => Some(bytes.to_vec()),
-            _ => None,
-        }
-    }));
+    // A close frame or a broken socket ends the byte stream, as the
+    // browser transport's onclose does.
+    let chunks = Box::pin(
+        stream
+            .take_while(|frame| {
+                std::future::ready(!matches!(frame, Ok(ws::Frame::Close(_)) | Err(_)))
+            })
+            .filter_map(|frame| async move {
+                match frame {
+                    Ok(ws::Frame::Binary(bytes)) => Some(bytes.to_vec()),
+                    _ => None,
+                }
+            }),
+    );
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     actix_web::rt::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
