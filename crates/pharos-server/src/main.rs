@@ -32,6 +32,8 @@ enum AppError {
     Domain(#[from] pharos_core::DomainError),
     #[error("{0}")]
     Ui(#[from] pharos_server::ui::UiBundleError),
+    #[error("{0}")]
+    Usage(&'static str),
 }
 
 /// LIB-C1 — reconcile the `libraries` table from `[media]` config and
@@ -886,6 +888,16 @@ async fn seed_probe_multitrack(stores: &Stores, path: &std::path::Path) -> Resul
     Ok(())
 }
 
+/// V211: a CLI-set password must be non-empty, as the API requires.
+fn require_password(password: &str) -> Result<(), AppError> {
+    if password.is_empty() {
+        return Err(AppError::Usage(
+            "a password is required: pass --password or set PHAROS_ADMIN_PASSWORD",
+        ));
+    }
+    Ok(())
+}
+
 /// Bootstrap a user (the supported way to create the first admin on a
 /// fresh deployment). Idempotent — a name collision is reported and left
 /// as-is. Password comes from the CLI arg / `PHAROS_ADMIN_PASSWORD` env
@@ -899,6 +911,7 @@ async fn create_user(
     use pharos_core::SecretString;
     use pharos_server::auth::{BuiltinAuth, CreateUserOutcome};
 
+    require_password(password)?;
     let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
@@ -943,6 +956,7 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
     use pharos_core::{SecretString, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
+    require_password(password)?;
     let stores = Stores::connect(&cfg.database.url).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
@@ -2286,5 +2300,25 @@ mod seed_pdf_tests {
         let bytes = std::fs::read(&p).unwrap();
         assert!(bytes.starts_with(b"%PDF-"), "must carry a PDF header");
         assert!(bytes.ends_with(b"%%EOF\n"), "must carry a trailer");
+    }
+}
+
+#[cfg(test)]
+mod require_password_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::require_password;
+
+    #[test]
+    fn empty_password_is_refused_before_any_store_work() {
+        let err = require_password("").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "a password is required: pass --password or set PHAROS_ADMIN_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn non_empty_password_is_accepted() {
+        assert!(require_password("x").is_ok());
     }
 }
