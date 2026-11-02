@@ -172,7 +172,23 @@ where
     TokenStore::resolve(&store, token2.0.expose())
         .await
         .unwrap();
+    // A token id stands in for the token and dies with it, and is not the
+    // token itself.
+    let token2_id = TokenStore::token_id(&store, token2.0.expose());
+    assert_ne!(token2_id, token2.0.expose());
+    assert_eq!(
+        TokenStore::resolve_token_id(&store, &token2_id)
+            .await
+            .unwrap(),
+        uid
+    );
     TokenStore::revoke(&store, token2.0.expose()).await.unwrap();
+    assert!(
+        TokenStore::resolve_token_id(&store, &token2_id)
+            .await
+            .is_err(),
+        "a revoked token's id must not resolve"
+    );
     assert!(
         TokenStore::resolve(&store, token2.0.expose())
             .await

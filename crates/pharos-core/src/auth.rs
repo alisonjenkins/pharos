@@ -236,6 +236,19 @@ pub trait TokenStore: Send + Sync {
 
     fn revoke(&self, token: &str) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 
+    /// A stable id for `token` that is not the token: what a record that
+    /// must end with the token stores in its place, so the secret is never
+    /// written twice.
+    fn token_id(&self, token: &str) -> String;
+
+    /// The user whose live token has [`token_id`](Self::token_id) `id`.
+    /// Fails like [`resolve`](Self::resolve) once that token is revoked or
+    /// expired.
+    fn resolve_token_id(
+        &self,
+        id: &str,
+    ) -> impl std::future::Future<Output = AuthResult<UserId>> + Send;
+
     /// The `device_id` a live token was issued to, or `None` for an unknown or
     /// expired token. Lets a request that cannot carry a device id itself (a
     /// browser WebSocket handshake) still be attributed to its device.

@@ -1180,6 +1180,20 @@ impl TokenStore for AnyStore {
         }
     }
 
+    fn token_id(&self, token: &str) -> String {
+        match self {
+            AnyStore::Sqlite(s) => s.token_id(token),
+            AnyStore::Postgres(p) => p.token_id(token),
+        }
+    }
+
+    async fn resolve_token_id(&self, id: &str) -> AuthResult<UserId> {
+        match self {
+            AnyStore::Sqlite(s) => s.resolve_token_id(id).await,
+            AnyStore::Postgres(p) => p.resolve_token_id(id).await,
+        }
+    }
+
     async fn device_for_token(&self, token: &str) -> AuthResult<Option<String>> {
         match self {
             AnyStore::Sqlite(s) => s.device_for_token(token).await,
