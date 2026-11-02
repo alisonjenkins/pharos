@@ -280,24 +280,34 @@ compat-playwright-full:
     url = "sqlite://$TMP/pharos.db?mode=rwc"
     EOF
     PHAROS_CONFIG="$TMP/pharos.toml"
-    # The default (ffmpeg-lib) build probes via a separate `transcode-worker`
-    # binary that pharos spawns as a sibling of its own executable. `cargo run
-    # --bin pharos` builds ONLY pharos, so without this the worker is missing
-    # ("spawn worker: No such file or directory"), every fixture fails to probe,
-    # the library comes up empty and the crawl 404s. Build the sibling first.
-    nix develop --command cargo build -q --bin transcode-worker
-    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # Already inside the devShell (CI's step, `nix develop` by hand): skip the
+    # per-command re-entry, each of which re-evaluates the flake.
+    if [ -n "${IN_NIX_SHELL:-}" ]; then DEV=(); else DEV=(nix develop --command); fi
+    # PHAROS_BIN_DIR (CI: `nix build .#pharosTestBins`) supplies prebuilt
+    # debug-assertion binaries; otherwise build them here. Both binaries are
+    # needed: the default (ffmpeg-lib) build probes via a separate
+    # `transcode-worker` that pharos spawns as a sibling of its own executable.
+    # Without it ("spawn worker: No such file or directory") every fixture
+    # fails to probe, the library comes up empty and the crawl 404s.
+    if [ -n "${PHAROS_BIN_DIR:-}" ]; then
+      BIN="$PHAROS_BIN_DIR"
+    else
+      "${DEV[@]}" cargo build -q --bin pharos --bin transcode-worker
+      BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug"
+    fi
+    "${DEV[@]}" "$BIN/pharos" --config "$PHAROS_CONFIG" admin seed-playwright-user
     # B53 — a SECOND user for the two-user same-deviceId SyncPlay test
     # (syncplay-two-users.spec.ts): two different accounts on one browser must
     # be distinct SyncPlay members.
-    nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin create-user --name playwright2 --password playwright2-test-pw --admin
-    nix develop --command bash -c "cargo run -q --bin pharos -- --config '$PHAROS_CONFIG' serve" &
+    "${DEV[@]}" "$BIN/pharos" --config "$PHAROS_CONFIG" admin create-user --name playwright2 --password playwright2-test-pw --admin
+    "${DEV[@]}" "$BIN/pharos" --config "$PHAROS_CONFIG" serve &
     SERVER_PID=$!
     trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
-    sleep 2
-    nix develop --command bash -c 'cd compat-playwright && npx playwright test'
+    # Wait for readiness (condition-based, not a flat sleep).
+    for i in $(seq 1 60); do curl -sf http://127.0.0.1:8096/System/Info/Public >/dev/null && break || sleep 0.5; done
+    "${DEV[@]}" bash -c 'cd compat-playwright && npx playwright test'
     # V191 — the item-file auth spec needs jellyfin-web same-origin with pharos.
-    nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.same-origin.config.ts'
+    "${DEV[@]}" bash -c 'cd compat-playwright && npx playwright test --config playwright.same-origin.config.ts'
 
 # Manual SyncPlay group-watch E2E: up to 3 real jellyfin-web members through
 # the full scenario matrix (VP9) + an h264 demuxed-CMAF smoke. Heavy (3
