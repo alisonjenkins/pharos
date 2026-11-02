@@ -570,7 +570,11 @@
           # /tmp for ffmpeg + tokio getrandom; a passwd/group entry for the
           # non-root pharos user.
           extraCommands = ''
-            mkdir -p etc var/lib/pharos/db var/lib/pharos/media var/lib/pharos/cache tmp
+            mkdir -p etc var/lib/pharos/db var/lib/pharos/media var/lib/pharos/cache tmp share
+            # ADR-0033: pharos serves its own UI from `[server].ui_dir`.
+            # Copied, not linked: the server indexes regular files only.
+            cp -r ${pharosUiBundle} share/pharos-ui
+            chmod -R u+w share/pharos-ui
             printf 'root:x:0:0::/root:/sbin/nologin\npharos:x:1000:1000::/var/lib/pharos:/sbin/nologin\n' > etc/passwd
             printf 'root:x:0:\npharos:x:1000:\n' > etc/group
             chmod 1777 tmp
