@@ -1,22 +1,25 @@
-//! The gate on client diagnostics: whether this browser has opted in to
+//! The gate on client diagnostics: whether this user has opted in to
 //! sending them, and the bounded hold for events raised before the session
 //! opens. Platform-neutral so the gate runs under host tests; the browser
-//! platform reads the choice from localStorage and does the submit.
+//! platform keeps the choice in the server's `Prefs` and does the submit.
 
 // Only the browser platform submits; the host build compiles this for tests.
 #![allow(dead_code)]
 
 use pharos_client::api::ClientEvent;
 
-/// The `localStorage` key holding this browser's diagnostics opt-in.
-pub const OPT_IN_KEY: &str = "pharos.diagnostics.opt_in";
+/// The `Prefs` key holding this user's diagnostics opt-in.
+pub const OPT_IN_PREF: &str = "diagnostics.opt_in";
+/// The `localStorage` key older builds kept the opt-in under. It is removed
+/// and never read: a stored `true` must not opt the user in on the server.
+pub const LEGACY_OPT_IN_KEY: &str = "pharos.diagnostics.opt_in";
 /// Events raised before the session opens; any past this are dropped.
 pub const MAX_PENDING: usize = 32;
 
-/// The stored opt-in. Only `"true"` opts in; absent, `"false"` and anything
+/// The stored opt-in. Only `true` opts in; absent, `false` and anything
 /// else leave diagnostics off.
-pub fn opt_in_from(raw: Option<&str>) -> bool {
-    raw == Some("true")
+pub fn opt_in_from(raw: Option<&[u8]>) -> bool {
+    raw == Some(b"true".as_slice())
 }
 
 /// Holds events raised before the session opens and decides, per call,
@@ -88,11 +91,12 @@ mod tests {
 
     #[test]
     fn opt_in_reads_only_the_literal_true() {
-        assert!(!opt_in_from(None));
-        assert!(!opt_in_from(Some("false")));
-        assert!(!opt_in_from(Some("garbage")));
-        assert!(!opt_in_from(Some("")));
-        assert!(opt_in_from(Some("true")));
+        assert!(!opt_in_from(None), "absent must be off");
+        assert!(!opt_in_from(Some(b"false")));
+        assert!(!opt_in_from(Some(b"garbage")));
+        assert!(!opt_in_from(Some(b"")));
+        assert!(!opt_in_from(Some(b"True")));
+        assert!(opt_in_from(Some(b"true")));
     }
 
     #[test]

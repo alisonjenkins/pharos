@@ -1464,13 +1464,21 @@ fn find_view_shows_a_failed_search_as_an_alert() {
 // ---- Appearance: diagnostics opt-in ------------------------------
 
 fn appearance_page() -> Element {
+    appearance_page_with(false)
+}
+
+fn appearance_page_on() -> Element {
+    appearance_page_with(true)
+}
+
+fn appearance_page_with(diagnostics: bool) -> Element {
     rsx! {
         AppearanceView {
             themes: Vec::new(),
             auto: false,
             editor: None,
             notice: None,
-            diagnostics: false,
+            diagnostics,
             on_diagnostics: |_| {},
             on_pick: |_| {},
             on_auto: |_| {},
@@ -1507,4 +1515,21 @@ fn appearance_diagnostics_toggle_is_labelled_and_unchecked_by_default() {
         !tag.contains("checked"),
         "toggle must be unchecked by default: {tag}"
     );
+}
+
+#[test]
+fn appearance_diagnostics_toggle_shows_the_server_side_choice() {
+    let off = render_root(appearance_page);
+    let on = render_root(appearance_page_on);
+    assert!(
+        off.contains("saved to your account"),
+        "the choice is per account, not per browser: {off}"
+    );
+    let checked = |html: &str| {
+        let id_at = html.find(r#"id="diagnostics-opt-in""#).unwrap();
+        let tag_start = html[..id_at].rfind("<input").unwrap_or(0);
+        html[tag_start..id_at + html[id_at..].find('>').unwrap_or(0)].contains("checked")
+    };
+    assert!(!checked(&off), "{off}");
+    assert!(checked(&on), "an opted-in user sees the box checked: {on}");
 }

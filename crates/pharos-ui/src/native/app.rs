@@ -691,6 +691,7 @@ fn NativeApp(route: Route) -> Element {
                 }
                 if api.peek().is_some() {
                     api.set(None);
+                    platform::forget_opt_in();
                 }
             }
         }
@@ -880,7 +881,17 @@ fn AppearanceScreen() -> Element {
     let themes = use_context::<Themes>();
     let mut editing = use_signal(|| None::<Editing>);
     let notice = use_signal(|| None::<Notice>);
+    let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
+    // The box shows the server's choice, not whatever was cached at sign-in.
+    use_future(move || async move {
+        let api = ctx.api.peek().clone();
+        if let Some(api) = api {
+            if let Ok(on) = platform::load_opted_in(&api).await {
+                diagnostics.set(on);
+            }
+        }
+    });
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -909,13 +920,22 @@ fn AppearanceScreen() -> Element {
             editor,
             notice: notice_now,
             diagnostics: diagnostics_on,
-            on_diagnostics: move |on: bool| match platform::set_opted_in(on) {
-                Ok(()) => diagnostics.set(on),
-                Err(e) => notify(
-                    notice,
-                    format!("Could not save the diagnostics choice: {e}"),
-                    true,
-                ),
+            on_diagnostics: move |on: bool| {
+                let api = ctx.api.peek().clone();
+                spawn(async move {
+                    let saved = match api {
+                        Some(api) => platform::set_opted_in(&api, on).await,
+                        None => Err("not signed in".to_owned()),
+                    };
+                    match saved {
+                        Ok(()) => diagnostics.set(on),
+                        Err(e) => notify(
+                            notice,
+                            format!("Could not save the diagnostics choice: {e}"),
+                            true,
+                        ),
+                    }
+                });
             },
             on_pick: move |name: String| {
                 editing.set(None);
@@ -1353,6 +1373,11 @@ mod tests {
             applied: use_signal(|| theme::DEFAULT.to_owned()),
         };
         use_context_provider(|| themes);
+        let ctx = Ctx {
+            api: use_signal(|| None::<NativeApi>),
+            machine: use_signal(Machine::new),
+        };
+        use_context_provider(|| ctx);
         rsx! { AppearanceScreen {} }
     }
 

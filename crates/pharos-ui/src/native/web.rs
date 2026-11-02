@@ -506,35 +506,86 @@ pub fn warn(message: &str) {
 struct Telemetry {
     sink: Sink<NativeApi>,
     failure_logged: bool,
+    /// The signed-in user's opt-in as last read from or written to `Prefs`.
+    /// Off until read, and again after sign-out.
+    opted_in: bool,
 }
 
 thread_local! {
     static TELEMETRY: RefCell<Telemetry> = RefCell::new(Telemetry::default());
 }
 
-/// Whether this browser has opted in to sending diagnostics. Unreadable
-/// storage counts as opted out.
+/// Whether the signed-in user has opted in to sending diagnostics, as
+/// last read from the server. Off before sign-in and until the read lands.
 pub fn opted_in() -> bool {
-    diagnostics::opt_in_from(
-        stored_theme(diagnostics::OPT_IN_KEY)
-            .ok()
-            .flatten()
-            .as_deref(),
-    )
+    TELEMETRY.with(|t| t.borrow().opted_in)
 }
 
-/// Stores this browser's diagnostics opt-in.
-pub fn set_opted_in(on: bool) -> Result<(), String> {
-    store_theme(diagnostics::OPT_IN_KEY, if on { "true" } else { "false" })
+fn remember_opt_in(on: bool) {
+    TELEMETRY.with(|t| t.borrow_mut().opted_in = on);
 }
 
-/// Sends the session's client events from now on, and the held ones.
-pub fn install_telemetry(api: &NativeApi) {
-    let opted = opted_in();
-    let held = TELEMETRY.with(|t| t.borrow_mut().sink.install(api.clone(), opted));
-    if !held.is_empty() {
-        send(api.clone(), held);
+/// Forgets the opt-in, so nothing is sent after sign-out until the next
+/// user's choice is read.
+pub fn forget_opt_in() {
+    remember_opt_in(false);
+}
+
+fn prefs_call(action: &str) -> CallInfo {
+    CallInfo {
+        ui_route: "telemetry".into(),
+        ui_action: action.into(),
+        ..Default::default()
     }
+}
+
+/// Reads the user's opt-in from `Prefs` and remembers it.
+pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
+    let raw = api
+        .pref(&prefs_call("opt_in_read"), diagnostics::OPT_IN_PREF)
+        .await
+        .map_err(|e| e.to_string())?;
+    let on = diagnostics::opt_in_from(raw.as_deref());
+    remember_opt_in(on);
+    Ok(on)
+}
+
+/// Writes the user's opt-in to `Prefs`; remembered only once the server
+/// has stored it.
+pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
+    let value: &[u8] = if on { b"true" } else { b"false" };
+    api.set_pref(&prefs_call("opt_in_write"), diagnostics::OPT_IN_PREF, value)
+        .await
+        .map_err(|e| e.to_string())?;
+    remember_opt_in(on);
+    Ok(())
+}
+
+/// Removes the `localStorage` opt-in older builds wrote. Its value is not
+/// read: the choice now lives on the server, and a stored `true` is not a
+/// consent the user gave there.
+fn remove_legacy_opt_in() {
+    let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+    if let Some(storage) = storage {
+        let _ = storage.remove_item(diagnostics::LEGACY_OPT_IN_KEY);
+    }
+}
+
+/// Reads the user's opt-in, then sends the session's client events from
+/// now on, and the held ones. An unreadable opt-in counts as off.
+pub fn install_telemetry(api: &NativeApi) {
+    remove_legacy_opt_in();
+    let api = api.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let opted = load_opted_in(&api).await.unwrap_or_else(|e| {
+            warn(&format!("pharos: diagnostics opt-in unreadable: {e}"));
+            false
+        });
+        let held = TELEMETRY.with(|t| t.borrow_mut().sink.install(api.clone(), opted));
+        if !held.is_empty() {
+            send(api, held);
+        }
+    });
 }
 
 /// Submits one client event without waiting for it, if opted in. Opted out,
@@ -553,12 +604,7 @@ fn send(api: NativeApi, events: Vec<ClientEvent>) {
         if !opted_in() {
             return;
         }
-        let call = pharos_client::CallInfo {
-            ui_route: "telemetry".into(),
-            ui_action: "submit".into(),
-            ..Default::default()
-        };
-        if let Err(e) = api.submit_events(&call, &events).await {
+        if let Err(e) = api.submit_events(&prefs_call("submit"), &events).await {
             // Logged once: a dead socket fails every later batch the same way.
             let first =
                 TELEMETRY.with(|t| !std::mem::replace(&mut t.borrow_mut().failure_logged, true));
