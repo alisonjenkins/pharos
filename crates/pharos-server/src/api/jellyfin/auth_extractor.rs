@@ -11,7 +11,7 @@ use crate::services::auth::TokenRefusal;
 use crate::state::AppState;
 use actix_web::{
     dev::Payload, error::ErrorInternalServerError, error::ErrorUnauthorized, web, FromRequest,
-    HttpRequest,
+    HttpMessage, HttpRequest,
 };
 use pharos_core::User;
 use std::{future::Future, pin::Pin};
@@ -25,7 +25,25 @@ impl FromRequest for AuthUser {
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_token(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
-        Box::pin(async move { authenticate(state, token).await.map(AuthUser) })
+        let req = req.clone();
+        Box::pin(async move {
+            let user = authenticate(state, token.clone()).await?;
+            note_header_credential(&req, token);
+            Ok(AuthUser(user))
+        })
+    }
+}
+
+/// The token a request authenticated with by header or `api_key`, left in
+/// the request extensions once the store accepted it. The
+/// [`CookieBackfill`](crate::middleware::CookieBackfill) middleware reads it
+/// to give a browser that signed in before the cookie existed its
+/// `JellyfinAuth`. It has no `Debug` impl, so it cannot reach a log line.
+pub(crate) struct HeaderCredential(pub(crate) String);
+
+pub(crate) fn note_header_credential(req: &HttpRequest, token: Option<String>) {
+    if let Some(token) = token {
+        req.extensions_mut().insert(HeaderCredential(token));
     }
 }
 
@@ -84,8 +102,10 @@ impl FromRequest for AuthSession {
         let token = extract_token(req);
         let device_id = device_id_from_request(req);
         let state = req.app_data::<web::Data<AppState>>().cloned();
+        let req = req.clone();
         Box::pin(async move {
-            let user = authenticate(state, token).await?;
+            let user = authenticate(state, token.clone()).await?;
+            note_header_credential(&req, token);
             Ok(AuthSession { user, device_id })
         })
     }
@@ -217,8 +237,17 @@ impl FromRequest for MediaUser {
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_media_token(req);
+        // A cookie-borne token is not a credential to echo back.
+        let header_borne = extract_token(req).is_some();
         let state = req.app_data::<web::Data<AppState>>().cloned();
-        Box::pin(async move { authenticate(state, token).await.map(MediaUser) })
+        let req = req.clone();
+        Box::pin(async move {
+            let user = authenticate(state, token.clone()).await?;
+            if header_borne {
+                note_header_credential(&req, token);
+            }
+            Ok(MediaUser(user))
+        })
     }
 }
 
@@ -228,8 +257,9 @@ impl FromRequest for MediaUser {
 const AUTH_COOKIE_MAX_AGE: actix_web::cookie::time::Duration =
     actix_web::cookie::time::Duration::days(400);
 
-/// [`AUTH_COOKIE`] carrying `token`, set at sign-in and when a media URL
-/// authenticated with `?api_key=` (P24). `Strict`, so no other site's page
+/// [`AUTH_COOKIE`] carrying `token`, set at sign-in and, by
+/// [`CookieBackfill`](crate::middleware::CookieBackfill), when a header or
+/// `api_key` request arrives without it. `Strict`, so no other site's page
 /// sends it; `Secure` when the request arrived over https.
 pub fn auth_cookie(req: &HttpRequest, token: &str) -> actix_web::cookie::Cookie<'static> {
     auth_cookie_with(req, token.to_owned(), AUTH_COOKIE_MAX_AGE)
