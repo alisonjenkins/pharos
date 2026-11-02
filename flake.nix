@@ -648,6 +648,14 @@
             runHook preInstall
             mkdir -p $out
             cp -r target/dx/pharos-ui-web/release/web/public/. $out/
+            # dx logs a failed wasm-opt and carries on; DWARF left in the wasm
+            # is the sign it never ran (V206).
+            for wasm in $out/assets/*.wasm; do
+              if grep -q --binary-files=binary '\.debug_info' "$wasm"; then
+                echo "pharosUiBundle: $wasm still has DWARF; wasm-opt did not run" >&2
+                exit 1
+              fi
+            done
             install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
             # hls.js, vendored and pinned (ADR-0035); the watch page loads it
             # from 'self' only where the browser lacks native HLS.
