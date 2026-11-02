@@ -2959,6 +2959,27 @@ impl UserStore for PostgresStore {
     }
 }
 
+impl PostgresStore {
+    /// The user holding the live token whose hash is `hash`. Uninstrumented:
+    /// `resolve` and `resolve_token_id` each count as one store call.
+    async fn user_for_token_hash(&self, hash: &str) -> AuthResult<UserId> {
+        // Look up by hash and reject expired tokens (expires_at NULL = never).
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT user_id FROM auth_tokens \
+             WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > $2)",
+        )
+        .bind(hash)
+        .bind(now_unix_secs())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
+        let uuid =
+            Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
+        Ok(UserId(uuid))
+    }
+}
+
 impl TokenStore for PostgresStore {
     #[tracing::instrument(skip(self), fields(user.id = %user_id, device = %device_id))]
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
@@ -2985,20 +3006,16 @@ impl TokenStore for PostgresStore {
 
     #[tracing::instrument(skip(self, token))]
     async fn resolve(&self, token: &str) -> AuthResult<UserId> {
-        // Look up by hash and reject expired tokens (expires_at NULL = never).
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT user_id FROM auth_tokens \
-             WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > $2)",
-        )
-        .bind(crate::auth_token::hash(token))
-        .bind(now_unix_secs())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
-        let (bytes,) = row.ok_or(AuthError::InvalidToken)?;
-        let uuid =
-            Uuid::from_slice(&bytes).map_err(|e| AuthError::Backend(format!("bad uuid: {e}")))?;
-        Ok(UserId(uuid))
+        self.user_for_token_hash(&self.token_id(token)).await
+    }
+
+    fn token_id(&self, token: &str) -> String {
+        crate::auth_token::hash(token)
+    }
+
+    #[tracing::instrument(skip(self, id))]
+    async fn resolve_token_id(&self, id: &str) -> AuthResult<UserId> {
+        self.user_for_token_hash(id).await
     }
 
     #[tracing::instrument(skip(self, token))]
