@@ -3,7 +3,7 @@
 //! pharos serves bytes whose type comes from the media file: embedded
 //! attachments, subtitles, images. Without `nosniff` a browser may sniff a
 //! body labelled one thing as HTML and run it on pharos's origin, where it
-//! can read the signed-in user's token (B254, V194).
+//! can read the signed-in user's token (B255, V195).
 
 use actix_web::{http::header, middleware::DefaultHeaders};
 

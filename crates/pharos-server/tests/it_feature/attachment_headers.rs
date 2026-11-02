@@ -1,4 +1,4 @@
-//! B254: an embedded attachment's type is whatever the media file says. An
+//! B255: an embedded attachment's type is whatever the media file says. An
 //! HTML or SVG attachment served inline would run on pharos's origin and can
 //! read the signed-in user's token. Only fonts are served inline; every
 //! attachment carries a script-less sandbox CSP; every response is `nosniff`.
