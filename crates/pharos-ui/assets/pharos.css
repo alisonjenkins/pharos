@@ -809,3 +809,21 @@ input:focus-visible {
     flex-basis: 7rem;
   }
 }
+
+/* Rails (012): no scrollbar; the wheel, touch, keyboard focus and the
+   controller still move them sideways. */
+
+.pharos-rail-items {
+  /* Room for a lifted poster, its shadow and focus ring, which the
+     scroller would otherwise clip; the negative margin keeps the layout. */
+  padding: 1rem 1.5rem 1.75rem;
+  margin: -1rem -1.5rem -1.75rem;
+  scroll-padding-inline: 1.5rem;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, transparent, currentColor 1.5rem, currentColor calc(100% - 1.5rem), transparent);
+  mask-image: linear-gradient(to right, transparent, currentColor 1.5rem, currentColor calc(100% - 1.5rem), transparent);
+}
+.pharos-rail-items::-webkit-scrollbar {
+  display: none;
+}

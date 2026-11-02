@@ -5,6 +5,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, Item, ItemKind, Page};
 
+use super::depth;
 use super::playback::MediaEvent;
 use super::route::Route;
 
@@ -181,6 +182,7 @@ pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
                 }
             }
             ul { class: "pharos-rail-items",
+                onwheel: move |evt| depth::rail_wheel(&evt),
                 for item in items {
                     li { key: "{item.id}", PosterTile { item: item.clone() } }
                 }

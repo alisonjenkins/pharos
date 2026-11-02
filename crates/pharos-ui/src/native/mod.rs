@@ -4,6 +4,7 @@
 pub mod app;
 pub mod appearance;
 pub mod browse;
+pub mod depth;
 pub mod diagnostics;
 pub mod find;
 pub mod listen;
