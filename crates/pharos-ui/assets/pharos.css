@@ -830,6 +830,28 @@ body {
   --px-shine: rgb(255 255 255); /* not themed: a highlight is light itself in every theme */
 }
 
+body::before {
+  /* Ambient light from above, tinted by the accent: the static fallback
+     for a theme's backdrop shader. A fixed layer, not a fixed background,
+     so scrolling never repaints it. */
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      120% 70% at 50% -10%,
+      color-mix(in srgb, var(--px-color-accent) calc(var(--px-effect-glow) * 30%), transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      150% 100% at 50% 50%,
+      transparent 55%,
+      color-mix(in srgb, var(--px-shade) calc(var(--px-effect-vignette) * 100%), transparent)
+    );
+}
+
 .pharos-poster {
   /* Lift and tilt both scale with how far the theme zooms a focused card. */
   --px-depth: calc(var(--px-motion-focus-scale) - 1);
