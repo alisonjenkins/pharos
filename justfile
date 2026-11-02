@@ -302,7 +302,9 @@ compat-playwright-full:
     "${DEV[@]}" "$BIN/pharos" --config "$PHAROS_CONFIG" admin create-user --name playwright2 --password playwright2-test-pw --admin
     "${DEV[@]}" "$BIN/pharos" --config "$PHAROS_CONFIG" serve &
     SERVER_PID=$!
-    trap 'kill $SERVER_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+    # Wait for the exit too: a back-to-back run would otherwise find this
+    # server still answering on :8096 and start its tests against it.
+    trap 'kill $SERVER_PID 2>/dev/null && wait $SERVER_PID 2>/dev/null; rm -rf "$TMP"' EXIT
     # Wait for readiness (condition-based, not a flat sleep).
     for i in $(seq 1 60); do curl -sf http://127.0.0.1:8096/System/Info/Public >/dev/null && break || sleep 0.5; done
     "${DEV[@]}" bash -c 'cd compat-playwright && npx playwright test'
