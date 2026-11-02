@@ -288,20 +288,41 @@ impl<U: UserStore> BuiltinAuth<U> {
         slots: &Arc<Semaphore>,
         wait: Duration,
     ) -> Result<User, Denial> {
-        let record = match self.users.lookup_by_name(name).await {
-            Ok(r) => r,
-            Err(AuthError::UserNotFound) => {
-                self.dummy_verify(password, slots, wait)
-                    .await
-                    .map_err(Denial::Backend)?;
-                return Err(Denial::Refused {
-                    reason: LoginFailure::UnknownUser,
-                    name_mismatch: NameMismatch::None,
-                });
-            }
-            Err(other) => return Err(Denial::Backend(other)),
+        let typed = name;
+        let name = typed.trim();
+        let mut found = self
+            .users
+            .lookup_by_name_ignore_case(name)
+            .await
+            .map_err(Denial::Backend)?;
+        // Matches arrive exact-first. Several accounts differing only by case
+        // are ambiguous unless one is exactly what was typed.
+        let ambiguous = found.len() > 1 && found.first().is_some_and(|r| r.name != name);
+        let record = if ambiguous {
+            None
+        } else {
+            found.drain(..).next()
         };
-        let name_mismatch = NameMismatch::between(name, &record.name);
+        let Some(record) = record else {
+            self.dummy_verify(password, slots, wait)
+                .await
+                .map_err(Denial::Backend)?;
+            let reason = if ambiguous {
+                tracing::warn!(
+                    reason = LoginFailure::AmbiguousName.label(),
+                    name_len = name.chars().count(),
+                    "login refused: the name matches several accounts that differ only by case"
+                );
+                LoginFailure::AmbiguousName
+            } else {
+                LoginFailure::UnknownUser
+            };
+            return Err(Denial::Refused {
+                reason,
+                name_mismatch: NameMismatch::None,
+            });
+        };
+        let name_mismatch = NameMismatch::between(typed, &record.name);
         let matched = match self
             .verify_off_worker(record.password_hash.expose(), password, slots, wait)
             .await
@@ -376,16 +397,20 @@ pub enum LoginFailure {
     Disabled,
     /// Refused by the throttle before any password check.
     Throttled,
+    /// Several accounts match the typed name ignoring case, and none matches
+    /// it exactly.
+    AmbiguousName,
     /// The attempt was dropped before a verdict (the request was cancelled).
     Unjudged,
 }
 
 impl LoginFailure {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::UnknownUser,
         Self::BadPassword,
         Self::Disabled,
         Self::Throttled,
+        Self::AmbiguousName,
         Self::Unjudged,
     ];
 
@@ -395,6 +420,7 @@ impl LoginFailure {
             Self::BadPassword => "bad_password",
             Self::Disabled => "disabled",
             Self::Throttled => "throttled",
+            Self::AmbiguousName => "ambiguous_name",
             Self::Unjudged => "unjudged",
         }
     }
@@ -892,6 +918,19 @@ mod tests {
                 .cloned()
                 .ok_or(AuthError::UserNotFound)
         }
+        async fn lookup_by_name_ignore_case(&self, name: &str) -> AuthResult<Vec<UserRecord>> {
+            let want = name.to_lowercase();
+            let mut found: Vec<UserRecord> = self
+                .by_name
+                .lock()
+                .await
+                .values()
+                .filter(|r| r.name.to_lowercase() == want)
+                .cloned()
+                .collect();
+            found.sort_by_key(|r| (r.name != name, r.name.clone()));
+            Ok(found)
+        }
         async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
             self.by_name
                 .lock()
@@ -1029,6 +1068,115 @@ mod tests {
         );
     }
 
+    /// Jellyfin matches the user name without regard to case or surrounding
+    /// whitespace; a phone keyboard capitalises and pads the name.
+    #[tokio::test]
+    async fn login_matches_the_name_ignoring_case_and_surrounding_whitespace() {
+        let auth = fresh().await;
+        seed(&auth, "ali", "hunter2").await;
+        let pw = SecretString::new("hunter2");
+        for typed in ["Ali", "ALI", " ali", "ali\t", "  Ali "] {
+            let user = auth.judge(typed, &pw).await.unwrap_or_else(|d| {
+                panic!("{typed:?} should sign in: {d:?}");
+            });
+            assert_eq!(user.name, "ali", "{typed:?}");
+        }
+        assert!(matches!(
+            auth.judge("Ali", &wrong()).await,
+            Err(Denial::Refused {
+                reason: LoginFailure::BadPassword,
+                name_mismatch: NameMismatch::Case
+            })
+        ));
+        assert!(matches!(
+            auth.judge(" ALI", &wrong()).await,
+            Err(Denial::Refused {
+                name_mismatch: NameMismatch::CaseAndWhitespace,
+                ..
+            })
+        ));
+    }
+
+    /// Two accounts that differ only by case: a name that is neither exactly
+    /// is refused rather than guessed, and the refusal still pays a verify.
+    /// An exact match still wins, so nobody who could sign in before is
+    /// locked out.
+    #[tokio::test]
+    async fn names_differing_only_by_case_are_ambiguous_unless_typed_exactly() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _m = metrics::set_default_local_recorder(&rec);
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _g = tracing::subscriber::set_default(sub);
+        let auth = fresh().await;
+        seed(&auth, "Sam", "pw-upper").await;
+        seed(&auth, "sam", "pw-lower").await;
+
+        match auth.judge("SAM", &SecretString::new("pw-upper")).await {
+            Err(Denial::Refused {
+                reason: LoginFailure::AmbiguousName,
+                ..
+            }) => {}
+            other => panic!("expected ambiguous_name, got {other:?}"),
+        }
+        assert_eq!(
+            dummy_verify_count(&rec),
+            1,
+            "ambiguous refusal burns a verify"
+        );
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let warn = log
+            .lines()
+            .find(|l| l.contains("ambiguous_name"))
+            .unwrap_or_else(|| panic!("no WARN in {log}"));
+        assert!(
+            warn.contains("WARN") && warn.contains("name_len=3"),
+            "{warn}"
+        );
+        assert!(!log.contains("SAM"), "typed name echoed: {log}");
+
+        assert_eq!(
+            auth.judge("Sam", &SecretString::new("pw-upper"))
+                .await
+                .unwrap()
+                .name,
+            "Sam"
+        );
+        assert_eq!(
+            auth.judge("sam", &SecretString::new("pw-lower"))
+                .await
+                .unwrap()
+                .name,
+            "sam"
+        );
+        // The exact match wins even when the other account's password is typed.
+        assert!(auth
+            .judge("sam", &SecretString::new("pw-upper"))
+            .await
+            .is_err());
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
     /// V177 — every refusal pays an argon2 verify through the shared slots
     /// before it answers. With no slot free each one is a busy backend fault,
     /// not an `InvalidCredentials` that came back without verifying.
@@ -1047,10 +1195,13 @@ mod tests {
             )
             .await
             .unwrap();
+        seed(&auth, "Sam", "hunter2").await;
+        seed(&auth, "sam", "hunter2").await;
         let no_slots = Arc::new(Semaphore::new(0));
         let wait = Duration::from_millis(20);
 
         for (case, name, password) in [
+            ("ambiguous name", "SAM", "hunter2"),
             ("unknown user", "nobody", "hunter2"),
             ("wrong password", "ali", "wrong"),
             ("disabled user", "off", "hunter2"),
@@ -1661,6 +1812,7 @@ mod tests {
                     "bad_password",
                     "disabled",
                     "throttled",
+                    "ambiguous_name",
                     "unjudged"
                 ]
             );

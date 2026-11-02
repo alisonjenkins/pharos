@@ -193,6 +193,15 @@ pub trait UserStore: Send + Sync {
         name: &str,
     ) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
 
+    /// Every user whose name equals `name` ignoring case, exact match first
+    /// then by name. The login lookup (Jellyfin matches names without regard
+    /// to case); an empty vec means no such user. Case folding is the
+    /// backend's: ASCII-only on sqlite, locale-aware `LOWER` on postgres.
+    fn lookup_by_name_ignore_case(
+        &self,
+        name: &str,
+    ) -> impl std::future::Future<Output = AuthResult<Vec<UserRecord>>> + Send;
+
     fn get(&self, id: UserId) -> impl std::future::Future<Output = AuthResult<UserRecord>> + Send;
 
     /// List every user. Ordered by name for stable admin-UI rendering.
