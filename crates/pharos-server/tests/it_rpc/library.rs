@@ -1152,7 +1152,7 @@ async fn native_detail_agrees_with_the_jellyfin_item_route() {
 
 /// T034: an item the policy hides answers `notFound`, exactly like an id
 /// that names nothing, so a detail call reveals nothing about what exists;
-/// a synthesised id has no detail yet.
+/// the same holds for a library view the policy hides.
 /// Disarm check: with the access check removed from
 /// `services::library::detail`, the hidden item answers its detail.
 #[actix_web::test]
@@ -1181,10 +1181,15 @@ async fn a_hidden_item_answers_like_a_missing_one() {
     let missing = wire_detail(&session, WireId::Real(987_654_321)).await;
     assert_eq!(hidden, Err("not found: item".to_owned()));
     assert_eq!(hidden, missing);
-    let synth = WireId::parse(&fx.lib_b_wire).unwrap();
+    let hidden_view = WireId::parse(&fx.lib_a_wire).unwrap();
     assert_eq!(
-        wire_detail(&session, synth).await,
+        wire_detail(&session, hidden_view).await,
         Err("not found: item".to_owned())
+    );
+    let allowed_view = WireId::parse(&fx.lib_b_wire).unwrap();
+    assert_eq!(
+        wire_detail(&session, allowed_view).await.unwrap()["Name"],
+        "Movies B"
     );
 }
 
@@ -1205,7 +1210,7 @@ async fn refused_item_calls_are_logged_and_counted() {
     let recorder = metrics_util::debugging::DebuggingRecorder::new();
     let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _metrics = metrics::set_default_local_recorder(&recorder);
-    let synth = WireId::parse(&fx.lib_a_wire).unwrap();
+    let synth = WireId::Synth(0x1234_5678);
     tokio::task::LocalSet::new()
         .run_until(async {
             let client = connect(&fx);
@@ -1223,15 +1228,15 @@ async fn refused_item_calls_are_logged_and_counted() {
             &[("call", "detail"), ("id_kind", id_kind), ("reason", reason)],
         )
     };
-    assert_eq!(series("synth", "synth_unsupported"), 1);
+    assert_eq!(series("synth", "not_found"), 1);
     assert_eq!(series("real", "not_found"), 1);
-    assert_eq!(series("real", "synth_unsupported"), 0);
+    assert_eq!(series("real", "synth_hidden"), 0);
     let text = logs.text();
     assert!(
         text.contains("INFO")
             && text.contains("native item call: refused")
             && text.contains("id_kind=\"synth\"")
-            && text.contains("reason=\"synth_unsupported\"")
+            && text.contains("reason=\"not_found\"")
             && text.contains(&format!("item.id={synth}")),
         "{text}"
     );
