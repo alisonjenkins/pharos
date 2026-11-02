@@ -259,6 +259,8 @@ pub fn PosterTile(item: Item) -> Element {
     rsx! {
         Link { to: open_route(&item), class: "pharos-poster",
             div { class: "pharos-poster-art",
+                onpointermove: move |evt| depth::tilt(&evt),
+                onpointerleave: move |evt| depth::untilt(&evt),
                 match &item.image {
                     Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
                     None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "{initial(&item.name)}" } },

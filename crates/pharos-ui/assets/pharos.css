@@ -243,10 +243,6 @@ input:focus-visible {
   color: inherit;
   text-decoration: none;
   min-width: 0;
-  transition: transform 0.1s ease;
-}
-.pharos-poster:hover {
-  transform: translateY(-2px);
 }
 .pharos-rail-items .pharos-poster {
   width: 9rem;
@@ -475,12 +471,8 @@ input:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pharos-poster,
   .pharos-button {
     transition: none;
-  }
-  .pharos-poster:hover {
-    transform: none;
   }
 }
 
@@ -826,4 +818,121 @@ input:focus-visible {
 }
 .pharos-rail-items::-webkit-scrollbar {
   display: none;
+}
+
+/* Depth (012): posters that lift and tilt.
+   Every amount comes from a theme token, so a theme with focus scale 1.0
+   and no glow (High Contrast) gets flat, still posters. Only transform and
+   opacity animate, so the compositor does the work on Quest and Frame. */
+
+body {
+  --px-shade: rgb(0 0 0); /* not themed: a shadow is the absence of light in every theme */
+  --px-shine: rgb(255 255 255); /* not themed: a highlight is light itself in every theme */
+}
+
+.pharos-poster {
+  /* Lift and tilt both scale with how far the theme zooms a focused card. */
+  --px-depth: calc(var(--px-motion-focus-scale) - 1);
+  --px-tilt-x: 0;
+  --px-tilt-y: 0;
+  perspective: 40rem;
+}
+.pharos-poster-art {
+  overflow: visible;
+  border-radius: var(--px-radius);
+  box-shadow:
+    0 1px 2px color-mix(in srgb, var(--px-shade) 40%, transparent),
+    0 4px 12px color-mix(in srgb, var(--px-shade) 25%, transparent);
+  transform: translateZ(0);
+  transition: transform var(--px-motion-duration) var(--px-motion-easing);
+}
+.pharos-poster-art img,
+.pharos-poster-placeholder {
+  border-radius: inherit;
+}
+.pharos-poster-placeholder {
+  background: linear-gradient(160deg, var(--px-color-surface-raised), var(--px-color-surface));
+}
+.pharos-progress {
+  border-bottom-left-radius: var(--px-radius);
+}
+/* The art is transformed, so it paints above in-flow siblings; positioning
+   the labels puts them back on top of its shadow. */
+.pharos-poster-name,
+.pharos-poster-sub {
+  position: relative;
+}
+
+/* The deep shadow and accent glow under a lifted poster, faded in rather
+   than animating box-shadow. */
+.pharos-poster-art::before {
+  content: "";
+  position: absolute;
+  inset: 8% 6% -2%;
+  z-index: -1;
+  border-radius: inherit;
+  box-shadow:
+    0 1.25rem 2rem color-mix(in srgb, var(--px-shade) 55%, transparent),
+    0 0 calc(2rem * var(--px-effect-glow))
+      color-mix(in srgb, var(--px-color-accent) calc(var(--px-effect-glow) * 70%), transparent);
+  opacity: 0;
+  transition: opacity var(--px-motion-duration) var(--px-motion-easing);
+}
+
+/* A sheen that follows the pointer across the art. */
+.pharos-poster-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at calc(50% + var(--px-tilt-x) * 50%) calc(50% + var(--px-tilt-y) * 50%),
+    color-mix(in srgb, var(--px-shine) calc(var(--px-depth) * 400%), transparent),
+    transparent 60%
+  );
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--px-shine) calc(var(--px-depth) * 200%), transparent);
+  opacity: 0;
+  transition: opacity var(--px-motion-duration) var(--px-motion-easing);
+}
+
+.pharos-poster:hover .pharos-poster-art,
+.pharos-poster:focus-visible .pharos-poster-art {
+  transform:
+    translateY(calc(var(--px-depth) * -10rem))
+    scale(var(--px-motion-focus-scale))
+    rotateX(calc(var(--px-tilt-y) * var(--px-depth) * -300deg))
+    rotateY(calc(var(--px-tilt-x) * var(--px-depth) * 300deg));
+}
+.pharos-poster:hover .pharos-poster-art::before,
+.pharos-poster:hover .pharos-poster-art::after,
+.pharos-poster:focus-visible .pharos-poster-art::before,
+.pharos-poster:focus-visible .pharos-poster-art::after {
+  opacity: 1;
+}
+
+/* The ring sits on the art, which is what moves; the link's own outline
+   would stay behind on the flat box. */
+.pharos-poster:focus-visible {
+  outline: none;
+}
+.pharos-poster:focus-visible .pharos-poster-art {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Focus still shows, by shadow and ring, but nothing moves. */
+  .pharos-poster:hover .pharos-poster-art,
+  .pharos-poster:focus-visible .pharos-poster-art {
+    transform: none;
+  }
+  .pharos-poster-art,
+  .pharos-poster-art::before,
+  .pharos-poster-art::after {
+    transition: none;
+  }
+  .pharos-poster-art::after {
+    display: none;
+  }
 }
