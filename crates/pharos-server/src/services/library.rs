@@ -848,3 +848,103 @@ pub async fn parent_has_visible_items(
     let (items, total) = state.stores.query(&mq).await?;
     Ok(total > 0 || !items.is_empty())
 }
+
+/// A listing of things that have no library of their own (`/Genres`,
+/// `/Studios`, `/Tags`, `/Persons`). The `kind` label of
+/// `pharos_entity_hidden_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Genre,
+    Studio,
+    Tag,
+    Person,
+}
+
+impl EntityKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            EntityKind::Genre => "genre",
+            EntityKind::Studio => "studio",
+            EntityKind::Tag => "tag",
+            EntityKind::Person => "person",
+        }
+    }
+}
+
+/// Each entity row with its item count as `user` sees it (V200). For a user
+/// whose policy hides nothing the store's count stands and every row is
+/// kept; otherwise the count is over `ids_for(wire id)` narrowed to the
+/// items they may see, and a row with none is left out. Rows left out for
+/// holding only hidden items count under `pharos_entity_hidden_total{kind}`.
+pub async fn visible_entity_rows<R, Fut>(
+    state: &AppState,
+    user: &User,
+    kind: EntityKind,
+    rows: Vec<R>,
+    row: impl Fn(&R) -> (&str, u32),
+    ids_for: impl Fn(String) -> Fut,
+) -> Result<Vec<(R, u32)>, DomainError>
+where
+    Fut: std::future::Future<Output = Result<Vec<pharos_core::MediaId>, DomainError>>,
+{
+    let Some(visible) = visible_items(state, user).await? else {
+        return Ok(rows
+            .into_iter()
+            .map(|r| {
+                let count = row(&r).1;
+                (r, count)
+            })
+            .collect());
+    };
+    let visible: std::collections::HashSet<_> = visible.iter().map(|i| i.id).collect();
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut hidden: u64 = 0;
+    for r in rows {
+        let ids = ids_for(row(&r).0.to_string()).await?;
+        let count = ids.iter().filter(|id| visible.contains(id)).count();
+        match u32::try_from(count).unwrap_or(u32::MAX) {
+            0 if ids.is_empty() => {}
+            0 => hidden += 1,
+            n => kept.push((r, n)),
+        }
+    }
+    if hidden > 0 {
+        metrics::counter!("pharos_entity_hidden_total", "kind" => kind.label()).increment(hidden);
+        tracing::debug!(user = %user.name, kind = kind.label(), hidden, "entities with no visible item left out");
+    }
+    Ok(kept)
+}
+
+/// How many of `ids` (one entity's items) `user` may see, or `None` when
+/// their policy hides nothing.
+pub async fn visible_count(
+    state: &AppState,
+    user: &User,
+    ids: &[pharos_core::MediaId],
+) -> Result<Option<u32>, DomainError> {
+    let Some(visible) = visible_items(state, user).await? else {
+        return Ok(None);
+    };
+    let ids: std::collections::HashSet<_> = ids.iter().collect();
+    let n = visible.iter().filter(|i| ids.contains(&i.id)).count();
+    Ok(Some(u32::try_from(n).unwrap_or(u32::MAX)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntityKind;
+
+    #[test]
+    fn entity_kind_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> = [
+            EntityKind::Genre,
+            EntityKind::Studio,
+            EntityKind::Tag,
+            EntityKind::Person,
+        ]
+        .map(EntityKind::label)
+        .into_iter()
+        .collect();
+        assert_eq!(labels.len(), 4);
+    }
+}

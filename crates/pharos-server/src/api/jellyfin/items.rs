@@ -6,7 +6,9 @@
 //! today — moves to SQL-side once library sizes warrant it.
 
 use crate::api::jellyfin::ci_query::CiQuery;
-use crate::services::library::{ItemQuery, KindFilter};
+use crate::services::library::{
+    visible_count, visible_entity_rows, EntityKind, ItemQuery, KindFilter,
+};
 use crate::services::playback::{self, PlaybackSwitches};
 use crate::{
     api::jellyfin::{
@@ -897,7 +899,7 @@ fn similarity_score(target: &MediaItem, candidate: &MediaItem) -> u32 {
 /// once that branch is wired (currently library/series/season only).
 async fn list_genres(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::GenreStore;
     // LIB-C4 — genres are now entity rows. Lazily backfill the join from
@@ -916,10 +918,23 @@ async fn list_genres(
         .genres_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let rows = visible_entity_rows(
+        &state,
+        &user.0,
+        EntityKind::Genre,
+        rows,
+        |gc| (&gc.genre.wire_id, gc.item_count),
+        |w| {
+            let state = state.clone();
+            async move { state.stores.item_ids_for_genre(&w).await }
+        },
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let items: Vec<SynthItemDto> = rows
         .iter()
-        .map(|gc| SynthItemDto {
-            child_count: Some(gc.item_count),
+        .map(|(gc, count)| SynthItemDto {
+            child_count: Some(*count),
             ..SynthItemDto::folder(
                 gc.genre.wire_id.clone(),
                 gc.genre.name.clone(),
@@ -1163,7 +1178,7 @@ async fn list_albums(
 /// wire-in of MetadataResult.studios.
 async fn list_studios(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::StudioStore;
     let rows = state
@@ -1171,10 +1186,23 @@ async fn list_studios(
         .studios_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let rows = visible_entity_rows(
+        &state,
+        &user.0,
+        EntityKind::Studio,
+        rows,
+        |sc| (&sc.studio.wire_id, sc.item_count),
+        |w| {
+            let state = state.clone();
+            async move { state.stores.item_ids_for_studio(&w).await }
+        },
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let items: Vec<SynthItemDto> = rows
         .iter()
-        .map(|sc| SynthItemDto {
-            child_count: Some(sc.item_count),
+        .map(|(sc, count)| SynthItemDto {
+            child_count: Some(*count),
             ..SynthItemDto::folder(
                 sc.studio.wire_id.clone(),
                 sc.studio.name.clone(),
@@ -1197,7 +1225,7 @@ async fn list_studios(
 /// endpoints.
 async fn list_tags(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::TagStore;
     let rows = state
@@ -1205,13 +1233,26 @@ async fn list_tags(
         .tags_with_counts()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let rows = visible_entity_rows(
+        &state,
+        &user.0,
+        EntityKind::Tag,
+        rows,
+        |tc| (&tc.tag.wire_id, tc.item_count),
+        |w| {
+            let state = state.clone();
+            async move { state.stores.item_ids_for_tag(&w).await }
+        },
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let items: Vec<SynthItemDto> = rows
         .iter()
         // B69 — "Tag" is NOT a kotlin BaseItemKind (crashes the strict SDK's
         // enum decode). A tag surfaces as a browsable "Folder" of its tagged
         // items — a valid BaseItemKind.
-        .map(|tc| SynthItemDto {
-            child_count: Some(tc.item_count),
+        .map(|(tc, count)| SynthItemDto {
+            child_count: Some(*count),
             ..SynthItemDto::folder(
                 tc.tag.wire_id.clone(),
                 tc.tag.name.clone(),
@@ -1377,6 +1418,29 @@ async fn list_persons(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let scoped = scoped_person_counts(&state, &user.0.policy, &q).await?;
+    // A ParentId or PersonTypes scope already counts over the user's items.
+    let rows: Vec<(pharos_core::PersonCount, u32)> = if scoped.is_some() {
+        rows.into_iter()
+            .map(|pc| {
+                let n = pc.item_count;
+                (pc, n)
+            })
+            .collect()
+    } else {
+        visible_entity_rows(
+            &state,
+            &user.0,
+            EntityKind::Person,
+            rows,
+            |pc| (&pc.person.wire_id, pc.item_count),
+            |w| {
+                let state = state.clone();
+                async move { state.stores.item_ids_for_person(&w).await }
+            },
+        )
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+    };
     let lower = |s: &Option<String>| s.as_deref().map(str::to_lowercase);
     let starts_with = lower(&q.name_starts_with);
     let or_greater = lower(&q.name_starts_with_or_greater);
@@ -1384,10 +1448,10 @@ async fn list_persons(
     let search = lower(&q.search_term);
     let mut keyed: Vec<(String, pharos_core::Person, u32)> = rows
         .into_iter()
-        .filter_map(|pc| {
+        .filter_map(|(pc, visible_count)| {
             let count = match &scoped {
                 Some(counts) => *counts.get(&pc.person.wire_id)?,
-                None => pc.item_count,
+                None => visible_count,
             };
             let name = pc.person.name.to_lowercase();
             let sort_key = pc
@@ -1424,7 +1488,7 @@ async fn list_persons(
 /// wire id. 404 when no person row carries that wire id.
 async fn get_person(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::PersonStore;
@@ -1439,12 +1503,26 @@ async fn get_person(
         .ok_or_else(|| error::ErrorNotFound("not found"))?;
     // Count how many items credit this person so the detail tile renders
     // "appears in N items" consistently with the list.
-    let count = state
+    let ids = state
         .stores
         .item_ids_for_person(&wire_id)
         .await
-        .map(|ids| ids.len() as u32)
-        .unwrap_or(0);
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let count = match visible_count(&state, &user.0, &ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+    {
+        None => u32::try_from(ids.len()).unwrap_or(u32::MAX),
+        Some(0) if ids.is_empty() => return Err(error::ErrorNotFound("not found")),
+        // A person is visible only through items the user may see (V200).
+        Some(0) => {
+            metrics::counter!("pharos_entity_hidden_total", "kind" => EntityKind::Person.label())
+                .increment(1);
+            tracing::warn!(user = %user.0.name, person = %wire_id, "refused a person with no visible item");
+            return Err(error::ErrorNotFound("not found"));
+        }
+        Some(n) => n,
+    };
     Ok(crate::api::jellyfin::wire::json(&person_dto(
         &state, person, count,
     )))
