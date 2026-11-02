@@ -161,12 +161,23 @@ pub(crate) fn counter(
         .sum()
 }
 
+/// Opts the fixture's user in to sending diagnostics, as `Prefs.set` would.
+async fn opt_in(fx: &Fixture) {
+    use pharos_core::UserPrefStore;
+    fx.state
+        .stores
+        .set_user_pref(fx.user_id, "diagnostics.opt_in", b"true")
+        .await
+        .unwrap();
+}
+
 /// A warn event is logged with its kind and route, and counted under its
 /// kind and level. Disarm check: without the `tracing` call or the counter
 /// in `log_event`, either assertion fails.
 #[actix_web::test]
 async fn a_warn_event_is_logged_with_its_kind_and_route_and_counted() {
     let fx = seed_rich().await;
+    opt_in(&fx).await;
     let logs = Captured::default();
     let _log = tracing::subscriber::set_default(subscriber(&logs));
     let recorder = DebuggingRecorder::new();
@@ -209,6 +220,7 @@ async fn a_warn_event_is_logged_with_its_kind_and_route_and_counted() {
 #[actix_web::test]
 async fn a_credential_looking_field_is_not_logged() {
     let fx = seed_rich().await;
+    opt_in(&fx).await;
     let logs = Captured::default();
     let _log = tracing::subscriber::set_default(subscriber(&logs));
     let recorder = DebuggingRecorder::new();
@@ -255,6 +267,7 @@ async fn a_credential_looking_field_is_not_logged() {
 #[actix_web::test]
 async fn a_batch_over_the_bound_is_dropped_and_counted() {
     let fx = seed_rich().await;
+    opt_in(&fx).await;
     let recorder = DebuggingRecorder::new();
     let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -298,6 +311,7 @@ async fn a_batch_over_the_bound_is_dropped_and_counted() {
 #[actix_web::test]
 async fn the_rate_limit_drops_and_counts_the_batches_beyond_the_burst() {
     let fx = seed_rich().await;
+    opt_in(&fx).await;
     let recorder = DebuggingRecorder::new();
     let snapshotter = pharos_test_metrics::snapshotter(&recorder);
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -372,4 +386,93 @@ async fn an_unauthenticated_session_cannot_submit() {
         ),
         0
     );
+}
+
+/// A user who has not opted in has the batch refused, nothing logged or
+/// counted as an event, and the events counted as dropped `not_opted_in`;
+/// the decision is logged with the user id and no event content. Disarm
+/// checks: without `count_dropped(NotOptedIn, ..)` the counter reads 0;
+/// with the `Ok(false)` arm treated as opted in, the event is logged.
+#[actix_web::test]
+async fn a_user_who_has_not_opted_in_is_dropped_and_counted() {
+    let fx = seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let refused = tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let tel = telemetry_of(&session_for(&client, &fx.user_token).await).await;
+            let event = Ev {
+                fields: vec![("reason", "private-detail")],
+                ..ev(EventKind::PlaybackError, Level::Error)
+            };
+            submit(&tel, &[event.clone(), event]).await
+        })
+        .await;
+
+    assert_eq!(
+        refused,
+        Err("diagnostics not enabled for this user".to_owned())
+    );
+    let text = logs.text();
+    assert!(!text.contains("client event"), "{text}");
+    assert!(!text.contains("private-detail"), "{text}");
+    assert!(
+        text.contains("client telemetry batch dropped")
+            && text.contains("reason=\"not_opted_in\"")
+            && text.contains(&fx.user_id.0.to_string()),
+        "{text}"
+    );
+    assert_eq!(
+        counter(
+            &snapshotter,
+            "pharos_client_events_dropped_total",
+            &[("reason", "not_opted_in")]
+        ),
+        2
+    );
+    assert_eq!(
+        counter(&snapshotter, "pharos_client_events_total", &[]),
+        0,
+        "a dropped event is not counted as received"
+    );
+}
+
+/// Opting in and out through `Prefs` changes what the same session's next
+/// batch does, at once: the cached opt-in is dropped on the write. Disarm
+/// check: without `forget_opt_in` in `Prefs.set`, the batch after opting out
+/// is still accepted.
+#[actix_web::test]
+async fn opting_in_and_out_through_prefs_takes_effect_on_the_next_batch() {
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            let tel = telemetry_of(&session).await;
+            let prefs = session.prefs_request().send().pipeline.get_prefs();
+            let seek = [ev(EventKind::Seek, Level::Info)];
+            let set = |value: &'static [u8]| {
+                let prefs = prefs.clone();
+                async move {
+                    let mut req = prefs.set_request();
+                    req.get().init_ctx();
+                    req.get().set_key("diagnostics.opt_in");
+                    req.get().set_value(value);
+                    req.send().promise.await.expect("set answers");
+                }
+            };
+            submit(&tel, &seek).await.expect_err("off by default");
+            set(b"true").await;
+            submit(&tel, &seek).await.expect("accepted once opted in");
+            set(b"false").await;
+            submit(&tel, &seek)
+                .await
+                .expect_err("refused once opted out");
+        })
+        .await;
 }

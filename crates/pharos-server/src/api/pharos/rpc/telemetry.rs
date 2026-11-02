@@ -73,9 +73,42 @@ impl server::telemetry::Handler for Telemetry {
         let events = params.get_events()?;
         let spans = params.get_spans()?;
         let mut out = results.get().init_result();
-        if let Err(denial) = self.session.current_user().await {
-            denial.write(out.init_error());
-            return Ok(());
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(out.init_error());
+                return Ok(());
+            }
+        };
+        match self.session.diagnostics_opted_in(user.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                count_dropped(DropReason::NotOptedIn, events.len());
+                tracing::debug!(
+                    user = %user.id.0,
+                    events = events.len(),
+                    reason = DropReason::NotOptedIn.label(),
+                    "client telemetry batch dropped"
+                );
+                Denial::NotPermitted {
+                    what: "diagnostics not enabled for this user",
+                }
+                .write(out.init_error());
+                return Ok(());
+            }
+            Err(e) => {
+                count_dropped(DropReason::PrefStoreUnavailable, events.len());
+                tracing::warn!(
+                    user = %user.id.0,
+                    error = %e,
+                    "client telemetry batch dropped: opt-in unreadable"
+                );
+                Denial::Unavailable {
+                    dependency: "pref store",
+                }
+                .write(out.init_error());
+                return Ok(());
+            }
         }
         let oversized = [
             ("telemetry_events", events.len(), MAX_EVENTS_PER_BATCH),
@@ -134,6 +167,8 @@ impl server::telemetry::Handler for Telemetry {
 enum DropReason {
     BatchTooLarge,
     RateLimited,
+    NotOptedIn,
+    PrefStoreUnavailable,
 }
 
 impl DropReason {
@@ -141,6 +176,8 @@ impl DropReason {
         match self {
             DropReason::BatchTooLarge => "batch_too_large",
             DropReason::RateLimited => "rate_limited",
+            DropReason::NotOptedIn => "not_opted_in",
+            DropReason::PrefStoreUnavailable => "pref_store_unavailable",
         }
     }
 }
@@ -346,7 +383,12 @@ mod tests {
         );
     }
 
-    const ALL_DROP_REASONS: [DropReason; 2] = [DropReason::BatchTooLarge, DropReason::RateLimited];
+    const ALL_DROP_REASONS: [DropReason; 4] = [
+        DropReason::BatchTooLarge,
+        DropReason::RateLimited,
+        DropReason::NotOptedIn,
+        DropReason::PrefStoreUnavailable,
+    ];
 
     #[test]
     fn credential_keys_are_recognised_whatever_their_case() {
