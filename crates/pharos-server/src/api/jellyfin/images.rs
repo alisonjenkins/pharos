@@ -455,6 +455,26 @@ async fn serve_image(
     {
         use pharos_core::PersonStore;
         if let Ok(Some(person)) = state.stores.person_by_wire_id(id_str).await {
+            // A hidden person answers as one with no photo (V200).
+            let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+            let ids = state
+                .stores
+                .item_ids_for_person(id_str)
+                .await
+                .map_err(ise)?;
+            let visible = crate::services::library::visible_entity(
+                state,
+                user,
+                crate::services::library::EntityKind::Person,
+                id_str,
+                &ids,
+            )
+            .await
+            .map_err(ise)?
+            .is_some();
+            if !visible {
+                return Ok(HttpResponse::NotFound().body(""));
+            }
             // Only real URLs: the scanner also ingests LEGACY Jellyfin
             // metadata (thumb_url = the old server's local disk path like
             // /config/data/metadata/People/…), which a browser would

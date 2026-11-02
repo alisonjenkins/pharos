@@ -915,18 +915,30 @@ where
     Ok(kept)
 }
 
-/// How many of `ids` (one entity's items) `user` may see, or `None` when
-/// their policy hides nothing.
-pub async fn visible_count(
+/// One entity asked for by id, with `ids` its items (V200): its item count
+/// as `user` sees it, or `None` when it should answer as an id that names
+/// nothing. A user whose policy hides nothing sees every item. An entity
+/// whose items are all hidden from `user` counts under
+/// `pharos_entity_hidden_total{kind}` and logs a WARN.
+pub async fn visible_entity(
     state: &AppState,
     user: &User,
+    kind: EntityKind,
+    wire_id: &str,
     ids: &[pharos_core::MediaId],
 ) -> Result<Option<u32>, DomainError> {
     let Some(visible) = visible_items(state, user).await? else {
-        return Ok(None);
+        return Ok(Some(u32::try_from(ids.len()).unwrap_or(u32::MAX)));
     };
-    let ids: std::collections::HashSet<_> = ids.iter().collect();
-    let n = visible.iter().filter(|i| ids.contains(&i.id)).count();
+    let wanted: std::collections::HashSet<_> = ids.iter().collect();
+    let n = visible.iter().filter(|i| wanted.contains(&i.id)).count();
+    if n == 0 {
+        if !ids.is_empty() {
+            metrics::counter!("pharos_entity_hidden_total", "kind" => kind.label()).increment(1);
+            tracing::warn!(user = %user.name, kind = kind.label(), wire_id, "refused an entity with no visible item");
+        }
+        return Ok(None);
+    }
     Ok(Some(u32::try_from(n).unwrap_or(u32::MAX)))
 }
 
