@@ -26,8 +26,8 @@ pub const UI_ROUTES: &[&str] = &[
     "browse", "title", "watch", "find", "together", "settings", "manage", "signin",
 ];
 
-/// A year: the longest `max-age` caches honour. Assets are content-hashed,
-/// so a changed file has a new name.
+/// A year: the longest `max-age` caches honour. Only content-hashed assets
+/// get it (see [`is_hashed_asset`]).
 const IMMUTABLE_MAX_AGE: u32 = 31_536_000;
 
 #[derive(Debug, thiserror::Error)]
@@ -202,8 +202,13 @@ async fn respond(
     path: &Path,
     outcome: Outcome,
 ) -> HttpResponse {
-    let file = match NamedFile::open(path) {
-        Ok(file) => file,
+    let owned = path.to_path_buf();
+    let file = match web::block(move || NamedFile::open(owned)).await {
+        Ok(Ok(file)) => file,
+        Ok(Err(e)) => {
+            tracing::error!(path = %path.display(), error = %e, "ui: bundle file unreadable");
+            return HttpResponse::InternalServerError().finish();
+        }
         Err(e) => {
             tracing::error!(path = %path.display(), error = %e, "ui: bundle file unreadable");
             return HttpResponse::InternalServerError().finish();
@@ -253,6 +258,13 @@ async fn redirect(req: HttpRequest) -> HttpResponse {
         .finish()
 }
 
+/// A dx-built asset, whose name carries its content hash (`-dxh<hex>`), so
+/// a changed file has a new URL. Unhashed files (`pharos.css`) revalidate.
+fn is_hashed_asset(key: &str) -> bool {
+    key.strip_prefix("assets/")
+        .is_some_and(|name| name.contains("-dxh"))
+}
+
 fn wants_html(req: &HttpRequest) -> bool {
     req.headers()
         .get(header::ACCEPT)
@@ -268,7 +280,7 @@ async fn fallback(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse
     let key = req.path().trim_start_matches('/');
     if is_read {
         if let Some(path) = bundle.files.get(key) {
-            let outcome = if key.starts_with("assets/") {
+            let outcome = if is_hashed_asset(key) {
                 Outcome::Asset
             } else {
                 Outcome::File

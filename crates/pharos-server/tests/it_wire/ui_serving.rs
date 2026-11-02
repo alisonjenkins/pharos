@@ -138,7 +138,8 @@ async fn api_routes_and_api_clients_never_get_the_spa() {
     assert_eq!(served_total(&snapshotter, "not_found"), 4);
 }
 
-/// Hashed assets cache forever; everything else revalidates. A path the
+/// Content-hashed assets cache forever; everything else, unhashed files
+/// under `assets/` included, revalidates. A path the
 /// LowercasePath middleware folded still finds its file. Disarm check: serve
 /// assets with `no-cache` and the immutable assertion fails.
 #[actix_web::test]
@@ -171,8 +172,18 @@ async fn assets_are_immutable_and_survive_lowercasing() {
     .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(cache_control(&resp), "no-cache");
+    // Unhashed, so a new release must reach the cache under the same URL.
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/assets/pharos.css")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(cache_control(&resp), "no-cache");
     assert_eq!(served_total(&snapshotter, "asset"), 1);
-    assert_eq!(served_total(&snapshotter, "file"), 1);
+    assert_eq!(served_total(&snapshotter, "file"), 2);
 }
 
 /// The old mount moves: `/ui/<rest>` answers 308 to `/<rest>`, query kept.
