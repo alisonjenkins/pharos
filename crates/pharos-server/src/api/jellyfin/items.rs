@@ -23,7 +23,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesMetadataStore, UserDataStore, UserId};
+use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
 use pharos_store_sqlx::ServerConfigStore;
 use serde::{Deserialize, Serialize};
 
@@ -2083,42 +2083,6 @@ fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Append `&AudioStreamIndex={idx}` to a transcode URL that doesn't already
-/// carry one, so the server's auto-selected audio track (the same absolute
-/// index that becomes `DefaultAudioStreamIndex`) rides the initial URL. Absent
-/// URL or absent selection → unchanged; an already-present index (the client
-/// named a track on this request) → unchanged, so it is idempotent with a
-/// manual switch. The check is a plain substring: the param name never appears
-/// elsewhere in these URLs.
-fn ensure_audio_index_param(url: Option<String>, idx: Option<u32>) -> Option<String> {
-    match (url, idx) {
-        (Some(u), Some(i)) if !u.contains("AudioStreamIndex") => {
-            Some(format!("{u}&AudioStreamIndex={i}"))
-        }
-        (other, _) => other,
-    }
-}
-
-/// Resolve the audio track to start on and NAME why, in priority order: a track
-/// the client explicitly requested, then one it played before (remembered),
-/// then the language/default-flag rule. The `&'static str` source is the
-/// decision's reason for the ODD selection log — a wrong-language start is
-/// otherwise indistinguishable between "the rule chose it" and "a remembered
-/// pick did" without reading the DB by hand.
-fn resolve_audio_pick(
-    explicit_ok: Option<u32>,
-    remembered: Option<u32>,
-    rule: Option<u32>,
-) -> (Option<u32>, &'static str) {
-    if let Some(i) = explicit_ok {
-        (Some(i), "explicit")
-    } else if let Some(i) = remembered {
-        (Some(i), "remembered")
-    } else {
-        (rule, "rule")
-    }
-}
-
 async fn playback_info(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -2564,115 +2528,17 @@ async fn playback_info(
     // Find the audio stream's actual index (or skip if there isn't one).
     // Hard-coding `1` for silent-video files made jellyfin-web's player
     // try to select a track that doesn't exist.
-    // Which tracks THIS user should start on. Until now this was "the first
-    // audio stream in the container", which is how Aliens — three Ukrainian
-    // tracks ahead of its English DTS-HD MA — played in Ukrainian every time.
-    // The preferences have been stored per user since `/Users/{id}/Configuration`
-    // existed; this is the first thing to read them.
-    let track_prefs = super::user_prefs::track_preference(&state, user.0.id).await;
-    let audio_facts = super::stream_select::audio_facts(&streams);
     // A client that names a track on THIS request has the final say, exactly as
     // for subtitles below: the pick is the user acting, not a preference.
     let explicit_audio_index: Option<u32> = query_param(req.query_string(), "AudioStreamIndex")
         .and_then(|v| v.trim().parse::<u32>().ok())
         .or(body_audio_index);
-    // An `OriginalLanguage` preference ranks by the language THIS title was
-    // made in — Japanese for anime, English for Hollywood, from one setting.
-    // Unenriched items record none and degrade to the container's own order
-    // rather than to a wrong language.
-    //
-    // An EPISODE never carries one: providers report the original language on
-    // the series record, because it is a property of the show. Measured on the
-    // live library mid-backfill — 9 of 32 refreshed movies had one, 0 of 14
-    // episodes — so resolving TV through its series is not an optimisation,
-    // it is the difference between the preference working for anime and not
-    // working at all.
-    let original_language = match item.metadata.original_language.clone() {
-        Some(l) => Some(l),
-        None if track_prefs.audio_original_language => match &item.series {
-            Some(series) => state
-                .stores
-                .series_metadata_by_keys(&[series.series_key().to_string()])
-                .await
-                .ok()
-                .and_then(|m| {
-                    m.get(series.series_key())
-                        .and_then(|s| s.original_language.clone())
-                }),
-            None => None,
-        },
-        None => None,
-    };
-    let audio_languages = track_prefs.audio_languages_for(original_language.as_deref());
-    // What this user last played THIS item with. An explicit choice they made
-    // outranks any language rule — it is the same person, saying the same
-    // thing, one session later.
-    let remembered = state
-        .stores
-        .get_user_data(user.0.id, id)
-        .await
-        .unwrap_or_default();
-    let remembered_audio = track_prefs
-        .remember_audio
-        .then_some(remembered.audio_stream_index)
-        .flatten()
-        .and_then(|i| u32::try_from(i).ok())
-        .filter(|idx| audio_facts.iter().any(|s| s.index == *idx));
-    let explicit_audio_ok =
-        explicit_audio_index.filter(|idx| audio_facts.iter().any(|s| s.index == *idx));
-    let rule_audio_index = super::stream_select::default_audio_stream_index(
-        &audio_facts,
-        &audio_languages,
-        track_prefs.prefer_default_audio_track,
-    );
-    let (default_audio_stream_index, audio_pick_source) =
-        resolve_audio_pick(explicit_audio_ok, remembered_audio, rule_audio_index);
-    // The language of the track actually chosen — Smart subtitles turn on
-    // precisely when this is NOT a language the user reads.
-    let chosen_audio_language: Option<String> = default_audio_stream_index.and_then(|idx| {
-        streams
-            .iter()
-            .find(|s| s.kind == "Audio" && s.index == idx)
-            .and_then(|s| s.language.clone())
-    });
-    // ODD: the audio pick was invisible — diagnosing a wrong-language start
-    // (Jana's Code Geass playing English, 2026-07-26) took a hand DB read.
-    // Record the decision: the resolved preference inputs, EVERY candidate with
-    // its language + default flag (the flag is what beats a language preference
-    // when prefer_default is on — the Aliens / Code Geass trap), and the chosen
-    // index/language/source. A surprising pick is now one query away from its
-    // reason. `chosen_index` uses -1 for "no audio" so the field stays numeric.
-    {
-        let chosen_is_default = default_audio_stream_index
-            .and_then(|idx| audio_facts.iter().find(|s| s.index == idx))
-            .is_some_and(|s| s.is_default);
-        let candidates = audio_facts
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}:{}{}",
-                    s.index,
-                    s.language.as_deref().unwrap_or("und"),
-                    if s.is_default { ":default" } else { "" }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        tracing::info!(
-            user.id = %user.0.id,
-            item.id = %id,
-            pick_source = audio_pick_source,
-            prefer_default_track = track_prefs.prefer_default_audio_track,
-            original_language_pref = track_prefs.audio_original_language,
-            original_language = original_language.as_deref().unwrap_or(""),
-            preferred_languages = %audio_languages.join(","),
-            candidates = %candidates,
-            chosen_index = default_audio_stream_index.map(i64::from).unwrap_or(-1),
-            chosen_language = chosen_audio_language.as_deref().unwrap_or(""),
-            chosen_is_default,
-            "playback: audio track selected"
-        );
-    }
+    let playback::AudioPick {
+        index: default_audio_stream_index,
+        language: chosen_audio_language,
+        prefs: track_prefs,
+        remembered,
+    } = playback::pick_audio(&state, &user.0, &item, &streams, explicit_audio_index).await;
 
     // The initial TranscodingUrl must carry the SERVER-selected audio track,
     // or the demuxed audio rendition falls to ffmpeg's default (the container's
@@ -2689,7 +2555,8 @@ async fn playback_info(
     // the client's own later requests (skipped once the URL already carries
     // one). Applies to every client that got a transcode URL: native players
     // use it verbatim, web re-reads it into the audio group's URL.
-    let transcoding_url = ensure_audio_index_param(transcoding_url, default_audio_stream_index);
+    let transcoding_url =
+        playback::ensure_audio_index_param(transcoding_url, default_audio_stream_index);
 
     // P12 — `DefaultSubtitleStreamIndex` resolution priority:
     //   0. What the CLIENT asked for on THIS request, if it asked at all.
@@ -7245,7 +7112,7 @@ mod remote_ip_tests {
 
 #[cfg(test)]
 mod audio_index_url_tests {
-    use super::{ensure_audio_index_param, resolve_audio_pick};
+    use crate::services::playback::{ensure_audio_index_param, resolve_audio_pick};
 
     #[test]
     fn audio_pick_priority_is_explicit_then_remembered_then_rule() {
