@@ -8,12 +8,10 @@ use pharos_api::pharos_capnp::{
     LibraryKind as WireKind,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, User, UserItemData};
+use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 
-use super::bootstrap::token_denial;
 use super::session::Session;
-use crate::services::auth::{user_for_token, TokenRefusal};
 use crate::services::library::{
     self, DetailError, ItemQuery, KindFilter, LibraryView, ListError, ListPage, QUERY_DEFAULT,
     QUERY_MAX,
@@ -27,22 +25,6 @@ impl Library {
     pub(super) fn new(session: Rc<Session>) -> Self {
         Self { session }
     }
-
-    /// The session's user as the store has them now, so a policy change or
-    /// a disabled account applies to the next call, not the next sign-in.
-    async fn current_user(&self) -> Result<User, Denial> {
-        if let Some(denial) = self.session.ended() {
-            return Err(denial);
-        }
-        user_for_token(&self.session.state.stores, &self.session.token)
-            .await
-            .map_err(|refusal| {
-                if let TokenRefusal::Unavailable(detail) = &refusal {
-                    tracing::warn!(error = %detail, "native library: token store unavailable");
-                }
-                token_denial(&refusal)
-            })
-    }
 }
 
 impl server::library::Handler for Library {
@@ -51,7 +33,7 @@ impl server::library::Handler for Library {
         _params: wire::ViewsParams,
         results: &mut wire::ViewsResults,
     ) -> Result<(), capnp::Error> {
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -93,7 +75,7 @@ impl server::library::Handler for Library {
         };
         // 0 is the field's default: the caller asked for no particular limit.
         let limit = Some(params.get_limit()).filter(|&n| n > 0);
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -129,7 +111,7 @@ impl server::library::Handler for Library {
         let kinds = kind_filter(params.get_kinds()?);
         // 0 is the field's default: the caller asked for no particular limit.
         let limit = Some(params.get_limit()).filter(|&n| n > 0);
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -180,7 +162,7 @@ impl server::library::Handler for Library {
             filters: (!filters.is_empty()).then(|| filters.join(",")),
             ..ItemQuery::default()
         };
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -208,7 +190,7 @@ impl server::library::Handler for Library {
         results: &mut wire::DetailResults,
     ) -> Result<(), capnp::Error> {
         let id = read_item_id(params.get()?.get_id()?)?;
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -290,7 +272,7 @@ impl server::library::Handler for Library {
             size(params.get_resume_limit()),
             size(params.get_next_up_limit()),
         );
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
@@ -310,7 +292,7 @@ impl server::library::Handler for Library {
     ) -> Result<(), capnp::Error> {
         // 0 is the field's default: the caller asked for no particular limit.
         let limit = Some(params.get()?.get_limit()).filter(|&n| n > 0);
-        let user = match self.current_user().await {
+        let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
                 denial.write(results.get().init_result().init_error());
