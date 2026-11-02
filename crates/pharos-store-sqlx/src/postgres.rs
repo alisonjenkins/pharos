@@ -871,6 +871,24 @@ impl MediaStore for PostgresStore {
         ))
     }
 
+    #[tracing::instrument(skip(self), fields(media.id = %id))]
+    async fn alternate_sources(
+        &self,
+        id: MediaId,
+    ) -> DomainResult<Vec<pharos_core::AlternateMediaSource>> {
+        let id_i64 = media_id_i64(id)?;
+        let row = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT alternate_sources_json FROM media_items WHERE id = $1",
+        )
+        .bind(id_i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(crate::alternate_source_json::decode(
+            row.and_then(|(json,)| json).as_deref(),
+        ))
+    }
+
     #[tracing::instrument(skip(self))]
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         let root_str = root.to_str();
