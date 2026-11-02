@@ -7,10 +7,11 @@
 
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, dto::UserItemDataDto},
+    services::{library::DetailError, user_data},
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{MediaStore, UserDataStore, UserItemData};
+use pharos_core::{UserDataStore, UserItemData};
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -55,25 +56,16 @@ pub fn register(cfg: &mut web::ServiceConfig) {
 /// routes and the modern userId-less `/UserPlayedItems|UserFavoriteItems/…`
 /// routes so the two families can never drift.
 fn op_mark_played(d: &mut UserItemData) {
-    d.played = true;
-    d.play_count = d.play_count.saturating_add(1);
-    d.last_played_position_ticks = 0;
-    d.last_played_at = now_unix();
+    user_data::apply_played(d, true);
 }
 fn op_unmark_played(d: &mut UserItemData) {
-    d.played = false;
-    // B176 — and forget where they were. Jellyfin's `MarkUnplayed` clears the
-    // resume position along with the flag, and leaving it set produces an item
-    // that says "unwatched" and then starts 40 minutes in: the flag and the
-    // position are two halves of one answer to "have I seen this", so a mutation
-    // that moves one and not the other leaves the pair contradicting itself.
-    d.last_played_position_ticks = 0;
+    user_data::apply_played(d, false);
 }
 fn op_mark_favorite(d: &mut UserItemData) {
-    d.is_favorite = true;
+    user_data::apply_favorite(d, true);
 }
 fn op_unmark_favorite(d: &mut UserItemData) {
-    d.is_favorite = false;
+    user_data::apply_favorite(d, false);
 }
 
 /// `POST /UserPlayedItems/{itemId}` — mark played for the bearer (no path
@@ -180,33 +172,15 @@ where
         // of 400ing (B36).
         return mutate_synth_folder(state, user, item_id_str, f).await;
     };
-    let user_id = user.id;
-    crate::api::jellyfin::require_item_access(state, user, item_id, "user_data").await?;
-    // Confirm the item exists before writing a row that the cascade
-    // would have to clean up later.
-    let item = state.stores.get(item_id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("item not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
-    let mut data = state
-        .stores
-        .get_user_data(user_id, item_id)
+    let (item, data) = user_data::update(state, user, item_id, f)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    f(&mut data);
-    state
-        .stores
-        .set_user_data(user_id, item_id, data)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(|e| match e {
+            DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
+            DetailError::NotFound => error::ErrorNotFound("item not found"),
+            DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
+        })?;
     let runtime = item.probe.run_time_ticks().unwrap_or(0);
     let dto = UserItemDataDto::from_domain_with_runtime(item_id, data, runtime);
-    // T40 phase 2 / B36 — fan out the FULL DTO to every connected
-    // /socket so jellyfin-web updates the watched indicator + favourite
-    // star in place without a refresh.
-    let entry =
-        serde_json::to_value(&dto).map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    state.notify_user_data_changed(&user_id.0.simple().to_string(), vec![entry]);
     Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
@@ -294,12 +268,4 @@ where
     entries.push(folder_val.clone());
     state.notify_user_data_changed(&user_id.0.simple().to_string(), entries);
     Ok(crate::api::jellyfin::wire::json(&folder_val))
-}
-
-fn now_unix() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
