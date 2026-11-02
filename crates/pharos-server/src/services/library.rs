@@ -156,7 +156,7 @@ pub async fn latest(
     let all = crate::services::access::visible_items(state, user, all, "latest")
         .await
         .map_err(LatestError::Hidden)?;
-    let scoped = crate::api::jellyfin::items::restrict_to_parent(state, &all, parent_id).await;
+    let scoped = restrict_to_parent(state, &all, parent_id).await;
     let mut typed = kinds.keep(scoped);
     // B97 — "Latest" means most-recently-ADDED first (DateCreated desc), so a
     // newly scanned film surfaces in the home "Recently Added" row. Rows
@@ -182,4 +182,254 @@ pub async fn latest(
             (item, ud)
         })
         .collect())
+}
+
+/// Drop items that don't live under the configured root / series /
+/// season mapped to `parent_id`. Unknown `parent_id` → empty list.
+/// The All-Media placeholder + `None` pass everything through.
+pub async fn restrict_to_parent(
+    state: &AppState,
+    items: &[MediaItem],
+    parent_id: Option<&str>,
+) -> Vec<MediaItem> {
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, genre_id_for, season_id_for_key, series_id_for_key,
+    };
+    use pharos_core::{
+        CollectionStore, GenreStore, LibraryStore, PersonStore, StudioStore, TagStore,
+    };
+    let Some(pid) = parent_id else {
+        return items.to_vec();
+    };
+    // B82 — accept the dashed UUID the kotlin SDK re-emits, not just the
+    // dashless form jellyfin-web echoes.
+    let canonical = crate::api::jellyfin::items::canonical_wire_id(pid);
+    let pid: &str = canonical.as_ref();
+    if pid.is_empty() || pid == "00000000000000000000000000000000" {
+        return items.to_vec();
+    }
+    // 1) Library / root match. LIB-C1 — prefer the typed `libraries` table:
+    //    resolve the ParentId by wire_id to the set of item ids assigned
+    //    that library (backfilled by path-prefix at boot, kept current by
+    //    the scanner). Fall back to the legacy path-prefix scan over
+    //    `media_roots` for libraries not yet backfilled (or test states
+    //    wired only with `with_media_roots`).
+    let matched_lib = state
+        .libraries()
+        .iter()
+        .find(|l| l.wire_id == pid)
+        .map(|l| (l.wire_id.clone(), l.root_path.clone()));
+    if let Some((wire_id, root_path)) = matched_lib {
+        if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
+            if !ids.is_empty() {
+                let want: std::collections::HashSet<u64> = ids.into_iter().collect();
+                return items
+                    .iter()
+                    .filter(|i| want.contains(&i.id))
+                    .cloned()
+                    .collect();
+            }
+        }
+        // No backfilled rows yet → fall back to the path-prefix scan
+        // against this library's root so the view still resolves.
+        let root = std::path::PathBuf::from(&root_path);
+        return items
+            .iter()
+            .filter(|i| i.path.starts_with(&root))
+            .cloned()
+            .collect();
+    }
+    if let Some(root) = state
+        .media_roots
+        .iter()
+        .find(|r| crate::api::jellyfin::items::library_id_for_root(r) == pid)
+    {
+        return items
+            .iter()
+            .filter(|i| i.path.starts_with(root))
+            .cloned()
+            .collect();
+    }
+    // 2) Series id → every episode whose folder-keyed series id matches
+    //    pid. LIB-C11: resolves via the show FOLDER (falling back to the
+    //    bare name for legacy rows), so a same-name show in another folder
+    //    isn't pulled in under the wrong series.
+    if items.iter().any(|i| {
+        i.series
+            .as_ref()
+            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
+    }) {
+        return items
+            .iter()
+            .filter(|i| {
+                i.series.as_ref().is_some_and(|s| {
+                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
+                })
+            })
+            .cloned()
+            .collect();
+    }
+    // 3) Season id → every episode in that (folder, season) pair.
+    if items.iter().any(|i| {
+        i.series.as_ref().is_some_and(|s| {
+            s.season_number.is_some_and(|n| {
+                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+            })
+        })
+    }) {
+        return items
+            .iter()
+            .filter(|i| {
+                i.series.as_ref().is_some_and(|s| {
+                    s.season_number.is_some_and(|n| {
+                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+    }
+    // 4) Artist id → every track whose artist or album_artist matches.
+    if items.iter().any(|i| {
+        i.probe
+            .artist
+            .as_deref()
+            .is_some_and(|a| artist_id_for(a) == pid)
+            || i.probe
+                .album_artist
+                .as_deref()
+                .is_some_and(|a| artist_id_for(a) == pid)
+    }) {
+        return items
+            .iter()
+            .filter(|i| {
+                i.probe
+                    .artist
+                    .as_deref()
+                    .is_some_and(|a| artist_id_for(a) == pid)
+                    || i.probe
+                        .album_artist
+                        .as_deref()
+                        .is_some_and(|a| artist_id_for(a) == pid)
+            })
+            .cloned()
+            .collect();
+    }
+    // 5) Album id → every track whose album hashes to pid.
+    if items.iter().any(|i| {
+        i.probe
+            .album
+            .as_deref()
+            .is_some_and(|a| album_id_for(a) == pid)
+    }) {
+        return items
+            .iter()
+            .filter(|i| {
+                i.probe
+                    .album
+                    .as_deref()
+                    .is_some_and(|a| album_id_for(a) == pid)
+            })
+            .cloned()
+            .collect();
+    }
+    // 6) Genre id → every item tagged with that genre. LIB-C4: resolve
+    //    via the genres.wire_id → item_genres → items indexed join when
+    //    the genre is a real row (the entity-backed exact pivot). If the
+    //    wire id matches no genre row yet (rows scanned before C4 and not
+    //    backfilled), fall back to the legacy in-memory probe.genre scan.
+    if let Ok(ids) = state.stores.item_ids_for_genre(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
+        }
+    }
+    if items.iter().any(|i| {
+        i.probe
+            .genre
+            .as_deref()
+            .map(pharos_core::split_genre_field)
+            .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
+    }) {
+        return items
+            .iter()
+            .filter(|i| {
+                i.probe
+                    .genre
+                    .as_deref()
+                    .map(pharos_core::split_genre_field)
+                    .is_some_and(|gs| gs.iter().any(|g| genre_id_for(g) == pid))
+            })
+            .cloned()
+            .collect();
+    }
+    // 7) Person id → every item crediting that person. LIB-C2: resolve
+    //    via people.wire_id → item_people → items indexed join. People
+    //    have no legacy probe column, so there is no in-memory fallback
+    //    (an unknown wire id simply yields no items → empty library).
+    if let Ok(ids) = state.stores.item_ids_for_person(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
+        }
+    }
+    // 8) Studio id → every item tagged with that studio. LIB-C3: resolve
+    //    via studios.wire_id → item_studios → items indexed join. Studios
+    //    have no legacy probe column (the old /Studios stub borrowed
+    //    album_artist but never linked it), so there is no in-memory
+    //    fallback — an unknown wire id yields no items → empty library.
+    if let Ok(ids) = state.stores.item_ids_for_studio(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
+        }
+    }
+    // 9) Collection / box set id → its members in curated sort_order.
+    //    LIB-C5: resolve via collections.wire_id → collection_items →
+    //    items, returning the members in the join's `sort_order` (NOT the
+    //    id order of `items`) so a curated box set renders in order. The
+    //    membership ids are the source of truth for both membership AND
+    //    order; we index `items` by id and emit in member order. A wire id
+    //    matching a *known but empty* collection still resolves (to an
+    //    empty list) so a freshly-created empty box set browses cleanly,
+    //    rather than falling through to the unknown-id empty Vec.
+    if let Ok(collection) = state.stores.collection_by_wire_id(pid).await {
+        if collection.is_some() {
+            let member_ids = state.stores.collection_items(pid).await.unwrap_or_default();
+            let mut by_id: std::collections::HashMap<pharos_core::MediaId, MediaItem> =
+                items.iter().map(|i| (i.id, i.clone())).collect();
+            return member_ids
+                .iter()
+                .filter_map(|id| by_id.remove(id))
+                .collect();
+        }
+    }
+    // 10) Tag id → every item carrying that tag. LIB-C6: resolve via
+    //     tags.wire_id → item_tags → items indexed join. Tags have no
+    //     legacy probe column, so there is no in-memory fallback — an
+    //     unknown wire id yields no items → empty library.
+    if let Ok(ids) = state.stores.item_ids_for_tag(pid).await {
+        if !ids.is_empty() {
+            let want: std::collections::HashSet<pharos_core::MediaId> = ids.into_iter().collect();
+            return items
+                .iter()
+                .filter(|i| want.contains(&i.id))
+                .cloned()
+                .collect();
+        }
+    }
+    // Unknown id — render an empty library.
+    Vec::new()
 }
