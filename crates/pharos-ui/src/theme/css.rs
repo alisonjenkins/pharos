@@ -94,6 +94,10 @@ mod tests {
     use super::*;
     use crate::theme::{shipped, DEFAULT};
 
+    const SHEET: &str = include_str!("../../assets/pharos.css");
+    /// Marks a declaration that is deliberately the same in every theme.
+    const NOT_THEMED: &str = "/* not themed: ";
+
     const TOKEN_NAMES: &[&str] = &[
         "--px-color-bg",
         "--px-color-surface",
@@ -237,5 +241,128 @@ mod tests {
         assert_eq!(num(0.0), "0");
         assert_eq!(num(0.83333333), "0.8333");
         assert_eq!(num(-0.00001), "0");
+    }
+
+    fn extract_root_block(sheet: &str) -> (&str, usize, usize) {
+        let start = sheet.find(":root {").expect("missing :root {");
+        let rest = sheet.get(start..).expect("valid start slice");
+        let mut offset = 0;
+        let mut end_rel = None;
+        for line in rest.split_inclusive('\n') {
+            offset += line.len();
+            if line == "}\n" {
+                end_rel = Some(offset);
+                break;
+            }
+        }
+        let end = start + end_rel.expect("missing closing }\\n for :root");
+        (
+            sheet.get(start..end).expect("valid root block slice"),
+            start,
+            end,
+        )
+    }
+
+    #[test]
+    fn the_sheet_root_is_the_default_theme() {
+        let (root_block, _, _) = extract_root_block(SHEET);
+        assert_eq!(root_block, emit(&shipped().resolve(DEFAULT).unwrap().theme));
+    }
+
+    #[test]
+    fn the_sheet_has_no_colour_literal_outside_root() {
+        let (_, root_start, root_end) = extract_root_block(SHEET);
+        let mut rest_without_root = String::with_capacity(SHEET.len());
+        rest_without_root.push_str(SHEET.get(..root_start).expect("valid prefix slice"));
+        rest_without_root.push_str(SHEET.get(root_end..).expect("valid suffix slice"));
+
+        let rest_without_root: String = rest_without_root
+            .lines()
+            .filter(|line| !line.contains(NOT_THEMED))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let mut text = String::with_capacity(rest_without_root.len());
+        let mut chars = rest_without_root.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                while let Some(inner) = chars.next() {
+                    if inner == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                text.push(c);
+            }
+        }
+
+        const BANNED_WORDS: &[&str] = &[
+            "white", "black", "red", "green", "blue", "gray", "grey", "yellow", "orange", "purple",
+            "pink",
+        ];
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if line.contains("rgb(")
+                || line.contains("rgba(")
+                || line.contains("hsl(")
+                || line.contains("hsla(")
+            {
+                panic!("offending line containing colour function: {line}");
+            }
+
+            if let Some((_prop, val)) = line.split_once(':') {
+                let mut search_from = val;
+                while let Some(hash_pos) = search_from.find('#') {
+                    let after_hash = search_from
+                        .get(hash_pos + 1..)
+                        .expect("valid after_hash slice");
+                    let hex_count = after_hash
+                        .chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .count();
+                    let next_char = after_hash.chars().nth(hex_count);
+                    let is_boundary = next_char.map_or(true, |c| !c.is_ascii_alphanumeric());
+                    if (3..=8).contains(&hex_count) && is_boundary {
+                        panic!("offending line containing hex colour: {line}");
+                    }
+                    search_from = after_hash;
+                }
+
+                for token in val.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                {
+                    if !token.is_empty() {
+                        for banned in BANNED_WORDS {
+                            if token.eq_ignore_ascii_case(banned) {
+                                panic!("offending line containing colour word '{banned}': {line}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_sheet_uses_no_pre_010_variable() {
+        const OLD_VARS: &[&str] = &[
+            "--bg)",
+            "--fg)",
+            "--muted)",
+            "--accent)",
+            "--tile-bg)",
+            "--error)",
+        ];
+        for var in OLD_VARS {
+            assert!(
+                !SHEET.contains(var),
+                "found pre-010 variable {var} in sheet"
+            );
+        }
     }
 }
