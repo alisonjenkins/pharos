@@ -51,6 +51,7 @@ pub mod contrast;
 pub mod css;
 pub mod device;
 pub mod doc;
+pub mod editor;
 pub mod format;
 pub mod resolve;
 pub mod signal;
