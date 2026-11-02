@@ -147,3 +147,24 @@ pub async fn pick_file(
 ) -> Result<Option<String>, crate::theme::ThemeError> {
     Ok(None)
 }
+
+/// No frames on the host: a render loop here waits forever.
+pub async fn animation_frame() -> f64 {
+    std::future::pending().await
+}
+
+pub fn user_activated() -> bool {
+    false
+}
+
+pub fn theme_palette() -> crate::render::Palette {
+    crate::render::Palette::default()
+}
+
+pub fn audio_tap(_media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>, String> {
+    Err(NO_BROWSER.into())
+}
+
+pub fn media_playing(_id: &str) -> bool {
+    false
+}
