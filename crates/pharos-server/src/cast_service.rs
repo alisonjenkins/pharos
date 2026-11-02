@@ -637,7 +637,7 @@ impl<F: TransportFactory> Actor<F> {
         if self
             .pending
             .get(&done.tv)
-            .is_none_or(|p| p.attempt != done.attempt)
+            .map_or(true, |p| p.attempt != done.attempt)
         {
             tracing::debug!(
                 tv = %done.tv,
