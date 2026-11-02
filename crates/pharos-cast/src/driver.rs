@@ -109,6 +109,10 @@ const TICKS_PER_MS: i64 = 10_000;
 /// Receivers echo our own command back as reports for ~0.5 s and a progress
 /// report can predate the command's effect, so the planner stays quiet this long.
 const SETTLE: Duration = Duration::from_secs(2);
+/// A `playbackstop` this close to the item's runtime is the item playing to
+/// its end, not a Stop. The receiver reports its media clock, which can stop
+/// short of the catalogue runtime (a transcode's last segment, rounding).
+const END_OF_ITEM_MARGIN_MS: i64 = 10_000;
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(250);
 /// Short enough that a TV coming back is noticed well inside the default 20 s grace.
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(4);
@@ -138,9 +142,22 @@ pub fn spawn<T: CastTransport + 'static>(
         user_pending_until: None,
         loss_since: None,
         last_cause: None,
+        finished: false,
     };
     let task = tokio::spawn(driver.run());
     CastDriverHandle { intents, task }
+}
+
+/// Whether a `playbackstop` at `position_ticks` is the end of an item that
+/// runs `run_time_ticks`. Without a runtime there is no telling, and the stop
+/// counts as one.
+fn played_to_end(position_ticks: Option<i64>, run_time_ticks: Option<i64>) -> bool {
+    match (position_ticks, run_time_ticks) {
+        (Some(at), Some(runtime)) if runtime > 0 => {
+            at.saturating_add(END_OF_ITEM_MARGIN_MS.saturating_mul(TICKS_PER_MS)) >= runtime
+        }
+        _ => false,
+    }
 }
 
 fn millis(d: Duration) -> i64 {
@@ -282,6 +299,9 @@ struct Driver<T> {
     user_pending_until: Option<Instant>,
     loss_since: Option<Instant>,
     last_cause: Option<String>,
+    /// The loaded item played to its end and the TV is idle: the next timed
+    /// intent reloads it, and the planner has nothing to correct.
+    finished: bool,
 }
 
 impl<T: CastTransport> Driver<T> {
@@ -688,6 +708,7 @@ impl<T: CastTransport> Driver<T> {
         self.last_report = None;
         self.planner = PlannerState::new();
         self.expected_paused = false;
+        self.finished = false;
     }
 
     async fn start_item(
@@ -734,9 +755,15 @@ impl<T: CastTransport> Driver<T> {
         force_seek: bool,
         at: Instant,
     ) -> Result<(), Halt> {
-        if self.loaded.is_none() {
+        let Some(item) = self.loaded.clone() else {
             tracing::debug!(tv = %self.cfg.receiver_name, position_ms, "cast intent before any Load ignored");
             return Ok(());
+        };
+        if self.finished {
+            // The TV went idle at the end of the item; a Seek or Unpause would
+            // land on nothing. The group is back in this item: load it again.
+            tracing::info!(tv = %self.cfg.receiver_name, item = %item.item_id, position_ms, playing, "cast reloading an item that had played to its end");
+            return self.load(item, position_ms, playing).await;
         }
         let threshold = i64::try_from(self.cfg.planner.threshold_ms).unwrap_or(i64::MAX);
         let off = match &self.last_report {
@@ -786,6 +813,17 @@ impl<T: CastTransport> Driver<T> {
             if self.state == ConnState::Following {
                 if self.echoes(now, |e| matches!(e, Effect::Stop)) {
                     tracing::debug!(tv = %self.cfg.receiver_name, "cast playbackstop is the echo of our own command");
+                } else if played_to_end(ps.position_ticks, report.run_time_ticks()) {
+                    // Not a Stop: the receiver reports the end of an item the
+                    // same way. The group moves on by itself (its players end
+                    // too and ask for the next item); the TV waits for it.
+                    self.finished = true;
+                    tracing::info!(
+                        tv = %self.cfg.receiver_name,
+                        item = %loaded.item_id,
+                        position_ms = ps.position_ticks.map(|t| t / TICKS_PER_MS),
+                        "cast item played to its end; waiting for the group's next item"
+                    );
                 } else {
                     self.user_acted(now, "stop", None);
                     self.emit(DriverEvent::UserStopped).await;
@@ -927,6 +965,9 @@ impl<T: CastTransport> Driver<T> {
         let Some(clock) = self.clock else {
             return Ok(());
         };
+        if self.finished {
+            return Ok(());
+        }
         if self.user_pending_until.is_some_and(|until| now < until) {
             tracing::debug!(tv = %self.cfg.receiver_name, "cast planner held while a receiver-originated change awaits the group");
             return Ok(());
@@ -1611,6 +1652,105 @@ mod tests {
         rig.fake.user_stop();
         assert_eq!(rig.next().await, DriverEvent::UserStopped);
         assert!(!rig.handle.is_finished());
+    }
+
+    #[test]
+    fn played_to_end_needs_a_runtime_and_a_position_near_it() {
+        let t = |ms: i64| Some(ms * TICKS_PER_MS);
+        assert!(played_to_end(t(3_600_000), t(3_600_000)));
+        assert!(
+            played_to_end(t(3_591_000), t(3_600_000)),
+            "within the margin"
+        );
+        assert!(!played_to_end(t(3_589_000), t(3_600_000)), "outside it");
+        assert!(!played_to_end(t(60_000), t(3_600_000)));
+        assert!(!played_to_end(t(3_600_000), None), "no runtime: a stop");
+        assert!(!played_to_end(t(0), t(0)), "a zero runtime says nothing");
+        assert!(!played_to_end(None, t(3_600_000)));
+    }
+
+    /// The stock receiver reports `playbackstop` when an item plays to its end
+    /// (MEDIA_FINISHED), exactly as it does for a Stop. Ending the cast there
+    /// dropped the TV out of the group at the end of every episode, just as
+    /// the group moved on to the next one.
+    /// Disarm check: with the runtime ignored, this reports `UserStopped`.
+    #[tokio::test(start_paused = true)]
+    async fn an_item_that_plays_to_its_end_is_not_a_stop_and_the_next_item_loads() {
+        let fake_cfg = FakeReceiverConfig {
+            runtime_ms: Some(60_000),
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        rig.load(55_000, true).await;
+        rig.until_state(ConnState::Following).await;
+
+        rig.fake.play_to_end();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(user_events(&mut rig.events), Vec::new());
+        assert!(!rig.handle.is_finished(), "the cast lives on");
+
+        rig.handle
+            .send(GroupIntent::Load {
+                item_id: "item-2".into(),
+                item_type: "Episode".into(),
+                position_ms: 0,
+                playing: true,
+            })
+            .await
+            .unwrap();
+        rig.until_state(ConnState::Following).await;
+        assert_eq!(rig.fake.state().item_id.as_deref(), Some("item-2"));
+        assert!(rig.fake.state().playing);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_well_before_the_end_is_still_the_user_stopping() {
+        let fake_cfg = FakeReceiverConfig {
+            runtime_ms: Some(3_600_000),
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        rig.load(60_000, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig.fake.user_stop();
+        assert_eq!(rig.next().await, DriverEvent::UserStopped);
+    }
+
+    /// Once the item has ended the TV is idle: a Seek or Play sent to it does
+    /// nothing. A group that seeks back into the ended item (or restarts it)
+    /// reloads it on the TV at the group's position instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_seek_after_the_item_ended_reloads_it() {
+        let fake_cfg = FakeReceiverConfig {
+            runtime_ms: Some(60_000),
+            ..Default::default()
+        };
+        let mut rig = start(fake_cfg, driver_cfg());
+        rig.load(55_000, true).await;
+        rig.until_state(ConnState::Following).await;
+        rig.fake.play_to_end();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        rig.handle
+            .send(GroupIntent::Seek {
+                position_ms: 20_000,
+                playing: false,
+                apply_at: Instant::now(),
+            })
+            .await
+            .unwrap();
+        rig.until_state(ConnState::Following).await;
+        let loads: Vec<i64> = rig
+            .fake
+            .commands()
+            .iter()
+            .filter(|c| matches!(c.body, CommandBody::PlayNow(_)))
+            .map(play_now_start_ms)
+            .collect();
+        assert_eq!(loads, vec![55_000, 20_000]);
+        let state = rig.fake.state();
+        assert_eq!(state.item_id.as_deref(), Some("item-1"));
+        assert!(state.paused, "the group was paused by the seek");
     }
 
     #[tokio::test(start_paused = true)]

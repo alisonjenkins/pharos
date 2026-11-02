@@ -339,3 +339,44 @@ async fn a_stop_on_the_tv_ends_the_cast_once_and_leaves_the_group_playing() {
         "stopping the TV does not pause the others"
     );
 }
+
+/// The stock receiver reports `playbackstop` when an episode plays to its end,
+/// the same message it sends for a Stop. The cast must outlive the end of the
+/// item, and the TV must load whatever the group plays next.
+/// Disarm check: with the driver treating every playbackstop as a Stop, the
+/// seat count drops to 0 after `play_to_end`.
+#[actix_web::test]
+async fn an_episode_that_plays_to_its_end_keeps_the_cast_for_the_next_one() {
+    let rig = rig_with_cast().await;
+    rig.receiver.configure(|c| c.runtime_ms = Some(3_600_000));
+    rig.receiver.play_to_end();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        rig.service.snapshot().await.len(),
+        1,
+        "the end of an item is not the user stopping the cast"
+    );
+
+    let (status, body) = rig
+        .post(
+            &rig.bob,
+            "/SyncPlay/SetNewQueue",
+            Some(serde_json::json!({
+                "PlayingQueue": ["item-2"],
+                "PlayingItemPosition": 0,
+                "StartPositionTicks": 0u64,
+            })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    eventually("the TV loads the group's next item", || {
+        play_nows(&rig).iter().any(|(id, _)| id == "item-2")
+    })
+    .await;
+    eventually("the TV plays it", || {
+        let s = rig.receiver.state();
+        s.playing && s.item_id.as_deref() == Some("item-2")
+    })
+    .await;
+    assert_eq!(rig.service.snapshot().await.len(), 1, "still one seat");
+}

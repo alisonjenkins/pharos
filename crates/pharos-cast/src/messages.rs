@@ -126,6 +126,21 @@ pub enum ReceiverReport {
 }
 
 impl ReceiverReport {
+    /// The item's runtime in ticks, when the report names one.
+    pub fn run_time_ticks(&self) -> Option<i64> {
+        match self {
+            ReceiverReport::PlaybackStart(r)
+            | ReceiverReport::PlaybackProgress(r)
+            | ReceiverReport::PlaybackStop(r)
+            | ReceiverReport::PlayStateChange(r) => r
+                .data
+                .now_playing_item
+                .as_ref()
+                .and_then(|i| i.run_time_ticks),
+            _ => None,
+        }
+    }
+
     pub fn play_state(&self) -> Option<&PlayState> {
         match self {
             ReceiverReport::PlaybackStart(r)
@@ -147,6 +162,25 @@ pub struct PlaybackReport {
 pub struct ReportData {
     #[serde(rename = "PlayState", default)]
     pub play_state: PlayState,
+    /// The item the receiver is playing. The stock receiver always sends it,
+    /// with the item's `RunTimeTicks`: what tells an item that played to its
+    /// end from a Stop.
+    #[serde(
+        rename = "NowPlayingItem",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub now_playing_item: Option<NowPlayingItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NowPlayingItem {
+    #[serde(
+        rename = "RunTimeTicks",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub run_time_ticks: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -347,9 +381,14 @@ mod tests {
                     play_session_id: Some("p".into()),
                     play_method: Some("DirectPlay".into()),
                 },
+                now_playing_item: Some(NowPlayingItem {
+                    run_time_ticks: Some(2),
+                }),
             },
         });
         let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["data"]["NowPlayingItem"]["RunTimeTicks"], 2);
+        assert_eq!(report.run_time_ticks(), Some(2));
         let ps = &v["data"]["PlayState"];
         for key in [
             "PositionTicks",

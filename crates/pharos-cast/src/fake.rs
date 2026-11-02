@@ -9,7 +9,8 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::messages::{
-    CommandBody, PlayState, PlaybackReport, ReceiverCommand, ReceiverReport, ReportData,
+    CommandBody, NowPlayingItem, PlayState, PlaybackReport, ReceiverCommand, ReceiverReport,
+    ReportData,
 };
 use crate::transport::{AppSession, CastError, CastTransport, TransportEvent};
 
@@ -27,6 +28,9 @@ pub struct FakeReceiverConfig {
     pub refuse_connect: bool,
     /// Gap between progress reports; `None` is the stock receiver's 1.5 s.
     pub progress_interval_ms: Option<u64>,
+    /// The loaded item's runtime, sent as `NowPlayingItem.RunTimeTicks` on
+    /// every report as the stock receiver does. `None` sends no item.
+    pub runtime_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +97,9 @@ impl Inner {
         PlaybackReport {
             data: ReportData {
                 play_state: self.play_state_at(at),
+                now_playing_item: self.config.runtime_ms.map(|ms| NowPlayingItem {
+                    run_time_ticks: Some(ms.saturating_mul(TICKS_PER_MS)),
+                }),
             },
         }
     }
@@ -285,6 +292,19 @@ impl FakeReceiverHandle {
         self.remote(|g, at| {
             let moved = g.position_at(at).saturating_add(delta_ms);
             g.rebase(at, moved);
+        });
+    }
+
+    /// Play to the end of the item: the stock receiver's `MEDIA_FINISHED`,
+    /// which reports `playbackstop` at the runtime and leaves the TV idle.
+    /// Uses `runtime_ms` from the config (set it first).
+    pub fn play_to_end(&self) {
+        self.remote(|g, at| {
+            if g.playing {
+                let end = g.config.runtime_ms.unwrap_or_else(|| g.position_at(at));
+                g.rebase(at, end.saturating_sub(g.config.drift_ms));
+                g.stop_item(at);
+            }
         });
     }
 
