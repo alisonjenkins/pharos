@@ -161,6 +161,77 @@ impl ReportClock {
     }
 }
 
+/// What a fatal hls.js error calls for (hls.js's own recovery calls).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// `startLoad()`: reload from where loading stopped.
+    StartLoad,
+    /// `recoverMediaError()`: rebuild the media buffers.
+    RecoverMedia,
+    /// Give up and show the error.
+    Fail,
+}
+
+impl Recovery {
+    /// The label the error log carries.
+    pub fn label(self) -> &'static str {
+        match self {
+            Recovery::StartLoad => "start_load",
+            Recovery::RecoverMedia => "recover_media",
+            Recovery::Fail => "fail",
+        }
+    }
+}
+
+/// Recoveries of one kind before a fatal error is shown. A fragment that
+/// loads refills the budget, so a long film survives scattered blips but a
+/// stream that keeps failing gives up within a few seconds.
+pub const MAX_RECOVERIES: u32 = 3;
+
+/// Chooses the recovery for each fatal hls.js error.
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryBudget {
+    network: u32,
+    media: u32,
+}
+
+impl RecoveryBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The recovery for a fatal error of hls.js `kind` (`ErrorTypes`) and
+    /// `details` (`ErrorDetails`).
+    pub fn on_fatal(&mut self, kind: &str, details: &str) -> Recovery {
+        let (used, recovery) = match kind {
+            // Nothing loaded yet to restart from: `startLoad` would do nothing.
+            "networkError" if details.starts_with("manifest") => return Recovery::Fail,
+            "networkError" => (&mut self.network, Recovery::StartLoad),
+            "mediaError" => (&mut self.media, Recovery::RecoverMedia),
+            _ => return Recovery::Fail,
+        };
+        if *used >= MAX_RECOVERIES {
+            return Recovery::Fail;
+        }
+        *used += 1;
+        recovery
+    }
+
+    /// The attempts used so far, for the error log.
+    pub fn attempts(&self, kind: &str) -> u32 {
+        match kind {
+            "networkError" => self.network,
+            "mediaError" => self.media,
+            _ => 0,
+        }
+    }
+
+    /// A fragment loaded: playback is moving again.
+    pub fn progressed(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Where Play starts: the stored position of a started, unfinished item.
 pub fn start_ms(position_ms: u64, played: bool) -> u64 {
     if played {
@@ -251,6 +322,64 @@ mod tests {
         let mut clock = ReportClock::new();
         assert!(clock.stop());
         assert_eq!(clock.on(1.0, MediaEvent::Ended), None);
+    }
+
+    #[test]
+    fn fatal_errors_recover_a_few_times_then_fail() {
+        let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            assert_eq!(
+                budget.on_fatal("networkError", "fragLoadError"),
+                Recovery::StartLoad
+            );
+        }
+        assert_eq!(
+            budget.on_fatal("networkError", "fragLoadError"),
+            Recovery::Fail
+        );
+        assert_eq!(budget.attempts("networkError"), MAX_RECOVERIES);
+        assert_eq!(
+            budget.on_fatal("mediaError", "bufferStalledError"),
+            Recovery::RecoverMedia,
+            "each kind has its own budget"
+        );
+    }
+
+    #[test]
+    fn a_loaded_fragment_refills_the_budget() {
+        let mut budget = RecoveryBudget::new();
+        for _ in 0..MAX_RECOVERIES {
+            budget.on_fatal("mediaError", "bufferAppendError");
+        }
+        budget.progressed();
+        assert_eq!(
+            budget.on_fatal("mediaError", "bufferAppendError"),
+            Recovery::RecoverMedia
+        );
+    }
+
+    #[test]
+    fn a_failed_manifest_and_other_errors_fail_at_once() {
+        let mut budget = RecoveryBudget::new();
+        assert_eq!(
+            budget.on_fatal("networkError", "manifestLoadError"),
+            Recovery::Fail
+        );
+        assert_eq!(
+            budget.on_fatal("keySystemError", "keySystemNoKeys"),
+            Recovery::Fail
+        );
+        assert_eq!(
+            budget.on_fatal("otherError", "internalException"),
+            Recovery::Fail
+        );
+    }
+
+    #[test]
+    fn recovery_labels_are_distinct() {
+        let labels =
+            [Recovery::StartLoad, Recovery::RecoverMedia, Recovery::Fail].map(Recovery::label);
+        assert_eq!(labels, ["start_load", "recover_media", "fail"]);
     }
 
     #[test]
