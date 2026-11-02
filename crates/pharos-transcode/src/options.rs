@@ -766,6 +766,53 @@ pub fn stereo_mono_filter(format: Video3DFormat) -> Option<&'static str> {
     }
 }
 
+/// How one eye of a packed frame is cut out, burned and put back (V234).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerEyeLayout {
+    /// `crop` filter for the first (left / top) and second (right / bottom) eye.
+    pub eye_crops: [&'static str; 2],
+    /// Half layouts squeeze each eye 2x on one axis; the subtitle must be drawn
+    /// on the unsqueezed eye or it displays stretched.
+    pub unsqueeze: Option<&'static str>,
+    /// Undoes `unsqueeze` after the burn.
+    pub squeeze: Option<&'static str>,
+    /// `hstack` or `vstack`, putting the eyes back together.
+    pub stack: &'static str,
+}
+
+/// Geometry for burning a subtitle into each eye of a packed layout.
+pub fn per_eye_layout(format: Video3DFormat) -> Option<PerEyeLayout> {
+    const SBS_CROPS: [&str; 2] = ["crop=iw/2:ih:0:0", "crop=iw/2:ih:iw/2:0"];
+    const TAB_CROPS: [&str; 2] = ["crop=iw:ih/2:0:0", "crop=iw:ih/2:0:ih/2"];
+    match format {
+        Video3DFormat::HalfSideBySide => Some(PerEyeLayout {
+            eye_crops: SBS_CROPS,
+            unsqueeze: Some("scale=iw*2:ih,setsar=1"),
+            squeeze: Some("scale=iw/2:ih"),
+            stack: "hstack",
+        }),
+        Video3DFormat::FullSideBySide => Some(PerEyeLayout {
+            eye_crops: SBS_CROPS,
+            unsqueeze: None,
+            squeeze: None,
+            stack: "hstack",
+        }),
+        Video3DFormat::HalfTopAndBottom => Some(PerEyeLayout {
+            eye_crops: TAB_CROPS,
+            unsqueeze: Some("scale=iw:ih*2,setsar=1"),
+            squeeze: Some("scale=iw:ih/2"),
+            stack: "vstack",
+        }),
+        Video3DFormat::FullTopAndBottom => Some(PerEyeLayout {
+            eye_crops: TAB_CROPS,
+            unsqueeze: None,
+            squeeze: None,
+            stack: "vstack",
+        }),
+        Video3DFormat::Mvc => None,
+    }
+}
+
 impl TranscodeOptions {
     pub fn start_position_seconds(&self) -> Option<f64> {
         if self.start_position_ticks == 0 {
@@ -779,21 +826,23 @@ impl TranscodeOptions {
         self.duration_ticks.map(|d| Ticks(d).seconds())
     }
 
-    /// Resolves the effective stereoscopic output mode.
-    ///
-    /// Returns [`StereoOutput::Mono2D`] when requested explicitly OR when burning
-    /// subtitles onto packed SBS/TAB video (B239) so the subtitle is not split
-    /// across both eyes. Otherwise preserves stereoscopic layout.
+    /// Resolves the effective stereoscopic output mode: what the caller asked
+    /// for. A subtitle burn no longer implies [`StereoOutput::Mono2D`]; on packed
+    /// 3D it is drawn into each eye ([`Self::per_eye_burn_format`], V234).
     pub fn effective_stereo_output(&self) -> StereoOutput {
-        if self.stereo_output == StereoOutput::Mono2D
-            || ((self.burn_subtitle_stream_index.is_some() || self.burn_intent)
-                && self
-                    .video_3d_format
-                    .is_some_and(|f| f.is_packed_sbs_or_tab()))
+        self.stereo_output
+    }
+
+    /// The packed layout whose eyes each get their own copy of the burned
+    /// subtitle (V234), when this segment burns a subtitle and keeps the 3D
+    /// layout. `None` for 2D output, MVC, or a segment with nothing to burn.
+    pub fn per_eye_burn_format(&self) -> Option<Video3DFormat> {
+        if self.effective_stereo_output() == StereoOutput::Preserve
+            && self.burn_subtitle_stream_index.is_some()
         {
-            StereoOutput::Mono2D
+            self.video_3d_format.filter(|f| f.is_packed_sbs_or_tab())
         } else {
-            StereoOutput::Preserve
+            None
         }
     }
 
@@ -1264,11 +1313,17 @@ mod tests {
     }
 
     #[test]
-    fn output_3d_follows_the_effective_stereo_output_not_the_requested_one() {
+    fn a_per_eye_burn_on_packed_3d_is_advertised_as_3d() {
         let mut o = cmaf_opts();
         o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
         o.stereo_output = StereoOutput::Preserve;
         o.burn_subtitle_stream_index = Some(2);
+        assert_eq!(o.output_3d(), Some(Output3D::Preserved));
+        assert_eq!(
+            o.output_video_3d_format(),
+            Some(Video3DFormat::HalfSideBySide)
+        );
+        o.stereo_output = StereoOutput::Mono2D;
         assert_eq!(o.output_3d(), Some(Output3D::FlattenedMono));
         assert_eq!(o.output_video_3d_format(), None);
     }
@@ -1299,6 +1354,34 @@ mod tests {
     }
 
     #[test]
+    fn per_eye_burn_mono2d_and_plain_renditions_have_distinct_keys() {
+        let path = std::path::Path::new("/m/3d.mkv");
+        let mut plain = cmaf_opts();
+        plain.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        plain.stereo_output = StereoOutput::Preserve;
+
+        let mut per_eye = plain.clone();
+        per_eye.burn_intent = true;
+        per_eye.burn_subtitle_stream_index = Some(2);
+
+        let mut mono_burn = per_eye.clone();
+        mono_burn.stereo_output = StereoOutput::Mono2D;
+
+        let keys = [
+            RenditionKey::new(path, &plain),
+            RenditionKey::new(path, &per_eye),
+            RenditionKey::new(path, &mono_burn),
+        ];
+        assert_ne!(keys[0], keys[1], "burned must not share a key with plain");
+        assert_ne!(keys[1], keys[2], "per-eye must not share a key with Mono2D");
+        assert_ne!(keys[0], keys[2]);
+        // One rendition across its segments: the per-segment index is neutralised.
+        let mut other_seg = per_eye.clone();
+        other_seg.burn_subtitle_stream_index = None;
+        assert_eq!(keys[1], RenditionKey::new(path, &other_seg));
+    }
+
+    #[test]
     fn effective_stereo_output_and_active_filter_burn_in() {
         let mut o = cmaf_opts();
         o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
@@ -1316,28 +1399,34 @@ mod tests {
             Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
         );
 
-        // Reset to Preserve: burn_subtitle_stream_index forces Mono2D on packed 3D (B239)
+        // A burn alone no longer implies Mono2D (V183, superseded by V234): the
+        // layout is kept and the subtitle is drawn into each eye.
         o.stereo_output = StereoOutput::Preserve;
+        assert_eq!(o.per_eye_burn_format(), None);
         o.burn_subtitle_stream_index = Some(2);
-        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
-        assert_eq!(
-            o.active_stereo_mono_filter(),
-            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
-        );
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Preserve);
+        assert_eq!(o.active_stereo_mono_filter(), None);
+        assert_eq!(o.per_eye_burn_format(), Some(Video3DFormat::HalfSideBySide));
 
-        // burn_intent also forces Mono2D
+        // burn_intent alone (a segment with no cue to burn) burns nothing.
         o.burn_subtitle_stream_index = None;
         o.burn_intent = true;
-        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
-        assert_eq!(
-            o.active_stereo_mono_filter(),
-            Some("crop=iw/2:ih:0:0,scale=iw*2:ih,setsar=1")
-        );
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Preserve);
+        assert_eq!(o.per_eye_burn_format(), None);
 
-        // MVC source is NOT packed SBS or TAB, so burn does not force Mono2D
+        // Asking for 2D still wins over a burn.
+        o.burn_subtitle_stream_index = Some(2);
+        o.stereo_output = StereoOutput::Mono2D;
+        assert_eq!(o.effective_stereo_output(), StereoOutput::Mono2D);
+        assert_eq!(o.per_eye_burn_format(), None);
+        assert!(o.active_stereo_mono_filter().is_some());
+        o.stereo_output = StereoOutput::Preserve;
+
+        // MVC source is NOT packed SBS or TAB: nothing to split per eye.
         o.video_3d_format = Some(Video3DFormat::Mvc);
         assert_eq!(o.effective_stereo_output(), StereoOutput::Preserve);
         assert_eq!(o.active_stereo_mono_filter(), None);
+        assert_eq!(o.per_eye_burn_format(), None);
     }
 
     #[test]

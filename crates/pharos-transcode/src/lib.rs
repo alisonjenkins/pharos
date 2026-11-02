@@ -41,8 +41,8 @@ pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, Wavefo
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
 pub use options::{
-    stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D, RenditionKey,
-    SourceCodec, StereoOutput, TranscodeOptions, VideoCodec,
+    per_eye_layout, stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D,
+    RenditionKey, SourceCodec, StereoOutput, TranscodeOptions, VideoCodec,
 };
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
@@ -275,7 +275,10 @@ fn ffmpeg_filter_escape(path: &str) -> String {
     escape_layer(&l2, &['\\', '\'', '[', ']', ',', ';'])
 }
 
-/// Emit the video filter arguments. Three shapes:
+/// Emit the video filter arguments. Three shapes (a burn on packed 3D that
+/// keeps its layout is a fourth, V234: the frame is split into its two eyes,
+/// each eye gets its own copy of the subtitle, and `hstack`/`vstack` rejoins
+/// them, always as a `-filter_complex` that owns the maps):
 ///
 /// - No burn — a plain `-vf` chain (or nothing when the chain is empty).
 /// - IMAGE subtitle burn (B40) — a `-filter_complex` overlaying the bitmap
@@ -319,7 +322,9 @@ fn push_video_filters(
     // graph must map it from there rather than from the source.
     muxed_audio: bool,
     mono_filter: Option<&str>,
+    per_eye: Option<pharos_core::Video3DFormat>,
 ) {
+    let layout = per_eye.and_then(per_eye_layout);
     match (burn_subtitle_stream_index, burn_is_text) {
         (Some(si), true) => {
             // Prefer the small pre-extracted `.ass` sidecar: ffmpeg's
@@ -347,6 +352,30 @@ fn push_video_filters(
                     format!("subtitles=filename={esc}:si={si}")
                 }
             };
+            if let Some(l) = layout {
+                // V234 — one copy of the subtitle per eye. The seek sandwich
+                // wraps the whole graph: both branches come off one split, so
+                // they share the same shifted clock.
+                let start = start_seconds.filter(|s| *s > 0.0);
+                let mut graph = String::from("[0:v:0]");
+                if let Some(start) = start {
+                    graph.push_str(&format!("setpts=PTS+{start:.6}/TB,"));
+                }
+                graph.push_str("split=2[e0][e1]");
+                for (i, crop) in l.eye_crops.iter().enumerate() {
+                    let mut eye = vec![(*crop).to_string()];
+                    eye.extend(l.unsqueeze.map(str::to_string));
+                    eye.push(subtitles.clone());
+                    eye.extend(l.squeeze.map(str::to_string));
+                    graph.push_str(&format!(";[e{i}]{}[o{i}]", eye.join(",")));
+                }
+                graph.push_str(&format!(";[o0][o1]{}", l.stack));
+                if let Some(start) = start {
+                    graph.push_str(&format!(",setpts=PTS-{start:.6}/TB"));
+                }
+                push_filter_complex(a, graph, vf_parts, muxed_audio, audio_source_stream_index);
+                return;
+            }
             let mut chain: Vec<String> = Vec::new();
             if let Some(mf) = mono_filter {
                 chain.push(mf.to_string());
@@ -367,6 +396,27 @@ fn push_video_filters(
         }
         (Some(si), false) => {
             let mut graph = String::new();
+            if let Some(l) = layout {
+                // V234 — the bitmap track is copied once per eye, each copy
+                // overlaid on its own (unsqueezed) eye.
+                graph.push_str(&format!("[0:v:0]split=2[e0][e1];[0:s:{si}]split=2[s0][s1]"));
+                for (i, crop) in l.eye_crops.iter().enumerate() {
+                    let mut eye = vec![(*crop).to_string()];
+                    eye.extend(l.unsqueeze.map(str::to_string));
+                    graph.push_str(&format!(
+                        ";[e{i}]{}[b{i}];[b{i}][s{i}]overlay=eof_action=pass",
+                        eye.join(",")
+                    ));
+                    if let Some(sq) = l.squeeze {
+                        graph.push(',');
+                        graph.push_str(sq);
+                    }
+                    graph.push_str(&format!("[o{i}]"));
+                }
+                graph.push_str(&format!(";[o0][o1]{}", l.stack));
+                push_filter_complex(a, graph, vf_parts, muxed_audio, audio_source_stream_index);
+                return;
+            }
             let overlay_in = if let Some(mf) = mono_filter {
                 graph.push_str(&format!("[0:v:0]{mf}[v0];[v0]"));
                 "[0:s:"
@@ -374,21 +424,7 @@ fn push_video_filters(
                 "[0:v:0][0:s:"
             };
             graph.push_str(&format!("{overlay_in}{si}]overlay=eof_action=pass"));
-            if !vf_parts.is_empty() {
-                graph.push(',');
-                graph.push_str(&vf_parts.join(","));
-            }
-            graph.push_str("[vout]");
-            a.push("-filter_complex".into());
-            a.push(graph);
-            a.push("-map".into());
-            a.push("[vout]".into());
-            a.push("-map".into());
-            a.push(match (muxed_audio, audio_source_stream_index) {
-                (true, _) => "1:a:0".into(),
-                (false, Some(i)) => format!("0:a:{i}"),
-                (false, None) => "0:a:0?".into(),
-            });
+            push_filter_complex(a, graph, vf_parts, muxed_audio, audio_source_stream_index);
         }
         (None, _) => {
             let mut chain: Vec<String> = Vec::new();
@@ -402,6 +438,33 @@ fn push_video_filters(
             }
         }
     }
+}
+
+/// Emits a burn `-filter_complex` ending in `[vout]`, with `vf_parts` (VAAPI
+/// upload etc.) chained once after the graph, plus the video and audio maps a
+/// `-filter_complex` makes mandatory.
+fn push_filter_complex(
+    a: &mut Vec<String>,
+    mut graph: String,
+    vf_parts: &[String],
+    muxed_audio: bool,
+    audio_source_stream_index: Option<u32>,
+) {
+    if !vf_parts.is_empty() {
+        graph.push(',');
+        graph.push_str(&vf_parts.join(","));
+    }
+    graph.push_str("[vout]");
+    a.push("-filter_complex".into());
+    a.push(graph);
+    a.push("-map".into());
+    a.push("[vout]".into());
+    a.push("-map".into());
+    a.push(match (muxed_audio, audio_source_stream_index) {
+        (true, _) => "1:a:0".into(),
+        (false, Some(i)) => format!("0:a:{i}"),
+        (false, None) => "0:a:0?".into(),
+    });
 }
 
 #[cfg(test)]
@@ -576,7 +639,7 @@ impl DecodeAccel {
         }
         // CPU crop / setsar in stereo_mono_filter cannot consume GPU-resident
         // cuda frames when hwaccel is active; fall back to software decode (B240).
-        if opts.active_stereo_mono_filter().is_some()
+        if (opts.active_stereo_mono_filter().is_some() || opts.per_eye_burn_format().is_some())
             && matches!(
                 device,
                 DeviceId::Hw {
@@ -970,10 +1033,12 @@ fn build_args_for_pipeline(
     // plain `-vf subtitles=` chain that keeps ffmpeg's default stream
     // selection, so it must NOT take the map-skip path below — it falls through
     // to the normal audio-map handling like any other re-encode.
+    // A per-eye TEXT burn (V234) is also a `-filter_complex`: the frame is split
+    // into two branches, so it owns the maps the same way.
     let burning_image_subs = opts.video.is_some()
         && !matches!(opts.video, Some(VideoCodec::Copy))
         && opts.burn_subtitle_stream_index.is_some()
-        && !opts.burn_subtitle_is_text;
+        && (!opts.burn_subtitle_is_text || opts.per_eye_burn_format().is_some());
     // Bound DECODER threads for a real video transcode (input-side
     // `-threads`, before `-i`). ffmpeg otherwise frame-threads the decoder
     // across every logical core PER JOB, so N concurrent segment encodes
@@ -1180,6 +1245,7 @@ fn build_args_for_pipeline(
                         opts.burn_fonts_dir.as_deref(),
                         opts.muxed_audio_source.is_some(),
                         opts.active_stereo_mono_filter(),
+                        opts.per_eye_burn_format(),
                     );
                 }
                 a.push("-c:v".into());
@@ -1217,6 +1283,7 @@ fn build_args_for_pipeline(
                     opts.burn_fonts_dir.as_deref(),
                     opts.muxed_audio_source.is_some(),
                     opts.active_stereo_mono_filter(),
+                    opts.per_eye_burn_format(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -3495,53 +3562,247 @@ mod tests {
         assert_eq!(a[meta_pos + 1], "stereo_mode=");
     }
 
+    /// Mono2D keeps the left-eye crop before the burn (the client asked for 2D).
     #[test]
-    fn subtitle_burn_on_packed_3d_forces_mono_filter_before_subtitles() {
+    fn mono2d_subtitle_burn_on_packed_3d_crops_the_left_eye_before_burning() {
         use pharos_core::Video3DFormat;
 
-        // Text subtitle burn
         let mut o = opts();
         o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
-        o.stereo_output = StereoOutput::Preserve; // Caller requested Preserve, but burn forces Mono2D
+        o.stereo_output = StereoOutput::Mono2D;
         o.burn_subtitle_stream_index = Some(2);
         o.burn_subtitle_is_text = true;
-
         let a = build_args("/m/3d.mkv", &o);
         let vf = a.iter().position(|x| x == "-vf").expect("has -vf");
         let vf_str = &a[vf + 1];
-
-        // mono_vf MUST appear before subtitles=
         let crop_idx = vf_str.find("crop=iw/2:ih:0:0").expect("has crop filter");
         let sub_idx = vf_str.find("subtitles=").expect("has subtitles filter");
         assert!(
             crop_idx < sub_idx,
             "crop must be before subtitles: {vf_str}"
         );
+        assert!(!a.iter().any(|x| x == "-filter_complex"), "{a:?}");
 
-        // Image subtitle burn
         let mut o_img = opts();
         o_img.video_3d_format = Some(Video3DFormat::HalfSideBySide);
-        o_img.stereo_output = StereoOutput::Preserve;
+        o_img.stereo_output = StereoOutput::Mono2D;
         o_img.burn_subtitle_stream_index = Some(3);
-        o_img.burn_subtitle_is_text = false;
-
         let a_img = build_args("/m/3d.mkv", &o_img);
         let fc = a_img
             .iter()
             .position(|x| x == "-filter_complex")
             .expect("has -filter_complex");
         let fc_str = &a_img[fc + 1];
-
-        // mono_vf MUST appear before overlay
-        let crop_idx = fc_str
-            .find("crop=iw/2:ih:0:0")
-            .expect("has crop in filter_complex");
-        let overlay_idx = fc_str
-            .find("overlay=")
-            .expect("has overlay in filter_complex");
         assert!(
-            crop_idx < overlay_idx,
+            fc_str.find("crop=iw/2:ih:0:0").expect("crop")
+                < fc_str.find("overlay=").expect("overlay"),
             "crop must be before overlay: {fc_str}"
         );
+        assert!(!fc_str.contains("split"), "{fc_str}");
+    }
+
+    fn per_eye_graph_of(
+        format: pharos_core::Video3DFormat,
+        text: bool,
+        start_ticks: u64,
+    ) -> (Vec<String>, String) {
+        let mut o = opts();
+        o.video_3d_format = Some(format);
+        o.stereo_output = StereoOutput::Preserve;
+        o.burn_intent = true;
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = text;
+        o.start_position_ticks = start_ticks;
+        let a = build_args("/m/3d.mkv", &o);
+        let fc = a
+            .iter()
+            .position(|x| x == "-filter_complex")
+            .unwrap_or_else(|| panic!("per-eye burn must be a -filter_complex: {a:?}"));
+        let graph = a[fc + 1].clone();
+        (a, graph)
+    }
+
+    /// Positions of `needles` in `hay`, which must all be found in this order.
+    fn assert_in_order(hay: &str, needles: &[&str]) {
+        let mut from = 0;
+        for n in needles {
+            let at = hay[from..]
+                .find(n)
+                .unwrap_or_else(|| panic!("`{n}` missing after byte {from} of {hay}"));
+            from += at + n.len();
+        }
+    }
+
+    #[test]
+    fn packed_3d_text_burn_draws_the_subtitle_into_each_eye() {
+        use pharos_core::Video3DFormat as F;
+        // (format, eye crops, unsqueeze, squeeze, stack)
+        let cases = [
+            (
+                F::HalfSideBySide,
+                ["crop=iw/2:ih:0:0", "crop=iw/2:ih:iw/2:0"],
+                Some(("scale=iw*2:ih,setsar=1", "scale=iw/2:ih")),
+                "hstack",
+            ),
+            (
+                F::FullSideBySide,
+                ["crop=iw/2:ih:0:0", "crop=iw/2:ih:iw/2:0"],
+                None,
+                "hstack",
+            ),
+            (
+                F::HalfTopAndBottom,
+                ["crop=iw:ih/2:0:0", "crop=iw:ih/2:0:ih/2"],
+                Some(("scale=iw:ih*2,setsar=1", "scale=iw:ih/2")),
+                "vstack",
+            ),
+            (
+                F::FullTopAndBottom,
+                ["crop=iw:ih/2:0:0", "crop=iw:ih/2:0:ih/2"],
+                None,
+                "vstack",
+            ),
+        ];
+        for (format, crops, scale, stack) in cases {
+            let (a, g) = per_eye_graph_of(format, true, 0);
+            assert!(!a.iter().any(|x| x == "-vf"), "{format:?}: {a:?}");
+            assert_eq!(g.matches("subtitles=").count(), 2, "{format:?}: {g}");
+            assert_in_order(&g, &["[0:v:0]split=2[e0][e1]", ";[e0]", crops[0]]);
+            assert_in_order(&g, &[";[e1]", crops[1]]);
+            for (eye, crop) in crops.iter().enumerate() {
+                let branch = g
+                    .split(';')
+                    .find(|b| b.starts_with(&format!("[e{eye}]")))
+                    .unwrap_or_else(|| panic!("no branch for eye {eye}: {g}"));
+                match scale {
+                    Some((up, down)) => assert_in_order(
+                        branch,
+                        &[crop, up, "subtitles=", down, &format!("[o{eye}]")],
+                    ),
+                    None => {
+                        assert!(!branch.contains("scale="), "{format:?}: {branch}");
+                        assert_in_order(branch, &[crop, "subtitles=", &format!("[o{eye}]")]);
+                    }
+                }
+            }
+            assert_in_order(&g, &["[o0][o1]", stack, "[vout]"]);
+            // The Mono2D left-eye crop must NOT run on the whole frame first.
+            assert!(!g.contains("[0:v:0]crop"), "{format:?}: {g}");
+            assert_eq!(g.matches("crop=").count(), 2, "{format:?}: {g}");
+            assert!(
+                a.windows(2).any(|w| w[0] == "-map" && w[1] == "[vout]"),
+                "{a:?}"
+            );
+            assert!(
+                a.windows(2).any(|w| w[0] == "-map" && w[1] == "0:a:0?"),
+                "{a:?}"
+            );
+            // 3D metadata is kept, since the output is still 3D.
+            assert!(!a.iter().any(|x| x == "stereo_mode="), "{format:?}: {a:?}");
+        }
+    }
+
+    #[test]
+    fn packed_3d_text_burn_keeps_the_seek_sandwich_around_the_whole_graph() {
+        let (_, g) = per_eye_graph_of(
+            pharos_core::Video3DFormat::FullSideBySide,
+            true,
+            300_000_000,
+        );
+        // The graph's clock is shifted ONCE: before the split, undone after the stack.
+        assert_in_order(
+            &g,
+            &[
+                "[0:v:0]setpts=PTS+",
+                ",split=2",
+                "[o0][o1]hstack,setpts=PTS-",
+                "[vout]",
+            ],
+        );
+        assert_eq!(g.matches("setpts=").count(), 2, "{g}");
+    }
+
+    #[test]
+    fn packed_3d_image_burn_overlays_a_copy_of_the_bitmap_on_each_eye() {
+        use pharos_core::Video3DFormat as F;
+        let cases = [
+            (F::HalfSideBySide, true, "hstack"),
+            (F::FullSideBySide, false, "hstack"),
+            (F::HalfTopAndBottom, true, "vstack"),
+            (F::FullTopAndBottom, false, "vstack"),
+        ];
+        for (format, squeezed, stack) in cases {
+            let (a, g) = per_eye_graph_of(format, false, 0);
+            assert_in_order(&g, &["[0:v:0]split=2[e0][e1];[0:s:2]split=2[s0][s1]"]);
+            assert_eq!(
+                g.matches("overlay=eof_action=pass").count(),
+                2,
+                "{format:?}: {g}"
+            );
+            assert_eq!(
+                g.matches("scale=").count(),
+                if squeezed { 4 } else { 0 },
+                "{format:?}: {g}"
+            );
+            assert_in_order(
+                &g,
+                &[
+                    ";[e0]",
+                    "crop=",
+                    "[b0];[b0][s0]overlay=",
+                    "[o0]",
+                    ";[e1]",
+                    "crop=",
+                    "[b1];[b1][s1]overlay=",
+                    "[o1]",
+                    ";[o0][o1]",
+                    stack,
+                    "[vout]",
+                ],
+            );
+            assert!(!g.contains("[0:v:0]crop"), "{format:?}: {g}");
+            assert!(
+                a.windows(2).any(|w| w[0] == "-map" && w[1] == "[vout]"),
+                "{a:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hardware_upload_tail_applies_once_after_the_stack() {
+        let mut o = opts();
+        o.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        o.burn_intent = true;
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        let a = build_args_for_device(
+            "/m/3d.mkv",
+            &o,
+            crate::protocol::DeviceId::Hw {
+                accel: HwAccel::Vaapi,
+                index: 0,
+            },
+            "pipe:1",
+            crate::DecodeOffload::Allowed,
+            None,
+        );
+        let fc = a
+            .iter()
+            .position(|x| x == "-filter_complex")
+            .expect("graph");
+        let g = &a[fc + 1];
+        assert_eq!(g.matches("hwupload").count(), 1, "{g}");
+        assert_in_order(g, &["[o0][o1]hstack", "format=nv12,hwupload", "[vout]"]);
+    }
+
+    #[test]
+    fn mvc_burn_is_not_split_per_eye() {
+        let mut o = opts();
+        o.video_3d_format = Some(pharos_core::Video3DFormat::Mvc);
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        let a = build_args("/m/3d.mkv", &o);
+        assert!(a.iter().any(|x| x == "-vf"), "{a:?}");
+        assert!(!a.iter().any(|x| x == "-filter_complex"), "{a:?}");
     }
 }
