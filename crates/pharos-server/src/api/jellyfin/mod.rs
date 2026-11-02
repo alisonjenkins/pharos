@@ -117,3 +117,43 @@ pub(crate) async fn require_bearer(
     auth_extractor::note_header_credential(req);
     Ok(user)
 }
+
+/// The bearer of an image request, or `None` for an anonymous one. Image
+/// GETs stay anonymous like Jellyfin's: jellyfin-web's `<img>` tags and the
+/// native apps' image loaders send no credential (B286, V225). A token that
+/// does not resolve counts as anonymous too, so a stale cookie or revoked
+/// token cannot cost a client its artwork; 503 only when the store could
+/// not say.
+pub(crate) async fn optional_bearer(
+    state: &crate::state::AppState,
+    req: &actix_web::HttpRequest,
+    id: &str,
+    route: &'static str,
+) -> Result<Option<pharos_core::User>, actix_web::Error> {
+    let Some(token) = auth_extractor::media_token(Some(state), req).await else {
+        tracing::debug!(item_id = id, route, "anonymous image request");
+        return Ok(None);
+    };
+    match crate::services::access::authenticate(state, Some(&token), id, route).await {
+        Ok(user) => {
+            auth_extractor::note_header_credential(req);
+            Ok(Some(user))
+        }
+        Err(crate::services::access::ItemHidden::Unauthenticated) => Ok(None),
+        Err(hidden) => Err(access_error(hidden)),
+    }
+}
+
+/// [`require_item_access`] for a signed-in requester; an anonymous one is
+/// served like on Jellyfin (see [`optional_bearer`]).
+pub(crate) async fn require_item_access_if_signed_in(
+    state: &crate::state::AppState,
+    user: Option<&pharos_core::User>,
+    id: pharos_core::MediaId,
+    route: &'static str,
+) -> Result<(), actix_web::Error> {
+    match user {
+        Some(user) => require_item_access(state, user, id, route).await,
+        None => Ok(()),
+    }
+}

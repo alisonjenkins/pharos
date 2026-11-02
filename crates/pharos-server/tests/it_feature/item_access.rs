@@ -384,15 +384,23 @@ async fn cache_built_lists_leave_out_hidden_libraries() {
     );
 }
 
-/// Routes that serve an item's files to element URLs (images, subtitles,
-/// fonts). V189: without a credential each answers 401 and counts
-/// `unauthenticated`; with one, a hidden item is 404 like any by-id route.
-fn file_routes(id: u64) -> Vec<String> {
+/// Routes that serve an item's images. V225: anonymous like Jellyfin's, since
+/// `<img>` tags and the native apps' image loaders send no credential; V189:
+/// with a credential, a hidden item is 404 like any by-id route.
+fn image_routes(id: u64) -> Vec<String> {
     vec![
         format!("/Items/{id}/Images"),
         format!("/Items/{id}/Images/Primary"),
         format!("/Items/{id}/Images/Backdrop/0"),
         format!("/Items/{id}/Images/Chapter/0"),
+    ]
+}
+
+/// Routes that serve an item's subtitle and font files. V189: without a
+/// credential each answers 401 and counts `unauthenticated`; their
+/// `DeliveryUrl`s carry the caller's token.
+fn subtitle_routes(id: u64) -> Vec<String> {
+    vec![
         format!("/Videos/{id}/Subtitles/0/Stream.vtt"),
         format!("/Videos/{id}/{id}/Subtitles/0/Stream.js"),
         format!("/Videos/{id}/Subtitles/0/Subtitles.srt"),
@@ -412,7 +420,7 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
     let app = test::init_service(build_app(f.state.clone())).await;
 
     let mut failures = Vec::new();
-    for uri in file_routes(f.rich_item_id) {
+    for uri in subtitle_routes(f.rich_item_id) {
         let before = denied_total(&snapshotter, "unauthenticated");
         let req = test::TestRequest::get().uri(&uri).to_request();
         let status = test::call_service(&app, req).await.status().as_u16();
@@ -421,7 +429,10 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
             failures.push(format!("anonymous {uri}: {status}, counted {counted}"));
         }
     }
-    for uri in file_routes(f.other_item_id) {
+    for uri in image_routes(f.other_item_id)
+        .into_iter()
+        .chain(subtitle_routes(f.other_item_id))
+    {
         let before = denied_total(&snapshotter, "library_not_allowed");
         let req = test::TestRequest::get()
             .uri(&format!("{uri}?api_key={}", f.user_token))
@@ -430,6 +441,57 @@ async fn file_routes_refuse_anonymous_and_hidden_requests() {
         let counted = denied_total(&snapshotter, "library_not_allowed") - before;
         if status != 404 || counted != 1 {
             failures.push(format!("hidden {uri}: {status}, counted {counted}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// B286: jellyfin-web's `<img>` URL (`?fillHeight=…&quality=96&tag=…`) and the
+/// native apps' image loaders carry no credential, and a stale cookie or a
+/// revoked token must not cost a client its artwork either. None is answered
+/// 401, and an anonymous request is not counted as a refusal. Disarm check: with the image
+/// routes back on `require_bearer`, every request here is 401.
+#[actix_web::test]
+async fn image_routes_serve_anonymous_requests() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    restrict_to_library_a(&f).await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+
+    let mut failures = Vec::new();
+    for id in [f.rich_item_id, f.other_item_id] {
+        for uri in image_routes(id) {
+            for (label, req) in [
+                (
+                    "anonymous",
+                    test::TestRequest::get().uri(&format!(
+                        "{uri}?fillHeight=446&quality=96&tag=0123456789abcdef"
+                    )),
+                ),
+                (
+                    "revoked token",
+                    test::TestRequest::get().uri(&format!("{uri}?api_key=not-a-token")),
+                ),
+                (
+                    "stale cookie",
+                    test::TestRequest::get()
+                        .uri(&uri)
+                        .insert_header(("Cookie", "JellyfinAuth=not-a-token")),
+                ),
+            ] {
+                let before = denied_total(&snapshotter, "unauthenticated");
+                let status = test::call_service(&app, req.to_request())
+                    .await
+                    .status()
+                    .as_u16();
+                let counted = denied_total(&snapshotter, "unauthenticated") - before;
+                if status == 401 || (label == "anonymous" && counted != 0) {
+                    failures.push(format!("{label} {uri}: {status}, counted {counted}"));
+                }
+            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
