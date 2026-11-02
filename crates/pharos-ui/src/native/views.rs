@@ -496,11 +496,11 @@ mod tests {
         assert!(html.contains("Continue watching"), "{html}");
         assert!(!html.contains("Next up"), "{html}");
         assert!(
-            html.contains(r#"href="/browse/7""#) && html.contains("Films"),
+            html.contains(r#"href="/ui/browse/7""#) && html.contains("Films"),
             "{html}"
         );
         assert!(
-            html.contains(r#"href="/title/42""#) && html.contains("Heat"),
+            html.contains(r#"href="/ui/title/42""#) && html.contains("Heat"),
             "{html}"
         );
         assert!(html.contains("width: 25%"), "{html}");
@@ -526,7 +526,7 @@ mod tests {
         };
         let html =
             render(move || rsx! { BrowseView { title: "Shows".to_string(), page: page.clone() } });
-        assert!(html.contains(r#"href="/browse/1""#), "{html}");
+        assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
         assert!(html.contains("Showing 1 of 3."), "{html}");
     }
 
@@ -542,7 +542,7 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
-            html.contains(r#"href="/watch/1""#) && html.contains(">Play<"),
+            html.contains(r#"href="/ui/watch/1""#) && html.contains(">Play<"),
             "{html}"
         );
         assert!(
@@ -571,7 +571,7 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("/watch/"), "{html}");
-        assert!(html.contains(r#"href="/browse/1""#), "{html}");
+        assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
     }
 
     #[test]

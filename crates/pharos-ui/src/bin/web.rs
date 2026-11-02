@@ -8,7 +8,7 @@
 //!
 //!     nix develop --command dx build --package pharos-ui --release
 //!
-//! Output lands under `target/dx/pharos-ui/release/web/public/`. Point
+//! Output lands under `target/dx/pharos-ui/release/web/public/`; served at `/ui/`. Point
 //! pharos-server at it via `[server].ui_dir` in `config.toml`.
 
 fn main() {

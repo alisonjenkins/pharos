@@ -4,8 +4,9 @@ name = "pharos-ui"
 [web.app]
 # title lives in index.html (setting it here too double-renders it).
 default_platform = "web"
-# Served at the root by pharos itself (spec 009 contracts/serving.md); the
-# server redirects the old /ui/ mount here.
+# pharos serves the bundle under /ui/ (ADR-0038); this prefixes the URLs dx
+# writes into index.html and must match `route::MOUNT`.
+base_path = "ui"
 
 [web.watcher]
 reload_html = true

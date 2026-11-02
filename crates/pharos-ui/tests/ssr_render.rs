@@ -1428,7 +1428,10 @@ fn find_view_labels_the_box_and_renders_a_tile_per_match() {
     assert!(html.contains(r#"type="search""#), "{html}");
     assert!(html.contains(r#"value="Alpha""#), "{html}");
     for (id, name) in [(1, "Alpha"), (2, "Alpha Two")] {
-        assert!(html.contains(&format!(r#"href="/title/{id}""#)), "{html}");
+        assert!(
+            html.contains(&format!(r#"href="/ui/title/{id}""#)),
+            "{html}"
+        );
         assert!(html.contains(&format!(">{name}</span>")), "{html}");
     }
     assert!(html.contains("2 found"), "{html}");
