@@ -1177,6 +1177,50 @@ where
     }
 
     // -----------------------------------------------------------------
+    // Tag policy scope (B266): `BlockedTags` hides an item carrying any of
+    // them, `AllowedTags` shows only items carrying one; names match without
+    // regard to case.
+    // -----------------------------------------------------------------
+    for (id, tags) in [
+        (9701 as MediaId, vec!["Gore"]),
+        (9702, vec!["family"]),
+        (9703, vec![]),
+        (9704, vec!["Family", "gore"]),
+    ] {
+        MediaStore::put(&store, media_item(id, &format!("Tagged {id}")))
+            .await
+            .unwrap();
+        let tags: Vec<String> = tags.into_iter().map(String::from).collect();
+        TagStore::link_item_tags(&store, id, &tags).await.unwrap();
+    }
+    for (blocked, allowed, expected) in [
+        (vec!["GORE"], vec![], vec![9702, 9703]),
+        (vec![], vec!["FAMILY"], vec![9702, 9704]),
+        (vec!["gore"], vec!["family"], vec![9702]),
+    ] {
+        let scope = pharos_core::TagScope {
+            blocked_lc: blocked.iter().map(|t| t.to_lowercase()).collect(),
+            allowed_lc: allowed.iter().map(|t| t.to_lowercase()).collect(),
+        };
+        let (items, _) = MediaStore::query(
+            &store,
+            &MediaQuery {
+                tag_scope: Some(scope.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut got: Vec<MediaId> = items
+            .iter()
+            .map(|i| i.id)
+            .filter(|id| (9701..=9704).contains(id))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, expected, "{scope:?}");
+    }
+
+    // -----------------------------------------------------------------
     // MediaSegmentStore (T86 / B123). The scan stamp is what separates
     // "analysed, found nothing" from "never analysed", and it had no
     // conformance coverage at all — its Postgres placeholders were only
