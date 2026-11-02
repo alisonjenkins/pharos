@@ -54,8 +54,9 @@ impl Session {
         Rc::clone(&self.conn)
     }
 
-    /// Whether the client reached the server over a non-private address,
-    /// the same test a Jellyfin request gets.
+    /// Whether the client reached the server over a non-private address:
+    /// `ip_is_remote`, as for a Jellyfin request, on the address the
+    /// WebSocket upgrade resolved through `trusted_proxies`.
     pub(super) fn client_is_remote(&self) -> bool {
         crate::api::jellyfin::items::ip_is_remote(&self.ctx.client_ip)
     }
