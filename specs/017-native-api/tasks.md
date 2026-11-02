@@ -119,7 +119,7 @@ method may exist without it (V173), so it precedes every story.
 Each extraction is one commit: service + its unit test, Jellyfin handler rewired (its tests unchanged and green), native method + `it_rpc` test.
 
 - [x] T029 [US4] `services/library.rs::views` ← `api/jellyfin` views handler; `Library.views` — **COMMIT**
-- [ ] T030 [US4] `services/library.rs::latest` ← `items.rs latest_items`; `Library.latest` — **COMMIT**
+- [x] T030 [US4] `services/library.rs::latest` ← `items.rs latest_items`; `Library.latest` — **COMMIT** — Done; `KindFilter` moved into `services::library` with it, and the native `ItemSummary` encoder (`rpc/library.rs write_item`) reads the Jellyfin projection, checked field by field against `/Users/{id}/Items/Latest` in `it_rpc/library.rs`
 - [ ] T031 [US4] `services/library.rs::resume` ← `items.rs resume_items` (typed `Vec<MediaKind>` instead of raw query parsing); `Library.resume` — **COMMIT**
 - [ ] T032 [US4] `services/library.rs::next_up`; `Library.nextUp` — **COMMIT**
 - [ ] T033 [US4] `services/library.rs::query` (parent, kinds, sort, name prefix, filters, paging); `Library.query` — **COMMIT**
