@@ -15,6 +15,7 @@ pub mod limits;
 pub mod origin;
 mod session;
 pub mod socket;
+mod user_data;
 
 use std::cell::RefCell;
 use std::rc::Rc;
