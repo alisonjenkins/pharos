@@ -33,6 +33,9 @@ pub struct GlowSurface {
     silence: Vec<u8>,
     lost: Rc<Cell<bool>>,
     on_lost: Closure<dyn FnMut(web_sys::Event)>,
+    /// Kept to release the context on drop: browsers cap live contexts
+    /// (~16) and free a dropped one only when it is garbage collected.
+    lose: Option<web_sys::WebglLoseContext>,
 }
 
 pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallback> {
@@ -58,6 +61,11 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
         .flatten()
         .and_then(|c| c.dyn_into::<web_sys::WebGl2RenderingContext>().ok())
         .ok_or(Fallback::NoWebgl2)?;
+    let lose = context
+        .get_extension("WEBGL_lose_context")
+        .ok()
+        .flatten()
+        .map(|e| e.unchecked_into::<web_sys::WebglLoseContext>());
     let gl = glow::Context::from_webgl2_context(context);
 
     let lost = Rc::new(Cell::new(false));
@@ -109,6 +117,7 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
             silence: silence(),
             lost,
             on_lost,
+            lose,
         }))
     }
 }
@@ -228,6 +237,9 @@ impl Drop for GlowSurface {
             self.gl.delete_texture(self.texture);
             self.gl.delete_vertex_array(self.vao);
             self.gl.delete_program(self.program);
+        }
+        if let Some(lose) = &self.lose {
+            lose.lose_context();
         }
     }
 }
