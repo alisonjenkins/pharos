@@ -6,6 +6,8 @@
 //! from a WebSocket to `/pharos/rpc`. [`resume`] turns the connection into a
 //! signed-in `Session` from the cookie `POST /pharos/session` set.
 
+#[cfg(target_arch = "wasm32")]
+pub mod browser;
 pub mod byte_stream;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
