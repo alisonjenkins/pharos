@@ -2,11 +2,50 @@
 //! wire layers write it here, so marking an item from either API checks the
 //! same policy and tells every connected jellyfin-web the same thing.
 
-use pharos_core::{DomainError, MediaItem, MediaStore, User, UserDataStore, UserItemData};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
+
+use pharos_core::{DomainError, MediaItem, MediaStore, User, UserDataStore, UserId, UserItemData};
 
 use crate::api::jellyfin::dto::UserItemDataDto;
 use crate::services::library::DetailError;
 use crate::state::AppState;
+
+/// One lock per (user, item) being written, so a read-modify-write of one
+/// user's state on one item never interleaves with another, while writes to
+/// anything else run freely. An entry lives only while someone holds or waits
+/// for its lock.
+#[derive(Clone, Default)]
+pub struct WriteLocks(Arc<Mutex<HashMap<(UserId, u64), Weak<tokio::sync::Mutex<()>>>>>);
+
+impl WriteLocks {
+    async fn lock(&self, user: UserId, id: u64) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.retain(|_, held| held.strong_count() > 0);
+            match map.get(&(user, id)).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    map.insert((user, id), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
 
 /// Marks `d` played, counting the play, or unplayed. Unplayed also forgets
 /// the resume position: Jellyfin's `MarkUnplayed` clears both, and an item
@@ -66,6 +105,7 @@ pub async fn update(
         DomainError::NotFound(_) => DetailError::NotFound,
         other => DetailError::Store(other),
     })?;
+    let write_guard = state.user_data_writes.lock(user.id, id).await;
     let mut data = state
         .stores
         .get_user_data(user.id, id)
@@ -77,6 +117,7 @@ pub async fn update(
         .set_user_data(user.id, id, data)
         .await
         .map_err(DetailError::Store)?;
+    drop(write_guard);
     let runtime = item.probe.run_time_ticks().unwrap_or(0);
     let dto = UserItemDataDto::from_domain_with_runtime(id, data, runtime);
     // The full DTO, so jellyfin-web updates the watched mark and the
@@ -86,4 +127,27 @@ pub async fn update(
         Err(e) => tracing::warn!(media.id = id, error = %e, "user data: change not announced"),
     }
     Ok((item, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes to different items do not wait on each other, and a lock
+    /// nobody holds is forgotten.
+    #[tokio::test]
+    async fn locks_are_per_user_and_item_and_forgotten() {
+        let locks = WriteLocks::default();
+        let (a, b) = (UserId::new(), UserId::new());
+        let held = locks.lock(a, 1).await;
+        let other_item = tokio::time::timeout(std::time::Duration::from_secs(1), locks.lock(a, 2));
+        let other_user = tokio::time::timeout(std::time::Duration::from_secs(1), locks.lock(b, 1));
+        assert!(other_item.await.is_ok());
+        assert!(other_user.await.is_ok());
+        let same = tokio::time::timeout(std::time::Duration::from_millis(50), locks.lock(a, 1));
+        assert!(same.await.is_err());
+        drop(held);
+        let _again = locks.lock(a, 3).await;
+        assert_eq!(locks.len(), 1);
+    }
 }

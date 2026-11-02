@@ -317,6 +317,11 @@ pub struct AppState {
     /// this lock, builds the whole synth-id → representative map in one scan,
     /// and every other request then hits the memo.
     pub synth_image_warm: Arc<tokio::sync::Mutex<()>>,
+    /// Held across `services::user_data::update`'s read-modify-write, so two
+    /// writes to one user's state (a native client pipelines them) cannot
+    /// each store the row the other read before it. Keyed by (user, item), so
+    /// one user's writes never wait on another's.
+    pub user_data_writes: crate::services::user_data::WriteLocks,
     /// Unix-seconds of the last live-playback segment request. The
     /// background asset backfill (trickplay / subtitles) reads this and
     /// stands down while a client is actively streaming, so a whole-file
@@ -654,6 +659,7 @@ impl AppState {
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
@@ -754,6 +760,7 @@ impl AppState {
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
