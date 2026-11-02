@@ -207,11 +207,11 @@ async fn respond(
         Ok(Ok(file)) => file,
         Ok(Err(e)) => {
             tracing::error!(path = %path.display(), error = %e, "ui: bundle file unreadable");
-            return HttpResponse::InternalServerError().finish();
+            return secured(HttpResponse::InternalServerError().finish(), &bundle.csp);
         }
         Err(e) => {
             tracing::error!(path = %path.display(), error = %e, "ui: bundle file unreadable");
-            return HttpResponse::InternalServerError().finish();
+            return secured(HttpResponse::InternalServerError().finish(), &bundle.csp);
         }
     };
     let cache = match outcome {
@@ -228,7 +228,14 @@ async fn respond(
     if let Ok(value) = HeaderValue::from_str(&cache.to_string()) {
         headers.insert(header::CACHE_CONTROL, value);
     }
-    headers.insert(header::CONTENT_SECURITY_POLICY, bundle.csp.clone());
+    secured(resp, &bundle.csp)
+}
+
+/// Stamps the security headers on a UI response of any status, so no reply
+/// from the UI, a redirect or an error included, goes out without them.
+fn secured(mut resp: HttpResponse, csp: &HeaderValue) -> HttpResponse {
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp.clone());
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -242,7 +249,7 @@ async fn respond(
 }
 
 /// `/ui/<rest>` → `308 /<rest>`, keeping the query.
-async fn redirect(req: HttpRequest) -> HttpResponse {
+async fn redirect(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
     let rest = req
         .path()
         .strip_prefix("/ui")
@@ -253,9 +260,12 @@ async fn redirect(req: HttpRequest) -> HttpResponse {
         q => format!("/{rest}?{q}"),
     };
     record(Outcome::Redirect);
-    HttpResponse::PermanentRedirect()
-        .insert_header((header::LOCATION, location))
-        .finish()
+    secured(
+        HttpResponse::PermanentRedirect()
+            .insert_header((header::LOCATION, location))
+            .finish(),
+        &bundle.csp,
+    )
 }
 
 /// A dx-built asset, whose name carries its content hash (`-dxh<hex>`), so
@@ -294,5 +304,5 @@ async fn fallback(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse
     }
     tracing::debug!(method = %req.method(), path = req.path(), "ui: no route or file");
     record(Outcome::NotFound);
-    HttpResponse::NotFound().finish()
+    secured(HttpResponse::NotFound().finish(), &bundle.csp)
 }
