@@ -721,3 +721,35 @@ pub async fn with_user_data(
         start: page.start,
     })
 }
+
+/// Why [`detail`] has no item to show.
+#[derive(Debug)]
+pub enum DetailError {
+    /// The user may not see the item, or the store could not say.
+    Hidden(crate::services::access::ItemHidden),
+    /// No stored item has this id.
+    NotFound,
+    /// The item or the user's play state could not be read.
+    Store(DomainError),
+}
+
+/// The stored item `id` with the user's play state, if `user` may see it.
+pub async fn detail(
+    state: &AppState,
+    user: &User,
+    id: u64,
+) -> Result<(MediaItem, UserItemData), DetailError> {
+    crate::services::access::check_item(state, user, id, "item")
+        .await
+        .map_err(DetailError::Hidden)?;
+    let item = state.stores.get(id).await.map_err(|e| match e {
+        DomainError::NotFound(_) => DetailError::NotFound,
+        other => DetailError::Store(other),
+    })?;
+    let user_data = state
+        .stores
+        .get_user_data(user.id, id)
+        .await
+        .map_err(DetailError::Store)?;
+    Ok((item, user_data))
+}
