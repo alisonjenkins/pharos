@@ -722,6 +722,11 @@ impl<P: Prober> FsScanner<P> {
                             && state.file_size == size
                             && state.probe_schema_version == expected_schema_version(&primary)
                         {
+                            if let Some((reason, edition)) =
+                                edition_drift_for(store, row, &alts).await?
+                            {
+                                record_edition_drift(row, &primary, reason, &edition, "skipped");
+                            }
                             seen_batch.push((row, mtime, size));
                             seen += 1;
                             outcome.skipped += 1;
@@ -1964,6 +1969,103 @@ fn edition_id_slug(edition: &str) -> String {
         }
     }
     s.trim_matches('-').to_string()
+}
+
+/// Why an unchanged primary no longer qualifies for the incremental skip
+/// because the editions grouped under it changed (B283). The `label()` strings
+/// are the `reason` values of `pharos_scan_reprobe_total`, a dashboard
+/// contract: do not rename them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReprobeReason {
+    /// A stored edition's file is no longer grouped under the primary.
+    Removed,
+    /// A file is grouped under the primary that the stored row lacks.
+    Added,
+    /// A stored edition's file is still there but its size differs.
+    Changed,
+}
+
+impl ReprobeReason {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Removed, Self::Added, Self::Changed];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Removed => "edition_removed",
+            Self::Added => "edition_added",
+            Self::Changed => "edition_changed",
+        }
+    }
+}
+
+/// Compare the editions stored on a primary's row with the ones on disk
+/// (`disk` is each grouped alternate's path and current size). Returns the
+/// first difference and the path it concerns. `AlternateMediaSource` records
+/// no mtime, so a changed edition is detected by size only, and only when the
+/// stored row recorded one.
+pub(crate) fn edition_drift(
+    stored: &[AlternateMediaSource],
+    disk: &[(PathBuf, Option<u64>)],
+) -> Option<(ReprobeReason, PathBuf)> {
+    if let Some(gone) = stored
+        .iter()
+        .find(|s| !disk.iter().any(|(p, _)| *p == s.path))
+    {
+        return Some((ReprobeReason::Removed, gone.path.clone()));
+    }
+    if let Some((new, _)) = disk
+        .iter()
+        .find(|(p, _)| !stored.iter().any(|s| s.path == *p))
+    {
+        return Some((ReprobeReason::Added, new.clone()));
+    }
+    stored.iter().find_map(|s| {
+        let now = disk.iter().find(|(p, _)| *p == s.path)?.1?;
+        (s.size_bytes? != now).then(|| (ReprobeReason::Changed, s.path.clone()))
+    })
+}
+
+/// Look up what `edition_drift` needs for the primary held by `row`: the
+/// stored editions and a stat of each grouped alternate. A vanished alternate
+/// stats as `None` and surfaces as a path-set difference or is ignored for the
+/// size comparison, never as an error.
+async fn edition_drift_for<S: MediaStore>(
+    store: &S,
+    row: MediaId,
+    alts: &[(String, PathBuf)],
+) -> DomainResult<Option<(ReprobeReason, PathBuf)>> {
+    let stored = store.alternate_sources(row).await?;
+    if stored.is_empty() && alts.is_empty() {
+        return Ok(None);
+    }
+    let mut disk = Vec::with_capacity(alts.len());
+    for (_, path) in alts {
+        let size = tokio::fs::metadata(path).await.ok().map(|m| m.len());
+        disk.push((path.clone(), size));
+    }
+    Ok(edition_drift(&stored, &disk))
+}
+
+/// Make an edition-set change visible: one info line carrying the item, its
+/// primary path, the reason and the offending edition path, plus the counter.
+/// Query: `{namespace="pharos"} |= "edition set changed"` or
+/// `sum by (reason) (increase(pharos_scan_reprobe_total[1h]))`.
+fn record_edition_drift(
+    row: MediaId,
+    primary: &Path,
+    reason: ReprobeReason,
+    edition: &Path,
+    outcome: &'static str,
+) {
+    tracing::info!(
+        media.id = %row,
+        path = %primary.display(),
+        reason = reason.label(),
+        edition = %edition.display(),
+        outcome,
+        "edition set changed since the stored row was written",
+    );
+    metrics::counter!("pharos_scan_reprobe_total", "reason" => reason.label()).increment(1);
 }
 
 /// P41 — group walk output into `(primary, Vec<(edition_label, alt_path)>)`
@@ -5682,6 +5784,42 @@ mod tests {
         let own = alt.probe.as_deref().expect("edition keeps its own probe");
         assert_eq!(own.video_3d_format, Some(Video3DFormat::HalfSideBySide));
         assert!(own.alternate_sources.is_empty());
+    }
+
+    #[test]
+    fn reprobe_reason_labels_are_distinct() {
+        let labels: HashSet<&'static str> = ReprobeReason::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), ReprobeReason::ALL.len());
+    }
+
+    #[test]
+    fn edition_drift_reports_the_offending_path() {
+        let alt = |path: &str, size: Option<u64>| AlternateMediaSource {
+            path: path.into(),
+            size_bytes: size,
+            ..Default::default()
+        };
+        let on_disk = |path: &str, size: Option<u64>| (PathBuf::from(path), size);
+        let same = [alt("/a", Some(1))];
+        assert_eq!(edition_drift(&same, &[on_disk("/a", Some(1))]), None);
+        assert_eq!(
+            edition_drift(&same, &[]),
+            Some((ReprobeReason::Removed, "/a".into()))
+        );
+        assert_eq!(
+            edition_drift(&[], &[on_disk("/b", Some(1))]),
+            Some((ReprobeReason::Added, "/b".into()))
+        );
+        assert_eq!(
+            edition_drift(&same, &[on_disk("/a", Some(2))]),
+            Some((ReprobeReason::Changed, "/a".into()))
+        );
+        // Unknown on either side is not a change: nothing to compare.
+        assert_eq!(edition_drift(&same, &[on_disk("/a", None)]), None);
+        assert_eq!(
+            edition_drift(&[alt("/a", None)], &[on_disk("/a", Some(2))]),
+            None
+        );
     }
 
     #[tokio::test]
