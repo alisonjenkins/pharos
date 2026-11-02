@@ -205,6 +205,12 @@ mod tests {
                 ratio: 0.0,
                 min: 0.0,
             },
+            ThemeError::UnknownTheme {
+                name: String::new(),
+            },
+            ThemeError::Storage {
+                message: String::new(),
+            },
         ];
         let warnings = [
             ThemeWarning::UnknownKey {
@@ -237,6 +243,8 @@ mod tests {
             "extends_cycle",
             "too_large",
             "contrast",
+            "unknown_theme",
+            "storage",
             "unknown_key",
             "newer_schema",
             "font_missing",

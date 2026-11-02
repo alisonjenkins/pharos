@@ -21,6 +21,7 @@ use super::views::{
     BrowseView, ErrorNote, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
     WatchView, VIDEO_ID,
 };
+use crate::theme;
 use crate::views::RootApp;
 
 /// Items a browse page asks for at once.
@@ -30,6 +31,7 @@ const BROWSE_PAGE: u32 = 100;
 /// mounts the older REST panes and never opens the native socket.
 #[component]
 pub fn Root() -> Element {
+    use_hook(apply_device_theme);
     let mut route = use_signal(|| Route::parse(&platform::current_path()));
     use_hook(|| {
         Rc::new(platform::on_pop_state(move |path| {
@@ -53,6 +55,34 @@ pub fn Root() -> Element {
     match route() {
         Route::Manage => rsx! { RootApp {} },
         route => rsx! { NativeApp { route } },
+    }
+}
+
+/// Apply the device's stored theme before the first native paint, logging
+/// which theme and, on a fallback, why.
+fn apply_device_theme() {
+    let stored = platform::stored_theme(theme::device::ACTIVE_KEY);
+    let startup = match theme::device::startup(&theme::shipped(), stored) {
+        Ok(startup) => startup,
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: theme unavailable reason={} keeping=pharos.css",
+                e.label()
+            ));
+            return;
+        }
+    };
+    for line in &startup.lines {
+        match line {
+            theme::device::Line::Info(l) => platform::info(l),
+            theme::device::Line::Warn(l) => platform::warn(l),
+        }
+    }
+    if let Err(e) = platform::apply_tokens(&theme::css::declarations(&startup.theme)) {
+        platform::warn(&format!(
+            "pharos: theme apply failed name={} error={e}",
+            startup.theme.name
+        ));
     }
 }
 

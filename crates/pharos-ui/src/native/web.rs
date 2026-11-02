@@ -485,3 +485,29 @@ pub fn warn(message: &str) {
 pub fn info(message: &str) {
     web_sys::console::info_1(&message.into());
 }
+
+/// The theme name stored under `key`. `Err` carries the browser's reason
+/// when storage cannot be read at all.
+pub fn stored_theme(key: &str) -> Result<Option<String>, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let storage = window
+        .local_storage()
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("localStorage is unavailable")?;
+    storage.get_item(key).map_err(|e| format!("{e:?}"))
+}
+
+/// Set every token on `<html>` in one `style` write, so the page restyles
+/// once.
+pub fn apply_tokens(declarations: &[(String, String)]) -> Result<(), String> {
+    let root = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .ok_or("no document element")?;
+    let style: String = declarations
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}; "))
+        .collect();
+    root.set_attribute("style", style.trim_end())
+        .map_err(|e| format!("{e:?}"))
+}
