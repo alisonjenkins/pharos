@@ -830,3 +830,45 @@ async fn an_owner_cannot_start_a_second_seat_while_their_first_is_resuming() {
     assert!(err.message.contains(TV), "names the resuming TV: {err}");
     assert_eq!(seat_total(&snap, "rejected", "user_has_seat"), 1);
 }
+
+/// A TV renamed only by case in config still matches its persisted seat, and
+/// the resume drives that seat: the group's commands reach the TV, and the
+/// seat's owner stays the one roster entry.
+#[tokio::test]
+async fn a_tv_renamed_by_case_resumes_under_its_persisted_seat() {
+    let (_snap, _guard) = recorder();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let snapshots = Arc::new(Snapshots::default());
+    let a = Process::boot(
+        &stores,
+        &snapshots,
+        &Locks::default(),
+        1,
+        config(&[TV]),
+        &[TV],
+    );
+    let (group_a, owner) = running_cast(&stores, &snapshots, &a).await;
+
+    let renamed = TV.to_uppercase();
+    let b_snapshots = restart_snapshots(&snapshots, group_a.group_id);
+    let b = Process::boot(
+        &stores,
+        &b_snapshots,
+        &Locks::default(),
+        2,
+        config(&[&renamed]),
+        &[],
+    );
+    let tv = b.factory.add_tv(&renamed);
+    let group_b = b.registry.get_or_create(group_a.group_id).await.unwrap();
+    eventually("the resumed seat loading the group's item", || {
+        has_command(&tv, "PlayNow")
+    })
+    .await;
+    wait_following(&b.service).await;
+    let snap = snapshot_of(&group_b).await;
+    assert_eq!(snap.cast_seats.len(), 1, "{:?}", snap.cast_seats);
+    let info = b.service.snapshot().await;
+    assert_eq!(info[0].seat_member, snap.cast_seats[0].seat);
+    assert_eq!(info[0].owner, owner.id);
+}

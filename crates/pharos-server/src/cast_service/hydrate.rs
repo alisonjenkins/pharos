@@ -100,7 +100,14 @@ async fn offer(to_actor: &mpsc::WeakSender<Command>, group: GroupHandle) -> bool
 impl<F: TransportFactory> Actor<F> {
     pub(super) async fn begin_resume(&mut self, group: GroupHandle, seat: CastSeatInfo) {
         let group_label = group.group_id.to_string();
-        let tv_name = seat.cast.tv.clone();
+        // Every map is keyed by the TV's configured name. The seat carries the
+        // name it was cast under, which a config edit may have recased; keying
+        // the resume by that would lose its connect result (`on_resumed` looks
+        // it up by the configured name) and strand the seat.
+        let tv_name = self
+            .cfg
+            .tv(&seat.cast.tv)
+            .map_or_else(|| seat.cast.tv.clone(), |tv| tv.name.clone());
         // The same seat can be offered twice (found while running and again on
         // hydration); only act while the roster still holds it.
         let still_seated = group
@@ -317,6 +324,18 @@ impl<F: TransportFactory> Actor<F> {
                 )
             })?;
 
+        // The roster's seat id is the truth: a TV renamed in config only by
+        // case still matches (`cfg.tv` ignores case) but derives another id,
+        // and a seat driven under that id would never get the group's
+        // commands.
+        let derived = member_id_for_device(&format!("{}:cast:{}", owner.0.simple(), tv.name));
+        if derived != seat.seat {
+            tracing::warn!(
+                derived = %derived, persisted = %seat.seat, tv = %tv.name,
+                "cast: the persisted seat id is not the one derived for this owner and TV; \
+                 resuming under the persisted id"
+            );
+        }
         let cast = self.assemble(
             transport,
             &token,
@@ -328,14 +347,9 @@ impl<F: TransportFactory> Actor<F> {
                 sender_device: String::new(),
                 group,
                 owner_member: *owner_member,
+                seat_member: Some(seat.seat),
             },
         );
-        if cast.seat_member != seat.seat {
-            tracing::error!(
-                derived = %cast.seat_member, persisted = %seat.seat, tv = %tv.name,
-                "cast: the persisted seat id is not the one derived for this owner and TV"
-            );
-        }
         // The roster already holds the seat; asking for the catch-up now gives
         // the driver the group's item and position to load.
         let _ = group

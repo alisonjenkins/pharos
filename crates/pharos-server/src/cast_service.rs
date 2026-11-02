@@ -889,6 +889,7 @@ impl<F: TransportFactory> Actor<F> {
                 sender_device: device_of(&req.owner_sync_key).to_owned(),
                 group: &group,
                 owner_member,
+                seat_member: None,
             },
         );
         let seat_member = cast.seat_member;
@@ -1285,6 +1286,9 @@ struct Assembly<'a> {
     sender_device: String,
     group: &'a GroupHandle,
     owner_member: MemberId,
+    /// The seat's member id when the roster already holds it (a resume);
+    /// `None` derives it from the owner and the TV's name (a fresh start).
+    seat_member: Option<MemberId>,
 }
 
 impl<F: TransportFactory> Actor<F> {
@@ -1317,8 +1321,9 @@ impl<F: TransportFactory> Actor<F> {
 
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        let seat_member =
-            member_id_for_device(&format!("{}:cast:{}", a.owner.0.simple(), a.tv.name));
+        let seat_member = a.seat_member.unwrap_or_else(|| {
+            member_id_for_device(&format!("{}:cast:{}", a.owner.0.simple(), a.tv.name))
+        });
         let seat_rx =
             self.deps
                 .sinks
