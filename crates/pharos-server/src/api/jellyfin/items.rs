@@ -3825,6 +3825,11 @@ const SYNTHESISED_ITEM_TYPES: &[&str] = &[
     "recording",
 ];
 
+/// On the `/Items` path every synth short-circuit (MusicAlbum, MusicArtist,
+/// Playlist, BoxSet, the show folders) has declined the request before this
+/// runs, and the SQL path can only return stored kinds, so naming none of
+/// them matches nothing. Naming a synthesised type gives `Unset`, which on
+/// the Latest path (no short-circuits) lists every kind.
 fn parse_kind_filter(include: Option<&str>) -> KindFilter {
     let Some(raw) = include.map(str::trim).filter(|s| !s.is_empty()) else {
         return KindFilter::Unset;

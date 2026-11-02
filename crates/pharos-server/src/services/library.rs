@@ -89,19 +89,14 @@ pub async fn views(state: &AppState, policy: &UserPolicy) -> Vec<LibraryView> {
 }
 
 /// Which stored kinds a listing keeps. The Jellyfin layer parses it from
-/// `IncludeItemTypes=`; the native API from a list of kinds.
+/// `IncludeItemTypes=` (`items::parse_kind_filter`); `Library.latest` names
+/// no kinds and passes `Unset`.
 ///
 /// B153 — the distinction that was missing. `MusicVideo` names a type pharos
 /// stores none of, and the old code read "zero recognised kinds" as "no kind
 /// filter", so a request for music videos returned the ENTIRE library: 51.6 MB
 /// of JSON for a query whose honest answer is an empty list. "I asked for X"
 /// must never widen to "I asked for anything".
-///
-/// Reaching this point already means every synth short-circuit (MusicAlbum,
-/// MusicArtist, Playlist, BoxSet, the show folders) has declined the request,
-/// and the SQL path can only ever return Movie / Episode / Audio rows — so if
-/// none of the named types is one of those, nothing can match, whichever
-/// unknown type it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KindFilter {
     /// No kind named: every kind is acceptable.
@@ -156,6 +151,8 @@ pub async fn latest(
     let all = crate::services::access::visible_items(state, user, all, "latest")
         .await
         .map_err(LatestError::Hidden)?;
+    // Home-page "Latest" rows must match the library the user clicked into,
+    // and jellyfin-web's "Latest Movies" row filters to Type=Movie.
     let scoped = restrict_to_parent(state, &all, parent_id).await;
     let mut typed = kinds.keep(scoped);
     // B97 — "Latest" means most-recently-ADDED first (DateCreated desc), so a
