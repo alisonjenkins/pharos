@@ -317,3 +317,70 @@ async fn the_3d_decision_counter_says_what_the_output_is() {
     assert_eq!(count("preserved", "transcode"), 1);
     assert_eq!(count("preserved", "direct_play"), 1);
 }
+
+/// V234 — a subtitle burned into a packed 3D source keeps the 3D layout: the
+/// transcode URL asks for `preserve`, and the decision metric says the plan is
+/// a per-eye burn along with the format. `StereoMode=mono` still downmixes.
+#[actix_web::test]
+async fn burning_a_subtitle_on_packed_3d_plans_a_per_eye_burn() {
+    let _ = pharos_server::obs::init("info", None);
+    let (state, token) = seed_with(vec![movie(
+        4,
+        "3D with PGS",
+        MediaProbe {
+            video_3d_format: Some(Video3DFormat::HalfSideBySide),
+            subtitle_tracks: vec![pharos_core::SubtitleTrack {
+                stream_index: 3,
+                codec: Some("hdmv_pgs_subtitle".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )])
+    .await;
+    let app = app!(state);
+
+    let transcoding_url = |query: &'static str| {
+        let app = &app;
+        let token = token.clone();
+        async move {
+            let resp = test::call_service(
+                app,
+                test::TestRequest::post()
+                    .uri(&format!(
+                        "/Items/4/PlaybackInfo?SubtitleStreamIndex=3{query}"
+                    ))
+                    .insert_header(("X-Emby-Token", token.as_str()))
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload("{}")
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+            let v: serde_json::Value =
+                serde_json::from_slice(&test::read_body(resp).await).unwrap();
+            v["MediaSources"][0]["TranscodingUrl"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a burn must transcode: {v}"))
+                .to_string()
+        }
+    };
+
+    let kept = transcoding_url("").await;
+    assert!(!kept.contains("StereoMode=mono"), "{kept}");
+    let flat = transcoding_url("&StereoMode=mono").await;
+    assert!(flat.contains("StereoMode=mono"), "{flat}");
+
+    let metrics = pharos_server::obs::render();
+    let line = |reason: &str, stereo: &str| {
+        metrics.lines().any(|l| {
+            l.starts_with("pharos_playback_3d_decision_total")
+                && l.contains("format=\"HalfSideBySide\"")
+                && l.contains(&format!("reason=\"{reason}\""))
+                && l.contains(&format!("stereo_output=\"{stereo}\""))
+        })
+    };
+    assert!(line("burn_per_eye", "preserve"), "{metrics}");
+    assert!(line("stereo_mode_query", "mono2d"), "{metrics}");
+    assert!(!line("subtitle_burn", "mono2d"), "{metrics}");
+}
