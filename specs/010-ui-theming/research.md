@@ -24,6 +24,15 @@ on ali-desktop.
   the figure includes code (formatting, `std` pieces) the UI may already
   link. It is an upper bound. The first phase-1 task measures the real increment inside
   `pharos-ui` and records it here.
+- **In pharos-ui, measured 2026-11-02T12:10:00Z**: the `nix build .#pharosUiBundle`
+  wasm went from 1 684 972 B to 1 954 794 B on main bdf4b726. That is
+  +269 822 B (+16 %) raw, and gzip -9 went from 611 291 B to 720 797 B
+  (+109 506 B). The figure covers the whole phase-1 engine: `toml`, the
+  serde derives, error formatting, the 7 embedded themes (~8 KB of text) and
+  CSS emission. The probe above puts about 140 KB of it on `toml`. Whether
+  that is acceptable is the owner's call. If it is not, the first cut is to
+  parse JSON instead (no new dependency) and to merge `extends` on the typed
+  docs rather than through `toml::Table`.
 - **Alternatives**:
   - **JSON**: costs nothing extra, because `serde_json` is already a
     `pharos-ui` dependency. But it allows no comments, it is noisier to
