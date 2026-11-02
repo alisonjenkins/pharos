@@ -1042,37 +1042,8 @@ async fn media_segments(
     Ok(crate::api::jellyfin::wire::query_result(items, total, 0))
 }
 
-/// Whether this item has anything for a client to skip — a detected segment or
-/// a chapter whose title classifies as one.
-///
-/// B130 — this is what `MediaSource.HasSegments` must carry.
-/// jellyfin-web's `MediaSegmentManager.onPlayerPlaybackStart` reads that field
-/// and returns BEFORE calling `getItemSegments` when it is false, so a `false`
-/// here makes `/MediaSegments/{id}` unreachable from the web client no matter
-/// how correct its answer would be.
-///
-/// Answered from the same two sources `build_media_segments` serves, so the
-/// advertisement cannot disagree with the response: if this says yes, that
-/// endpoint returns at least one segment.
-pub(crate) async fn item_has_segments(state: &AppState, item: &pharos_core::MediaItem) -> bool {
-    use pharos_core::MediaSegmentStore;
-    if item
-        .probe
-        .chapters
-        .iter()
-        .any(|c| classify_chapter_title(&c.title).is_some())
-    {
-        return true;
-    }
-    matches!(state.stores.media_segments_for(item.id).await, Ok(s) if !s.is_empty())
-}
-
-/// Walk the item's chapter list and project intro / outro / recap
-/// chapters into Jellyfin's MediaSegment shape so jellyfin-web's
-/// "Skip Intro" overlay fires.
-///
-/// Heuristic-only: titles matching common patterns are classified;
-/// everything else is ignored.
+/// The item's segments in Jellyfin's MediaSegment shape; empty for an id that
+/// does not parse or an item that cannot be read.
 async fn build_media_segments(
     state: &AppState,
     item_id: &str,
@@ -1085,155 +1056,25 @@ async fn build_media_segments(
     let Ok(item) = state.stores.get(id).await else {
         return Vec::new();
     };
-    use pharos_core::MediaSegmentStore;
-    let mut out = Vec::new();
-    // Track which segment Types a CHAPTER already supplied — chapters are exact
-    // (author-labeled) so they win over a fingerprint/black-frame detection for
-    // the same Type (T86/ADR-0018 #6, layered sources).
-    let mut seen_types: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-    let chapters = &item.probe.chapters;
-    for (idx, c) in chapters.iter().enumerate() {
-        let Some(seg_type) = classify_chapter_title(&c.title) else {
-            continue;
-        };
-        // A second chapter of the same Type is a boundary marker ("Intro
-        // end"), not a real second span — ripper tools title the chapter
-        // AFTER the intro to describe the transition, and it matches the
-        // same substring. Keep only the first (B201/V154).
-        if !seen_types.insert(seg_type) {
-            continue;
-        }
-        let start_ticks = c.start_ms.saturating_mul(10_000);
-        // The chapter's `end_ms` is the *next* chapter's start —
-        // ffprobe carries it explicitly so we trust it.
-        let end_ticks = if c.end_ms > c.start_ms {
-            c.end_ms.saturating_mul(10_000)
-        } else {
-            start_ticks.saturating_add(30_000_000_000) // 30s fallback
-        };
-        out.push(MediaSegmentDto::new(
-            item_id,
-            &idx.to_string(),
-            start_ticks,
-            end_ticks,
-            seg_type,
-        ));
-    }
-    // T86 — union the auto-DETECTED segments (audio-fingerprint intro/outro,
-    // black-frame credits) the backfill persisted, skipping any Type a chapter
-    // already covered. This is what makes Skip Intro / Skip Outro work for the
-    // vast majority of TV rips, which carry no labeled intro chapters.
-    if let Ok(detected) = state.stores.media_segments_for(id).await {
-        for (di, seg) in detected.iter().enumerate() {
-            let t = seg.kind.as_str();
-            if seen_types.contains(t) {
-                continue;
-            }
-            out.push(MediaSegmentDto::new(
+    crate::services::segments::for_item(state, &item)
+        .await
+        .into_iter()
+        .map(|s| {
+            MediaSegmentDto::new(
                 item_id,
-                &format!("d{di}"),
-                seg.start_ms.saturating_mul(10_000),
-                seg.end_ms.saturating_mul(10_000),
-                t,
-            ));
-        }
-    }
-    out
-}
-
-/// Map a free-text chapter title to a Jellyfin MediaSegmentType.
-/// Returns None when the title doesn't look like an actionable
-/// segment.
-pub(crate) fn classify_chapter_title(title: &str) -> Option<&'static str> {
-    let lc = title.to_ascii_lowercase();
-    if lc.contains("intro") || lc.contains("opening") {
-        return Some("Intro");
-    }
-    if lc.contains("outro")
-        || lc.contains("end credits")
-        || lc.contains("closing")
-        || lc.starts_with("credits")
-    {
-        return Some("Outro");
-    }
-    if lc.contains("recap") || lc.contains("previously on") {
-        return Some("Recap");
-    }
-    if lc.contains("preview") || lc.contains("next on") {
-        return Some("Preview");
-    }
-    if lc.contains("commercial") {
-        return Some("Commercial");
-    }
-    None
+                &s.key,
+                s.start_ms.saturating_mul(10_000),
+                s.end_ms.saturating_mul(10_000),
+                s.kind,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod media_segments_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-
-    #[test]
-    fn classify_chapter_title_branches() {
-        assert_eq!(classify_chapter_title("Opening"), Some("Intro"));
-        assert_eq!(classify_chapter_title("Intro 1"), Some("Intro"));
-        assert_eq!(classify_chapter_title("End credits"), Some("Outro"));
-        assert_eq!(classify_chapter_title("Credits"), Some("Outro"));
-        assert_eq!(classify_chapter_title("Previously on"), Some("Recap"));
-        assert_eq!(classify_chapter_title("Recap"), Some("Recap"));
-        assert_eq!(classify_chapter_title("Next on"), Some("Preview"));
-        assert_eq!(
-            classify_chapter_title("Commercial break"),
-            Some("Commercial")
-        );
-        assert_eq!(classify_chapter_title("Chapter 4"), None);
-        assert_eq!(classify_chapter_title("The Beach"), None);
-    }
-
-    #[actix_web::test]
-    async fn build_media_segments_keeps_only_first_chapter_per_type() {
-        // B201: "Intro start" / "Intro end" is a boundary-marker pair, not
-        // two real intro spans. The second chapter must not surface as its
-        // own segment covering the rest of the episode (V154).
-        use crate::state::{AppState, Stores};
-        use pharos_core::{MediaChapter, MediaItem, MediaKind, MediaProbe, MediaStore};
-
-        let stores = Stores::connect("sqlite::memory:").await.unwrap();
-        stores
-            .put(MediaItem {
-                id: 42,
-                path: "/sabrina-s01e02.mkv".into(),
-                title: "Chapter Two".into(),
-                kind: MediaKind::Episode,
-                probe: MediaProbe {
-                    chapters: vec![
-                        MediaChapter {
-                            start_ms: 0,
-                            end_ms: 102_853,
-                            title: "Intro start".into(),
-                        },
-                        MediaChapter {
-                            start_ms: 102_853,
-                            end_ms: 3_429_760,
-                            title: "Intro end".into(),
-                        },
-                    ],
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let state = AppState::new(stores, "t".into());
-
-        let segs = build_media_segments(&state, "42").await;
-        let intros: Vec<_> = segs.iter().filter(|s| s.kind == "Intro").collect();
-        assert_eq!(
-            intros.len(),
-            1,
-            "a same-Type second chapter must be dropped as a boundary marker, not unioned in: {segs:?}"
-        );
-    }
 
     #[test]
     fn folder_storage_reports_real_figures_for_existing_dir() {

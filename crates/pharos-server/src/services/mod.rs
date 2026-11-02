@@ -7,4 +7,5 @@ pub mod auth;
 pub mod library;
 pub mod play_state;
 pub mod playback;
+pub mod segments;
 pub mod user_data;

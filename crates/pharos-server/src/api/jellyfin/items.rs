@@ -2739,7 +2739,7 @@ async fn playback_info(
     // never asks and the skip button never appears. Instrumented as a decision
     // (V75's sibling): the verdict alone cannot distinguish "no segments" from
     // "never looked".
-    let has_segments = crate::api::jellyfin::system::item_has_segments(&state, &item).await;
+    let has_segments = crate::services::segments::any(&state, &item).await;
     tracing::debug!(
         media.id = id,
         has_segments,
