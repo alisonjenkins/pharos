@@ -134,6 +134,8 @@ pub async fn resume(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     fn api(kind: &'static str) -> ClientError {
@@ -142,6 +144,31 @@ mod tests {
             reason: String::new(),
             trace_id: String::new(),
         }
+    }
+
+    /// A `Done` that carries an `Error` is that error, not success, so a
+    /// refused report or stop surfaces.
+    #[test]
+    fn a_done_error_is_an_api_error() {
+        let mut message = capnp::message::Builder::new_default();
+        let mut out = message.init_root::<done::Builder<'_>>();
+        out.reborrow().init_error().init_kind().set_revoked(());
+        let err = read_done(out.into_reader()).expect_err("an error result");
+        assert!(
+            matches!(
+                err,
+                ClientError::Api {
+                    kind: "revoked",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        let mut message = capnp::message::Builder::new_default();
+        let mut out = message.init_root::<done::Builder<'_>>();
+        out.set_ok(());
+        assert!(read_done(out.into_reader()).is_ok());
     }
 
     /// The server answers `notPermitted` to signed-in users too (an
