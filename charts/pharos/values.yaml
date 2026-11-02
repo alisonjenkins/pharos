@@ -69,9 +69,9 @@ config:
   server:
     bind: "0.0.0.0:8096"
     name: "pharos"
-    # In-image Dioxus UI bundle path (only if the image was built with it).
-    # Leave null to use the optional jellyfin-web UI deployment instead.
-    uiDir: null
+    # pharos-ui bundle baked into the image (ADR-0033), served at `/`.
+    # null serves no UI; `/` then answers "pharos".
+    uiDir: "/share/pharos-ui"
     # Caches live under the cache volume (see persistence.cache).
     imageCacheDir: "/var/lib/pharos/cache/images"
     imageSeekSeconds: 30
@@ -294,10 +294,11 @@ jellyfinWeb:
   service:
     type: ClusterIP
 
-# pharos-ui: pharos's own Dioxus UI. angie image serving the WASM bundle
-# under /ui/ + reverse-proxying the REST API to pharos, same-origin.
+# pharos-ui sidecar: the old angie image serving the bundle under /ui/.
+# Superseded by ADR-0033 (pharos serves the UI itself via config.server.uiDir);
+# its image is not published.
 pharosUi:
-  enabled: true
+  enabled: false
   image:
     repository: pharos-ui
     tag: "latest"
