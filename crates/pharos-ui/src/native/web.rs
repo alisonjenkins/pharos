@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use super::diagnostics::{self, Sink};
 use gloo_net::http::Request;
 use pharos_client::api::{Capabilities, ClientEvent, ClientEventKind, ClientLevel, NativeApi};
 use pharos_client::browser::{self, Connection};
@@ -501,14 +502,9 @@ pub fn warn(message: &str) {
     web_sys::console::warn_1(&message.into());
 }
 
-/// Events raised before the session opens wait here, bounded, and go out
-/// with the first batch once it does.
-const MAX_PENDING_EVENTS: usize = 32;
-
 #[derive(Default)]
 struct Telemetry {
-    api: Option<NativeApi>,
-    pending: Vec<ClientEvent>,
+    sink: Sink<NativeApi>,
     failure_logged: bool,
 }
 
@@ -516,38 +512,47 @@ thread_local! {
     static TELEMETRY: RefCell<Telemetry> = RefCell::new(Telemetry::default());
 }
 
+/// Whether this browser has opted in to sending diagnostics. Unreadable
+/// storage counts as opted out.
+pub fn opted_in() -> bool {
+    diagnostics::opt_in_from(
+        stored_theme(diagnostics::OPT_IN_KEY)
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
+/// Stores this browser's diagnostics opt-in.
+pub fn set_opted_in(on: bool) -> Result<(), String> {
+    store_theme(diagnostics::OPT_IN_KEY, if on { "true" } else { "false" })
+}
+
 /// Sends the session's client events from now on, and the held ones.
 pub fn install_telemetry(api: &NativeApi) {
-    let held = TELEMETRY.with(|t| {
-        let mut t = t.borrow_mut();
-        t.api = Some(api.clone());
-        std::mem::take(&mut t.pending)
-    });
+    let opted = opted_in();
+    let held = TELEMETRY.with(|t| t.borrow_mut().sink.install(api.clone(), opted));
     if !held.is_empty() {
         send(api.clone(), held);
     }
 }
 
-/// Submits one client event without waiting for it. Before the session
-/// opens it is held, up to [`MAX_PENDING_EVENTS`], and the rest are dropped.
+/// Submits one client event without waiting for it, if opted in. Opted out,
+/// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
-    let api = TELEMETRY.with(|t| {
-        let mut t = t.borrow_mut();
-        if let Some(api) = t.api.clone() {
-            return Some(api);
-        }
-        if t.pending.len() < MAX_PENDING_EVENTS {
-            t.pending.push(event.clone());
-        }
-        None
-    });
-    if let Some(api) = api {
+    let opted = opted_in();
+    let submit = TELEMETRY.with(|t| t.borrow_mut().sink.report(opted, event));
+    if let Some((api, event)) = submit {
         send(api, vec![event]);
     }
 }
 
 fn send(api: NativeApi, events: Vec<ClientEvent>) {
     wasm_bindgen_futures::spawn_local(async move {
+        // Checked again here: the opt-in may have been turned off since the event was raised.
+        if !opted_in() {
+            return;
+        }
         let call = pharos_client::CallInfo {
             ui_route: "telemetry".into(),
             ui_action: "submit".into(),

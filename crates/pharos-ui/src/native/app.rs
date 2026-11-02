@@ -880,6 +880,7 @@ fn AppearanceScreen() -> Element {
     let themes = use_context::<Themes>();
     let mut editing = use_signal(|| None::<Editing>);
     let notice = use_signal(|| None::<Notice>);
+    let mut diagnostics = use_signal(platform::opted_in);
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -899,6 +900,7 @@ fn AppearanceScreen() -> Element {
         .as_ref()
         .map(|state| editor_view(state, &themes.catalogue.read()));
     let notice_now = notice.read().clone();
+    let diagnostics_on = *diagnostics.read();
 
     rsx! {
         AppearanceView {
@@ -906,6 +908,15 @@ fn AppearanceScreen() -> Element {
             auto,
             editor,
             notice: notice_now,
+            diagnostics: diagnostics_on,
+            on_diagnostics: move |on: bool| match platform::set_opted_in(on) {
+                Ok(()) => diagnostics.set(on),
+                Err(e) => notify(
+                    notice,
+                    format!("Could not save the diagnostics choice: {e}"),
+                    true,
+                ),
+            },
             on_pick: move |name: String| {
                 editing.set(None);
                 themes.choose(name.clone());
