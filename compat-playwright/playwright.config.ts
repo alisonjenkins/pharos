@@ -36,7 +36,10 @@ export default defineConfig({
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: 1,
+  // Files run in parallel; tests inside a file stay serial (fullyParallel
+  // false). Every spec makes its own browser context and SyncPlay group, so
+  // files share only the seeded server. 4 cut the suite from ~96s to ~30s.
+  workers: 4,
   reporter: process.env.CI ? "github" : "list",
   timeout: 60_000,
 
