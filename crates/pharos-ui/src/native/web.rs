@@ -903,6 +903,15 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     if !same_origin {
         return Err(format!("cross-origin source {src}"));
     }
+    // WebKit's native HLS feeds a MediaElementAudioSourceNode silence, so a
+    // routed element would go quiet; leave it unrouted and draw idle.
+    if src
+        .split('?')
+        .next()
+        .is_some_and(|path| path.ends_with(".m3u8"))
+    {
+        return Err(format!("native HLS source {src}"));
+    }
     let js = |e: JsValue| format!("{e:?}");
     let context = web_sys::AudioContext::new().map_err(js)?;
     let source = context.create_media_element_source(&media).map_err(js)?;
