@@ -3770,10 +3770,10 @@ async fn latest_items(
     )
     .await
     .map_err(|e| match e {
-        crate::services::library::LatestError::Hidden(hidden) => {
+        crate::services::library::ListError::Hidden(hidden) => {
             crate::api::jellyfin::access_error(hidden)
         }
-        crate::services::library::LatestError::Store(e) => {
+        crate::services::library::ListError::Store(e) => {
             error::ErrorInternalServerError(e.to_string())
         }
     })?;

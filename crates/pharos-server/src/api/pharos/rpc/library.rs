@@ -13,7 +13,7 @@ use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 use super::bootstrap::token_denial;
 use super::session::Session;
 use crate::services::auth::{user_for_token, TokenRefusal};
-use crate::services::library::{self, KindFilter, LatestError, LibraryView};
+use crate::services::library::{self, KindFilter, LibraryView, ListError};
 
 pub(super) struct Library {
     session: Rc<Session>,
@@ -103,8 +103,8 @@ impl server::library::Handler for Library {
             Ok(rows) => rows,
             Err(e) => {
                 let detail = match &e {
-                    LatestError::Hidden(hidden) => hidden.label().to_owned(),
-                    LatestError::Store(e) => e.to_string(),
+                    ListError::Hidden(hidden) => hidden.label().to_owned(),
+                    ListError::Store(e) => e.to_string(),
                 };
                 tracing::warn!(error = %detail, "native library: latest unavailable");
                 Denial::Unavailable {
