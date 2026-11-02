@@ -87,6 +87,10 @@ async fn add_remote_item(
     if url.is_empty() {
         return Err(error::ErrorBadRequest("url is required"));
     }
+    if let Err(e) = resolver.check_target(url).await {
+        refused(&user.0.name, url, e.label(), &e.to_string());
+        return Err(error::ErrorBadRequest(e.to_string()));
+    }
 
     let resolved = resolver.describe(url).await.map_err(|e| {
         tracing::warn!(url, error = %e, "could not catalogue a URL");

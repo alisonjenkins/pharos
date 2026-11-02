@@ -78,6 +78,12 @@ pub struct RemoteConfig {
     /// be revoked before any TTL elapses.
     #[serde(default = "default_resolve_ttl_secs")]
     pub resolve_ttl_secs: u64,
+    /// Hosts a URL may name although they resolve to a private, loopback or
+    /// link-local address (B260). Empty, the default, means a catalogued URL
+    /// must point at the public internet: cataloguing makes the server fetch
+    /// it, and a LAN address would turn that into a request from inside.
+    #[serde(default)]
+    pub allow_private_hosts: Vec<String>,
 }
 
 fn default_ytdlp_bin() -> String {
@@ -117,6 +123,7 @@ impl Default for RemoteConfig {
             cache_dir: None,
             cache_max_bytes: default_remote_cache_max_bytes(),
             resolve_ttl_secs: default_resolve_ttl_secs(),
+            allow_private_hosts: Vec::new(),
         }
     }
 }
