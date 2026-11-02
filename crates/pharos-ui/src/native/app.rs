@@ -12,6 +12,7 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
@@ -19,8 +20,8 @@ use super::playback::{
 };
 use super::route::Route;
 use super::views::{
-    BrowseView, ErrorNote, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
-    WatchView, VIDEO_ID,
+    BrowseView, ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView,
+    TitleView, WatchView, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -810,8 +811,47 @@ fn Screen(route: Route) -> Element {
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
         Route::Appearance => rsx! { AppearanceScreen {} },
+        Route::Find => rsx! { FindScreen {} },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
+}
+
+/// The find screen: each edit of the box starts a debounced search, and only
+/// the reply to the newest edit is shown.
+#[component]
+fn FindScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut text = use_signal(String::new);
+    let mut find = use_signal(Find::default);
+    let mut hits = use_signal(|| Hits::Idle);
+    let on_input = move |value: String| {
+        text.set(value.clone());
+        let Some(generation) = find.write().edit(&value) else {
+            hits.set(Hits::Idle);
+            return;
+        };
+        spawn(async move {
+            platform::sleep_ms(DEBOUNCE_MS).await;
+            if !find.peek().is_current(generation) {
+                return;
+            }
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            let term = find.peek().term().to_owned();
+            let reply = api
+                .search(&call("find", "search"), &term, RESULT_LIMIT)
+                .await;
+            if !find.peek().is_current(generation) {
+                return;
+            }
+            match settle(ctx.machine, reply) {
+                Ok(page) => hits.set(Hits::Found(page)),
+                Err(message) => hits.set(Hits::Failed(message)),
+            }
+        });
+    };
+    rsx! { FindView { text: text(), hits: hits(), on_input } }
 }
 
 /// Replace the current route once mounted (signed in at `/signin`).

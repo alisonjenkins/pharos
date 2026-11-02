@@ -42,6 +42,7 @@ pub fn Shell(on_sign_out: EventHandler<()>, children: Element) -> Element {
             header { class: "pharos-banner pharos-shell-bar",
                 Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
                 nav { class: "pharos-shell-nav",
+                    Link { to: Route::Find, "Find" }
                     Link { to: Route::Appearance, "Appearance" }
                     Link { to: Route::Manage, "Manage" }
                     button {
@@ -202,6 +203,54 @@ pub fn BrowseView(title: String, page: Page) -> Element {
                 p { class: "pharos-muted",
                     "Showing {page.items.len()} of {page.total}."
                 }
+            }
+        }
+    }
+}
+
+/// What the find screen shows under its box.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Hits {
+    /// Nothing asked yet: the box is blank.
+    Idle,
+    /// The matches for the newest term; empty when nothing matched.
+    Found(Page),
+    Failed(String),
+}
+
+const FIND_INPUT: &str = "find-input";
+
+/// The search box and the matches under it. Typing reports each new text
+/// through `on_input`; the grid is the same poster tiles a library shows.
+#[component]
+pub fn FindView(text: String, hits: Hits, on_input: EventHandler<String>) -> Element {
+    rsx! {
+        section { class: "pharos-find",
+            h2 { "Find" }
+            div { class: "pharos-find-field",
+                label { r#for: FIND_INPUT, "Search" }
+                input {
+                    id: FIND_INPUT,
+                    r#type: "search",
+                    autocomplete: "off",
+                    value: "{text}",
+                    oninput: move |evt: FormEvent| on_input.call(evt.value()),
+                }
+            }
+            match hits {
+                Hits::Idle => rsx! {},
+                Hits::Failed(message) => rsx! { ErrorNote { message } },
+                Hits::Found(page) if page.items.is_empty() => rsx! {
+                    p { class: "pharos-empty", role: "status", "No matches" }
+                },
+                Hits::Found(page) => rsx! {
+                    p { class: "pharos-muted", role: "status", "{page.total} found" }
+                    ul { class: "pharos-grid",
+                        for item in page.items.iter() {
+                            li { key: "{item.id}", PosterTile { item: item.clone() } }
+                        }
+                    }
+                },
             }
         }
     }
