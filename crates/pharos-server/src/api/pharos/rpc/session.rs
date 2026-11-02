@@ -7,9 +7,10 @@ use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
 use pharos_core::{AuthError, User};
 
+use super::bootstrap::token_denial;
 use super::library::Library;
 use super::ConnectionCtx;
-use crate::services::auth::{revoke_token, RevokeCause};
+use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
 use crate::state::AppState;
 
 pub(super) struct Session {
@@ -45,6 +46,22 @@ impl Session {
         self.ctx.has_ended(&self.token).then_some(Denial::Revoked {
             reason: "logged out",
         })
+    }
+
+    /// The session's user as the store has them now, so a policy change or
+    /// a disabled account applies to the next call, not the next sign-in.
+    pub(super) async fn current_user(&self) -> Result<User, Denial> {
+        if let Some(denial) = self.ended() {
+            return Err(denial);
+        }
+        user_for_token(&self.state.stores, &self.token)
+            .await
+            .map_err(|refusal| {
+                if let TokenRefusal::Unavailable(detail) = &refusal {
+                    tracing::warn!(error = %detail, "native session: token store unavailable");
+                }
+                token_denial(&refusal)
+            })
     }
 }
 
