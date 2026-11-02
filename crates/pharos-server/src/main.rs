@@ -244,7 +244,8 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
-        .hash_password(&SecretString::new("playwright-test-pw"))
+        .hash_password_off_worker(&SecretString::new("playwright-test-pw"))
+        .await
         .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
     let user = UserRecord {
         id: UserId::new(),
@@ -951,7 +952,8 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
         .await
         .map_err(|e| AppError::Io(std::io::Error::other(format!("look up user '{name}': {e}"))))?;
     let hash = auth
-        .hash_password(&SecretString::new(password.to_string()))
+        .hash_password_off_worker(&SecretString::new(password.to_string()))
+        .await
         .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
     stores
         .set_password(record.id, hash)
@@ -1020,7 +1022,8 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
-        .hash_password(&SecretString::new("playwright-test-pw"))
+        .hash_password_off_worker(&SecretString::new("playwright-test-pw"))
+        .await
         .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
     let user = UserRecord {
         id: UserId::new(),
