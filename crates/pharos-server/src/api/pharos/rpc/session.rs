@@ -9,6 +9,7 @@ use pharos_core::{AuthError, User};
 
 use super::bootstrap::token_denial;
 use super::library::Library;
+use super::user_data::UserData;
 use super::ConnectionCtx;
 use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
 use crate::state::AppState;
@@ -93,6 +94,20 @@ impl server::session::Handler for Session {
         results
             .get()
             .set_library(server::library::client(Library::new(self), &conn));
+        Ok(())
+    }
+
+    /// Never refused, like `library`; each `UserData` call checks the
+    /// session itself.
+    async fn user_data(
+        self: Rc<Self>,
+        _params: wire::UserDataParams,
+        results: &mut wire::UserDataResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_user_data(server::user_data::client(UserData::new(self), &conn));
         Ok(())
     }
 
