@@ -1,7 +1,11 @@
 import { test, expect } from "@playwright/test";
 
 // T51 phase 3 — drive the pharos Dioxus UI (served at `/` by
-// `[server].ui_dir`) end-to-end through a real Chromium.
+// `[server].ui_dir`) end-to-end through a real Chromium: the native app
+// at `/` and legacy management panes at `/manage`.
+//
+// The native sign-in tests need `[server.native_api].enabled = true`, the
+// test origin in `allowed_origins`, and https; with the API off they skip.
 //
 // Skips cleanly when `/` is not the UI — useful in environments where the
 // WASM bundle hasn't been built. Build with:
@@ -23,7 +27,7 @@ test.describe("pharos Dioxus UI", () => {
     );
   });
 
-  test("login form renders, sign-in button present", async ({ page }) => {
+  test("legacy panes at /manage: login form renders, sign-in button present", async ({ page }) => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
     page.on("requestfailed", (r) => {
@@ -33,7 +37,7 @@ test.describe("pharos Dioxus UI", () => {
       }
     });
 
-    await page.goto("/");
+    await page.goto("/manage");
 
     // App shell renders.
     await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
@@ -53,8 +57,8 @@ test.describe("pharos Dioxus UI", () => {
     expect(errors, errors.join("\n")).toEqual([]);
   });
 
-  test("server-picker toggle reveals the picker form", async ({ page }) => {
-    await page.goto("/");
+  test("legacy panes at /manage: server-picker toggle reveals the picker form", async ({ page }) => {
+    await page.goto("/manage");
     await page.locator(".pharos-switch-server").click();
     await expect(page.locator(".pharos-server-picker")).toBeVisible();
     // Either an empty-state or the saved-server list renders.
@@ -67,7 +71,7 @@ test.describe("pharos Dioxus UI", () => {
     ).toHaveValue(new RegExp(PHAROS_URL.replace(/^https?:\/\//, "")));
   });
 
-  test("login with seeded creds reaches the library nav", async ({ page }) => {
+  test("legacy panes at /manage: login with seeded creds reaches the library nav", async ({ page }) => {
     const auth = await page.request.post(
       `${PHAROS_URL}/Users/AuthenticateByName`,
       {
@@ -83,7 +87,7 @@ test.describe("pharos Dioxus UI", () => {
       `pharos has no seeded test user (${TEST_USER}); skipping login flow`,
     );
 
-    await page.goto("/");
+    await page.goto("/manage");
     await page.locator('input[type="text"]').fill(TEST_USER);
     await page.locator('input[type="password"]').fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
@@ -96,5 +100,110 @@ test.describe("pharos Dioxus UI", () => {
     await expect(page.locator(".pharos-nav-livetv")).toBeVisible();
     await expect(page.locator(".pharos-nav-prefs")).toBeVisible();
     await expect(page.locator(".pharos-nav-remote")).toBeVisible();
+  });
+
+  test.describe("native app at /", () => {
+    test("root shows the native app's state", async ({ page }) => {
+      const errors: string[] = [];
+      page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
+
+      await page.goto("/");
+
+      await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
+
+      const signin = page.locator("form#signin");
+      const notEnabled = page.locator("section.pharos-status", {
+        hasText: "This interface is not enabled",
+      });
+      await expect(signin.or(notEnabled)).toBeVisible({ timeout: 10_000 });
+
+      expect(errors, errors.join("\n")).toEqual([]);
+    });
+
+    test("not-enabled page links to Manage", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 404,
+        `native API is on (status ${probe.status()}); skipping not-enabled test`,
+      );
+
+      await page.goto("/");
+      await page.getByRole("button", { name: "Open Manage" }).click();
+      await expect(page).toHaveURL(/\/manage$/);
+      await expect(page.locator("form")).toBeVisible();
+      await expect(page.locator('input[type="password"]')).toBeVisible();
+    });
+
+    test("native sign-in reaches home", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await expect(
+        page.locator(".pharos-shell-nav").getByRole("link", { name: "Manage" }),
+      ).toBeVisible();
+
+      await page.getByRole("button", { name: "Sign out" }).click();
+      await expect(page.locator("form#signin")).toBeVisible();
+    });
+
+    test("a wrong password says so", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill("definitely-wrong");
+      await page.getByRole("button", { name: "Sign in" }).click();
+
+      await expect(page.locator('[role="alert"]')).toContainText(
+        /Wrong name or password|Too many failed attempts/,
+      );
+    });
+
+    test("unknown route renders a message, not a blank page", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await page.goto("/nope");
+      await expect(page.getByText("Nothing at /nope.")).toBeVisible({
+        timeout: 15_000,
+      });
+    });
   });
 });
