@@ -1028,7 +1028,6 @@ async fn list_artists(
     user: AuthUser,
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
-    use crate::api::jellyfin::dto::artist_id_for;
     use std::collections::HashSet;
     let all = state
         .list_items_cached()
@@ -1060,21 +1059,7 @@ async fn list_artists(
         }
     }
     names.sort();
-    let items: Vec<SynthItemDto> = names
-        .iter()
-        .map(|n| SynthItemDto {
-            image_tags: Some(Default::default()),
-            backdrop_image_tags: Some(Vec::new()),
-            genres: Some(Vec::new()),
-            tags: Some(Vec::new()),
-            ..SynthItemDto::folder(
-                artist_id_for(n),
-                n.clone(),
-                state.server_id.clone(),
-                "MusicArtist",
-            )
-        })
-        .collect();
+    let items: Vec<SynthItemDto> = names.iter().map(|n| artist_folder(&state, n)).collect();
     let mut items = items;
     crate::api::jellyfin::images::stamp_synth_image_tags(&state, &mut items).await;
     let total = items.len() as u32;
@@ -3741,6 +3726,76 @@ fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]
     }
 }
 
+/// Whether audio row `i` is filed under `artist` on an artist page: its
+/// album artist, or its track artist when it has no album artist.
+pub(crate) fn on_artist_page(i: &MediaItem, artist: &str) -> bool {
+    filed_artist(i).is_some_and(|a| a.eq_ignore_ascii_case(artist))
+}
+
+fn filed_artist(i: &MediaItem) -> Option<&str> {
+    i.probe
+        .album_artist
+        .as_deref()
+        .or(i.probe.artist.as_deref())
+}
+
+/// The albums the kept audio rows of `items` make up, sorted per the
+/// request, as DTOs.
+pub(crate) async fn album_dtos(
+    state: &AppState,
+    items: &[MediaItem],
+    keep: impl Fn(&MediaItem) -> bool,
+    sort_by: Option<&str>,
+    orders: &[bool],
+) -> Vec<serde_json::Value> {
+    let mut aggs = aggregate_albums(items, keep);
+    sort_album_aggs(&mut aggs, sort_by, orders);
+    let mut dtos = Vec::with_capacity(aggs.len());
+    for a in &aggs {
+        dtos.push(synth_album_dto(state, a).await);
+    }
+    dtos
+}
+
+/// The artists the audio rows of `items` are filed under (see
+/// [`on_artist_page`]), each once, in name order, as DTOs. Every artist
+/// listed has at least one track on its artist page.
+pub(crate) async fn filed_artist_dtos(
+    state: &AppState,
+    items: &[MediaItem],
+) -> Vec<serde_json::Value> {
+    let mut names: Vec<&str> = items
+        .iter()
+        .filter(|i| i.kind == MediaKind::Audio)
+        .filter_map(filed_artist)
+        .filter(|n| !n.is_empty())
+        .collect();
+    names.sort_by_cached_key(|n| (n.to_lowercase(), n.to_string()));
+    names.dedup();
+    let mut dtos: Vec<SynthItemDto> = names.into_iter().map(|n| artist_folder(state, n)).collect();
+    crate::api::jellyfin::images::stamp_synth_image_tags(state, &mut dtos).await;
+    dtos.into_iter()
+        .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
+        .collect()
+}
+
+/// The folder DTO for artist `name`, as `/Artists` lists it.
+fn artist_folder(state: &AppState, name: &str) -> SynthItemDto {
+    use crate::api::jellyfin::dto::artist_id_for;
+    SynthItemDto {
+        image_tags: Some(Default::default()),
+        backdrop_image_tags: Some(Vec::new()),
+        genres: Some(Vec::new()),
+        tags: Some(Vec::new()),
+        ..SynthItemDto::folder(
+            artist_id_for(name),
+            name.to_owned(),
+            state.server_id.clone(),
+            "MusicArtist",
+        )
+    }
+}
+
 /// Music short-circuits for `/Items` + `/Users/{u}/Items`. Returns `None`
 /// when the request isn't a music-shaped one (the caller continues down
 /// the SQL list path).
@@ -3789,18 +3844,14 @@ async fn maybe_list_music(
     if let Some(artist) = artist_parent {
         // Discography: albums whose album artist is this artist, falling
         // back to the track `artist` for untagged album_artist rows.
-        let mut aggs = aggregate_albums(&all, |i| {
-            i.probe
-                .album_artist
-                .as_deref()
-                .or(i.probe.artist.as_deref())
-                .is_some_and(|a| a.eq_ignore_ascii_case(&artist))
-        });
-        sort_album_aggs(&mut aggs, q.sort_by.as_deref(), &orders);
-        let mut items: Vec<serde_json::Value> = Vec::new();
-        for a in aggs.iter() {
-            items.push(synth_album_dto(state, a).await);
-        }
+        let mut items = album_dtos(
+            state,
+            &all,
+            |i| on_artist_page(i, &artist),
+            q.sort_by.as_deref(),
+            &orders,
+        )
+        .await;
         // Loose tracks (no album tag) still belong on the artist page.
         let loose: Vec<&MediaItem> = all
             .iter()
@@ -5624,7 +5675,7 @@ fn fill_parent_ids(state: &AppState, dtos: &mut [BaseItemDto], items: &[&MediaIt
 /// show folders — a mixed request (e.g. `Series,Movie`) falls through to the
 /// normal media query so real kinds still page from SQL.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ShowFolderKind {
+pub(crate) enum ShowFolderKind {
     Series,
     Season,
 }
@@ -5738,28 +5789,142 @@ async fn maybe_list_virtual_shows(
     policy: &pharos_core::UserPolicy,
     q: &ListQuery,
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
-    use std::collections::BTreeMap;
-
     let Some(mode) = virtual_show_kind(q.include_item_types.as_deref()) else {
         return Ok(None);
     };
+    let page = virtual_shows_page(
+        state,
+        user_id,
+        policy,
+        q.parent_id.as_deref(),
+        mode,
+        &q.into(),
+    )
+    .await?;
+    Ok(Some(crate::api::jellyfin::wire::query_result(
+        page.items,
+        page.total,
+        q.start_index,
+    )))
+}
+
+/// One page of synthesised items (series, seasons, albums, artists) as their
+/// Jellyfin DTOs, with the number of matches before paging. `/Items` encodes
+/// it as a query result; the native `Library.query` reads each DTO into an
+/// `ItemSummary`, so the two APIs list the same groups.
+pub(crate) struct SynthPage {
+    pub(crate) items: Vec<serde_json::Value>,
+    pub(crate) total: u32,
+}
+
+/// `items` paged by `start` and `limit` (`None` is every item).
+fn synth_page(mut items: Vec<serde_json::Value>, start: u32, limit: Option<u32>) -> SynthPage {
+    let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+    let start = (start as usize).min(items.len());
+    let end = start
+        .saturating_add(limit.map_or(usize::MAX, |l| l as usize))
+        .min(items.len());
+    SynthPage {
+        items: items.drain(start..end).collect(),
+        total,
+    }
+}
+
+/// The audio rows under `parent` that `user` may see, unpaged and unsorted:
+/// the library, folder and parental scoping of the stored listing, for the
+/// album and artist groupings to fold.
+pub(crate) async fn scoped_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    parent: &ParentResolution,
+) -> Result<Vec<MediaItem>, actix_web::Error> {
+    if matches!(parent, ParentResolution::Empty) {
+        return Ok(Vec::new());
+    }
+    let mut mq = build_media_query(user.id, &ItemQuery::default(), parent, true);
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    mq.kinds = vec![MediaKind::Audio];
+    mq.limit = None;
+    mq.start_index = 0;
+    mq.sort = Vec::new();
+    let (tracks, _total) = state
+        .stores
+        .query(&mq)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(tracks)
+}
+
+/// What a music listing folds its tracks into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MusicGrouping {
+    Album,
+    Artist,
+}
+
+/// The albums or artists under `parent_id`, folded out of the stored tracks
+/// there. Under an artist, albums are that artist's own (its artist page's
+/// discography, without loose tracks); under a library or folder, every
+/// album or artist with a track in it.
+pub(crate) async fn music_groups_page(
+    state: &AppState,
+    user: &pharos_core::User,
+    parent_id: Option<&str>,
+    grouping: MusicGrouping,
+    q: &ItemQuery,
+) -> Result<SynthPage, actix_web::Error> {
+    let parent = resolve_parent_filter(state, parent_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let tracks = scoped_tracks(state, user, &parent).await?;
+    let artist = match &parent {
+        ParentResolution::Filter(pharos_core::ParentFilter::Artist { name }) => Some(name.as_str()),
+        _ => None,
+    };
+    let items = match grouping {
+        MusicGrouping::Album => {
+            let orders = parse_sort_orders(q.sort_order.as_deref());
+            album_dtos(
+                state,
+                &tracks,
+                |i| artist.map_or(true, |a| on_artist_page(i, a)),
+                q.sort_by.as_deref(),
+                &orders,
+            )
+            .await
+        }
+        MusicGrouping::Artist => filed_artist_dtos(state, &tracks).await,
+    };
+    Ok(synth_page(items, q.start_index, q.limit))
+}
+
+/// The series (or one series' seasons) under `parent_id`, folded out of the
+/// stored episodes there: pharos stores no Series or Season row.
+pub(crate) async fn virtual_shows_page(
+    state: &AppState,
+    user_id: UserId,
+    policy: &pharos_core::UserPolicy,
+    parent_id: Option<&str>,
+    mode: ShowFolderKind,
+    q: &ItemQuery,
+) -> Result<SynthPage, actix_web::Error> {
+    use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
+    use std::collections::BTreeMap;
 
     // Reuse the full parent/search scoping the media query already implements:
     // fetch the matching EPISODES unpaged, then collapse them in memory. The
     // SearchTerm→series_name match means a `SearchTerm=Code Geass` browse
     // narrows to that show before collapsing.
-    let parent = resolve_parent_filter(state, q.parent_id.as_deref())
+    let parent = resolve_parent_filter(state, parent_id)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     if matches!(parent, ParentResolution::Empty) {
-        return Ok(Some(crate::api::jellyfin::wire::query_result(
-            Vec::<serde_json::Value>::new(),
-            0,
-            q.start_index,
-        )));
+        return Ok(SynthPage {
+            items: Vec::new(),
+            total: 0,
+        });
     }
-    let mut mq = build_media_query(user_id, &q.into(), &parent, true);
+    let mut mq = build_media_query(user_id, q, &parent, true);
     apply_policy_scope(&mut mq, policy, &state.parental_ratings);
     mq.kinds = vec![MediaKind::Episode];
     mq.limit = None;
@@ -5905,20 +6070,8 @@ async fn maybe_list_virtual_shows(
         // Stable: ties keep the name-then-folder order the map produced.
         rows.sort_by(|a, b| compare_by_chain(&a.0, &b.0, &chain, ShowSortKeys::value));
     }
-    let mut items: Vec<serde_json::Value> = rows.into_iter().map(|(_, dto)| dto).collect();
-    let total = items.len() as u32;
-    let start = q.start_index as usize;
-    let end = start.saturating_add(q.take_limit()).min(items.len());
-    let page: Vec<serde_json::Value> = if start >= items.len() {
-        Vec::new()
-    } else {
-        items.drain(start..end).collect()
-    };
-    Ok(Some(crate::api::jellyfin::wire::query_result(
-        page,
-        total,
-        q.start_index,
-    )))
+    let items: Vec<serde_json::Value> = rows.into_iter().map(|(_, dto)| dto).collect();
+    Ok(synth_page(items, q.start_index, q.limit))
 }
 
 /// A series or season lives in one show folder, so one library: the episode
