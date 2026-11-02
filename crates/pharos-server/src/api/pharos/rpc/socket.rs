@@ -226,25 +226,34 @@ impl Recheck {
 /// each message takes one token. Time is passed in so tests use synthetic
 /// instants.
 #[derive(Debug)]
-struct MessageBucket {
+pub(super) struct MessageBucket {
     tokens: f64,
     last: Instant,
+    burst: f64,
+    per_second: f64,
 }
 
 impl MessageBucket {
     fn new(now: Instant) -> Self {
+        Self::with_rate(now, INBOUND_MESSAGE_BURST, INBOUND_MESSAGES_PER_SECOND)
+    }
+
+    /// A bucket that starts full at `burst` and refills at `per_second`.
+    pub(super) fn with_rate(now: Instant, burst: u32, per_second: u32) -> Self {
         Self {
-            tokens: f64::from(INBOUND_MESSAGE_BURST),
+            tokens: f64::from(burst),
             last: now,
+            burst: f64::from(burst),
+            per_second: f64::from(per_second),
         }
     }
 
     /// Whether a message arriving at `now` is within the rate.
-    fn admit(&mut self, now: Instant) -> bool {
+    pub(super) fn admit(&mut self, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = self.last.max(now);
-        let refilled = self.tokens + elapsed * f64::from(INBOUND_MESSAGES_PER_SECOND);
-        self.tokens = refilled.min(f64::from(INBOUND_MESSAGE_BURST));
+        let refilled = self.tokens + elapsed * self.per_second;
+        self.tokens = refilled.min(self.burst);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
