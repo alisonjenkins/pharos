@@ -1,4 +1,4 @@
-const float AMPLITUDE = 0.32;
+const float AMPLITUDE = 0.42;
 
 float trace(float x) {
     return wave(x) * AMPLITUDE * (0.5 + u_level);
