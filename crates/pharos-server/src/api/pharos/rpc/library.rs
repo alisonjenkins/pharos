@@ -720,8 +720,28 @@ fn synth_kind(dto: &serde_json::Value) -> Kind {
 /// A synthesised item's `ItemDetail` from its Jellyfin DTO: name, kind,
 /// overview, genres, year, Primary image and parentage, whichever it has.
 fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
+    write_synth_summary(out.reborrow().init_summary(), id, dto);
+    out.set_overview(dto_str(dto, "Overview"));
+    let genres: Vec<&str> = dto
+        .get("Genres")
+        .and_then(|g| g.as_array())
+        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
+        .unwrap_or_default();
+    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
+    let mut list = out.init_genres(count);
+    for (i, genre) in (0..count).zip(&genres) {
+        list.set(i, genre);
+    }
+}
+
+/// A synthesised item's `ItemSummary` from its Jellyfin DTO: name, kind,
+/// year, Primary image, parentage and index, whichever it has.
+fn write_synth_summary(
+    mut summary: item_summary::Builder<'_>,
+    id: WireId,
+    dto: &serde_json::Value,
+) {
     let kind = synth_kind(dto);
-    let mut summary = out.reborrow().init_summary();
     set_item_id(summary.reborrow().init_id(), id);
     summary.set_kind(kind);
     summary.set_name(dto_str(dto, "Name"));
@@ -757,17 +777,6 @@ fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde
         .and_then(|n| u32::try_from(n).ok())
     {
         summary.init_index_number().set_some(n);
-    }
-    out.set_overview(dto_str(dto, "Overview"));
-    let genres: Vec<&str> = dto
-        .get("Genres")
-        .and_then(|g| g.as_array())
-        .map(|g| g.iter().filter_map(|g| g.as_str()).collect())
-        .unwrap_or_default();
-    let count = u32::try_from(genres.len()).unwrap_or(u32::MAX);
-    let mut list = out.init_genres(count);
-    for (i, genre) in (0..count).zip(&genres) {
-        list.set(i, genre);
     }
 }
 
