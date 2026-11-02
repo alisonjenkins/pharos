@@ -30,6 +30,8 @@ enum AppError {
     Store(#[from] pharos_store_sqlx::StoreError),
     #[error("domain: {0}")]
     Domain(#[from] pharos_core::DomainError),
+    #[error("{0}")]
+    Ui(#[from] pharos_server::ui::UiBundleError),
 }
 
 /// LIB-C1 — reconcile the `libraries` table from `[media]` config and
@@ -2059,7 +2061,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     });
 
     let handle_for_app = readiness.clone();
-    let ui_dir = cfg.server.ui_dir.clone();
+    let ui_bundle = match cfg.server.ui_dir.as_deref() {
+        Some(dir) => {
+            let bundle = std::sync::Arc::new(pharos_server::ui::UiBundle::load(dir)?);
+            tracing::info!(ui_dir = %dir.display(), files = bundle.file_count(), "pharos-ui served at /");
+            Some(bundle)
+        }
+        None => None,
+    };
     // Spec 017: off unless [server.native_api].enabled. The connection caps
     // are shared by every worker, so they are built once here.
     pharos_server::api::pharos::rpc::record_state(&cfg.server.native_api);
@@ -2096,23 +2105,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
             .wrap(RedMetrics)
             .wrap(LowercasePath)
-            .wrap(cors)
-            .configure(router::configure)
+            .wrap(cors);
+        if let Some(bundle) = ui_bundle.as_ref() {
+            app = app.configure(pharos_server::ui::configure(bundle.clone()));
+        }
+        app.configure(router::configure)
             .configure(pharos_server::api::pharos::rpc::configure(
                 native_api.clone(),
                 native_limits.clone(),
-            ));
-        if let Some(path) = ui_dir.as_ref() {
-            // Dioxus default-routes the SPA in hash mode unless configured
-            // otherwise, so a single `Files::new` with `index_file` is
-            // enough — no history-mode fallback needed.
-            app = app.service(
-                actix_files::Files::new("/ui", path)
-                    .index_file("index.html")
-                    .use_last_modified(true),
-            );
-        }
-        app
+            ))
     })
     .bind(&cfg.server.bind)?
     // Phase B3 — we own the SIGTERM/SIGINT → graceful-drain sequencing

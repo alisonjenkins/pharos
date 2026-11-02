@@ -40,3 +40,4 @@ pub mod tmdb;
 pub mod transcode_sessions;
 pub mod trickplay_backfill;
 pub mod tvdb;
+pub mod ui;
