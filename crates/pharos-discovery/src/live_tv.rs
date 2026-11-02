@@ -113,7 +113,7 @@ pub fn parse_m3u(body: &str) -> Result<Vec<LiveChannel>, LiveTvError> {
     let mut out = Vec::new();
     let mut pending: Option<ExtinfMeta> = None;
     let mut next_number: u32 = 1;
-    for raw in body.lines() {
+    for (index, raw) in body.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line == "#EXTM3U" || line.starts_with("#EXTM3U:") {
             continue;
@@ -126,9 +126,9 @@ pub fn parse_m3u(body: &str) -> Result<Vec<LiveChannel>, LiveTvError> {
             // Other directives (#EXTVLCOPT, #EXTGRP, etc.) — skip.
             continue;
         }
-        let meta = pending
-            .take()
-            .ok_or_else(|| LiveTvError::Malformed(format!("stream URL with no #EXTINF: {line}")))?;
+        let meta = pending.take().ok_or_else(|| {
+            LiveTvError::Malformed(format!("stream URL with no #EXTINF on line {}", index + 1))
+        })?;
         let id = meta
             .tvg_id
             .clone()
@@ -423,6 +423,16 @@ http://example/cnn.ts
     fn m3u_dangling_url_with_no_extinf_errors() {
         let bad = "#EXTM3U\nhttp://example/bare\n";
         assert!(parse_m3u(bad).is_err());
+    }
+
+    /// A playlist URL often carries the provider's credentials, and this
+    /// error reaches the startup log, so it names the line, not its text.
+    #[test]
+    fn a_malformed_playlist_error_does_not_quote_the_url() {
+        let bad = "#EXTM3U\nhttp://user:secret@example/live/user/secret/1.ts\n";
+        let msg = parse_m3u(bad).unwrap_err().to_string();
+        assert!(!msg.contains("secret"), "{msg}");
+        assert!(msg.contains("line 2"), "{msg}");
     }
 
     #[test]
