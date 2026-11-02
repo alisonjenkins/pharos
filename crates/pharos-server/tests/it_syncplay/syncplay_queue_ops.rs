@@ -94,7 +94,7 @@ async fn party() -> Party {
         handle
             .tx
             .send(GroupMsg::AddMember {
-                user: None,
+                user: Some(uid),
                 member_id: reg.member_id,
                 name: "lace".into(),
                 reply: rtx,
