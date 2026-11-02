@@ -50,18 +50,26 @@ test-threads = 4
 # assertion load-independent (compare the QUANTISED weights placement actually
 # consumes, not the raw rates) rather than to widen the margin, which would buy
 # quiet by weakening the property the design rests on.
+#
+# B270: one at a time was not enough. libx264 encodes on every core, so a probe
+# still shared the CPU with every other test nextest was running, and two
+# back-to-back probes saw different load. `threads-required = "num-test-threads"`
+# makes nextest run each probe with nothing else beside it.
 [test-groups]
 encode-rate-probe = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(pharos-transcode) and test(probe::rate_tests)'
 test-group = "encode-rate-probe"
+threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
 filter = 'package(pharos-transcode) and test(probe::rate_tests)'
 test-group = "encode-rate-probe"
+threads-required = "num-test-threads"
 
 [[profile.nix.overrides]]
 filter = 'package(pharos-transcode) and test(probe::rate_tests)'
 test-group = "encode-rate-probe"
+threads-required = "num-test-threads"
 
