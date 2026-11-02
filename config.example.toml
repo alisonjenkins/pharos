@@ -4,7 +4,7 @@ name = "pharos"
 # Path to the built Dioxus UI bundle. Produce with:
 #   nix develop --command dx build --package pharos-ui --release
 # Then point this at the resulting `web/public/` directory and the
-# server will serve it at /ui/*.
+# server will serve it at / (and redirect /ui/* there).
 # ui_dir = "/srv/pharos/ui/public"
 # Seconds between database writes of one play session's resume position.
 # Clients report every ~10 s and writing each report made the progress
