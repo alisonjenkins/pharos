@@ -7,7 +7,7 @@
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::services::library::{
-    visible_count, visible_entity_rows, EntityKind, ItemQuery, KindFilter,
+    visible_entity, visible_entity_rows, EntityKind, EntityView, ItemQuery, KindFilter,
 };
 use crate::services::playback::{self, PlaybackSwitches};
 use crate::{
@@ -1503,25 +1503,21 @@ async fn get_person(
         .ok_or_else(|| error::ErrorNotFound("not found"))?;
     // Count how many items credit this person so the detail tile renders
     // "appears in N items" consistently with the list.
-    let ids = state
-        .stores
-        .item_ids_for_person(&wire_id)
+    let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+    let count = match visible_entity(&state, &user.0, EntityKind::Person, &wire_id)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let count = match visible_count(&state, &user.0, &ids)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        .map_err(ise)?
     {
-        None => u32::try_from(ids.len()).unwrap_or(u32::MAX),
-        Some(0) if ids.is_empty() => return Err(error::ErrorNotFound("not found")),
-        // A person is visible only through items the user may see (V200).
-        Some(0) => {
-            metrics::counter!("pharos_entity_hidden_total", "kind" => EntityKind::Person.label())
-                .increment(1);
-            tracing::warn!(user = %user.0.name, person = %wire_id, "refused a person with no visible item");
-            return Err(error::ErrorNotFound("not found"));
+        EntityView::All => {
+            let ids = state
+                .stores
+                .item_ids_for_person(&wire_id)
+                .await
+                .map_err(ise)?;
+            u32::try_from(ids.len()).unwrap_or(u32::MAX)
         }
-        Some(n) => n,
+        EntityView::Visible(items) => u32::try_from(items.len()).unwrap_or(u32::MAX),
+        EntityView::Hidden => return Err(error::ErrorNotFound("not found")),
     };
     Ok(crate::api::jellyfin::wire::json(&person_dto(
         &state, person, count,
@@ -5057,21 +5053,32 @@ pub(crate) fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
 /// renderer (a music genre rendered as a video Genre lists nothing).
 async fn synth_genre(
     state: &AppState,
+    user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
     use pharos_core::GenreStore;
-    let rows = state
-        .stores
-        .genres_with_counts()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let ise = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+    let rows = state.stores.genres_with_counts().await.map_err(ise)?;
     let Some(gc) = rows.iter().find(|gc| gc.genre.wire_id == id_str) else {
         return Ok(None);
     };
-    let all = state
-        .list_items_cached()
+    // The count and the Type come only from items the user may see.
+    let visible = match visible_entity(state, user, EntityKind::Genre, id_str)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        .map_err(ise)?
+    {
+        EntityView::All => None,
+        EntityView::Visible(items) => Some(items),
+        EntityView::Hidden => return Ok(None),
+    };
+    let count = match &visible {
+        None => gc.item_count,
+        Some(items) => u32::try_from(items.len()).unwrap_or(u32::MAX),
+    };
+    let all = match visible {
+        None => state.list_items_cached().await.map_err(ise)?,
+        Some(items) => std::sync::Arc::new(items),
+    };
     let want = gc.genre.name.to_lowercase();
     let (mut audio, mut other) = (0u32, 0u32);
     for item in all.iter() {
@@ -5096,7 +5103,7 @@ async fn synth_genre(
     };
     Ok(Some(
         serde_json::to_value(SynthItemDto {
-            child_count: Some(gc.item_count),
+            child_count: Some(count),
             ..SynthItemDto::folder(
                 gc.genre.wire_id.clone(),
                 gc.genre.name.clone(),
@@ -5346,7 +5353,7 @@ async fn fetch_item_dto(
         if let Some(view) = synth_album_or_artist(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
-        if let Some(view) = synth_genre(state, id_str).await? {
+        if let Some(view) = synth_genre(state, user, id_str).await? {
             return Ok(crate::api::jellyfin::wire::json(&view));
         }
         // B156 — a genre wire id. `/Genres` and `/MusicGenres` hand these out

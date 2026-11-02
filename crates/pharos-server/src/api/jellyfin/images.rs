@@ -455,6 +455,19 @@ async fn serve_image(
     {
         use pharos_core::PersonStore;
         if let Ok(Some(person)) = state.stores.person_by_wire_id(id_str).await {
+            // A hidden person answers as one with no photo (V200). A failed
+            // check withholds the photo too, like the lookup above.
+            use crate::services::library::{visible_entity, EntityKind, EntityView};
+            let visible = match visible_entity(state, user, EntityKind::Person, id_str).await {
+                Ok(view) => !matches!(view, EntityView::Hidden),
+                Err(e) => {
+                    tracing::warn!(error = %e, person = id_str, "person visibility check failed");
+                    false
+                }
+            };
+            if !visible {
+                return Ok(HttpResponse::NotFound().body(""));
+            }
             // Only real URLs: the scanner also ingests LEGACY Jellyfin
             // metadata (thumb_url = the old server's local disk path like
             // /config/data/metadata/People/…), which a browser would
