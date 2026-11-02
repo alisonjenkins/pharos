@@ -651,4 +651,20 @@ async fn resume_row_honours_the_limit_the_client_asked_for() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["Items"].as_array().map(Vec::len), Some(30));
+
+    // A StartIndex past the end, even past u32, is an empty page at the end,
+    // never the first page again.
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!(
+                "/Users/{upath}/Items/Resume?StartIndex=4294967296&Limit=12"
+            ))
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Items"].as_array().map(Vec::len), Some(0));
+    assert_eq!(v["StartIndex"].as_u64(), Some(30));
 }
