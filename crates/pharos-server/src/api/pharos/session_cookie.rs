@@ -32,10 +32,9 @@ use crate::state::AppState;
 pub const MAX_BODY: usize = 4 * 1024;
 
 /// How long the browser keeps the cookie: the longest browsers allow
-/// (400 days). The token behind it lives until it is revoked, and a browser
-/// that dropped its cookie could no longer sign out, so the cookie should not
-/// expire before the token; until tokens expire server-side, an unused one is
-/// revoked from the user's devices list.
+/// (400 days). The cookie outlives its token, which expires 90 days after
+/// issue; the server rejects an expired token, so a cookie past that point
+/// signs nothing in.
 const COOKIE_MAX_AGE: CookieDuration = CookieDuration::days(400);
 
 #[derive(Deserialize)]
