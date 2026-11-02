@@ -312,5 +312,68 @@ test.describe("pharos Dioxus UI", () => {
         .toBeGreaterThan(3 * 10_000_000);
       expect(problems, problems.join("\n")).toEqual([]);
     });
+
+    // A playlist that never loads is fatal to hls.js with nothing to restart
+    // from, so the page must say so rather than show a black box.
+    test("an HLS stream that cannot load shows why", async ({ page, request }) => {
+      test.setTimeout(60_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-fail-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      // Probed by the seed, and with Matroska hidden it remuxes to HLS.
+      const movie = items.Items?.find((i: { Path?: string }) =>
+        i.Path?.endsWith("/multitrack.mkv"),
+      );
+      test.skip(!movie, "pharos has no seeded multitrack fixture");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+        };
+      });
+      await page.route(/\.m3u8(\?|$)/, (route) => route.abort());
+      const errors: string[] = [];
+      page.on("console", (m) => {
+        if (m.text().startsWith("pharos: playback error")) errors.push(m.text());
+      });
+
+      await page.goto("/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await page.goto(`/title/${nativeId}`);
+      await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+      await expect(page.getByText(/^Playback failed: the stream failed/)).toBeVisible({
+        timeout: 30_000,
+      });
+      expect(
+        errors.some((e) => /engine=hlsjs .*fatal=true action=fail/.test(e)),
+        errors.join("\n"),
+      ).toBe(true);
+    });
   });
 });
