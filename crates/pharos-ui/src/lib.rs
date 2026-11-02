@@ -10,6 +10,7 @@
 pub mod api_types;
 pub mod client;
 pub mod native;
+pub mod theme;
 pub mod views;
 
 pub use api_types::{ItemKind, LibraryItem, LoggedInUser};

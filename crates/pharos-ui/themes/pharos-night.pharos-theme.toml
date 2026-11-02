@@ -1,0 +1,63 @@
+[meta]
+name = "Pharos Night"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+
+[palette]
+bg = "#0e1116"
+surface = "#1a2030"
+surface-raised = "#222a3b"
+overlay = "#11151c"
+border = "#2a3142"
+fg = "#e6e8eb"
+fg-muted = "#8b95a5"
+accent = "#4cb4ff"
+accent-fg = "#001e2e"
+focus = "#8fd0ff"
+success = "#3ddc97"
+warning = "#ffb454"
+danger = "#ff6b6b"
+progress = "#4cb4ff"
+badge = "#ff8a3d"
+
+[palette.kind]
+movie = "#ff8a5b"
+show = "#7c9cff"
+music = "#3ddc97"
+book = "#e0b252"
+live = "#ff6b6b"
+
+[type]
+ui = "system-ui"
+display = "system-ui"
+scale = 1.2
+base_px = 16
+mono_ui = false
+
+[shape]
+radius_px = 8
+border_px = 1
+density = "comfortable"
+
+[motion]
+duration_ms = 180
+easing = "standard"
+focus_scale = 1.05
+
+[effects]
+background = "gradient"
+blur_px = 24
+vignette = 0.3
+grain = 0.0
+glow = 0.4
+
+[layout]
+hero = true
+rail_poster = "landscape"
+rail_collapsed = false
+
+[contrast]
+level = "aa"
+decorative = []

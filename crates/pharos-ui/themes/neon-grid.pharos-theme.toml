@@ -1,0 +1,35 @@
+[meta]
+name = "Neon Grid"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+extends = "Pharos Night"
+
+[palette]
+bg = "#000000"
+surface = "#0a120c"
+surface-raised = "#101c13"
+overlay = "#050a06"
+border = "#1c3d22"
+fg = "#c8ffc0"
+fg-muted = "#7fb078"
+accent = "#39ff14"
+accent-fg = "#001a00"
+focus = "#39ff14"
+progress = "#39ff14"
+
+[type]
+ui = "mono"
+display = "mono"
+mono_ui = true
+
+[shape]
+radius_px = 0
+
+[effects]
+background = "shader"
+shader = "scanlines"
+vignette = 0.4
+grain = 0.15
+glow = 0.8

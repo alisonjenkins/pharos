@@ -1,0 +1,30 @@
+[meta]
+name = "Kali Dark"
+schema = 1
+author = "pharos"
+version = "1.0.0"
+scheme = "dark"
+extends = "Pharos Night"
+
+[palette]
+bg = "#0b0f19"
+surface = "#121a2b"
+surface-raised = "#1a2438"
+overlay = "#0e1422"
+border = "#26324d"
+fg = "#e4eaf5"
+fg-muted = "#8d9bb8"
+accent = "#367bf0"
+accent-fg = "#020617"
+focus = "#7fb0ff"
+progress = "#367bf0"
+
+[type]
+display = "mono"
+
+[shape]
+radius_px = 2
+
+[effects]
+vignette = 0.2
+glow = 0.3
