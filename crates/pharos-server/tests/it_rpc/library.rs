@@ -623,3 +623,88 @@ async fn native_resume_agrees_with_the_jellyfin_resume_route() {
         pharos_jellyfin_api::dto::WireId::Real(fx.other_item_id).to_string()
     );
 }
+
+/// Seeds three episodes of "Show" in /libA and one of "Another" in /libB,
+/// with "Show" S01E01 already played.
+async fn seed_shows(fx: &crate::common::Fixture) {
+    use pharos_core::{
+        LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo, UserDataStore as _,
+    };
+    let episode = |id: u64, lib: &str, show: &str, ep: u32| MediaItem {
+        id,
+        path: format!("/{lib}/{show}/Season 01/e{ep}.mkv").into(),
+        title: format!("{show} {ep}"),
+        kind: MediaKind::Episode,
+        series: Some(SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(1),
+            episode_number: Some(ep),
+            series_folder: Some(format!("/{lib}/{show}")),
+            series_year: None,
+        }),
+        ..MediaItem::default()
+    };
+    for item in [
+        episode(401, "libA", "Show", 1),
+        episode(403, "libA", "Show", 3),
+        episode(402, "libA", "Show", 2),
+        episode(501, "libB", "Another", 1),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    fx.state
+        .stores
+        .set_user_data(
+            fx.user_id,
+            401,
+            pharos_core::UserItemData {
+                played: true,
+                ..pharos_core::UserItemData::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// T032: the first unplayed episode of each series, ordered by series name,
+/// scoped to one series on request, only where the policy allows.
+#[actix_web::test]
+async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
+    let fx = seed_rich().await;
+    seed_shows(&fx).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids = |page: library::ListPage| page.items.iter().map(|(i, _)| i.id).collect::<Vec<_>>();
+
+    let all = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    assert_eq!(all.total, 2);
+    assert_eq!(ids(all), [501, 402]);
+
+    let one = library::next_up(&fx.state, &user, None, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(ids(one), [501], "a limit below 1 still lists one");
+
+    let show = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Show"), "Show");
+    let scoped = library::next_up(&fx.state, &user, Some(&show), None)
+        .await
+        .unwrap();
+    assert_eq!(ids(scoped), [402]);
+
+    let restricted = pharos_core::User {
+        policy: UserPolicy {
+            enable_all_folders: false,
+            enabled_folders: vec![fx.lib_a_wire.clone()],
+            ..UserPolicy::default()
+        },
+        ..user
+    };
+    let a = library::next_up(&fx.state, &restricted, None, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(a), [402]);
+}
