@@ -3727,7 +3727,8 @@ fn sort_album_aggs(aggs: &mut [AlbumAgg], sort_by: Option<&str>, orders: &[bool]
 }
 
 /// Whether audio row `i` is filed under `artist` on an artist page: its
-/// album artist, or its track artist when it has no album artist.
+/// album artist, or its track artist when it has no (or an empty) album
+/// artist.
 pub(crate) fn on_artist_page(i: &MediaItem, artist: &str) -> bool {
     filed_artist(i).is_some_and(|a| a.eq_ignore_ascii_case(artist))
 }
@@ -3736,12 +3737,13 @@ fn filed_artist(i: &MediaItem) -> Option<&str> {
     i.probe
         .album_artist
         .as_deref()
+        .filter(|a| !a.is_empty())
         .or(i.probe.artist.as_deref())
 }
 
 /// The albums the kept audio rows of `items` make up, sorted per the
 /// request, as DTOs.
-pub(crate) async fn album_dtos(
+async fn album_dtos(
     state: &AppState,
     items: &[MediaItem],
     keep: impl Fn(&MediaItem) -> bool,
@@ -3758,12 +3760,10 @@ pub(crate) async fn album_dtos(
 }
 
 /// The artists the audio rows of `items` are filed under (see
-/// [`on_artist_page`]), each once, in name order, as DTOs. Every artist
-/// listed has at least one track on its artist page.
-pub(crate) async fn filed_artist_dtos(
-    state: &AppState,
-    items: &[MediaItem],
-) -> Vec<serde_json::Value> {
+/// [`on_artist_page`]), in name order. Names differing only in case are one
+/// artist, as the artist page matches them so, listed under the first
+/// spelling in sort order. Every artist listed has a track on its page.
+fn filed_artist_names(items: &[MediaItem]) -> Vec<&str> {
     let mut names: Vec<&str> = items
         .iter()
         .filter(|i| i.kind == MediaKind::Audio)
@@ -3771,8 +3771,13 @@ pub(crate) async fn filed_artist_dtos(
         .filter(|n| !n.is_empty())
         .collect();
     names.sort_by_cached_key(|n| (n.to_lowercase(), n.to_string()));
-    names.dedup();
-    let mut dtos: Vec<SynthItemDto> = names.into_iter().map(|n| artist_folder(state, n)).collect();
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    names
+}
+
+/// The folder DTOs for artists `names`, with their image tags.
+async fn artist_dtos(state: &AppState, names: &[&str]) -> Vec<serde_json::Value> {
+    let mut dtos: Vec<SynthItemDto> = names.iter().map(|n| artist_folder(state, n)).collect();
     crate::api::jellyfin::images::stamp_synth_image_tags(state, &mut dtos).await;
     dtos.into_iter()
         .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
@@ -5819,15 +5824,22 @@ pub(crate) struct SynthPage {
 
 /// `items` paged by `start` and `limit` (`None` is every item).
 fn synth_page(mut items: Vec<serde_json::Value>, start: u32, limit: Option<u32>) -> SynthPage {
-    let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
-    let start = (start as usize).min(items.len());
-    let end = start
-        .saturating_add(limit.map_or(usize::MAX, |l| l as usize))
-        .min(items.len());
+    let (total, window) = page_window(items.len(), start, limit);
     SynthPage {
-        items: items.drain(start..end).collect(),
+        items: items.drain(window).collect(),
         total,
     }
+}
+
+/// The total of `len` items, and the range `start` and `limit` (`None` is
+/// every item) page out of them.
+fn page_window(len: usize, start: u32, limit: Option<u32>) -> (u32, std::ops::Range<usize>) {
+    let total = u32::try_from(len).unwrap_or(u32::MAX);
+    let start = (start as usize).min(len);
+    let end = start
+        .saturating_add(limit.map_or(usize::MAX, |l| l as usize))
+        .min(len);
+    (total, start..end)
 }
 
 /// The audio rows under `parent` that `user` may see, unpaged and unsorted:
@@ -5881,26 +5893,6 @@ pub(crate) async fn music_groups_page(
         ParentResolution::Filter(pharos_core::ParentFilter::Artist { name }) => Some(name.as_str()),
         _ => None,
     };
-    let items = match grouping {
-        MusicGrouping::Album => {
-            let orders = parse_sort_orders(q.sort_order.as_deref());
-            album_dtos(
-                state,
-                &tracks,
-                |i| artist.map_or(true, |a| on_artist_page(i, a)),
-                q.sort_by.as_deref(),
-                &orders,
-            )
-            .await
-        }
-        MusicGrouping::Artist => {
-            let mut artists = filed_artist_dtos(state, &tracks).await;
-            if first_sort_order_descending(q.sort_order.as_deref()) {
-                artists.reverse();
-            }
-            artists
-        }
-    };
     // The letter picker filters by the group's own name, as the series
     // listing does, not by its tracks' titles.
     let prefix = q
@@ -5909,18 +5901,43 @@ pub(crate) async fn music_groups_page(
         .or(q.name_starts_with_or_greater.as_deref())
         .map(str::to_lowercase)
         .filter(|p| !p.is_empty());
-    let items = match prefix {
-        Some(prefix) => items
-            .into_iter()
-            .filter(|dto| {
-                dto.get("Name")
-                    .and_then(|n| n.as_str())
-                    .is_some_and(|n| name_matches_letter(n, &prefix))
-            })
-            .collect(),
-        None => items,
+    let named = |name: &str| {
+        prefix
+            .as_deref()
+            .map_or(true, |p| name_matches_letter(name, p))
     };
-    Ok(synth_page(items, q.start_index, q.limit))
+    // Groups are sorted, filtered and paged on their names; only the page
+    // returned is built into DTOs, each of which looks up an image tag.
+    match grouping {
+        MusicGrouping::Album => {
+            let mut aggs =
+                aggregate_albums(&tracks, |i| artist.map_or(true, |a| on_artist_page(i, a)));
+            sort_album_aggs(
+                &mut aggs,
+                q.sort_by.as_deref(),
+                &parse_sort_orders(q.sort_order.as_deref()),
+            );
+            aggs.retain(|a| named(&a.name));
+            let (total, window) = page_window(aggs.len(), q.start_index, q.limit);
+            let mut items = Vec::with_capacity(window.len());
+            for a in &aggs[window] {
+                items.push(synth_album_dto(state, a).await);
+            }
+            Ok(SynthPage { items, total })
+        }
+        MusicGrouping::Artist => {
+            let mut names = filed_artist_names(&tracks);
+            if first_sort_order_descending(q.sort_order.as_deref()) {
+                names.reverse();
+            }
+            names.retain(|n| named(n));
+            let (total, window) = page_window(names.len(), q.start_index, q.limit);
+            Ok(SynthPage {
+                items: artist_dtos(state, &names[window]).await,
+                total,
+            })
+        }
+    }
 }
 
 /// The series (or one series' seasons) under `parent_id`, folded out of the
@@ -7887,5 +7904,33 @@ mod series_dto_tests {
         assert_eq!(v["Genres"], serde_json::json!([]));
         assert_eq!(v["ProviderIds"], serde_json::json!({}));
         assert_eq!(v["Type"], "Series");
+    }
+}
+
+#[cfg(test)]
+mod filed_artist_tests {
+    use super::*;
+
+    fn track(album_artist: Option<&str>, artist: Option<&str>) -> MediaItem {
+        MediaItem {
+            kind: MediaKind::Audio,
+            probe: pharos_core::MediaProbe {
+                album_artist: album_artist.map(Into::into),
+                artist: artist.map(Into::into),
+                ..pharos_core::MediaProbe::default()
+            },
+            ..MediaItem::default()
+        }
+    }
+
+    #[test]
+    fn artists_differing_only_in_case_are_one_and_an_empty_album_artist_falls_back() {
+        let tracks = [
+            track(Some("Abba"), None),
+            track(Some("ABBA"), None),
+            track(Some(""), Some("Foo")),
+        ];
+        assert_eq!(filed_artist_names(&tracks), ["ABBA", "Foo"]);
+        assert!(on_artist_page(&tracks[2], "foo"));
     }
 }
