@@ -484,6 +484,7 @@ mod tests {
             ("css.rs", include_str!("css.rs")),
             ("device.rs", include_str!("device.rs")),
             ("doc.rs", include_str!("doc.rs")),
+            ("editor.rs", include_str!("editor.rs")),
             ("mod.rs", include_str!("mod.rs")),
             ("resolve.rs", include_str!("resolve.rs")),
             ("signal.rs", include_str!("signal.rs")),

@@ -243,6 +243,29 @@ impl PaletteDoc {
     }
 }
 
+impl PaletteDoc {
+    /// The raw colour slot for `role`, for editing.
+    pub fn slot(&mut self, role: PaletteRole) -> &mut Option<String> {
+        match role {
+            PaletteRole::Bg => &mut self.bg,
+            PaletteRole::Surface => &mut self.surface,
+            PaletteRole::SurfaceRaised => &mut self.surface_raised,
+            PaletteRole::Overlay => &mut self.overlay,
+            PaletteRole::Border => &mut self.border,
+            PaletteRole::Fg => &mut self.fg,
+            PaletteRole::FgMuted => &mut self.fg_muted,
+            PaletteRole::Accent => &mut self.accent,
+            PaletteRole::AccentFg => &mut self.accent_fg,
+            PaletteRole::Focus => &mut self.focus,
+            PaletteRole::Success => &mut self.success,
+            PaletteRole::Warning => &mut self.warning,
+            PaletteRole::Danger => &mut self.danger,
+            PaletteRole::Progress => &mut self.progress,
+            PaletteRole::Badge => &mut self.badge,
+        }
+    }
+}
+
 impl KindDoc {
     /// The raw colour for `kind`.
     pub fn get(&self, kind: Kind) -> Option<&String> {
@@ -252,6 +275,17 @@ impl KindDoc {
             Kind::Music => self.music.as_ref(),
             Kind::Book => self.book.as_ref(),
             Kind::Live => self.live.as_ref(),
+        }
+    }
+
+    /// The raw colour slot for `kind`, for editing.
+    pub fn slot(&mut self, kind: Kind) -> &mut Option<String> {
+        match kind {
+            Kind::Movie => &mut self.movie,
+            Kind::Show => &mut self.show,
+            Kind::Music => &mut self.music,
+            Kind::Book => &mut self.book,
+            Kind::Live => &mut self.live,
         }
     }
 }
