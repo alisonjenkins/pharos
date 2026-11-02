@@ -186,8 +186,10 @@ compat-dioxus-full native="on":
       exit "$status"
     }
     trap cleanup EXIT
-    UI_DIR=$(nix build --no-link --print-out-paths .#pharosUiBundle)
-    MEDIA_SRC=$(nix build --no-link --print-out-paths .#testMediaTree)
+    # Out-links root both store paths for the run: an unrooted --no-link
+    # output can be garbage-collected before pharos reads it (B284).
+    UI_DIR=$(nix build --out-link "$TMP/ui-bundle" --print-out-paths .#pharosUiBundle)
+    MEDIA_SRC=$(nix build --out-link "$TMP/media-src" --print-out-paths .#testMediaTree)
     # The seed writes fixture-*.webm into the media root; a store path is
     # read-only, so copy the tree into a writable directory.
     mkdir -p "$TMP/media"
