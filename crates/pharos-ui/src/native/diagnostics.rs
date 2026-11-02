@@ -22,6 +22,15 @@ pub fn opt_in_from(raw: Option<&[u8]>) -> bool {
     raw == Some(b"true".as_slice())
 }
 
+/// The value the toggle shows once a save resolves: the value the server
+/// stored on success, the value it held before the attempt on failure.
+pub fn shown_after_save(saved: Result<bool, String>, server_before: bool) -> bool {
+    match saved {
+        Ok(stored) => stored,
+        Err(_) => server_before,
+    }
+}
+
 /// Holds events raised before the session opens and decides, per call,
 /// whether an event is submitted now. The opt-in is passed in at each call,
 /// so turning it off stops the next submit.
@@ -97,6 +106,20 @@ mod tests {
         assert!(!opt_in_from(Some(b"")));
         assert!(!opt_in_from(Some(b"True")));
         assert!(opt_in_from(Some(b"true")));
+    }
+
+    #[test]
+    fn toggle_shows_what_the_server_holds_once_a_save_resolves() {
+        assert!(shown_after_save(Ok(true), false), "a stored on must show");
+        assert!(!shown_after_save(Ok(false), true), "a stored off must show");
+        assert!(
+            !shown_after_save(Err("offline".to_owned()), false),
+            "a failed save of on must show the server's off"
+        );
+        assert!(
+            shown_after_save(Err("offline".to_owned()), true),
+            "a failed save of off must show the server's on"
+        );
     }
 
     #[test]

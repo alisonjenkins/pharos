@@ -77,6 +77,7 @@ pub fn AppearanceView(
     editor: Option<EditorView>,
     notice: Option<Notice>,
     diagnostics: bool,
+    diagnostics_key: u32,
     on_diagnostics: EventHandler<bool>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
@@ -111,7 +112,10 @@ pub fn AppearanceView(
             fieldset { class: "pharos-diagnostics",
                 legend { "Diagnostics" }
                 label {
+                    // Keyed so a failed save rebuilds the box: the DOM keeps the
+                    // user's flip, and an unchanged `checked` never resets it.
                     input {
+                        key: "{diagnostics_key}",
                         r#type: "checkbox",
                         id: "diagnostics-opt-in",
                         checked: diagnostics,
@@ -372,6 +376,15 @@ mod tests {
     }
 
     fn page(themes: Vec<ThemeCard>, editor: Option<EditorView>, notice: Option<Notice>) -> String {
+        page_with_diagnostics(themes, editor, notice, false)
+    }
+
+    fn page_with_diagnostics(
+        themes: Vec<ThemeCard>,
+        editor: Option<EditorView>,
+        notice: Option<Notice>,
+        diagnostics: bool,
+    ) -> String {
         render(move || {
             rsx! {
                 AppearanceView {
@@ -379,7 +392,8 @@ mod tests {
                     auto: false,
                     editor: editor.clone(),
                     notice: notice.clone(),
-                    diagnostics: false,
+                    diagnostics,
+                    diagnostics_key: 0,
                     on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
@@ -395,6 +409,32 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn diagnostics_box(html: &str) -> &str {
+        html.find("id=\"diagnostics-opt-in\"")
+            .and_then(|at| {
+                let start = html[..at].rfind('<')?;
+                let end = at + html[at..].find('>')?;
+                html.get(start..=end)
+            })
+            .unwrap_or("<toggle not rendered>")
+    }
+
+    #[test]
+    fn diagnostics_box_renders_the_server_value_it_is_given() {
+        let on = page_with_diagnostics(Vec::new(), None, None, true);
+        assert!(
+            diagnostics_box(&on).contains("checked"),
+            "a server value of on must render checked: {}",
+            diagnostics_box(&on)
+        );
+        let off = page_with_diagnostics(Vec::new(), None, None, false);
+        assert!(
+            !diagnostics_box(&off).contains("checked"),
+            "a server value of off must render unchecked: {}",
+            diagnostics_box(&off)
+        );
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {

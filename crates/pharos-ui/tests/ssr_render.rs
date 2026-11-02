@@ -1479,6 +1479,7 @@ fn appearance_page_with(diagnostics: bool) -> Element {
             editor: None,
             notice: None,
             diagnostics,
+            diagnostics_key: 0,
             on_diagnostics: |_| {},
             on_pick: |_| {},
             on_auto: |_| {},
