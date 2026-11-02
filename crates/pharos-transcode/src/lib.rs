@@ -41,8 +41,8 @@ pub use backend::{BackendError, FfmpegBackend, ProbeJson, SubtitleFormat, Wavefo
 pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncodeCap};
 pub use hwaccel::HwAccel;
 pub use options::{
-    stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, RenditionKey, SourceCodec,
-    StereoOutput, TranscodeOptions, VideoCodec,
+    stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D, RenditionKey,
+    SourceCodec, StereoOutput, TranscodeOptions, VideoCodec,
 };
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,

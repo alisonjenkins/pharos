@@ -707,6 +707,54 @@ impl StereoOutput {
     }
 }
 
+/// What a transcode of a 3D source puts in the bytes, for the same inputs the
+/// encoder gets: the source format and the effective [`StereoOutput`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Output3D {
+    /// The output keeps the source's 3D packing.
+    Preserved,
+    /// ffmpeg has no H.264 MVC decoder, so it reads the base view only and
+    /// every MVC transcode is 2D whatever the stereo output asks for.
+    FlattenedMvc,
+    /// `Mono2D` on a packed source: a left-eye crop scaled back up.
+    FlattenedMono,
+}
+
+impl Output3D {
+    pub const ALL: [Self; 3] = [Self::Preserved, Self::FlattenedMvc, Self::FlattenedMono];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preserved => "preserved",
+            Self::FlattenedMvc => "flattened_mvc",
+            Self::FlattenedMono => "flattened_mono",
+        }
+    }
+
+    pub const fn is_flattened(self) -> bool {
+        !matches!(self, Self::Preserved)
+    }
+
+    /// `effective` must come from [`TranscodeOptions::effective_stereo_output`]
+    /// (or the negotiation's equivalent) so a forced `Mono2D` is counted.
+    pub const fn of(format: Video3DFormat, effective: StereoOutput) -> Self {
+        match (format, effective) {
+            (Video3DFormat::Mvc, _) => Self::FlattenedMvc,
+            (_, StereoOutput::Mono2D) => Self::FlattenedMono,
+            (_, StereoOutput::Preserve) => Self::Preserved,
+        }
+    }
+
+    /// The 3D format the output advertises: the source's when preserved,
+    /// none when flattened.
+    pub const fn format(self, source: Video3DFormat) -> Option<Video3DFormat> {
+        match self {
+            Self::Preserved => Some(source),
+            Self::FlattenedMvc | Self::FlattenedMono => None,
+        }
+    }
+}
+
 /// ffmpeg video filter string to extract and display the left eye as a 2D frame.
 pub fn stereo_mono_filter(format: Video3DFormat) -> Option<&'static str> {
     match format {
@@ -747,6 +795,18 @@ impl TranscodeOptions {
         } else {
             StereoOutput::Preserve
         }
+    }
+
+    /// How this transcode treats the source's 3D layout; `None` for a 2D source.
+    pub fn output_3d(&self) -> Option<Output3D> {
+        self.video_3d_format
+            .map(|f| Output3D::of(f, self.effective_stereo_output()))
+    }
+
+    /// The 3D format the transcoded bytes carry; `None` when the output is 2D.
+    pub fn output_video_3d_format(&self) -> Option<Video3DFormat> {
+        self.video_3d_format
+            .and_then(|f| Output3D::of(f, self.effective_stereo_output()).format(f))
     }
 
     /// Returns the ffmpeg filter chain required to downmix 3D video to 2D mono, if active.
@@ -1172,6 +1232,54 @@ mod tests {
             Some("crop=iw:ih/2:0:0,setsar=1")
         );
         assert_eq!(stereo_mono_filter(Video3DFormat::Mvc), None);
+    }
+
+    #[test]
+    fn output_3d_over_all_formats_and_stereo_outputs() {
+        let all = [
+            Video3DFormat::HalfSideBySide,
+            Video3DFormat::FullSideBySide,
+            Video3DFormat::HalfTopAndBottom,
+            Video3DFormat::FullTopAndBottom,
+            Video3DFormat::Mvc,
+        ];
+        for f in all {
+            for s in StereoOutput::ALL {
+                let mut o = cmaf_opts();
+                o.video_3d_format = Some(f);
+                o.stereo_output = s;
+                let (want_out, want_fmt) = match (f, s) {
+                    (Video3DFormat::Mvc, _) => (Output3D::FlattenedMvc, None),
+                    (_, StereoOutput::Mono2D) => (Output3D::FlattenedMono, None),
+                    (_, StereoOutput::Preserve) => (Output3D::Preserved, Some(f)),
+                };
+                assert_eq!(o.output_3d(), Some(want_out), "{f:?} {s:?}");
+                assert_eq!(o.output_video_3d_format(), want_fmt, "{f:?} {s:?}");
+            }
+        }
+        let mut o = cmaf_opts();
+        o.video_3d_format = None;
+        assert_eq!(o.output_3d(), None);
+        assert_eq!(o.output_video_3d_format(), None);
+    }
+
+    #[test]
+    fn output_3d_follows_the_effective_stereo_output_not_the_requested_one() {
+        let mut o = cmaf_opts();
+        o.video_3d_format = Some(Video3DFormat::HalfSideBySide);
+        o.stereo_output = StereoOutput::Preserve;
+        o.burn_subtitle_stream_index = Some(2);
+        assert_eq!(o.output_3d(), Some(Output3D::FlattenedMono));
+        assert_eq!(o.output_video_3d_format(), None);
+    }
+
+    #[test]
+    fn output_3d_labels_are_distinct() {
+        let mut labels = std::collections::HashSet::new();
+        for v in Output3D::ALL {
+            assert!(labels.insert(v.label()), "{v:?}");
+        }
+        assert_eq!(Output3D::ALL.iter().filter(|v| v.is_flattened()).count(), 2);
     }
 
     #[test]
