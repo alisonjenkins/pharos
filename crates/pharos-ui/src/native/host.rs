@@ -102,3 +102,28 @@ pub fn stored_theme(_key: &str) -> Result<Option<String>, String> {
 pub fn apply_tokens(_declarations: &[(String, String)]) -> Result<(), String> {
     Ok(())
 }
+
+pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
+    Ok(())
+}
+
+pub fn prefers(_query: &str) -> bool {
+    false
+}
+
+pub struct MediaWatch;
+
+pub fn on_media_change(_query: &str, _on_change: impl FnMut() + 'static) -> MediaWatch {
+    MediaWatch
+}
+
+pub fn download(_filename: &str, _mime: &str, _text: &str) -> Result<(), crate::theme::ThemeError> {
+    Ok(())
+}
+
+pub async fn pick_file(
+    _accept: &str,
+    _max_bytes: usize,
+) -> Result<Option<String>, crate::theme::ThemeError> {
+    Ok(None)
+}

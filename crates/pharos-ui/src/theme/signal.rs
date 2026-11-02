@@ -98,6 +98,29 @@ pub fn rejected(name: &str, source: Source, result: &ContrastResult) -> String {
     )
 }
 
+/// A custom theme was deleted from the device.
+pub fn deleted(name: &str) -> String {
+    format!(
+        "pharos: theme deleted name={} source={}",
+        field(name),
+        Source::Local.label()
+    )
+}
+
+/// A theme file was exported, `bytes` long.
+pub fn exported(name: &str, bytes: usize) -> String {
+    format!("pharos: theme exported name={} bytes={bytes}", field(name))
+}
+
+/// A write to device storage failed; the theme in memory stays applied.
+pub fn storage_failed(key: &str, error: &str) -> String {
+    format!(
+        "pharos: theme storage write failed key={} error={}",
+        field(key),
+        field(error)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -106,6 +129,26 @@ mod tests {
 
     use super::*;
     use crate::theme::contrast::PAIRS;
+
+    #[test]
+    fn deleted_exported_and_storage_lines_have_the_documented_shape() {
+        assert_eq!(
+            deleted("My Theme"),
+            "pharos: theme deleted name=\"My Theme\" source=local"
+        );
+        assert_eq!(
+            exported("Kali Dark", 812),
+            "pharos: theme exported name=\"Kali Dark\" bytes=812"
+        );
+        assert_eq!(
+            storage_failed("pharos.theme.active", "quota exceeded"),
+            "pharos: theme storage write failed key=pharos.theme.active error=\"quota exceeded\""
+        );
+        assert_eq!(
+            storage_failed("pharos.theme.custom", "QuotaExceededError"),
+            "pharos: theme storage write failed key=pharos.theme.custom error=QuotaExceededError"
+        );
+    }
 
     #[test]
     fn applied_line_has_the_documented_shape() {
