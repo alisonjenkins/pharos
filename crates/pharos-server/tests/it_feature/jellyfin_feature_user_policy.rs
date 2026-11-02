@@ -390,3 +390,73 @@ async fn metadata_editing_routes_are_admin_only() {
         .to_request();
     assert_eq!(test::call_service(&app, req).await.status().as_u16(), 403);
 }
+
+/// B261: box sets are shared by every user, so creating one or changing its
+/// members is admin-only (V188), as in Jellyfin. A refused request answers
+/// 403, leaves the box set as it was, and counts under
+/// `pharos_admin_required_total`.
+/// Disarm check: with the collection routes' `require_admin` removed, the
+/// user's create and edits answer 200/204 and the members change.
+#[actix_web::test]
+async fn collection_editing_is_admin_only() {
+    use pharos_core::CollectionStore as _;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let (rich, other) = (f.rich_item_id, f.other_item_id);
+    let shared = f
+        .state
+        .stores
+        .create_collection("Shared", &[rich])
+        .await
+        .unwrap()
+        .wire_id;
+    let mut answered = Vec::new();
+    for (method, uri) in [
+        (
+            actix_web::http::Method::POST,
+            format!("/Collections?Name=Mine&Ids={rich}"),
+        ),
+        (
+            actix_web::http::Method::POST,
+            format!("/Collections/{shared}/Items?Ids={other}"),
+        ),
+        (
+            actix_web::http::Method::DELETE,
+            format!("/Collections/{shared}/Items?Ids={rich}"),
+        ),
+    ] {
+        let req = test::TestRequest::default()
+            .method(method.clone())
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request();
+        let status = test::call_service(&app, req).await.status().as_u16();
+        if status != 403 {
+            answered.push(format!("{method} {uri} → {status}"));
+        }
+    }
+    assert!(
+        answered.is_empty(),
+        "a user edited box sets:\n{}",
+        answered.join("\n")
+    );
+    assert_eq!(
+        f.state.stores.collection_items(&shared).await.unwrap(),
+        vec![rich]
+    );
+    let refused: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| k.key().name() == "pharos_admin_required_total")
+        .map(|(.., v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum();
+    assert_eq!(refused, 3);
+}

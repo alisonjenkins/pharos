@@ -39,7 +39,11 @@ async fn seed() -> (web::Data<AppState>, String, Stores) {
             id: uid,
             name: "u".into(),
             password_hash: hash,
-            policy: UserPolicy::default(),
+            // Box set editing is admin-only (B261).
+            policy: UserPolicy {
+                admin: true,
+                ..UserPolicy::default()
+            },
         })
         .await
         .unwrap();
