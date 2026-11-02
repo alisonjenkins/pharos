@@ -1608,9 +1608,10 @@ fn split_tag_csv(raw: Option<&str>) -> Vec<String> {
 /// the client routes straight into it — matching Jellyfin's create shape.
 async fn create_collection(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::CollectionStore;
     let name = q
         .name
@@ -1642,10 +1643,11 @@ async fn create_collection(
 /// matches no collection. Returns 204 (Jellyfin's add-items shape).
 async fn collection_items_add(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::CollectionStore;
     // B92 — canonicalise the dashed collection wire id the kotlin SDK sends.
     let wire_id = canonical_wire_id(&path.into_inner()).into_owned();
@@ -1666,10 +1668,11 @@ async fn collection_items_add(
 /// id matches no collection. Returns 204 (Jellyfin's remove-items shape).
 async fn collection_items_remove(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<CollectionMutateQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
+    crate::api::jellyfin::admin::require_admin(&user)?;
     use pharos_core::CollectionStore;
     // B92 — canonicalise the dashed collection wire id the kotlin SDK sends.
     let wire_id = canonical_wire_id(&path.into_inner()).into_owned();
