@@ -2,3 +2,4 @@
 //! served at `/`. The older REST panes stay reachable at `/manage`.
 
 pub mod route;
+pub mod views;
