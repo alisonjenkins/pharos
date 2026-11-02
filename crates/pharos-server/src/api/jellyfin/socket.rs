@@ -230,11 +230,17 @@ async fn ws_entry(
         sinks.get_ref().clone(),
         device_id,
         bus_rx,
-        user.0.name,
-        user_id_str,
-        user.0.policy.admin,
+        user.0,
     ));
     Ok(response)
+}
+
+/// What a `SyncPlayJoinGroup` frame needs to decide whether the socket's user
+/// may join (V201), and where to say no.
+struct JoinGate<'a> {
+    state: &'a AppState,
+    user: &'a pharos_core::User,
+    out: &'a mpsc::Sender<ServerMsg>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -247,12 +253,13 @@ async fn handle_connection<S>(
     sinks: MemberSinks,
     device_id: Option<String>,
     mut bus_rx: broadcast::Receiver<SocketBroadcast>,
-    member_name: String,
-    bound_user_id: String,
-    is_admin: bool,
+    user: pharos_core::User,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
+    let member_name = user.name.clone();
+    let bound_user_id = user.id.0.simple().to_string();
+    let is_admin = user.policy.admin;
     let started = Instant::now();
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);
     let mut current_group: Option<GroupHandle> = None;
@@ -557,6 +564,7 @@ async fn handle_connection<S>(
                             &member_name,
                             &registry,
                             started,
+                            JoinGate { state: &state, user: &user, out: &out_tx },
                         )
                         .await;
                     }
@@ -692,6 +700,7 @@ async fn handle_inbound(
     member_name: &str,
     registry: &GroupRegistry,
     started: Instant,
+    gate: JoinGate<'_>,
 ) {
     let _ = started;
     match inbound.message_type.as_str() {
@@ -714,6 +723,17 @@ async fn handle_inbound(
                 Ok(h) => h,
                 Err(_) => return,
             };
+            if !super::syncplay::may_join(
+                gate.state,
+                gate.user,
+                &handle,
+                super::syncplay::GroupHiddenRoute::Socket,
+            )
+            .await
+            {
+                let _ = gate.out.send(ServerMsg::NotInGroup).await;
+                return;
+            }
             join_via_handle(handle, current_group, member_id, member_name).await;
         }
         "SyncPlayLeaveGroup" => {
@@ -1715,6 +1735,84 @@ mod tests {
             "cause labels must stay stable — a rename breaks the LogQL/PromQL \
              dashboard contract"
         );
+    }
+
+    /// B265 / V201: a `SyncPlayJoinGroup` frame admits only a user who may see
+    /// the group's queue; a refused frame answers NotInGroup and joins nothing.
+    /// Disarm check: with the frame's `may_join` gate removed, the restricted
+    /// user joins.
+    #[actix_web::test]
+    async fn a_socket_join_frame_needs_a_visible_queue() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = AppState::new(stores, "t".into());
+        let registry = GroupRegistry::spawn(std::sync::Arc::new(pharos_sync::LocalDelivery::new(
+            MemberSinks::new(),
+        )));
+        let group = registry.create().await.unwrap();
+        let leader = MemberId::new();
+        let (reply, joined) = oneshot::channel();
+        group
+            .tx
+            .send(GroupMsg::AddMember {
+                member_id: leader,
+                name: "leader".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        joined.await.unwrap();
+        group
+            .tx
+            .send(GroupMsg::SetNewQueue {
+                sender: leader,
+                item_ids: vec![format!("{:032x}", 4242)],
+                item_runtimes_ms: vec![None],
+                playing_index: 0,
+                start_position_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(!group.snapshot().await.unwrap().queue_item_ids.is_empty());
+
+        let mut user = pharos_core::User {
+            id: pharos_core::UserId::new(),
+            name: "restricted".into(),
+            policy: pharos_core::UserPolicy {
+                enable_all_folders: false,
+                ..pharos_core::UserPolicy::default()
+            },
+            has_password: true,
+        };
+        let mut outcomes = Vec::new();
+        for all_folders in [false, true] {
+            user.policy.enable_all_folders = all_folders;
+            let frame: Inbound = serde_json::from_value(serde_json::json!({
+                "MessageType": "SyncPlayJoinGroup",
+                "Data": { "GroupId": group.group_id.0 },
+            }))
+            .unwrap();
+            let (out, mut out_rx) = mpsc::channel(4);
+            let mut current = None;
+            handle_inbound(
+                frame,
+                &mut current,
+                MemberId::new(),
+                "member",
+                &registry,
+                Instant::now(),
+                JoinGate {
+                    state: &state,
+                    user: &user,
+                    out: &out,
+                },
+            )
+            .await;
+            let not_in_group = matches!(out_rx.try_recv(), Ok(ServerMsg::NotInGroup));
+            outcomes.push((all_folders, current.is_some(), not_in_group));
+        }
+        assert_eq!(outcomes, vec![(false, false, true), (true, true, false)]);
     }
 
     #[actix_web::test]
