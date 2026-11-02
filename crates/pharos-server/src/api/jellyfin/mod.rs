@@ -112,6 +112,6 @@ pub(crate) async fn require_bearer(
     let user = crate::services::access::authenticate(state, token.as_deref(), id, route)
         .await
         .map_err(access_error)?;
-    auth_extractor::note_header_credential(req, auth_extractor::extract_token(req));
+    auth_extractor::note_header_credential(req);
     Ok(user)
 }

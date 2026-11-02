@@ -27,22 +27,25 @@ impl FromRequest for AuthUser {
         let state = req.app_data::<web::Data<AppState>>().cloned();
         let req = req.clone();
         Box::pin(async move {
-            let user = authenticate(state, token.clone()).await?;
-            note_header_credential(&req, token);
+            let user = authenticate(state, token).await?;
+            note_header_credential(&req);
             Ok(AuthUser(user))
         })
     }
 }
 
-/// The token a request authenticated with by header or `api_key`, left in
-/// the request extensions once the store accepted it. The
+/// The token a request authenticated with by header, left in the request
+/// extensions once the store accepted it. An `api_key` in the URL is never
+/// noted: another site's page can put one in an `<img>` (B253). The
 /// [`CookieBackfill`](crate::middleware::CookieBackfill) middleware reads it
 /// to give a browser that signed in before the cookie existed its
 /// `JellyfinAuth`. It has no `Debug` impl, so it cannot reach a log line.
 pub(crate) struct HeaderCredential(pub(crate) String);
 
-pub(crate) fn note_header_credential(req: &HttpRequest, token: Option<String>) {
-    if let Some(token) = token {
+/// Call only once the request has authenticated: every extractor tries the
+/// header token first, so a header token present here is the one accepted.
+pub(crate) fn note_header_credential(req: &HttpRequest) {
+    if let Some(token) = extract_header_token(req) {
         req.extensions_mut().insert(HeaderCredential(token));
     }
 }
@@ -104,8 +107,8 @@ impl FromRequest for AuthSession {
         let state = req.app_data::<web::Data<AppState>>().cloned();
         let req = req.clone();
         Box::pin(async move {
-            let user = authenticate(state, token.clone()).await?;
-            note_header_credential(&req, token);
+            let user = authenticate(state, token).await?;
+            note_header_credential(&req);
             Ok(AuthSession { user, device_id })
         })
     }
@@ -166,6 +169,20 @@ pub fn device_id_from_request(req: &HttpRequest) -> Option<String> {
 /// by media-element `src=` playback where headers can't be injected).
 /// Never the `JellyfinAuth` cookie: see [`extract_media_token`].
 pub fn extract_token(req: &HttpRequest) -> Option<String> {
+    extract_header_token(req).or_else(|| {
+        req.query_string()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, v)| {
+                (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey"))
+                    && !v.is_empty()
+            })
+            .map(|(_, v)| v.to_string())
+    })
+}
+
+/// The token from a Jellyfin auth header, ignoring `api_key`.
+fn extract_header_token(req: &HttpRequest) -> Option<String> {
     let h = req.headers();
 
     if let Some(v) = h.get("X-Emby-Token").and_then(|v| v.to_str().ok()) {
@@ -185,16 +202,6 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
             if let Some(tok) = parse_mediabrowser_token(v) {
                 return Some(tok);
             }
-        }
-    }
-    for (k, v) in req
-        .query_string()
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-    {
-        if (k.eq_ignore_ascii_case("api_key") || k.eq_ignore_ascii_case("ApiKey")) && !v.is_empty()
-        {
-            return Some(v.to_string());
         }
     }
     None
@@ -237,15 +244,11 @@ impl FromRequest for MediaUser {
 
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let token = extract_media_token(req);
-        // A cookie-borne token is not a credential to echo back.
-        let header_borne = extract_token(req).is_some();
         let state = req.app_data::<web::Data<AppState>>().cloned();
         let req = req.clone();
         Box::pin(async move {
-            let user = authenticate(state, token.clone()).await?;
-            if header_borne {
-                note_header_credential(&req, token);
-            }
+            let user = authenticate(state, token).await?;
+            note_header_credential(&req);
             Ok(MediaUser(user))
         })
     }
