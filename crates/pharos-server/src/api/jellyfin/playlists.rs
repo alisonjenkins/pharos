@@ -306,7 +306,7 @@ pub(crate) async fn visible_entry_count(
 
 /// The playlist header `BaseItemDto`. A Jellyfin playlist is an `IsFolder`
 /// `Playlist` item — opening it lists members via `/Playlists/{id}/Items`
-/// (and the `/Items?ParentId=<wire id>` pivot). `Id` is the wire id so it
+/// `Id` is the wire id so it
 /// round-trips byte-identically.
 pub(crate) fn playlist_dto(
     state: &AppState,
