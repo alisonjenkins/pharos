@@ -284,6 +284,20 @@ pub async fn password_login(
     admit: impl FnOnce(&User) -> Result<(), (u32, u32)>,
 ) -> Result<(User, pharos_core::AuthToken), PasswordLoginError> {
     let result: Result<_, PasswordLoginError> = async {
+        // An empty password is never a valid native credential: refuse it
+        // before any hash, with the same answer as a wrong password (B271).
+        if password.expose().is_empty() {
+            tracing::warn!(
+                transport = transport.label(),
+                user = %name,
+                client_ip = %client_ip,
+                reason = "empty_password",
+                "native login refused"
+            );
+            return Err(PasswordLoginError::Refused(
+                crate::auth::LoginRefusal::Invalid,
+            ));
+        }
         let user = state
             .login_throttle
             .verify(&state.auth, name, password, client_ip)

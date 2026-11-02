@@ -107,6 +107,26 @@ async fn a_wrong_password_or_unknown_user_is_the_same_401_with_no_cookie() {
     }
 }
 
+/// An account whose password is "" (Jellyfin `/Users/New` without a password
+/// stores exactly that) must not sign in with "", and must answer as a wrong
+/// password does, so the response cannot tell the two apart.
+#[actix_web::test]
+async fn an_empty_password_never_signs_in_and_answers_like_a_wrong_one() {
+    let fx = seed_rich().await;
+    fx.state
+        .auth
+        .create_user("blank", &pharos_core::SecretString::new(""), false)
+        .await
+        .unwrap();
+    let wrong = call(&fx, login("guest", "nope")).await;
+    let wrong_body = test::read_body(wrong).await;
+    let resp = call(&fx, login("blank", "")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(session_cookie(&resp).is_none());
+    let empty_body = test::read_body(resp).await;
+    assert_eq!(empty_body, wrong_body);
+}
+
 #[actix_web::test]
 async fn without_an_allowed_origin_nothing_is_checked_or_set() {
     let fx = seed_rich().await;
