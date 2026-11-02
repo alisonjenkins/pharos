@@ -3815,6 +3815,34 @@ impl TranscodeSessionStore for PostgresStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(res.rows_affected())
     }
+
+    #[tracing::instrument(skip(self, except_play_session_id))]
+    async fn trim_transcode_sessions_for_holder(
+        &self,
+        holder: UserId,
+        except_play_session_id: &str,
+        keep: usize,
+        updated_since_unix_secs: i64,
+    ) -> DomainResult<Vec<String>> {
+        let offset = i64::try_from(keep.saturating_sub(1))
+            .map_err(|e| DomainError::Backend(format!("keep overflow: {e}")))?;
+        let mut rows: Vec<(i64, String)> = sqlx::query_as(
+            "DELETE FROM transcode_sessions WHERE play_session_id IN ( \
+               SELECT play_session_id FROM transcode_sessions \
+               WHERE holder_user_id = $1 AND play_session_id <> $2 AND updated_at >= $3 \
+               ORDER BY updated_at DESC, play_session_id DESC OFFSET $4) \
+             RETURNING updated_at, play_session_id",
+        )
+        .bind(holder.0.simple().to_string())
+        .bind(except_play_session_id)
+        .bind(updated_since_unix_secs)
+        .bind(offset)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.sort_unstable();
+        Ok(rows.into_iter().map(|(_, id)| id).collect())
+    }
 }
 
 impl SyncGroupStore for PostgresStore {
