@@ -307,3 +307,4 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
 - V206: every wasm `pharosUiBundle` ships has been through wasm-opt: it holds no DWARF (`.debug_*`) section, and the build fails if one does, because dx reports a failed wasm-opt only in its log.
 - V207: a path has at most one `media_items` row, and a scan or watch event writes a file over the row already holding its path, under that row's id, whether or not the id is `stable_id(path)`; it never inserts a second row for a held path.
 - V208: a test whose assertion depends on wall-clock throughput (the encode-rate probes) runs with no other test beside it (`threads-required = "num-test-threads"` in every nextest profile), so the load it measures under is the machine's, not the rest of the suite's.
+- V210: password verification never runs on an async worker thread, and at most MAX_CONCURRENT_VERIFIES run at once; a busy refusal is not counted as a failed guess.
