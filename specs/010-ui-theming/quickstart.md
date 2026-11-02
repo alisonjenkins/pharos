@@ -24,5 +24,12 @@ All commands run in `nix develop`.
 4. **Signal check**: in the browser console, filter on `pharos: theme`. Every
    apply prints `applied`, and every rejected input prints `fallback` or
    `rejected` with its reason and value. Once Telemetry lands (017 T069), the
-   same events become queryable in Loki as `themeFallback`. T069 defines the
-   query, and this step gets updated to name it.
+   same events become queryable in Loki as `themeFallback`:
+
+   ```logql
+   {namespace="pharos"} |= "client event" | json | fields_kind="themeFallback"
+   ```
+
+   The playback lines are `fields_kind="playbackError"`. The server's logs are
+   JSON, so the kind sits at `fields.kind`, which `| json` flattens to
+   `fields_kind`. Each event is also counted in `pharos_client_events_total{kind,level}`.
