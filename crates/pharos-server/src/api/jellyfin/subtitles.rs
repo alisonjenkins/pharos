@@ -196,11 +196,11 @@ async fn deliver_attachment(
 
 /// An attachment's type comes from the media file, so whoever made the file
 /// chooses it. A sandboxed, script-less CSP keeps an HTML or SVG attachment
-/// from running on pharos's origin even if a browser renders it (B254).
+/// from running on pharos's origin even if a browser renders it (B255).
 const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
 
 /// Font mimetypes Matroska muxers write. Only these are served inline,
-/// for SubtitlesOctopus; anything else is a download (V194).
+/// for SubtitlesOctopus; anything else is a download (V195).
 fn is_font(mime: &str) -> bool {
     let mime = mime
         .split(';')
