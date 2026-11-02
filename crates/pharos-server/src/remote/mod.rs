@@ -117,15 +117,53 @@ pub async fn check_target(url: &str, allowed_hosts: &[String]) -> Result<(), Tar
             detail: "no addresses".to_string(),
         });
     }
-    match addrs
-        .into_iter()
-        .find(|a| !crate::api::jellyfin::items::ip_is_remote(a) || a.is_multicast())
-    {
+    match addrs.into_iter().find(|a| !is_public(a)) {
         Some(addr) => Err(TargetRefused::Private {
             host: host.to_string(),
             addr,
         }),
         None => Ok(()),
+    }
+}
+
+/// Whether `ip` is an ordinary internet address: not private, loopback,
+/// link-local, CGNAT, multicast, broadcast or reserved, judging a v4 address
+/// embedded in a v6 one (mapped, compatible, NAT64, 6to4) by the v4 rules.
+fn is_public(ip: &std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4_public = |v4: Ipv4Addr| {
+        let [a, b, c, _] = v4.octets();
+        !(a == 0 || a >= 224 || (a == 192 && b == 0 && c == 0) || (a == 198 && (b & 0xfe) == 18))
+            && crate::api::jellyfin::items::ip_is_remote(&IpAddr::V4(v4))
+    };
+    match ip {
+        IpAddr::V4(v4) => v4_public(*v4),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let low_v4 = Ipv4Addr::new(
+                (seg[6] >> 8) as u8,
+                seg[6] as u8,
+                (seg[7] >> 8) as u8,
+                seg[7] as u8,
+            );
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4_public(v4);
+            }
+            if seg[..6] == [0; 6] || seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return v4_public(low_v4);
+            }
+            if seg[0] == 0x2002 {
+                let six_to_four = Ipv4Addr::new(
+                    (seg[1] >> 8) as u8,
+                    seg[1] as u8,
+                    (seg[2] >> 8) as u8,
+                    seg[2] as u8,
+                );
+                return v4_public(six_to_four);
+            }
+            let site_local = (seg[0] & 0xffc0) == 0xfec0;
+            !(v6.is_multicast() || site_local) && crate::api::jellyfin::items::ip_is_remote(ip)
+        }
     }
 }
 
@@ -675,6 +713,42 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    /// Every address that is not plainly the public internet is refused,
+    /// including the ones embedded in a v6 address.
+    #[tokio::test]
+    async fn a_reserved_or_embedded_private_address_is_refused() {
+        let mut passed = Vec::new();
+        for host in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+            "[::127.0.0.1]",
+            "[64:ff9b::7f00:1]",
+            "[2002:7f00:1::]",
+            "[fec0::1]",
+            "[ff02::1]",
+            "[::ffff:10.0.0.1]",
+        ] {
+            let url = format!("http://{host}/x");
+            if !matches!(
+                check_target(&url, &[]).await,
+                Err(TargetRefused::Private { .. })
+            ) {
+                passed.push(url);
+            }
+        }
+        assert!(passed.is_empty(), "reached as public: {passed:?}");
+        assert_eq!(check_target("http://93.184.216.34/x", &[]).await, Ok(()));
+        assert_eq!(
+            check_target("http://[2606:2800:220:1::1]/x", &[]).await,
+            Ok(())
+        );
+    }
 
     #[test]
     fn target_refusal_labels_are_distinct() {
