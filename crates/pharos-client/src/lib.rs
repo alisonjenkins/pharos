@@ -77,12 +77,14 @@ impl ClientError {
     }
 
     /// Whether the server refused because no session was signed in or it
-    /// was revoked, so the UI should show sign-in.
+    /// was revoked, so the UI should show sign-in. Every sign-in refusal is
+    /// `revoked`; `notPermitted` also covers signed-in refusals such as an
+    /// unplayable item, so it does not count.
     pub fn needs_sign_in(&self) -> bool {
         matches!(
             self,
             ClientError::Api {
-                kind: "revoked" | "notPermitted",
+                kind: "revoked",
                 ..
             }
         )
@@ -122,4 +124,35 @@ pub async fn resume(
         return Err(ClientError::from_api(e?));
     }
     Ok(result.get_session()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api(kind: &'static str) -> ClientError {
+        ClientError::Api {
+            kind,
+            reason: String::new(),
+            trace_id: String::new(),
+        }
+    }
+
+    /// The server answers `notPermitted` to signed-in users too (an
+    /// unplayable item, a pending quick-connect), so only `revoked` sends
+    /// the UI to sign-in.
+    #[test]
+    fn only_a_revoked_session_needs_sign_in() {
+        assert!(api("revoked").needs_sign_in());
+        for kind in [
+            "notPermitted",
+            "notFound",
+            "invalid",
+            "limit",
+            "unavailable",
+            "other",
+        ] {
+            assert!(!api(kind).needs_sign_in(), "{kind}");
+        }
+    }
 }
