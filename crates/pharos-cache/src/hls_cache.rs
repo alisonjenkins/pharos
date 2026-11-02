@@ -1305,18 +1305,7 @@ impl SegmentIdentity {
             audio_bitrate_kbps: kbps(opts.audio_bitrate_bps()),
             codec_tag: codec_tag(opts.video, opts.audio_codec(), opts.container),
             source_gen,
-            stereo_output: if opts.stereo_output == pharos_transcode::StereoOutput::Mono2D
-                || ((subtitle_index.is_some()
-                    || opts.burn_subtitle_stream_index.is_some()
-                    || opts.burn_intent)
-                    && opts
-                        .video_3d_format
-                        .is_some_and(|f| f.is_packed_sbs_or_tab()))
-            {
-                pharos_transcode::StereoOutput::Mono2D
-            } else {
-                pharos_transcode::StereoOutput::Preserve
-            },
+            stereo_output: opts.stereo_output,
         }
     }
 
@@ -8772,14 +8761,33 @@ mod tests {
         );
         assert_ne!(key_mono.etag(), key_preserve.etag());
 
-        // Also test implicit mono2d when burning subtitles on packed 3D
+        // A burn on packed 3D keeps the layout (V223): it is named by its
+        // subtitle index, so it can collide neither with the unburned segment
+        // nor with the Mono2D burn that older builds cached under `_mono2d`.
         let mut opts_packed_burn = opts_preserve.clone();
-        opts_packed_burn.stereo_output = pharos_transcode::StereoOutput::Preserve;
         opts_packed_burn.burn_intent = true;
+        opts_packed_burn.burn_subtitle_stream_index = Some(2);
         let key_burn =
-            SegmentIdentity::new(1, 5, Some(1), None, &opts_packed_burn, SourceGen::LOCAL);
-        assert!(key_burn.filename().ends_with("_mono2d.ts"));
-        assert_eq!(key_burn.etag(), key_mono.etag());
+            SegmentIdentity::new(1, 5, Some(1), Some(2), &opts_packed_burn, SourceGen::LOCAL);
+        assert!(
+            !key_burn.filename().contains("_mono2d"),
+            "{}",
+            key_burn.filename()
+        );
+        assert_ne!(key_burn.filename(), key_preserve.filename());
+        assert_ne!(key_burn.etag(), key_preserve.etag());
+
+        let mut opts_mono_burn = opts_packed_burn.clone();
+        opts_mono_burn.stereo_output = pharos_transcode::StereoOutput::Mono2D;
+        let key_mono_burn =
+            SegmentIdentity::new(1, 5, Some(1), Some(2), &opts_mono_burn, SourceGen::LOCAL);
+        assert!(key_mono_burn.filename().ends_with("_mono2d.ts"));
+        assert_ne!(key_burn.filename(), key_mono_burn.filename());
+        assert_ne!(
+            key_burn.cache_relative_path(),
+            key_mono_burn.cache_relative_path()
+        );
+        assert_ne!(key_burn.etag(), key_mono_burn.etag());
     }
 
     #[test]
