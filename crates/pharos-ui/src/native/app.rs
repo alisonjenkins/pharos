@@ -11,6 +11,7 @@ use pharos_client::api::{
 };
 use pharos_client::{CallInfo, ClientError};
 
+use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
@@ -21,7 +22,11 @@ use super::views::{
     BrowseView, ErrorNote, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
     WatchView, VIDEO_ID,
 };
-use crate::theme;
+use crate::theme::editor::{Draft, EffectField};
+use crate::theme::resolve::PaletteRole;
+use crate::theme::signal::{self, Source};
+use crate::theme::value::{Density, FontStack, Rgba};
+use crate::theme::{self, contrast, css, device, doc, format, Catalogue, Theme, ThemeError};
 use crate::views::RootApp;
 
 /// Items a browse page asks for at once.
@@ -31,7 +36,14 @@ const BROWSE_PAGE: u32 = 100;
 /// mounts the older REST panes and never opens the native socket.
 #[component]
 pub fn Root() -> Element {
-    use_hook(apply_device_theme);
+    let boot = use_hook(boot_theme);
+    let themes = Themes {
+        catalogue: use_signal(|| boot.catalogue.clone()),
+        active: use_signal(|| boot.active.clone()),
+        applied: use_signal(|| boot.applied.clone()),
+    };
+    use_context_provider(|| themes);
+    use_hook(move || Rc::new(watch_system_preferences(themes)));
     let mut route = use_signal(|| Route::parse(&platform::current_path()));
     use_hook(|| {
         Rc::new(platform::on_pop_state(move |path| {
@@ -58,32 +70,571 @@ pub fn Root() -> Element {
     }
 }
 
-/// Apply the device's stored theme before the first native paint, logging
-/// which theme and, on a fallback, why.
-fn apply_device_theme() {
-    let stored = platform::stored_theme(theme::device::ACTIVE_KEY);
-    let startup = match theme::device::startup(&theme::shipped(), stored, false, false) {
-        Ok(startup) => startup,
+const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
+const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
+const IMPORT_ACCEPT: &str = ".toml,application/toml";
+const THEME_MIME: &str = "application/toml";
+/// The colour shown for a role when neither the draft nor its base resolves.
+const UNRESOLVED: Rgba = Rgba {
+    r: 0,
+    g: 0,
+    b: 0,
+    a: 255,
+};
+
+/// The theme state every screen shares: the named themes, the choice (a
+/// name or `auto`) and the name applied now.
+#[derive(Clone, Copy)]
+pub struct Themes {
+    catalogue: Signal<Catalogue>,
+    active: Signal<String>,
+    applied: Signal<String>,
+}
+
+impl Themes {
+    /// Apply the active choice and record the name applied. `auto` resolves
+    /// against the system's preferences at this moment.
+    fn apply_active(mut self) {
+        let active = self.active.peek().clone();
+        let (dark, more) = prefers();
+        let catalogue = self.catalogue.peek();
+        match theme::device::startup(&catalogue, Ok(Some(active)), dark, more) {
+            Ok(startup) => {
+                log_lines(&startup.lines);
+                apply_theme(&startup.theme);
+                self.applied.set(startup.theme.name);
+            }
+            Err(e) => warn_unavailable(&e),
+        }
+    }
+
+    /// Make `name` the choice, apply it and store the choice.
+    fn choose(mut self, name: String) {
+        self.active.set(name);
+        self.apply_active();
+        self.store_active();
+    }
+
+    fn store_active(self) {
+        store_setting(device::ACTIVE_KEY, &self.active.peek());
+    }
+
+    fn store_custom(self) {
+        let json = device::custom_json(&self.catalogue.peek());
+        store_setting(device::CUSTOM_KEY, &json);
+    }
+
+    /// The catalogue entry `name` changed: re-apply it when it is the active
+    /// choice, and store the custom themes.
+    fn catalogue_changed(self, name: &str) {
+        if *self.active.peek() == name {
+            self.apply_active();
+        }
+        self.store_custom();
+    }
+
+    /// The system's preferences changed: re-resolve when `auto` is chosen.
+    fn follow_system(self) {
+        if *self.active.peek() == device::AUTO {
+            self.apply_active();
+        }
+    }
+}
+
+/// The device's catalogue and choices at start-up.
+#[derive(Clone)]
+struct Boot {
+    catalogue: Catalogue,
+    active: String,
+    applied: String,
+}
+
+/// Load the custom themes, then apply the device's stored choice before the
+/// first native paint, logging which theme and, on a fallback, why.
+fn boot_theme() -> Boot {
+    let mut catalogue = theme::shipped();
+    log_lines(&device::load_custom(
+        &mut catalogue,
+        platform::stored_theme(device::CUSTOM_KEY),
+    ));
+    let stored = platform::stored_theme(device::ACTIVE_KEY);
+    let auto = matches!(&stored, Ok(Some(name)) if name == device::AUTO);
+    let (dark, more) = prefers();
+    match device::startup(&catalogue, stored, dark, more) {
+        Ok(startup) => {
+            log_lines(&startup.lines);
+            apply_theme(&startup.theme);
+            let active = if auto {
+                device::AUTO.to_owned()
+            } else {
+                startup.theme.name.clone()
+            };
+            Boot {
+                catalogue,
+                active,
+                applied: startup.theme.name,
+            }
+        }
         Err(e) => {
-            platform::warn(&format!(
-                "pharos: theme unavailable reason={} keeping=pharos.css",
-                e.label()
+            warn_unavailable(&e);
+            Boot {
+                catalogue,
+                active: theme::DEFAULT.to_owned(),
+                applied: theme::DEFAULT.to_owned(),
+            }
+        }
+    }
+}
+
+/// Keep the two system-preference listeners for the page's life; a change
+/// re-resolves `auto`.
+fn watch_system_preferences(themes: Themes) -> [platform::MediaWatch; 2] {
+    [
+        platform::on_media_change(PREFERS_DARK, move || themes.follow_system()),
+        platform::on_media_change(PREFERS_MORE_CONTRAST, move || themes.follow_system()),
+    ]
+}
+
+fn prefers() -> (bool, bool) {
+    (
+        platform::prefers(PREFERS_DARK),
+        platform::prefers(PREFERS_MORE_CONTRAST),
+    )
+}
+
+/// Set the page's tokens in one style write. A failure is logged and the
+/// page keeps the tokens it had.
+fn apply_theme(theme: &Theme) {
+    if let Err(e) = platform::apply_tokens(&css::declarations(theme)) {
+        platform::warn(&format!(
+            "pharos: theme apply failed name={} error={e}",
+            theme.name
+        ));
+    }
+}
+
+fn warn_unavailable(e: &ThemeError) {
+    platform::warn(&format!(
+        "pharos: theme unavailable reason={} keeping=pharos.css",
+        e.label()
+    ));
+}
+
+fn log_lines(lines: &[device::Line]) {
+    for line in lines {
+        match line {
+            device::Line::Info(l) => platform::info(l),
+            device::Line::Warn(l) => platform::warn(l),
+        }
+    }
+}
+
+fn store_setting(key: &str, value: &str) {
+    if let Err(e) = platform::store_theme(key, value) {
+        platform::warn(&signal::storage_failed(key, &e));
+    }
+}
+
+fn source_label(name: &str) -> Source {
+    if theme::is_shipped(name) {
+        Source::Shipped
+    } else {
+        Source::Local
+    }
+}
+
+fn unknown_theme(name: &str) {
+    platform::warn(&signal::fallback(
+        name,
+        source_label(name),
+        &ThemeError::UnknownTheme {
+            name: name.to_owned(),
+        },
+        "-",
+    ));
+}
+
+fn bad_field(path: &str, value: &str) -> ThemeError {
+    ThemeError::BadValue {
+        path: path.to_owned(),
+        value: value.to_owned(),
+        expected: "a value the editor offers".to_owned(),
+    }
+}
+
+fn notify(mut notice: Signal<Option<Notice>>, text: String, error: bool) {
+    notice.set(Some(Notice { text, error }));
+}
+
+/// Store `source` as a custom theme. The outcome's lines are logged; the
+/// saved name, or the reason for refusing, comes back.
+fn save_theme(mut themes: Themes, source: String, from: Source) -> Result<String, String> {
+    let outcome = {
+        let mut catalogue = themes.catalogue.write();
+        device::save(&mut catalogue, source, from)
+    };
+    match outcome {
+        Ok(saved) => {
+            log_lines(&saved.lines);
+            Ok(saved.name)
+        }
+        Err(refusal) => {
+            log_lines(&refusal.lines);
+            Err(refusal.reason)
+        }
+    }
+}
+
+fn import(themes: Themes, notice: Signal<Option<Notice>>, source: String) {
+    match save_theme(themes, source, Source::Import) {
+        Ok(name) => {
+            themes.catalogue_changed(&name);
+            notify(notice, format!("Imported {name}"), false);
+        }
+        Err(reason) => notify(notice, reason, true),
+    }
+}
+
+fn import_file(themes: Themes, notice: Signal<Option<Notice>>) {
+    spawn(async move {
+        match platform::pick_file(IMPORT_ACCEPT, doc::MAX_BYTES).await {
+            Ok(Some(text)) => import(themes, notice, text),
+            Ok(None) => {}
+            Err(e) => {
+                platform::warn(&signal::fallback("-", Source::Import, &e, "-"));
+                notify(notice, e.to_string(), true);
+            }
+        }
+    });
+}
+
+fn export(themes: Themes, notice: Signal<Option<Notice>>, name: &str) {
+    let source = themes.catalogue.peek().get_source(name).map(str::to_owned);
+    let Some(source) = source else {
+        unknown_theme(name);
+        return;
+    };
+    let filename = format!("{}.pharos-theme.toml", theme::slug(name));
+    match platform::download(&filename, THEME_MIME, &source) {
+        Ok(()) => platform::info(&signal::exported(name, source.len())),
+        Err(e) => {
+            platform::warn(&signal::fallback(name, source_label(name), &e, "-"));
+            notify(notice, e.to_string(), true);
+        }
+    }
+}
+
+fn delete(
+    mut themes: Themes,
+    mut editing: Signal<Option<Editing>>,
+    notice: Signal<Option<Notice>>,
+    name: &str,
+) {
+    if theme::is_shipped(name) {
+        platform::warn(&signal::fallback(
+            name,
+            Source::Shipped,
+            &ThemeError::BadValue {
+                path: "meta.name".to_owned(),
+                value: name.to_owned(),
+                expected: "a custom theme".to_owned(),
+            },
+            "-",
+        ));
+        return;
+    }
+    if !themes.catalogue.write().remove(name) {
+        unknown_theme(name);
+        return;
+    }
+    platform::info(&signal::deleted(name));
+    let editing_it = editing
+        .peek()
+        .as_ref()
+        .is_some_and(|state| state.base == name || state.draft.name() == Some(name));
+    if editing_it {
+        editing.set(None);
+    }
+    if *themes.active.peek() == name {
+        themes.choose(theme::DEFAULT.to_owned());
+    } else if editing_it {
+        themes.apply_active();
+    }
+    themes.store_custom();
+    notify(notice, format!("Deleted {name}"), false);
+}
+
+fn customise(
+    themes: Themes,
+    mut editing: Signal<Option<Editing>>,
+    mut notice: Signal<Option<Notice>>,
+    base: String,
+) {
+    let name = fresh_name(&themes.catalogue.peek(), &base);
+    let draft = Draft::new(&name, &base);
+    apply_preview(themes, &draft);
+    editing.set(Some(Editing { draft, base }));
+    notice.set(None);
+}
+
+fn edit_custom(
+    themes: Themes,
+    mut editing: Signal<Option<Editing>>,
+    mut notice: Signal<Option<Notice>>,
+    name: &str,
+) {
+    let source = themes.catalogue.peek().get_source(name).map(str::to_owned);
+    let Some(source) = source else {
+        unknown_theme(name);
+        return;
+    };
+    match Draft::from_source(&source) {
+        Ok(draft) => {
+            let base = format::read(&source)
+                .ok()
+                .and_then(|(doc, _)| doc.extends().map(str::to_owned))
+                .unwrap_or_else(|| theme::DEFAULT.to_owned());
+            apply_preview(themes, &draft);
+            editing.set(Some(Editing { draft, base }));
+            notice.set(None);
+        }
+        Err(e) => {
+            platform::warn(&signal::fallback(name, source_label(name), &e, "-"));
+            notify(notice, e.to_string(), true);
+        }
+    }
+}
+
+/// Save the draft as a custom theme and make it the choice. A refusal keeps
+/// the editor open with its reason.
+fn save_editor(
+    themes: Themes,
+    mut editing: Signal<Option<Editing>>,
+    notice: Signal<Option<Notice>>,
+) {
+    let Some(state) = editing.peek().clone() else {
+        return;
+    };
+    let source = match state.draft.source() {
+        Ok(source) => source,
+        Err(e) => {
+            platform::warn(&signal::fallback(
+                state.draft.name().unwrap_or("-"),
+                Source::Editor,
+                &e,
+                "-",
             ));
+            notify(notice, e.to_string(), true);
             return;
         }
     };
-    for line in &startup.lines {
-        match line {
-            theme::device::Line::Info(l) => platform::info(l),
-            theme::device::Line::Warn(l) => platform::warn(l),
+    match save_theme(themes, source, Source::Editor) {
+        Ok(name) => {
+            editing.set(None);
+            themes.choose(name.clone());
+            themes.store_custom();
+            notify(notice, format!("Saved {name}"), false);
+        }
+        Err(reason) => notify(notice, reason, true),
+    }
+}
+
+/// Apply one editor change to the draft, then preview it live. A change the
+/// editor could not have sent is logged and dropped.
+fn edit_draft(themes: Themes, mut editing: Signal<Option<Editing>>, edit: Edit) {
+    let Some(mut state) = editing.peek().clone() else {
+        return;
+    };
+    match apply_edit(&mut state.draft, edit) {
+        Ok(()) => {
+            apply_preview(themes, &state.draft);
+            editing.set(Some(state));
+        }
+        Err(e) => platform::warn(&signal::fallback(
+            state.draft.name().unwrap_or("-"),
+            Source::Editor,
+            &e,
+            "-",
+        )),
+    }
+}
+
+fn apply_edit(draft: &mut Draft, edit: Edit) -> Result<(), ThemeError> {
+    match edit {
+        Edit::Name(name) => draft.set_name(&name),
+        Edit::Colour(role, hex) => {
+            let parsed = PaletteRole::parse(&role).ok_or_else(|| bad_field("palette", &role))?;
+            draft.set_colour(parsed, &hex);
+        }
+        Edit::Density(label) => {
+            let density =
+                Density::parse(&label).ok_or_else(|| bad_field("shape.density", &label))?;
+            draft.set_density(density);
+        }
+        Edit::UiFont(label) => {
+            let font = FontStack::parse(&label).ok_or_else(|| bad_field("type.ui", &label))?;
+            draft.set_ui_font(font);
+        }
+        Edit::Effect(label, value) => {
+            let field = effect_field(&label).ok_or_else(|| bad_field("effects", &label))?;
+            draft.set_effect(field, value);
         }
     }
-    if let Err(e) = platform::apply_tokens(&theme::css::declarations(&startup.theme)) {
-        platform::warn(&format!(
-            "pharos: theme apply failed name={} error={e}",
-            startup.theme.name
-        ));
+    Ok(())
+}
+
+fn effect_field(label: &str) -> Option<EffectField> {
+    match label {
+        "blur" => Some(EffectField::Blur),
+        "vignette" => Some(EffectField::Vignette),
+        "grain" => Some(EffectField::Grain),
+        "glow" => Some(EffectField::Glow),
+        _ => None,
     }
+}
+
+/// Show the draft's resolved tokens without saving them. A draft that does
+/// not resolve keeps the tokens already applied, and logs why.
+fn apply_preview(themes: Themes, draft: &Draft) {
+    match draft.preview(&themes.catalogue.peek()) {
+        Ok(resolved) => apply_theme(&resolved.theme),
+        Err(e) => platform::warn(&signal::fallback(
+            draft.name().unwrap_or("-"),
+            Source::Editor,
+            &e,
+            &themes.applied.peek(),
+        )),
+    }
+}
+
+fn cancel(
+    themes: Themes,
+    mut editing: Signal<Option<Editing>>,
+    mut notice: Signal<Option<Notice>>,
+) {
+    editing.set(None);
+    notice.set(None);
+    themes.apply_active();
+}
+
+/// `My <base>`, or the first `My <base> <n>` no custom theme already uses.
+fn fresh_name(catalogue: &Catalogue, base: &str) -> String {
+    let first = format!("My {base}");
+    if catalogue.get_source(&first).is_none() {
+        return first;
+    }
+    (2..)
+        .map(|n| format!("My {base} {n}"))
+        .find(|name| catalogue.get_source(name).is_none())
+        .unwrap_or(first)
+}
+
+/// The theme cards for the catalogue. A theme that does not resolve gets no
+/// card; its fallback line is logged instead.
+fn theme_cards(catalogue: &Catalogue) -> Vec<ThemeCard> {
+    let mut cards = Vec::new();
+    for name in catalogue.names() {
+        match catalogue.resolve(name) {
+            Ok(resolved) => cards.push(card(name, &resolved.theme)),
+            Err(e) => platform::warn(&signal::fallback(name, source_label(name), &e, "-")),
+        }
+    }
+    cards
+}
+
+fn card(name: &str, theme: &Theme) -> ThemeCard {
+    let p = &theme.palette;
+    ThemeCard {
+        name: name.to_owned(),
+        shipped: theme::is_shipped(name),
+        active: false,
+        swatches: [p.bg, p.surface, p.accent, p.fg]
+            .iter()
+            .map(Rgba::to_css)
+            .collect(),
+    }
+}
+
+/// `#rrggbb`, the only form an `<input type=color>` accepts.
+fn hex6(colour: Rgba) -> String {
+    format!("#{:02x}{:02x}{:02x}", colour.r, colour.g, colour.b)
+}
+
+/// The raw text the draft holds for `role`, if it sets one.
+fn raw_colour(draft: &Draft, role: PaletteRole) -> Option<String> {
+    let source = draft.source().ok()?;
+    let (mut doc, _) = format::read(&source).ok()?;
+    doc.palette.as_mut()?.slot(role).clone()
+}
+
+fn contrast_rows(theme: &Theme) -> Vec<ContrastRow> {
+    contrast::check(theme)
+        .into_iter()
+        .map(|r| ContrastRow {
+            pair: r.pair.to_string(),
+            ratio: r.ratio,
+            min: r.min,
+            pass: r.pass,
+            decorative: r.decorative,
+        })
+        .collect()
+}
+
+fn effects_of(theme: &Theme) -> Vec<(String, f64)> {
+    let e = &theme.effects;
+    vec![
+        ("blur".to_owned(), f64::from(e.blur_px)),
+        ("vignette".to_owned(), e.vignette),
+        ("grain".to_owned(), e.grain),
+        ("glow".to_owned(), e.glow),
+    ]
+}
+
+/// The editor's view of a draft. Each colour is the draft's resolved colour;
+/// a role whose draft value is not a colour shows the base theme's. The
+/// preview's error is shown, and its contrast table left empty.
+fn editor_view(state: &Editing, catalogue: &Catalogue) -> EditorView {
+    let base = catalogue.resolve(&state.base).ok().map(|r| r.theme);
+    let preview = state.draft.preview(catalogue);
+    let colours = PaletteRole::ALL
+        .iter()
+        .map(|&role| {
+            let colour = match &preview {
+                Ok(resolved) => resolved.theme.palette.get(role),
+                Err(_) => raw_colour(&state.draft, role)
+                    .and_then(|raw| Rgba::parse(&raw))
+                    .or_else(|| base.as_ref().map(|t| t.palette.get(role)))
+                    .unwrap_or(UNRESOLVED),
+            };
+            (role.label().to_owned(), hex6(colour))
+        })
+        .collect();
+    let shown: Option<&Theme> = match &preview {
+        Ok(resolved) => Some(&resolved.theme),
+        Err(_) => base.as_ref(),
+    };
+    EditorView {
+        name: state.draft.name().unwrap_or_default().to_owned(),
+        base: state.base.clone(),
+        colours,
+        density: shown
+            .map(|t| t.density.label().to_owned())
+            .unwrap_or_default(),
+        ui_font: shown.map(|t| t.ui.label().to_owned()).unwrap_or_default(),
+        effects: shown.map(effects_of).unwrap_or_default(),
+        contrast: preview
+            .as_ref()
+            .map(|resolved| contrast_rows(&resolved.theme))
+            .unwrap_or_default(),
+        error: preview.as_ref().err().map(ToString::to_string),
+    }
+}
+
+/// An edit in progress: the draft and the theme it extends.
+#[derive(Clone)]
+struct Editing {
+    draft: Draft,
+    base: String,
 }
 
 /// Navigation that replaces the current history entry, for redirects.
@@ -258,9 +809,7 @@ fn Screen(route: Route) -> Element {
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
-        Route::Appearance => {
-            rsx! { ErrorNote { message: "Appearance is not wired yet.".to_string() } }
-        }
+        Route::Appearance => rsx! { AppearanceScreen {} },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
 }
@@ -271,6 +820,62 @@ fn Redirect(to: Route) -> Element {
     let replace = use_context::<Replace>();
     use_effect(move || replace.0.call(to.clone()));
     rsx! { Loading {} }
+}
+
+/// The Appearance page: the theme gallery, imports, and the editor, mapped
+/// onto the shared theme state.
+#[component]
+fn AppearanceScreen() -> Element {
+    let themes = use_context::<Themes>();
+    let mut editing = use_signal(|| None::<Editing>);
+    let notice = use_signal(|| None::<Notice>);
+    let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
+    // Leaving the page mid-edit must put the active theme back.
+    use_drop(move || {
+        if editing.peek().is_some() {
+            themes.apply_active();
+        }
+    });
+
+    let applied = themes.applied.read().clone();
+    let mut list: Vec<ThemeCard> = cards.read().clone();
+    for card in list.iter_mut() {
+        card.active = card.name == applied;
+    }
+    let auto = *themes.active.read() == device::AUTO;
+    let editor = editing
+        .read()
+        .as_ref()
+        .map(|state| editor_view(state, &themes.catalogue.read()));
+    let notice_now = notice.read().clone();
+
+    rsx! {
+        AppearanceView {
+            themes: list,
+            auto,
+            editor,
+            notice: notice_now,
+            on_pick: move |name: String| {
+                editing.set(None);
+                themes.choose(name.clone());
+                notify(notice, format!("Applied {name}"), false);
+            },
+            on_auto: move |()| {
+                editing.set(None);
+                themes.choose(device::AUTO.to_owned());
+                notify(notice, "Following the system".to_owned(), false);
+            },
+            on_customise: move |base: String| customise(themes, editing, notice, base),
+            on_edit_custom: move |name: String| edit_custom(themes, editing, notice, &name),
+            on_delete: move |name: String| delete(themes, editing, notice, &name),
+            on_export: move |name: String| export(themes, notice, &name),
+            on_import_file: move |()| import_file(themes, notice),
+            on_import_paste: move |text: String| import(themes, notice, text),
+            on_edit: move |edit: Edit| edit_draft(themes, editing, edit),
+            on_save: move |()| save_editor(themes, editing, notice),
+            on_cancel: move |()| cancel(themes, editing, notice),
+        }
+    }
 }
 
 /// Renders a load's state: loading, its error, or `view` of its value.
@@ -544,6 +1149,8 @@ fn Player(playing: PlayingRef, last_ms: LastMs) -> Element {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
 
     #[test]
@@ -552,5 +1159,156 @@ mod tests {
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Connecting…"), "{html}");
+    }
+
+    #[test]
+    fn the_device_starts_on_the_default_theme_when_nothing_is_stored() {
+        let boot = boot_theme();
+        assert_eq!(boot.active, theme::DEFAULT);
+        assert_eq!(boot.applied, theme::DEFAULT);
+    }
+
+    #[test]
+    fn a_theme_that_does_not_resolve_gets_no_card() {
+        let mut catalogue = theme::shipped();
+        catalogue
+            .insert("[meta]\nname = \"Broken\"\nschema = 1\nextends = \"Nowhere\"\n".to_owned())
+            .unwrap();
+        let cards = theme_cards(&catalogue);
+        assert_eq!(cards.len(), 7);
+        assert!(cards.iter().all(|c| c.name != "Broken"));
+    }
+
+    #[test]
+    fn a_card_shows_the_resolved_bg_surface_accent_and_fg() {
+        let catalogue = theme::shipped();
+        let resolved = catalogue.resolve("Kali Dark").unwrap().theme;
+        let card = theme_cards(&catalogue)
+            .into_iter()
+            .find(|c| c.name == "Kali Dark")
+            .unwrap();
+        let p = resolved.palette;
+        assert_eq!(
+            card.swatches,
+            [p.bg, p.surface, p.accent, p.fg]
+                .iter()
+                .map(Rgba::to_css)
+                .collect::<Vec<_>>()
+        );
+        assert!(card.shipped);
+    }
+
+    #[test]
+    fn a_draft_colour_that_is_not_a_colour_shows_the_base_colour_and_the_error() {
+        let catalogue = theme::shipped();
+        let base = catalogue.resolve("Kali Dark").unwrap().theme;
+        let mut draft = Draft::new("Mine", "Kali Dark");
+        draft.set_colour(PaletteRole::Accent, "nope");
+        let state = Editing {
+            draft,
+            base: "Kali Dark".into(),
+        };
+        let view = editor_view(&state, &catalogue);
+        let accent = view
+            .colours
+            .iter()
+            .find(|(role, _)| role == "accent")
+            .unwrap();
+        assert_eq!(accent.1, hex6(base.palette.accent));
+        assert!(
+            view.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("palette.accent"),
+            "{view:?}"
+        );
+        assert!(view.contrast.is_empty());
+    }
+
+    #[test]
+    fn a_valid_draft_colour_shows_its_resolved_hex() {
+        let catalogue = theme::shipped();
+        let mut draft = Draft::new("Mine", "Kali Dark");
+        draft.set_colour(PaletteRole::Accent, "#FF00FF");
+        let view = editor_view(
+            &Editing {
+                draft,
+                base: "Kali Dark".into(),
+            },
+            &catalogue,
+        );
+        let accent = view
+            .colours
+            .iter()
+            .find(|(role, _)| role == "accent")
+            .unwrap();
+        assert_eq!(accent.1, "#ff00ff");
+        assert_eq!(view.error, None);
+        assert!(!view.contrast.is_empty());
+    }
+
+    #[test]
+    fn editor_changes_land_on_the_draft_and_unknown_fields_are_refused() {
+        let mut draft = Draft::new("Mine", "Kali Dark");
+        apply_edit(&mut draft, Edit::Colour("accent".into(), "#00ff00".into())).unwrap();
+        apply_edit(&mut draft, Edit::Effect("blur".into(), 3.0)).unwrap();
+        apply_edit(&mut draft, Edit::Density("compact".into())).unwrap();
+        apply_edit(&mut draft, Edit::Name("Renamed".into())).unwrap();
+        let resolved = draft.preview(&theme::shipped()).unwrap();
+        assert_eq!(resolved.theme.palette.accent.g, 255);
+        assert_eq!(resolved.theme.effects.blur_px, 3);
+        assert_eq!(resolved.theme.name, "Renamed");
+        assert!(apply_edit(&mut draft, Edit::Colour("glitter".into(), "#000000".into())).is_err());
+        assert!(apply_edit(&mut draft, Edit::Effect("sparkle".into(), 1.0)).is_err());
+    }
+
+    #[test]
+    fn a_new_custom_theme_takes_the_first_free_name() {
+        let mut catalogue = theme::shipped();
+        assert_eq!(fresh_name(&catalogue, "Kali Dark"), "My Kali Dark");
+        catalogue
+            .insert("[meta]\nname = \"My Kali Dark\"\nschema = 1\n".to_owned())
+            .unwrap();
+        assert_eq!(fresh_name(&catalogue, "Kali Dark"), "My Kali Dark 2");
+    }
+
+    #[test]
+    fn a_save_over_the_size_limit_is_refused_with_its_reason() {
+        let refusal = device::save(
+            &mut theme::shipped(),
+            "x".repeat(doc::MAX_BYTES + 1),
+            Source::Import,
+        )
+        .unwrap_err();
+        assert!(refusal.reason.contains("limit"), "{}", refusal.reason);
+    }
+
+    #[component]
+    fn HarnessRoot() -> Element {
+        let themes = Themes {
+            catalogue: use_signal(theme::shipped),
+            active: use_signal(|| theme::DEFAULT.to_owned()),
+            applied: use_signal(|| theme::DEFAULT.to_owned()),
+        };
+        use_context_provider(|| themes);
+        rsx! { AppearanceScreen {} }
+    }
+
+    #[test]
+    fn the_appearance_screen_renders_seven_cards_with_the_applied_one_marked() {
+        let mut dom = VirtualDom::new(HarnessRoot);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert_eq!(
+            html.matches("class=\"pharos-theme-card\"").count(),
+            7,
+            "{html}"
+        );
+        let marked = html
+            .split("<li")
+            .find(|chunk| chunk.contains("aria-current=\"true\""))
+            .unwrap_or("");
+        assert!(marked.contains("data-theme=\"pharos-night\""), "{html}");
+        assert!(html.contains("class=\"pharos-swatch\""), "{html}");
     }
 }

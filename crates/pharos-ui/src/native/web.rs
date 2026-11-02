@@ -511,3 +511,143 @@ pub fn apply_tokens(declarations: &[(String, String)]) -> Result<(), String> {
     root.set_attribute("style", style.trim_end())
         .map_err(|e| format!("{e:?}"))
 }
+
+/// Write `value` under `key` in `localStorage`.
+pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let storage = window
+        .local_storage()
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("localStorage is unavailable")?;
+    storage.set_item(key, value).map_err(|e| format!("{e:?}"))
+}
+
+/// Whether the media `query` matches now, false when the browser lacks it.
+pub fn prefers(query: &str) -> bool {
+    web_sys::window()
+        .and_then(|w| w.match_media(query).ok().flatten())
+        .is_some_and(|list| list.matches())
+}
+
+/// A `change` listener on a media query; removed on drop.
+pub struct MediaWatch {
+    list: Option<web_sys::MediaQueryList>,
+    listener: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl Drop for MediaWatch {
+    fn drop(&mut self) {
+        if let Some(list) = &self.list {
+            let _ = list.remove_event_listener_with_callback(
+                "change",
+                self.listener.as_ref().unchecked_ref(),
+            );
+        }
+    }
+}
+
+/// Call `on_change` whenever the media `query` starts or stops matching.
+pub fn on_media_change(query: &str, mut on_change: impl FnMut() + 'static) -> MediaWatch {
+    let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| on_change());
+    let list = web_sys::window().and_then(|w| w.match_media(query).ok().flatten());
+    match &list {
+        Some(list) => {
+            let _ =
+                list.add_event_listener_with_callback("change", listener.as_ref().unchecked_ref());
+        }
+        None => warn(&format!(
+            "pharos: theme follow-system unavailable query={query}"
+        )),
+    }
+    MediaWatch { list, listener }
+}
+
+/// How long a download's object URL lives after the click, so the browser
+/// has started reading it.
+const REVOKE_AFTER_MS: u32 = 1_000;
+
+/// Save `text` as `filename` through a temporary object URL and `<a download>`.
+pub fn download(filename: &str, mime: &str, text: &str) -> Result<(), crate::theme::ThemeError> {
+    let storage_error = |message: String| crate::theme::ThemeError::Storage { message };
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| storage_error("no document".into()))?;
+    let parts = js_sys::Array::of1(&JsValue::from_str(text));
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime);
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &options)
+        .map_err(|e| storage_error(format!("{e:?}")))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| storage_error(format!("{e:?}")))?;
+    let anchor = document
+        .create_element("a")
+        .map_err(|e| storage_error(format!("{e:?}")))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| storage_error("not an anchor element".into()))?;
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    let body = document.body();
+    if let Some(body) = &body {
+        body.append_child(&anchor)
+            .map_err(|e| storage_error(format!("{e:?}")))?;
+    }
+    anchor.click();
+    if let Some(body) = &body {
+        let _ = body.remove_child(&anchor);
+    }
+    spawn_detached(async move {
+        sleep_ms(REVOKE_AFTER_MS).await;
+        let _ = web_sys::Url::revoke_object_url(&url);
+    });
+    Ok(())
+}
+
+/// Ask the user for a file matching `accept`, read as text. `Ok(None)` when
+/// the picker closes with nothing chosen; a file over `max_bytes` is refused
+/// before it is read.
+pub async fn pick_file(
+    accept: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, crate::theme::ThemeError> {
+    let storage_error = |message: String| crate::theme::ThemeError::Storage { message };
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or_else(|| storage_error("no document".into()))?;
+    let input = document
+        .create_element("input")
+        .map_err(|e| storage_error(format!("{e:?}")))?
+        .dyn_into::<web_sys::HtmlInputElement>()
+        .map_err(|_| storage_error("not an input element".into()))?;
+    input.set_type("file");
+    input.set_accept(accept);
+    let body = document.body();
+    if let Some(body) = &body {
+        body.append_child(&input)
+            .map_err(|e| storage_error(format!("{e:?}")))?;
+    }
+    let settled = js_sys::Promise::new(&mut |resolve, _| {
+        // A pick fires `change`, a dismissal fires `cancel`; both end the wait.
+        let _ = input.add_event_listener_with_callback("change", &resolve);
+        let _ = input.add_event_listener_with_callback("cancel", &resolve);
+    });
+    input.click();
+    let _ = wasm_bindgen_futures::JsFuture::from(settled).await;
+    if let Some(body) = &body {
+        let _ = body.remove_child(&input);
+    }
+    let Some(file) = input.files().and_then(|files| files.get(0)) else {
+        return Ok(None);
+    };
+    let size = file.size();
+    if size > max_bytes as f64 {
+        return Err(crate::theme::ThemeError::TooLarge {
+            bytes: size as usize,
+        });
+    }
+    let text = wasm_bindgen_futures::JsFuture::from(file.text())
+        .await
+        .map_err(|e| storage_error(format!("could not read the file: {e:?}")))?;
+    text.as_string()
+        .map(Some)
+        .ok_or_else(|| storage_error("the file is not text".into()))
+}
