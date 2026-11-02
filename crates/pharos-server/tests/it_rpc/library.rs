@@ -1363,6 +1363,58 @@ async fn native_search_leaves_out_a_hidden_library() {
     );
 }
 
+/// A user whose policy caps the parental rating gets only the matches at or
+/// below the cap: the `G` item answers, the `R` item with the same term does
+/// not.
+/// Disarm check: with `visible_items` ignoring `max_parental_rating`, the
+/// capped assertion finds both items.
+#[actix_web::test]
+async fn native_search_leaves_out_an_item_above_the_parental_limit() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaMetadata, MediaStore as _};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    for (id, title, rating) in [(401, "Alpha Kids", "G"), (402, "Alpha Adult", "R")] {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libA/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                metadata: MediaMetadata {
+                    official_rating: Some(rating.into()),
+                    ..MediaMetadata::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+
+    assert_eq!(wire_search(&session, "Alpha", 0).await.0, 2);
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                max_parental_rating: Some(0),
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let (total, found) = wire_search(&session, "Alpha", 0).await;
+    let names: Vec<_> = found.iter().map(|s| s["Name"].clone()).collect();
+    assert_eq!(
+        (total, names),
+        (1, vec![serde_json::json!("Alpha Kids")]),
+        "the G-capped user must not be served the R-rated match"
+    );
+}
+
 /// T038: `limit` caps the answer and the total counts what was answered;
 /// 0 is the default page, which holds all five here.
 #[actix_web::test]
