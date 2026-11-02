@@ -82,6 +82,20 @@ impl UserStore for SqliteStore {
             .ok_or(AuthError::UserNotFound)
     }
 
+    #[tracing::instrument(skip(self), fields(user.name = %name))]
+    async fn lookup_by_name_ignore_case(&self, name: &str) -> AuthResult<Vec<UserRecord>> {
+        let rows: Vec<UserRow> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users \
+             WHERE LOWER(name) = LOWER(?) ORDER BY (name = ?) DESC, name",
+        )
+        .bind(name)
+        .bind(name)
+        .fetch_all(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(record_from_row).collect()
+    }
+
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();

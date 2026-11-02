@@ -2933,6 +2933,19 @@ impl UserStore for PostgresStore {
             .ok_or(AuthError::UserNotFound)
     }
 
+    #[tracing::instrument(skip(self), fields(user.name = %name))]
+    async fn lookup_by_name_ignore_case(&self, name: &str) -> AuthResult<Vec<UserRecord>> {
+        let rows: Vec<PgUserRow> = sqlx::query_as(
+            "SELECT id, name, password_hash, admin, policy_json FROM users \
+             WHERE LOWER(name) = LOWER($1) ORDER BY (name = $1) DESC, name",
+        )
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter().map(record_from_row).collect()
+    }
+
     #[tracing::instrument(skip(self), fields(user.id = %id))]
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
         let id_bytes = id.0.as_bytes().to_vec();
