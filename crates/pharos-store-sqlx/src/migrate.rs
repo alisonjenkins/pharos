@@ -13,7 +13,7 @@
 //! people, studios, tags, collections, playlists, media_items,
 //! system_identity, runtime_config, named_config, scan_runs), then the
 //! dependents that reference them (auth_tokens, user_data,
-//! user_configuration, display_preferences, artwork, item_genres,
+//! user_configuration, display_preferences, user_prefs, artwork, item_genres,
 //! item_people, item_studios, item_tags, collection_items,
 //! playlist_items).
 //!
@@ -96,6 +96,7 @@ pub async fn migrate_sqlite_to_postgres(
         "display_preferences".into(),
         copy_display_preferences(sp, &mut tx).await?,
     ));
+    tables.push(("user_prefs".into(), copy_user_prefs(sp, &mut tx).await?));
     tables.push(("artwork".into(), copy_artwork(sp, &mut tx).await?));
     tables.push((
         "item_genres".into(),
@@ -773,6 +774,31 @@ async fn copy_display_preferences(
         .bind(dp_id)
         .bind(client)
         .bind(prefs)
+        .bind(updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(StoreError::Sqlx)?;
+    }
+    Ok(n)
+}
+
+async fn copy_user_prefs(
+    sp: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<u64, StoreError> {
+    let rows: Vec<(Vec<u8>, String, Vec<u8>, i64)> =
+        sqlx::query_as("SELECT user_id, key, value, updated_at FROM user_prefs")
+            .fetch_all(sp)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    let n = rows.len() as u64;
+    for (user_id, key, value, updated_at) in rows {
+        sqlx::query(
+            "INSERT INTO user_prefs (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(user_id)
+        .bind(key)
+        .bind(value)
         .bind(updated_at)
         .execute(&mut **tx)
         .await
