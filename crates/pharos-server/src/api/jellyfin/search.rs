@@ -77,8 +77,8 @@ async fn search_hints(
 ) -> Result<impl Responder, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for, genre_id_for};
     use crate::services::library::{parent_has_visible_items, visible_items};
-    let user = &user.0;
     use std::collections::HashSet;
+    let user = &user.0;
 
     // Unicode-aware lowercase so accented titles match queries typed
     // in different case (Pokémon / POKÉMON). ASCII-only
