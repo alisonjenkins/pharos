@@ -1164,7 +1164,7 @@ async fn may_see_queue(
     user: &pharos_core::User,
     queue: &[String],
 ) -> bool {
-    if user.policy.enable_all_folders || queue.is_empty() {
+    if crate::services::library::hides_nothing(&user.policy) || queue.is_empty() {
         return true;
     }
     let Some(mut ids) = queue
@@ -1191,7 +1191,7 @@ pub(crate) async fn may_join(
     handle: &GroupHandle,
     route: GroupHiddenRoute,
 ) -> bool {
-    if user.policy.enable_all_folders {
+    if crate::services::library::hides_nothing(&user.policy) {
         return true;
     }
     let group = handle.group_id.to_string();
