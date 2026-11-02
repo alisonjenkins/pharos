@@ -6152,6 +6152,14 @@ async fn fetch_item_dto(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
         {
+            if !crate::services::access::check_playlist(
+                user,
+                &playlist,
+                crate::services::access::PlaylistAccess::Read,
+                "item",
+            ) {
+                return Err(error::ErrorNotFound("not found"));
+            }
             let count = state
                 .stores
                 .playlist_entries(id_str)

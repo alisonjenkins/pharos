@@ -13,6 +13,7 @@
 //! `/Items` surface, then overlays the per-entry `PlaylistItemId`.
 
 use crate::api::jellyfin::ci_query::CiQuery;
+use crate::services::access::{check_playlist, PlaylistAccess};
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, items},
     state::AppState,
@@ -94,19 +95,14 @@ struct PlaylistCreationResultDto {
 /// `GET /Playlists/{id}` — the playlist header as a `Playlist` folder item.
 async fn get_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     // B92 — canonicalise the dashed playlist wire id the kotlin SDK sends
     // (playlist ids are UUIDs; the store matches wire_id exactly, so a dashed
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
-    let playlist = state
-        .stores
-        .playlist_by_wire_id(&wire_id)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-        .ok_or_else(|| error::ErrorNotFound("playlist not found"))?;
+    let playlist = playlist_for(&state, &user, &wire_id, PlaylistAccess::Read).await?;
     let count = state
         .stores
         .playlist_entries(&wire_id)
@@ -130,15 +126,7 @@ async fn playlist_items(
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
     // 404 when the playlist itself is absent (distinct from an empty one).
-    if state
-        .stores
-        .playlist_by_wire_id(&wire_id)
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
-        .is_none()
-    {
-        return Err(error::ErrorNotFound("playlist not found"));
-    }
+    playlist_for(&state, &user, &wire_id, PlaylistAccess::Read).await?;
     let entries = state
         .stores
         .playlist_entries(&wire_id)
@@ -193,6 +181,7 @@ async fn add_items(
     // (playlist ids are UUIDs; the store matches wire_id exactly, so a dashed
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
+    playlist_for(&state, &user, &wire_id, PlaylistAccess::Write).await?;
     let ids = items::parse_id_csv(q.ids.as_deref());
     for id in &ids {
         crate::api::jellyfin::require_item_access(&state, &user.0, *id, "playlist").await?;
@@ -218,7 +207,7 @@ struct RemoveItemsQuery {
 /// `DELETE /Playlists/{id}/Items?EntryIds=` — remove specific entries.
 async fn remove_items(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
     q: CiQuery<RemoveItemsQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -226,6 +215,7 @@ async fn remove_items(
     // (playlist ids are UUIDs; the store matches wire_id exactly, so a dashed
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
+    playlist_for(&state, &user, &wire_id, PlaylistAccess::Write).await?;
     let entry_ids = parse_str_csv(q.entry_ids.as_deref());
     let removed = state
         .stores
@@ -241,12 +231,13 @@ async fn remove_items(
 /// `POST /Playlists/{id}/Items/{entryId}/Move/{newIndex}` — reorder an entry.
 async fn move_item(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<(String, String, usize)>,
 ) -> Result<impl Responder, actix_web::Error> {
     let (wire_id, entry_id, new_index) = path.into_inner();
     // B92 — canonicalise the dashed playlist wire id the kotlin SDK sends.
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&wire_id).into_owned();
+    playlist_for(&state, &user, &wire_id, PlaylistAccess::Write).await?;
     let outcome = state
         .stores
         .move_playlist_entry(&wire_id, &entry_id, new_index)
@@ -262,13 +253,14 @@ async fn move_item(
 /// `DELETE /Playlists/{id}` — delete the playlist and its entries.
 async fn delete_playlist(
     state: web::Data<AppState>,
-    _user: AuthUser,
+    user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
     // B92 — canonicalise the dashed playlist wire id the kotlin SDK sends
     // (playlist ids are UUIDs; the store matches wire_id exactly, so a dashed
     // id would 404 every playlist route on Android TV).
     let wire_id = crate::api::jellyfin::items::canonical_wire_id(&path.into_inner()).into_owned();
+    playlist_for(&state, &user, &wire_id, PlaylistAccess::Write).await?;
     let deleted = state
         .stores
         .delete_playlist(&wire_id)
@@ -278,6 +270,23 @@ async fn delete_playlist(
         return Err(error::ErrorNotFound("playlist not found"));
     }
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// The playlist `wire_id` names, when `user` may `access` it; 404 when it
+/// does not exist or `user` may not (`services::access::check_playlist`).
+async fn playlist_for(
+    state: &AppState,
+    user: &AuthUser,
+    wire_id: &str,
+    access: PlaylistAccess,
+) -> Result<pharos_core::Playlist, actix_web::Error> {
+    state
+        .stores
+        .playlist_by_wire_id(wire_id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+        .filter(|p| check_playlist(&user.0, p, access, "playlist"))
+        .ok_or_else(|| error::ErrorNotFound("playlist not found"))
 }
 
 /// The playlist header `BaseItemDto`. A Jellyfin playlist is an `IsFolder`

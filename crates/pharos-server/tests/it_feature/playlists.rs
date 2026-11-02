@@ -203,3 +203,126 @@ async fn get_json_post(f: &common::Fixture, uri: &str) -> (u16, Value) {
     let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
     (status, v)
 }
+
+fn playlist_denied(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, action: &str) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_playlist_access_denied_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "action" && l.value() == action)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum()
+}
+
+/// B259: a playlist answers only its owner. Another signed-in user gets 404
+/// on every playlist route, as for a playlist that does not exist, and
+/// cannot read, change or delete it. A server-owned playlist (no owner) is
+/// readable by everyone and changed only by an admin. Each refusal counts
+/// under `pharos_playlist_access_denied_total{action}`.
+/// Disarm check: with `services::access::check_playlist` answering `Ok`
+/// first, the other user's requests succeed and the counter reads 0.
+#[actix_web::test]
+async fn a_playlist_answers_only_its_owner() {
+    use pharos_core::PlaylistStore as _;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let f = seed_rich().await;
+    let (_, v) = get_json_post(
+        &f,
+        &format!(
+            "/Playlists?Name=Mine&Ids={},{}&MediaType=Video",
+            f.rich_item_id, f.other_item_id
+        ),
+    )
+    .await;
+    let pid = v["Id"].as_str().unwrap().to_string();
+    let entry = items(&f, &pid).await[0]["PlaylistItemId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let as_user = |method: actix_web::http::Method, uri: String| {
+        test::TestRequest::default()
+            .method(method)
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", f.user_token.as_str()))
+            .to_request()
+    };
+    use actix_web::http::Method;
+    let other = f.other_item_id;
+    let mut answered = Vec::new();
+    for (method, uri) in [
+        (Method::GET, format!("/Playlists/{pid}")),
+        (Method::GET, format!("/Playlists/{pid}/Items")),
+        (Method::GET, format!("/Items/{pid}")),
+        (Method::POST, format!("/Playlists/{pid}/Items?Ids={other}")),
+        (
+            Method::DELETE,
+            format!("/Playlists/{pid}/Items?EntryIds={entry}"),
+        ),
+        (
+            Method::POST,
+            format!("/Playlists/{pid}/Items/{entry}/Move/1"),
+        ),
+        (Method::DELETE, format!("/Playlists/{pid}")),
+    ] {
+        let status = test::call_service(&app, as_user(method.clone(), uri.clone()))
+            .await
+            .status()
+            .as_u16();
+        if status != 404 {
+            answered.push(format!("{method} {uri} → {status}"));
+        }
+    }
+    assert!(
+        answered.is_empty(),
+        "another user's playlist answered:\n{}",
+        answered.join("\n")
+    );
+    assert_eq!(playlist_denied(&snapshotter, "read"), 3);
+    assert_eq!(playlist_denied(&snapshotter, "write"), 4);
+    let kept = items(&f, &pid).await;
+    assert_eq!(kept.len(), 2, "owner's playlist changed: {kept:?}");
+    assert_eq!(kept[0]["PlaylistItemId"], entry.as_str());
+
+    let shared = f
+        .state
+        .stores
+        .create_playlist("Shared", None, "Video", &[f.other_item_id])
+        .await
+        .unwrap()
+        .wire_id;
+    for (method, uri, want) in [
+        (Method::GET, format!("/Playlists/{shared}"), 200),
+        (Method::GET, format!("/Playlists/{shared}/Items"), 200),
+        (
+            Method::POST,
+            format!("/Playlists/{shared}/Items?Ids={other}"),
+            404,
+        ),
+        (Method::DELETE, format!("/Playlists/{shared}"), 404),
+    ] {
+        let status = test::call_service(&app, as_user(method.clone(), uri.clone()))
+            .await
+            .status()
+            .as_u16();
+        assert_eq!(status, want, "{method} {uri}");
+    }
+    assert_eq!(
+        send(&f, "DELETE", &format!("/Playlists/{shared}")).await,
+        204
+    );
+}
