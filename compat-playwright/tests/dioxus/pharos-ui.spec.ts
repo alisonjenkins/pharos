@@ -1,13 +1,13 @@
 import { test, expect } from "@playwright/test";
 
-// T51 phase 3 — drive the pharos Dioxus UI (served at `/` by
+// T51 phase 3 — drive the pharos Dioxus UI (served at `/ui/` by
 // `[server].ui_dir`) end-to-end through a real Chromium: the native app
-// at `/` and legacy management panes at `/manage`.
+// at `/ui/` and legacy management panes at `/ui/manage`.
 //
 // The native sign-in tests need `[server.native_api].enabled = true`, the
 // test origin in `allowed_origins`, and https; with the API off they skip.
 //
-// Skips cleanly when `/` is not the UI — useful in environments where the
+// Skips cleanly when `/ui/` is not the UI — useful in environments where the
 // WASM bundle hasn't been built. Build with:
 //   nix develop --command dx build --package pharos-ui --release
 // then point `[server].ui_dir` at `target/dx/pharos-ui/release/web/public`.
@@ -18,7 +18,7 @@ const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
 
 test.describe("pharos Dioxus UI", () => {
   test.beforeAll(async ({ request }) => {
-    const probe = await request.get(`${PHAROS_URL}/`, {
+    const probe = await request.get(`${PHAROS_URL}/ui/`, {
       headers: { Accept: "text/html" },
     });
     test.skip(
@@ -27,7 +27,7 @@ test.describe("pharos Dioxus UI", () => {
     );
   });
 
-  test("legacy panes at /manage: login form renders, sign-in button present", async ({ page }) => {
+  test("legacy panes at /ui/manage: login form renders, sign-in button present", async ({ page }) => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
     page.on("requestfailed", (r) => {
@@ -37,7 +37,7 @@ test.describe("pharos Dioxus UI", () => {
       }
     });
 
-    await page.goto("/manage");
+    await page.goto("/ui/manage");
 
     // App shell renders.
     await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
@@ -57,8 +57,8 @@ test.describe("pharos Dioxus UI", () => {
     expect(errors, errors.join("\n")).toEqual([]);
   });
 
-  test("legacy panes at /manage: server-picker toggle reveals the picker form", async ({ page }) => {
-    await page.goto("/manage");
+  test("legacy panes at /ui/manage: server-picker toggle reveals the picker form", async ({ page }) => {
+    await page.goto("/ui/manage");
     await page.locator(".pharos-switch-server").click();
     await expect(page.locator(".pharos-server-picker")).toBeVisible();
     // Either an empty-state or the saved-server list renders.
@@ -71,7 +71,7 @@ test.describe("pharos Dioxus UI", () => {
     ).toHaveValue(new RegExp(PHAROS_URL.replace(/^https?:\/\//, "")));
   });
 
-  test("legacy panes at /manage: login with seeded creds reaches the library nav", async ({ page }) => {
+  test("legacy panes at /ui/manage: login with seeded creds reaches the library nav", async ({ page }) => {
     const auth = await page.request.post(
       `${PHAROS_URL}/Users/AuthenticateByName`,
       {
@@ -87,7 +87,7 @@ test.describe("pharos Dioxus UI", () => {
       `pharos has no seeded test user (${TEST_USER}); skipping login flow`,
     );
 
-    await page.goto("/manage");
+    await page.goto("/ui/manage");
     await page.locator('input[type="text"]').fill(TEST_USER);
     await page.locator('input[type="password"]').fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
@@ -102,12 +102,12 @@ test.describe("pharos Dioxus UI", () => {
     await expect(page.locator(".pharos-nav-remote")).toBeVisible();
   });
 
-  test.describe("native app at /", () => {
+  test.describe("native app at /ui/", () => {
     test("root shows the native app's state", async ({ page }) => {
       const errors: string[] = [];
       page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
 
-      await page.goto("/");
+      await page.goto("/ui/");
 
       await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
 
@@ -142,7 +142,7 @@ test.describe("pharos Dioxus UI", () => {
         }
       });
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await expect.poll(() => rootToken("--px-color-bg")).toBe("#000000");
       await expect
         .poll(() => lines.join("\n"))
@@ -167,9 +167,9 @@ test.describe("pharos Dioxus UI", () => {
         `native API is on (status ${probe.status()}); skipping not-enabled test`,
       );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.getByRole("button", { name: "Open Manage" }).click();
-      await expect(page).toHaveURL(/\/manage$/);
+      await expect(page).toHaveURL(/\/ui\/manage$/);
       await expect(page.locator("form")).toBeVisible();
       await expect(page.locator('input[type="password"]')).toBeVisible();
     });
@@ -183,7 +183,7 @@ test.describe("pharos Dioxus UI", () => {
         `native API is not enabled (status ${probe.status()}); skipping native test`,
       );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
@@ -208,7 +208,7 @@ test.describe("pharos Dioxus UI", () => {
         `native API is not enabled (status ${probe.status()}); skipping native test`,
       );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill("definitely-wrong");
       await page.getByRole("button", { name: "Sign in" }).click();
@@ -230,7 +230,7 @@ test.describe("pharos Dioxus UI", () => {
         `native API is not enabled (status ${probe.status()}); skipping native test`,
       );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
@@ -238,8 +238,8 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
 
-      await page.goto("/nope");
-      await expect(page.getByText("Nothing at /nope.")).toBeVisible({
+      await page.goto("/ui/nope");
+      await expect(page.getByText("Nothing at /ui/nope.")).toBeVisible({
         timeout: 15_000,
       });
     });
@@ -256,7 +256,7 @@ test.describe("pharos Dioxus UI", () => {
         `native API is not enabled (status ${probe.status()}); skipping native test`,
       );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
@@ -265,7 +265,7 @@ test.describe("pharos Dioxus UI", () => {
       });
 
       await page.getByRole("link", { name: "Find" }).click();
-      await expect(page).toHaveURL(/\/find$/);
+      await expect(page).toHaveURL(/\/ui\/find$/);
       const box = page.getByLabel("Search");
       // Every seeded title starts "Playwright …", so the term matches them.
       await box.fill("Playwright");
@@ -341,7 +341,7 @@ test.describe("pharos Dioxus UI", () => {
         if (r.url().includes("/assets/vendor/hls.min.js")) hlsjs.push(r.url());
       });
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
@@ -350,9 +350,9 @@ test.describe("pharos Dioxus UI", () => {
       });
       expect(hlsjs, "hls.js is fetched only by the watch page").toEqual([]);
 
-      await page.goto(`/title/${nativeId}`);
+      await page.goto(`/ui/title/${nativeId}`);
       await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-      await expect(page).toHaveURL(new RegExp(`/watch/${nativeId}$`));
+      await expect(page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
       await expect.poll(() => hlsjs.length, { timeout: 15_000 }).toBe(1);
       await expect
         .poll(
@@ -431,14 +431,14 @@ test.describe("pharos Dioxus UI", () => {
         if (m.text().startsWith("pharos: playback error")) errors.push(m.text());
       });
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
       await expect(page.locator(".pharos-shell-bar")).toBeVisible({
         timeout: 15_000,
       });
-      await page.goto(`/title/${nativeId}`);
+      await page.goto(`/ui/title/${nativeId}`);
       await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
       await expect(page.getByText(/^Playback failed: the stream failed/)).toBeVisible({
         timeout: 30_000,
@@ -470,13 +470,13 @@ test.describe("pharos Dioxus UI", () => {
           name,
         );
 
-      await page.goto("/");
+      await page.goto("/ui/");
       await page.evaluate(() => localStorage.removeItem("pharos.theme.custom"));
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
       await page.locator(".pharos-shell-nav").getByRole("link", { name: "Appearance" }).click();
-      await expect(page).toHaveURL(/\/settings\/appearance$/);
+      await expect(page).toHaveURL(/\/ui\/settings\/appearance$/);
       await expect(page.locator("li.pharos-theme-card")).toHaveCount(7);
 
       // Apply switches without a reload, and the pick survives one.
