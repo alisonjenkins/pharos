@@ -2336,7 +2336,10 @@ fn has_sxxeyy_token(name: &str) -> bool {
 /// - series_name = the closest ancestor directory of `path` that is
 ///   *not* a "Season N" / "S01" / "Specials" / a configured media
 ///   root token. Falls back to the immediate parent directory name
-///   when nothing else fits.
+///   when nothing else fits. A scene release folder
+///   (`Show.Name.S01E03.720p-GRP`) is skipped like a season folder and
+///   names the show instead; the folder above it is the show's only when
+///   its name matches, else the show is keyed beside the release.
 /// - season_number = parsed from a "Season N" / "S<NN>" parent dir
 ///   if present, or from the `SxxEyy` token in the filename.
 /// - episode_number = parsed from the `SxxEyy` token in the filename.
@@ -2351,12 +2354,17 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
     let episode = parsed.map(|(_, e)| e);
 
     // Walk parents from closest to farthest, retaining the &Path so the
-    // first non-season ancestor's FULL path becomes the C11 folder key.
+    // first non-season, non-release ancestor's FULL path becomes the C11
+    // folder key.
     let parents: Vec<&Path> = path.ancestors().skip(1).collect();
 
     let mut season_from_dir: Option<u32> = None;
     let mut series_name: Option<String> = None;
     let mut series_folder: Option<PathBuf> = None;
+    // The innermost release folder names the show; the outermost one is
+    // where a show without its own folder is keyed (beside it).
+    let mut release: Option<ReleaseFolder> = None;
+    let mut outermost_release: Option<&Path> = None;
 
     for parent in parents {
         let Some(component) = parent.file_name().and_then(|s| s.to_str()) else {
@@ -2370,6 +2378,19 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
             season_from_dir = season_from_dir.or(Some(0));
             continue;
         }
+        if let Some(found) = parse_release_folder(component) {
+            season_from_dir = season_from_dir.or(found.season);
+            release.get_or_insert(found);
+            outermost_release = Some(parent);
+            continue;
+        }
+        // Above a release, a folder is the show's own only when it carries
+        // the show's name; otherwise it is the library root.
+        if let Some(found) = &release {
+            if fold_name(strip_trailing_year(component)) != fold_name(&found.show) {
+                break;
+            }
+        }
         // First non-season ancestor wins as the series. LIB-C11: capture
         // both the display name AND the canonical folder path (the show
         // root that holds the season dirs / episodes) for identity.
@@ -2378,6 +2399,15 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
         break;
     }
 
+    let release_year = release.as_ref().and_then(|r| r.year);
+    if series_name.is_none() {
+        if let Some(found) = release {
+            series_folder = outermost_release
+                .and_then(Path::parent)
+                .map(|p| p.join(&found.show));
+            series_name = Some(found.show);
+        }
+    }
     let mut series_name = series_name?;
     let mut season_number = season_from_dir.or(filename_season);
     // An absolute-numbered episode with no season declared belongs to season 1
@@ -2392,7 +2422,8 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
         .as_deref()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
-        .and_then(parse_folder_year);
+        .and_then(parse_folder_year)
+        .or(release_year);
     // When a year was parsed, strip the trailing `(YYYY)` from the display
     // name so the title stays clean ("Cosmos", not "Cosmos (1980)") while
     // identity stays keyed on the full folder path.
@@ -2407,6 +2438,57 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
         series_folder,
         series_year,
     })
+}
+
+/// The show a scene release folder (`Show.Name.S01E03.720p.HDTV-GRP`,
+/// `Show.Name.2005.S02.1080p.BluRay-GRP`) is for: the cleaned name before
+/// its season/episode token, the token's season, and any year in the name.
+struct ReleaseFolder {
+    show: String,
+    season: Option<u32>,
+    year: Option<u32>,
+}
+
+/// A season-pack token (`.S02.`) in a release folder name: a bare season
+/// with no episode, between separators.
+static SEASON_PACK_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)[ ._\[(-]s(?<s>\d{1,2})(?:[ ._\])-]|$)")
+        .map_err(|e| tracing::error!(error = %e, "invalid season-pack regex"))
+        .ok()
+});
+
+/// `Some` when `name` is a release folder rather than a show folder: it
+/// holds a season+episode or season-pack token with a show name before it.
+/// Episode-only and absolute-number forms are not enough, since a show
+/// folder may itself end in a number ("Show 99").
+fn parse_release_folder(name: &str) -> Option<ReleaseFolder> {
+    let token = EP_EXPRS
+        .iter()
+        .filter(|x| !x.optimistic)
+        .filter_map(|x| x.re.captures(name))
+        .find(|c| {
+            c.name("s")
+                .and_then(|m| plausible_season(m.as_str()))
+                .is_some()
+        })
+        .or_else(|| SEASON_PACK_RE.as_ref()?.captures(name))?;
+    let start = token.get(0)?.start();
+    let season = token.name("s").and_then(|m| plausible_season(m.as_str()));
+    let parsed = crate::metadata::filename::parse_filename(&name[..start], true);
+    Some(ReleaseFolder {
+        show: parsed.title?,
+        season,
+        year: parsed.year,
+    })
+}
+
+/// Lower-cased letters and digits only, so `Person of Interest` and
+/// `Person.of.Interest` compare equal.
+fn fold_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// LIB-C11 — drop a trailing `(YYYY)` marker from a show display name so
@@ -2537,14 +2619,20 @@ fn parse_episode_from_name(name: &str) -> Option<(Option<u32>, u32)> {
             let Ok(episode) = e_match.as_str().parse::<u32>() else {
                 continue;
             };
-            let season = caps
-                .name("s")
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-                .filter(|s| !(200..=1927).contains(s) && *s <= 2500);
+            let season = caps.name("s").and_then(|m| plausible_season(m.as_str()));
             return Some((season, episode));
         }
     }
     None
+}
+
+/// A season number outside Jellyfin's junk band (200–1927 or above 2500,
+/// where resolutions and years land: `1920x1080` is not season 1920).
+fn plausible_season(digits: &str) -> Option<u32> {
+    digits
+        .parse::<u32>()
+        .ok()
+        .filter(|s| !(200..=1927).contains(s) && *s <= 2500)
 }
 
 /// Parse a "Season N" / "Season NN" / "S01" / "S1" directory name → N.
@@ -5643,6 +5731,90 @@ mod tests {
         assert_eq!(info.series_name, "Show Without Season Dir");
         assert_eq!(info.season_number, Some(5));
         assert_eq!(info.episode_number, Some(11));
+    }
+
+    #[test]
+    fn a_release_folder_in_the_library_root_names_its_show() {
+        let p = Path::new(
+            "/tv/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE.mkv",
+        );
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Person of Interest");
+        assert_eq!(
+            info.series_folder.as_deref(),
+            Some("/tv/Person of Interest")
+        );
+        assert_eq!(info.season_number, Some(1));
+        assert_eq!(info.episode_number, Some(3));
+
+        let other = parse_series_info(Path::new(
+            "/tv/Person.of.Interest.S01E04.720p.HDTV.x264-LOL/poi.104.mkv",
+        ))
+        .expect("series info");
+        assert_eq!(other.series_key(), info.series_key());
+    }
+
+    #[test]
+    fn a_release_folder_drops_its_tags_and_keeps_its_year() {
+        let p =
+            Path::new("/tv/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION [PublicHD]/x.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "The Vampire Diaries");
+        assert_eq!(info.season_number, Some(4));
+
+        let pack = parse_series_info(Path::new(
+            "/tv/Doctor.Who.2005.S02.1080p.BluRay.x264-GRP/Doctor.Who.2005.S02E01.mkv",
+        ))
+        .expect("series info");
+        assert_eq!(pack.series_name, "Doctor Who");
+        assert_eq!(pack.series_year, Some(2005));
+        assert_eq!(pack.season_number, Some(2));
+        assert_eq!(pack.episode_number, Some(1));
+    }
+
+    #[test]
+    fn a_release_folder_inside_its_show_folder_keeps_the_show_folder() {
+        let p = Path::new(
+            "/tv/Person of Interest (2011)/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE/e.mkv",
+        );
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Person of Interest");
+        assert_eq!(
+            info.series_folder.as_deref(),
+            Some("/tv/Person of Interest (2011)")
+        );
+        assert_eq!(info.series_year, Some(2011));
+    }
+
+    #[test]
+    fn nested_release_folders_resolve_to_the_show_folder() {
+        let p = Path::new("/tv/Show/Show.S01.Complete.720p/Show.S01E01.720p-GRP/x.mkv");
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "Show");
+        assert_eq!(info.series_folder.as_deref(), Some("/tv/Show"));
+
+        let rooted = parse_series_info(Path::new(
+            "/tv/Doctor.Who.2005.S02.1080p/Doctor.Who.2005.S02E01.720p-GRP/x.mkv",
+        ))
+        .expect("series info");
+        assert_eq!(rooted.series_folder.as_deref(), Some("/tv/Doctor Who"));
+
+        let in_show = parse_series_info(Path::new(
+            "/tv/Doctor Who/Doctor.Who.2005.S02E01.720p-GRP/x.mkv",
+        ))
+        .expect("series info");
+        assert_eq!(in_show.series_folder.as_deref(), Some("/tv/Doctor Who"));
+        assert_eq!(in_show.series_year, Some(2005));
+    }
+
+    #[test]
+    fn a_show_folder_with_a_number_is_not_a_release_folder() {
+        for show in ["Stargate SG-1", "Show 1920x1080", "Ep 12", "Glee"] {
+            assert!(parse_release_folder(show).is_none(), "{show}");
+        }
+        let info = parse_series_info(Path::new("/tv/Stargate SG-1/Season 02/S02E05.mkv"))
+            .expect("series info");
+        assert_eq!(info.series_name, "Stargate SG-1");
     }
 
     // LIB-C11 — two distinct shows sharing a name must yield the SAME
