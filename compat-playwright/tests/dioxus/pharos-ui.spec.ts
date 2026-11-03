@@ -1722,6 +1722,91 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // Spec 019: an image subtitle (DVD here) is drawn by the player from the
+    // server's PNGs, so turning it on keeps the playback it has: no new
+    // session, no burn. Disarm check: with `subtitle_switch` renegotiating
+    // for an image track, picking it reloads the player and the cue is gone.
+    test("an image subtitle is drawn over the same playback", async ({ page, request }) => {
+      test.setTimeout(180_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-image-subs-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const dvdSubs = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: { "X-Emby-Token": token } },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/09-test-dvd-subtitle.mkv"));
+      await expect.poll(dvdSubs, { timeout: 60_000 }).toBeTruthy();
+      const movie = await dvdSubs();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      const sessions = new Set<string>();
+      page.on("request", (r) => {
+        const url = new URL(r.url());
+        if (!url.pathname.toLowerCase().startsWith(`/videos/${movie.Id}/`)) return;
+        const session = url.searchParams.get("tag") ?? url.searchParams.get("PlaySessionId");
+        if (session) sessions.add(session);
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/watch/${nativeId}`);
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(1);
+
+      // The chrome takes no pointer events while idle.
+      await page.locator("#pharos-player").hover();
+      const picker = page.getByRole("combobox", { name: "Subtitles" });
+      const dvd = await picker.locator("option").nth(1).getAttribute("value");
+      expect(dvd, "the DVD subtitle is offered").toMatch(/^\d+$/);
+      await picker.selectOption(dvd!);
+      await expect(picker).toHaveValue(dvd!);
+
+      const at = (seconds: number) =>
+        page.evaluate((s) => {
+          const v = document.getElementById("pharos-video") as HTMLVideoElement;
+          v.pause();
+          v.currentTime = s;
+        }, seconds);
+      const shown = page.locator(".pharos-image-sub");
+      // The first cue is on from 0.5 s to 2.5 s, the second from 4 s to 6 s.
+      await at(1);
+      await expect(shown, "the first cue is drawn").toHaveCount(1, { timeout: 60_000 });
+      await expect(shown).toHaveAttribute("src", new RegExp(`/subtitles/${dvd}/images/0\\.png\\?v=\\d+-\\d+$`));
+      await expect
+        .poll(() => shown.evaluate((img: HTMLImageElement) => img.naturalWidth), {
+          message: "the cue's PNG loads",
+        })
+        .toBeGreaterThan(0);
+      await at(3);
+      await expect(shown, "nothing between cues").toHaveCount(0);
+      await at(5);
+      await expect(shown).toHaveAttribute("src", /\/images\/1\.png\?v=\d+-\d+$/);
+      expect(sessions.size, "turning the subtitle on kept the playback").toBe(1);
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // A playlist that never loads is fatal to hls.js with nothing to restart
     // from, so the page must say so rather than show a black box.
     test("an HLS stream that cannot load shows why", async ({ page, request }) => {
