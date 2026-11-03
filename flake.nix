@@ -714,6 +714,11 @@
             # from 'self' only where the browser lacks native HLS.
             install -Dm644 crates/pharos-ui/assets/vendor/hls.min.js $out/assets/vendor/hls.min.js
             install -Dm644 crates/pharos-ui/assets/vendor/hls.js.LICENSE $out/assets/vendor/hls.js.LICENSE
+            # JASSUB, vendored and pinned (ADR-0046); the watch page loads it
+            # only to draw an ASS/SSA subtitle.
+            for f in crates/pharos-ui/assets/vendor/jassub/*; do
+              install -Dm644 "$f" "$out/assets/vendor/jassub/$(basename "$f")"
+            done
             runHook postInstall
           '';
           dontFixup = true;
