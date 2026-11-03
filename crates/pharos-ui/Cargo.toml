@@ -77,6 +77,8 @@ web-sys = { version = "0.3", optional = true, features = [
     "TextTrack",
     "TextTrackList",
     "TextTrackMode",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
     "DomRect",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }

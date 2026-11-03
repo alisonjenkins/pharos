@@ -97,6 +97,13 @@ pub fn now_ms() -> f64 {
 
 pub fn spawn_detached(_fut: impl std::future::Future<Output = ()> + 'static) {}
 
+/// The host has no DOM to observe.
+pub struct SentinelWatch;
+
+pub fn watch_sentinel(_ids: &[&str], _on_visible: impl FnMut() + 'static) -> Option<SentinelWatch> {
+    None
+}
+
 pub struct PageHide;
 
 pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {

@@ -670,9 +670,9 @@ struct Replace(EventHandler<Route>);
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
 #[derive(Clone, Copy)]
-struct Ctx {
-    api: Signal<Option<NativeApi>>,
-    machine: Signal<Machine>,
+pub(super) struct Ctx {
+    pub(super) api: Signal<Option<NativeApi>>,
+    pub(super) machine: Signal<Machine>,
 }
 
 #[component]
@@ -806,7 +806,7 @@ async fn connect(
     machine.write().apply(event);
 }
 
-fn call(route: &str, action: &str) -> CallInfo {
+pub(super) fn call(route: &str, action: &str) -> CallInfo {
     CallInfo {
         ui_route: route.into(),
         ui_action: action.into(),
