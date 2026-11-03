@@ -7,9 +7,9 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::platform;
-use super::playback::MediaEvent;
+use super::playback::{clock, MediaEvent, MediaState};
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
-use super::watch_view::VIDEO_ID;
+use super::watch_view::{Control, VIDEO_ID};
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
 
 use crate::render::{self, Fallback, Frame, Surface};
@@ -67,11 +67,19 @@ impl Tap {
     }
 }
 
+/// How far the skip buttons jump.
+const SKIP_MS: u64 = 10_000;
+
 #[component]
 pub fn ListenView(
     title: String,
     image: Option<String>,
+    year: Option<u16>,
+    genres: Vec<String>,
+    runtime_ms: u64,
+    media: MediaState,
     on_media: EventHandler<MediaEvent>,
+    on_control: EventHandler<Control>,
 ) -> Element {
     let tap = use_hook(Tap::default);
     let mut style =
@@ -84,13 +92,31 @@ pub fn ListenView(
             platform::warn(&format!("pharos: visualiser style not stored error={e}"));
         }
     };
+    // Where a drag on the seek bar is, so playback seeks once on release
+    // rather than on every step and the thumb stays under the pointer.
+    let mut scrub = use_signal(|| None::<u64>);
     let current = style();
     let note = fallback().map(|f| match f {
         Fallback::ReducedMotion => "The visualiser is still because reduced motion is on.",
         _ => "This device cannot draw the visualiser.",
     });
+    let total = match media.duration_ms {
+        0 => runtime_ms,
+        d => d,
+    };
+    let at = scrub()
+        .unwrap_or(media.position_ms)
+        .min(total.max(media.position_ms));
+    let played = if total > 0 {
+        at as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let meta = meta_line(year, &genres);
     rsx! {
-        section { class: "pharos-listen",
+        section {
+            class: "pharos-listen",
+            "data-playing": if media.paused { "false" } else { "true" },
             if let (Some(program), None) = (current.program(), fallback()) {
                 Visualiser {
                     key: "{current.label()}",
@@ -101,26 +127,87 @@ pub fn ListenView(
                 }
             }
             div { class: "pharos-listen-body",
-                div { class: "pharos-listen-art",
-                    match &image {
-                        Some(src) => rsx! { img { src: "{src}", alt: "" } },
-                        None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "♪" } },
+                div { class: "pharos-listen-cover",
+                    div { class: "pharos-listen-disc", aria_hidden: "true" }
+                    div { class: "pharos-listen-art",
+                        match &image {
+                            Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                            None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "♪" } },
+                        }
                     }
                 }
-                h2 { class: "pharos-listen-title", "{title}" }
-                audio {
-                    id: VIDEO_ID,
-                    class: "pharos-audio",
-                    controls: true,
-                    autoplay: true,
-                    onplaying: move |_| on_media.call(MediaEvent::Playing),
-                    onpause: move |_| on_media.call(MediaEvent::Pause),
-                    onseeked: move |_| on_media.call(MediaEvent::Seeked),
-                    ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
-                    onended: move |_| on_media.call(MediaEvent::Ended),
-                    onvolumechange: move |_| on_media.call(MediaEvent::Changed),
-                    ondurationchange: move |_| on_media.call(MediaEvent::Changed),
-                    onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                div { class: "pharos-listen-main",
+                    p { class: "pharos-listen-eyebrow", "Now playing" }
+                    h2 { class: "pharos-listen-title", "{title}" }
+                    if let Some(meta) = meta {
+                        p { class: "pharos-listen-meta", "{meta}" }
+                    }
+                    audio {
+                        id: VIDEO_ID,
+                        class: "pharos-audio",
+                        autoplay: true,
+                        onplaying: move |_| on_media.call(MediaEvent::Playing),
+                        onpause: move |_| on_media.call(MediaEvent::Pause),
+                        onseeked: move |_| on_media.call(MediaEvent::Seeked),
+                        ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
+                        onended: move |_| on_media.call(MediaEvent::Ended),
+                        onvolumechange: move |_| on_media.call(MediaEvent::Changed),
+                        ondurationchange: move |_| on_media.call(MediaEvent::Changed),
+                        onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                    }
+                    div { class: "pharos-listen-seek",
+                        input {
+                            class: "pharos-listen-range",
+                            r#type: "range",
+                            aria_label: "Seek",
+                            min: 0,
+                            max: "{total}",
+                            step: 1000,
+                            value: "{at}",
+                            disabled: total == 0,
+                            style: "--pharos-fill: {played:.2}%",
+                            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+                            oninput: move |evt: FormEvent| {
+                                if let Ok(ms) = evt.value().parse::<f64>() {
+                                    scrub.set(Some(ms as u64));
+                                }
+                            },
+                            onchange: move |evt: FormEvent| {
+                                scrub.set(None);
+                                if let Ok(ms) = evt.value().parse::<f64>() {
+                                    on_control.call(Control::Seek(ms as u64));
+                                }
+                            },
+                        }
+                        div { class: "pharos-listen-times",
+                            span { "{clock(at)}" }
+                            span { "{clock(total)}" }
+                        }
+                    }
+                    div { class: "pharos-listen-transport",
+                        button {
+                            class: "pharos-listen-skip",
+                            r#type: "button",
+                            aria_label: "Back 10 seconds",
+                            onclick: move |_| on_control.call(Control::Seek(media.position_ms.saturating_sub(SKIP_MS))),
+                            Icon { path: ICON_BACK }
+                        }
+                        button {
+                            class: "pharos-listen-play",
+                            r#type: "button",
+                            aria_label: if media.paused { "Play" } else { "Pause" },
+                            onclick: move |_| on_control.call(Control::TogglePlay),
+                            Icon { path: if media.paused { ICON_PLAY } else { ICON_PAUSE } }
+                        }
+                        button {
+                            class: "pharos-listen-skip",
+                            r#type: "button",
+                            aria_label: "Forward 10 seconds",
+                            onclick: move |_| on_control.call(Control::Seek(media.position_ms + SKIP_MS)),
+                            Icon { path: ICON_FORWARD }
+                        }
+                    }
+                    ListenVolume { media, on_control }
                 }
                 div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
                     for s in Style::ALL {
@@ -134,9 +221,75 @@ pub fn ListenView(
                     }
                 }
                 if let Some(note) = note {
-                    p { class: "pharos-muted", "{note}" }
+                    p { class: "pharos-muted pharos-listen-note", "{note}" }
                 }
             }
+        }
+    }
+}
+
+/// "2003 · Trip-hop, Electronic"; `None` when there is neither.
+fn meta_line(year: Option<u16>, genres: &[String]) -> Option<String> {
+    let parts: Vec<String> = year
+        .map(|y| y.to_string())
+        .into_iter()
+        .chain((!genres.is_empty()).then(|| genres.join(", ")))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+#[component]
+fn ListenVolume(media: MediaState, on_control: EventHandler<Control>) -> Element {
+    let shown = if media.muted { 0.0 } else { media.volume };
+    rsx! {
+        div { class: "pharos-listen-volume",
+            button {
+                class: "pharos-listen-skip",
+                r#type: "button",
+                aria_label: if media.muted { "Unmute" } else { "Mute" },
+                onclick: move |_| on_control.call(Control::Volume {
+                    // Unmuting a slider dragged to 0 would stay silent.
+                    volume: if media.muted && media.volume == 0.0 { 1.0 } else { media.volume },
+                    muted: !media.muted,
+                }),
+                Icon { path: if shown == 0.0 { ICON_MUTED } else { ICON_VOLUME } }
+            }
+            input {
+                class: "pharos-listen-range",
+                r#type: "range",
+                aria_label: "Volume",
+                min: 0,
+                max: 1,
+                step: 0.05,
+                value: "{shown}",
+                style: "--pharos-fill: {shown * 100.0:.0}%",
+                onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+                oninput: move |evt: FormEvent| {
+                    if let Ok(volume) = evt.value().parse::<f64>() {
+                        on_control.call(Control::Volume { volume, muted: volume == 0.0 });
+                    }
+                },
+            }
+        }
+    }
+}
+
+const ICON_PLAY: &str =
+    "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z";
+const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
+const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
+const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
+const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
+const ICON_MUTED: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4L16.6 12Z";
+
+#[component]
+fn Icon(path: &'static str) -> Element {
+    rsx! {
+        svg {
+            class: "pharos-icon",
+            view_box: "0 0 24 24",
+            "aria-hidden": "true",
+            path { d: path, fill: "currentColor" }
         }
     }
 }
@@ -264,15 +417,81 @@ mod tests {
     use super::*;
 
     fn render(title: &str, image: Option<&str>) -> String {
+        render_with(title, image, MediaState::default())
+    }
+
+    fn render_with(title: &str, image: Option<&str>, media: MediaState) -> String {
         let (title, image) = (title.to_owned(), image.map(str::to_owned));
         let mut dom = VirtualDom::new_with_props(
             move |()| {
-                rsx! { ListenView { title: title.clone(), image: image.clone(), on_media: |_| {} } }
+                rsx! {
+                    ListenView {
+                        title: title.clone(),
+                        image: image.clone(),
+                        year: Some(1998),
+                        genres: vec!["Trip-hop".to_owned()],
+                        runtime_ms: 330_000,
+                        media,
+                        on_media: |_| {},
+                        on_control: |_| {},
+                    }
+                }
             },
             (),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_song_has_its_own_controls_not_the_browsers() {
+        let html = render("Teardrop", None);
+        assert!(!html.contains("controls"), "{html}");
+        for label in ["Seek", "Volume", "Back 10 seconds", "Forward 10 seconds"] {
+            assert!(
+                html.contains(&format!(r#"aria-label="{label}""#)),
+                "{label}"
+            );
+        }
+        assert!(html.contains("1998 · Trip-hop"), "{html}");
+    }
+
+    #[test]
+    fn the_play_button_and_clock_follow_the_media() {
+        let paused = render("Teardrop", None);
+        assert!(paused.contains(r#"aria-label="Play""#), "{paused}");
+        assert!(paused.contains(r#"data-playing="false""#), "{paused}");
+        // No duration yet: the runtime stands in for the length.
+        assert!(paused.contains("5:30"), "{paused}");
+
+        let playing = render_with(
+            "Teardrop",
+            None,
+            MediaState {
+                position_ms: 78_000,
+                duration_ms: 241_000,
+                paused: false,
+                ..MediaState::default()
+            },
+        );
+        assert!(playing.contains(r#"aria-label="Pause""#), "{playing}");
+        assert!(playing.contains(r#"data-playing="true""#), "{playing}");
+        assert!(
+            playing.contains("1:18") && playing.contains("4:01"),
+            "{playing}"
+        );
+    }
+
+    #[test]
+    fn the_meta_line_shows_what_there_is() {
+        assert_eq!(meta_line(None, &[]), None);
+        assert_eq!(meta_line(Some(2003), &[]).as_deref(), Some("2003"));
+        let genres = ["Rock".to_owned(), "Pop".to_owned()];
+        assert_eq!(meta_line(None, &genres).as_deref(), Some("Rock, Pop"));
+        assert_eq!(
+            meta_line(Some(2003), &genres).as_deref(),
+            Some("2003 · Rock, Pop")
+        );
     }
 
     #[test]
