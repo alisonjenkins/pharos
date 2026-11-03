@@ -114,6 +114,7 @@ async fn play_negotiates_and_reports_progress() {
         audio_codecs: vec!["aac".into()],
         containers: vec!["mp4".into()],
         max_bitrate: 0,
+        image_subtitles: Vec::new(),
     };
     let detail = api
         .detail(&call, ItemRef::Real(MOVIE))

@@ -413,7 +413,7 @@ impl server::library::Handler for Library {
             c.set_name(chapter.name.as_str());
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
-        let tracks = watch::tracks(&item).await;
+        let tracks = watch::tracks(&item, watch::extracts_image_subtitles(state)).await;
         write_tracks(
             out.reborrow().init_audio_tracks(len(&tracks.audio)),
             &tracks.audio,
@@ -1272,9 +1272,13 @@ fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: 
         w.set_is_default(t.is_default);
         w.set_is_forced(t.is_forced);
         w.set_is_hearing_impaired(t.is_hearing_impaired);
-        match &t.vtt_url {
-            Some(url) => {
+        match &t.drawn {
+            Some(watch::Drawn::Vtt(url)) => {
                 w.set_delivery(SubtitleDelivery::External);
+                w.set_url(url.as_str());
+            }
+            Some(watch::Drawn::Images(url)) => {
+                w.set_delivery(SubtitleDelivery::Image);
                 w.set_url(url.as_str());
             }
             None => w.set_delivery(SubtitleDelivery::Burn),

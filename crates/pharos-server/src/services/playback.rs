@@ -1237,15 +1237,20 @@ pub struct Capabilities {
     pub containers: Vec<String>,
     /// Bits per second; 0 is "no limit".
     pub max_bitrate: u64,
+    /// Image subtitle codecs the player draws from extracted PNGs (spec 019).
+    pub image_subtitles: Vec<String>,
 }
 
 impl Capabilities {
     /// The capabilities as the profile the negotiator reads: one direct-play
     /// and one transcoding profile per media type. The transcoding profiles
     /// name the HLS surfaces pharos serves: video on the master, audio on the
-    /// universal endpoint.
-    pub fn profile(&self) -> DeviceProfile {
-        use pharos_jellyfin_api::device_profile::{DirectPlayProfile, TranscodingProfile};
+    /// universal endpoint. The declared image subtitles render externally only
+    /// when `draws_images` (this server extracts them); otherwise they burn.
+    pub fn profile(&self, draws_images: bool) -> DeviceProfile {
+        use pharos_jellyfin_api::device_profile::{
+            DirectPlayProfile, SubtitleProfileDto, TranscodingProfile,
+        };
         let csv = |v: &[String]| v.join(",");
         let (containers, video, audio) = (
             csv(&self.containers),
@@ -1284,6 +1289,23 @@ impl Capabilities {
                 },
             ],
             max_streaming_bitrate: (self.max_bitrate > 0).then_some(self.max_bitrate),
+            subtitle_profiles: if draws_images {
+                // A non-empty list switches off the empty-profile default that
+                // keeps every text subtitle External, so name the WebVTT and
+                // ASS the native player is served (ASS converted) explicitly.
+                ["vtt", "ass"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .chain(self.image_subtitles.iter().cloned())
+                    .map(|format| SubtitleProfileDto {
+                        format,
+                        method: "External".into(),
+                        ..SubtitleProfileDto::default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             ..DeviceProfile::default()
         }
     }
@@ -1339,7 +1361,9 @@ pub async fn grant(
     if matches!(item.kind, MediaKind::Book) {
         return Err(GrantError::NotPlayable);
     }
-    let profile = r.capabilities.profile();
+    let profile = r
+        .capabilities
+        .profile(crate::services::watch::extracts_image_subtitles(state));
     // The same start tracks PlaybackInfo picks: the user's remembered track,
     // else their language rules.
     let streams = crate::services::watch::streams(&item).await;
@@ -2096,12 +2120,13 @@ mod native_max_bitrate_tests {
             audio_codecs: vec!["aac".into()],
             containers: vec!["mp4".into()],
             max_bitrate,
+            image_subtitles: vec![],
         }
     }
 
     fn decide(max_bitrate: u64, source_bps: u64) -> Decision {
         negotiate(
-            &caps(max_bitrate).profile(),
+            &caps(max_bitrate).profile(false),
             &source(source_bps),
             &ServerCodecSupport::default(),
         )

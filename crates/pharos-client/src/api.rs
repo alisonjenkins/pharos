@@ -238,6 +238,9 @@ pub struct Track {
     /// itself. `None` for a subtitle the server must burn in, so choosing it
     /// renegotiates; always `None` for audio.
     pub vtt_url: Option<String>,
+    /// An image subtitle's same-origin PNG manifest, which the player draws
+    /// itself (spec 019); set only when the server extracts image subtitles.
+    pub images_url: Option<String>,
 }
 
 /// Trickplay sprites: `tile_url` with `{tile}` replaced fetches tile n, a
@@ -295,6 +298,8 @@ pub struct Capabilities {
     pub containers: Vec<String>,
     /// Bits per second; 0 = no limit.
     pub max_bitrate: u64,
+    /// Image subtitle codecs the player draws from the server's PNGs.
+    pub image_subtitles: Vec<String>,
 }
 
 /// The server's playback decision.
@@ -940,6 +945,11 @@ impl PharosApi for NativeApi {
                 &caps.containers,
             );
             c.set_max_bitrate(caps.max_bitrate);
+            set_texts(
+                c.reborrow()
+                    .init_image_subtitles(len(&caps.image_subtitles)),
+                &caps.image_subtitles,
+            );
             set_choice(p.reborrow().init_audio(), picks.audio);
             set_choice(p.init_subtitle(), picks.subtitle);
         }
@@ -1043,7 +1053,11 @@ fn read_tracks(
                 is_hearing_impaired: t.get_is_hearing_impaired(),
                 vtt_url: match t.get_delivery()? {
                     SubtitleDelivery::External => Some(text(t.get_url())?),
-                    SubtitleDelivery::Burn => None,
+                    SubtitleDelivery::Burn | SubtitleDelivery::Image => None,
+                },
+                images_url: match t.get_delivery()? {
+                    SubtitleDelivery::Image => Some(text(t.get_url())?),
+                    SubtitleDelivery::External | SubtitleDelivery::Burn => None,
                 },
             })
         })

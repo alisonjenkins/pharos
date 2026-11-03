@@ -2804,3 +2804,81 @@ async fn omdb_scores_reach_films_and_shows() {
     let mature = shows.iter().find(|s| s["Name"] == "Mature").unwrap();
     assert!(mature["ImdbRating"].is_null() && mature["CriticRating"].is_null());
 }
+
+/// Spec 019: on a server that extracts image subtitles, the detail offers an
+/// image subtitle as the PNG manifest the player draws, and a text one still
+/// as WebVTT.
+/// Disarm check: with `write_tracks` writing `Drawn::Images` as `burn`, or
+/// `detail` passing `draws_images: false`, the PGS track reads `burn`.
+#[cfg(feature = "ffmpeg-lib")]
+#[actix_web::test]
+async fn native_detail_offers_image_subtitles_to_draw_when_the_server_extracts_them() {
+    use pharos_api::pharos_capnp::{detail_result, SubtitleDelivery};
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _, SubtitleTrack};
+    use pharos_jellyfin_api::dto::WireId;
+
+    let cache = tempfile::tempdir().unwrap();
+    let (server, fx) = crate::revocation::start_drawing_images(cache.path()).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut item = MediaItem {
+        id: 104,
+        path: "/libA/Tracked.mkv".into(),
+        title: "Tracked".into(),
+        kind: MediaKind::Movie,
+        ..MediaItem::default()
+    };
+    item.probe.video_codec = Some("h264".into());
+    item.probe.subtitle_tracks = vec![
+        SubtitleTrack {
+            stream_index: 3,
+            codec: Some("subrip".into()),
+            ..SubtitleTrack::default()
+        },
+        SubtitleTrack {
+            stream_index: 4,
+            codec: Some("hdmv_pgs_subtitle".into()),
+            ..SubtitleTrack::default()
+        },
+    ];
+    fx.state.stores.put(item).await.unwrap();
+
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    req.get().init_id().set_real(104);
+    let reply = req.send().promise.await.expect("detail");
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail refused");
+    };
+    let subtitles: Vec<(u32, SubtitleDelivery, String)> = d
+        .unwrap()
+        .get_subtitle_tracks()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t.get_index(),
+                t.get_delivery().unwrap(),
+                t.get_url().unwrap().to_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let id = WireId::Real(104);
+    assert_eq!(
+        subtitles,
+        vec![
+            (
+                3,
+                SubtitleDelivery::External,
+                format!("/videos/{id}/subtitles/3/stream.vtt")
+            ),
+            (
+                4,
+                SubtitleDelivery::Image,
+                format!("/videos/{id}/subtitles/4/images.json")
+            ),
+        ]
+    );
+}
