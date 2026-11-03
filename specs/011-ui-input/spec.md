@@ -56,7 +56,9 @@ right-click any item for its context menu; middle-click / Ctrl-click opens in a
 new tab (real URLs, 009); drag to reorder playlists and queue; shift-click and
 drag-rectangle multi-select in grids; a plain vertical wheel always scrolls the
 page, and rails scroll sideways only on horizontal input (a trackpad swipe or
-Shift+wheel); thumb buttons (Back/Forward) navigate.
+Shift+wheel); on a library grid in name order, which has no rails, Shift+wheel
+steps to the next or previous first letter instead (V252); thumb buttons
+(Back/Forward) navigate.
 
 ### US6 — multi-select and bulk actions (P2)
 
