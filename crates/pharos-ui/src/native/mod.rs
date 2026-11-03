@@ -8,6 +8,7 @@ pub mod browse;
 pub mod depth;
 pub mod diagnostics;
 pub mod find;
+pub mod letters;
 pub mod listen;
 pub mod machine;
 pub mod paging;

@@ -1,4 +1,5 @@
-//! Paging a browse grid (V237): which page to ask for next, and when to stop.
+//! Paging a browse grid (V237): which page to ask for next, and when to stop;
+//! and how far to read for a jump to a letter (V252).
 //! Pure, so the rules run under host tests; the scroll sentinel and the fetch
 //! that feed it live in `browse` and the platform module.
 
@@ -82,6 +83,23 @@ impl Pager {
         self.in_flight = true;
         self.failed = false;
         Some(self.loaded())
+    }
+
+    /// Claims the pages up to and including the tile at `target`, for a
+    /// jump to a letter (B312/V252): the start and how many to ask for, a
+    /// whole number of `page`s but at most `max`. `None` when that tile is
+    /// already loaded, a page is in flight, or nothing more can be loaded.
+    /// Pages stay contiguous from the first, so scrolling back up needs
+    /// nothing more.
+    pub fn begin_through(&mut self, target: u32, page: u32, max: u32) -> Option<(u32, u32)> {
+        let loaded = self.loaded();
+        if self.in_flight || !self.has_more() || target < loaded {
+            return None;
+        }
+        let want = (target - loaded + 1).div_ceil(page.max(1)) * page.max(1);
+        self.in_flight = true;
+        self.failed = false;
+        Some((loaded, want.clamp(page.max(1), max.max(page))))
     }
 
     /// Appends the page that was asked for. An empty page ends paging.
@@ -226,6 +244,28 @@ mod tests {
         assert_eq!(p.sentinel(), Some(70));
         let short = Pager::new(page(0, 10, 250));
         assert_eq!(short.sentinel(), Some(0));
+    }
+
+    #[test]
+    fn a_jump_asks_for_whole_pages_through_its_target() {
+        let mut p = Pager::new(page(0, 100, 5000));
+        assert_eq!(p.begin_through(50, 100, 1000), None, "already loaded");
+        assert_eq!(p.begin_through(100, 100, 1000), Some((100, 100)));
+        assert_eq!(p.begin_through(900, 100, 1000), None, "one in flight");
+        p.land(page(100, 100, 5000));
+        assert_eq!(p.begin_through(950, 100, 1000), Some((200, 800)));
+        p.land(page(200, 800, 5000));
+        assert_eq!(
+            p.begin_through(4000, 100, 1000),
+            Some((1000, 1000)),
+            "capped"
+        );
+    }
+
+    #[test]
+    fn a_jump_past_the_end_asks_for_nothing() {
+        let mut p = Pager::new(page(0, 3, 3));
+        assert_eq!(p.begin_through(10, 100, 1000), None);
     }
 
     #[test]
