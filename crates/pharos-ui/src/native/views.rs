@@ -501,6 +501,7 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            stereo: None,
         }
     }
 
@@ -727,6 +728,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -748,6 +750,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -764,6 +767,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("/watch/"), "{html}");
