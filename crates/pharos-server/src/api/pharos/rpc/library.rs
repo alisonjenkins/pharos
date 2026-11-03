@@ -356,12 +356,18 @@ impl server::library::Handler for Library {
         };
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
         let mut out = results.get().init_result().init_detail();
-        write_item(
-            out.reborrow().init_summary(),
-            &item,
-            user_data,
-            &state.server_id,
-        );
+        let mut summary = out.reborrow().init_summary();
+        write_item(summary.reborrow(), &item, user_data, &state.server_id);
+        // A film sits straight under its library, as Jellyfin's detail says,
+        // so the UI can name the library above it.
+        if !summary.has_parent_id() {
+            if let Some(library) = crate::api::jellyfin::items::library_parent_id(state, &item)
+                .as_deref()
+                .and_then(WireId::parse)
+            {
+                set_item_id(summary.init_parent_id(), library);
+            }
+        }
         out.set_overview(dto.overview.as_deref().unwrap_or_default());
         let count = u32::try_from(dto.genres.len()).unwrap_or(u32::MAX);
         let mut genres = out.reborrow().init_genres(count);
