@@ -54,6 +54,8 @@ impl server::playback::Handler for Playback {
             stream_choice::None(()) => Some(-1),
             stream_choice::Default(()) => None,
         };
+        let version = params.get_version()?.to_str()?.trim();
+        let version = (!version.is_empty()).then_some(version);
         let session = &self.session;
         let granted = match (session.current_user().await, id, audio_stream_index) {
             (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
@@ -64,6 +66,7 @@ impl server::playback::Handler for Playback {
                     subtitle_stream_index,
                     token: &session.token,
                     client_is_remote: session.client_is_remote(),
+                    version,
                 };
                 playback::grant(&session.state, &user, id, &request)
                     .await
@@ -71,6 +74,10 @@ impl server::playback::Handler for Playback {
                         GrantError::Item(e) => item_denial(id, &e, "negotiate"),
                         GrantError::NotPlayable => Denial::NotPermitted {
                             what: "streaming a book",
+                        },
+                        GrantError::NoSuchVersion => Denial::NotFound { what: "version" },
+                        GrantError::VersionUnprobed => Denial::Unavailable {
+                            dependency: "the version's probe (rescan the library)",
                         },
                     })
             }
