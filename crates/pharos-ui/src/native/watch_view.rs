@@ -3,6 +3,7 @@
 //! what the viewer does goes out as [`Control`], which the player turns into
 //! calls on the `<video>` or a new playback.
 
+use dioxus::html::geometry::WheelDelta;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
@@ -25,6 +26,14 @@ const VOLUME_STEP: f64 = 0.1;
 /// How often a playing picture checks for a still pointer; the chrome fades
 /// one to two ticks after the last movement.
 const IDLE_TICK_MS: u32 = 1_500;
+/// How far one wheel notch moves the volume, or seeks with Shift held.
+const WHEEL_VOLUME_STEP: f64 = 0.05;
+const WHEEL_SEEK_MS: u64 = 5_000;
+/// Wheel travel that makes one notch. A mouse notch is about this far; a
+/// trackpad sends many small deltas, which add up instead of each counting.
+const WHEEL_NOTCH_PX: f64 = 100.0;
+/// A line of wheel travel (`deltaMode` 1, as Firefox reports a mouse).
+const WHEEL_LINE_PX: f64 = 40.0;
 
 /// Everything the controls show.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -129,6 +138,8 @@ pub fn WatchView(
     // A tap that only brings the hidden chrome back must not also pause; a
     // paused player's chrome is never hidden.
     let mut woke_by_tap = use_signal(|| false);
+    // Wheel travel short of a whole notch, kept for the next event.
+    let mut wheel_carry = use_signal(|| 0.0_f64);
     let mut wake = move || {
         stirred.set(true);
         if *idle.peek() {
@@ -196,6 +207,15 @@ pub fn WatchView(
                 onpointerdown: move |evt: PointerEvent| {
                     woke_by_tap.set(evt.pointer_type() == "touch" && idle() && !media.paused);
                     wake();
+                },
+                onwheel: move |evt: WheelEvent| {
+                    evt.prevent_default();
+                    wake();
+                    let (notches, rest) = wheel_notches(wheel_carry(), evt.delta());
+                    wheel_carry.set(rest);
+                    if let Some(control) = wheel_control(notches, evt.modifiers().shift(), media) {
+                        on_control.call(control);
+                    }
                 },
                 video {
                     id: VIDEO_ID,
@@ -480,6 +500,45 @@ fn TrackPicker(
     }
 }
 
+/// Adds `delta` to the wheel travel `carried` from earlier events: the
+/// whole notches it now makes, up (away from the viewer) counting positive,
+/// and the travel left over. Shift turns a wheel sideways on some systems, so
+/// the larger axis counts.
+pub fn wheel_notches(carried: f64, delta: WheelDelta) -> (i32, f64) {
+    let along = |x: f64, y: f64| if y.abs() >= x.abs() { y } else { x };
+    let px = match delta {
+        WheelDelta::Pixels(v) => along(v.x, v.y),
+        WheelDelta::Lines(v) => along(v.x, v.y) * WHEEL_LINE_PX,
+        WheelDelta::Pages(v) => along(v.x, v.y) * WHEEL_NOTCH_PX,
+    };
+    let travel = carried - px;
+    let notches = (travel / WHEEL_NOTCH_PX).trunc();
+    // A wheel moves at most a few dozen notches between events.
+    #[allow(clippy::cast_possible_truncation)]
+    let whole = notches.clamp(-1_000.0, 1_000.0) as i32;
+    (whole, travel - notches * WHEEL_NOTCH_PX)
+}
+
+/// What `notches` of wheel do: change the volume, or with Shift seek.
+pub fn wheel_control(notches: i32, shift: bool, media: MediaState) -> Option<Control> {
+    if notches == 0 {
+        return None;
+    }
+    if shift {
+        let by = u64::from(notches.unsigned_abs()) * WHEEL_SEEK_MS;
+        let to = if notches > 0 {
+            media.position_ms.saturating_add(by)
+        } else {
+            media.position_ms.saturating_sub(by)
+        };
+        return Some(Control::Seek(to));
+    }
+    Some(Control::Volume {
+        volume: (media.volume + f64::from(notches) * WHEEL_VOLUME_STEP).clamp(0.0, 1.0),
+        muted: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use pharos_client::api::SegmentKind;
@@ -634,6 +693,60 @@ mod tests {
         let html = render(c);
         assert!(!html.contains("Previous episode"), "{html}");
         assert!(html.contains(r#"aria-label="Next episode""#), "{html}");
+    }
+
+    #[test]
+    fn a_wheel_notch_steps_the_volume_and_with_shift_seeks() {
+        let media = MediaState {
+            position_ms: 60_000,
+            volume: 0.5,
+            ..MediaState::default()
+        };
+        let (up, _) = wheel_notches(0.0, WheelDelta::pixels(0.0, -100.0, 0.0));
+        assert_eq!(up, 1);
+        assert_eq!(
+            wheel_control(up, false, media),
+            Some(Control::Volume {
+                volume: 0.55,
+                muted: false
+            })
+        );
+        let (down, _) = wheel_notches(0.0, WheelDelta::lines(0.0, 3.0, 0.0));
+        assert_eq!(down, -1);
+        assert_eq!(
+            wheel_control(down, true, media),
+            Some(Control::Seek(55_000))
+        );
+        // Shift turns the wheel sideways on some systems.
+        let (sideways, _) = wheel_notches(0.0, WheelDelta::pixels(-100.0, 0.0, 0.0));
+        assert_eq!(
+            wheel_control(sideways, true, media),
+            Some(Control::Seek(65_000))
+        );
+    }
+
+    #[test]
+    fn trackpad_travel_adds_up_to_a_notch_and_the_volume_stays_in_range() {
+        let (none, rest) = wheel_notches(0.0, WheelDelta::pixels(0.0, -60.0, 0.0));
+        assert_eq!(none, 0);
+        assert_eq!(wheel_control(none, false, MediaState::default()), None);
+        let (one, _) = wheel_notches(rest, WheelDelta::pixels(0.0, -60.0, 0.0));
+        assert_eq!(one, 1);
+        let loud = MediaState {
+            volume: 1.0,
+            ..MediaState::default()
+        };
+        assert_eq!(
+            wheel_control(5, false, loud),
+            Some(Control::Volume {
+                volume: 1.0,
+                muted: false
+            })
+        );
+        assert_eq!(
+            wheel_control(-3, true, MediaState::default()),
+            Some(Control::Seek(0))
+        );
     }
 
     #[test]
