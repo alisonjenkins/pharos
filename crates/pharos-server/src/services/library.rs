@@ -614,6 +614,10 @@ pub struct ItemQuery {
     pub ids: Option<String>,
     pub sort_seed: Option<u64>,
     pub genres: Option<String>,
+    /// One genre by its name, matched through the genre entity rather than
+    /// the raw probe string `genres` compares, so an item tagged "Action,
+    /// Sci-Fi" is in both. A series matches on its show metadata's genres.
+    pub genre: Option<String>,
     pub tags: Option<String>,
     pub name_starts_with: Option<String>,
     pub name_starts_with_or_greater: Option<String>,
