@@ -20,7 +20,7 @@ use super::machine::Event;
 use super::paging::{Pager, Trigger};
 use super::platform;
 use super::route::Route;
-use super::views::{progress_percent, runtime, Link, PosterTile};
+use super::views::{progress_percent, runtime, ArtPlaceholder, Link, PosterTile};
 
 /// Most children one browse page lists.
 pub const BROWSE_PAGE: u32 = 100;
@@ -902,12 +902,14 @@ fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool)
         "pharos-hero-art"
     };
     let image = detail.as_ref().and_then(|d| d.item.image.clone());
+    let kind = detail.as_ref().map_or(ItemKind::Series, |d| d.item.kind);
     let facts = facts.join(" · ");
     rsx! {
         header { class: "pharos-hero",
             div { class: art_class,
-                if let Some(src) = image {
-                    img { src: "{src}", alt: "" }
+                match image {
+                    Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                    None => rsx! { ArtPlaceholder { kind, name: title.clone() } },
                 }
             }
             div { class: "pharos-hero-body",
