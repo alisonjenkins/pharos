@@ -13,6 +13,7 @@ pub mod group_app;
 pub mod group_session;
 pub mod letters;
 pub mod listen;
+pub mod lyrics;
 pub mod machine;
 pub mod paging;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]

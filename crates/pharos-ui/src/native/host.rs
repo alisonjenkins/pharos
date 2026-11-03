@@ -146,6 +146,10 @@ pub fn scroll_to_tile(_at: u32) -> bool {
     false
 }
 
+pub fn center_child(_id: &str, _at: u32) -> bool {
+    false
+}
+
 pub struct PageHide;
 
 pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {

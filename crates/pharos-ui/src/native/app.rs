@@ -1435,6 +1435,31 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    let lyrics = use_resource({
+        let (id, kind) = (p.detail.item.id, p.kind);
+        move || {
+            let api = ctx.api.read().clone();
+            async move {
+                if kind != ItemKind::Audio {
+                    return None;
+                }
+                match api?.lyrics(&call("watch", "lyrics"), id).await {
+                    Ok(lyrics) => {
+                        platform::info(&format!(
+                            "pharos: lyrics lines={} synced={}",
+                            lyrics.lines.len(),
+                            lyrics.synced
+                        ));
+                        Some(lyrics)
+                    }
+                    Err(e) => {
+                        platform::warn(&format!("pharos: lyrics unavailable: {e}"));
+                        None
+                    }
+                }
+            }
+        }
+    });
 
     let stop = {
         let (p, clock, last_ms) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&last_ms.0));
@@ -1678,6 +1703,7 @@ fn Player(
                 media: media(),
                 previous: near.previous,
                 next: near.next,
+                lyrics: lyrics.read().clone().flatten(),
                 on_media,
                 on_control,
             }
