@@ -1324,6 +1324,34 @@ pub enum GrantError {
     NotPlayable,
 }
 
+/// The tracks [`grant`] starts `id` on when the player names neither: the
+/// user's remembered pick for this item, else their language rules. A title
+/// page shows them before playback starts; no session is registered.
+pub async fn start_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+    capabilities: &Capabilities,
+) -> Result<(Option<u32>, Option<u32>), GrantError> {
+    let (item, _) = crate::services::library::detail(state, user, id)
+        .await
+        .map_err(GrantError::Item)?;
+    if matches!(item.kind, MediaKind::Book) {
+        return Err(GrantError::NotPlayable);
+    }
+    let profile = capabilities.profile();
+    let streams = crate::services::watch::streams(&item).await;
+    let audio = pick_audio(state, user, &item, &streams, None).await;
+    let subtitle = pick_subtitle(
+        &audio,
+        &streams,
+        &item.probe,
+        &profile.subtitle_profiles,
+        None,
+    );
+    Ok((audio.index, subtitle))
+}
+
 /// Negotiates `id` for a native player and registers the session that
 /// authorizes its stream, as `/Items/{id}/PlaybackInfo` does for a
 /// Jellyfin client: the same access check, decision, metric and session.
