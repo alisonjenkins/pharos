@@ -260,6 +260,9 @@ pub struct AppState {
     /// 009 — cast seats: TV reachability and the service handle. Inert unless
     /// `[[cast.tvs]]` is configured.
     pub cast: crate::cast_service::CastRuntime,
+    /// SyncPlay hub, registry and sinks, for the native `Group` interface;
+    /// installed by `main` once the groups exist.
+    pub sync: crate::group_ops::SyncRuntime,
     /// T87 — the last segment-transcode options each PlaySessionId used,
     /// keyed by play session. Lets the SyncPlay seek handler PREWARM the
     /// target segments for every group member's exact variant (audio pick,
@@ -666,6 +669,7 @@ impl AppState {
             bus,
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
+            sync: crate::group_ops::SyncRuntime::default(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
@@ -780,6 +784,7 @@ impl AppState {
             bus,
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
+            sync: crate::group_ops::SyncRuntime::default(),
             segment_opts_hints: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             prefetch_tasks: crate::prefetch_registry::PrefetchRegistry::new(),
             session_starts: crate::session_start::SessionStarts::new(),
