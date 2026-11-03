@@ -4,6 +4,7 @@
 //! calls on the `<video>` or a new playback.
 
 use dioxus::html::geometry::WheelDelta;
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
@@ -222,11 +223,32 @@ pub fn WatchView(
                     class: "pharos-video",
                     autoplay: true,
                     playsinline: true,
-                    onclick: move |_| {
+                    onclick: move |evt: MouseEvent| {
                         if woke_by_tap() {
                             woke_by_tap.set(false);
+                        } else if evt.modifiers().shift() {
+                            if let Some(id) = previous {
+                                on_control.call(Control::Play(id));
+                            }
                         } else {
                             on_control.call(Control::TogglePlay);
+                        }
+                    },
+                    // Shift+right click is next, so it opens no menu. Firefox
+                    // shows its menu on Shift+right click whatever the page
+                    // says, but the click still counts.
+                    oncontextmenu: move |evt: MouseEvent| {
+                        if evt.modifiers().shift() {
+                            evt.prevent_default();
+                        }
+                    },
+                    onmouseup: move |evt: MouseEvent| {
+                        if evt.trigger_button() == Some(MouseButton::Secondary)
+                            && evt.modifiers().shift()
+                        {
+                            if let Some(id) = next {
+                                on_control.call(Control::Play(id));
+                            }
                         }
                     },
                     onplaying: move |_| on_media.call(MediaEvent::Playing),
