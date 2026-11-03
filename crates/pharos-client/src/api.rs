@@ -11,7 +11,7 @@ use pharos_api::pharos_capnp::{
     item_query, item_summary, items_result, library, lyrics_result, me_result, negotiate_result,
     opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session, stream_choice,
     telemetry, track, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind,
-    SubtitleDelivery,
+    Stereo3d as WireStereo, StereoFilter, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -95,6 +95,27 @@ pub enum LibraryKind {
     Books,
 }
 
+/// How a 3D video packs its two eyes into one frame (018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stereo {
+    HalfSideBySide,
+    FullSideBySide,
+    HalfTopAndBottom,
+    FullTopAndBottom,
+    /// A second view a browser cannot decode: it plays in 2D.
+    Mvc,
+}
+
+/// One playable file of an item: its primary, or a grouped edition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    /// What [`PharosApi::play`] takes; empty for the primary.
+    pub id: String,
+    pub name: String,
+    pub stereo: Option<Stereo>,
+    pub primary: bool,
+}
+
 /// One item as a list or rail shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -122,6 +143,8 @@ pub struct Item {
     pub imdb_rating: Option<u16>,
     /// Rotten Tomatoes Tomatometer, a percentage.
     pub critic_rating: Option<u16>,
+    /// Its 3D packing, or its first 3D version's when it is itself 2D.
+    pub stereo: Option<Stereo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +186,8 @@ pub struct Listing {
     pub genre: Option<String>,
     /// Only played (`Some(true)`) or unplayed (`Some(false)`) items.
     pub played: Option<bool>,
+    /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
+    pub stereo: Option<bool>,
 }
 
 impl Listing {
@@ -175,6 +200,7 @@ impl Listing {
             descending: false,
             genre: None,
             played: None,
+            stereo: None,
         }
     }
 }
@@ -201,6 +227,9 @@ pub struct Detail {
     /// server lists them.
     pub trickplay: Vec<Trickplay>,
     pub segments: Vec<Segment>,
+    /// The primary first, then each grouped edition; empty from a server
+    /// older than schema 7.
+    pub versions: Vec<Version>,
 }
 
 /// A song's lyrics. When `synced`, every line has the time it is sung from;
@@ -383,11 +412,13 @@ pub trait PharosApi {
         recent: &[ItemRef],
         count: u32,
     ) -> Result<crate::mix::MixBatch, ClientError>;
-    /// Negotiate playback of `id` with the tracks in `picks`.
+    /// Negotiate playback of `id` with the tracks in `picks`, from the
+    /// [`Version`] whose id is `version` (empty: the primary).
     async fn play(
         &self,
         call: &CallInfo,
         id: ItemRef,
+        version: &str,
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
@@ -841,6 +872,18 @@ impl PharosApi for NativeApi {
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,
+                    versions: d
+                        .get_versions()?
+                        .iter()
+                        .map(|v| {
+                            Ok(Version {
+                                id: text(v.get_id())?,
+                                name: text(v.get_name())?,
+                                stereo: read_stereo(v.get_stereo()),
+                                primary: v.get_primary(),
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -918,6 +961,7 @@ impl PharosApi for NativeApi {
         &self,
         call: &CallInfo,
         id: ItemRef,
+        version: &str,
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, NativeGrant), ClientError> {
@@ -941,7 +985,8 @@ impl PharosApi for NativeApi {
             );
             c.set_max_bitrate(caps.max_bitrate);
             set_choice(p.reborrow().init_audio(), picks.audio);
-            set_choice(p.init_subtitle(), picks.subtitle);
+            set_choice(p.reborrow().init_subtitle(), picks.subtitle);
+            p.set_version(version);
         }
         let reply = req.send().promise.await?;
         let grant = match reply
@@ -1157,6 +1202,11 @@ fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
     q.set_sort_by(&listing.sort_by);
     q.set_descending(listing.descending);
     q.set_genre(listing.genre.as_deref().unwrap_or_default());
+    q.set_stereo(match listing.stereo {
+        None => StereoFilter::Any,
+        Some(true) => StereoFilter::Only3d,
+        Some(false) => StereoFilter::Only2d,
+    });
     let played = listing
         .played
         .map(|p| if p { "IsPlayed" } else { "IsUnplayed" });
@@ -1220,7 +1270,20 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
             .then(|| read_library_kind(item.get_library_kind())),
         imdb_rating: read_opt_u16(item.get_imdb_rating()?)?,
         critic_rating: read_opt_u16(item.get_critic_rating()?)?,
+        stereo: read_stereo(item.get_stereo()),
     })
+}
+
+/// An enum value this build does not know (a newer server's) reads as 2D.
+fn read_stereo(stereo: Result<WireStereo, capnp::NotInSchema>) -> Option<Stereo> {
+    match stereo.ok()? {
+        WireStereo::None => None,
+        WireStereo::HalfSideBySide => Some(Stereo::HalfSideBySide),
+        WireStereo::FullSideBySide => Some(Stereo::FullSideBySide),
+        WireStereo::HalfTopAndBottom => Some(Stereo::HalfTopAndBottom),
+        WireStereo::FullTopAndBottom => Some(Stereo::FullTopAndBottom),
+        WireStereo::Mvc => Some(Stereo::Mvc),
+    }
 }
 
 #[cfg(test)]

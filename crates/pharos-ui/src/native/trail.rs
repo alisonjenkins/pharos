@@ -111,6 +111,7 @@ mod tests {
                 subtitle_tracks: Vec::new(),
                 trickplay: Vec::new(),
                 segments: Vec::new(),
+                versions: Vec::new(),
             })
         }
         async fn lyrics(
@@ -133,6 +134,7 @@ mod tests {
             &self,
             _: &CallInfo,
             _: ItemRef,
+            _: &str,
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
@@ -168,6 +170,7 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            stereo: None,
         }
     }
 

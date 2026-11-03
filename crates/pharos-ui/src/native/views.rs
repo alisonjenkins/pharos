@@ -647,6 +647,7 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            stereo: None,
         }
     }
 
@@ -661,6 +662,7 @@ mod tests {
             subtitle_tracks: Vec::new(),
             trickplay: Vec::new(),
             segments: Vec::new(),
+            versions: Vec::new(),
         };
         let answer = vec![
             MemberSeen {
@@ -1021,6 +1023,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -1042,6 +1045,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -1065,6 +1069,7 @@ mod tests {
                 subtitle_tracks: vec![],
                 trickplay: vec![],
                 segments: vec![],
+                versions: Vec::new(),
             };
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
@@ -1082,6 +1087,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("/watch/"), "{html}");
