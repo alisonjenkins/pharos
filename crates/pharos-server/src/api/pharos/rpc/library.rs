@@ -137,36 +137,7 @@ impl server::library::Handler for Library {
         params: wire::QueryParams,
         results: &mut wire::QueryResults,
     ) -> Result<(), capnp::Error> {
-        let q = params.get()?.get_q()?;
-        let parent = if q.has_parent_id() {
-            Some(read_item_id(q.get_parent_id()?)?.to_string())
-        } else {
-            None
-        };
-        let text = |t: capnp::text::Reader<'_>| -> Result<Option<String>, capnp::Error> {
-            let t = t.to_str()?.trim();
-            Ok((!t.is_empty()).then(|| t.to_owned()))
-        };
-        let mut filters = Vec::new();
-        for f in q.get_filters()? {
-            filters.push(f?.to_str()?.to_owned());
-        }
-        let limit = match q.get_limit() {
-            0 => QUERY_DEFAULT,
-            n => n.min(QUERY_MAX),
-        };
-        let query = ItemQuery {
-            start_index: q.get_start(),
-            limit: Some(limit),
-            kinds: kind_filter(q.get_kinds()?),
-            sort_by: text(q.get_sort_by()?)?,
-            sort_order: q.get_descending().then(|| "Descending".to_owned()),
-            name_starts_with: text(q.get_name_starts_with()?)?,
-            filters: (!filters.is_empty()).then(|| filters.join(",")),
-            genre: text(q.get_genre()?)?,
-            ..ItemQuery::default()
-        };
-        let grouping = grouping_of(q.get_kinds()?);
+        let (parent, query, grouping) = read_query(params.get()?.get_q()?)?;
         let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
@@ -211,6 +182,60 @@ impl server::library::Handler for Library {
             "query",
             &state.server_id,
         );
+        Ok(())
+    }
+
+    async fn index(
+        self: Rc<Self>,
+        params: wire::IndexParams,
+        results: &mut wire::IndexResults,
+    ) -> Result<(), capnp::Error> {
+        let (parent, query, grouping) = read_query(params.get()?.get_q()?)?;
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let indexed = library::index(
+            &self.session.state,
+            &user,
+            parent.as_deref(),
+            grouping,
+            &query,
+        )
+        .await;
+        let out = results.get().init_result();
+        let index = match indexed {
+            Ok(index) => index,
+            Err(GroupError::SeasonsOutsideSeries) => {
+                Denial::NotPermitted {
+                    what: "seasons outside a series",
+                }
+                .write(out.init_error());
+                return Ok(());
+            }
+            Err(GroupError::Store(error)) => {
+                tracing::warn!(parent = parent.as_deref().unwrap_or("none"), %error, "native library: list index unavailable");
+                Denial::Unavailable {
+                    dependency: "media store",
+                }
+                .write(out.init_error());
+                return Ok(());
+            }
+        };
+        let mut out = out.init_index();
+        let mut letters = out.reborrow().init_letters(len_u32(&index.letters));
+        for (i, (letter, start)) in (0..).zip(&index.letters) {
+            let mut entry = letters.reborrow().get(i);
+            entry.set_letter(letter.encode_utf8(&mut [0; 4]));
+            entry.set_start(*start);
+        }
+        let mut genres = out.init_genres(len_u32(&index.genres));
+        for (i, genre) in (0..).zip(&index.genres) {
+            genres.set(i, genre.as_str());
+        }
         Ok(())
     }
 
@@ -403,6 +428,43 @@ impl server::library::Handler for Library {
         );
         Ok(())
     }
+}
+
+/// A wire `ItemQuery` as the parent's id, the service query and the grouping
+/// it names, shared by `query` and `index`.
+fn read_query(
+    q: pharos_api::pharos_capnp::item_query::Reader<'_>,
+) -> Result<(Option<String>, ItemQuery, Option<Grouping>), capnp::Error> {
+    let parent = if q.has_parent_id() {
+        Some(read_item_id(q.get_parent_id()?)?.to_string())
+    } else {
+        None
+    };
+    let text = |t: capnp::text::Reader<'_>| -> Result<Option<String>, capnp::Error> {
+        let t = t.to_str()?.trim();
+        Ok((!t.is_empty()).then(|| t.to_owned()))
+    };
+    let mut filters = Vec::new();
+    for f in q.get_filters()? {
+        filters.push(f?.to_str()?.to_owned());
+    }
+    let limit = match q.get_limit() {
+        0 => QUERY_DEFAULT,
+        n => n.min(QUERY_MAX),
+    };
+    let query = ItemQuery {
+        start_index: q.get_start(),
+        limit: Some(limit),
+        kinds: kind_filter(q.get_kinds()?),
+        sort_by: text(q.get_sort_by()?)?,
+        sort_order: q.get_descending().then(|| "Descending".to_owned()),
+        name_starts_with: text(q.get_name_starts_with()?)?,
+        filters: (!filters.is_empty()).then(|| filters.join(",")),
+        genre: text(q.get_genre()?)?,
+        ..ItemQuery::default()
+    };
+    let grouping = grouping_of(q.get_kinds()?);
+    Ok((parent, query, grouping))
 }
 
 /// The home page, or `unavailable` with its cause logged.

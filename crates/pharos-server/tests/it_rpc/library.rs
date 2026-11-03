@@ -2484,3 +2484,117 @@ async fn a_listing_keeps_to_watched_or_unwatched() {
         ["Mature"]
     );
 }
+
+/// One `Library.index` call: each letter and where it starts, then genres.
+async fn wire_index(
+    session: &session::Client,
+    parent: &str,
+    kinds: &[Kind],
+    genre: &str,
+) -> (Vec<(String, u32)>, Vec<String>) {
+    use pharos_api::pharos_capnp::index_result;
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.index_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    match WireId::parse(parent).unwrap() {
+        WireId::Real(n) => q.reborrow().init_parent_id().set_real(n),
+        WireId::Synth(n) => q.reborrow().init_parent_id().set_synth(n),
+    }
+    let mut list = q.reborrow().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    q.set_sort_by("SortName");
+    q.set_genre(genre);
+    let reply = req.send().promise.await.expect("index");
+    let index_result::Index(index) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("index failed");
+    };
+    let index = index.unwrap();
+    let letters = index
+        .get_letters()
+        .unwrap()
+        .iter()
+        .map(|l| {
+            (
+                l.get_letter().unwrap().to_str().unwrap().to_owned(),
+                l.get_start(),
+            )
+        })
+        .collect();
+    let genres = index
+        .get_genres()
+        .unwrap()
+        .iter()
+        .map(|g| g.unwrap().to_str().unwrap().to_owned())
+        .collect();
+    (letters, genres)
+}
+
+/// The letter index (B312/V252): each letter's start is the offset of its
+/// first item in the same listing `Library.query` pages, so a page asked for
+/// from there opens on that letter; it follows the genre, and the genres it
+/// offers do not.
+/// Disarm check: with `index` listing unsorted (or ignoring the genre), the
+/// page at a letter's start opens on another letter.
+#[actix_web::test]
+async fn letters_start_where_the_listing_pages_them() {
+    use pharos_core::{GenreStore as _, SeriesMetadata, SeriesMetadataStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    fx.state
+        .stores
+        .link_item_genres(102, &["Drama".to_owned()])
+        .await
+        .unwrap();
+    let lib_a = fx.lib_a_wire.clone();
+
+    let (letters, genres) = wire_index(&session, &lib_a, &[], "").await;
+    assert!(genres.contains(&"Drama".to_owned()), "{genres:?}");
+    assert!(!letters.is_empty());
+    for (letter, start) in &letters {
+        let (_, page) = wire_query(
+            &session,
+            Some(&lib_a),
+            &[],
+            "SortName",
+            false,
+            "",
+            &[],
+            *start,
+            1,
+        )
+        .await;
+        let name = page[0]["Name"].as_str().unwrap();
+        let first = pharos_core::sort_name(name)
+            .chars()
+            .next()
+            .unwrap()
+            .to_ascii_uppercase();
+        assert_eq!(first.to_string(), *letter, "{name} at {start}");
+    }
+    let (drama, drama_genres) = wire_index(&session, &lib_a, &[], "Drama").await;
+    assert_eq!(drama.first().map(|(_, s)| *s), Some(0));
+    assert_eq!(drama_genres, genres);
+
+    let tv = seed_tv_library(&fx).await;
+    fx.state
+        .stores
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: "/libTV/Show".into(),
+            series_name: "Show".into(),
+            genres: vec!["Comedy".into()],
+            ..SeriesMetadata::default()
+        })
+        .await
+        .unwrap();
+    let (letters, genres) = wire_index(&session, &tv, &[Kind::Series], "").await;
+    assert_eq!(letters, [("M".to_owned(), 0), ("S".to_owned(), 1)]);
+    assert_eq!(genres, ["Comedy"]);
+}
