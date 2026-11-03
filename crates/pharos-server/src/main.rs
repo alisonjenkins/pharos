@@ -2048,6 +2048,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         hub: session_hub.get_ref().clone(),
         registry: group_registry.get_ref().clone(),
         sinks: member_sinks.clone(),
+        socket_loss_grace: pharos_server::group_ops::SOCKET_LOSS_GRACE,
     });
     let member_sinks_data = web::Data::new(member_sinks);
     let token_resolver_data = web::Data::new(token_resolver);
