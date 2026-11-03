@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 14;
+const schemaVersion :UInt32 = 19;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -61,6 +61,10 @@ enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album
 # What a `library` item holds; mirrors pharos_core::LibraryKind.
 enum LibraryKind { mixed @0; movies @1; tvShows @2; music @3; books @4; }
 
+# How a video packs two eyes into one frame; mirrors pharos_core::Video3DFormat.
+# `none` is ordinary 2D video, and what an older server's zero reads as.
+enum Stereo3d { none @0; halfSideBySide @1; fullSideBySide @2; halfTopAndBottom @3; fullTopAndBottom @4; mvc @5; }
+
 struct ImageRef { kind @0 :Text; tag @1 :Text; url @2 :Text; blurhash @3 :Text; }
 
 struct UserState { played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32; }
@@ -73,6 +77,7 @@ struct ItemSummary {
   libraryKind @11 :LibraryKind;                            # kind == library only
   imdbRating @12 :OptU16;      # IMDb score in tenths: 78 is 7.8
   criticRating @13 :OptU16;    # Rotten Tomatoes Tomatometer, a percentage
+  stereo @14 :Stereo3d;        # the primary's packing, else the first 3D version's (022 FR-001)
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
@@ -148,6 +153,7 @@ struct ItemQuery {
   kinds @1 :List(Kind); sortBy @2 :Text; descending @3 :Bool;
   nameStartsWith @4 :Text; filters @5 :List(Text); start @6 :UInt32; limit @7 :UInt32;
   genre @8 :Text;              # one genre's name; empty means every genre
+  stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both (022 FR-004)
 }
 
 # Where each first letter starts in a listing, in the listing's own order: a
@@ -179,13 +185,19 @@ interface Library {
   lyrics @9 (ctx :CallContext, id :ItemId) -> (result :LyricsResult);
   mix @10 (ctx :CallContext, spec :MixSpec, recent :List(ItemId), count :UInt32) -> (result :MixResult);
 }
+enum StereoFilter { any @0; only3d @1; only2d @2; }
+
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
   audioTracks @4 :List(Track);
   subtitleTracks @5 :List(Track);
   trickplay @6 :List(Trickplay);    # one per width the server renders; empty when off or unprobed
   segments @7 :List(Segment);
+  versions @8 :List(Version);       # the primary first, then each grouped edition (022 FR-002)
 }
+# One playable file of an item. `id` is what Playback.negotiate takes as
+# `version`; the primary's is empty.
+struct Version { id @0 :Text; name @1 :Text; stereo @2 :Stereo3d; primary @3 :Bool; }
 struct Chapter { name @0 :Text; startMs @1 :UInt64; }
 # An audio or subtitle stream. `index` is what Playback.negotiate takes.
 struct Track {
@@ -291,7 +303,8 @@ interface PlaybackGrant {
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
 interface Playback {
-  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice) -> (result :NegotiateResult);
+  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice, version :Text) -> (result :NegotiateResult);
+  # `version`: a Version.id from ItemDetail.versions; empty plays the primary.
 }
 
 # ---- push -----------------------------------------------------------------
@@ -330,6 +343,7 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   playbackDecision @10; playbackStall @11; playbackError @12; qualitySwitch @13;
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
   groupDrift @19; groupHardSeek @20; groupWait @21;
+  xrSessionStarted @22; xrSessionFailed @23;
 }
 enum Level { error @0; warn @1; info @2; }
 struct TelemetryEvent {

@@ -26,6 +26,8 @@
 | `group_drift` | info (sampled) | playhead vs group clock while playing (014, 1 per 10 s) | group, drift_ms |
 | `group_hard_seek` | warn | drift past the hard-seek threshold (014) | group, drift_ms |
 | `group_wait` | info | time spent waiting on other members (014) | group, wait_ms |
+| `xr_session_started` | info | WebXR immersive session began (022) | format, path |
+| `xr_session_failed` | warn | WebXR session refused or ended by error (022) | format, reason |
 
 ## Server-side signals produced from them (labels bounded via `label()`)
 
