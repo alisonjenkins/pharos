@@ -7,10 +7,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    decision_result, detail_result, done, home_result, item_id, item_summary, items_result,
-    library, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs,
-    session, stream_choice, telemetry, track, Kind, LibraryKind as WireLibraryKind,
-    SegmentKind as WireSegmentKind, SubtitleDelivery,
+    decision_result, detail_result, done, home_result, index_result, item_id, item_query,
+    item_summary, items_result, library, negotiate_result, opt_u16, opt_u32, playback,
+    playback_grant, pref_result, prefs, session, stream_choice, telemetry, track, Kind,
+    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
@@ -135,6 +135,48 @@ pub struct Page {
     pub items: Vec<Item>,
     pub total: u32,
     pub start: u32,
+}
+
+/// One listing of a parent's children: what it holds, its order, and what
+/// narrows it (B312/V252). Enough to ask for any page of it again.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Listing {
+    pub parent: ItemRef,
+    /// A kind the server synthesises (series, season, album, artist) lists
+    /// those groups; `None` lists the stored items.
+    pub group: Option<ItemKind>,
+    /// Jellyfin `SortBy` tokens, such as `SortName` or
+    /// `ParentIndexNumber,IndexNumber`.
+    pub sort_by: String,
+    pub descending: bool,
+    /// One genre, by name.
+    pub genre: Option<String>,
+    /// Only played (`Some(true)`) or unplayed (`Some(false)`) items.
+    pub played: Option<bool>,
+}
+
+impl Listing {
+    /// The whole of `group` under `parent` in `sort_by` order, ascending.
+    pub fn of(parent: ItemRef, group: Option<ItemKind>, sort_by: &str) -> Self {
+        Self {
+            parent,
+            group,
+            sort_by: sort_by.to_owned(),
+            descending: false,
+            genre: None,
+            played: None,
+        }
+    }
+}
+
+/// Where each first letter starts in a listing, and the genres it can be
+/// narrowed to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListIndex {
+    /// Each letter the listing holds (`#` for anything not A to Z) and the
+    /// offset of its first item, in listing order.
+    pub letters: Vec<(char, u32)>,
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,7 +328,20 @@ pub trait PharosApi {
         sort_by: &str,
         start: u32,
         limit: u32,
+    ) -> Result<Page, ClientError> {
+        self.query(call, &Listing::of(parent, group, sort_by), start, limit)
+            .await
+    }
+    /// `limit` items of `listing` from `start`.
+    async fn query(
+        &self,
+        call: &CallInfo,
+        listing: &Listing,
+        start: u32,
+        limit: u32,
     ) -> Result<Page, ClientError>;
+    /// Where each letter starts in `listing`, and its genres.
+    async fn index(&self, call: &CallInfo, listing: &Listing) -> Result<ListIndex, ClientError>;
     /// The items whose title or text matches `text`, best match first, at
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
@@ -471,12 +526,10 @@ impl PharosApi for NativeApi {
         }
     }
 
-    async fn list(
+    async fn query(
         &self,
         call: &CallInfo,
-        parent: ItemRef,
-        group: Option<ItemKind>,
-        sort_by: &str,
+        listing: &Listing,
         start: u32,
         limit: u32,
     ) -> Result<Page, ClientError> {
@@ -485,16 +538,47 @@ impl PharosApi for NativeApi {
             let mut p = req.get();
             call.write(p.reborrow().init_ctx());
             let mut q = p.init_q();
-            set_item_ref(q.reborrow().init_parent_id(), parent);
-            if let Some(kind) = group.and_then(wire_kind) {
-                q.reborrow().init_kinds(1).set(0, kind);
-            }
-            q.set_sort_by(sort_by);
+            write_listing(q.reborrow(), listing);
             q.set_start(start);
             q.set_limit(limit);
         }
         let reply = req.send().promise.await?;
         read_page(reply.get()?.get_result()?)
+    }
+
+    async fn index(&self, call: &CallInfo, listing: &Listing) -> Result<ListIndex, ClientError> {
+        let mut req = self.library.index_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            write_listing(p.init_q(), listing);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            index_result::Index(index) => {
+                let index = index?;
+                let letters = index
+                    .get_letters()?
+                    .iter()
+                    .filter_map(|l| {
+                        let letter = text(l.get_letter()).map(|t| t.chars().next());
+                        letter.map(|c| c.map(|c| (c, l.get_start()))).transpose()
+                    })
+                    .collect::<Result<_, capnp::Error>>()?;
+                let genres = index
+                    .get_genres()?
+                    .iter()
+                    .map(text)
+                    .collect::<Result<_, capnp::Error>>()?;
+                Ok(ListIndex { letters, genres })
+            }
+            index_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
     }
 
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError> {
@@ -810,6 +894,24 @@ fn read_opt_u32(o: opt_u32::Reader<'_>) -> Result<Option<u32>, capnp::Error> {
 }
 
 /// An `ItemsResult` as a [`Page`], or the API error it carries.
+/// `listing` into a wire `ItemQuery`, leaving its page unset.
+fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
+    set_item_ref(q.reborrow().init_parent_id(), listing.parent);
+    if let Some(kind) = listing.group.and_then(wire_kind) {
+        q.reborrow().init_kinds(1).set(0, kind);
+    }
+    q.set_sort_by(&listing.sort_by);
+    q.set_descending(listing.descending);
+    q.set_genre(listing.genre.as_deref().unwrap_or_default());
+    let played = listing
+        .played
+        .map(|p| if p { "IsPlayed" } else { "IsUnplayed" });
+    let mut filters = q.init_filters(u32::from(played.is_some()));
+    if let Some(played) = played {
+        filters.set(0, played);
+    }
+}
+
 fn read_page(result: items_result::Reader<'_>) -> Result<Page, ClientError> {
     match result.which().map_err(capnp::Error::from)? {
         items_result::Page(page) => {
