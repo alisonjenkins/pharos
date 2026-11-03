@@ -1443,6 +1443,30 @@ fn find_view_labels_the_box_and_renders_a_tile_per_match() {
 }
 
 #[test]
+fn a_poster_tile_shows_its_imdb_and_rotten_tomatoes_scores() {
+    use pharos_client::api::Page;
+    use pharos_ui::native::views::Hits;
+    let mut rated = find_item(1, "Rated");
+    rated.imdb_rating = Some(81);
+    rated.critic_rating = Some(45);
+    let page = Page {
+        items: vec![rated, find_item(2, "Unrated")],
+        total: 2,
+        start: 0,
+    };
+    let html = render_find("R", Hits::Found(page));
+    assert_eq!(html.matches("pharos-ratings-tile").count(), 1, "{html}");
+    assert!(html.contains(r#"aria-hidden="true""#), "{html}");
+    assert!(html.contains("pharos-rating pharos-rating-imdb"), "{html}");
+    assert!(html.contains(r#"title="IMDb 8.1 out of 10""#), "{html}");
+    assert!(
+        html.contains("pharos-rating pharos-rating-rotten"),
+        "{html}"
+    );
+    assert!(html.contains(r#"title="Rotten Tomatoes 45%""#), "{html}");
+}
+
+#[test]
 fn find_view_says_no_matches_for_an_empty_answer() {
     use pharos_client::api::Page;
     use pharos_ui::native::views::Hits;
