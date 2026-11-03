@@ -1124,6 +1124,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
 #[component]
 fn TitleScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
+    let nav = use_context::<Nav>();
     let detail = use_resource(move || {
         let api = ctx.api.read().clone();
         async move {
@@ -1138,7 +1139,14 @@ fn TitleScreen(id: ItemRef) -> Element {
     loaded(
         state.as_ref().and_then(Option::as_ref),
         |detail: &Detail| {
-            rsx! { TitleView { detail: detail.clone() } }
+            // The group seam is not on the network yet: go to the Together
+            // page, where groups are listed and joined.
+            rsx! {
+                TitleView {
+                    detail: detail.clone(),
+                    on_watch_together: move |_| nav.0.call(Route::Together),
+                }
+            }
         },
     )
 }

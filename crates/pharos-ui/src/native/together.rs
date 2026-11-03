@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use pharos_client::api::ItemRef;
+use pharos_client::api::{ItemKind, ItemRef};
 
 /// How many clock samples the estimator keeps; older ones fall off.
 pub const CLOCK_WINDOW: usize = 9;
@@ -184,6 +184,12 @@ pub fn expected_position(
         return anchor_position_ms;
     }
     anchor_position_ms + u64::try_from(now_server_ms - anchor_server_ms).unwrap_or(0)
+}
+
+/// Whether a group can watch this kind together: films and episodes. Music
+/// plays alone.
+pub fn can_watch_together(kind: ItemKind) -> bool {
+    matches!(kind, ItemKind::Movie | ItemKind::Episode)
 }
 
 /// A group's id, as the server minted it.
