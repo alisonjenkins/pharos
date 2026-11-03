@@ -771,32 +771,32 @@ async fn remote_subtitle_search(
     crate::api::jellyfin::wire::json(&serde_json::Value::Array(vec![]))
 }
 
-/// `GET /Audio/{id}/Lyrics` — serve time-synced lyrics from an `.lrc`
-/// sidecar beside the audio file when present, else an empty lyric doc
-/// (200). Shape is Jellyfin's `LyricDto` (`{ Metadata, Lyrics: [{Text,
-/// Start}] }`, `Start` in ticks).
+/// `GET /Audio/{id}/Lyrics` — the song's lyrics from the shared lyrics
+/// service (tags, sidecars, optional online provider; B360/V300), else an
+/// empty lyric doc (200). Shape is Jellyfin's `LyricDto` (`{ Metadata,
+/// Lyrics: [{Text, Start}] }`, `Start` in ticks, null on plain lyrics).
 async fn get_lyrics(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
+    use crate::services::library::DetailError;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
-    crate::api::jellyfin::require_item_access(&state, &user.0, id, "item").await?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
-        pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
-        other => error::ErrorInternalServerError(other.to_string()),
-    })?;
-    let lines = read_lrc_sidecar(&item.path).unwrap_or_default();
+    // `for_item` applies the item-access policy itself.
+    let found = crate::services::lyrics::for_item(&state, &user.0, id)
+        .await
+        .map_err(|e| match e {
+            DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
+            DetailError::NotFound => error::ErrorNotFound("not found"),
+            DetailError::Store(other) => error::ErrorInternalServerError(other.to_string()),
+        })?;
     // B78/V38 — typed LyricDto, not a json! literal.
-    Ok(crate::api::jellyfin::wire::json(&LyricDto {
-        metadata: LyricMetadataDto {},
-        lyrics: lines,
-    }))
+    Ok(crate::api::jellyfin::wire::json(&LyricDto::from(found)))
 }
 
 /// Jellyfin `LyricDto` (`GET /Audio/{id}/Lyrics`). `Metadata` is an all-nullable
-/// `LyricMetadata` — an empty `{}` deserializes cleanly on strict clients.
+/// `LyricMetadata`, so strict clients accept it with only `IsSynced` set.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct LyricDto {
@@ -804,54 +804,43 @@ struct LyricDto {
     lyrics: Vec<LyricLineDto>,
 }
 
-/// Empty `LyricMetadata` — serializes to `{}`.
+impl From<Option<crate::services::lyrics::Lyrics>> for LyricDto {
+    fn from(found: Option<crate::services::lyrics::Lyrics>) -> Self {
+        let Some(found) = found else {
+            return Self {
+                metadata: LyricMetadataDto { is_synced: None },
+                lyrics: Vec::new(),
+            };
+        };
+        Self {
+            metadata: LyricMetadataDto {
+                is_synced: Some(found.synced()),
+            },
+            lyrics: found
+                .lines
+                .into_iter()
+                .map(|l| LyricLineDto {
+                    text: l.text,
+                    start: l.start_ms.map(|ms| ms.saturating_mul(10_000)),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
-struct LyricMetadataDto {}
+#[serde(rename_all = "PascalCase")]
+struct LyricMetadataDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_synced: Option<bool>,
+}
 
 /// One `LyricLine`: `Start` in Jellyfin ticks (100 ns).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct LyricLineDto {
     text: String,
-    start: u64,
-}
-
-/// Read + parse an `.lrc` sidecar (same stem as the media file). Returns the
-/// synced lines as Jellyfin `LyricLine` objects, or `None` when no sidecar
-/// exists / it can't be read. Malformed lines are skipped.
-fn read_lrc_sidecar(media_path: &std::path::Path) -> Option<Vec<LyricLineDto>> {
-    let lrc = media_path.with_extension("lrc");
-    let text = std::fs::read_to_string(&lrc).ok()?;
-    let mut out: Vec<LyricLineDto> = Vec::new();
-    for line in text.lines() {
-        if let Some((ticks, content)) = parse_lrc_line(line) {
-            out.push(LyricLineDto {
-                text: content,
-                start: ticks,
-            });
-        }
-    }
-    Some(out)
-}
-
-/// Parse one `[mm:ss.xx]text` LRC line into `(start_ticks, text)`. Returns
-/// `None` for metadata / blank / malformed lines. Ticks are 100 ns units
-/// (Jellyfin's `Start`).
-fn parse_lrc_line(line: &str) -> Option<(u64, String)> {
-    let line = line.trim();
-    let close = line.find(']')?;
-    if !line.starts_with('[') {
-        return None;
-    }
-    let stamp = &line[1..close];
-    let text = line[close + 1..].trim().to_string();
-    let (min_s, rest) = stamp.split_once(':')?;
-    let minutes: u64 = min_s.parse().ok()?;
-    // Seconds may carry a fractional part (.xx or .xxx).
-    let seconds: f64 = rest.parse().ok()?;
-    let total_ms = (minutes as f64) * 60_000.0 + seconds * 1000.0;
-    let ticks = (total_ms * 10_000.0) as u64;
-    Some((ticks, text))
+    start: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
