@@ -482,6 +482,21 @@ fn handle_tiny(
             Ok(windows) => WorkerEvent::SubtitleWindowsResult { job_id, windows },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::SubtitleImages {
+            input,
+            stream_rel_idx,
+            out_dir,
+            ..
+        } => {
+            match libav::subtitle_images::extract_subtitle_images(&input, stream_rel_idx, &out_dir)
+            {
+                Ok(m) => WorkerEvent::Done {
+                    job_id,
+                    out_bytes: m.events.len() as u64,
+                },
+                Err(e) => frame_err(job_id, e),
+            }
+        }
         TinyOp::Integrity { input } => match libav::integrity::scan_integrity(&input) {
             Ok(report) => WorkerEvent::IntegrityResult {
                 job_id,
