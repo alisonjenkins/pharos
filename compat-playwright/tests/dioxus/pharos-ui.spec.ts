@@ -370,6 +370,73 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.getByRole("button", { name: "Show more" })).toHaveCount(0);
     });
 
+    // A mouse wheel over a rail scrolls the page, not the rail: turning it
+    // sideways trapped the page under the shelves on the home screen.
+    test("a vertical wheel over a rail scrolls the page", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      // Part-watch a few videos, so the home screen holds the same shelves
+      // whichever tests ran before this one.
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-wheel-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const videos = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode,Movie&Limit=4`,
+          { headers: api },
+        )
+      ).json();
+      for (const v of videos.Items ?? []) {
+        await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+          headers: api,
+          data: { ItemId: v.Id, PlaySessionId: `pw-wheel-${v.Id}`, PositionTicks: 25_000_000, IsPaused: true },
+        });
+      }
+      // Narrow and short, so the rails overflow and the page scrolls.
+      await page.setViewportSize({ width: 320, height: 360 });
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      const rails = page.locator("ul.pharos-rail-items");
+      await expect(rails.first().locator("li").first()).toBeVisible({ timeout: 15_000 });
+      // Every shelf loaded, so the layout no longer moves under the pointer.
+      await page.waitForLoadState("networkidle");
+      const at = await rails.evaluateAll((els) =>
+        els.findIndex((el) => el.scrollWidth > el.clientWidth),
+      );
+      expect(at, "some rail overflows sideways").toBeGreaterThanOrEqual(0);
+      const rail = rails.nth(at);
+
+      // Settle the page and the pointer before the wheel: a wheel sent while
+      // the page is still scrolling to the rail can land on stale layout.
+      const frames = () =>
+        page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      await rail.scrollIntoViewIfNeeded();
+      await frames();
+      const box = await rail.boundingBox();
+      expect(box, "the rail is on the page").toBeTruthy();
+      await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+      await frames();
+      const top = await page.evaluate(() => window.scrollY);
+      await page.mouse.wheel(0, 200);
+
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(top);
+      expect(await rail.evaluate((el) => el.scrollLeft)).toBe(0);
+    });
+
     // A TV library lists its series by name and a series opens the show page
     // with its episodes; every step is a click, not a URL.
     test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
