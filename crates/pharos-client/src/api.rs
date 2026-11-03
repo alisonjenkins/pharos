@@ -115,6 +115,9 @@ pub struct Item {
     pub parent: Option<ItemRef>,
     /// A library's kind; `None` for anything else.
     pub library_kind: Option<LibraryKind>,
+    /// A track's album and artist, from its tags (B320).
+    pub album: Option<String>,
+    pub artist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -971,6 +974,8 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
         parent,
         library_kind: (kind == ItemKind::Library)
             .then(|| read_library_kind(item.get_library_kind())),
+        album: Some(text(item.get_album())?).filter(|s| !s.is_empty()),
+        artist: Some(text(item.get_artist())?).filter(|s| !s.is_empty()),
     })
 }
 

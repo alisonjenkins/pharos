@@ -430,6 +430,8 @@ mod tests {
             episode: None,
             parent: None,
             library_kind: None,
+            album: None,
+            artist: None,
         }
     }
 
