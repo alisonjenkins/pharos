@@ -202,6 +202,7 @@ fn read_capabilities(caps: capabilities::Reader<'_>) -> Result<Capabilities, cap
         audio_codecs: texts(caps.get_audio_codecs()?)?,
         containers: texts(caps.get_containers()?)?,
         max_bitrate: caps.get_max_bitrate(),
+        image_subtitles: texts(caps.get_image_subtitles()?)?,
     })
 }
 

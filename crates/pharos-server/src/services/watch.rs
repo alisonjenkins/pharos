@@ -9,7 +9,9 @@ use pharos_jellyfin_api::dto::{
     SubtitleStreamCtx,
 };
 
-use crate::api::jellyfin::subtitles::{discover_sidecars, sidecar_language_from_name};
+use crate::api::jellyfin::subtitles::{
+    discover_sidecars, is_image_subtitle_codec, sidecar_language_from_name,
+};
 use crate::state::AppState;
 
 /// One audio or subtitle stream. `index` is the absolute stream index a
@@ -23,9 +25,18 @@ pub struct Track {
     pub is_default: bool,
     pub is_forced: bool,
     pub is_hearing_impaired: bool,
-    /// A text subtitle's WebVTT. `None` for an image subtitle, which only
-    /// plays burned into the video, and for every audio track.
-    pub vtt_url: Option<String>,
+    /// How the player draws this subtitle itself. `None` for a subtitle that
+    /// only plays burned into the video, and for every audio track.
+    pub drawn: Option<Drawn>,
+}
+
+/// A subtitle the player draws over the video rather than one burned in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drawn {
+    /// A text subtitle's WebVTT.
+    Vtt(String),
+    /// An image subtitle's timed PNG manifest (spec 019).
+    Images(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,7 +49,9 @@ pub struct Tracks {
 /// order PlaybackInfo lists them. Text subtitles of every format, ASS
 /// included, are offered as WebVTT: the native player renders no ASS (013
 /// FR-003 leaves its renderer open), and a plain-text cue beats a burn.
-pub async fn tracks(item: &MediaItem) -> Tracks {
+/// Image subtitles are offered as PNGs when `draws_images` (the server can
+/// extract them, [`extracts_image_subtitles`]), else they burn.
+pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
     if !is_video(item) {
         return Tracks::default();
     }
@@ -48,15 +61,33 @@ pub async fn tracks(item: &MediaItem) -> Tracks {
         match s.kind {
             "Audio" => out.audio.push(track(s, None)),
             "Subtitle" => {
-                let vtt = s
-                    .is_text_subtitle_stream
-                    .then(|| format!("/videos/{id}/subtitles/{}/stream.vtt", s.index));
-                out.subtitles.push(track(s, vtt));
+                let drawn = if s.is_text_subtitle_stream {
+                    Some(Drawn::Vtt(format!(
+                        "/videos/{id}/subtitles/{}/stream.vtt",
+                        s.index
+                    )))
+                } else if draws_images && s.codec.as_deref().is_some_and(is_image_subtitle_codec) {
+                    Some(Drawn::Images(format!(
+                        "/videos/{id}/subtitles/{}/images.json",
+                        s.index
+                    )))
+                } else {
+                    None
+                };
+                out.subtitles.push(track(s, drawn));
             }
             _ => {}
         }
     }
     out
+}
+
+/// Whether this server extracts image subtitles for a player to draw.
+pub fn extracts_image_subtitles(state: &AppState) -> bool {
+    state
+        .subtitles
+        .as_ref()
+        .is_some_and(pharos_cache::subtitle_cache::SubtitleCache::extracts_images)
 }
 
 fn is_video(item: &MediaItem) -> bool {
@@ -82,7 +113,7 @@ pub async fn streams(item: &MediaItem) -> Vec<MediaStreamDto> {
     build_media_streams_with_subtitles(&item.probe, is_video(item), Some(&ctx))
 }
 
-fn track(s: MediaStreamDto, vtt_url: Option<String>) -> Track {
+fn track(s: MediaStreamDto, drawn: Option<Drawn>) -> Track {
     Track {
         index: s.index,
         language: s.language,
@@ -91,7 +122,7 @@ fn track(s: MediaStreamDto, vtt_url: Option<String>) -> Track {
         is_default: s.is_default,
         is_forced: s.is_forced,
         is_hearing_impaired: s.is_hearing_impaired,
-        vtt_url,
+        drawn,
     }
 }
 

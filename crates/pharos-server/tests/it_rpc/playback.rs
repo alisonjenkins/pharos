@@ -60,6 +60,7 @@ fn caps(video: &[&str], audio: &[&str], containers: &[&str]) -> Capabilities {
         audio_codecs: own(audio),
         containers: own(containers),
         max_bitrate: 0,
+        image_subtitles: Vec::new(),
     }
 }
 
@@ -159,6 +160,11 @@ async fn negotiate(
             c.reborrow().init_containers(caps.containers.len() as u32),
         );
         c.set_max_bitrate(caps.max_bitrate);
+        set(
+            &caps.image_subtitles,
+            c.reborrow()
+                .init_image_subtitles(caps.image_subtitles.len() as u32),
+        );
     }
     set_choice(p.reborrow().init_audio(), audio);
     set_choice(p.reborrow().init_subtitle(), subtitle);
@@ -214,7 +220,7 @@ async fn stop(grant: &playback_grant::Client, position_ms: u64) -> Result<(), St
 /// The same capabilities as the Jellyfin `DeviceProfile` body a native app
 /// would post.
 fn device_profile_json(caps: &Capabilities) -> serde_json::Value {
-    let profile = caps.profile();
+    let profile = caps.profile(false);
     let direct: Vec<_> = profile
         .direct_play_profiles
         .iter()
@@ -288,7 +294,7 @@ async fn native_negotiation_agrees_with_playback_info() {
         )
         .await
         .unwrap();
-        let profile = caps.profile();
+        let profile = caps.profile(false);
         let service = playback::negotiate(
             &fx.state,
             &item,
@@ -549,4 +555,107 @@ async fn the_decision_names_its_tracks_and_reports_remember_a_switch() {
     .await
     .unwrap();
     assert_eq!(again.subtitle, Some(3), "{again:?}");
+}
+
+/// MOVIE with a `dvd_subtitle` at stream 3 and an ASS at stream 4.
+async fn seed_image_subtitle(fx: &Fixture) {
+    use pharos_core::SubtitleTrack;
+    seed_playable(fx).await;
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    item.probe.subtitle_tracks = vec![
+        SubtitleTrack {
+            stream_index: 3,
+            codec: Some("dvd_subtitle".into()),
+            ..SubtitleTrack::default()
+        },
+        SubtitleTrack {
+            stream_index: 4,
+            codec: Some("ass".into()),
+            ..SubtitleTrack::default()
+        },
+    ];
+    fx.state.stores.put(item).await.unwrap();
+}
+
+/// Spec 019 FR-003: a player that declares an image subtitle codec, on a
+/// server that extracts it, direct plays with that subtitle on: it draws the
+/// PNGs itself. Declaring it switches no text subtitle to a burn.
+/// Disarm check: with `Capabilities::profile` leaving `image_subtitles` out,
+/// the first decision is `subtitle_burn`; leaving out the `ass` entry, the
+/// ASS one is.
+#[cfg(feature = "ffmpeg-lib")]
+#[actix_web::test]
+async fn a_player_that_draws_image_subtitles_keeps_direct_play() {
+    let cache = tempfile::tempdir().unwrap();
+    let (server, fx) = crate::revocation::start_drawing_images(cache.path()).await;
+    seed_image_subtitle(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut draws = caps(&["h264"], &["aac"], &["mp4"]);
+    draws.image_subtitles = vec!["dvd_subtitle".into()];
+
+    for subtitle in [3, 4] {
+        let (_grant, decided) = negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            &draws,
+            Choice::Default,
+            Choice::Index(subtitle),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (decided.method.as_str(), decided.downgrade.as_str()),
+            ("direct_play", "none"),
+            "subtitle {subtitle}: {decided:?}"
+        );
+        assert_eq!(decided.subtitle, Some(subtitle));
+    }
+}
+
+/// Spec 019 FR-004: an image subtitle still burns for a player that does
+/// not declare it, and on a server that cannot extract it.
+/// Disarm check: with `grant` building the profile with `draws_images: true`
+/// regardless of the server, the second negotiation direct plays.
+#[actix_web::test]
+async fn an_image_subtitle_burns_unless_both_sides_can_draw_it() {
+    let mut draws = caps(&["h264"], &["aac"], &["mp4"]);
+    draws.image_subtitles = vec!["dvd_subtitle".into()];
+    let silent = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let cases: Vec<(&str, bool, &Capabilities)> = vec![
+        ("player declares nothing", true, &silent),
+        ("server cannot extract", false, &draws),
+    ];
+    for (case, server_extracts, player) in cases {
+        let cache = tempfile::tempdir().unwrap();
+        let (server, fx) = if server_extracts {
+            #[cfg(feature = "ffmpeg-lib")]
+            {
+                crate::revocation::start_drawing_images(cache.path()).await
+            }
+            #[cfg(not(feature = "ffmpeg-lib"))]
+            {
+                continue;
+            }
+        } else {
+            crate::revocation::start().await
+        };
+        seed_image_subtitle(&fx).await;
+        let (client, _closed) = crate::revocation::connect(&server).await;
+        let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+        let (_grant, decided) = negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            player,
+            Choice::Default,
+            Choice::Index(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided.downgrade, "subtitle_burn", "{case}: {decided:?}");
+        assert_eq!(decided.subtitle, Some(3), "{case}");
+    }
 }
