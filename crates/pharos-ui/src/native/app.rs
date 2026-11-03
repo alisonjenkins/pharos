@@ -1105,6 +1105,28 @@ fn WatchScreen(id: ItemRef) -> Element {
     // The tracks asked for; changing them negotiates a new playback.
     let mut picks = use_signal(TrackPicks::default);
     let resume_from = Rc::clone(&last_ms);
+    // The episodes either side follow the item, not the playback, so a track
+    // change that renegotiates does not look them up again.
+    let near = use_resource(move || {
+        let api = ctx.api.read().clone();
+        async move {
+            let api = api?;
+            let info = call("watch", "neighbours");
+            let result = async {
+                let episode = api.detail(&info, id).await?.item;
+                if episode.kind != ItemKind::Episode {
+                    return Ok(Neighbours::default());
+                }
+                browse::neighbours(&api, &info, &episode).await
+            }
+            .await;
+            result
+                .map_err(|e| {
+                    platform::warn(&format!("pharos: episode neighbours unavailable: {e}"))
+                })
+                .ok()
+        }
+    });
     let playing = use_resource(move || {
         let api = ctx.api.read().clone();
         let resume_from = Rc::clone(&resume_from);
@@ -1170,6 +1192,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                 Player {
                     playing: p.clone(),
                     last_ms: LastMs(Rc::clone(&last_ms)),
+                    near: near.read().flatten().unwrap_or_default(),
                     on_renegotiate: move |next| picks.set(next),
                 }
             },
@@ -1210,6 +1233,7 @@ fn choice(index: Option<u32>) -> TrackChoice {
 fn Player(
     playing: PlayingRef,
     last_ms: LastMs,
+    near: Neighbours,
     on_renegotiate: EventHandler<TrackPicks>,
 ) -> Element {
     let ctx = use_context::<Ctx>();
@@ -1392,26 +1416,6 @@ fn Player(
         }
     };
 
-    let episode = p.detail.item.clone();
-    let near = use_resource(move || {
-        let api = ctx.api.read().clone();
-        let episode = episode.clone();
-        async move {
-            if episode.kind != ItemKind::Episode {
-                return Neighbours::default();
-            }
-            let Some(api) = api else {
-                return Neighbours::default();
-            };
-            browse::neighbours(&api, &call("watch", "neighbours"), &episode)
-                .await
-                .unwrap_or_else(|e| {
-                    platform::warn(&format!("pharos: episode neighbours unavailable: {e}"));
-                    Neighbours::default()
-                })
-        }
-    });
-    let near = (*near.read()).unwrap_or_default();
     let controls = Controls {
         media: media(),
         runtime_ms: p.detail.item.runtime_ms,
