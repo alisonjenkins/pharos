@@ -5621,13 +5621,23 @@ async fn library_view_for_id(
 }
 
 /// Library-root id whose path prefixes this item, if any. Used to
-/// post-fill `BaseItemDto.parent_id` for top-level items.
+/// post-fill `BaseItemDto.parent_id` for top-level items. The innermost
+/// library wins, so a TV library nested in a mixed root owns its shows.
 fn library_parent_id(state: &AppState, item: &MediaItem) -> Option<String> {
-    state
-        .media_roots
+    let typed = state
+        .libraries()
         .iter()
-        .find(|r| item.path.starts_with(r))
-        .map(|r| library_id_for_root(r))
+        .filter(|l| item.path.starts_with(&l.root_path))
+        .max_by_key(|l| l.root_path.len())
+        .map(|l| l.wire_id.clone());
+    typed.or_else(|| {
+        state
+            .media_roots
+            .iter()
+            .filter(|r| item.path.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .map(|r| library_id_for_root(r))
+    })
 }
 
 /// Walk a Vec<BaseItemDto> + matching items, post-filling ParentId
