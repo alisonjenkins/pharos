@@ -43,6 +43,7 @@ pub fn Shell(on_sign_out: EventHandler<()>, children: Element) -> Element {
                 Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
                 nav { class: "pharos-shell-nav",
                     Link { to: Route::Find, "Find" }
+                    Link { to: Route::Together, "Together" }
                     Link { to: Route::Appearance, "Appearance" }
                     Link { to: Route::Manage, "Manage" }
                     button {

@@ -20,6 +20,11 @@ pub enum Route {
     Appearance,
     /// The search screen, `/find`: matches from `Library.search` as you type.
     Find,
+    /// Watch together (014): the groups to join, `/together`.
+    Together,
+    /// An invite link to one group, `/together/{id}`. The id is as the
+    /// server minted it, lowercase (paths are lowercased on parse).
+    TogetherGroup(String),
     /// No route matched; carries the path for the message.
     NotFound(String),
 }
@@ -47,6 +52,8 @@ impl Route {
             ["manage"] => Route::Manage,
             ["find"] => Route::Find,
             ["settings", "appearance"] => Route::Appearance,
+            ["together"] => Route::Together,
+            ["together", g] if is_group_id(g) => Route::TogetherGroup((*g).to_owned()),
             _ => not_found(path),
         }
     }
@@ -62,6 +69,8 @@ impl Route {
             Route::Manage => format!("{MOUNT}/manage"),
             Route::Appearance => format!("{MOUNT}/settings/appearance"),
             Route::Find => format!("{MOUNT}/find"),
+            Route::Together => format!("{MOUNT}/together"),
+            Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
             Route::NotFound(path) => path.clone(),
         }
     }
@@ -77,9 +86,18 @@ impl Route {
             Route::Manage => "manage",
             Route::Appearance => "appearance",
             Route::Find => "find",
+            Route::Together => "together",
+            Route::TogetherGroup(_) => "together_group",
             Route::NotFound(_) => "not_found",
         }
     }
+}
+
+/// A group id is a token of letters, digits, `-` and `_`.
+fn is_group_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn not_found(path: &str) -> Route {
@@ -102,6 +120,8 @@ mod tests {
             Route::Manage,
             Route::Appearance,
             Route::Find,
+            Route::Together,
+            Route::TogetherGroup("0a1b-2c_3d".into()),
         ] {
             assert_eq!(Route::parse(&route.path()), route, "{route:?}");
         }
@@ -125,6 +145,26 @@ mod tests {
         assert_eq!(Route::Home.path(), "/ui/");
         assert_eq!(Route::Title(ItemRef::Real(3)).path(), "/ui/title/3");
         assert_eq!(Route::Appearance.path(), "/ui/settings/appearance");
+    }
+
+    #[test]
+    fn together_routes_parse_and_format() {
+        assert_eq!(Route::parse("/ui/together"), Route::Together);
+        assert_eq!(Route::parse("/together/"), Route::Together);
+        assert_eq!(
+            Route::parse("/ui/together/AB12"),
+            Route::TogetherGroup("ab12".into())
+        );
+        assert_eq!(Route::Together.path(), "/ui/together");
+        assert_eq!(
+            Route::TogetherGroup("ab12".into()).path(),
+            "/ui/together/ab12"
+        );
+        assert_eq!(Route::Together.name(), "together");
+        assert_eq!(Route::TogetherGroup("x".into()).name(), "together_group");
+        for path in ["/together/a/b", "/together/a%20b", "/together/a.b"] {
+            assert_eq!(Route::parse(path), Route::NotFound(path.into()), "{path}");
+        }
     }
 
     #[test]
