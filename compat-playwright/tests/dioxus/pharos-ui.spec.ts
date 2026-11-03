@@ -372,7 +372,8 @@ test.describe("pharos Dioxus UI", () => {
 
     // A mouse wheel over a rail scrolls the page, not the rail: turning it
     // sideways trapped the page under the shelves on the home screen.
-    test("a vertical wheel over a rail scrolls the page", async ({ page, request }) => {
+    // Sideways input still scrolls the rail.
+    test("a vertical wheel over a rail scrolls the page, a sideways one the rail", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },
       });
@@ -435,6 +436,23 @@ test.describe("pharos Dioxus UI", () => {
 
       await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(top);
       expect(await rail.evaluate((el) => el.scrollLeft)).toBe(0);
+
+      // Sideways input still moves the rail and leaves the page: a
+      // horizontal wheel or trackpad swipe, then Shift+wheel. The page moved,
+      // so point at the rail again.
+      const moved = await rail.boundingBox();
+      await page.mouse.move(moved!.x + moved!.width / 2, moved!.y + moved!.height / 2);
+      await frames();
+      const y = await page.evaluate(() => window.scrollY);
+      await page.mouse.wheel(120, 0);
+      await expect.poll(() => rail.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
+      await rail.evaluate((el) => el.scrollTo({ left: 0, behavior: "instant" }));
+      await frames();
+      await page.keyboard.down("Shift");
+      await page.mouse.wheel(0, 120);
+      await page.keyboard.up("Shift");
+      await expect.poll(() => rail.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
+      expect(await page.evaluate(() => window.scrollY)).toBe(y);
     });
 
     // A TV library lists its series by name and a series opens the show page
