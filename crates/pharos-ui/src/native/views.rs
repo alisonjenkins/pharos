@@ -3,11 +3,12 @@
 //! renders under `dioxus-ssr` in tests (009 FR-014).
 
 use dioxus::prelude::*;
-use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, LibraryKind, Page};
+use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind, Page};
 
 use super::depth;
 use super::platform;
 use super::route::Route;
+use super::together::can_watch_together;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
 /// instead of reloading the page.
@@ -312,7 +313,12 @@ pub fn PosterTile(item: Item) -> Element {
 }
 
 #[component]
-pub fn TitleView(detail: Detail) -> Element {
+pub fn TitleView(
+    detail: Detail,
+    /// The viewer asked to watch this item together.
+    #[props(default)]
+    on_watch_together: EventHandler<ItemRef>,
+) -> Element {
     let item = &detail.item;
     let facts: Vec<String> = [
         item.year.map(|y| y.to_string()),
@@ -344,6 +350,19 @@ pub fn TitleView(detail: Detail) -> Element {
                     if item.kind.playable() {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
                             if resume { "Resume" } else { "Play" }
+                        }
+                    }
+                    if can_watch_together(item.kind) {
+                        {
+                            let id = item.id;
+                            rsx! {
+                                button {
+                                    class: "pharos-button",
+                                    r#type: "button",
+                                    onclick: move |_| on_watch_together.call(id),
+                                    "Watch together"
+                                }
+                            }
                         }
                     }
                     if matches!(open_route(item), Route::Browse(_)) {
@@ -748,6 +767,30 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
+    }
+
+    #[test]
+    fn watch_together_shows_only_for_films_and_episodes() {
+        for (kind, shown) in [
+            (ItemKind::Movie, true),
+            (ItemKind::Episode, true),
+            (ItemKind::Audio, false),
+            (ItemKind::Series, false),
+            (ItemKind::Album, false),
+        ] {
+            let detail = Detail {
+                item: item(kind),
+                overview: String::new(),
+                genres: vec![],
+                chapters: vec![],
+                audio_tracks: vec![],
+                subtitle_tracks: vec![],
+                trickplay: vec![],
+                segments: vec![],
+            };
+            let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+            assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
+        }
     }
 
     #[test]
