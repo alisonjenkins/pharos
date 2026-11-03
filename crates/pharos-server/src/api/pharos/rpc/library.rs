@@ -1010,7 +1010,14 @@ fn write_synth_summary(
         .and_then(|n| n.as_u64())
         .and_then(|n| u32::try_from(n).ok())
     {
-        summary.init_index_number().set_some(n);
+        summary.reborrow().init_index_number().set_some(n);
+    }
+    if let Some(score) = dto
+        .get("CriticRating")
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|r| tomatometer(r as f32))
+    {
+        summary.init_critic_rating().set_some(score);
     }
 }
 
@@ -1087,6 +1094,16 @@ fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    if let Some(score) = dto.critic_rating.and_then(tomatometer) {
+        out.init_critic_rating().set_some(score);
+    }
+}
+
+/// A stored `CriticRating` as a whole Tomatometer percentage; `None` for a
+/// value outside 0–100, which no critic score can be.
+fn tomatometer(rating: f32) -> Option<u16> {
+    let rounded = rating.round();
+    (0.0..=100.0).contains(&rounded).then_some(rounded as u16)
 }
 
 fn write_view(mut item: item_summary::Builder<'_>, id: WireId, view: &LibraryView) {

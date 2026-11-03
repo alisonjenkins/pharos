@@ -319,6 +319,7 @@ fn summary(item: pharos_api::pharos_capnp::item_summary::Reader<'_>) -> serde_js
         "IndexNumber": item.has_index_number().then(|| opt32(item.get_index_number().unwrap())).flatten(),
         "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
         "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
+        "CriticRating": item.has_critic_rating().then(|| opt16(item.get_critic_rating().unwrap())).flatten(),
     })
 }
 
@@ -334,6 +335,7 @@ fn project(dtos: &[serde_json::Value]) -> Vec<serde_json::Value> {
                 "IndexNumber": d.get("IndexNumber").cloned().unwrap_or_default(),
                 "ParentIndexNumber": d.get("ParentIndexNumber").cloned().unwrap_or_default(),
                 "Primary": d["ImageTags"].get("Primary").cloned().unwrap_or_default(),
+                "CriticRating": d.get("CriticRating").and_then(|r| r.as_f64()).map(|r| r.round() as u32),
             })
         })
         .collect()
@@ -1127,6 +1129,7 @@ async fn native_detail_agrees_with_the_jellyfin_item_route() {
         ..MediaItem::default()
     };
     item.metadata.overview = Some("Told in two parts.".into());
+    item.metadata.critic_rating = Some(83.4);
     item.probe.genre = Some("Drama".into());
     item.probe.chapters = vec![
         MediaChapter {
@@ -1173,6 +1176,10 @@ async fn native_detail_agrees_with_the_jellyfin_item_route() {
             .into();
         assert_eq!(native, want, "item {id}");
     }
+    assert_eq!(
+        wire_detail(&session, WireId::Real(103)).await.unwrap()["CriticRating"],
+        83
+    );
     assert_eq!(
         wire_detail(&session, WireId::Real(103)).await.unwrap()["Chapters"]
             .as_array()
