@@ -1839,6 +1839,8 @@ struct Playing {
     /// The audio stream this playback was asked for. The server may play
     /// another, so `audio` alone cannot tell a request was already made.
     asked_audio: Option<u32>,
+    /// The tracks the viewer asked for; `Default` left the pick to the server.
+    asked: TrackPicks,
 }
 
 impl Playing {
@@ -2045,6 +2047,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             TrackChoice::Index(i) => Some(i),
                             _ => None,
                         },
+                        asked,
                     })))
                 }),
             )
@@ -2664,9 +2667,17 @@ fn Player(
             };
             let grant = p.grant.borrow().clone();
             let at = last_ms.get();
+            // A track the viewer chose is reported so the next playback
+            // starts on it; one the server chose is left to its rules.
             let tracks = TrackPicks {
-                audio: TrackChoice::Default,
-                subtitle: switched.get().unwrap_or_default(),
+                audio: match p.asked.audio {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.audio),
+                },
+                subtitle: switched.get().unwrap_or(match p.asked.subtitle {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.subtitle),
+                }),
             };
             spawn(async move {
                 let result = grant
