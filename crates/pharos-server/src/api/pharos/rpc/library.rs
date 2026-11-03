@@ -1203,6 +1203,20 @@ pub(super) fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    // B320: a track's page names who made it and where it comes from. The
+    // album artist reads truer for a compilation; the track artist covers a
+    // file tagged with only that.
+    if let Some(album) = &dto.album {
+        out.set_album(album.as_str());
+    }
+    let artist = dto
+        .album_artists
+        .first()
+        .map(|a| a.name.as_str())
+        .or_else(|| dto.artists.first().map(String::as_str));
+    if let Some(artist) = artist {
+        out.set_artist(artist);
+    }
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.reborrow().init_critic_rating().set_some(score);
     }
