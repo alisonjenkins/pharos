@@ -1,6 +1,9 @@
 //! Consolidated integration-test binary: one link instead of 4; each `mod` is a former tests/*.rs.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../common/dvd_subtitle.rs"]
+mod dvd_subtitle;
+
 #[path = "../common/mod.rs"]
 mod common;
 
