@@ -326,6 +326,8 @@ pub trait PharosApi {
     type Playing: PlaybackGrant;
 
     async fn home(&self, call: &CallInfo) -> Result<Home, ClientError>;
+    /// The libraries the user may see, in the server's order.
+    async fn views(&self, call: &CallInfo) -> Result<Page, ClientError>;
     /// The children of `parent` (a library, series, season, album), sorted
     /// by name, `limit` from `start`.
     async fn browse(
@@ -642,6 +644,13 @@ impl PharosApi for NativeApi {
             }
             index_result::Error(e) => Err(ClientError::from_api(e?)),
         }
+    }
+
+    async fn views(&self, call: &CallInfo) -> Result<Page, ClientError> {
+        let mut req = self.library.views_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        read_page(reply.get()?.get_result()?)
     }
 
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError> {
