@@ -1071,6 +1071,8 @@ struct Playing {
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// The tracks the viewer asked for; `Default` left the pick to the server.
+    asked: TrackPicks,
 }
 
 impl Playing {
@@ -1180,6 +1182,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                         detail,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
+                        asked,
                     })))
                 }),
             )
@@ -1347,9 +1350,17 @@ fn Player(
             };
             let grant = p.grant.clone();
             let at = last_ms.get();
+            // A track the viewer chose is reported so the next playback
+            // starts on it; one the server chose is left to its rules.
             let tracks = TrackPicks {
-                audio: TrackChoice::Default,
-                subtitle: switched.get().unwrap_or_default(),
+                audio: match p.asked.audio {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.audio),
+                },
+                subtitle: switched.get().unwrap_or(match p.asked.subtitle {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.subtitle),
+                }),
             };
             spawn(async move {
                 let result = grant
