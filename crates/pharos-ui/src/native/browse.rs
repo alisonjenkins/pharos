@@ -1266,7 +1266,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant, TrackPicks};
+    use pharos_client::api::{
+        Capabilities, Decision, Home, PlaybackGrant, StartTracks, TrackPicks,
+    };
 
     use super::*;
     use crate::native::views::Nav;
@@ -1406,6 +1408,14 @@ mod tests {
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
+            Err(refused())
+        }
+        async fn start_tracks(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+            _: &Capabilities,
+        ) -> Result<StartTracks, ClientError> {
             Err(refused())
         }
     }
