@@ -7,7 +7,10 @@
 
 use dioxus::prelude::*;
 use futures_util::future::{join3, try_join};
-use pharos_client::api::{Detail, Item, ItemKind, ItemRef, LibraryKind, Page, PharosApi};
+use pharos_client::api::{
+    ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind, Page,
+    PharosApi,
+};
 use pharos_client::{CallInfo, ClientError};
 
 use super::route::Route;
@@ -23,6 +26,17 @@ const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
 /// What a browse screen shows under a title that could not be fetched.
 pub const BROWSE_TITLE_FALLBACK: &str = "Browse";
 
+/// What `ui_action` a further page of a listing is fetched under.
+pub const MORE_ACTION: &str = "more";
+
+/// One paged listing: enough to ask for any page of it again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListSource {
+    pub parent: ItemRef,
+    pub group: Option<ItemKind>,
+    pub sort: &'static str,
+}
+
 /// A loaded browse screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Browse {
@@ -31,6 +45,8 @@ pub enum Browse {
     Grid {
         title: String,
         page: Page,
+        /// How to list the rest of `page`, when one paged listing backs it.
+        more: Option<ListSource>,
     },
     Show(Show),
     Music {
@@ -137,6 +153,53 @@ pub fn default_season(seasons: &[Item]) -> Option<ItemRef> {
         .map(|s| s.id)
 }
 
+/// Fetches the page of `source` that starts at `start`. Every failure is
+/// logged through `warn` and reported through `report` as an `rpcFailed`
+/// event, as a success is recorded (V237). `call` builds the `CallInfo`
+/// from a route and action; this stamps it `browse` / `more`.
+pub async fn fetch_more<A: PharosApi>(
+    api: &A,
+    call: impl Fn(&str, &str) -> CallInfo,
+    source: &ListSource,
+    start: u32,
+    warn: impl Fn(String),
+    report: impl Fn(ClientEvent),
+) -> Result<Page, ClientError> {
+    let info = call("browse", MORE_ACTION);
+    let result = api
+        .list(
+            &info,
+            source.parent,
+            source.group,
+            source.sort,
+            start,
+            BROWSE_PAGE,
+        )
+        .await;
+    if let Err(e) = &result {
+        let outcome = match e {
+            ClientError::Api { kind, .. } => kind,
+            ClientError::Rpc(_) => "transport",
+        };
+        warn(format!(
+            "pharos: browse {} more failed start={start} outcome={outcome}: {e}",
+            source.parent
+        ));
+        report(ClientEvent {
+            kind: ClientEventKind::RpcFailed,
+            level: ClientLevel::Warn,
+            route: "browse".to_owned(),
+            fields: vec![
+                ("interface", "library".to_owned()),
+                ("method", "list".to_owned()),
+                ("outcome", outcome.to_owned()),
+                ("reason", e.to_string()),
+            ],
+        });
+    }
+    result
+}
+
 /// Loads the browse screen for `id`. The listing is the point of the screen,
 /// so a detail that cannot be read is reported through `warn` and the plain
 /// grid shown; only a failed listing fails the screen.
@@ -158,19 +221,29 @@ pub async fn load<A: PharosApi>(
         .map_or_else(|| BROWSE_TITLE_FALLBACK.to_owned(), |d| d.item.name.clone());
     let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
     Ok(match (plan(detail.as_ref()), detail) {
-        (Plan::SeriesGrid, _) => Browse::Grid {
-            title,
-            page: list(id, Some(ItemKind::Series), "SortName").await?,
-        },
+        (Plan::SeriesGrid, _) => {
+            let more = ListSource {
+                parent: id,
+                group: Some(ItemKind::Series),
+                sort: "SortName",
+            };
+            Browse::Grid {
+                title,
+                page: list(more.parent, more.group, more.sort).await?,
+                more: Some(more),
+            }
+        }
         (Plan::MixedLibrary, _) => {
             let (series, stored) = try_join(
                 list(id, Some(ItemKind::Series), "SortName"),
                 list(id, None, "SortName"),
             )
             .await?;
+            // Two listings merged: no single list to continue.
             Browse::Grid {
                 title,
                 page: series_first(series, stored),
+                more: None,
             }
         }
         (Plan::MusicLibrary, _) => {
@@ -247,21 +320,37 @@ pub async fn load<A: PharosApi>(
             tracks: list(id, None, INDEX_ORDER).await?,
             detail,
         },
-        (Plan::Season { series: None }, _) => Browse::Grid {
-            title,
-            page: list(id, None, INDEX_ORDER).await?,
-        },
-        _ => Browse::Grid {
-            title,
-            page: list(id, None, "SortName").await?,
-        },
+        (Plan::Season { series: None }, _) => {
+            let more = ListSource {
+                parent: id,
+                group: None,
+                sort: INDEX_ORDER,
+            };
+            Browse::Grid {
+                title,
+                page: list(more.parent, more.group, more.sort).await?,
+                more: Some(more),
+            }
+        }
+        _ => {
+            let more = ListSource {
+                parent: id,
+                group: None,
+                sort: "SortName",
+            };
+            Browse::Grid {
+                title,
+                page: list(more.parent, more.group, more.sort).await?,
+                more: Some(more),
+            }
+        }
     })
 }
 
 #[component]
 pub fn BrowseLayout(browse: Browse) -> Element {
     match browse {
-        Browse::Grid { title, page } => rsx! { GridView { title, page } },
+        Browse::Grid { title, page, .. } => rsx! { GridView { title, page } },
         Browse::Show(show) => rsx! { ShowView { show } },
         Browse::Music {
             title,
@@ -651,6 +740,10 @@ mod tests {
         details: HashMap<ItemRef, Detail>,
         lists: HashMap<(ItemRef, Option<ItemKind>), Vec<Item>>,
         asked: RefCell<Vec<(ItemRef, Option<ItemKind>, String)>>,
+        /// Every listing's route, action, start index and limit.
+        stamped: RefCell<Vec<(String, String, u32, u32)>>,
+        /// Refuses every listing.
+        refuse_lists: bool,
     }
 
     fn refused() -> ClientError {
@@ -668,16 +761,25 @@ mod tests {
         }
         async fn list(
             &self,
-            _: &CallInfo,
+            info: &CallInfo,
             parent: ItemRef,
             group: Option<ItemKind>,
             sort_by: &str,
-            _: u32,
-            _: u32,
+            start: u32,
+            limit: u32,
         ) -> Result<Page, ClientError> {
             self.asked
                 .borrow_mut()
                 .push((parent, group, sort_by.into()));
+            self.stamped.borrow_mut().push((
+                info.ui_route.clone(),
+                info.ui_action.clone(),
+                start,
+                limit,
+            ));
+            if self.refuse_lists {
+                return Err(refused());
+            }
             Ok(page(
                 self.lists
                     .get(&(parent, group))
@@ -797,6 +899,11 @@ mod tests {
             Browse::Grid {
                 title: BROWSE_TITLE_FALLBACK.into(),
                 page: page(vec![item(ItemRef::Real(3), ItemKind::Movie, "Film")]),
+                more: Some(ListSource {
+                    parent: id,
+                    group: None,
+                    sort: "SortName",
+                }),
             }
         );
         assert!(
@@ -905,5 +1012,73 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+    fn stamp(route: &str, action: &str) -> CallInfo {
+        CallInfo {
+            ui_route: route.into(),
+            ui_action: action.into(),
+            ..CallInfo::default()
+        }
+    }
+
+    const BULK: ItemRef = ItemRef::Synth(20);
+
+    fn bulk_source() -> ListSource {
+        ListSource {
+            parent: BULK,
+            group: None,
+            sort: "SortName",
+        }
+    }
+
+    #[test]
+    fn a_further_page_is_asked_for_under_the_more_action() {
+        let fake = Fake::default();
+        let events = RefCell::new(Vec::new());
+        run(fetch_more(
+            &fake,
+            stamp,
+            &bulk_source(),
+            100,
+            |_| {},
+            |e| events.borrow_mut().push(e),
+        ))
+        .unwrap();
+        assert_eq!(
+            *fake.stamped.borrow(),
+            [("browse".into(), "more".into(), 100, BROWSE_PAGE)]
+        );
+        assert!(events.borrow().is_empty(), "a success reports no failure");
+    }
+
+    #[test]
+    fn a_failed_page_warns_and_reports_an_rpc_failed_event() {
+        let fake = Fake {
+            refuse_lists: true,
+            ..Fake::default()
+        };
+        let warned = RefCell::new(Vec::new());
+        let events = RefCell::new(Vec::new());
+        let result = run(fetch_more(
+            &fake,
+            stamp,
+            &bulk_source(),
+            200,
+            |l| warned.borrow_mut().push(l),
+            |e| events.borrow_mut().push(e),
+        ));
+        assert!(result.is_err());
+        let warned = warned.borrow();
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("start=200"), "{}", warned[0]);
+        assert!(warned[0].contains("notFound"), "{}", warned[0]);
+        let events = events.borrow();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ClientEventKind::RpcFailed);
+        assert_eq!(events[0].route, "browse");
+        assert!(events[0]
+            .fields
+            .contains(&("outcome", "notFound".to_owned())));
+        assert!(events[0].fields.contains(&("method", "list".to_owned())));
     }
 }
