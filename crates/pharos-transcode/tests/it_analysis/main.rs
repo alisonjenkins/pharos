@@ -8,4 +8,5 @@ mod fingerprint_detect;
 mod intro_alignment_recall;
 mod subtitle_burn_ass;
 mod subtitle_burn_per_eye;
+mod subtitle_images_extract;
 mod subtitle_windows_scan;
