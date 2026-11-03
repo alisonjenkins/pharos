@@ -115,6 +115,10 @@ pub struct Item {
     pub parent: Option<ItemRef>,
     /// A library's kind; `None` for anything else.
     pub library_kind: Option<LibraryKind>,
+    /// IMDb score in tenths: 78 is 7.8.
+    pub imdb_rating: Option<u16>,
+    /// Rotten Tomatoes Tomatometer, a percentage.
+    pub critic_rating: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -890,6 +894,13 @@ fn read_kind(kind: Result<Kind, capnp::NotInSchema>) -> ItemKind {
     }
 }
 
+fn read_opt_u16(o: opt_u16::Reader<'_>) -> Result<Option<u16>, capnp::Error> {
+    Ok(match o.which()? {
+        opt_u16::Some(n) => Some(n),
+        opt_u16::None(()) => None,
+    })
+}
+
 fn read_opt_u32(o: opt_u32::Reader<'_>) -> Result<Option<u32>, capnp::Error> {
     Ok(match o.which()? {
         opt_u32::Some(n) => Some(n),
@@ -937,10 +948,7 @@ fn read_items(
 }
 
 fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
-    let year = match item.get_year()?.which()? {
-        opt_u16::Some(y) => Some(y),
-        opt_u16::None(()) => None,
-    };
+    let year = read_opt_u16(item.get_year()?)?;
     let image = item
         .get_images()?
         .iter()
@@ -971,6 +979,8 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
         parent,
         library_kind: (kind == ItemKind::Library)
             .then(|| read_library_kind(item.get_library_kind())),
+        imdb_rating: read_opt_u16(item.get_imdb_rating()?)?,
+        critic_rating: read_opt_u16(item.get_critic_rating()?)?,
     })
 }
 
