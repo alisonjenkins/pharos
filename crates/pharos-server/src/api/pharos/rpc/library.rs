@@ -452,12 +452,33 @@ fn read_query(
         0 => QUERY_DEFAULT,
         n => n.min(QUERY_MAX),
     };
+    let sort_by = text(q.get_sort_by()?)?;
+    // A first key of date added takes an order token per key, so the
+    // listing takes the per-key chain: with one, the Jellyfin route reads it
+    // by its legacy rule, newest first when asked ascending (B316). Any other
+    // order keeps its one token, and with it the legacy tie-breaks.
+    let by_added = sort_by.as_deref().is_some_and(|s| {
+        matches!(
+            s.split(',').map(str::trim).find(|t| !t.is_empty()),
+            Some("DateCreated" | "DateAdded")
+        )
+    });
+    let order = if q.get_descending() {
+        "Descending"
+    } else {
+        "Ascending"
+    };
+    let sort_order = if by_added {
+        Some(format!("{order},{order}"))
+    } else {
+        q.get_descending().then(|| order.to_owned())
+    };
     let query = ItemQuery {
         start_index: q.get_start(),
         limit: Some(limit),
         kinds: kind_filter(q.get_kinds()?),
-        sort_by: text(q.get_sort_by()?)?,
-        sort_order: q.get_descending().then(|| "Descending".to_owned()),
+        sort_by,
+        sort_order,
         name_starts_with: text(q.get_name_starts_with()?)?,
         filters: (!filters.is_empty()).then(|| filters.join(",")),
         genre: text(q.get_genre()?)?,
