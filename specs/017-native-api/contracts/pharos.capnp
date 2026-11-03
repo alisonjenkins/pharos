@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 4;
+const schemaVersion :UInt32 = 5;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -130,7 +130,17 @@ struct ItemQuery {
   parentId @0 :ItemId;         # pointer field: absent means "no parent filter"
   kinds @1 :List(Kind); sortBy @2 :Text; descending @3 :Bool;
   nameStartsWith @4 :Text; filters @5 :List(Text); start @6 :UInt32; limit @7 :UInt32;
+  genre @8 :Text;              # one genre's name; empty means every genre
 }
+
+# Where each first letter starts in a listing, in the listing's own order: a
+# letter's `start` is the offset of its first item, so a client can page
+# straight to it. `#` gathers names that do not start with a letter A to Z.
+# Only letters the listing holds appear. `genres` are the genres found under
+# the query's parent and kind, ignoring its own genre and filters.
+struct LetterStart { letter @0 :Text; start @1 :UInt32; }
+struct ListIndex { letters @0 :List(LetterStart); genres @1 :List(Text); }
+struct IndexResult { union { index @0 :ListIndex; error @1 :Error; } }
 
 # Home is aggregated server-side: pipelining only follows capabilities, not
 # data, so "views, then latest per view" cannot be one flight client-side.
@@ -147,6 +157,7 @@ interface Library {
   detail @5 (ctx :CallContext, id :ItemId) -> (result :DetailResult);
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
+  index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
 }
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
