@@ -27,6 +27,7 @@ mod platform;
 #[path = "web.rs"]
 mod platform;
 pub mod playback;
+pub mod preplay;
 pub mod quality;
 pub mod queue;
 pub mod rails;

@@ -551,7 +551,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
 /// A `<select>` of tracks; nothing at all for an item with one audio track
 /// or no subtitles.
 #[component]
-fn TrackPicker(
+pub(super) fn TrackPicker(
     label: &'static str,
     tracks: Vec<Track>,
     pick: Option<u32>,

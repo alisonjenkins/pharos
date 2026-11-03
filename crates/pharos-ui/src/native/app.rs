@@ -9,7 +9,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _,
-    PlaybackGrant as _, TrackChoice, TrackPicks,
+    PlaybackGrant as _, StartTracks, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -34,6 +34,7 @@ use super::playback::{
     volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
     ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
 };
+use super::preplay::{self, PlayPicks, TrackChoices};
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
@@ -924,6 +925,8 @@ fn NativeApp(route: Route) -> Element {
     let mix = use_signal(|| None::<ActiveMix>);
     use_context_provider(|| MixCtx(mix));
     mixes::use_top_up(api, queue, mix);
+    let play_picks = use_signal(|| None);
+    use_context_provider(|| PlayPicks(play_picks));
     let nav = use_context::<Nav>();
     // Signing out ends the session, and the player with it; signing in
     // again on the watch route, which never changed, plays its item.
@@ -1757,9 +1760,13 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 
 /// A film or episode page with the group's marks on it.
 #[component]
-fn SeenTitle(detail: Detail, on_watch_together: EventHandler<ItemRef>) -> Element {
+fn SeenTitle(
+    detail: Detail,
+    on_watch_together: EventHandler<ItemRef>,
+    tracks: Option<Element>,
+) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
-    rsx! { TitleView { detail, on_watch_together, seen } }
+    rsx! { TitleView { detail, on_watch_together, seen, tracks } }
 }
 
 #[component]
@@ -1798,7 +1805,37 @@ fn TitleScreen(id: ItemRef) -> Element {
             }
         });
     };
+    // The tracks playback would start on, for the pickers to show, asked
+    // only once the title has a choice to offer (a book or a one-track song
+    // has none). Without them the pickers start on each list's first entry
+    // and still ask the server only for what the viewer changes.
+    let start = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let choice = detail.read().as_ref().and_then(Option::as_ref).map(|d| {
+            d.as_ref().is_ok_and(|d| {
+                d.item.kind.playable()
+                    && (d.audio_tracks.len() > 1 || !d.subtitle_tracks.is_empty())
+            })
+        });
+        async move {
+            let api = api?;
+            if !choice? {
+                return None;
+            }
+            let asked = api
+                .start_tracks(&call("title", "tracks"), id, &platform::capabilities())
+                .await;
+            Some(asked.unwrap_or_else(|e| {
+                platform::warn(&format!("pharos: start tracks unavailable: {e}"));
+                StartTracks::default()
+            }))
+        }
+    });
+    // Picks made on an earlier visit are not this visit's.
+    let mut pending = use_context::<PlayPicks>().0;
+    use_effect(move || pending.set(None));
     let state = detail.read();
+    let start = start.read().flatten();
     rsx! {
         if let Some(message) = group_error.read().clone() {
             ErrorNote { message }
@@ -1806,10 +1843,21 @@ fn TitleScreen(id: ItemRef) -> Element {
         {loaded(
             state.as_ref().and_then(Option::as_ref),
             |detail: &Detail| {
+                let tracks = start.map(|start| {
+                    rsx! {
+                        TrackChoices {
+                            id,
+                            audio: detail.audio_tracks.clone(),
+                            subtitles: detail.subtitle_tracks.clone(),
+                            start,
+                        }
+                    }
+                });
                 rsx! {
                     SeenTitle {
                         detail: detail.clone(),
                         on_watch_together: on_watch_together.clone(),
+                        tracks,
                     }
                 }
             },
@@ -1880,8 +1928,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
-    // The tracks asked for; changing them negotiates a new playback.
-    let mut picks = use_signal(TrackPicks::default);
+    // The tracks asked for, first on the title page; changing them
+    // negotiates a new playback.
+    let mut pending = use_context::<PlayPicks>().0;
+    let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
+    use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
     // negotiation.

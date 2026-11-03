@@ -442,6 +442,8 @@ pub fn TitleView(
     /// What the group's members have seen, when in one.
     #[props(default)]
     seen: Vec<MemberSeen>,
+    /// The audio and subtitle pickers, under the actions.
+    tracks: Option<Element>,
 ) -> Element {
     let item = &detail.item;
     let in_group = if seen.is_empty() {
@@ -497,6 +499,9 @@ pub fn TitleView(
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
+                }
+                if let Some(tracks) = tracks {
+                    {tracks}
                 }
                 InThisGroup { rows: in_group }
                 if !detail.overview.is_empty() {

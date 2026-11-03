@@ -978,6 +978,18 @@ body:has(.pharos-stage.is-full) .pharos-error {
   background: rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
   color: inherit;
 }
+.pharos-title-tracks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: -0.75rem 0 1.5rem;
+}
+.pharos-title-tracks .pharos-track-picker {
+  max-width: 20rem;
+  border-color: var(--px-color-border);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+}
 .pharos-seek {
   position: relative;
   padding: 0.5rem 0;
