@@ -591,12 +591,41 @@ impl Membership {
 }
 
 impl Drop for Membership {
+    /// Dropping the capability, which is how a closed tab or a lost
+    /// connection looks from here, is a socket loss and not a leave: the
+    /// group keeps the seat for the grace so a reconnect (the same device
+    /// joining again) takes it over, and removes it if none comes. After
+    /// `leave` there is nothing to lose; the pump is left to deliver the last
+    /// `ended` and end when its channel closes.
     fn drop(&mut self) {
-        // After `leave` the pump is left to deliver the last `ended` and end
-        // when its channel closes.
-        if !self.left.get() {
-            self.pump.abort();
+        if self.left.get() {
+            return;
         }
+        self.pump.abort();
+        if self.deps.hub.conn_gen(&self.key) != Some(self.gen) {
+            return;
+        }
+        // The capability can be dropped as the runtime goes down.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let deps = self.deps.clone();
+        let (key, member_id, gen) = (self.key.clone(), self.member_id, self.gen);
+        let group = self.group.tx.clone();
+        runtime.spawn(async move {
+            let _ = group.send(GroupMsg::MemberSocketLost { member_id }).await;
+            tokio::time::sleep(deps.socket_loss_grace).await;
+            // A drain leaves the membership for the next process (B26).
+            if crate::state::is_shutting_down() {
+                return;
+            }
+            // A newer registration of the device bumped the generation.
+            if let Some(group) = deps.hub.remove_if_current_gen(&key, gen) {
+                let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+                deps.sinks.remove(member_id, gen);
+                tracing::info!(device_id = %key, %member_id, group = %group.group_id, "syncplay: native member removed after its connection stayed gone");
+            }
+        });
     }
 }
 

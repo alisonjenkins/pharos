@@ -9,6 +9,10 @@ use pharos_sync::messages::MemberId;
 use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
 use std::sync::{Arc, OnceLock};
 
+/// How long a member whose connection dropped keeps its seat for a reconnect
+/// before the group removes it; a reconnect inside it supersedes the removal.
+pub const SOCKET_LOSS_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The SyncPlay machinery a surface needs to reach groups: who is connected,
 /// the groups, and where each member's messages are delivered.
 #[derive(Clone)]
@@ -16,6 +20,8 @@ pub struct SyncDeps {
     pub hub: SessionHub,
     pub registry: GroupRegistry,
     pub sinks: MemberSinks,
+    /// [`SOCKET_LOSS_GRACE`] outside tests.
+    pub socket_loss_grace: std::time::Duration,
 }
 
 /// [`SyncDeps`], installed once the server has built them (the groups start
