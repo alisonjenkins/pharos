@@ -6,13 +6,14 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use super::lyrics::LyricsPanel;
 use super::platform;
 use super::playback::{clock, MediaEvent, MediaState};
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
     total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
 };
-use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
+use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef, Lyrics};
 
 use crate::render::{self, Fallback, Frame, Surface};
 
@@ -28,6 +29,10 @@ const SEEK_SETTLE_MS: u64 = 1_000;
 /// How long a released scrub may wait for its seek before the bar follows
 /// the playhead again, so a seek that never lands cannot pin the thumb.
 const SEEK_GIVE_UP_MS: u32 = 5_000;
+
+/// Device-local: whether the listener hid the lyrics panel.
+const LYRICS_KEY: &str = "pharos.listen.lyrics";
+const LYRICS_HIDDEN: &str = "hidden";
 
 /// The analyser on this screen's media element. Web Audio routes an element
 /// once, so it outlives style changes and is shared with each visualiser.
@@ -101,6 +106,8 @@ pub fn ListenView(
     /// The tracks before and after this one on its album.
     previous: Option<ItemRef>,
     next: Option<ItemRef>,
+    /// The song's lyrics; `None` while they load or when the server has none.
+    lyrics: Option<Lyrics>,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
 ) -> Element {
@@ -109,6 +116,19 @@ pub fn ListenView(
     let mut style =
         use_signal(|| Style::parse(platform::stored_theme(STYLE_KEY).ok().flatten().as_deref()));
     let mut fallback = use_signal(|| None::<Fallback>);
+    let mut show_lyrics = use_signal(|| {
+        platform::stored_theme(LYRICS_KEY).ok().flatten().as_deref() != Some(LYRICS_HIDDEN)
+    });
+    let mut toggle_lyrics = move || {
+        let show = !show_lyrics();
+        show_lyrics.set(show);
+        if let Err(e) =
+            platform::store_theme(LYRICS_KEY, if show { "shown" } else { LYRICS_HIDDEN })
+        {
+            platform::warn(&format!("pharos: lyrics choice not stored error={e}"));
+        }
+    };
+    let lyrics = lyrics.filter(|l| !l.lines.is_empty());
     let mut choose = move |next: Style| {
         style.set(next);
         fallback.set(None);
@@ -286,14 +306,33 @@ pub fn ListenView(
                         }
                     }
                 }
-                div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
-                    for s in Style::ALL {
+                if let (Some(lyrics), true) = (lyrics.clone(), show_lyrics()) {
+                    LyricsPanel {
+                        lyrics,
+                        position_ms: media.position_ms,
+                        on_seek: move |ms| on_control.call(Control::Seek(ms)),
+                    }
+                }
+                div { class: "pharos-listen-options",
+                    div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
+                        for s in Style::ALL {
+                            button {
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: if s == current { "true" } else { "false" },
+                                onclick: move |_| choose(s),
+                                "{s.name()}"
+                            }
+                        }
+                    }
+                    if lyrics.is_some() {
                         button {
-                            class: "pharos-chip",
+                            class: "pharos-chip pharos-lyrics-toggle",
                             r#type: "button",
-                            aria_pressed: if s == current { "true" } else { "false" },
-                            onclick: move |_| choose(s),
-                            "{s.name()}"
+                            aria_pressed: if show_lyrics() { "true" } else { "false" },
+                            aria_controls: show_lyrics().then_some(super::lyrics::PANEL_ID),
+                            onclick: move |_| toggle_lyrics(),
+                            "Lyrics"
                         }
                     }
                 }
@@ -462,6 +501,15 @@ mod tests {
     }
 
     fn render_with(title: &str, image: Option<&str>, media: MediaState) -> String {
+        render_full(title, image, media, None)
+    }
+
+    fn render_full(
+        title: &str,
+        image: Option<&str>,
+        media: MediaState,
+        lyrics: Option<Lyrics>,
+    ) -> String {
         let (title, image) = (title.to_owned(), image.map(str::to_owned));
         let mut dom = VirtualDom::new_with_props(
             move |()| {
@@ -473,6 +521,7 @@ mod tests {
                         genres: vec!["Trip-hop".to_owned()],
                         runtime_ms: 330_000,
                         media,
+                        lyrics: lyrics.clone(),
                         on_media: |_| {},
                         on_control: |_| {},
                     }
@@ -559,6 +608,32 @@ mod tests {
         );
         assert!(html.contains("--pharos-fill: 100.00%"), "{html}");
         assert!(html.contains(r#"step="any""#), "{html}");
+    }
+
+    #[test]
+    fn lyrics_get_a_panel_and_a_toggle_only_when_there_are_some() {
+        use pharos_client::api::LyricLine;
+        let none = render_full("Teardrop", None, MediaState::default(), None);
+        assert!(!none.contains("pharos-lyrics"), "{none}");
+        let empty = render_full(
+            "Teardrop",
+            None,
+            MediaState::default(),
+            Some(Lyrics::default()),
+        );
+        assert!(!empty.contains("pharos-lyrics"), "{empty}");
+
+        let words = Lyrics {
+            synced: true,
+            lines: vec![LyricLine {
+                start_ms: 1_000,
+                text: "Love, love is a verb".to_owned(),
+            }],
+        };
+        let html = render_full("Teardrop", None, MediaState::default(), Some(words));
+        assert!(html.contains(r#"aria-label="Lyrics""#), "{html}");
+        assert!(html.contains("Love, love is a verb"), "{html}");
+        assert!(html.contains(r#"aria-controls="pharos-lyrics""#), "{html}");
     }
 
     #[test]
