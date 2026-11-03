@@ -366,6 +366,8 @@ pub struct AppState {
     /// push, and `POST/DELETE /ScheduledTasks/Running/{id}` all read/drive it so
     /// jellyfin-web renders a real scan bar. See [`crate::scan_tasks`].
     pub scan_tasks: Arc<crate::scan_tasks::ScanTasks>,
+    /// Song lyrics from tags, sidecars and an optional online provider.
+    pub lyrics: Arc<crate::services::lyrics::LyricsFinder>,
     /// Phase B2 — true when this replica holds background-work leadership
     /// (the Postgres advisory lock, or unconditionally under SQLite). The
     /// DB-writing background loops (library rescan, trickplay/subtitle warm,
@@ -688,6 +690,7 @@ impl AppState {
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
+            lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -802,6 +805,7 @@ impl AppState {
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
             scan_tasks: Arc::new(crate::scan_tasks::ScanTasks::new()),
+            lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
@@ -903,6 +907,13 @@ impl AppState {
     /// configured refresh knobs instead of silently defaulting.
     pub fn with_metadata_config(mut self, cfg: crate::config::MetadataConfig) -> Self {
         self.metadata_config = cfg;
+        self
+    }
+
+    /// Attach the lyrics finder, carrying the online provider when
+    /// `[lyrics].online` is on.
+    pub fn with_lyrics(mut self, finder: crate::services::lyrics::LyricsFinder) -> Self {
+        self.lyrics = Arc::new(finder);
         self
     }
 
