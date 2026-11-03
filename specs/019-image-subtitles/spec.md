@@ -30,7 +30,7 @@ The bitmaps come from one whole-file demux and decode of the subtitle stream (ab
 **Acceptance scenarios**:
 
 1. **Given** a cold cache, **When** the manifest is first requested, **Then** extraction starts once (concurrent requests share it) and the response is a partial manifest, never an error; the player polls it while `complete` is false.
-2. **Given** a completed extraction, **When** the file is unchanged, **Then** later requests serve from the cache with no demux; a changed mtime or a bumped `IMAGE_SUB_GEN_VERSION` re-extracts.
+2. **Given** a completed extraction, **When** the file is unchanged, **Then** later requests serve from the cache with no demux; a changed mtime or a bumped `IMAGE_SUB_GEN_VERSION` (part of the directory name) re-extracts.
 3. **Given** a library scan or startup warm, **Then** no image-subtitle extraction runs (B49/B52).
 
 ## Requirements
@@ -41,7 +41,7 @@ The bitmaps come from one whole-file demux and decode of the subtitle stream (ab
 - **FR-004** The manifest is JSON: `{ "width", "height", "complete", "through_ms", "events": [{ "start_ms", "end_ms", "x", "y", "width", "height", "forced", "url" }] }`. `width`/`height` are the subtitle canvas (the source's coded size for DVD, the PGS presentation size). Bitmaps are PNG (RGBA, palette applied) at `/videos/{id}/subtitles/{index}/images/{n}.png`.
 - **FR-005** An event's end is its decoded `end_display_time` when non-zero, else the next event's start (PGS clears with an empty event), capped at 15 s for a final event without one.
 - **FR-006** Routes require item access like the WebVTT route; a bitmap not yet extracted answers 404.
-- **FR-007** Signals: `pharos_subtitle_image_extract_total{outcome}` (`complete`, `failed`), the extraction log line with events, duration and bytes, and `subtitle.delivery=Image` in `playbackinfo subtitle selection`. Live check: `{namespace="pharos"} |= "playbackinfo subtitle selection" |= "dvd_subtitle"` shows `Some(Image)` and the following `native playback negotiated` shows `downgrade="none"`.
+- **FR-007** Signals: `pharos_subtitle_image_extract_total{outcome}` (`complete`, `failed`), the extraction log line with events, duration and bytes, and `subtitle.delivery` in `playbackinfo subtitle selection`, which reads `Some(External)` for an image codec only when the player draws it (any other image subtitle reads `Some(Burn)`). Live check: `{namespace="pharos"} |= "playbackinfo subtitle selection" |= "dvd_subtitle"` shows `Some(External)` and the playback's decision shows `downgrade="none"`.
 
 ## Out of scope
 
