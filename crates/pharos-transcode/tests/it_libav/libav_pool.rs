@@ -240,3 +240,21 @@ fn punch_hole(path: &Path, len: usize) {
     f.write_all(&vec![0u8; len]).expect("write hole");
     f.sync_all().expect("sync");
 }
+
+#[tokio::test]
+async fn pool_extracts_image_subtitles_across_the_worker_boundary() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let src = crate::dvd_subtitle::make_source(tmp.path());
+    let out = tmp.path().join("out");
+    let pool = LibavWorkerPool::new(worker_bin(), 1);
+
+    let events = pool.subtitle_images(&src, 0, &out).await.unwrap();
+
+    assert_eq!(events, 2);
+    assert!(out.join("manifest.json").is_file());
+    assert!(out.join("0.png").is_file() && out.join("1.png").is_file());
+}

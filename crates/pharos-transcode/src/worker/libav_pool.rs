@@ -49,6 +49,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
+        TinyOp::SubtitleImages { .. } => "subtitle_images",
         TinyOp::Integrity { .. } => "integrity",
         TinyOp::Fingerprint { .. } => "fingerprint",
         TinyOp::FingerprintMulti { .. } => "fingerprint_multi",
@@ -65,6 +66,8 @@ fn is_heavy_op(op: &TinyOp) -> bool {
         TinyOp::Trickplay { .. }
             | TinyOp::Waveform { .. }
             | TinyOp::SubtitleWindows { .. }
+            // As does decoding every image subtitle event.
+            | TinyOp::SubtitleImages { .. }
             // Integrity demuxes the whole file too, and by construction its
             // inputs are the slowest ones in the library.
             | TinyOp::Integrity { .. }
@@ -344,6 +347,24 @@ impl LibavWorkerPool {
             WorkerEvent::SubtitleWindowsResult { windows, .. } => Ok(windows),
             other => Err(unexpected(other)),
         }
+    }
+
+    /// Image subtitles — decode the `stream_rel_idx`-th subtitle stream into
+    /// `out_dir` (PNGs + `manifest.json`); returns the event count.
+    pub async fn subtitle_images(
+        &self,
+        input: impl Into<PathBuf>,
+        stream_rel_idx: u32,
+        out_dir: impl Into<PathBuf>,
+    ) -> Result<u64, PoolError> {
+        let ev = self
+            .run(TinyOp::SubtitleImages {
+                input: input.into(),
+                stream_rel_idx,
+                out_dir: out_dir.into(),
+            })
+            .await?;
+        expect_done(ev)
     }
 
     /// Container integrity — demux the whole source, decode nothing, report

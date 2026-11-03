@@ -238,6 +238,15 @@ pub enum TinyOp {
         /// Codec-relative subtitle index (the `N` of `-map 0:s:N`).
         stream_rel_idx: u32,
     },
+    /// Decode one image subtitle stream into `out_dir` as `{n}.png` plus a
+    /// `manifest.json` that is rewritten as the decode advances → `Done`
+    /// with the event count in `out_bytes` (spec 019).
+    SubtitleImages {
+        input: PathBuf,
+        /// Codec-relative subtitle index (the `N` of `-map 0:s:N`).
+        stream_rel_idx: u32,
+        out_dir: PathBuf,
+    },
     /// Demux a whole source without decoding it and report container faults
     /// → `WorkerEvent::IntegrityResult`. This is the op that finds a file
     /// which probes perfectly and breaks mid-playback. Demux-only, so it is
