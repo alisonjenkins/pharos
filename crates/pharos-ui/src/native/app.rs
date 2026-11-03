@@ -2154,7 +2154,7 @@ impl Playing {
             self.detail
                 .subtitle_tracks
                 .iter()
-                .any(|t| t.index == i && t.vtt_url.is_none())
+                .any(|t| t.index == i && t.vtt_url.is_none() && t.images_url.is_none())
         })
     }
 }

@@ -971,6 +971,23 @@ body:has(.pharos-stage.is-full) .pharos-error {
   outline: none;
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
 }
+/* An image subtitle (spec 019): a canvas the size of the picture's contained
+   box, centred like the picture, with each cue placed on it in percent. */
+.pharos-image-subs {
+  position: absolute;
+  inset: 0;
+  container-type: size;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.pharos-image-subs-canvas {
+  position: relative;
+}
+.pharos-image-sub {
+  position: absolute;
+}
 .pharos-player:focus-visible {
   box-shadow: inset 0 0 0 2px var(--px-color-accent);
 }
