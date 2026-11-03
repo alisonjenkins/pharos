@@ -492,13 +492,15 @@ pub fn index_label(item: &Item) -> Option<String> {
 }
 
 /// The lines under a poster's name: an episode's series, then its numbers,
-/// each on its own line so a long series name cannot hide the numbers.
+/// each on its own line so a long series name cannot hide the numbers. A
+/// song shows its artist, or its year when untagged.
 fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
         ItemKind::Episode => [item.series_name.clone(), index_label(item)]
             .into_iter()
             .flatten()
             .collect(),
+        ItemKind::Audio if item.artist.is_some() => item.artist.clone().into_iter().collect(),
         _ => item.year.map(|y| y.to_string()).into_iter().collect(),
     }
 }
@@ -919,6 +921,13 @@ mod tests {
         ] {
             assert!(html.contains(want), "missing {want} in {html}");
         }
+
+        let html = render(move || rsx! { PosterTile { item: song.clone() } });
+        assert!(html.contains(">♪<"), "{html}");
+        assert!(
+            html.contains(r#"class="pharos-poster-sub" title="Owl City""#),
+            "{html}"
+        );
     }
 
     #[test]
@@ -930,5 +939,6 @@ mod tests {
         assert_eq!(index_label(&song).as_deref(), Some("Track 4"));
         song.season = Some(2);
         assert_eq!(index_label(&song).as_deref(), Some("Disc 2 · Track 4"));
+        assert_eq!(sub_lines(&song), ["2001"], "untagged: the year");
     }
 }
