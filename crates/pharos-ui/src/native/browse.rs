@@ -28,7 +28,7 @@ use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
-use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
+use super::views::{progress_percent, runtime, ArtPlaceholder, Link, PosterTile, Ratings};
 use pharos_client::mix::radio;
 
 /// Most children one browse page lists.
@@ -926,12 +926,14 @@ fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool)
         "pharos-hero-art"
     };
     let image = detail.as_ref().and_then(|d| d.item.image.clone());
+    let kind = detail.as_ref().map_or(ItemKind::Series, |d| d.item.kind);
     let facts = facts.join(" · ");
     rsx! {
         header { class: "pharos-hero",
             div { class: art_class,
-                if let Some(src) = image {
-                    img { src: "{src}", alt: "" }
+                match image {
+                    Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                    None => rsx! { ArtPlaceholder { kind, name: title.clone() } },
                 }
             }
             div { class: "pharos-hero-body",

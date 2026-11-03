@@ -415,7 +415,7 @@ pub fn PosterTile(item: Item) -> Element {
                 onpointerleave: move |evt| depth::untilt(&evt),
                 match &item.image {
                     Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
-                    None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "{initial(&item.name)}" } },
+                    None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                 }
                 if item.played {
                     span { class: "pharos-badge", "Watched" }
@@ -459,11 +459,13 @@ pub fn TitleView(
     .collect();
     let facts = facts.join(" · ");
     let resume = progress_percent(item).is_some();
+    let track = item.kind == ItemKind::Audio;
     rsx! {
         article { class: "pharos-title",
-            div { class: "pharos-title-art",
-                if let Some(src) = &item.image {
-                    img { src: "{src}", alt: "" }
+            div { class: if track { "pharos-title-art pharos-title-art-square" } else { "pharos-title-art" },
+                match &item.image {
+                    Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                    None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                 }
             }
             div { class: "pharos-title-body",
@@ -574,6 +576,19 @@ pub fn Ratings(kind: ItemKind, imdb: Option<u16>, critic: Option<u16>, tile: boo
                 }
             }
         }
+    }
+}
+
+/// What stands in for missing art: a tile in the theme's accent with a note
+/// for music and the name's first letter for anything else (B320).
+#[component]
+pub fn ArtPlaceholder(kind: ItemKind, name: String) -> Element {
+    let glyph = match kind {
+        ItemKind::Audio | ItemKind::Album | ItemKind::Artist => "♪".to_owned(),
+        _ => initial(&name),
+    };
+    rsx! {
+        div { class: "pharos-poster-placeholder pharos-art-placeholder", aria_hidden: "true", "{glyph}" }
     }
 }
 

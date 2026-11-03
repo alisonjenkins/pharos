@@ -664,6 +664,13 @@ input:focus-visible {
   border-radius: 8px;
   display: block;
 }
+.pharos-title-art .pharos-art-placeholder {
+  aspect-ratio: 2 / 3;
+  font-size: 6rem;
+}
+.pharos-title-art-square .pharos-art-placeholder {
+  aspect-ratio: 1;
+}
 .pharos-title-body {
   flex: 1 1 auto;
   min-width: 0;
@@ -2030,6 +2037,17 @@ body::before {
 }
 .pharos-poster-placeholder {
   background: linear-gradient(160deg, var(--px-color-surface-raised), var(--px-color-surface));
+}
+/* Missing art (B320): a tile lit from one corner in the theme's accent, so a
+   gap in a grid or on a title page reads as designed. */
+.pharos-art-placeholder {
+  box-sizing: border-box;
+  border-radius: var(--px-radius);
+  color: color-mix(in srgb, var(--px-color-fg) 70%, transparent);
+  background:
+    radial-gradient(circle at 28% 22%, color-mix(in srgb, var(--px-color-accent) 40%, transparent), transparent 62%),
+    linear-gradient(150deg, color-mix(in srgb, var(--px-color-accent) 22%, var(--px-color-surface)), var(--px-color-surface) 70%);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--px-color-fg) 10%, transparent);
 }
 .pharos-progress {
   border-bottom-left-radius: var(--px-radius);
