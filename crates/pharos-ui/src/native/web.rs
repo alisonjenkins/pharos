@@ -319,6 +319,17 @@ pub fn element_width(id: &str) -> f64 {
         .map_or(0.0, |e| e.get_bounding_client_rect().width())
 }
 
+/// Moves keyboard focus to the element `id`, if it is in the page.
+pub fn focus(id: &str) {
+    if let Some(element) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = element.focus();
+    }
+}
+
 /// Enters fullscreen on the element `id`, or leaves it.
 pub fn toggle_fullscreen(id: &str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {

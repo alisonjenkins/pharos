@@ -99,6 +99,8 @@ pub fn element_width(_id: &str) -> f64 {
 
 pub fn toggle_fullscreen(_id: &str) {}
 
+pub fn focus(_id: &str) {}
+
 pub fn now_ms() -> f64 {
     0.0
 }

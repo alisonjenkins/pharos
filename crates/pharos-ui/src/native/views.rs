@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, LibraryKind, Page};
 
 use super::depth;
+use super::find::SUGGEST_LIMIT;
 use super::route::Route;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
@@ -34,15 +35,15 @@ pub fn Link(to: Route, class: Option<String>, children: Element) -> Element {
     }
 }
 
-/// The frame around every signed-in screen.
+/// The frame around every signed-in screen; `search` is the bar's search box.
 #[component]
-pub fn Shell(on_sign_out: EventHandler<()>, children: Element) -> Element {
+pub fn Shell(on_sign_out: EventHandler<()>, search: Element, children: Element) -> Element {
     rsx! {
         div { class: "pharos-app",
             header { class: "pharos-banner pharos-shell-bar",
                 Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
                 nav { class: "pharos-shell-nav",
-                    Link { to: Route::Find, "Find" }
+                    {search}
                     Link { to: Route::Appearance, "Appearance" }
                     Link { to: Route::Manage, "Manage" }
                     button {
@@ -234,7 +235,7 @@ pub enum Hits {
     Failed(String),
 }
 
-const FIND_INPUT: &str = "find-input";
+pub const FIND_INPUT: &str = "find-input";
 
 /// The search box and the matches under it. Typing reports each new text
 /// through `on_input`; the grid is the same poster tiles a library shows.
@@ -269,6 +270,129 @@ pub fn FindView(text: String, hits: Hits, on_input: EventHandler<String>) -> Ele
                 },
             }
         }
+    }
+}
+
+const SEARCH_INPUT: &str = "search-input";
+const SEARCH_LIST: &str = "search-list";
+
+/// The top bar's search box: matches from every library listed under it as
+/// you type. `open` hides the list (Escape, a pick, focus gone) without
+/// clearing the text; `active` is the match the arrow keys are on.
+#[component]
+pub fn SearchBox(
+    text: String,
+    hits: Hits,
+    open: bool,
+    active: Option<usize>,
+    on_input: EventHandler<String>,
+    on_key: EventHandler<KeyboardEvent>,
+    on_open: EventHandler<()>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let shown = open && !text.trim().is_empty() && hits != Hits::Idle;
+    let active_id = active.filter(|_| shown).map(option_id);
+    rsx! {
+        div { class: "pharos-search", role: "search",
+            input {
+                id: SEARCH_INPUT,
+                r#type: "search",
+                placeholder: "Search",
+                autocomplete: "off",
+                role: "combobox",
+                "aria-label": "Search all libraries",
+                "aria-autocomplete": "list",
+                "aria-controls": SEARCH_LIST,
+                "aria-expanded": if shown { "true" } else { "false" },
+                "aria-activedescendant": active_id,
+                value: "{text}",
+                oninput: move |evt: FormEvent| on_input.call(evt.value()),
+                onkeydown: move |evt| on_key.call(evt),
+                onfocus: move |_| on_open.call(()),
+                onblur: move |_| on_close.call(()),
+            }
+            if shown {
+                div {
+                    class: "pharos-search-pop",
+                    // Keeps focus in the box, so its blur does not close the
+                    // list before the click on a match lands.
+                    onmousedown: move |evt: MouseEvent| evt.prevent_default(),
+                    onclick: move |_| on_close.call(()),
+                    match hits {
+                        Hits::Idle => rsx! {},
+                        Hits::Failed(message) => rsx! { ErrorNote { message } },
+                        Hits::Found(page) if page.items.is_empty() => rsx! {
+                            p { class: "pharos-empty", role: "status", "No matches" }
+                        },
+                        Hits::Found(page) => rsx! {
+                            ul { id: SEARCH_LIST, role: "listbox", "aria-label": "Matches",
+                                for (at, item) in page.items.iter().take(SUGGEST_LIMIT).enumerate() {
+                                    li {
+                                        key: "{item.id}",
+                                        id: option_id(at),
+                                        role: "option",
+                                        "aria-selected": if active == Some(at) { "true" } else { "false" },
+                                        SearchHit { item: item.clone() }
+                                    }
+                                }
+                            }
+                            Link { to: Route::Find, class: "pharos-search-all",
+                                if page.total as usize > SUGGEST_LIMIT {
+                                    "See all {page.total} matches"
+                                } else {
+                                    "Open the find page"
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn option_id(at: usize) -> String {
+    format!("search-option-{at}")
+}
+
+/// One match in the search list: a thumbnail, the name, and what it is.
+#[component]
+fn SearchHit(item: Item) -> Element {
+    let detail = std::iter::once(kind_name(item.kind).to_owned())
+        .chain(sub_lines(&item))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    rsx! {
+        Link { to: open_route(&item), class: "pharos-search-hit",
+            match &item.image {
+                Some(src) => rsx! { img { class: "pharos-search-thumb", src: "{src}", alt: "", loading: "lazy" } },
+                None => rsx! { span { class: "pharos-search-thumb", "aria-hidden": "true", "{initial(&item.name)}" } },
+            }
+            span { class: "pharos-search-text",
+                span { class: "pharos-search-name", "{item.name}" }
+                span { class: "pharos-muted", "{detail}" }
+            }
+        }
+    }
+}
+
+/// What an item is, in a word, for a search match.
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Movie => "Film",
+        ItemKind::Episode => "Episode",
+        ItemKind::Audio => "Song",
+        ItemKind::Book => "Book",
+        ItemKind::Series => "Series",
+        ItemKind::Season => "Season",
+        ItemKind::Album => "Album",
+        ItemKind::Artist => "Artist",
+        ItemKind::Person => "Person",
+        ItemKind::Collection => "Collection",
+        ItemKind::Playlist => "Playlist",
+        ItemKind::Channel => "Channel",
+        ItemKind::Library => "Library",
+        ItemKind::Other => "Item",
     }
 }
 
@@ -549,6 +673,110 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn search_box(text: &str, hits: Hits, open: bool, active: Option<usize>) -> String {
+        let text = text.to_owned();
+        render(move || {
+            rsx! {
+                SearchBox {
+                    text: text.clone(),
+                    hits: hits.clone(),
+                    open,
+                    active,
+                    on_input: |_| {},
+                    on_key: |_| {},
+                    on_open: |_| {},
+                    on_close: |_| {},
+                }
+            }
+        })
+    }
+
+    fn found(count: u32) -> Hits {
+        let items = (0..count)
+            .map(|n| Item {
+                id: ItemRef::Real(u64::from(n) + 1),
+                name: format!("Match {n}"),
+                ..item(ItemKind::Movie)
+            })
+            .collect();
+        Hits::Found(Page {
+            items,
+            total: count,
+            start: 0,
+        })
+    }
+
+    #[test]
+    fn the_shell_bar_holds_the_search_box() {
+        let html = render(|| {
+            rsx! {
+                Shell {
+                    on_sign_out: |_| {},
+                    search: rsx! { SearchBox {
+                        text: String::new(),
+                        hits: Hits::Idle,
+                        open: false,
+                        active: None,
+                        on_input: |_| {},
+                        on_key: |_| {},
+                        on_open: |_| {},
+                        on_close: |_| {},
+                    } },
+                    p { "screen" }
+                }
+            }
+        });
+        let bar = html.split("</header>").next().unwrap_or_default();
+        assert!(bar.contains(r#"role="search""#), "{html}");
+        assert!(
+            bar.contains(r#"aria-label="Search all libraries""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_search_list_shows_the_first_matches_and_a_way_to_the_rest() {
+        let html = search_box("match", found(9), true, Some(1));
+        assert_eq!(
+            html.matches(r#"role="option""#).count(),
+            SUGGEST_LIMIT,
+            "{html}"
+        );
+        assert!(html.contains("See all 9 matches"), "{html}");
+        assert!(html.contains(r#"href="/ui/title/1""#), "{html}");
+        assert!(html.contains("Film · 2001"), "{html}");
+        assert!(
+            html.contains(r#"aria-activedescendant="search-option-1""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-expanded="true""#), "{html}");
+    }
+
+    #[test]
+    fn the_search_list_stays_shut_until_there_is_something_to_show() {
+        for (text, hits, open) in [
+            ("match", found(3), false),
+            ("", found(3), true),
+            ("  ", found(3), true),
+            ("match", Hits::Idle, true),
+        ] {
+            let html = search_box(text, hits, open, Some(0));
+            assert!(
+                !html.contains("pharos-search-pop"),
+                "{text:?} {open}: {html}"
+            );
+            assert!(html.contains(r#"aria-expanded="false""#), "{html}");
+            assert!(!html.contains("aria-activedescendant"), "{html}");
+        }
+    }
+
+    #[test]
+    fn the_search_list_says_when_nothing_matched() {
+        let html = search_box("zzz", found(0), true, None);
+        assert!(html.contains("No matches"), "{html}");
+        assert!(!html.contains(r#"role="option""#), "{html}");
     }
 
     #[test]
