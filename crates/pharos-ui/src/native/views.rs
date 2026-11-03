@@ -304,6 +304,7 @@ pub fn PosterTile(item: Item) -> Element {
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
+                Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
             }
             span { class: "pharos-poster-name", title: "{item.name}", "{item.name}" }
             for line in sub {
@@ -341,6 +342,7 @@ pub fn TitleView(detail: Detail) -> Element {
                 if !facts.is_empty() {
                     p { class: "pharos-muted", "{facts}" }
                 }
+                Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 div { class: "pharos-actions",
                     if item.kind.playable() {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
@@ -356,6 +358,73 @@ pub fn TitleView(detail: Detail) -> Element {
                 }
                 if !detail.genres.is_empty() {
                     p { class: "pharos-muted", "{detail.genres.join(\", \")}" }
+                }
+            }
+        }
+    }
+}
+
+/// One outside score for a title, as a chip shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rating {
+    /// `imdb`, `fresh` or `rotten`: picks the chip's colour.
+    pub source: &'static str,
+    pub label: &'static str,
+    pub value: String,
+    /// The chip's tooltip, with the source spelled out.
+    pub tooltip: String,
+}
+
+/// The Tomatometer at which Rotten Tomatoes calls a title fresh.
+const FRESH_FROM: u16 = 60;
+
+/// A film's or show's IMDb and Rotten Tomatoes scores, in that order,
+/// whichever it has; nothing for any other kind, whose scores (an album's
+/// critic score, an episode's show-level one) these chips would misname.
+pub fn ratings(kind: ItemKind, imdb: Option<u16>, critic: Option<u16>) -> Vec<Rating> {
+    if !matches!(kind, ItemKind::Movie | ItemKind::Series) {
+        return Vec::new();
+    }
+    let imdb = imdb.map(|tenths| {
+        let score = format!("{}.{}", tenths / 10, tenths % 10);
+        Rating {
+            source: "imdb",
+            label: "IMDb",
+            tooltip: format!("IMDb {score} out of 10"),
+            value: score,
+        }
+    });
+    let critics = critic.map(|percent| Rating {
+        source: if percent >= FRESH_FROM {
+            "fresh"
+        } else {
+            "rotten"
+        },
+        label: "RT",
+        value: format!("{percent}%"),
+        tooltip: format!("Rotten Tomatoes {percent}%"),
+    });
+    imdb.into_iter().chain(critics).collect()
+}
+
+/// A title's outside scores as chips; nothing when it has none. A tile's
+/// chips are hidden from assistive tech so they stay out of the link's name.
+#[component]
+pub fn Ratings(kind: ItemKind, imdb: Option<u16>, critic: Option<u16>, tile: bool) -> Element {
+    let ratings = ratings(kind, imdb, critic);
+    if ratings.is_empty() {
+        return rsx! {};
+    }
+    let (class, hidden) = match tile {
+        true => ("pharos-ratings pharos-ratings-tile", Some("true")),
+        false => ("pharos-ratings", None),
+    };
+    rsx! {
+        ul { class, aria_label: "Ratings", "aria-hidden": hidden,
+            for r in ratings {
+                li { class: "pharos-rating pharos-rating-{r.source}", title: "{r.tooltip}",
+                    span { class: "pharos-rating-source", "{r.label}" }
+                    " {r.value}"
                 }
             }
         }
@@ -432,6 +501,40 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+        }
+    }
+
+    #[test]
+    fn ratings_show_imdb_then_rotten_tomatoes() {
+        assert!(ratings(ItemKind::Movie, None, None).is_empty());
+        let r = ratings(ItemKind::Movie, Some(78), Some(92));
+        assert_eq!(
+            r.iter()
+                .map(|r| (r.source, r.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("imdb", "7.8"), ("fresh", "92%")]
+        );
+        assert_eq!(r[0].tooltip, "IMDb 7.8 out of 10");
+        assert_eq!(r[1].tooltip, "Rotten Tomatoes 92%");
+    }
+
+    #[test]
+    fn a_whole_imdb_score_keeps_its_tenth_and_59_percent_is_rotten() {
+        let r = ratings(ItemKind::Series, Some(80), Some(59));
+        assert_eq!(r[0].value, "8.0");
+        assert_eq!(r[1].source, "rotten");
+        assert_eq!(ratings(ItemKind::Series, None, Some(60))[0].source, "fresh");
+    }
+
+    #[test]
+    fn only_films_and_shows_get_rating_chips() {
+        for kind in [
+            ItemKind::Episode,
+            ItemKind::Album,
+            ItemKind::Artist,
+            ItemKind::Audio,
+        ] {
+            assert!(ratings(kind, Some(70), Some(70)).is_empty(), "{kind:?}");
         }
     }
 

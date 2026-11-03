@@ -20,7 +20,7 @@ use super::machine::Event;
 use super::paging::{Pager, Trigger};
 use super::platform;
 use super::route::Route;
-use super::views::{progress_percent, runtime, Link, PosterTile};
+use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
 
 /// Most children one browse page lists.
 pub const BROWSE_PAGE: u32 = 100;
@@ -914,6 +914,9 @@ fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool)
                 h2 { "{title}" }
                 if !facts.is_empty() {
                     p { class: "pharos-muted", "{facts}" }
+                }
+                if let Some(d) = detail.as_ref() {
+                    Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
                 }
                 if let Some(d) = detail.as_ref().filter(|d| !d.overview.is_empty()) {
                     p { class: "pharos-overview", "{d.overview}" }
