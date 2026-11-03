@@ -212,6 +212,12 @@ compat-dioxus-full native="on" port="8096":
     # read-only, so copy the tree into a writable directory.
     mkdir -p "$TMP/media"
     cp -rL --no-preserve=mode "$MEDIA_SRC/." "$TMP/media/"
+    # A movie library of more than one browse page (100), for the grid's
+    # infinite scroll: 120 hard links to one small clip, under distinct names.
+    mkdir -p "$TMP/media/Bulk"
+    for n in $(seq -w 1 120); do
+      ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/Bulk $n.webm"
+    done
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
       NATIVE_BLOCK=$(cat <<NATIVE
@@ -245,6 +251,11 @@ compat-dioxus-full native="on" port="8096":
     path = "$TMP/media/TV"
     name = "TV"
     kind = "tvshows"
+
+    [[media.libraries]]
+    path = "$TMP/media/Bulk"
+    name = "Bulk"
+    kind = "movies"
 
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
