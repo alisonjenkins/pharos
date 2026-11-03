@@ -1138,7 +1138,7 @@ fn WatchScreen(id: ItemRef) -> Element {
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let (decision, grant) = api
-                    .play(&info, id, &platform::capabilities(), asked)
+                    .play(&info, id, "", &platform::capabilities(), asked)
                     .await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }

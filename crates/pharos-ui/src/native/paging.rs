@@ -145,6 +145,7 @@ mod tests {
                 episode: None,
                 parent: None,
                 library_kind: None,
+                stereo: None,
             })
             .collect()
     }
