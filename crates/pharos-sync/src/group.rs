@@ -230,6 +230,15 @@ pub enum GroupMsg {
         user: Option<UserId>,
         reply: oneshot::Sender<Joined>,
     },
+    /// Register a cast seat already classified and bound to its cast. When the
+    /// owner's Controller carries the same binding the seat is hidden from the
+    /// first instant, so other members are never told it joined.
+    AddCastSeat {
+        member_id: MemberId,
+        name: String,
+        cast: CastBinding,
+        reply: oneshot::Sender<Joined>,
+    },
     RemoveMember {
         member_id: MemberId,
     },
@@ -388,6 +397,16 @@ pub enum GroupMsg {
         member_id: MemberId,
         ignore: bool,
     },
+    /// Re-classify a member (e.g. a Cast adapter registering its TV seat, or a
+    /// remote-control client turning into a `Controller`). Non-`Player` kinds
+    /// leave every gate and freeze they were holding and never join one again.
+    /// Like `SetIgnoreWait` there is no reply: the new kind is observable on
+    /// the next roster / `Snapshot`.
+    SetMemberKind {
+        member: MemberId,
+        kind: MemberKind,
+        cast: Option<CastBinding>,
+    },
     /// A member's `/socket` reconnected (its fresh sink is already swapped into
     /// the per-replica `MemberSinks`; the member persists across socket churn).
     /// Re-sends the catch-up so the reconnected client immediately re-syncs to
@@ -443,6 +462,11 @@ pub enum RemoteCommand {
         /// `default`: a replica that predates the field sends none.
         #[serde(default)]
         user: Option<UserId>,
+    },
+    AddCastSeat {
+        member_id: MemberId,
+        name: String,
+        cast: CastBinding,
     },
     RemoveMember {
         member_id: MemberId,
@@ -560,6 +584,11 @@ pub enum RemoteCommand {
         member_id: MemberId,
         ignore: bool,
     },
+    SetMemberKind {
+        member: MemberId,
+        kind: MemberKind,
+        cast: Option<CastBinding>,
+    },
 }
 
 impl RemoteCommand {
@@ -579,6 +608,19 @@ impl RemoteCommand {
                     member_id,
                     name,
                     user,
+                    reply,
+                }
+            }
+            RemoteCommand::AddCastSeat {
+                member_id,
+                name,
+                cast,
+            } => {
+                let (reply, _rx) = oneshot::channel();
+                GroupMsg::AddCastSeat {
+                    member_id,
+                    name,
+                    cast,
                     reply,
                 }
             }
@@ -718,6 +760,9 @@ impl RemoteCommand {
             RemoteCommand::SetIgnoreWait { member_id, ignore } => {
                 GroupMsg::SetIgnoreWait { member_id, ignore }
             }
+            RemoteCommand::SetMemberKind { member, kind, cast } => {
+                GroupMsg::SetMemberKind { member, kind, cast }
+            }
         }
     }
 }
@@ -752,11 +797,46 @@ pub struct GroupSnapshot {
     /// Wire item id of every queue entry, in order: who may see the group
     /// depends on who may see all of them.
     pub queue_item_ids: Vec<String>,
+    /// Every cast seat in the roster, with the Controller it is paired with.
+    pub cast_seats: Vec<CastSeatInfo>,
+}
+
+/// One cast seat as the roster holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastSeatInfo {
+    pub seat: MemberId,
+    pub name: String,
+    pub cast: CastBinding,
+    /// The Controller carrying the same binding, i.e. the owner's player.
+    pub controller: Option<MemberId>,
+}
+
+/// What a roster entry is. Closed enum, not a bool pair, so a "controller that
+/// is also a seat" is unrepresentable. Only `Player` members ack readiness
+/// gates and report buffering; the others hear every group update but never
+/// hold a gate (V139, V161).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MemberKind {
+    #[default]
+    Player,
+    Controller,
+    CastSeat,
+}
+
+/// The cast a `Controller` / `CastSeat` member belongs to: the TV's name and
+/// the user who owns the session. Two members with equal bindings are the same
+/// cast and are shown as one roster entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastBinding {
+    pub tv: String,
+    pub owner: String,
 }
 
 struct MemberRec {
     name: String,
     user: Option<UserId>,
+    kind: MemberKind,
+    cast: Option<CastBinding>,
     offset: ClockOffset,
     buffering: bool,
     /// Jellyfin `/SyncPlay/SetIgnoreWait` — the client halted its own playback
@@ -1862,7 +1942,8 @@ impl GroupState {
             // a disconnected member can never ack, so including it freezes the
             // group until the 30s anti-wedge (it stays in the roster for the
             // reconnect grace and rejoins gates once its socket is back).
-            .filter(|(_, m)| !m.ignore_wait && m.connected)
+            // Only Players ack: a Controller or CastSeat never will (V139, V161).
+            .filter(|(_, m)| m.kind == MemberKind::Player && !m.ignore_wait && m.connected)
             .map(|(id, _)| *id)
             .collect()
     }
@@ -2250,8 +2331,22 @@ impl GroupState {
         self.enter_waiting(pending, resume, position_ms, GateReason::Seek, at_server_ms);
     }
 
-    /// Lowest-MemberId-wins election. Deterministic, no voting needed.
+    /// Lowest-MemberId-wins election among Players. Deterministic, no voting
+    /// needed.
     fn elect_leader(&mut self) {
+        // A Controller or CastSeat never acks and has no player to command, so
+        // while any Player is connected only Players are candidates. With no
+        // connected Player the pool is the whole roster, so a group of only
+        // non-players still has a leader.
+        let any_player = self
+            .members
+            .values()
+            .any(|m| m.kind == MemberKind::Player && m.connected);
+        let candidates = || {
+            self.members
+                .iter()
+                .filter(move |(_, m)| !any_player || (m.kind == MemberKind::Player && m.connected))
+        };
         // Prefer the lowest-id member that is still LIVE (seen within
         // MEMBER_TTL_MS). A dead-socket ghost lingers in the roster for up to
         // ~150s before the T83 prune removes it; electing it as leader would
@@ -2260,15 +2355,26 @@ impl GroupState {
         // to plain lowest-id when none look live (e.g. right after a deploy,
         // before anyone has re-pinged) so the group is never leaderless.
         let now = tokio::time::Instant::now();
-        let live_min = self
-            .members
-            .iter()
+        let live_min = candidates()
             .filter(|(_, m)| {
                 now.saturating_duration_since(m.last_seen).as_millis() as u64 <= MEMBER_TTL_MS
             })
             .map(|(id, _)| *id)
             .min();
-        self.leader = live_min.or_else(|| self.members.keys().min().copied());
+        self.leader = live_min.or_else(|| candidates().map(|(id, _)| *id).min());
+    }
+
+    /// True when a non-Player leads while a connected Player could.
+    fn leader_should_yield_to_player(&self) -> bool {
+        let leads_non_player = self
+            .leader
+            .and_then(|id| self.members.get(&id))
+            .is_some_and(|m| m.kind != MemberKind::Player);
+        leads_non_player
+            && self
+                .members
+                .values()
+                .any(|m| m.kind == MemberKind::Player && m.connected)
     }
 
     fn lead_time_ms(&self) -> u64 {
@@ -2314,18 +2420,85 @@ impl GroupState {
         self.delivery.deliver(to, msg);
     }
 
+    /// A Controller and a CastSeat share this cast binding.
+    fn cast_is_paired(&self, cast: &CastBinding) -> bool {
+        let has = |kind: MemberKind| {
+            self.members
+                .values()
+                .any(|m| m.kind == kind && m.cast.as_ref() == Some(cast))
+        };
+        has(MemberKind::Controller) && has(MemberKind::CastSeat)
+    }
+
+    /// A CastSeat whose Controller exists is folded into the Controller's
+    /// roster entry, so join and leave broadcasts must not name it.
+    fn is_hidden_seat(&self, member_id: MemberId) -> bool {
+        self.members.get(&member_id).is_some_and(|m| {
+            m.kind == MemberKind::CastSeat
+                && m.cast.as_ref().is_some_and(|c| self.cast_is_paired(c))
+        })
+    }
+
+    /// The roster as clients see it. A user casting to a TV has a Controller
+    /// and a CastSeat bound to the same cast (same TV, same owner); they show as
+    /// ONE entry, the Controller's, with the TV as `device`. Derived on every
+    /// call and never stored, so the underlying members are untouched.
     fn member_summaries(&self) -> Vec<MemberSummary> {
+        let paired = |cast: &CastBinding| self.cast_is_paired(cast);
         let mut out: Vec<_> = self
             .members
             .iter()
-            .map(|(id, m)| MemberSummary {
-                member_id: *id,
-                name: m.name.clone(),
-                is_leader: Some(*id) == self.leader,
+            .filter(|(_, m)| {
+                !(m.kind == MemberKind::CastSeat && m.cast.as_ref().is_some_and(paired))
+            })
+            .map(|(id, m)| {
+                let pair = m
+                    .cast
+                    .as_ref()
+                    .filter(|c| m.kind == MemberKind::Controller && paired(c));
+                let seat_leads = pair.is_some_and(|c| {
+                    self.members.iter().any(|(sid, s)| {
+                        s.kind == MemberKind::CastSeat
+                            && s.cast.as_ref() == Some(c)
+                            && Some(*sid) == self.leader
+                    })
+                });
+                MemberSummary {
+                    member_id: *id,
+                    name: m.name.clone(),
+                    is_leader: Some(*id) == self.leader || seat_leads,
+                    device: pair.map(|c| c.tv.clone()),
+                }
             })
             .collect();
         out.sort_by_key(|s| s.member_id);
         out
+    }
+
+    fn cast_seats(&self) -> Vec<CastSeatInfo> {
+        let mut seats: Vec<CastSeatInfo> = self
+            .members
+            .iter()
+            .filter(|(_, m)| m.kind == MemberKind::CastSeat)
+            .filter_map(|(id, m)| {
+                let cast = m.cast.clone()?;
+                let controller = self
+                    .members
+                    .iter()
+                    .find(|(_, c)| {
+                        c.kind == MemberKind::Controller && c.cast.as_ref() == Some(&cast)
+                    })
+                    .map(|(cid, _)| *cid);
+                Some(CastSeatInfo {
+                    seat: *id,
+                    name: m.name.clone(),
+                    cast,
+                    controller,
+                })
+            })
+            .collect();
+        seats.sort_by_key(|s| s.seat);
+        seats
     }
 
     /// Serialize the whole coordination state to the opaque blob the store
@@ -2344,6 +2517,8 @@ impl GroupState {
                     name: m.name.clone(),
                     user: m.user,
                     ignore_wait: m.ignore_wait,
+                    kind: m.kind,
+                    cast: m.cast.clone(),
                 })
                 .collect(),
             leader: self.leader,
@@ -2412,6 +2587,8 @@ impl GroupState {
                         offset: ClockOffset::default(),
                         buffering: false,
                         ignore_wait: m.ignore_wait,
+                        kind: m.kind,
+                        cast: m.cast,
                         connected: false,
                         last_seen: now,
                         socket_gone_since: Some((now, SocketGoneCause::Hydrated)),
@@ -2496,6 +2673,11 @@ struct PersistMember {
     /// `default` keeps older snapshots deserializable.
     #[serde(default)]
     ignore_wait: bool,
+    /// `default` (Player) keeps pre-cast snapshots loading unchanged.
+    #[serde(default)]
+    kind: MemberKind,
+    #[serde(default)]
+    cast: Option<CastBinding>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2936,6 +3118,7 @@ impl GroupHandle {
 /// T83 ghost prune.
 fn remove_member(state: &mut GroupState, member_id: MemberId) {
     let was_leader = state.leader == Some(member_id);
+    let hidden = state.is_hidden_seat(member_id);
     // Capture the display name BEFORE the roster drop — the wire `UserLeft`
     // toast renders this string verbatim (B37: a uuid here reached users).
     let name = state
@@ -2951,8 +3134,23 @@ fn remove_member(state: &mut GroupState, member_id: MemberId) {
             state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
         }
     }
-    state.broadcast(ServerMsg::MemberLeft { member_id, name });
+    if !hidden {
+        state.broadcast(ServerMsg::MemberLeft { member_id, name });
+    }
     release_gate_holds_for(state, member_id);
+}
+
+/// Move leadership off a non-Player once a connected Player exists, announcing
+/// the change the same way `remove_member` does (one `LeaderChange`, no
+/// playback command).
+fn yield_leadership_to_player(state: &mut GroupState) {
+    if !state.leader_should_yield_to_player() {
+        return;
+    }
+    state.elect_leader();
+    if let Some(new_leader) = state.leader {
+        state.broadcast(ServerMsg::LeaderChange { leader: new_leader });
+    }
 }
 
 /// Free any readiness gate / buffering freeze that is only still waiting on
@@ -3024,6 +3222,9 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::BufferingEnd { member_id }
         | GroupMsg::ObserveClock { member_id, .. }
         | GroupMsg::SetIgnoreWait { member_id, .. }
+        | GroupMsg::SetMemberKind {
+            member: member_id, ..
+        }
         | GroupMsg::ResyncMember { member_id, .. } => Some(*member_id),
         GroupMsg::LeaderPlay { sender, .. }
         | GroupMsg::LeaderPause { sender }
@@ -3040,9 +3241,10 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::PreviousItem { sender, .. }
         | GroupMsg::SetRepeatMode { sender, .. }
         | GroupMsg::SetShuffleMode { sender, .. } => Some(*sender),
-        GroupMsg::AddMember { .. } | GroupMsg::RemoveMember { .. } | GroupMsg::Snapshot { .. } => {
-            None
-        }
+        GroupMsg::AddMember { .. }
+        | GroupMsg::AddCastSeat { .. }
+        | GroupMsg::RemoveMember { .. }
+        | GroupMsg::Snapshot { .. } => None,
         // A socket loss is the OPPOSITE of a sign of life — never refresh
         // last_seen for it (that would keep a ghost alive past its TTL).
         GroupMsg::SetGroupName { .. }
@@ -3071,6 +3273,130 @@ fn controls_existing_queue(msg: &GroupMsg) -> bool {
             | GroupMsg::RemoveFromPlaylist { .. }
             | GroupMsg::MovePlaylistItem { .. }
     )
+}
+
+/// Admit a member to the roster, or treat a duplicate as a reconnect (B57).
+/// `kind`/`cast` let a cast seat arrive already classified, so a seat paired
+/// with its Controller is never announced to the others.
+fn add_member(
+    state: &mut GroupState,
+    member_id: MemberId,
+    name: String,
+    user: Option<UserId>,
+    kind: MemberKind,
+    cast: Option<CastBinding>,
+    reply: oneshot::Sender<Joined>,
+) {
+    // B57 — idempotent re-add: a duplicate New/Join for a member already
+    // in the roster (client retry, or the New/Join churn a socket race
+    // can trigger) must NOT reset the member's buffering/ignore_wait
+    // flags or fire a spurious "user joined" toast to everyone. Treat it
+    // as a reconnect: refresh name + liveness, re-send this member's own
+    // Joined + catch-up (so its fresh client re-syncs), and reply — but
+    // skip the roster-wide MemberJoined broadcast.
+    if let Some(rec) = state.members.get_mut(&member_id) {
+        rec.name = name.clone();
+        rec.user = user.or(rec.user);
+        rec.last_seen = tokio::time::Instant::now();
+        // The socket is back — the member is a gate follower again.
+        rec.connected = true;
+        let outage_secs = record_socket_return(rec);
+        let summaries = state.member_summaries();
+        let leader = state.leader.unwrap_or(member_id);
+        let _ = reply.send(Joined {
+            group_id: state.id,
+            leader,
+            members: summaries.clone(),
+        });
+        state.send_one(
+            member_id,
+            ServerMsg::Joined {
+                group_id: state.id,
+                leader,
+                members: summaries,
+            },
+        );
+        state.send_catch_up(member_id);
+        if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
+            state.force_reseek_one(member_id, secs);
+        }
+        yield_leadership_to_player(state);
+        return;
+    }
+    let was_empty = state.members.is_empty();
+    state.members.insert(
+        member_id,
+        MemberRec {
+            name: name.clone(),
+            user,
+            offset: ClockOffset::default(),
+            buffering: false,
+            ignore_wait: false,
+            kind,
+            cast,
+            connected: true,
+            last_seen: tokio::time::Instant::now(),
+            socket_gone_since: None,
+        },
+    );
+    if was_empty {
+        state.elect_leader();
+    }
+    let summaries = state.member_summaries();
+    let leader = state.leader.unwrap_or(member_id); // Always Some after election above.
+    let _ = reply.send(Joined {
+        group_id: state.id,
+        leader,
+        members: summaries.clone(),
+    });
+    // Notify the joiner over its own sink too (not just the oneshot
+    // reply), so the HTTP-driven join path — where the reply goes to the
+    // HTTP handler, not the socket — still delivers `GroupJoined` to the
+    // client. The WS path's socket receives the same message.
+    state.send_one(
+        member_id,
+        ServerMsg::Joined {
+            group_id: state.id,
+            leader,
+            members: summaries.clone(),
+        },
+    );
+    // Tell existing members someone joined (not the joiner itself).
+    let me = MemberSummary {
+        member_id,
+        name,
+        is_leader: Some(member_id) == state.leader,
+        device: None,
+    };
+    if !state.is_hidden_seat(member_id) {
+        state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
+    }
+    yield_leadership_to_player(state);
+    // B183 — a queue that was only SEEDED has never been sent to anyone,
+    // so no client holds its `playlist_item_id` and the group is not
+    // startable: the joiner below would get a catch-up nobody else can
+    // follow, and the creator would remain unbound (the seed logs
+    // exactly that, `creator_bound = false`). Promote it to a real
+    // broadcast the moment a SECOND member arrives — which is the first
+    // moment the seed's whole reason for existing, "do not disturb the
+    // creator", stops being free.
+    //
+    // This reproduces by hand what the operator had to do manually
+    // during the 2026-08-01 session: recreate the group and re-start
+    // playback inside it. The creator's player reloads once, at the
+    // instant it invited somebody, and lands at the position it was
+    // already playing.
+    //
+    // No readiness gate: a gate here would be opened on members that
+    // may have nothing to transition through, which is the wedge B182
+    // is about. The playback state below resumes everyone directly.
+    if state.promote_seed_only_queue("join") {
+        return;
+    }
+    // Queue + playback catch-up so the new member loads the SAME item at
+    // the group's current position. Adding a member NEVER mutates
+    // `playing_index` (A6: a join must not advance the group).
+    state.send_catch_up(member_id);
 }
 
 async fn handle(state: &mut GroupState, msg: GroupMsg) {
@@ -3102,110 +3428,33 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             name,
             user,
             reply,
+        } => add_member(
+            state,
+            member_id,
+            name,
+            user,
+            MemberKind::Player,
+            None,
+            reply,
+        ),
+        GroupMsg::AddCastSeat {
+            member_id,
+            name,
+            cast,
+            reply,
         } => {
-            // B57 — idempotent re-add: a duplicate New/Join for a member already
-            // in the roster (client retry, or the New/Join churn a socket race
-            // can trigger) must NOT reset the member's buffering/ignore_wait
-            // flags or fire a spurious "user joined" toast to everyone. Treat it
-            // as a reconnect: refresh name + liveness, re-send this member's own
-            // Joined + catch-up (so its fresh client re-syncs), and reply — but
-            // skip the roster-wide MemberJoined broadcast.
-            if let Some(rec) = state.members.get_mut(&member_id) {
-                rec.name = name.clone();
-                rec.user = user.or(rec.user);
-                rec.last_seen = tokio::time::Instant::now();
-                // The socket is back — the member is a gate follower again.
-                rec.connected = true;
-                let outage_secs = record_socket_return(rec);
-                let summaries = state.member_summaries();
-                let leader = state.leader.unwrap_or(member_id);
-                let _ = reply.send(Joined {
-                    group_id: state.id,
-                    leader,
-                    members: summaries.clone(),
-                });
-                state.send_one(
-                    member_id,
-                    ServerMsg::Joined {
-                        group_id: state.id,
-                        leader,
-                        members: summaries,
-                    },
-                );
-                state.send_catch_up(member_id);
-                if let Some(secs) = outage_secs.filter(|s| *s >= FORCE_RESEEK_AFTER_OUTAGE_SECS) {
-                    state.force_reseek_one(member_id, secs);
-                }
-                return;
-            }
-            let was_empty = state.members.is_empty();
-            state.members.insert(
-                member_id,
-                MemberRec {
-                    name: name.clone(),
-                    user,
-                    offset: ClockOffset::default(),
-                    buffering: false,
-                    ignore_wait: false,
-                    connected: true,
-                    last_seen: tokio::time::Instant::now(),
-                    socket_gone_since: None,
-                },
-            );
-            if was_empty {
-                state.elect_leader();
-            }
-            let summaries = state.member_summaries();
-            let leader = state.leader.unwrap_or(member_id); // Always Some after election above.
-            let _ = reply.send(Joined {
-                group_id: state.id,
-                leader,
-                members: summaries.clone(),
-            });
-            // Notify the joiner over its own sink too (not just the oneshot
-            // reply), so the HTTP-driven join path — where the reply goes to the
-            // HTTP handler, not the socket — still delivers `GroupJoined` to the
-            // client. The WS path's socket receives the same message.
-            state.send_one(
-                member_id,
-                ServerMsg::Joined {
-                    group_id: state.id,
-                    leader,
-                    members: summaries.clone(),
-                },
-            );
-            // Tell existing members someone joined (not the joiner itself).
-            let me = MemberSummary {
+            // The seat plays for its owner: it is the owner's user, so the
+            // per-member access checks (V201) judge it as that user.
+            let owner = Uuid::parse_str(&cast.owner).ok().map(UserId);
+            add_member(
+                state,
                 member_id,
                 name,
-                is_leader: Some(member_id) == state.leader,
-            };
-            state.broadcast_except(member_id, ServerMsg::MemberJoined { member: me });
-            // B183 — a queue that was only SEEDED has never been sent to anyone,
-            // so no client holds its `playlist_item_id` and the group is not
-            // startable: the joiner below would get a catch-up nobody else can
-            // follow, and the creator would remain unbound (the seed logs
-            // exactly that, `creator_bound = false`). Promote it to a real
-            // broadcast the moment a SECOND member arrives — which is the first
-            // moment the seed's whole reason for existing, "do not disturb the
-            // creator", stops being free.
-            //
-            // This reproduces by hand what the operator had to do manually
-            // during the 2026-08-01 session: recreate the group and re-start
-            // playback inside it. The creator's player reloads once, at the
-            // instant it invited somebody, and lands at the position it was
-            // already playing.
-            //
-            // No readiness gate: a gate here would be opened on members that
-            // may have nothing to transition through, which is the wedge B182
-            // is about. The playback state below resumes everyone directly.
-            if state.promote_seed_only_queue("join") {
-                return;
-            }
-            // Queue + playback catch-up so the new member loads the SAME item at
-            // the group's current position. Adding a member NEVER mutates
-            // `playing_index` (A6: a join must not advance the group).
-            state.send_catch_up(member_id);
+                owner,
+                MemberKind::CastSeat,
+                Some(cast),
+                reply,
+            )
         }
         GroupMsg::ResyncMember { member_id, user } => {
             // A reconnected socket for an existing member (its fresh sink is
@@ -3219,6 +3468,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     rec.user = rec.user.or(user);
                     record_socket_return(rec)
                 });
+                yield_leadership_to_player(state);
                 // A reconnect (page reload / deploy rollover) hands a FRESH
                 // jellyfin-web Manager whose `groupInfo` is null and whose
                 // SyncPlay is not enabled. Lead the catch-up with `Joined`
@@ -3411,6 +3661,15 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 return;
             }
             if let Some(rec) = state.members.get_mut(&member_id) {
+                if rec.kind != MemberKind::Player {
+                    tracing::info!(
+                        group = %state.id,
+                        member = %member_id,
+                        kind = ?rec.kind,
+                        "syncplay: buffering report from a non-player ignored (V139)"
+                    );
+                    return;
+                }
                 rec.buffering = true;
             }
             // V19: one corrective Pause, not a storm. If already paused due
@@ -3671,7 +3930,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             let buffering: HashSet<MemberId> = state
                 .members
                 .iter()
-                .filter(|(_, m)| m.buffering && !m.ignore_wait)
+                .filter(|(_, m)| m.buffering && !m.ignore_wait && m.kind == MemberKind::Player)
                 .map(|(id, _)| *id)
                 .collect();
             if buffering.is_empty() {
@@ -3806,6 +4065,17 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .increment(1);
                 state.send_playback_state(member_id);
             }
+        }
+        GroupMsg::SetMemberKind { member, kind, cast } => {
+            if let Some(rec) = state.members.get_mut(&member) {
+                rec.kind = kind;
+                rec.cast = cast;
+                if kind != MemberKind::Player {
+                    rec.buffering = false;
+                    release_gate_holds_for(state, member);
+                }
+            }
+            yield_leadership_to_player(state);
         }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             if let Some(rec) = state.members.get_mut(&member_id) {
@@ -4236,6 +4506,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .iter()
                     .map(|e| e.item_id.clone())
                     .collect(),
+                cast_seats: state.cast_seats(),
             };
             let _ = reply.send(snap);
         }
@@ -6155,6 +6426,8 @@ mod tests {
                 id: member,
                 name: "one".into(),
                 ignore_wait: false,
+                kind: MemberKind::Player,
+                cast: None,
             }],
             leader: Some(member),
             group_paused_due_to_buffering: false,
@@ -8074,6 +8347,8 @@ mod tests {
             offset: ClockOffset::default(),
             buffering: false,
             ignore_wait: false,
+            kind: MemberKind::Player,
+            cast: None,
             connected: true,
             last_seen,
         };
@@ -10155,6 +10430,33 @@ mod tests {
         }
     }
 
+    /// A cast seat plays for its owner, so it records the owner's user. A seat
+    /// with no user reads as an unknown member, and every queue change in its
+    /// group is then refused (V201).
+    /// Disarm check: with the seat added with no user, the snapshot holds `None`.
+    #[tokio::test(start_paused = true)]
+    async fn a_cast_seat_records_its_owners_user() {
+        let owner = UserId::new();
+        let h = GroupHandle::spawn(
+            GroupId::new(),
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+        );
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(GroupMsg::AddCastSeat {
+            member_id: MemberId::new(),
+            name: "owner".into(),
+            cast: CastBinding {
+                tv: "Living Room".into(),
+                owner: owner.0.simple().to_string(),
+            },
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap();
+        assert_eq!(snapshot_of(&h).await.member_users, vec![Some(owner)]);
+    }
+
     /// A member records the user behind it: on the snapshot the HTTP layer
     /// reads, in the persisted state, and across the bus. A snapshot or bus
     /// command written before the field existed still decodes, with no user,
@@ -10187,6 +10489,8 @@ mod tests {
                 id: member,
                 name: "one".into(),
                 ignore_wait: false,
+                kind: MemberKind::Player,
+                cast: None,
             }],
             leader: Some(member),
             group_paused_due_to_buffering: false,
