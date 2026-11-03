@@ -161,6 +161,33 @@ input:focus-visible {
   text-decoration: none;
 }
 
+/* A pill per library under the bar; at phone width the row scrolls sideways
+   rather than wrapping. */
+.pharos-library-nav {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.pharos-library-tab {
+  flex: none;
+  padding: 0.35rem 0.9rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: 999px;
+  color: var(--px-color-fg);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.pharos-library-tab:hover {
+  border-color: var(--px-color-accent);
+}
+.pharos-library-tab[aria-current="page"] {
+  background: var(--px-color-accent);
+  border-color: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+
 .pharos-link-button {
   background: none;
   border: 0;
@@ -476,7 +503,7 @@ body:has(.pharos-watch) {
 }
 /* The shell under the player is out of sight, so out of the tab order and
    the accessibility tree too. */
-body:has(.pharos-watch) .pharos-shell-bar {
+body:has(.pharos-watch) .pharos-shell {
   visibility: hidden;
 }
 /* A playback error stays readable over the picture. */
