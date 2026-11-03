@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     capabilities, decision, done, opt_u32, playback as wire, playback_grant as grant_wire,
-    stream_choice,
+    start_tracks_result, stream_choice,
 };
 use pharos_api::{server, Denial};
 use pharos_jellyfin_api::dto::WireId;
@@ -98,6 +98,46 @@ impl server::playback::Handler for Playback {
             Err(denial) => denial.write(out.init_error()),
         }
         Ok(())
+    }
+
+    async fn start_tracks(
+        self: Rc<Self>,
+        params: wire::StartTracksParams,
+        results: &mut wire::StartTracksResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let id = read_item_id(params.get_id()?)?;
+        let capabilities = read_capabilities(params.get_caps()?)?;
+        let picked = match (self.session.current_user().await, id) {
+            (Err(denial), _) => Err(denial),
+            (Ok(user), WireId::Real(id)) => {
+                playback::start_tracks(&self.session.state, &user, id, &capabilities)
+                    .await
+                    .map_err(|e| match e {
+                        GrantError::Item(e) => item_denial(id, &e, "start_tracks"),
+                        GrantError::NotPlayable => Denial::NotPermitted {
+                            what: "streaming a book",
+                        },
+                    })
+            }
+            (Ok(_), WireId::Synth(_)) => Err(Denial::NotFound { what: "item" }),
+        };
+        write_start_tracks(results.get().init_result(), picked);
+        Ok(())
+    }
+}
+
+fn write_start_tracks(
+    out: start_tracks_result::Builder<'_>,
+    picked: Result<(Option<u32>, Option<u32>), Denial>,
+) {
+    match picked {
+        Ok((audio, subtitle)) => {
+            let mut tracks = out.init_tracks();
+            set_opt(tracks.reborrow().init_audio(), audio);
+            set_opt(tracks.init_subtitle(), subtitle);
+        }
+        Err(denial) => denial.write(out.init_error()),
     }
 }
 
