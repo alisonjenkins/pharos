@@ -108,6 +108,24 @@ pub fn watch_sentinel(_ids: &[&str], _on_visible: impl FnMut() + 'static) -> Opt
     None
 }
 
+pub struct ShiftWheel;
+
+pub fn on_shift_wheel(_on_turn: impl FnMut(f64) + 'static) -> ShiftWheel {
+    ShiftWheel
+}
+
+pub fn first_visible_tile() -> Option<u32> {
+    None
+}
+
+pub fn tile_in_view(_at: u32) -> bool {
+    false
+}
+
+pub fn scroll_to_tile(_at: u32) -> bool {
+    false
+}
+
 pub struct PageHide;
 
 pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {

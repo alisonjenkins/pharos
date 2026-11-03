@@ -9,12 +9,13 @@ use dioxus::prelude::*;
 use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind, Page,
-    PharosApi,
+    ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind,
+    ListIndex, Listing, Page, PharosApi,
 };
 use pharos_client::{CallInfo, ClientError};
 
-use super::app::{call, Ctx};
+use super::app::{call, remount_on, Ctx};
+use super::letters::{self, Wheel, LETTERS};
 use super::machine::Event;
 use super::paging::{Pager, Trigger};
 use super::platform;
@@ -34,12 +35,110 @@ pub const BROWSE_TITLE_FALLBACK: &str = "Browse";
 /// What `ui_action` a further page of a listing is fetched under.
 pub const MORE_ACTION: &str = "more";
 
-/// One paged listing: enough to ask for any page of it again.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ListSource {
-    pub parent: ItemRef,
-    pub group: Option<ItemKind>,
-    pub sort: &'static str,
+/// Most tiles one page holds when a jump to a letter reads ahead; the
+/// server's own cap on a native page.
+pub const JUMP_PAGE: u32 = 1000;
+
+/// What a library's filter bar orders by (B312/V252).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Order {
+    Name,
+    /// Release date, then year for anything without one.
+    Released,
+    /// When the item reached the library; a series, its newest episode.
+    Added,
+}
+
+impl Order {
+    pub const ALL: [Order; 3] = [Order::Name, Order::Released, Order::Added];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Order::Name => "Name",
+            Order::Released => "Release date",
+            Order::Added => "Date added",
+        }
+    }
+
+    /// The `<option>` value naming it.
+    pub fn token(self) -> &'static str {
+        match self {
+            Order::Name => "name",
+            Order::Released => "released",
+            Order::Added => "added",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.token() == token)
+    }
+
+    /// The `SortBy` it asks for; `None` keeps the listing's own name order.
+    fn sort_by(self) -> Option<&'static str> {
+        match self {
+            Order::Name => None,
+            Order::Released => Some("PremiereDate,ProductionYear,SortName"),
+            Order::Added => Some("DateCreated,SortName"),
+        }
+    }
+
+    /// The direction it starts in: A to Z, or newest first.
+    pub fn starts_descending(self) -> bool {
+        self != Order::Name
+    }
+}
+
+/// How a library's filter bar narrows and orders its grid. The default is
+/// the listing as the library opens: everything, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Narrow {
+    pub order: Order,
+    pub descending: bool,
+    pub genre: Option<String>,
+    /// Only watched (`Some(true)`) or unwatched (`Some(false)`) items.
+    pub played: Option<bool>,
+}
+
+impl Default for Narrow {
+    fn default() -> Self {
+        Self {
+            order: Order::Name,
+            descending: false,
+            genre: None,
+            played: None,
+        }
+    }
+}
+
+impl Narrow {
+    /// `base` ordered and narrowed this way.
+    pub fn apply(&self, base: &Listing) -> Listing {
+        Listing {
+            sort_by: self
+                .order
+                .sort_by()
+                .map_or_else(|| base.sort_by.clone(), str::to_owned),
+            descending: self.descending,
+            genre: self.genre.clone(),
+            played: self.played,
+            ..base.clone()
+        }
+    }
+
+    /// Ordered `order`, in the direction it starts in.
+    pub fn ordered(&self, order: Order) -> Self {
+        Self {
+            order,
+            descending: order.starts_descending(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether the grid is in name order, so jumping by letter means
+    /// something.
+    pub fn by_letter(&self) -> bool {
+        self.order == Order::Name
+    }
 }
 
 /// A loaded browse screen.
@@ -51,7 +150,9 @@ pub enum Browse {
         title: String,
         page: Page,
         /// How to list the rest of `page`, when one paged listing backs it.
-        more: Option<ListSource>,
+        more: Option<Listing>,
+        /// A library's own grid, which gets the filter bar and letter rail.
+        library: bool,
     },
     Show(Show),
     Music {
@@ -158,29 +259,21 @@ pub fn default_season(seasons: &[Item]) -> Option<ItemRef> {
         .map(|s| s.id)
 }
 
-/// Fetches the page of `source` that starts at `start`. Every failure is
+/// Fetches `limit` items of `source` from `start`. Every failure is
 /// logged through `warn` and reported through `report` as an `rpcFailed`
 /// event, as a success is recorded (V237). `call` builds the `CallInfo`
 /// from a route and action; this stamps it `browse` / `more`.
 pub async fn fetch_more<A: PharosApi>(
     api: &A,
     call: impl Fn(&str, &str) -> CallInfo,
-    source: &ListSource,
+    source: &Listing,
     start: u32,
+    limit: u32,
     warn: impl Fn(String),
     report: impl Fn(ClientEvent),
 ) -> Result<Page, ClientError> {
     let info = call("browse", MORE_ACTION);
-    let result = api
-        .list(
-            &info,
-            source.parent,
-            source.group,
-            source.sort,
-            start,
-            BROWSE_PAGE,
-        )
-        .await;
+    let result = api.query(&info, source, start, limit).await;
     if let Err(e) = &result {
         let outcome = match e {
             ClientError::Api { kind, .. } => kind,
@@ -225,17 +318,18 @@ pub async fn load<A: PharosApi>(
         .as_ref()
         .map_or_else(|| BROWSE_TITLE_FALLBACK.to_owned(), |d| d.item.name.clone());
     let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
+    let paged = |more: Listing| async move { api.query(info, &more, 0, BROWSE_PAGE).await };
+    let library = detail
+        .as_ref()
+        .is_some_and(|d| d.item.kind == ItemKind::Library);
     Ok(match (plan(detail.as_ref()), detail) {
         (Plan::SeriesGrid, _) => {
-            let more = ListSource {
-                parent: id,
-                group: Some(ItemKind::Series),
-                sort: "SortName",
-            };
+            let more = Listing::of(id, Some(ItemKind::Series), "SortName");
             Browse::Grid {
                 title,
-                page: list(more.parent, more.group, more.sort).await?,
+                page: paged(more.clone()).await?,
                 more: Some(more),
+                library,
             }
         }
         (Plan::MixedLibrary, _) => {
@@ -249,6 +343,7 @@ pub async fn load<A: PharosApi>(
                 title,
                 page: series_first(series, stored),
                 more: None,
+                library: false,
             }
         }
         (Plan::MusicLibrary, _) => {
@@ -326,27 +421,21 @@ pub async fn load<A: PharosApi>(
             detail,
         },
         (Plan::Season { series: None }, _) => {
-            let more = ListSource {
-                parent: id,
-                group: None,
-                sort: INDEX_ORDER,
-            };
+            let more = Listing::of(id, None, INDEX_ORDER);
             Browse::Grid {
                 title,
-                page: list(more.parent, more.group, more.sort).await?,
+                page: paged(more.clone()).await?,
                 more: Some(more),
+                library: false,
             }
         }
         _ => {
-            let more = ListSource {
-                parent: id,
-                group: None,
-                sort: "SortName",
-            };
+            let more = Listing::of(id, None, "SortName");
             Browse::Grid {
                 title,
-                page: list(more.parent, more.group, more.sort).await?,
+                page: paged(more.clone()).await?,
                 more: Some(more),
+                library,
             }
         }
     })
@@ -355,7 +444,12 @@ pub async fn load<A: PharosApi>(
 #[component]
 pub fn BrowseLayout(browse: Browse) -> Element {
     match browse {
-        Browse::Grid { title, page, more } => rsx! { GridView { title, page, more } },
+        Browse::Grid {
+            title,
+            page,
+            more,
+            library,
+        } => rsx! { GridView { title, page, more, library } },
         Browse::Show(show) => rsx! { ShowView { show } },
         Browse::Music {
             title,
@@ -368,15 +462,160 @@ pub fn BrowseLayout(browse: Browse) -> Element {
 }
 
 #[component]
-pub fn GridView(title: String, page: Page, more: Option<ListSource>) -> Element {
+pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool) -> Element {
     rsx! {
         section { class: "pharos-browse",
             h2 { "{title}" }
             match more {
-                Some(source) => rsx! {
-                    PagedGrid { key: "{source.parent}", first: page, source }
-                },
+                Some(base) if library => rsx! { LibraryGrid { first: page, base } },
+                Some(source) => remount_on(
+                    &source.parent.to_string(),
+                    rsx! { PagedGrid { first: page, source, by_letter: false } },
+                ),
                 None => rsx! { PosterGrid { page } },
+            }
+        }
+    }
+}
+
+/// The `<option>` value of "every genre" and "watched or not".
+const ANY: &str = "";
+
+/// A library's grid under its filter bar (B312/V252): the bar's choice is
+/// the listing, and a new choice starts the grid afresh from its first page.
+#[component]
+fn LibraryGrid(first: Page, base: Listing) -> Element {
+    let ctx = use_context::<Ctx>();
+    let narrow = use_signal(Narrow::default);
+    let genres = use_signal(Vec::<String>::new);
+    let opening = base.clone();
+    // The library opened on its default listing; any other is fetched here.
+    let listed = use_resource(move || {
+        let listing = narrow.read().apply(&opening);
+        let first = first.clone();
+        let fresh = *narrow.read() != Narrow::default();
+        async move {
+            if !fresh {
+                return Ok((listing, first));
+            }
+            let Some(api) = ctx.api.peek().clone() else {
+                return Err("not signed in".to_owned());
+            };
+            fetch_more(
+                &api,
+                call,
+                &listing,
+                0,
+                BROWSE_PAGE,
+                |line| platform::warn(&line),
+                platform::report_event,
+            )
+            .await
+            .map(|page| (listing, page))
+            .map_err(|e| e.to_string())
+        }
+    });
+    let by_letter = narrow.read().by_letter();
+    rsx! {
+        FilterBar { narrow, genres }
+        match &*listed.read() {
+            None => rsx! { p { class: "pharos-muted", "Loading…" } },
+            Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
+            Some(Ok((listing, page))) => remount_on(
+                &format!("{listing:?}"),
+                rsx! {
+                    PagedGrid {
+                        first: page.clone(),
+                        source: listing.clone(),
+                        by_letter,
+                        genres,
+                    }
+                },
+            ),
+        }
+    }
+}
+
+/// Sort, direction, genre and watched state for a library's grid.
+#[component]
+fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
+    let now = narrow.read().clone();
+    let genre = now.genre.clone().unwrap_or_default();
+    let played = match now.played {
+        None => ANY,
+        Some(false) => "unwatched",
+        Some(true) => "watched",
+    };
+    let direction = match (now.order, now.descending) {
+        (Order::Name, false) => "A to Z",
+        (Order::Name, true) => "Z to A",
+        (_, true) => "Newest first",
+        (_, false) => "Oldest first",
+    };
+    let mut narrow = narrow;
+    rsx! {
+        div { class: "pharos-filters", role: "group", aria_label: "Sort and filter",
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "Sort" }
+                select {
+                    aria_label: "Sort",
+                    value: now.order.token(),
+                    onchange: move |e| {
+                        if let Some(order) = Order::from_token(&e.value()) {
+                            let next = narrow.read().ordered(order);
+                            narrow.set(next);
+                        }
+                    },
+                    for order in Order::ALL {
+                        option { value: order.token(), selected: order == now.order, "{order.label()}" }
+                    }
+                }
+            }
+            button {
+                class: "pharos-button pharos-filter-direction",
+                r#type: "button",
+                aria_label: "Sort direction: {direction}",
+                onclick: move |_| narrow.with_mut(|n| n.descending = !n.descending),
+                "{direction}"
+            }
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "Genre" }
+                select {
+                    aria_label: "Genre",
+                    value: "{genre}",
+                    onchange: move |e| {
+                        let value = e.value();
+                        narrow.with_mut(|n| n.genre = (value != ANY).then_some(value));
+                    },
+                    option { value: ANY, selected: genre.is_empty(), "All genres" }
+                    for g in genres.read().iter().cloned() {
+                        option { value: "{g}", selected: g == genre, "{g}" }
+                    }
+                    // A chosen genre stays offered while the list reloads.
+                    if !genre.is_empty() && !genres.read().contains(&genre) {
+                        option { value: "{genre}", selected: true, "{genre}" }
+                    }
+                }
+            }
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "Watched" }
+                select {
+                    aria_label: "Watched",
+                    value: played,
+                    onchange: move |e| {
+                        let value = e.value();
+                        narrow.with_mut(|n| {
+                            n.played = match value.as_str() {
+                                "watched" => Some(true),
+                                "unwatched" => Some(false),
+                                _ => None,
+                            }
+                        });
+                    },
+                    option { value: ANY, selected: played == ANY, "All" }
+                    option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
+                    option { value: "watched", selected: played == "watched", "Watched" }
+                }
             }
         }
     }
@@ -390,47 +629,76 @@ const SENTINEL_ID: &str = "pharos-more-sentinel";
 /// observer watches this too.
 const END_ID: &str = "pharos-more-end";
 
+/// What a grid asks its pager for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// The next page, as the viewer nears the end or presses the button.
+    Next(Trigger),
+    /// Every page through the tile at this offset, for a jump to a letter.
+    Through(u32),
+}
+
 /// A grid that loads the rest of its listing as the viewer nears the end
 /// (V237): an observer on a tile `SENTINEL_LEAD` before the last, and on
 /// the end of the list, asks for the next page, and a button does the same by
 /// hand and retries a failure (V237; B294 was the dead end this replaces).
+/// In name order it also jumps by letter (V252): the rail on the right goes
+/// straight to one, and Shift+wheel steps to the next or previous, reading
+/// ahead through the pages in between.
 #[component]
-fn PagedGrid(first: Page, source: ListSource) -> Element {
+fn PagedGrid(
+    first: Page,
+    source: Listing,
+    by_letter: bool,
+    genres: Option<Signal<Vec<String>>>,
+) -> Element {
     let ctx = use_context::<Ctx>();
     let mut pager = use_signal(|| Pager::new(first.clone()));
     // The observer and the button fire outside any one render, so both send
     // here; `Pager::begin` is what keeps a second request out while one is
     // in flight.
-    let requests = use_coroutine(move |mut rx: UnboundedReceiver<Trigger>| async move {
-        while let Some(trigger) = rx.next().await {
-            let Some(start) = pager.write().begin(trigger) else {
-                continue;
-            };
-            let Some(api) = ctx.api.peek().clone() else {
-                pager.write().fail();
-                continue;
-            };
-            spawn(async move {
-                let result = fetch_more(
-                    &api,
-                    call,
-                    &source,
-                    start,
-                    |line| platform::warn(&line),
-                    platform::report_event,
-                )
-                .await;
-                match result {
-                    Ok(page) => pager.write().land(page),
-                    Err(e) => {
-                        if e.needs_sign_in() {
-                            let mut machine = ctx.machine;
-                            machine.write().apply(Event::NeedsSignIn);
-                        }
-                        pager.write().fail();
+    let paged = source.clone();
+    let requests = use_coroutine(move |mut rx: UnboundedReceiver<Ask>| {
+        let paged = paged.clone();
+        async move {
+            while let Some(ask) = rx.next().await {
+                let claimed = match ask {
+                    Ask::Next(trigger) => pager.write().begin(trigger).map(|s| (s, BROWSE_PAGE)),
+                    Ask::Through(target) => {
+                        pager.write().begin_through(target, BROWSE_PAGE, JUMP_PAGE)
                     }
-                }
-            });
+                };
+                let Some((start, limit)) = claimed else {
+                    continue;
+                };
+                let Some(api) = ctx.api.peek().clone() else {
+                    pager.write().fail();
+                    continue;
+                };
+                let source = paged.clone();
+                spawn(async move {
+                    let result = fetch_more(
+                        &api,
+                        call,
+                        &source,
+                        start,
+                        limit,
+                        |line| platform::warn(&line),
+                        platform::report_event,
+                    )
+                    .await;
+                    match result {
+                        Ok(page) => pager.write().land(page),
+                        Err(e) => {
+                            if e.needs_sign_in() {
+                                let mut machine = ctx.machine;
+                                machine.write().apply(Event::NeedsSignIn);
+                            }
+                            pager.write().fail();
+                        }
+                    }
+                });
+            }
         }
     });
     let mut watch = use_signal(|| None::<platform::SentinelWatch>);
@@ -441,12 +709,94 @@ fn PagedGrid(first: Page, source: ListSource) -> Element {
         let armed = pager.read().sentinel().is_some();
         watch.set(if armed {
             platform::watch_sentinel(&[SENTINEL_ID, END_ID], move || {
-                requests.send(Trigger::Scroll)
+                requests.send(Ask::Next(Trigger::Scroll))
             })
         } else {
             None
         });
     });
+
+    // Where each letter starts, and the genres for the filter bar.
+    let indexed = source.clone();
+    let index = use_resource(move || {
+        let listing = indexed.clone();
+        async move {
+            let api = ctx.api.peek().clone()?;
+            match api.index(&call("browse", "index"), &listing).await {
+                Ok(index) => Some(index),
+                Err(e) => {
+                    platform::warn(&format!(
+                        "pharos: browse {} index failed: {e}",
+                        listing.parent
+                    ));
+                    None
+                }
+            }
+        }
+    });
+    use_effect(move || {
+        if let (Some(Some(index)), Some(mut genres)) = (&*index.read(), genres) {
+            if *genres.peek() != index.genres {
+                genres.set(index.genres.clone());
+            }
+        }
+    });
+    let starts = use_memo(move || match &*index.read() {
+        Some(Some(ListIndex { letters, .. })) => letters.clone(),
+        _ => Vec::new(),
+    });
+
+    // A jump: the tile to bring to the top, once its page is in, and the
+    // tile last jumped to, which Shift+wheel steps on from while in view.
+    let mut jump = use_signal(|| None::<u32>);
+    let mut cursor = use_signal(|| None::<u32>);
+    use_effect(move || {
+        let Some(target) = jump() else {
+            return;
+        };
+        let state = pager.read();
+        let loaded = u32::try_from(state.items().len()).unwrap_or(u32::MAX);
+        if target < loaded {
+            platform::scroll_to_tile(target);
+            jump.set(None);
+        } else if state.failed() || !state.has_more() {
+            jump.set(None);
+        } else if !state.in_flight() {
+            requests.send(Ask::Through(target));
+        }
+    });
+    let mut go = move |target: u32| {
+        cursor.set(Some(target));
+        jump.set(Some(target));
+    };
+    let mut wheel = use_signal(Wheel::default);
+    use_hook(move || {
+        by_letter.then(|| {
+            std::rc::Rc::new(platform::on_shift_wheel(move |turn| {
+                let steps = wheel.write().feed(turn);
+                if steps == 0 {
+                    return;
+                }
+                let here = cursor
+                    .peek()
+                    .filter(|&c| platform::tile_in_view(c))
+                    .or_else(platform::first_visible_tile)
+                    .unwrap_or(0);
+                let starts = starts.peek();
+                let mut at = here;
+                for _ in 0..steps.unsigned_abs() {
+                    match letters::step(&starts, at, steps > 0) {
+                        Some(next) => at = next,
+                        None => break,
+                    }
+                }
+                if at != here {
+                    go(at);
+                }
+            }))
+        })
+    });
+
     let state = pager.read();
     let page = Page {
         items: state.items().to_vec(),
@@ -460,7 +810,33 @@ fn PagedGrid(first: Page, source: ListSource) -> Element {
     } else {
         "Show more"
     };
+    let starts = starts.read().clone();
+    let current = cursor().and_then(|at| letters::letter_at(&starts, at));
     rsx! {
+        if by_letter && !starts.is_empty() {
+            nav { class: "pharos-letters", aria_label: "Jump to letter",
+                for letter in LETTERS {
+                    {
+                        let start = letters::start_of(&starts, letter);
+                        rsx! {
+                            button {
+                                class: "pharos-letter",
+                                r#type: "button",
+                                disabled: start.is_none(),
+                                "aria-current": if current == Some(letter) { "true" },
+                                aria_label: if letter == '#' { "Numbers and symbols" },
+                                onclick: move |_| {
+                                    if let Some(start) = start {
+                                        go(start);
+                                    }
+                                },
+                                "{letter}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
         PosterList { page, sentinel: state.sentinel() }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
@@ -469,7 +845,7 @@ fn PagedGrid(first: Page, source: ListSource) -> Element {
                 class: "pharos-button",
                 r#type: "button",
                 disabled: state.in_flight(),
-                onclick: move |_| requests.send(Trigger::Button),
+                onclick: move |_| requests.send(Ask::Next(Trigger::Button)),
                 "{label}"
             }
         }
@@ -885,9 +1261,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use pharos_client::api::{
-        Capabilities, Decision, Home, ListIndex, Listing, PlaybackGrant, TrackPicks,
-    };
+    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant, TrackPicks};
 
     use super::*;
     use crate::native::views::Nav;
@@ -1124,11 +1498,8 @@ mod tests {
             Browse::Grid {
                 title: BROWSE_TITLE_FALLBACK.into(),
                 page: page(vec![item(ItemRef::Real(3), ItemKind::Movie, "Film")]),
-                more: Some(ListSource {
-                    parent: id,
-                    group: None,
-                    sort: "SortName",
-                }),
+                more: Some(Listing::of(id, None, "SortName")),
+                library: false,
             }
         );
         assert!(
@@ -1248,12 +1619,8 @@ mod tests {
 
     const BULK: ItemRef = ItemRef::Synth(20);
 
-    fn bulk_source() -> ListSource {
-        ListSource {
-            parent: BULK,
-            group: None,
-            sort: "SortName",
-        }
+    fn bulk_source() -> Listing {
+        Listing::of(BULK, None, "SortName")
     }
 
     #[test]
@@ -1265,6 +1632,7 @@ mod tests {
             stamp,
             &bulk_source(),
             100,
+            BROWSE_PAGE,
             |_| {},
             |e| events.borrow_mut().push(e),
         ))
@@ -1289,6 +1657,7 @@ mod tests {
             stamp,
             &bulk_source(),
             200,
+            BROWSE_PAGE,
             |l| warned.borrow_mut().push(l),
             |e| events.borrow_mut().push(e),
         ));
@@ -1305,6 +1674,63 @@ mod tests {
             .fields
             .contains(&("outcome", "notFound".to_owned())));
         assert!(events[0].fields.contains(&("method", "list".to_owned())));
+    }
+
+    #[test]
+    fn the_filter_bar_orders_and_narrows_the_listing() {
+        let base = Listing::of(ItemRef::Real(4), Some(ItemKind::Series), "SortName");
+        assert_eq!(Narrow::default().apply(&base), base, "opens as listed");
+        let newest = Narrow::default().ordered(Order::Added);
+        let listing = newest.apply(&base);
+        assert_eq!(listing.sort_by, "DateCreated,SortName");
+        assert!(listing.descending, "a date order starts newest first");
+        assert_eq!(listing.group, Some(ItemKind::Series));
+        let released = Narrow {
+            genre: Some("Drama".into()),
+            played: Some(false),
+            ..Narrow::default().ordered(Order::Released)
+        };
+        let listing = released.apply(&base);
+        assert_eq!(listing.sort_by, "PremiereDate,ProductionYear,SortName");
+        assert_eq!(listing.genre.as_deref(), Some("Drama"));
+        assert_eq!(listing.played, Some(false));
+        let by_name = released.ordered(Order::Name);
+        assert!(by_name.by_letter() && !by_name.descending);
+        assert_eq!(by_name.apply(&base).sort_by, "SortName");
+        assert_eq!(
+            by_name.genre.as_deref(),
+            Some("Drama"),
+            "a new order keeps the filters"
+        );
+        assert!(!newest.by_letter());
+    }
+
+    #[test]
+    fn order_tokens_round_trip() {
+        for order in Order::ALL {
+            assert_eq!(Order::from_token(order.token()), Some(order));
+        }
+        assert_eq!(Order::from_token("bogus"), None);
+    }
+
+    #[test]
+    fn only_a_library_grid_gets_the_filter_bar() {
+        let mut fake = Fake::default();
+        let lib = ItemRef::Real(9);
+        let mut library = item(lib, ItemKind::Library, "Films");
+        library.library_kind = Some(LibraryKind::Movies);
+        fake.details.insert(lib, detail(library));
+        let collection = ItemRef::Real(10);
+        fake.details.insert(
+            collection,
+            detail(item(collection, ItemKind::Collection, "Boxset")),
+        );
+        let opened = |id| run(load(&fake, &CallInfo::default(), id, |_| {})).unwrap();
+        assert!(matches!(opened(lib), Browse::Grid { library: true, .. }));
+        assert!(matches!(
+            opened(collection),
+            Browse::Grid { library: false, .. }
+        ));
     }
 
     fn episode_in(id: ItemRef, season: ItemRef) -> Item {
