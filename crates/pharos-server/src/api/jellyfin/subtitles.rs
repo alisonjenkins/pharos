@@ -92,7 +92,138 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/attachments/{stream_index}",
         web::get().to(stream_attachment_short),
+    )
+    // Spec 019 — image subtitles the native player draws itself: a timed
+    // manifest plus one PNG per event, extracted once per file.
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/images.json",
+        web::get().to(image_subtitle_manifest),
+    )
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/images/{n}.png",
+        web::get().to(image_subtitle_png),
     );
+}
+
+/// The manifest of an image subtitle track, its `file` names rewritten to
+/// fetchable URLs. While the one extraction is still reading the source, the
+/// manifest covers it up to `through_ms` and `complete` is false; the player
+/// polls until it is true.
+async fn image_subtitle_manifest(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<(String, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle_images").await?;
+    let dir = image_subtitle_dir(&state, &id, stream_index).await?;
+    let raw = match tokio::fs::read(dir.join(pharos_cache::subtitle_cache::IMAGE_SUB_MANIFEST_FILE))
+        .await
+    {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(error::ErrorInternalServerError(format!(
+                "read {}: {e}",
+                dir.display()
+            )))
+        }
+    };
+    let base = format!("/videos/{id}/subtitles/{stream_index}/images");
+    let body = manifest_with_urls(raw.as_deref(), &base).map_err(|e| {
+        error::ErrorInternalServerError(format!("manifest in {}: {e}", dir.display()))
+    })?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/json; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(body))
+}
+
+/// One event's PNG. 404 until the extraction has written it.
+async fn image_subtitle_png(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<(String, u32, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, stream_index, n) = path.into_inner();
+    bearer(&state, &req, &id, "subtitle_images").await?;
+    let dir = image_subtitle_dir(&state, &id, stream_index).await?;
+    match tokio::fs::read(dir.join(format!("{n}.png"))).await {
+        Ok(png) => Ok(HttpResponse::Ok()
+            .content_type("image/png")
+            .insert_header((header::CACHE_CONTROL, "private, max-age=86400"))
+            .body(png)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(error::ErrorNotFound("subtitle image not extracted"))
+        }
+        Err(e) => Err(error::ErrorInternalServerError(format!(
+            "read {n}.png in {}: {e}",
+            dir.display()
+        ))),
+    }
+}
+
+/// The extraction directory of the image subtitle track at absolute
+/// `stream_index`, starting its extraction on the first ask. 415 for a text
+/// track, 404 when this server cannot extract or the extraction failed.
+async fn image_subtitle_dir(
+    state: &AppState,
+    id_str: &str,
+    stream_index: u32,
+) -> Result<std::path::PathBuf, actix_web::Error> {
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let item =
+        super::media_source::load_named(state, super::media_source::Route::Subtitles, id, None)
+            .await?;
+    let tracks = &item.probe.subtitle_tracks;
+    let Some(rel_idx) = tracks.iter().position(|t| t.stream_index == stream_index) else {
+        return Err(error::ErrorNotFound("no subtitle stream at that index"));
+    };
+    let codec = tracks[rel_idx].codec.as_deref().unwrap_or("");
+    if !is_image_subtitle_codec(codec) {
+        return Err(error::ErrorUnsupportedMediaType(format!(
+            "{codec} is a text subtitle; fetch stream.vtt"
+        )));
+    }
+    let Some(subs) = state.subtitles.as_ref() else {
+        return Err(error::ErrorNotFound("no subtitle cache"));
+    };
+    let mtime = mtime_secs(&item.path).await;
+    match subs
+        .image_subtitles(&item.path, mtime, rel_idx as u32)
+        .await
+    {
+        Some(pharos_cache::subtitle_cache::ImageSubs::Dir { dir, .. }) => Ok(dir),
+        Some(pharos_cache::subtitle_cache::ImageSubs::Failed) => {
+            Err(error::ErrorNotFound("image subtitle extraction failed"))
+        }
+        None => Err(error::ErrorNotFound(
+            "this server does not extract image subtitles",
+        )),
+    }
+}
+
+/// `raw` (the extractor's manifest, `None` before its first write) with each
+/// event's `file` replaced by `url` = `{base}/{file}`.
+fn manifest_with_urls(
+    raw: Option<&[u8]>,
+    base: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let Some(raw) = raw else {
+        return Ok(serde_json::json!({
+            "width": 0, "height": 0, "complete": false, "through_ms": 0, "events": [],
+        }));
+    };
+    let mut manifest: serde_json::Value = serde_json::from_slice(raw)?;
+    if let Some(events) = manifest.get_mut("events").and_then(|e| e.as_array_mut()) {
+        for event in events.iter_mut().filter_map(|e| e.as_object_mut()) {
+            if let Some(serde_json::Value::String(file)) = event.remove("file") {
+                event.insert("url".into(), format!("{base}/{file}").into());
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 /// The bearer of a subtitle or attachment fetch, refused (401) without a
@@ -1853,6 +1984,27 @@ mod tests {
         let s = SubtitleStyle::default();
         assert!(s.is_empty());
         assert!(s.render_style_block().is_empty());
+    }
+
+    #[test]
+    fn image_manifest_events_carry_fetchable_urls() {
+        let raw = br#"{"width":720,"height":480,"complete":false,"through_ms":6000,
+            "events":[{"start_ms":500,"end_ms":2500,"x":240,"y":400,"width":240,
+            "height":48,"forced":false,"file":"0.png"}]}"#;
+        let got = manifest_with_urls(Some(raw), "/videos/9/subtitles/2/images").unwrap();
+        let event = &got["events"][0];
+        assert_eq!(event["url"], "/videos/9/subtitles/2/images/0.png");
+        assert!(event.get("file").is_none(), "the disk name stays private");
+        assert_eq!(event["start_ms"], 500);
+        assert_eq!(got["width"], 720);
+        assert_eq!(got["complete"], false);
+    }
+
+    #[test]
+    fn an_unwritten_image_manifest_reads_as_incomplete_and_empty() {
+        let got = manifest_with_urls(None, "/x").unwrap();
+        assert_eq!(got["complete"], false);
+        assert_eq!(got["events"], serde_json::json!([]));
     }
 
     #[test]

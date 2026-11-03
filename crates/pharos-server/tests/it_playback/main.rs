@@ -5,6 +5,7 @@
 mod store_calls;
 
 mod browser_codec_matrix;
+mod image_subtitle_routes;
 mod jellyfin_hls_softsubs;
 mod jellyfin_playbackinfo_client_switches;
 mod jellyfin_playbackinfo_kotlin_strict;
