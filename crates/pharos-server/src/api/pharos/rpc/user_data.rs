@@ -8,7 +8,7 @@ use pharos_api::{server, Denial};
 use pharos_core::UserItemData;
 use pharos_jellyfin_api::dto::WireId;
 
-use super::library::{item_denial, read_item_id, write_user_state};
+use super::library::{item_denial, read_item_id, wire_denial, write_user_state};
 use super::session::Session;
 use crate::services::user_data;
 
@@ -38,7 +38,14 @@ impl server::user_data::Handler for UserData {
                     .map(|(_, data)| data)
                     .map_err(|e| item_denial(id, &e, "set_played"))
             }
-            (Ok(_), WireId::Synth(_)) => Err(synth_denial()),
+            // A series or season: every episode in it the user may see.
+            (Ok(user), synth @ WireId::Synth(_)) => {
+                user_data::update_folder(&self.session.state, &user, &synth.to_string(), |d| {
+                    user_data::apply_played(d, played)
+                })
+                .await
+                .map_err(|e| wire_denial(synth, &e, "set_played"))
+            }
         };
         write_result(results.get().init_result(), written);
         Ok(())
@@ -66,7 +73,7 @@ impl server::user_data::Handler for UserData {
     }
 }
 
-/// Synthesised items (series, season, album…) have no native write yet.
+/// Synthesised items (series, season, album…) have no native favourite yet.
 fn synth_denial() -> Denial {
     Denial::NotFound { what: "item" }
 }
