@@ -145,7 +145,8 @@ struct IndexResult { union { index @0 :ListIndex; error @1 :Error; } }
 # Home is aggregated server-side: pipelining only follows capabilities, not
 # data, so "views, then latest per view" cannot be one flight client-side.
 struct HomeRail { view @0 :ItemSummary; latest @1 :List(ItemSummary); }
-struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); }
+# `resume` holds films and episodes, `listening` music; `resumeLimit` sizes both.
+struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); listening @3 :List(ItemSummary); }
 struct HomeResult { union { home @0 :Home; error @1 :Error; } }
 
 interface Library {
