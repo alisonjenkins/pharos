@@ -690,4 +690,21 @@ mod tests {
         assert_eq!(sub_lines(&e), ["S1 · E3"]);
         assert_eq!(sub_lines(&item(ItemKind::Movie)), ["2001"]);
     }
+
+    #[test]
+    fn a_tile_puts_series_and_numbers_on_their_own_lines_with_tooltips() {
+        let mut e = item(ItemKind::Episode);
+        e.name = "Murder House".into();
+        e.series_name = Some("American Horror Story".into());
+        e.season = Some(1);
+        e.episode = Some(1);
+        let html = render(move || rsx! { PosterTile { item: e.clone() } });
+        for want in [
+            r#"class="pharos-poster-name" title="Murder House""#,
+            r#"class="pharos-poster-sub" title="American Horror Story""#,
+            r#"class="pharos-poster-sub" title="S1 · E1""#,
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+    }
 }
