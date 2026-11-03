@@ -138,6 +138,14 @@ mod tests {
         ) -> Result<(Decision, NoGrant), ClientError> {
             Err(missing())
         }
+        async fn start_tracks(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+            _: &Capabilities,
+        ) -> Result<pharos_client::api::StartTracks, ClientError> {
+            Err(missing())
+        }
     }
 
     /// Runs a future the fake answers without waiting.
