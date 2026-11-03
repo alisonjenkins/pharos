@@ -505,7 +505,7 @@ mod tests {
             start: 0,
         };
         let html = render(
-            move || rsx! { crate::native::browse::GridView { title: "Shows".to_string(), page: page.clone() } },
+            move || rsx! { crate::native::browse::GridView { title: "Shows".to_string(), page: page.clone(), library: false } },
         );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
         assert!(html.contains("Showing 1 of 3."), "{html}");
