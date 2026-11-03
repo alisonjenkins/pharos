@@ -1447,6 +1447,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // built-in US default) backing per-user MaxParentalRating enforcement.
     state.parental_ratings =
         pharos_server::parental::ParentalRatingMap::from_config(&cfg.parental.ratings);
+    if cfg.lyrics.online {
+        tracing::info!(provider = "lrclib", "lyrics: online lookup on");
+        state = state.with_lyrics(pharos_server::services::lyrics::LyricsFinder::with_online(
+            std::sync::Arc::new(pharos_server::services::lyrics::lrclib::LrcLib::new()),
+        ));
+    }
     // P48 — one resident libav worker pool shared by the image + trickplay
     // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
     // run in-process in crash-isolated workers; the fork/exec is amortised.
