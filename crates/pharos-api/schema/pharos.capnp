@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 6;
+const schemaVersion :UInt32 = 7;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -117,9 +117,10 @@ interface Session {
   telemetry @6 (ctx :CallContext) -> (telemetry :Telemetry);
   admin @7 (ctx :CallContext) -> (result :AdminResult);
   logout @8 (ctx :CallContext) -> (result :Done);
+  group @9 (ctx :CallContext) -> (group :Group);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
-  # Group, Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
+  # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
 }
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
 
@@ -256,6 +257,7 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   webglContextLost @6; longFrame @7; routePaint @8; slowInteraction @9;
   playbackDecision @10; playbackStall @11; playbackError @12; qualitySwitch @13;
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
+  groupDrift @19; groupHardSeek @20; groupWait @21;
 }
 enum Level { error @0; warn @1; info @2; }
 struct TelemetryEvent {
@@ -279,3 +281,58 @@ struct CountResult { union { count @0 :UInt32; error @1 :Error; } }
 interface Admin {
   sessions @0 (ctx :CallContext) -> (result :CountResult);
 }
+
+# ---- group watch (014) ----------------------------------------------------
+# The same SyncPlay groups jellyfin-web uses (pharos-sync's GroupRegistry), so a
+# native member and a Jellyfin member can share one group. A member is the
+# call's `ctx.device` (per user): a call with no device is refused
+# `invalid{field "ctx.device"}`. Dropping a Membership is a socket loss (the
+# member's TTL applies), not a leave; `leave` is explicit.
+struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; }
+struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); }
+struct GroupsResult { union { groups @0 :List(GroupSummary); error @1 :Error; } }
+# Not a union, like ResumeResult, so a call on `membership` pipelines. A refused
+# create or join still returns a membership whose every call fails with the
+# same error; `status` says why.
+struct MembershipResult { membership @0 :Membership; status @1 :Done; }
+# NTP-style: the server's receive and send times (T2, T3) for the client's
+# `clientMs` (T1). The client closes the loop with Membership.clockReport.
+struct ClockSample { clientMsEcho @0 :UInt64; recvMs @1 :UInt64; sendMs @2 :UInt64; }
+struct ClockResult { union { sample @0 :ClockSample; error @1 :Error; } }
+
+interface Group {
+  list   @0 (ctx :CallContext) -> (result :GroupsResult);
+  create @1 (ctx :CallContext, item :ItemId, positionMs :UInt64, sink :GroupSink) -> (result :MembershipResult);
+  join   @2 (ctx :CallContext, id :GroupId, sink :GroupSink) -> (result :MembershipResult);
+  clock  @3 (ctx :CallContext, clientMs :UInt64) -> (result :ClockResult);
+}
+interface Membership {
+  unpause   @0 (ctx :CallContext) -> (result :Done);
+  pause     @1 (ctx :CallContext) -> (result :Done);
+  seek      @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
+  # `playlistItemId` is the queue entry the report is FOR (the item update
+  # carries it); the group drops a stale report racing a queue change (B37).
+  buffering @3 (ctx :CallContext, positionMs :UInt64, buffering :Bool, playlistItemId :Text) -> (result :Done);
+  ready     @4 (ctx :CallContext, positionMs :UInt64, playing :Bool, playlistItemId :Text) -> (result :Done);
+  leave     @5 (ctx :CallContext) -> (result :Done);
+  # Liveness beacon, every 30 s: keeps a member that is only watching clear of
+  # the ghost prune (T83).
+  ping      @6 (ctx :CallContext) -> (result :Done);
+  clockReport @7 (ctx :CallContext, t1 :UInt64, t2 :UInt64, t3 :UInt64, t4 :UInt64) -> (result :Done);
+}
+enum EndReason { left @0; notInGroup @1; }
+struct GroupUpdate {
+  union {
+    joined  @0 :GroupSummary;
+    play    @1 :At;
+    pause   @2 :At;
+    seek    @3 :At;
+    member  @4 :GroupMember;           # joined, or its buffering changed
+    left    @5 :Text;                  # member id
+    item    @6 :ItemAt;                # the group moved to another item
+    ended   @7 :EndReason;
+  }
+  struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; }
+  struct ItemAt { item @0 :ItemId; playlistItemId @1 :Text; positionMs @2 :UInt64; playing @3 :Bool; }
+}
+interface GroupSink { update @0 (ctx :CallContext, update :GroupUpdate) -> (result :Done); }

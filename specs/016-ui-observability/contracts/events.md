@@ -23,6 +23,9 @@
 | `focus_recovered` | info | focus target vanished (011) | zone |
 | `cache_served` | info (sampled) | query served stale vs fresh | key_kind, stale |
 | `csp_violation` | warn | CSP report | directive, blocked |
+| `group_drift` | info (sampled) | playhead vs group clock while playing (014, 1 per 10 s) | group, drift_ms |
+| `group_hard_seek` | warn | drift past the hard-seek threshold (014) | group, drift_ms |
+| `group_wait` | info | time spent waiting on other members (014) | group, wait_ms |
 
 ## Server-side signals produced from them (labels bounded via `label()`)
 
