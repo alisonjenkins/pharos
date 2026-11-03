@@ -2,6 +2,11 @@
 //! need the server. Pure functions and models here; the screens and the
 //! network seam come in later commits.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use pharos_client::api::ItemRef;
+
 /// How many clock samples the estimator keeps; older ones fall off.
 pub const CLOCK_WINDOW: usize = 9;
 
@@ -179,6 +184,290 @@ pub fn expected_position(
         return anchor_position_ms;
     }
     anchor_position_ms + u64::try_from(now_server_ms - anchor_server_ms).unwrap_or(0)
+}
+
+/// A group's id, as the server minted it.
+pub type GroupId = String;
+
+/// Someone in a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+    pub buffering: bool,
+}
+
+/// A group as the Together page lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSummary {
+    pub id: GroupId,
+    pub name: String,
+    /// What the group is watching; `None` before it has an item.
+    pub item: Option<ItemRef>,
+    pub members: Vec<Member>,
+}
+
+/// A refused or failed group call, in words for the viewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupError(pub String);
+
+/// The server's reply to `clock`: the client's timestamp echoed, then when
+/// the server received the request and when it replied (`t1`, `t2`, `t3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockReply {
+    pub client_ms_echo: i64,
+    pub recv_ms: i64,
+    pub send_ms: i64,
+}
+
+impl ClockReply {
+    /// The estimator's sample, once the reply arrives at `t4`.
+    pub fn sample(&self, t4: i64) -> ClockSample {
+        ClockSample {
+            t1: self.client_ms_echo,
+            t2: self.recv_ms,
+            t3: self.send_ms,
+            t4,
+        }
+    }
+}
+
+/// Why a group ended for this member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    Left,
+    Dissolved,
+    NotInGroup,
+    Removed,
+}
+
+/// What the server pushes to a member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupUpdate {
+    Joined(GroupSummary),
+    Play {
+        at_server_ms: i64,
+        position_ms: u64,
+    },
+    Pause {
+        at_server_ms: i64,
+        position_ms: u64,
+    },
+    Seek {
+        at_server_ms: i64,
+        position_ms: u64,
+    },
+    /// A member joined, or its buffering changed.
+    Member(Member),
+    /// A member left (its id).
+    Left(String),
+    /// The group moved to another item.
+    Item {
+        item: ItemRef,
+        playlist_item_id: String,
+        position_ms: u64,
+        playing: bool,
+    },
+    Ended(EndReason),
+    Error(String),
+}
+
+/// Where a membership's pushed updates go.
+pub type GroupSink = Rc<dyn Fn(GroupUpdate)>;
+
+/// The seam to the server's native `Group` and `Membership` interfaces. A
+/// thin adapter over `pharos-client` implements it; [`FakeGroups`] stands in
+/// until then. Async without `Send`: the browser runs on one thread.
+#[allow(async_fn_in_trait)]
+pub trait GroupClient {
+    async fn list(&self) -> Result<Vec<GroupSummary>, GroupError>;
+    /// Start a group on `item` at `position_ms`; updates go to `sink`.
+    async fn create(
+        &self,
+        item: ItemRef,
+        position_ms: u64,
+        sink: GroupSink,
+    ) -> Result<GroupSummary, GroupError>;
+    async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError>;
+    async fn clock(&self, client_ms: i64) -> Result<ClockReply, GroupError>;
+    /// Keep-alive, every 30 s.
+    async fn ping(&self) -> Result<(), GroupError>;
+    /// Report a finished round trip, so the server knows this member's offset.
+    async fn clock_report(&self, t1: i64, t2: i64, t3: i64, t4: i64) -> Result<(), GroupError>;
+    async fn unpause(&self) -> Result<(), GroupError>;
+    async fn pause(&self) -> Result<(), GroupError>;
+    async fn seek(&self, position_ms: u64) -> Result<(), GroupError>;
+    async fn buffering(
+        &self,
+        playlist_item_id: String,
+        position_ms: u64,
+        buffering: bool,
+    ) -> Result<(), GroupError>;
+    async fn ready(
+        &self,
+        playlist_item_id: String,
+        position_ms: u64,
+        playing: bool,
+    ) -> Result<(), GroupError>;
+    async fn leave(&self) -> Result<(), GroupError>;
+}
+
+/// The seam's one place of construction: the screens ask for the client
+/// here. Until the real adapter lands this is the in-memory [`FakeGroups`].
+pub fn group_api() -> FakeGroups {
+    FakeGroups::default()
+}
+
+/// An in-memory [`GroupClient`] for tests and the pre-network screens. It
+/// keeps its groups and a log of the calls it received.
+#[derive(Clone, Default)]
+pub struct FakeGroups {
+    groups: Rc<RefCell<Vec<GroupSummary>>>,
+    calls: Rc<RefCell<Vec<String>>>,
+    sinks: Rc<RefCell<Vec<GroupSink>>>,
+    joined: Rc<RefCell<Option<GroupId>>>,
+}
+
+impl FakeGroups {
+    pub fn with_groups(groups: Vec<GroupSummary>) -> Self {
+        Self {
+            groups: Rc::new(RefCell::new(groups)),
+            ..Self::default()
+        }
+    }
+
+    /// The calls received, as `name` or `name(args)`.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.borrow().clone()
+    }
+
+    /// Push an update to every member the fake holds a sink for.
+    pub fn push(&self, update: &GroupUpdate) {
+        for sink in self.sinks.borrow().iter() {
+            sink(update.clone());
+        }
+    }
+
+    fn log(&self, call: String) {
+        self.calls.borrow_mut().push(call);
+    }
+
+    fn me() -> Member {
+        Member {
+            id: "me".into(),
+            name: "You".into(),
+            buffering: false,
+        }
+    }
+}
+
+impl GroupClient for FakeGroups {
+    async fn list(&self) -> Result<Vec<GroupSummary>, GroupError> {
+        self.log("list".into());
+        Ok(self.groups.borrow().clone())
+    }
+
+    async fn create(
+        &self,
+        item: ItemRef,
+        position_ms: u64,
+        sink: GroupSink,
+    ) -> Result<GroupSummary, GroupError> {
+        self.log(format!("create({item},{position_ms})"));
+        let mut groups = self.groups.borrow_mut();
+        let group = GroupSummary {
+            id: format!("g{}", groups.len() + 1),
+            name: "Watch together".into(),
+            item: Some(item),
+            members: vec![Self::me()],
+        };
+        groups.push(group.clone());
+        self.sinks.borrow_mut().push(sink);
+        *self.joined.borrow_mut() = Some(group.id.clone());
+        Ok(group)
+    }
+
+    async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError> {
+        self.log(format!("join({id})"));
+        let mut groups = self.groups.borrow_mut();
+        let Some(group) = groups.iter_mut().find(|g| g.id == id) else {
+            return Err(GroupError("This group has ended".into()));
+        };
+        group.members.push(Self::me());
+        self.sinks.borrow_mut().push(sink);
+        *self.joined.borrow_mut() = Some(group.id.clone());
+        Ok(group.clone())
+    }
+
+    async fn clock(&self, client_ms: i64) -> Result<ClockReply, GroupError> {
+        self.log(format!("clock({client_ms})"));
+        Ok(ClockReply {
+            client_ms_echo: client_ms,
+            recv_ms: client_ms,
+            send_ms: client_ms,
+        })
+    }
+
+    async fn ping(&self) -> Result<(), GroupError> {
+        self.log("ping".into());
+        Ok(())
+    }
+
+    async fn clock_report(&self, t1: i64, t2: i64, t3: i64, t4: i64) -> Result<(), GroupError> {
+        self.log(format!("clock_report({t1},{t2},{t3},{t4})"));
+        Ok(())
+    }
+
+    async fn unpause(&self) -> Result<(), GroupError> {
+        self.log("unpause".into());
+        Ok(())
+    }
+
+    async fn pause(&self) -> Result<(), GroupError> {
+        self.log("pause".into());
+        Ok(())
+    }
+
+    async fn seek(&self, position_ms: u64) -> Result<(), GroupError> {
+        self.log(format!("seek({position_ms})"));
+        Ok(())
+    }
+
+    async fn buffering(
+        &self,
+        playlist_item_id: String,
+        position_ms: u64,
+        buffering: bool,
+    ) -> Result<(), GroupError> {
+        self.log(format!(
+            "buffering({playlist_item_id},{position_ms},{buffering})"
+        ));
+        Ok(())
+    }
+
+    async fn ready(
+        &self,
+        playlist_item_id: String,
+        position_ms: u64,
+        playing: bool,
+    ) -> Result<(), GroupError> {
+        self.log(format!("ready({playlist_item_id},{position_ms},{playing})"));
+        Ok(())
+    }
+
+    async fn leave(&self) -> Result<(), GroupError> {
+        self.log("leave".into());
+        let Some(id) = self.joined.borrow_mut().take() else {
+            return Ok(());
+        };
+        let mut groups = self.groups.borrow_mut();
+        if let Some(g) = groups.iter_mut().find(|g| g.id == id) {
+            g.members.retain(|m| m.id != "me");
+        }
+        groups.retain(|g| !g.members.is_empty());
+        self.sinks.borrow_mut().clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +655,73 @@ mod tests {
         assert_eq!(expected_position(5_000, 100, 1_100, true), 6_000);
         assert_eq!(expected_position(5_000, 100, 1_100, false), 5_000);
         assert_eq!(expected_position(5_000, 100, 50, true), 5_000);
+    }
+
+    fn now<T>(f: impl std::future::Future<Output = T>) -> Option<T> {
+        use futures_util::FutureExt as _;
+        f.now_or_never()
+    }
+
+    #[test]
+    fn a_clock_reply_becomes_a_sample() {
+        let r = ClockReply {
+            client_ms_echo: 1_000,
+            recv_ms: 1_120,
+            send_ms: 1_150,
+        };
+        let e = estimator(&[r.sample(1_070)]);
+        assert_eq!(e.offset_ms(), Some(100));
+        assert_eq!(e.rtt_ms(), Some(40));
+    }
+
+    #[test]
+    fn the_fake_creates_and_ends_a_group() {
+        let api = FakeGroups::default();
+        let sink: GroupSink = Rc::new(|_| {});
+        assert_eq!(now(api.list()), Some(Ok(vec![])));
+        let made = now(api.create(ItemRef::Real(7), 5_000, sink.clone()));
+        assert_eq!(
+            made.and_then(Result::ok).map(|g| g.item),
+            Some(Some(ItemRef::Real(7)))
+        );
+        assert_eq!(
+            now(api.list()).and_then(Result::ok).map(|g| g.len()),
+            Some(1)
+        );
+        assert_eq!(
+            now(api.join("nope", sink)),
+            Some(Err(GroupError("This group has ended".into())))
+        );
+        assert_eq!(now(api.leave()), Some(Ok(())));
+        assert_eq!(now(api.list()), Some(Ok(vec![])));
+        assert_eq!(
+            api.calls(),
+            [
+                "list",
+                "create(7,5000)",
+                "list",
+                "join(nope)",
+                "leave",
+                "list"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fake_pushes_updates_to_its_sinks() {
+        let api = FakeGroups::with_groups(vec![GroupSummary {
+            id: "g1".into(),
+            name: "Friday".into(),
+            item: None,
+            members: vec![],
+        }]);
+        let seen = Rc::new(RefCell::new(vec![]));
+        let sink: GroupSink = {
+            let seen = Rc::clone(&seen);
+            Rc::new(move |u| seen.borrow_mut().push(u))
+        };
+        assert!(matches!(now(api.join("g1", sink)), Some(Ok(_))));
+        api.push(&GroupUpdate::Ended(EndReason::Dissolved));
+        assert_eq!(*seen.borrow(), [GroupUpdate::Ended(EndReason::Dissolved)]);
     }
 }

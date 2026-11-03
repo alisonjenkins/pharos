@@ -12,6 +12,8 @@ use super::platform;
 use super::playback::{
     clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
 };
+use super::together::Member;
+use super::together_view::MemberStrip;
 
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
@@ -126,6 +128,11 @@ pub fn WatchView(
     controls: Controls,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
+    /// The group watching together, when there is one: shown over the
+    /// picture with a Leave button.
+    #[props(default)]
+    members: Vec<Member>,
+    #[props(default)] on_leave: EventHandler<()>,
 ) -> Element {
     let c = &controls;
     let total = c.total_ms();
@@ -249,6 +256,9 @@ pub fn WatchView(
                         "←"
                     }
                     h2 { class: "pharos-watch-title", "{title}" }
+                    if !members.is_empty() {
+                        MemberStrip { members, on_leave }
+                    }
                 }
                 if let Some(seg) = skip {
                     button {
