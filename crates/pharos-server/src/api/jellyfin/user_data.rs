@@ -11,7 +11,7 @@ use crate::{
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{UserDataStore, UserItemData};
+use pharos_core::UserItemData;
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -174,21 +174,23 @@ where
     };
     let (item, data) = user_data::update(state, user, item_id, f)
         .await
-        .map_err(|e| match e {
-            DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
-            DetailError::NotFound => error::ErrorNotFound("item not found"),
-            DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
-        })?;
+        .map_err(detail_error)?;
     let runtime = item.probe.run_time_ticks().unwrap_or(0);
     let dto = UserItemDataDto::from_domain_with_runtime(item_id, data, runtime);
     Ok(crate::api::jellyfin::wire::json(&dto))
 }
 
+fn detail_error(e: DetailError) -> actix_web::Error {
+    match e {
+        DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
+        DetailError::NotFound => error::ErrorNotFound("item not found"),
+        DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
+    }
+}
+
 /// B36 — mark-played / favourite on a synthetic series or season id:
-/// apply the mutation to every child episode, broadcast one
-/// `UserDataChanged` frame carrying all changed entries (plus a folder
-/// entry so the series/season detail page's play-state matches by Key),
-/// and return the folder-level DTO the way real Jellyfin does.
+/// apply the mutation to every child episode and return the folder-level
+/// DTO the way real Jellyfin does.
 async fn mutate_synth_folder<F>(
     state: &AppState,
     user: &pharos_core::User,
@@ -198,74 +200,22 @@ async fn mutate_synth_folder<F>(
 where
     F: Fn(&mut UserItemData),
 {
-    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
     // B91 — the Android TV kotlin SDK marks a whole show / season watched via
     // `POST /UserPlayedItems/{id}` with the synth id re-serialised DASHED
-    // (`11a177ee-3a0e-0b8f-11a1-77ee3a0e0b8f`). Every comparison below is against
+    // (`11a177ee-3a0e-0b8f-11a1-77ee3a0e0b8f`). Every comparison is against
     // the dashless `series_id_for_key` / `season_id_for_key` hash, so without
     // canonicalising the dashed id never matches → the cascade found no episodes
     // → 404, which the SDK can't deserialise → the app CRASHES (the B84 class).
     // The same dashed-id sweep already fixed nav (B85) + parent lists (B82).
     let canonical = crate::api::jellyfin::items::canonical_wire_id(id_str);
     let id_str: &str = canonical.as_ref();
-    let all = state
-        .list_items_cached()
+    let folder = user_data::update_folder(state, user, id_str, f)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let user_id = user.id;
-    let mut episodes: Vec<_> = all
-        .iter()
-        .filter(|item| {
-            let Some(series) = item.series.as_ref() else {
-                return false;
-            };
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
-                return true;
-            }
-            series.season_number.is_some_and(|n| {
-                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n) == id_str
-            })
-        })
-        .collect();
-    crate::services::access::retain_visible(state, user, &mut episodes, |e| e.id, "user_data")
-        .await
-        .map_err(crate::api::jellyfin::access_error)?;
-    if episodes.is_empty() {
-        return Err(error::ErrorNotFound("item not found"));
-    }
-    let mut entries = Vec::with_capacity(episodes.len() + 1);
-    let mut folder_data = UserItemData::default();
-    f(&mut folder_data);
-    for item in episodes {
-        let mut data = state
-            .stores
-            .get_user_data(user_id, item.id)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        f(&mut data);
-        state
-            .stores
-            .set_user_data(user_id, item.id, data)
-            .await
-            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-        let runtime = item.probe.run_time_ticks().unwrap_or(0);
-        let dto = UserItemDataDto::from_domain_with_runtime(item.id, data, runtime);
-        entries.push(
-            serde_json::to_value(&dto)
-                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?,
-        );
-    }
-    // Folder-level DTO: ItemId/Key are the synthetic id so the detail
-    // page (which matches on Key) picks it up. B78/V38 — typed DTO, not a
-    // json! literal, so the kotlin-required UserData field set stays complete.
-    let folder_val = serde_json::to_value(UserItemDataDto::folder(
+        .map_err(detail_error)?;
+    Ok(crate::api::jellyfin::wire::json(&UserItemDataDto::folder(
         id_str,
-        folder_data.played,
-        folder_data.play_count,
-        folder_data.is_favorite,
-    ))
-    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    entries.push(folder_val.clone());
-    state.notify_user_data_changed(&user_id.0.simple().to_string(), entries);
-    Ok(crate::api::jellyfin::wire::json(&folder_val))
+        folder.played,
+        folder.play_count,
+        folder.is_favorite,
+    )))
 }
