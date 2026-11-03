@@ -1219,6 +1219,11 @@ body:has(.pharos-stage.is-full) .pharos-error {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+.pharos-listen-artist {
+  margin: 0;
+  font-size: 1.2rem;
+  font-weight: 600;
+}
 .pharos-listen-meta {
   grid-area: meta;
   margin: 0;
