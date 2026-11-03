@@ -298,6 +298,60 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page).toHaveURL(/\/ui\/watch\/\d+$/);
     });
 
+    // A TV library lists its series by name and a series opens the show page
+    // with its episodes; every step is a click, not a URL.
+    test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-tv-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      // Home -> the TV library, whose tiles are series sorted by name.
+      await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
+      await expect(page.locator("section.pharos-browse h2")).toHaveText("TV", {
+        timeout: 15_000,
+      });
+      const tiles = page.locator("ul.pharos-grid .pharos-poster-name");
+      await expect(tiles).toHaveText(["Another Show", "Playwright Show"]);
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      // Series -> the show page with its three episodes.
+      await tiles.filter({ hasText: "Playwright Show" }).click();
+      await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show", {
+        timeout: 15_000,
+      });
+      const episodes = page.locator("ol.pharos-episodes li");
+      await expect(episodes).toHaveCount(3);
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      // Episode -> its title page, named as the row was.
+      const row = (await episodes.first().locator(".pharos-episode-name").innerText()).trim();
+      const name = row.replace(/^\d+\.\s+/, "");
+      await episodes.first().locator("a.pharos-episode-link").click();
+      await expect(page).toHaveURL(/\/ui\/title\//);
+      await expect(page.locator("article.pharos-title h2")).toHaveText(name, {
+        timeout: 15_000,
+      });
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+    });
+
     // 012 US5: artist, then album, then track list.
     test("browse walks an artist to an album and its tracks", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
