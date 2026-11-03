@@ -12,6 +12,7 @@ pub mod cli;
 pub mod client_ip;
 pub mod config;
 pub mod dlna;
+pub mod group_ops;
 pub mod health;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
