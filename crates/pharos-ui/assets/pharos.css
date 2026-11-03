@@ -451,8 +451,8 @@ body:has(.pharos-watch) .pharos-error {
   transition: opacity 0.2s;
 }
 /* A phone sets its volume with its own buttons; the slider would push
-   fullscreen onto a second row. */
-@media (max-width: 40rem) {
+   fullscreen onto a second row. A narrow desktop window keeps it. */
+@media (max-width: 40rem) and (pointer: coarse) {
   .pharos-volume {
     display: none;
   }
