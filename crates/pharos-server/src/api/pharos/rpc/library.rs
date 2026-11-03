@@ -5,10 +5,11 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
-    user_state, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
+    user_state, version, Kind, LibraryKind as WireKind, SegmentKind, Stereo3d, StereoFilter,
+    SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
+use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData, Video3DFormat};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 
 use super::session::Session;
@@ -360,6 +361,12 @@ impl server::library::Handler for Library {
             .into_iter()
             .filter_map(|s| segment_kind(s.kind).map(|k| (k, s)))
             .collect();
+        if matches!(item.kind, MediaKind::Movie | MediaKind::Episode) {
+            let count = u32::try_from(item.probe.alternate_sources.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            write_versions(out.reborrow().init_versions(count), &item);
+        }
         let mut list = out.init_segments(len(&segments));
         for (i, (kind, s)) in (0..).zip(&segments) {
             let mut w = list.reborrow().get(i);
@@ -461,6 +468,12 @@ fn read_query(
         name_starts_with: text(q.get_name_starts_with()?)?,
         filters: (!filters.is_empty()).then(|| filters.join(",")),
         genre: text(q.get_genre()?)?,
+        // An enum value this build does not know narrows nothing.
+        is_3d: match q.get_stereo() {
+            Ok(StereoFilter::Only3d) => Some(true),
+            Ok(StereoFilter::Only2d) => Some(false),
+            Ok(StereoFilter::Any) | Err(_) => None,
+        },
         ..ItemQuery::default()
     };
     let grouping = grouping_of(q.get_kinds()?);
@@ -1094,6 +1107,7 @@ fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    out.set_stereo(wire_stereo(item_stereo(item)));
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.init_critic_rating().set_some(score);
     }
@@ -1111,6 +1125,42 @@ fn tomatometer(rating: f32) -> Option<u16> {
         return None;
     }
     Some(rounded as u16)
+}
+
+/// The packing a tile badges: the primary's, else the first 3D edition's,
+/// so the badge agrees with the store's `has_3d` (022 FR-001).
+fn item_stereo(item: &MediaItem) -> Option<Video3DFormat> {
+    item.probe.video_3d_format.or_else(|| {
+        item.probe
+            .alternate_sources
+            .iter()
+            .find_map(|a| a.video_3d_format)
+    })
+}
+
+fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
+    match format {
+        None => Stereo3d::None,
+        Some(Video3DFormat::HalfSideBySide) => Stereo3d::HalfSideBySide,
+        Some(Video3DFormat::FullSideBySide) => Stereo3d::FullSideBySide,
+        Some(Video3DFormat::HalfTopAndBottom) => Stereo3d::HalfTopAndBottom,
+        Some(Video3DFormat::FullTopAndBottom) => Stereo3d::FullTopAndBottom,
+        Some(Video3DFormat::Mvc) => Stereo3d::Mvc,
+    }
+}
+
+/// An item's playable files, the primary first (022 FR-002). An edition's
+/// id is what `Playback.negotiate` takes as `version`.
+fn write_versions(mut out: capnp::struct_list::Builder<'_, version::Owned>, item: &MediaItem) {
+    let mut primary = out.reborrow().get(0);
+    primary.set_primary(true);
+    primary.set_stereo(wire_stereo(item.probe.video_3d_format));
+    for (i, alt) in (1..out.len()).zip(&item.probe.alternate_sources) {
+        let mut v = out.reborrow().get(i);
+        v.set_id(alt.id.as_str());
+        v.set_name(alt.name.as_deref().unwrap_or_default());
+        v.set_stereo(wire_stereo(alt.video_3d_format));
+    }
 }
 
 fn write_view(mut item: item_summary::Builder<'_>, id: WireId, view: &LibraryView) {
