@@ -23,6 +23,8 @@
 | `focus_recovered` | info | focus target vanished (011) | zone |
 | `cache_served` | info (sampled) | query served stale vs fresh | key_kind, stale |
 | `csp_violation` | warn | CSP report | directive, blocked |
+| `xr_session_started` | info | WebXR immersive session began (022) | format, path |
+| `xr_session_failed` | warn | WebXR session refused or ended by error (022) | format, reason |
 
 ## Server-side signals produced from them (labels bounded via `label()`)
 
