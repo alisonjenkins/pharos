@@ -165,7 +165,7 @@ async fn ping(
 }
 
 /// Add the caller (from the hub) to `handle` as a member. Shared by New + Join.
-async fn add_caller_to_group(
+pub(crate) async fn add_caller_to_group(
     hub: &SessionHub,
     sinks: &MemberSinks,
     device_id: &str,
@@ -413,7 +413,7 @@ async fn creator_now_playing(
 /// The group actor cannot do this itself: it has no store handle, and until it
 /// was told, it had no way to know an item had ENDED, so a group left Playing
 /// extrapolated past the end forever (T114).
-async fn resolve_runtimes_ms(
+pub(crate) async fn resolve_runtimes_ms(
     state: &crate::state::AppState,
     item_ids: &[String],
 ) -> Vec<Option<u64>> {
@@ -1057,6 +1057,8 @@ pub(crate) enum GroupHiddenRoute {
     Native,
     /// `Group.list` on the native RPC API.
     RpcList,
+    /// `Group.join` on the native RPC API.
+    RpcJoin,
 }
 
 impl GroupHiddenRoute {
@@ -1067,6 +1069,7 @@ impl GroupHiddenRoute {
             GroupHiddenRoute::Socket => "socket",
             GroupHiddenRoute::Native => "native",
             GroupHiddenRoute::RpcList => "rpc_list",
+            GroupHiddenRoute::RpcJoin => "rpc_join",
         }
     }
 }
