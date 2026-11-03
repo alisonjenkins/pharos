@@ -18,6 +18,7 @@ mod jellyfin_latest;
 mod jellyfin_music_browse;
 mod jellyfin_search;
 mod name_prefix_audit;
+mod nested_root_scans;
 mod pagination_audit;
 mod parent_id_audit;
 mod random_sort_seed;
