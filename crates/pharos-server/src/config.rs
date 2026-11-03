@@ -27,6 +27,9 @@ pub struct Config {
     /// `contact` rather than a key — see [`MusicBrainzConfig`].
     #[serde(default)]
     pub musicbrainz: MusicBrainzConfig,
+    /// Song lyrics; only the online provider switch is configurable.
+    #[serde(default)]
+    pub lyrics: LyricsConfig,
     /// Online metadata/artwork enrichment tunables (refresh cadence, batch
     /// size, match-confidence floor). All fields default when the
     /// `[metadata]` section is absent.
@@ -250,6 +253,17 @@ impl MusicBrainzConfig {
             .map(str::trim)
             .filter(|c| !c.is_empty())
     }
+}
+
+/// `[lyrics]` — where songs' lyrics come from beyond their own tags and
+/// sidecar files.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct LyricsConfig {
+    /// Look up lyrics on LRCLIB (lrclib.net) when a song has none locally.
+    /// Off by default: each lookup sends the song's title, artist, album and
+    /// length to that service. Env: `PHAROS_LYRICS_ONLINE`.
+    #[serde(default)]
+    pub online: bool,
 }
 
 /// `[metadata]` — online metadata/artwork enrichment tunables. All fields
@@ -1359,6 +1373,16 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 self.musicbrainz.contact = Some(v.to_string());
+            }
+        }
+        if let Ok(v) = std::env::var("PHAROS_LYRICS_ONLINE") {
+            match env_bool(&v) {
+                Some(b) => self.lyrics.online = b,
+                None if !v.trim().is_empty() => tracing::warn!(
+                    value = %v,
+                    "PHAROS_LYRICS_ONLINE is not a recognised boolean; leaving [lyrics].online unchanged"
+                ),
+                None => {}
             }
         }
         // 008 — the feature switch is env-overridable so a deployment can turn
