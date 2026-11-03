@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 14;
+const schemaVersion :UInt32 = 16;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -73,6 +73,7 @@ struct ItemSummary {
   libraryKind @11 :LibraryKind;                            # kind == library only
   imdbRating @12 :OptU16;      # IMDb score in tenths: 78 is 7.8
   criticRating @13 :OptU16;    # Rotten Tomatoes Tomatometer, a percentage
+  album @14 :Text; artist @15 :Text;    # a track's tags; empty when untagged (B320)
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
