@@ -54,8 +54,9 @@ Keys work in fullscreen and without the chrome visible.
 Hover a card for a preview (backdrop + quick actions) after a short delay;
 right-click any item for its context menu; middle-click / Ctrl-click opens in a
 new tab (real URLs, 009); drag to reorder playlists and queue; shift-click and
-drag-rectangle multi-select in grids; mouse wheel scrolls rails horizontally on
-hover; thumb buttons (Back/Forward) navigate.
+drag-rectangle multi-select in grids; a plain vertical wheel always scrolls the
+page, and rails scroll sideways only on horizontal input (a trackpad swipe or
+Shift+wheel); thumb buttons (Back/Forward) navigate.
 
 ### US6 — multi-select and bulk actions (P2)
 
