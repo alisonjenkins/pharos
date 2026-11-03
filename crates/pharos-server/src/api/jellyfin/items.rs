@@ -5623,7 +5623,7 @@ async fn library_view_for_id(
 /// Library-root id whose path prefixes this item, if any. Used to
 /// post-fill `BaseItemDto.parent_id` for top-level items. The innermost
 /// library wins, so a TV library nested in a mixed root owns its shows.
-fn library_parent_id(state: &AppState, item: &MediaItem) -> Option<String> {
+pub(crate) fn library_parent_id(state: &AppState, item: &MediaItem) -> Option<String> {
     let typed = state
         .libraries()
         .iter()
