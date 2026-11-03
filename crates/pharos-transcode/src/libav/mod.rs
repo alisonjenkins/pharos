@@ -55,6 +55,8 @@ pub fn init() -> Result<(), ffmpeg_the_third::Error> {
 #[cfg(feature = "backend-lib")]
 pub mod subtitle;
 #[cfg(feature = "backend-lib")]
+pub mod subtitle_images;
+#[cfg(feature = "backend-lib")]
 pub mod subtitle_windows;
 #[cfg(feature = "backend-lib")]
 pub mod trickplay;
