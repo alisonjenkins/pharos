@@ -1329,11 +1329,40 @@ async fn list_groups(
     if !sync_play_allows(&user.0, SyncPlayNeed::Join, "list") {
         return HttpResponse::Forbidden().finish();
     }
+    let out: Vec<GroupInfoDto> = listed_groups(&state, &registry, &user.0, GroupHiddenRoute::List)
+        .await
+        .into_iter()
+        .map(|g| GroupInfoDto {
+            group_id: g.id,
+            group_name: g.name,
+            state: play_state_str(g.state),
+            participants: g.participants,
+            last_updated_at: now_iso8601(),
+        })
+        .collect();
+    crate::api::jellyfin::wire::json(&out)
+}
+
+/// One group `user` may see, as the list surfaces show it.
+pub(crate) struct ListedGroup {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) state: pharos_sync::messages::GroupPlayState,
+    pub(crate) participants: Vec<String>,
+}
+
+/// Every group `user` may see (V201): live groups, then those only a fresh
+/// persisted snapshot holds, a group whose queue holds an item the user may
+/// not see withheld and counted under `route`. An unreachable registry lists
+/// nothing, so the caller renders "no active groups" rather than an error.
+pub(crate) async fn listed_groups(
+    state: &crate::state::AppState,
+    registry: &GroupRegistry,
+    user: &pharos_core::User,
+    route: GroupHiddenRoute,
+) -> Vec<ListedGroup> {
     let Ok(handles) = registry.list().await else {
-        // Actor unreachable: return empty rather than 500 so the UI
-        // renders an "no active groups" pane instead of an error.
-        let empty: Vec<GroupInfoDto> = vec![];
-        return crate::api::jellyfin::wire::json(&empty);
+        return Vec::new();
     };
     let mut out = Vec::with_capacity(handles.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1342,16 +1371,15 @@ async fn list_groups(
             continue;
         };
         seen.insert(snap.id.to_string());
-        if !may_see_queue(&state, &user.0, &snap.queue_item_ids).await {
-            group_hidden(GroupHiddenRoute::List, &user.0, &snap.id.to_string());
+        if !may_see_queue(state, user, &snap.queue_item_ids).await {
+            group_hidden(route, user, &snap.id.to_string());
             continue;
         }
-        out.push(GroupInfoDto {
-            group_id: snap.id.to_string(),
-            group_name: snap.group_name,
-            state: play_state_str(snap.play_state),
+        out.push(ListedGroup {
+            id: snap.id.to_string(),
+            name: snap.group_name,
+            state: snap.play_state,
             participants: snap.participants,
-            last_updated_at: now_iso8601(),
         });
     }
     // B28 — groups this process doesn't hold in memory but that still exist as
@@ -1371,21 +1399,20 @@ async fn list_groups(
                 let Some(summary) = pharos_sync::group::snapshot_summary(&row.state_json) else {
                     continue;
                 };
-                if !may_see_queue(&state, &user.0, &summary.queue_item_ids).await {
-                    group_hidden(GroupHiddenRoute::List, &user.0, &row.group_id);
+                if !may_see_queue(state, user, &summary.queue_item_ids).await {
+                    group_hidden(route, user, &row.group_id);
                     continue;
                 }
-                out.push(GroupInfoDto {
-                    group_id: row.group_id,
-                    group_name: summary.group_name,
-                    state: play_state_str(summary.play_state),
+                out.push(ListedGroup {
+                    id: row.group_id,
+                    name: summary.group_name,
+                    state: summary.play_state,
                     participants: summary.participants,
-                    last_updated_at: now_iso8601(),
                 });
             }
         }
     }
-    crate::api::jellyfin::wire::json(&out)
+    out
 }
 
 fn now_iso8601() -> String {
