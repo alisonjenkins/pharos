@@ -1213,7 +1213,7 @@ test.describe("pharos Dioxus UI", () => {
       });
     });
 
-    test("find: a term in the seeded media shows tiles, nonsense says no matches", async ({
+    test("search: the bar lists matches as you type, Enter opens them all, nonsense says no matches", async ({
       page,
       request,
     }) => {
@@ -1233,11 +1233,23 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
 
-      await page.getByRole("link", { name: "Find" }).click();
+      // The bar's box lists the first matches as you type; every seeded
+      // title starts "Playwright …", so the term matches them.
+      const bar = page.getByRole("combobox", { name: "Search all libraries" });
+      await bar.fill("Playwright");
+      const options = page.getByRole("option");
+      await expect(options.first()).toBeVisible({ timeout: 15_000 });
+      await bar.press("ArrowDown");
+      await expect(options.first()).toHaveAttribute("aria-selected", "true");
+      await bar.press("Escape");
+      await expect(options).toHaveCount(0);
+
+      // Enter with no match picked opens the find screen on the same term.
+      await bar.press("Enter");
       await expect(page).toHaveURL(/\/ui\/find$/);
       const box = page.getByLabel("Search");
-      // Every seeded title starts "Playwright …", so the term matches them.
-      await box.fill("Playwright");
+      await expect(box).toHaveValue("Playwright");
+      await expect(box).toBeFocused();
       await expect(page.locator(".pharos-poster").first()).toBeVisible({
         timeout: 15_000,
       });
@@ -1833,11 +1845,12 @@ test.describe("pharos Dioxus UI now playing", () => {
       timeout: 15_000,
     });
 
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    const tile = page.locator(".pharos-poster").first();
-    await expect(tile).toBeVisible({ timeout: 15_000 });
-    await tile.click();
+    await page
+      .getByRole("combobox", { name: "Search all libraries" })
+      .fill("carefree");
+    const hit = page.getByRole("option").first().getByRole("link");
+    await expect(hit).toBeVisible({ timeout: 15_000 });
+    await hit.click();
     // The click on Play is the gesture Web Audio needs.
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
 
