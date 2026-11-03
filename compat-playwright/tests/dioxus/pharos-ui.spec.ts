@@ -1299,3 +1299,73 @@ test.describe("pharos Dioxus UI now playing", () => {
       .toBe("halo");
   });
 });
+
+// V300: the seeded song has a synced .lrc sidecar (a line every 2 s, written
+// by `just compat-dioxus-full`). Its lines light up in time, a line seeks
+// when clicked, and the Lyrics chip hides the panel.
+test.describe("pharos Dioxus UI lyrics", () => {
+  test("synced lyrics follow the song and seek when a line is chosen", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    await page.goto("/ui/");
+    await page.evaluate(() => localStorage.removeItem("pharos.listen.lyrics"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    const tile = page.locator(".pharos-poster").first();
+    await expect(tile).toBeVisible({ timeout: 15_000 });
+    await tile.click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+
+    const panel = page.getByRole("region", { name: "Lyrics" });
+    await expect(panel).toBeVisible({ timeout: 15_000 });
+    await expect(panel).toHaveAttribute("data-synced", "true");
+    const audio = page.locator("#pharos-video");
+    const current = panel.locator('[data-state="current"]');
+    // Restart from the top so the lit line is predictable.
+    await audio.evaluate((a) => ((a as HTMLMediaElement).currentTime = 0));
+    await expect(current).toHaveText(/Carefree line [01]$/, { timeout: 15_000 });
+    await expect(current).toHaveText(/Carefree line [2-9]$/, { timeout: 15_000 });
+
+    // A later line seeks there, lights up, and is scrolled to the middle.
+    await panel.getByRole("button", { name: "Carefree line 15" }).click();
+    await expect
+      .poll(() => audio.evaluate((a) => (a as HTMLMediaElement).currentTime))
+      .toBeGreaterThanOrEqual(29.5);
+    await expect(current).toHaveText(/Carefree line 1[5-9]$/);
+    await expect
+      .poll(() =>
+        panel.evaluate((p) => {
+          const lit = p.querySelector('[data-state="current"]') as HTMLElement;
+          const box = p.getBoundingClientRect();
+          const line = lit.getBoundingClientRect();
+          return Math.abs(line.top + line.height / 2 - (box.top + box.height / 2));
+        }),
+      )
+      .toBeLessThan(40);
+
+    await page.getByRole("button", { name: "Lyrics", exact: true }).click();
+    await expect(panel).toBeHidden();
+    await expect
+      .poll(() =>
+        page.evaluate(() => localStorage.getItem("pharos.listen.lyrics")),
+      )
+      .toBe("hidden");
+    await page.getByRole("button", { name: "Lyrics", exact: true }).click();
+    await expect(panel).toBeVisible();
+  });
+});
