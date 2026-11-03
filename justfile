@@ -223,6 +223,11 @@ compat-dioxus-full native="on" port="8096":
       l=${letters:$((10#$n % 26)):1}
       ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/$l$l Bulk $n.webm"
     done
+    # Synced lyrics for the seeded song, a line every 2 s, for the lyrics
+    # panel test (V300).
+    for n in $(seq 0 20); do
+      printf '[%02d:%02d.00]Carefree line %d\n' $((n * 2 / 60)) $((n * 2 % 60)) "$n"
+    done > "$TMP/media/05-carefree.lrc"
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
       NATIVE_BLOCK=$(cat <<NATIVE
