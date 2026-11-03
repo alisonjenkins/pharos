@@ -1400,6 +1400,81 @@ async fn browsing_a_library_a_series_and_a_season_answers_detail_then_listing() 
     assert_eq!(list(season_id).await.len(), 2);
 }
 
+/// The parent `Library.detail` names for `id`, as a wire id.
+async fn wire_parent(
+    session: &session::Client,
+    id: pharos_jellyfin_api::dto::WireId,
+) -> Option<String> {
+    use pharos_api::pharos_capnp::{detail_result, item_id};
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    let mut out = req.get().init_id();
+    match id {
+        WireId::Real(n) => out.set_real(n),
+        WireId::Synth(n) => out.set_synth(n),
+    }
+    let reply = req.send().promise.await.expect("detail");
+    let result = reply.get().unwrap().get_result().unwrap();
+    let detail_result::Detail(d) = result.which().unwrap() else {
+        panic!("detail {id} refused");
+    };
+    let summary = d.unwrap().get_summary().unwrap();
+    if !summary.has_parent_id() {
+        return None;
+    }
+    Some(
+        match summary.get_parent_id().unwrap().which().unwrap() {
+            item_id::Real(n) => WireId::Real(n),
+            item_id::Synth(n) => WireId::Synth(n),
+        }
+        .to_string(),
+    )
+}
+
+/// B318: every step of the UI's breadcrumb trail names the step above it,
+/// up to the innermost library: an episode its season, a season its series,
+/// a series and a film their library, even under a mixed library that holds
+/// them all.
+/// Disarm check: with `series_dto` leaving `parent_id` unset, the series
+/// names no parent; with `library_parent_id` taking the first root that
+/// matches, the series names the mixed library.
+#[actix_web::test]
+async fn detail_names_each_parent_up_to_the_innermost_library() {
+    use pharos_core::{LibraryKind, LibraryStore as _};
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key, WireId};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    fx.state
+        .stores
+        .upsert_library("Everything", "/", LibraryKind::Mixed, &"d".repeat(32))
+        .await
+        .unwrap();
+    let tv = seed_tv_library(&fx).await;
+    seed_movies(&fx).await;
+    let film_library = fx
+        .state
+        .libraries()
+        .iter()
+        .find(|l| l.root_path == "/libA")
+        .map(|l| l.wire_id.clone());
+
+    let parent = |id: String| wire_parent(&session, WireId::parse(&id).unwrap());
+    let show = series_id_for_key(Some("/libTV/Show"), "Show");
+    let season = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    assert_eq!(
+        parent(WireId::Real(601).to_string()).await,
+        Some(season.clone())
+    );
+    assert_eq!(parent(season).await, Some(show.clone()));
+    assert_eq!(parent(show).await, Some(tv));
+    assert!(film_library.is_some(), "the fixture has no /libA library");
+    assert_eq!(parent(WireId::Real(101).to_string()).await, film_library);
+}
+
 /// A user who may not see a library, or whose parental cap rules out a
 /// series' episodes, is refused the synthesised detail exactly as for an id
 /// that names nothing, and the refusal is counted.
