@@ -430,6 +430,8 @@ mod tests {
             episode: None,
             parent: None,
             library_kind: None,
+            imdb_rating: None,
+            critic_rating: None,
         }
     }
 
