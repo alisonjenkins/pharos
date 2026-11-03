@@ -216,6 +216,8 @@ pub struct Track {
     pub is_default: bool,
     pub is_forced: bool,
     pub is_hearing_impaired: bool,
+    /// An audio track's channel count; 0 is unknown.
+    pub channels: u16,
     /// A text subtitle's same-origin WebVTT, which the player renders
     /// itself. `None` for a subtitle the server must burn in, so choosing it
     /// renegotiates; always `None` for audio.
@@ -802,6 +804,7 @@ fn read_tracks(
                 is_default: t.get_is_default(),
                 is_forced: t.get_is_forced(),
                 is_hearing_impaired: t.get_is_hearing_impaired(),
+                channels: t.get_channels(),
                 vtt_url: match t.get_delivery()? {
                     SubtitleDelivery::External => Some(text(t.get_url())?),
                     SubtitleDelivery::Burn => None,
