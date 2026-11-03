@@ -23,6 +23,7 @@ pub mod playback;
 pub mod rails;
 pub mod route;
 pub mod together;
+pub mod together_view;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;
