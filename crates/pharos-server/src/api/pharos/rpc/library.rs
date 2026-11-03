@@ -1150,6 +1150,10 @@ fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: 
         w.set_is_default(t.is_default);
         w.set_is_forced(t.is_forced);
         w.set_is_hearing_impaired(t.is_hearing_impaired);
+        w.set_channels(
+            t.channels
+                .map_or(0, |c| u16::try_from(c).unwrap_or(u16::MAX)),
+        );
         match &t.vtt_url {
             Some(url) => {
                 w.set_delivery(SubtitleDelivery::External);
