@@ -16,6 +16,7 @@ mod group;
 mod library;
 mod limits;
 mod login;
+mod lyrics;
 mod playback;
 mod prefs;
 mod quick_connect;
