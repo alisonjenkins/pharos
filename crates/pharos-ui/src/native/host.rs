@@ -118,6 +118,12 @@ pub fn on_shift_wheel(_on_turn: impl FnMut(f64) + 'static) -> ShiftWheel {
     ShiftWheel
 }
 
+pub struct RailGestures;
+
+pub fn rail_gestures() -> RailGestures {
+    RailGestures
+}
+
 pub fn first_visible_tile() -> Option<u32> {
     None
 }
