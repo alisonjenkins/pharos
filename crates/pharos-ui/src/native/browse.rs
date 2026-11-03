@@ -781,6 +781,70 @@ fn TrackRow(track: Item) -> Element {
     }
 }
 
+/// The episodes either side of one, for the player's previous and next.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Neighbours {
+    pub previous: Option<ItemRef>,
+    pub next: Option<ItemRef>,
+}
+
+/// `episode`'s neighbours: the episodes beside it in its season, else the
+/// last of the season before or the first of the season after. Crossing a
+/// season skips specials (season 0), so season 1 runs on into season 2; a
+/// special has neighbours only among the specials.
+pub async fn neighbours<A: PharosApi>(
+    api: &A,
+    info: &CallInfo,
+    episode: &Item,
+) -> Result<Neighbours, ClientError> {
+    let Some(season) = episode.parent else {
+        return Ok(Neighbours::default());
+    };
+    let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
+    let here = list(season, None, INDEX_ORDER).await?.items;
+    let Some(at) = here.iter().position(|e| e.id == episode.id) else {
+        return Ok(Neighbours::default());
+    };
+    let mut near = Neighbours {
+        previous: at.checked_sub(1).and_then(|i| here.get(i)).map(|e| e.id),
+        next: here.get(at + 1).map(|e| e.id),
+    };
+    if near.previous.is_some() && near.next.is_some() {
+        return Ok(near);
+    }
+    let Some(series) = api.detail(info, season).await?.item.parent else {
+        return Ok(near);
+    };
+    let mut seasons = list(series, Some(ItemKind::Season), "").await?.items;
+    seasons.sort_by_key(|s| s.episode.unwrap_or(u32::MAX));
+    let Some(s) = seasons.iter().position(|x| x.id == season) else {
+        return Ok(near);
+    };
+    let regular = |x: &&Item| x.episode != Some(0);
+    if seasons.get(s).is_some_and(|x| !regular(&x)) {
+        return Ok(near);
+    }
+    if near.previous.is_none() {
+        if let Some(before) = seasons.get(..s).and_then(|b| b.iter().rev().find(regular)) {
+            near.previous = list(before.id, None, INDEX_ORDER)
+                .await?
+                .items
+                .last()
+                .map(|e| e.id);
+        }
+    }
+    if near.next.is_none() {
+        if let Some(after) = seasons.get(s + 1..).and_then(|a| a.iter().find(regular)) {
+            near.next = list(after.id, None, INDEX_ORDER)
+                .await?
+                .items
+                .first()
+                .map(|e| e.id);
+        }
+    }
+    Ok(near)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1196,5 +1260,93 @@ mod tests {
             .fields
             .contains(&("outcome", "notFound".to_owned())));
         assert!(events[0].fields.contains(&("method", "list".to_owned())));
+    }
+
+    fn episode_in(id: ItemRef, season: ItemRef) -> Item {
+        let mut e = item(id, ItemKind::Episode, "Episode");
+        e.parent = Some(season);
+        e
+    }
+
+    /// Season 1 of two episodes, season 2 of one, and a special.
+    fn run_fake() -> Fake {
+        let mut fake = show_fake();
+        let mut s1 = item(S1, ItemKind::Season, "Season 1");
+        s1.parent = Some(SERIES);
+        fake.details.insert(S1, detail(s1));
+        let mut specials = item(SPECIALS, ItemKind::Season, "Specials");
+        specials.parent = Some(SERIES);
+        fake.details.insert(SPECIALS, detail(specials));
+        fake.lists.insert(
+            (S1, None),
+            vec![
+                episode_in(ItemRef::Real(1), S1),
+                episode_in(ItemRef::Real(4), S1),
+            ],
+        );
+        fake.lists
+            .insert((S2, None), vec![episode_in(ItemRef::Real(2), S2)]);
+        fake.lists.insert(
+            (SPECIALS, None),
+            vec![episode_in(ItemRef::Real(9), SPECIALS)],
+        );
+        fake
+    }
+
+    fn near(fake: &Fake, id: ItemRef, season: ItemRef) -> Neighbours {
+        run(neighbours(
+            fake,
+            &CallInfo::default(),
+            &episode_in(id, season),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_episode_inside_its_season_neighbours_its_season() {
+        let fake = run_fake();
+        assert_eq!(
+            near(&fake, ItemRef::Real(1), S1),
+            Neighbours {
+                previous: None,
+                next: Some(ItemRef::Real(4))
+            }
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_season_runs_on_into_the_next_skipping_specials() {
+        let fake = run_fake();
+        assert_eq!(
+            near(&fake, ItemRef::Real(4), S1),
+            Neighbours {
+                previous: Some(ItemRef::Real(1)),
+                next: Some(ItemRef::Real(2))
+            }
+        );
+        assert_eq!(
+            near(&fake, ItemRef::Real(2), S2),
+            Neighbours {
+                previous: Some(ItemRef::Real(4)),
+                next: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_special_stays_among_the_specials() {
+        let fake = run_fake();
+        assert_eq!(
+            near(&fake, ItemRef::Real(9), SPECIALS),
+            Neighbours::default()
+        );
+    }
+
+    #[test]
+    fn a_film_has_no_neighbours() {
+        let fake = Fake::default();
+        let film = item(ItemRef::Real(3), ItemKind::Movie, "Film");
+        let n = run(neighbours(&fake, &CallInfo::default(), &film)).unwrap();
+        assert_eq!(n, Neighbours::default());
     }
 }
