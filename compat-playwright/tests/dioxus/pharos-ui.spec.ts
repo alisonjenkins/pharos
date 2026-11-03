@@ -809,6 +809,26 @@ test.describe("pharos Dioxus UI", () => {
       await page.mouse.wheel(0, -300);
       await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(before);
 
+      // A filter narrows the listing but keeps it in name order: the rail
+      // stays and still jumps (V252).
+      await page.getByLabel("Watched", { exact: true }).selectOption("unwatched");
+      await expect(rail).toBeVisible({ timeout: 15_000 });
+      await rail.getByRole("button", { name: "Z", exact: true }).click();
+      await expect(tiles.filter({ hasText: /^ZZ Bulk/ }).first()).toBeInViewport({
+        timeout: 15_000,
+      });
+      await page.getByLabel("Watched", { exact: true }).selectOption({ index: 0 });
+      await page.getByLabel("Genre", { exact: true }).selectOption("Drama");
+      await expect(tiles).toHaveCount(60, { timeout: 15_000 });
+      await expect(rail).toBeVisible({ timeout: 15_000 });
+      // The Dramas are the even titles, which run A, C, E ... Y.
+      await expect(rail.getByRole("button", { name: "Z", exact: true })).toBeDisabled();
+      await rail.getByRole("button", { name: "Y", exact: true }).click();
+      await expect(tiles.filter({ hasText: /^YY Bulk/ }).first()).toBeInViewport({
+        timeout: 15_000,
+      });
+      await page.getByLabel("Genre", { exact: true }).selectOption({ index: 0 });
+
       // Date added, newest first: no letters to jump by.
       await page.getByLabel("Sort", { exact: true }).selectOption("added");
       await expect(rail).toHaveCount(0);
