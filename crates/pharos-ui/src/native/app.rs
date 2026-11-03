@@ -39,6 +39,7 @@ use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
+use super::show_tracks;
 use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
@@ -1843,13 +1844,19 @@ fn TitleScreen(id: ItemRef) -> Element {
         {loaded(
             state.as_ref().and_then(Option::as_ref),
             |detail: &Detail| {
+                let series = show_tracks::show_of(detail);
                 let tracks = start.map(|start| {
+                    // A choice made on another episode of the show applies here.
+                    let start = series.map_or(start, |s| {
+                        show_tracks::shown(&show_tracks::load(s), detail, start)
+                    });
                     rsx! {
                         TrackChoices {
                             id,
                             audio: detail.audio_tracks.clone(),
                             subtitles: detail.subtitle_tracks.clone(),
                             start,
+                            series: series.map(str::to_owned),
                         }
                     }
                 });
@@ -2045,12 +2052,17 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let caps = negotiation_capabilities(detail.item.kind, auto);
+                // What the viewer left to the server takes the show's choice
+                // from its other episodes, when this one has a track like it.
+                let asked = show_tracks::show_of(&detail).map_or(asked, |s| {
+                    show_tracks::apply(&show_tracks::load(s), &detail, asked)
+                });
                 let (decision, grant) = api.play(&info, id, &caps, asked).await?;
-                Ok::<_, ClientError>((detail, decision, grant))
+                Ok::<_, ClientError>((detail, decision, grant, asked))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
+                settle(ctx.machine, result).and_then(|(detail, decision, grant, asked)| {
                     let engine = choose_engine(
                         decision.is_hls(),
                         platform::plays_hls(),
@@ -2841,6 +2853,10 @@ fn Player(
                     }
                 }
                 Control::Audio(index) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.audio_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_audio(s, tracks, index));
+                    }
                     let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
                         session().is_some_and(|s| s.pick_audio(index))
                     }) else {
@@ -2852,6 +2868,10 @@ fn Player(
                     });
                 }
                 Control::Subtitle(to) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.subtitle_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, tracks, to));
+                    }
                     let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
                         session().is_some_and(|s| s.pick_subtitle(to))
                     });

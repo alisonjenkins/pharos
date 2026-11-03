@@ -546,7 +546,7 @@ const GENERIC_TITLE_WORDS: &[&str] = &[
 /// A language's English name for an ISO 639-1 or 639-2 (bibliographic or
 /// terminology) code, else the code in capitals. A region or script tag
 /// after it (`pt-BR`, `zh-Hant`) is dropped; the track title says which.
-fn language_name(code: &str) -> String {
+pub fn language_name(code: &str) -> String {
     let lower = code.trim().to_ascii_lowercase();
     let base = lower.split(['-', '_']).next().unwrap_or_default();
     match base {

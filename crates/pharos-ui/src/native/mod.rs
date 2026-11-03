@@ -33,6 +33,7 @@ pub mod queue;
 pub mod rails;
 pub mod route;
 pub mod seen;
+pub mod show_tracks;
 pub mod stage;
 pub mod style_picker;
 pub mod together;
