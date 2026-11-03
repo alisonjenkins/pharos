@@ -1167,7 +1167,9 @@ pub struct Neighbours {
 /// `episode`'s neighbours: the episodes beside it in its season, else the
 /// last of the season before or the first of the season after. Crossing a
 /// season skips specials (season 0), so season 1 runs on into season 2; a
-/// special has neighbours only among the specials.
+/// special has neighbours only among the specials. A track's parent is its
+/// album, so it gets the tracks beside it; its artist lists no seasons, so
+/// it never crosses albums.
 pub async fn neighbours<A: PharosApi>(
     api: &A,
     info: &CallInfo,
@@ -1829,6 +1831,37 @@ mod tests {
         assert_eq!(
             near(&fake, ItemRef::Real(9), SPECIALS),
             Neighbours::default()
+        );
+    }
+
+    #[test]
+    fn a_track_neighbours_its_album_and_stops_at_its_ends() {
+        let mut fake = Fake::default();
+        let artist = ItemRef::Synth(30);
+        let album = ItemRef::Synth(31);
+        let mut a = item(album, ItemKind::Album, "Album");
+        a.parent = Some(artist);
+        fake.details.insert(album, detail(a));
+        let track = |n| {
+            let mut t = item(ItemRef::Real(n), ItemKind::Audio, "Track");
+            t.parent = Some(album);
+            t
+        };
+        fake.lists.insert((album, None), vec![track(40), track(41)]);
+        let near = |n| run(neighbours(&fake, &CallInfo::default(), &track(n))).unwrap();
+        assert_eq!(
+            near(40),
+            Neighbours {
+                previous: None,
+                next: Some(ItemRef::Real(41)),
+            }
+        );
+        assert_eq!(
+            near(41),
+            Neighbours {
+                previous: Some(ItemRef::Real(40)),
+                next: None,
+            }
         );
     }
 

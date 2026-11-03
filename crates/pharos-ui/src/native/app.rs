@@ -1114,7 +1114,8 @@ fn WatchScreen(id: ItemRef) -> Element {
             let info = call("watch", "neighbours");
             let result = async {
                 let episode = api.detail(&info, id).await?.item;
-                if episode.kind != ItemKind::Episode {
+                // An episode's neighbours are in its series, a track's on its album.
+                if !matches!(episode.kind, ItemKind::Episode | ItemKind::Audio) {
                     return Ok(Neighbours::default());
                 }
                 browse::neighbours(&api, &info, &episode).await
