@@ -139,6 +139,23 @@ pub fn push(path: &str) {
     }
 }
 
+/// Whether a mouse event started on a control (a button, link, field or
+/// slider) rather than on the surface around it. Dioxus dispatches from the
+/// app root, so the handler's own element is not the target.
+pub fn on_a_control(evt: &dioxus::prelude::MouseEvent) -> bool {
+    use dioxus_web::WebEventExt;
+    use wasm_bindgen::JsCast;
+    evt.try_as_web_event()
+        .and_then(|web| web.target())
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| {
+            el.closest("button, a, input, select, textarea, [role=slider], [role=button]")
+                .ok()
+                .flatten()
+        })
+        .is_some()
+}
+
 /// `history.back()`, when the page before this one is the app's: an entry
 /// the app pushed. `history.length` would also count other sites' pages.
 pub fn go_back() -> bool {
