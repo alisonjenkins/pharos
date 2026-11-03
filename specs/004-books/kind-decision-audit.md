@@ -77,6 +77,7 @@ has no business in.
 | `filename.rs:216` (`Movie`) | `(year)`-in-filename parsing; books rarely carry it and a wrong year is worse than none |
 | `fs.rs:1022,1027` (`Movie`→`Episode` promotion, series info) | a Book is never promoted to an episode |
 | `items.rs:4659` (`Episode` scoping) | query scoping |
+| `services/library.rs:846` `WATCHING_KINDS` (`Movie\|Episode`) and the `Audio` listening row in `home` | native home resume rows; a Book is in neither (B310) |
 
 ### SAFE — reachable only by a path a book cannot take
 
