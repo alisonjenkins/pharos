@@ -298,6 +298,78 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page).toHaveURL(/\/ui\/watch\/\d+$/);
     });
 
+    // A library larger than one browse page (100) loads the rest as the grid
+    // is scrolled (V237); the seed's "Bulk" library holds 120 titles.
+    test("browse scrolls a library past one page and every title loads", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-scroll-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const json = async (path: string) =>
+        (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+      const views = await json(`/Users/${user.Id}/Views`);
+      const bulk = views.Items?.find((i: { Name: string }) => i.Name === "Bulk");
+      test.skip(!bulk, "the seed has no Bulk library");
+      // The startup scan may still be indexing the titles.
+      let total = 0;
+      await expect
+        .poll(
+          async () => {
+            const listed = await json(
+              `/Users/${user.Id}/Items?ParentId=${bulk.Id}&Recursive=true&Limit=1`,
+            );
+            total = listed.TotalRecordCount ?? 0;
+            return total;
+          },
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(100);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await page.locator("section.pharos-rail h2 a", { hasText: /^Bulk$/ }).click();
+      const tiles = page.locator("section.pharos-browse ul.pharos-grid li");
+      await expect(tiles.first()).toBeVisible({ timeout: 15_000 });
+      expect(await tiles.count(), "the first page is 100 tiles").toBe(100);
+
+      // Scroll to the bottom until the tile count stops growing.
+      let seen = 0;
+      let stable = 0;
+      for (let round = 0; round < 40 && stable < 3; round++) {
+        await page.evaluate(() =>
+          window.scrollTo(0, document.documentElement.scrollHeight),
+        );
+        await page.waitForTimeout(500);
+        const now = await tiles.count();
+        stable = now === seen ? stable + 1 : 0;
+        seen = now;
+      }
+      expect(seen, "every title loads once the grid is scrolled").toBe(total);
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Show more" })).toHaveCount(0);
+    });
+
     // A TV library lists its series by name and a series opens the show page
     // with its episodes; every step is a click, not a URL.
     test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
