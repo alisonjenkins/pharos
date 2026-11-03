@@ -26,6 +26,8 @@ use super::playback::{
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
+use super::together::{group_api, GroupClient as _, GroupSink, GroupSummary};
+use super::together_view::{InviteView, TogetherView};
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
@@ -864,6 +866,8 @@ fn Screen(route: Route) -> Element {
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
         Route::Appearance => rsx! { AppearanceScreen {} },
         Route::Find => rsx! { FindScreen {} },
+        Route::Together => rsx! { TogetherScreen {} },
+        Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
 }
@@ -904,6 +908,89 @@ fn FindScreen() -> Element {
         });
     };
     rsx! { FindView { text: text(), hits: hits(), on_input } }
+}
+
+/// Join `id` and go to what the group is watching. The group client is the
+/// in-memory seam of [`group_api`] until the network adapter lands.
+fn join_group(
+    api: super::together::FakeGroups,
+    nav: Nav,
+    mut error: Signal<Option<String>>,
+    id: String,
+) {
+    spawn(async move {
+        let sink: GroupSink = Rc::new(|_| {});
+        match api.join(&id, sink).await {
+            Ok(group) => {
+                if let Some(item) = group.item {
+                    nav.0.call(Route::Watch(item));
+                }
+            }
+            Err(e) => error.set(Some(e.0)),
+        }
+    });
+}
+
+/// The Together page: the groups running now.
+#[component]
+fn TogetherScreen() -> Element {
+    let nav = use_context::<Nav>();
+    let api = use_hook(group_api);
+    let error = use_signal(|| None::<String>);
+    let groups = use_resource({
+        let api = api.clone();
+        move || {
+            let api = api.clone();
+            async move { api.list().await }
+        }
+    });
+    let state = groups.read();
+    match state.as_ref() {
+        None => rsx! { Loading {} },
+        Some(Err(e)) => rsx! { ErrorNote { message: e.0.clone() } },
+        Some(Ok(groups)) => rsx! {
+            if let Some(message) = error() {
+                ErrorNote { message }
+            }
+            TogetherView {
+                groups: groups.clone(),
+                on_join: move |id: String| join_group(api.clone(), nav, error, id),
+            }
+        },
+    }
+}
+
+/// An invite link: join the group if it still runs.
+#[component]
+fn InviteScreen(id: String) -> Element {
+    let nav = use_context::<Nav>();
+    let api = use_hook(group_api);
+    let error = use_signal(|| None::<String>);
+    let groups = use_resource({
+        let api = api.clone();
+        move || {
+            let api = api.clone();
+            async move { api.list().await }
+        }
+    });
+    let state = groups.read();
+    match state.as_ref() {
+        None => rsx! { Loading {} },
+        Some(Err(e)) => rsx! { ErrorNote { message: e.0.clone() } },
+        Some(Ok(groups)) => {
+            let group: Option<GroupSummary> = groups.iter().find(|g| g.id == id).cloned();
+            rsx! {
+                if let Some(message) = error() {
+                    ErrorNote { message }
+                }
+                InviteView {
+                    group,
+                    on_join: move |id: String| join_group(api.clone(), nav, error, id),
+                    on_start_new: move |_| nav.0.call(Route::Together),
+                }
+            }
+        }
+    }
 }
 
 /// Replace the current route once mounted (signed in at `/signin`).
