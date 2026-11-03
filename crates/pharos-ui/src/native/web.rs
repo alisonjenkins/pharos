@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::diagnostics::{self, Sink};
+use super::rails;
 use gloo_net::http::Request;
 use pharos_client::api::{Capabilities, ClientEvent, ClientEventKind, ClientLevel, NativeApi};
 use pharos_client::browser::{self, Connection};
@@ -457,6 +458,120 @@ fn wheel_scale(e: &web_sys::WheelEvent) -> f64 {
         web_sys::WheelEvent::DOM_DELTA_PAGE => 800.0,
         _ => 1.0,
     }
+}
+
+/// The rail at or above an event's target.
+fn rail_at(e: &web_sys::Event) -> Option<web_sys::HtmlElement> {
+    e.target()?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .closest(".pharos-rail-items")
+        .ok()??
+        .dyn_into::<web_sys::HtmlElement>()
+        .ok()
+}
+
+#[derive(Default)]
+struct RailState {
+    glide: Option<(web_sys::HtmlElement, rails::Glide)>,
+}
+
+type Handler = Box<dyn FnMut(web_sys::Event)>;
+
+/// The window listeners behind rail gestures; removed on drop.
+pub struct RailGestures(Vec<WindowListener>);
+
+/// An event name, whether it listens in the capture phase, and its handler.
+struct WindowListener(&'static str, bool, Closure<dyn FnMut(web_sys::Event)>);
+
+impl Drop for RailGestures {
+    fn drop(&mut self) {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        for WindowListener(name, capture, listener) in &self.0 {
+            let _ = window.remove_event_listener_with_callback_and_bool(
+                name,
+                listener.as_ref().unchecked_ref(),
+                *capture,
+            );
+        }
+    }
+}
+
+/// Scroll rails further on a sideways wheel notch (B315).
+pub fn rail_gestures() -> RailGestures {
+    let state = Rc::new(RefCell::new(RailState::default()));
+    let reduced = prefers("(prefers-reduced-motion: reduce)");
+    let mut listeners: Vec<(&'static str, bool, Handler)> = Vec::new();
+
+    let st = state.clone();
+    listeners.push((
+        "wheel",
+        false,
+        Box::new(move |e: web_sys::Event| {
+            let Some(e) = e.dyn_ref::<web_sys::WheelEvent>() else {
+                return;
+            };
+            if e.ctrl_key() || e.meta_key() {
+                return;
+            }
+            let Some(rail) = rail_at(e) else {
+                return;
+            };
+            let scale = wheel_scale(e);
+            let lines = e.delta_mode() != web_sys::WheelEvent::DOM_DELTA_PIXEL;
+            let Some(step) = rails::wheel_step(
+                e.delta_x() * scale,
+                e.delta_y() * scale,
+                e.shift_key(),
+                lines,
+            ) else {
+                return;
+            };
+            let mut st = st.borrow_mut();
+            let last = st
+                .glide
+                .as_ref()
+                .filter(|(r, _)| *r == rail)
+                .map(|(_, g)| *g);
+            let max = f64::from(rail.scroll_width() - rail.client_width());
+            let left = f64::from(rail.scroll_left());
+            let Some(glide) = rails::glide(last, e.time_stamp(), left, max, step) else {
+                return;
+            };
+            e.prevent_default();
+            let options = web_sys::ScrollToOptions::new();
+            options.set_left(glide.to);
+            options.set_behavior(if reduced {
+                web_sys::ScrollBehavior::Instant
+            } else {
+                web_sys::ScrollBehavior::Smooth
+            });
+            rail.scroll_to_with_scroll_to_options(&options);
+            st.glide = Some((rail, glide));
+        }),
+    ));
+
+    let Some(window) = web_sys::window() else {
+        return RailGestures(Vec::new());
+    };
+    let options = web_sys::AddEventListenerOptions::new();
+    options.set_passive(false);
+    let held = listeners
+        .into_iter()
+        .map(|(name, capture, f)| {
+            let listener = Closure::<dyn FnMut(web_sys::Event)>::wrap(f);
+            options.set_capture(capture);
+            let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
+                name,
+                listener.as_ref().unchecked_ref(),
+                &options,
+            );
+            WindowListener(name, capture, listener)
+        })
+        .collect();
+    RailGestures(held)
 }
 
 /// The tiles of the browse grid, in order.
