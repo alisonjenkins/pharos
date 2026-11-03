@@ -982,6 +982,17 @@ test.describe("pharos Dioxus UI now playing", () => {
       )
       .toMatch(/style=spectrum/);
 
+    // The screen's own controls drive the <audio>; the browser's are off.
+    const audio = page.locator("#pharos-video");
+    await expect(audio).not.toHaveAttribute("controls", /.*/);
+    await page.getByRole("button", { name: "Pause" }).click();
+    await expect
+      .poll(() => audio.evaluate((a) => (a as HTMLMediaElement).paused))
+      .toBe(true);
+    await expect(page.getByRole("button", { name: "Play" })).toBeVisible();
+    await page.getByRole("button", { name: "Play" }).click();
+    await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+
     await page.getByRole("button", { name: "Halo" }).click();
     await expect(page.getByRole("button", { name: "Halo" })).toHaveAttribute(
       "aria-pressed",
