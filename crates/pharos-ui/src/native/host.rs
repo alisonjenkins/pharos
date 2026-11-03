@@ -151,6 +151,8 @@ pub fn toggle_pip(_id: &str) {}
 
 pub fn focus_by_id(_id: &str) {}
 
+pub fn focus(_id: &str) {}
+
 pub fn now_ms() -> f64 {
     0.0
 }
