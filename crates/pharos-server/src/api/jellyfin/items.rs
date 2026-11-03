@@ -5920,7 +5920,7 @@ pub(crate) async fn virtual_shows_page(
     q: &ItemQuery,
 ) -> Result<SynthPage, actix_web::Error> {
     use crate::api::jellyfin::dto::{season_display_name, series_id_for_key};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     // Reuse the full parent/search scoping the media query already implements:
     // fetch the matching EPISODES unpaged, then collapse them in memory. The
@@ -5966,11 +5966,37 @@ pub(crate) async fn virtual_shows_page(
 
     let descending = first_sort_order_descending(q.sort_order.as_deref());
 
+    // `Filters=IsPlayed` / `IsUnplayed` on series tiles: a series is played
+    // once every episode in it is. The episode query above is unpaged, so
+    // its user-data filter was left out and is applied here per series.
+    let want_played = q
+        .filters
+        .as_deref()
+        .map(UserDataFilter::parse)
+        .and_then(|f| f.is_played)
+        .filter(|_| matches!(mode, ShowFolderKind::Series));
+    let mut unplayed_series: HashSet<String> = HashSet::new();
+    if want_played.is_some() {
+        let ids: Vec<u64> = episodes.iter().map(|e| e.id).collect();
+        let user_data = state
+            .stores
+            .user_data_bulk(user_id, &ids)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for (ep, ud) in episodes.iter().zip(user_data) {
+            if let (Some(series), false) = (ep.series.as_ref(), ud.played) {
+                unplayed_series.insert(series_id_for_key(
+                    series.series_folder.as_deref(),
+                    &series.series_name,
+                ));
+            }
+        }
+    }
+
     // B93 — child / recursive counts per key so the Series/Season folder DTOs
     // advertise ChildCount (a series' seasons, a season's episodes). Computed
     // over the FULL episode set (independent of the A-Z letter filter, which
     // only decides which tiles show).
-    use std::collections::{HashMap, HashSet};
     let mut series_seasons: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut series_eps: HashMap<String, u32> = HashMap::new();
     let mut season_eps: HashMap<u32, u32> = HashMap::new();
@@ -6018,6 +6044,9 @@ pub(crate) async fn virtual_shows_page(
                     }
                 }
                 let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+                if want_played.is_some_and(|want| want == unplayed_series.contains(&skey)) {
+                    continue;
+                }
                 let meta = meta_map.get(series.series_key());
                 if let Some(want) = genre {
                     if !meta.is_some_and(|m| m.genres.iter().any(|g| g.eq_ignore_ascii_case(want)))
