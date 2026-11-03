@@ -145,9 +145,16 @@ pub fn ErrorNote(message: String) -> Element {
 
 #[component]
 pub fn HomeView(home: Home) -> Element {
-    let empty = home.rails.is_empty() && home.resume.is_empty() && home.next_up.is_empty();
+    let empty = home.rails.is_empty()
+        && home.resume.is_empty()
+        && home.listening.is_empty()
+        && home.next_up.is_empty();
     let mut rails: Vec<&HomeRail> = home.rails.iter().collect();
     rails.sort_by_key(|rail| rail_rank(rail.library.library_kind));
+    // Music to resume sits just before the music libraries.
+    let music = rail_rank(Some(LibraryKind::Music));
+    let split = rails.partition_point(|rail| rail_rank(rail.library.library_kind) < music);
+    let (before_music, from_music) = rails.split_at(split);
     rsx! {
         div { class: "pharos-home",
             if empty {
@@ -159,14 +166,27 @@ pub fn HomeView(home: Home) -> Element {
             if !home.next_up.is_empty() {
                 Rail { title: "Next up", items: home.next_up.clone() }
             }
-            for rail in rails {
-                Rail {
-                    key: "{rail.library.id}",
-                    title: rail.library.name.clone(),
-                    link: Route::Browse(rail.library.id),
-                    items: rail.latest.clone(),
-                }
+            for rail in before_music {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
             }
+            if !home.listening.is_empty() {
+                Rail { title: "Continue listening", items: home.listening.clone() }
+            }
+            for rail in from_music {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            }
+        }
+    }
+}
+
+/// A library's newest items, titled with a link to the whole library.
+#[component]
+fn LibraryRail(rail: HomeRail) -> Element {
+    rsx! {
+        Rail {
+            title: rail.library.name.clone(),
+            link: Route::Browse(rail.library.id),
+            items: rail.latest.clone(),
         }
     }
 }
@@ -486,10 +506,12 @@ mod tests {
                 latest: vec![movie.clone()],
             }],
             resume: vec![movie],
+            listening: vec![],
             next_up: vec![],
         };
         let html = render(move || rsx! { HomeView { home: home.clone() } });
         assert!(html.contains("Continue watching"), "{html}");
+        assert!(!html.contains("Continue listening"), "{html}");
         assert!(!html.contains("Next up"), "{html}");
         assert!(
             html.contains(r#"href="/ui/browse/7""#) && html.contains("Films"),
@@ -503,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn home_rails_run_shows_films_music_books_then_mixed() {
+    fn home_rails_run_shows_films_listening_music_books_then_mixed() {
         let rail = |id: u64, name: &str, kind: Option<LibraryKind>| {
             let mut lib = item(ItemKind::Library);
             lib.id = ItemRef::Real(id);
@@ -516,6 +538,8 @@ mod tests {
         };
         let mut next = item(ItemKind::Episode);
         next.id = ItemRef::Real(99);
+        let mut song = item(ItemKind::Audio);
+        song.id = ItemRef::Real(98);
         let home = Home {
             rails: vec![
                 rail(1, "Media", Some(LibraryKind::Mixed)),
@@ -525,6 +549,7 @@ mod tests {
                 rail(5, "TV Shows", Some(LibraryKind::TvShows)),
             ],
             resume: vec![item(ItemKind::Movie)],
+            listening: vec![song],
             next_up: vec![next],
         };
         let html = render(move || rsx! { HomeView { home: home.clone() } });
@@ -537,6 +562,7 @@ mod tests {
             "Next up",
             "TV Shows",
             "Movies",
+            "Continue listening",
             "Music",
             "Books",
             "Media",
@@ -547,12 +573,24 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_home_points_at_manage() {
+    fn music_resumes_under_continue_listening_not_watching() {
+        let mut song = item(ItemKind::Audio);
+        song.id = ItemRef::Real(9);
+        song.name = "Carefree".into();
         let home = Home {
-            rails: vec![],
-            resume: vec![],
-            next_up: vec![],
+            listening: vec![song],
+            ..Home::default()
         };
+        let html = render(move || rsx! { HomeView { home: home.clone() } });
+        assert!(html.contains("Continue listening"), "{html}");
+        assert!(html.contains("Carefree"), "{html}");
+        assert!(!html.contains("Continue watching"), "{html}");
+        assert!(!html.contains("Add a library from Manage"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_home_points_at_manage() {
+        let home = Home::default();
         let html = render(move || rsx! { HomeView { home: home.clone() } });
         assert!(html.contains("Add a library from Manage"), "{html}");
     }
