@@ -948,6 +948,15 @@ body:has(.pharos-stage.is-full) .pharos-error {
   object-fit: contain;
   background: black; /* not themed: the letterbox around video is black in every theme */
 }
+/* WebVTT cues: an outline and soft shadow instead of the browser's opaque
+   box. `::cue` takes no border-radius or padding, so any box stays square;
+   the dark outline keeps white text readable on a white frame. */
+.pharos-video::cue {
+  color: #fff; /* not themed: subtitles sit on the video, whose colours no theme sets */
+  background: transparent;
+  text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 3px #000, 0 2px 6px rgb(0 0 0 / 0.8); /* not themed: subtitles sit on the video */
+  font-family: var(--px-font-ui);
+}
 /* The controls sit on the picture, so they are light on a dark scrim in every
    theme; only the accent follows the theme. */
 .pharos-player {
