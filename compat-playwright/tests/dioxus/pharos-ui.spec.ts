@@ -461,6 +461,46 @@ test.describe("pharos Dioxus UI", () => {
       expect(await page.evaluate(() => window.scrollY)).toBe(y);
     });
 
+    // A notch of sideways wheel moves a rail a few posters, not under one,
+    // and a mouse drag scrolls it without opening the poster it started on;
+    // a plain click still does (B315).
+    test("a rail moves further per sideways notch and scrolls with a mouse drag", async ({ page, request }) => {
+      const rail = await overflowingRail(page, request);
+      const frames = () =>
+        page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      const left = () => rail.evaluate((el) => el.scrollLeft);
+      const reset = async () => {
+        await rail.evaluate((el) => el.scrollTo({ left: 0, behavior: "instant" }));
+        await frames();
+      };
+      await rail.scrollIntoViewIfNeeded();
+      await frames();
+      const box = (await rail.boundingBox())!;
+      const midY = box.y + box.height / 2;
+      await page.mouse.move(box.x + box.width / 2, midY);
+      await frames();
+
+      const max = await rail.evaluate((el) => el.scrollWidth - el.clientWidth);
+      await page.mouse.wheel(100, 0);
+      await expect.poll(left).toBeGreaterThan(Math.min(250, max - 1));
+      await reset();
+
+      const url = page.url();
+      await page.mouse.move(box.x + box.width - 20, midY);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width / 2, midY, { steps: 8 });
+      await page.mouse.move(box.x + 20, midY, { steps: 8 });
+      await expect(rail).toHaveClass(/is-dragging/);
+      await page.mouse.up();
+      await expect(rail).not.toHaveClass(/is-dragging/);
+      expect(await left()).toBeGreaterThan(Math.min(100, max - 1));
+      await frames();
+      expect(page.url(), "the drag opened no poster").toBe(url);
+
+      await rail.locator("a.pharos-poster").first().click();
+      await expect(page).not.toHaveURL(url);
+    });
+
     // A library jumps by first letter (V252): the rail on the right goes
     // straight to one, reading ahead past the first page; Shift+wheel steps
     // between letters; a date order hides the rail. The seed's "Bulk" names
