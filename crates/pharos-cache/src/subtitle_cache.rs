@@ -43,6 +43,44 @@ pub enum SubtitleKind {
     /// gating: segments with no event skip the overlay re-encode entirely.
     /// Computed once per (file, mtime, track) by a whole-file demux scan.
     EventWindows,
+    /// The decoded events of an IMAGE subtitle stream (codec-relative
+    /// index) as PNGs and a manifest, in a directory of their own (spec
+    /// 019): see [`SubtitleCache::image_subtitles`].
+    Images,
+}
+
+/// Bump when extraction's output changes, so directories an older build
+/// wrote are never read; the version is part of the directory name.
+pub const IMAGE_SUB_GEN_VERSION: u32 = 1;
+
+/// Where a track's image extraction stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSubs {
+    /// The directory holding `manifest.json` and the PNGs it names. While
+    /// the extraction is still reading the file, the manifest there covers
+    /// its source up to `through_ms`.
+    Dir(PathBuf),
+    /// The extraction failed this boot; the track has no images until restart.
+    Failed,
+}
+
+/// How a background image extraction ended: the `outcome` label of
+/// `pharos_subtitle_image_extract_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(all(unix, feature = "ffmpeg-lib")), allow(dead_code))]
+enum ImageExtractOutcome {
+    Complete,
+    Failed,
+}
+
+#[cfg_attr(not(all(unix, feature = "ffmpeg-lib")), allow(dead_code))]
+impl ImageExtractOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Cache key: source file + mtime stamps the input so any later edit
@@ -285,6 +323,140 @@ impl SubtitleCache {
         });
     }
 
+    /// Whether this cache can extract image subtitles: it needs a disk root
+    /// for the PNGs and the libav pool to decode them.
+    pub fn extracts_images(&self) -> bool {
+        #[cfg(all(unix, feature = "ffmpeg-lib"))]
+        let pool = self.pool.is_some();
+        #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+        let pool = false;
+        self.root.is_some() && pool
+    }
+
+    /// The decoded events of the `rel_idx`-th subtitle stream (codec-
+    /// relative). Non-blocking, like [`Self::image_sub_event_windows`]: the
+    /// first ask starts ONE background extraction (bg-I/O gated, never from
+    /// a scan, B49/B52) and returns the directory it is filling; the
+    /// manifest there grows as it runs. `None` when the cache cannot extract
+    /// ([`Self::extracts_images`]).
+    pub async fn image_subtitles(
+        &self,
+        path: &Path,
+        mtime_secs: i64,
+        rel_idx: u32,
+        duration_ms: u64,
+    ) -> Option<ImageSubs> {
+        if !self.extracts_images() {
+            return None;
+        }
+        let dir = self.image_dir(path, mtime_secs, rel_idx)?;
+        let key = Key {
+            path: path.to_path_buf(),
+            mtime_secs,
+            stream_index: rel_idx,
+            kind: SubtitleKind::Images,
+        };
+        // A complete manifest is final, so the common case is answered
+        // without the lock that every scan and extraction shares.
+        if manifest_complete(&dir).await {
+            return Some(ImageSubs::Dir(dir));
+        }
+        let mut scans = self.win_scans.lock().await;
+        match scans.get(&key) {
+            Some(WinScan::Pending) => return Some(ImageSubs::Dir(dir)),
+            Some(WinScan::Failed) => return Some(ImageSubs::Failed),
+            None => {}
+        }
+        // An extraction may have finished since the read above; checked again
+        // under the lock so a second one never starts over a complete
+        // directory and rewrites its manifest as incomplete.
+        if manifest_complete(&dir).await {
+            return Some(ImageSubs::Dir(dir));
+        }
+        // Absent, or left half-written by a run that died: extract (again).
+        scans.insert(key.clone(), WinScan::Pending);
+        drop(scans);
+        self.spawn_image_extraction(key, duration_ms, dir.clone());
+        Some(ImageSubs::Dir(dir))
+    }
+
+    /// Where the `rel_idx`-th subtitle stream's images are, without starting
+    /// or checking an extraction:
+    /// `{root}/subtitles/{hash(path)}-{mtime}-{idx}-i{IMAGE_SUB_GEN_VERSION}/`.
+    /// `None` without a disk root.
+    pub fn image_dir(&self, path: &Path, mtime_secs: i64, rel_idx: u32) -> Option<PathBuf> {
+        let file = self.disk_path(&Key {
+            path: path.to_path_buf(),
+            mtime_secs,
+            stream_index: rel_idx,
+            kind: SubtitleKind::Images,
+        })?;
+        let stem = file.file_stem()?.to_str()?.to_owned();
+        Some(file.with_file_name(format!("{stem}{IMAGE_SUB_GEN_VERSION}")))
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    fn spawn_image_extraction(&self, key: Key, duration_ms: u64, dir: PathBuf) {
+        let Some(pool) = self.pool.clone() else {
+            return;
+        };
+        let scans = self.win_scans.clone();
+        let gate = self.bg_gate.clone();
+        tokio::spawn(async move {
+            // Whole-file NFS read → background-I/O gated (yields to playback).
+            let _permit = match &gate {
+                Some(g) => g.clone().acquire_owned().await.ok(),
+                None => None,
+            };
+            let started = std::time::Instant::now();
+            let res = pool
+                .subtitle_images(key.path.clone(), key.stream_index, duration_ms, dir.clone())
+                .await;
+            let extract_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match res {
+                Ok(events) => {
+                    metrics::counter!(
+                        "pharos_subtitle_image_extract_total",
+                        "outcome" => ImageExtractOutcome::Complete.label()
+                    )
+                    .increment(1);
+                    let decode_errors = read_manifest(&dir)
+                        .await
+                        .and_then(|m| m.get("decode_errors")?.as_u64())
+                        .unwrap_or(0);
+                    tracing::info!(
+                        path = %key.path.display(),
+                        rel_idx = key.stream_index,
+                        events,
+                        decode_errors,
+                        extract_ms,
+                        dir = %dir.display(),
+                        "image subtitle extraction complete"
+                    );
+                    scans.lock().await.remove(&key);
+                }
+                Err(e) => {
+                    metrics::counter!(
+                        "pharos_subtitle_image_extract_total",
+                        "outcome" => ImageExtractOutcome::Failed.label()
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        error = %e,
+                        path = %key.path.display(),
+                        rel_idx = key.stream_index,
+                        extract_ms,
+                        "image subtitle extraction failed; the track has no images for the rest of this run"
+                    );
+                    scans.lock().await.insert(key, WinScan::Failed);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+    fn spawn_image_extraction(&self, _key: Key, _duration_ms: u64, _dir: PathBuf) {}
+
     /// On-disk path for a key: `{root}/subtitles/{hash(path)}-{mtime}-{idx}-{k}.sub`.
     /// The source path is hashed (it contains `/` and arbitrary chars); mtime +
     /// index + kind keep distinct extractions apart and invalidate on edit.
@@ -299,6 +471,7 @@ impl SubtitleCache {
             SubtitleKind::EmbeddedAss => 'a',
             SubtitleKind::EmbeddedSrt => 'r',
             SubtitleKind::EventWindows => 'w',
+            SubtitleKind::Images => 'i',
         };
         Some(root.join("subtitles").join(format!(
             "{ph:016x}-{}-{}-{k}.sub",
@@ -480,6 +653,19 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
+/// `dir`'s manifest, `None` before its first write.
+async fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
+    let bytes = tokio::fs::read(dir.join("manifest.json")).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether `dir`'s manifest says its extraction read the whole stream.
+async fn manifest_complete(dir: &Path) -> bool {
+    read_manifest(dir)
+        .await
+        .is_some_and(|m| m.get("complete").and_then(serde_json::Value::as_bool) == Some(true))
+}
+
 /// Read the source path's mtime as seconds since epoch. Returns `0`
 /// when the file is missing or stat fails — handlers fall through to
 /// "always miss" behaviour, which is the conservative default.
@@ -499,6 +685,125 @@ pub async fn mtime_secs(path: &std::path::Path) -> i64 {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn a_cache_without_a_disk_root_or_pool_extracts_no_images() {
+        let cache = SubtitleCache::new(1 << 20, 16);
+        assert!(!cache.extracts_images());
+        assert_eq!(
+            cache.image_subtitles(Path::new("/m/a.mkv"), 1, 0, 0).await,
+            None
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let disk_only = SubtitleCache::new(1 << 20, 16).with_disk(tmp.path());
+        assert!(
+            !disk_only.extracts_images(),
+            "a disk root alone cannot decode"
+        );
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    fn image_cache(root: &Path) -> SubtitleCache {
+        // A worker that cannot start: every extraction fails.
+        let pool = pharos_transcode::worker::LibavWorkerPool::new("/nonexistent/worker", 1);
+        SubtitleCache::new(1 << 20, 16)
+            .with_disk(root)
+            .with_pool(pool)
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    #[test]
+    fn a_failed_image_extraction_is_counted_and_the_track_stops_asking() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = image_cache(tmp.path());
+        let src = Path::new("/m/fringe.mkv");
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (first, later) = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let first = cache.image_subtitles(src, 7, 0, 0).await;
+                let mut later = None;
+                for _ in 0..100 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    later = cache.image_subtitles(src, 7, 0, 0).await;
+                    if later == Some(ImageSubs::Failed) {
+                        break;
+                    }
+                }
+                (first, later)
+            })
+        });
+
+        assert!(
+            matches!(first, Some(ImageSubs::Dir(_))),
+            "the first ask starts an extraction: {first:?}"
+        );
+        assert_eq!(later, Some(ImageSubs::Failed));
+        let failed = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == "pharos_subtitle_image_extract_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == "failed")
+            })
+            .map(|(.., v)| v);
+        assert_eq!(
+            failed,
+            Some(DebugValue::Counter(1)),
+            "one extraction, counted once"
+        );
+    }
+
+    #[test]
+    fn image_extraction_outcome_labels_are_distinct() {
+        let labels = [ImageExtractOutcome::Complete, ImageExtractOutcome::Failed]
+            .map(ImageExtractOutcome::label);
+        assert_eq!(labels, ["complete", "failed"]);
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    #[tokio::test]
+    async fn a_complete_manifest_on_disk_is_served_without_extracting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = image_cache(tmp.path());
+        let src = Path::new("/m/fringe.mkv");
+        let dir = cache.image_dir(src, 7, 0).unwrap();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("manifest.json"), br#"{"complete":true}"#)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let got = cache.image_subtitles(src, 7, 0, 0).await;
+            assert_eq!(got, Some(ImageSubs::Dir(dir.clone())));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    #[test]
+    fn image_directories_are_versioned_and_per_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = image_cache(tmp.path());
+        let a = cache.image_dir(Path::new("/m/x.mkv"), 1, 0).unwrap();
+        let b = cache.image_dir(Path::new("/m/x.mkv"), 1, 1).unwrap();
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.ends_with(&format!("-0-i{IMAGE_SUB_GEN_VERSION}")),
+            "{name}"
+        );
+        assert!(a.starts_with(tmp.path().join("subtitles")));
+    }
 
     #[tokio::test]
     async fn miss_returns_none() {
