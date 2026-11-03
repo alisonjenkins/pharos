@@ -174,8 +174,15 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
+        let target = browse_target(state, parent.as_deref()).await;
         if let Some(grouping) = grouping {
             let listed = library::grouped(state, &user, parent.as_deref(), grouping, &query).await;
+            record_browse(
+                parent.as_deref(),
+                target,
+                listed.as_ref().ok().map(|p| (p.items.len(), p.total)),
+                query.start_index,
+            );
             write_grouped(
                 results.get().init_result(),
                 listed,
@@ -191,6 +198,12 @@ impl server::library::Handler for Library {
         }
         .map_err(ListError::Store);
         record_query(QUERY_SHAPE_STORED, listed.is_ok());
+        record_browse(
+            parent.as_deref(),
+            target,
+            listed.as_ref().ok().map(|p| (p.items.len(), p.total)),
+            query.start_index,
+        );
         write_listing(
             results.get().init_result(),
             listed,
@@ -527,6 +540,121 @@ fn record_query(shape: &'static str, ok: bool) {
         "outcome" => if ok { "ok" } else { "error" }
     )
     .increment(1);
+}
+
+/// What a native browse is listing the children of. The `level` label of
+/// `pharos_rpc_browse_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowseLevel {
+    /// A library view.
+    Library,
+    /// A series: its seasons.
+    Series,
+    /// A season: its episodes.
+    Season,
+    /// Anything else: no parent, a genre, a collection, an unknown id.
+    Other,
+}
+
+impl BrowseLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowseLevel::Library => "library",
+            BrowseLevel::Series => "series",
+            BrowseLevel::Season => "season",
+            BrowseLevel::Other => "other",
+        }
+    }
+}
+
+/// The `kind` label of `pharos_rpc_browse_total`: the library kind browsed,
+/// `tvshows` for the levels under a TV library, `none` for a parent that is
+/// no library.
+fn browse_kind_label(kind: Option<LibraryKind>) -> &'static str {
+    kind.map_or("none", LibraryKind::collection_type)
+}
+
+/// The level and library kind a `Library.query` parent names, resolved by
+/// the same `resolve_parent_filter` the listing uses. A store error counts as
+/// `other`: the listing reports it itself.
+async fn browse_target(
+    state: &AppState,
+    parent: Option<&str>,
+) -> (BrowseLevel, Option<LibraryKind>) {
+    use crate::api::jellyfin::items::{resolve_parent_filter, ParentResolution};
+    use pharos_core::ParentFilter;
+    match resolve_parent_filter(state, parent).await {
+        Ok(ParentResolution::Filter(ParentFilter::Library { wire_id })) => {
+            let kind = state
+                .libraries()
+                .iter()
+                .find(|l| l.wire_id == wire_id)
+                .map(|l| l.kind);
+            (BrowseLevel::Library, kind)
+        }
+        Ok(ParentResolution::PathPrefix(root)) => {
+            let kind = state
+                .libraries()
+                .iter()
+                .find(|l| l.root_path == root)
+                .map_or(LibraryKind::Mixed, |l| l.kind);
+            (BrowseLevel::Library, Some(kind))
+        }
+        Ok(ParentResolution::Filter(ParentFilter::Series { .. })) => {
+            (BrowseLevel::Series, Some(LibraryKind::TvShows))
+        }
+        Ok(ParentResolution::Filter(ParentFilter::Season { .. })) => {
+            (BrowseLevel::Season, Some(LibraryKind::TvShows))
+        }
+        _ => (BrowseLevel::Other, None),
+    }
+}
+
+/// Records a native browse: a count under `pharos_rpc_browse_total{level,kind}`
+/// for every query, and, when it had a page (`listed` is its item count and
+/// total), a line with the parent, level and counts. An empty container logs
+/// at INFO (a library, series or season that lists nothing is the symptom of
+/// a browse that cannot reach its children); everything else at DEBUG. A
+/// query without a page is logged by its refusal.
+fn record_browse(
+    parent: Option<&str>,
+    target: (BrowseLevel, Option<LibraryKind>),
+    listed: Option<(usize, u32)>,
+    start: u32,
+) {
+    let (level, kind) = target;
+    let kind = browse_kind_label(kind);
+    metrics::counter!(
+        "pharos_rpc_browse_total",
+        "level" => level.label(),
+        "kind" => kind
+    )
+    .increment(1);
+    let Some((count, total)) = listed else {
+        return;
+    };
+    let parent = parent.unwrap_or("");
+    if count == 0 && level != BrowseLevel::Other {
+        tracing::info!(
+            parent,
+            level = level.label(),
+            kind,
+            count,
+            total,
+            start,
+            "native browse: empty listing"
+        );
+    } else {
+        tracing::debug!(
+            parent,
+            level = level.label(),
+            kind,
+            count,
+            total,
+            start,
+            "native browse"
+        );
+    }
 }
 
 /// A grouped listing's page, each group read from its Jellyfin DTO the way
@@ -954,7 +1082,7 @@ fn segment_kind(kind: &str) -> Option<SegmentKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::RefusalReason;
+    use super::{BrowseLevel, RefusalReason};
     use crate::services::access::ItemHidden;
 
     /// A renamed or merged label breaks dashboards silently.
@@ -979,6 +1107,20 @@ mod tests {
             ]
             .map(RefusalReason::label),
         );
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
+    }
+
+    /// A renamed or merged label breaks dashboards silently.
+    #[test]
+    fn browse_level_labels_are_distinct() {
+        let labels = [
+            BrowseLevel::Library,
+            BrowseLevel::Series,
+            BrowseLevel::Season,
+            BrowseLevel::Other,
+        ]
+        .map(BrowseLevel::label);
         let distinct: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(distinct.len(), labels.len(), "{labels:?}");
     }

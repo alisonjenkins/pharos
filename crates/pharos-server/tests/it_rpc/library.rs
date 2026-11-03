@@ -2212,3 +2212,76 @@ async fn native_detail_lists_the_tracks_and_segments_the_jellyfin_routes_serve()
     // Trickplay is off in this fixture, so no sprite set is advertised.
     assert_eq!(d.get_trickplay().unwrap().len(), 0);
 }
+
+/// A native browse is visible: one count per call under
+/// `pharos_rpc_browse_total{level,kind}`, whichever listing answers it, and a
+/// line with the parent, level and result count; an empty container logs at
+/// INFO. It complements `pharos_rpc_query_total`, which says which listing
+/// answered.
+/// Disarm check: with `record_browse` not incrementing the counter (or not
+/// logging), this fails.
+#[actix_web::test]
+async fn native_browses_are_counted_by_level_and_kind() {
+    use crate::telemetry::{connect, counter, session_for, subscriber, Captured};
+    use pharos_core::{LibraryKind, LibraryStore as _};
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+
+    let fx = crate::common::seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let tv = seed_tv_library(&fx).await;
+    let empty = "d".repeat(32);
+    fx.state
+        .stores
+        .upsert_library("Empty TV", "/libEmpty", LibraryKind::TvShows, &empty)
+        .await
+        .unwrap();
+    let libraries = fx.state.stores.libraries().await.unwrap();
+    fx.state.set_libraries(libraries);
+    let series = series_id_for_key(Some("/libTV/Show"), "Show");
+    let season = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            listed(&session, &fx.lib_a_wire, &[], "").await;
+            listed(&session, &tv, &[], "").await;
+            listed(&session, &tv, &[Kind::Series], "").await;
+            listed(&session, &empty, &[Kind::Series], "").await;
+            listed(&session, &series, &[Kind::Season], "").await;
+            listed(&session, &season, &[], "").await;
+            let _ = wire_query(&session, None, &[], "", false, "", &[], 0, 0).await;
+        })
+        .await;
+    let browses = |level, kind| {
+        counter(
+            &snapshotter,
+            "pharos_rpc_browse_total",
+            &[("level", level), ("kind", kind)],
+        )
+    };
+    assert_eq!(browses("library", "movies"), 1);
+    assert_eq!(browses("library", "tvshows"), 3);
+    assert_eq!(browses("series", "tvshows"), 1);
+    assert_eq!(browses("season", "tvshows"), 1);
+    assert_eq!(browses("other", "none"), 1);
+    assert_eq!(browses("season", "movies"), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("INFO")
+            && text.contains("native browse: empty listing")
+            && text.contains(&format!("parent=\"{empty}\""))
+            && text.contains("level=\"library\"")
+            && text.contains("count=0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("DEBUG")
+            && text.contains(&format!("parent=\"{season}\""))
+            && text.contains("native browse"),
+        "{text}"
+    );
+}
