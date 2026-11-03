@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 5;
+const schemaVersion :UInt32 = 6;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -159,6 +159,7 @@ interface Library {
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
   index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
+  lyrics @9 (ctx :CallContext, id :ItemId) -> (result :LyricsResult);
 }
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
@@ -188,6 +189,14 @@ struct Trickplay {
 enum SegmentKind { intro @0; outro @1; recap @2; preview @3; commercial @4; }
 struct Segment { kind @0 :SegmentKind; startMs @1 :UInt64; endMs @2 :UInt64; }
 struct DetailResult { union { detail @0 :ItemDetail; error @1 :Error; } }
+# A song's lyrics. `synced`: every line has a `startMs` to follow along by;
+# otherwise `startMs` is 0 and the lines are plain text, a blank line between
+# verses. No lines means the song has none. `source` names where they came
+# from: `sidecar_lrc`, `embedded_synced`, `embedded_text`, `sidecar_text` or
+# `online`, empty when there are none.
+struct LyricLine { startMs @0 :UInt64; text @1 :Text; }
+struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; }
+struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
 
 interface UserData {
   setPlayed @0 (ctx :CallContext, id :ItemId, played :Bool) -> (result :UserStateResult);
