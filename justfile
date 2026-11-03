@@ -176,14 +176,27 @@ compat-dioxus-full native="on" port="8096":
       status=$?
       if [[ -f "$TMP/pharos.pid" ]]; then
         pid=$(cat "$TMP/pharos.pid")
+        children=$(pgrep -P "$pid" || true)
         kill "$pid" 2>/dev/null || true
-        for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+        # Bounded by actix's 30 s shutdown_timeout; drain_grace_secs is 0 here.
+        for _ in $(seq 1 350); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        if kill -0 "$pid" 2>/dev/null; then
+          echo "compat-dioxus-full: pharos ignored SIGTERM for 35 s, killing it" >&2
+          kill -KILL "$pid" 2>/dev/null || true
+        fi
+        # Transcode workers write into $TMP too; never remove it under them.
+        for c in $children; do kill "$c" 2>/dev/null || true; done
+        for _ in $(seq 1 50); do
+          alive=""; for c in $children; do kill -0 "$c" 2>/dev/null && alive=1; done
+          [[ -z "$alive" ]] && break; sleep 0.1
+        done
+        [[ -n "${SERVE_JOB:-}" ]] && wait "$SERVE_JOB" 2>/dev/null || true
       fi
       if [[ $status -ne 0 && -f "$TMP/pharos.log" ]]; then
         echo "compat-dioxus-full: pharos log tail:" >&2
         tail -n 50 "$TMP/pharos.log" >&2 || true
       fi
-      rm -rf "$TMP"
+      if ! rm -rf "$TMP" 2>/dev/null; then sleep 1; rm -rf "$TMP"; fi
       exit "$status"
     }
     trap cleanup EXIT
@@ -213,6 +226,7 @@ compat-dioxus-full native="on" port="8096":
     [server]
     bind = "127.0.0.1:{{ port }}"
     name = "pharos-playwright"
+    drain_grace_secs = 0
     ui_dir = "$UI_DIR"
     image_cache_dir = "$TMP/images"
     trickplay_cache_dir = "$TMP/trickplay"
@@ -247,6 +261,7 @@ compat-dioxus-full native="on" port="8096":
     if [[ -r /proc/self/mountinfo ]]; then grep -E ' /nix(/| )' /proc/self/mountinfo | sed 's/^/  mount: /' || true; fi
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
     nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
+    SERVE_JOB=$!
     for _ in $(seq 1 120); do
       if curl -fsS -o /dev/null http://127.0.0.1:{{ port }}/ui/ 2>/dev/null; then ready=1; break; fi
       sleep 1
