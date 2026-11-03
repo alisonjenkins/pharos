@@ -4,13 +4,16 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 
 use super::platform;
 use super::playback::{clock, MediaEvent, MediaState};
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
-use super::watch_view::{total_ms, transport_key, Control, Volume, SEEK_STEP_MS, VIDEO_ID};
-use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+use super::watch_view::{
+    total_ms, transport_key, wheel_control, wheel_notches, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
+};
+use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
 use crate::render::{self, Fallback, Frame, Surface};
 
@@ -96,10 +99,15 @@ pub fn ListenView(
     genres: Vec<String>,
     runtime_ms: u64,
     media: MediaState,
+    /// The tracks before and after this one on its album.
+    previous: Option<ItemRef>,
+    next: Option<ItemRef>,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
 ) -> Element {
     let tap = use_hook(Tap::default);
+    // Wheel travel short of a whole notch, kept for the next event.
+    let mut wheel_carry = use_signal(|| 0.0_f64);
     let mut style =
         use_signal(|| Style::parse(platform::stored_theme(STYLE_KEY).ok().flatten().as_deref()));
     let mut fallback = use_signal(|| None::<Fallback>);
@@ -131,7 +139,12 @@ pub fn ListenView(
     };
     let meta = meta_line(year, &genres);
     let on_key = move |evt: KeyboardEvent| {
-        if let Some(control) = transport_key(&evt.key(), &media) {
+        let control = match evt.key() {
+            Key::Character(k) if k == "N" => next.map(Control::Play),
+            Key::Character(k) if k == "P" => previous.map(Control::Play),
+            key => transport_key(&key, &media),
+        };
+        if let Some(control) = control {
             evt.prevent_default();
             on_control.call(control);
         }
@@ -141,6 +154,35 @@ pub fn ListenView(
             class: "pharos-listen",
             tabindex: 0,
             onkeydown: on_key,
+            onwheel: move |evt: WheelEvent| {
+                evt.prevent_default();
+                let (notches, rest) = wheel_notches(wheel_carry(), evt.delta());
+                wheel_carry.set(rest);
+                if let Some(control) = wheel_control(notches, evt.modifiers().shift(), media) {
+                    on_control.call(control);
+                }
+            },
+            // Shift+click is the previous track, Shift+right click the next,
+            // which opens no menu (Firefox opens its own regardless).
+            onclick: move |evt: MouseEvent| {
+                if evt.modifiers().shift() {
+                    if let Some(id) = previous {
+                        on_control.call(Control::Play(id));
+                    }
+                }
+            },
+            oncontextmenu: move |evt: MouseEvent| {
+                if evt.modifiers().shift() {
+                    evt.prevent_default();
+                }
+            },
+            onmouseup: move |evt: MouseEvent| {
+                if evt.trigger_button() == Some(MouseButton::Secondary) && evt.modifiers().shift() {
+                    if let Some(id) = next {
+                        on_control.call(Control::Play(id));
+                    }
+                }
+            },
             "data-playing": if media.paused { "false" } else { "true" },
             if let (Some(program), None) = (current.program(), fallback()) {
                 Visualiser {
