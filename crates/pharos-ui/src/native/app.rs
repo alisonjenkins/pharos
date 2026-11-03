@@ -1446,6 +1446,8 @@ fn Player(
                 genres: p.detail.genres.clone(),
                 runtime_ms: p.detail.item.runtime_ms,
                 media: media(),
+                previous: near.previous,
+                next: near.next,
                 on_media,
                 on_control,
             }
