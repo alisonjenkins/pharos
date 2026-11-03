@@ -350,6 +350,25 @@
                    $out
           '';
 
+        # Track-switch fixture: testsrc + two audio tracks (440 Hz eng,
+        # 880 Hz jpn). Picking the second track renegotiates playback.
+        dualAudioWebm =
+          pkgs.runCommand "test-dual-audio.webm"
+            { nativeBuildInputs = [ pkgs.ffmpeg-headless ]; } ''
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "testsrc=duration=10:size=640x480:rate=30" \
+                   -f lavfi -i "sine=frequency=440:duration=10:sample_rate=48000" \
+                   -f lavfi -i "sine=frequency=880:duration=10:sample_rate=48000" \
+                   -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                   -pix_fmt yuv420p \
+                   -c:a libopus -b:a 64k \
+                   -map 0:v:0 -map 1:a:0 -map 2:a:0 \
+                   -metadata:s:a:0 language=eng \
+                   -metadata:s:a:1 language=jpn \
+                   -shortest \
+                   $out
+          '';
+
         # Assembly-only derivation. Pure cp + cat — no ffmpeg here.
         # Each cp is from an already-cached store path; the assembly
         # itself is cheap and re-runs trivially when any one sub-fixture
@@ -364,6 +383,7 @@
           cp ${avConfirmWebm} $out/06-test-av-confirm.webm
           cp ${subtitlesVtt}  $out/07-test-subtitles.vtt
           cp ${subtitlesWebm} $out/07-test-subtitles.webm
+          cp ${dualAudioWebm} $out/08-test-dual-audio.webm
           cat > $out/LICENSES.txt <<EOF
         01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
@@ -373,6 +393,7 @@
         06-test-av-confirm.webm       Synthetic       ffmpeg lavfi testsrc + 440 Hz sine, generated at build time
         07-test-subtitles.webm        Synthetic       testsrc + 523 Hz tone + embedded WebVTT track (English)
         07-test-subtitles.vtt         Synthetic       sidecar VTT for 07-test-subtitles.webm
+        08-test-dual-audio.webm       Synthetic       testsrc + 440 Hz (eng) and 880 Hz (jpn) audio tracks
         EOF
         '';
 
