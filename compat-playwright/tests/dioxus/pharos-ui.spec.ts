@@ -455,6 +455,97 @@ test.describe("pharos Dioxus UI", () => {
       expect(await page.evaluate(() => window.scrollY)).toBe(y);
     });
 
+    // A library jumps by first letter (V252): the rail on the right goes
+    // straight to one, reading ahead past the first page; Shift+wheel steps
+    // between letters; a date order hides the rail. The seed's "Bulk" names
+    // run AA, BB, ... ZZ, so Z starts past the first 100 tiles.
+    test("browse jumps a library by letter and sorts it by date added", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-letters-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const json = async (path: string) =>
+        (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+      const views = await json(`/Users/${user.Id}/Views`);
+      const bulk = views.Items?.find((i: { Name: string }) => i.Name === "Bulk");
+      test.skip(!bulk, "the seed has no Bulk library");
+      await expect
+        .poll(
+          async () =>
+            (
+              await json(
+                `/Users/${user.Id}/Items?ParentId=${bulk.Id}&Recursive=true&Limit=1`,
+              )
+            ).TotalRecordCount ?? 0,
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(100);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.locator("section.pharos-rail h2 a", { hasText: /^Bulk$/ }).click();
+      const tiles = page.locator("section.pharos-browse ul.pharos-grid li");
+      await expect(tiles.first()).toBeVisible({ timeout: 15_000 });
+      const rail = page.getByRole("navigation", { name: "Jump to letter" });
+      await expect(rail).toBeVisible({ timeout: 15_000 });
+      await expect(rail.getByRole("button", { name: "Numbers and symbols" })).toBeDisabled();
+
+      // Z lies past the first page: the jump reads ahead to it.
+      expect(await tiles.count()).toBe(100);
+      await rail.getByRole("button", { name: "Z", exact: true }).click();
+      const firstZ = tiles.filter({ hasText: /^ZZ Bulk/ }).first();
+      await expect(firstZ).toBeInViewport({ timeout: 15_000 });
+      expect(await tiles.count()).toBeGreaterThan(100);
+      await expect(rail.getByRole("button", { name: "Z", exact: true })).toHaveAttribute(
+        "aria-current",
+        "true",
+      );
+
+      // Shift+wheel up steps back one letter, to Y, and leaves the page
+      // where the jump put it otherwise.
+      await page.mouse.move(400, 400);
+      await page.keyboard.down("Shift");
+      await page.mouse.wheel(0, -120);
+      await page.keyboard.up("Shift");
+      await expect(tiles.filter({ hasText: /^YY Bulk/ }).first()).toBeInViewport();
+      await expect(rail.getByRole("button", { name: "Y", exact: true })).toHaveAttribute(
+        "aria-current",
+        "true",
+      );
+
+      // A plain wheel still scrolls the page (B295).
+      const before = await page.evaluate(() => window.scrollY);
+      await page.mouse.wheel(0, -300);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeLessThan(before);
+
+      // Date added, newest first: no letters to jump by.
+      await page.getByLabel("Sort", { exact: true }).selectOption("added");
+      await expect(rail).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /Sort direction: Newest first/ })).toBeVisible();
+      await expect(tiles.first()).toBeVisible();
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await page.evaluate(() => window.scrollTo(0, 0));
+    });
+
     // A TV library lists its series by name and a series opens the show page
     // with its episodes; every step is a click, not a URL.
     test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
