@@ -14,7 +14,7 @@ use pharos_client::{CallInfo, ClientError};
 
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::backdrop::Backdrop;
-use super::browse;
+use super::browse::{self, Neighbours};
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::listen::ListenView;
@@ -833,7 +833,9 @@ fn Screen(route: Route) -> Element {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
         Route::Title(id) => rsx! { TitleScreen { id } },
-        Route::Watch(id) => rsx! { WatchScreen { id } },
+        // Another item (the next episode) mounts a new playback rather than
+        // re-rendering this one's.
+        Route::Watch(id) => remount_on(&id.to_string(), rsx! { WatchScreen { id } }),
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
@@ -1358,6 +1360,7 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::Play(id) => nav.0.call(Route::Watch(id)),
                 Control::Back => {
                     if !platform::go_back() {
                         nav.0.call(Route::Home);
@@ -1389,6 +1392,26 @@ fn Player(
         }
     };
 
+    let episode = p.detail.item.clone();
+    let near = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let episode = episode.clone();
+        async move {
+            if episode.kind != ItemKind::Episode {
+                return Neighbours::default();
+            }
+            let Some(api) = api else {
+                return Neighbours::default();
+            };
+            browse::neighbours(&api, &call("watch", "neighbours"), &episode)
+                .await
+                .unwrap_or_else(|e| {
+                    platform::warn(&format!("pharos: episode neighbours unavailable: {e}"));
+                    Neighbours::default()
+                })
+        }
+    });
+    let near = (*near.read()).unwrap_or_default();
     let controls = Controls {
         media: media(),
         runtime_ms: p.detail.item.runtime_ms,
@@ -1400,6 +1423,8 @@ fn Player(
         subtitles: p.detail.subtitle_tracks.clone(),
         audio_pick: p.audio,
         subtitle_pick: subtitle(),
+        previous: near.previous,
+        next: near.next,
     };
     rsx! {
         if let Some(message) = failed() {

@@ -4,7 +4,7 @@
 //! calls on the `<video>` or a new playback.
 
 use dioxus::prelude::*;
-use pharos_client::api::{Chapter, Segment, Track, Trickplay};
+use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
 use super::platform;
 use super::playback::{
@@ -44,6 +44,9 @@ pub struct Controls {
     pub audio_pick: Option<u32>,
     /// The subtitle on screen, rendered or burned; `None` is off.
     pub subtitle_pick: Option<u32>,
+    /// The episodes before and after this one, when it is an episode.
+    pub previous: Option<ItemRef>,
+    pub next: Option<ItemRef>,
 }
 
 impl Controls {
@@ -73,6 +76,8 @@ pub enum Control {
     Fullscreen,
     /// Leave the player for the page before it.
     Back,
+    /// Play another item: the previous or next episode.
+    Play(ItemRef),
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -123,6 +128,7 @@ pub fn WatchView(
         (false, true) => "pharos-player is-idle",
         (false, false) => "pharos-player",
     };
+    let (previous, next) = (c.previous, c.next);
     let on_key = move |evt: KeyboardEvent| {
         wake();
         let back = |by: u64| Control::Seek(media.position_ms.saturating_sub(by));
@@ -131,6 +137,14 @@ pub fn WatchView(
             muted: false,
         };
         let control = match evt.key() {
+            Key::Character(k) if k == "N" => match next {
+                Some(id) => Control::Play(id),
+                None => return,
+            },
+            Key::Character(k) if k == "P" => match previous {
+                Some(id) => Control::Play(id),
+                None => return,
+            },
             Key::Character(k) if k == " " || k == "k" => Control::TogglePlay,
             Key::Character(k) if k == "m" => Control::Volume {
                 volume: media.volume,
@@ -224,6 +238,24 @@ pub fn WatchView(
                             aria_label: if media.paused { "Play" } else { "Pause" },
                             onclick: move |_| on_control.call(Control::TogglePlay),
                             if media.paused { "▶" } else { "❚❚" }
+                        }
+                        if let Some(id) = c.previous {
+                            button {
+                                class: "pharos-control",
+                                r#type: "button",
+                                aria_label: "Previous episode",
+                                onclick: move |_| on_control.call(Control::Play(id)),
+                                "⏮"
+                            }
+                        }
+                        if let Some(id) = c.next {
+                            button {
+                                class: "pharos-control",
+                                r#type: "button",
+                                aria_label: "Next episode",
+                                onclick: move |_| on_control.call(Control::Play(id)),
+                                "⏭"
+                            }
                         }
                         span { class: "pharos-time",
                             "{clock(media.position_ms)} / {clock(total)}"
@@ -520,6 +552,17 @@ mod tests {
         assert!(player.is_some() && top > player, "{html}");
         assert!(html.contains(r#"aria-label="Back""#), "{html}");
         assert!(html.contains("Pilot"), "{html}");
+    }
+
+    #[test]
+    fn episode_buttons_show_only_where_there_is_an_episode() {
+        let html = render(controls());
+        assert!(!html.contains("Previous episode") && !html.contains("Next episode"));
+        let mut c = controls();
+        c.next = Some(ItemRef::Real(8));
+        let html = render(c);
+        assert!(!html.contains("Previous episode"), "{html}");
+        assert!(html.contains(r#"aria-label="Next episode""#), "{html}");
     }
 
     #[test]
