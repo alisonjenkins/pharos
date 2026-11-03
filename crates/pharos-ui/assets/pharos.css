@@ -445,6 +445,16 @@ body:has(.pharos-watch) .pharos-error {
   background: linear-gradient(transparent, rgb(0 0 0 / 0.75)); /* not themed: controls sit on the video, whose colours no theme sets */
   transition: opacity 0.2s;
 }
+/* Playing with the pointer at rest: only the picture (and its subtitles). */
+.pharos-player.is-idle {
+  cursor: none;
+}
+.pharos-player.is-idle:not(:has(:focus-visible)) .pharos-watch-top,
+.pharos-player.is-idle:not(:has(:focus-visible)) .pharos-controls,
+.pharos-player.is-idle:not(:has(:focus-visible)) .pharos-skip {
+  opacity: 0;
+  pointer-events: none;
+}
 .pharos-control-row {
   display: flex;
   align-items: center;
@@ -642,6 +652,7 @@ body:has(.pharos-watch) .pharos-error {
 
 @media (prefers-reduced-motion: reduce) {
   .pharos-button,
+  .pharos-watch-top,
   .pharos-controls,
   .pharos-seek-track {
     transition: none;

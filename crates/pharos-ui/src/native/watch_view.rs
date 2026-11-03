@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Segment, Track, Trickplay};
 
+use super::platform;
 use super::playback::{
     clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
 };
@@ -21,6 +22,9 @@ pub const SEEK_ID: &str = "pharos-seek";
 const SEEK_STEP_MS: u64 = 10_000;
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
+/// How often a playing picture checks for a still pointer; the chrome fades
+/// one to two ticks after the last movement.
+const IDLE_TICK_MS: u32 = 1_500;
 
 /// Everything the controls show.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -84,12 +88,43 @@ pub fn WatchView(
     let c = &controls;
     let total = c.total_ms();
     let media = c.media;
-    let class = if media.paused {
-        "pharos-player is-paused"
-    } else {
-        "pharos-player"
+    // The chrome over the picture fades while the pointer rests, as in any
+    // modern player: `stirred` records movement since the last tick, and one
+    // ticking task runs while the chrome is shown.
+    let mut idle = use_signal(|| false);
+    let mut stirred = use_signal(|| false);
+    let mut ticking = use_signal(|| false);
+    // A tap that only brings the chrome back must not also pause.
+    let mut woke_by_tap = use_signal(|| false);
+    let mut wake = move || {
+        stirred.set(true);
+        if *idle.peek() {
+            idle.set(false);
+        }
+        if *ticking.peek() {
+            return;
+        }
+        ticking.set(true);
+        spawn(async move {
+            loop {
+                platform::sleep_ms(IDLE_TICK_MS).await;
+                if !*stirred.peek() {
+                    break;
+                }
+                stirred.set(false);
+            }
+            ticking.set(false);
+            idle.set(true);
+        });
+    };
+    use_hook(wake);
+    let class = match (media.paused, idle()) {
+        (true, _) => "pharos-player is-paused",
+        (false, true) => "pharos-player is-idle",
+        (false, false) => "pharos-player",
     };
     let on_key = move |evt: KeyboardEvent| {
+        wake();
         let back = |by: u64| Control::Seek(media.position_ms.saturating_sub(by));
         let volume = |v: f64| Control::Volume {
             volume: v.clamp(0.0, 1.0),
@@ -126,12 +161,23 @@ pub fn WatchView(
                 class,
                 tabindex: 0,
                 onkeydown: on_key,
+                onpointermove: move |_| wake(),
+                onpointerdown: move |evt: PointerEvent| {
+                    woke_by_tap.set(evt.pointer_type() == "touch" && idle());
+                    wake();
+                },
                 video {
                     id: VIDEO_ID,
                     class: "pharos-video",
                     autoplay: true,
                     playsinline: true,
-                    onclick: move |_| on_control.call(Control::TogglePlay),
+                    onclick: move |_| {
+                        if woke_by_tap() {
+                            woke_by_tap.set(false);
+                        } else {
+                            on_control.call(Control::TogglePlay);
+                        }
+                    },
                     onplaying: move |_| on_media.call(MediaEvent::Playing),
                     onpause: move |_| on_media.call(MediaEvent::Pause),
                     onseeked: move |_| on_media.call(MediaEvent::Seeked),
