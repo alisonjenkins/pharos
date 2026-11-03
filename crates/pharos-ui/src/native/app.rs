@@ -21,7 +21,7 @@ use super::approve_device;
 use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
 use super::diagnostics;
-use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
+use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupPlayer, GroupView, Ui};
 use super::listen::ListenView;
@@ -45,8 +45,8 @@ use super::together_view::{InviteView, TogetherView};
 use super::track_follow;
 use super::trail;
 use super::views::{
-    ErrorNote, FindView, Hits, HomeView, Loading, MarkPlayed, Nav, PlayFromStart, Shell,
-    SignInView, StatusView, TitleView,
+    open_route, ErrorNote, FindView, Hits, HomeView, Loading, MarkPlayed, Nav, PlayFromStart,
+    SearchBox, Shell, SignInView, StatusView, TitleView, FIND_INPUT,
 };
 use super::watch_view::{
     text_track_id, total_ms, Control, Controls, UpNextCard, WatchView, OUTGOING_ID, PLAYER_ID,
@@ -1005,6 +1005,12 @@ fn NativeApp(route: Route) -> Element {
             });
         }))
     });
+    let search = Search {
+        text: use_signal(String::new),
+        find: use_signal(Find::default),
+        hits: use_signal(|| Hits::Idle),
+    };
+    use_context_provider(|| search);
     let nav = use_context::<Nav>();
     let mut start_over = use_signal(|| None::<ItemRef>);
     use_context_provider(|| StartOver(start_over));
@@ -1121,6 +1127,7 @@ fn NativeApp(route: Route) -> Element {
             }
         };
         let me = me.read().clone().flatten();
+        let on_find = route == Route::Find;
         return rsx! {
             Shell {
                 libraries: libraries(),
@@ -1138,6 +1145,12 @@ fn NativeApp(route: Route) -> Element {
                                 machine.write().apply(Event::SignOutAnswered(reply));
                             });
                         },
+                    }
+                },
+                // The find screen has its own box over the same search.
+                search: rsx! {
+                    if !on_find {
+                        TopSearch {}
                     }
                 },
                 if let Some(message) = notice {
@@ -1334,42 +1347,127 @@ fn StageView() -> Element {
     }
 }
 
-/// The find screen: each edit of the box starts a debounced search, and only
-/// the reply to the newest edit is shown.
-#[component]
-fn FindScreen() -> Element {
-    let ctx = use_context::<Ctx>();
-    let mut text = use_signal(String::new);
-    let mut find = use_signal(Find::default);
-    let mut hits = use_signal(|| Hits::Idle);
-    let on_input = move |value: String| {
-        text.set(value.clone());
-        let Some(generation) = find.write().edit(&value) else {
-            hits.set(Hits::Idle);
+/// The one search the top bar's box and the find screen share, so a term
+/// typed in the bar is still there, with its matches, on the find screen.
+#[derive(Clone, Copy)]
+struct Search {
+    text: Signal<String>,
+    find: Signal<Find>,
+    hits: Signal<Hits>,
+}
+
+impl Search {
+    /// Each edit starts a debounced search, and only the reply to the newest
+    /// edit is kept.
+    fn edit(mut self, ctx: Ctx, value: String) {
+        let generation = self.find.write().edit(&value);
+        self.text.set(value);
+        let Some(generation) = generation else {
+            self.hits.set(Hits::Idle);
             return;
         };
         spawn(async move {
             platform::sleep_ms(DEBOUNCE_MS).await;
-            if !find.peek().is_current(generation) {
+            if !self.find.peek().is_current(generation) {
                 return;
             }
             let Some(api) = ctx.api.peek().clone() else {
                 return;
             };
-            let term = find.peek().term().to_owned();
+            let term = self.find.peek().term().to_owned();
             let reply = api
                 .search(&call("find", "search"), &term, RESULT_LIMIT)
                 .await;
-            if !find.peek().is_current(generation) {
+            if !self.find.peek().is_current(generation) {
                 return;
             }
             match settle(ctx.machine, reply) {
-                Ok(page) => hits.set(Hits::Found(page)),
-                Err(message) => hits.set(Hits::Failed(message)),
+                Ok(page) => self.hits.set(Hits::Found(page)),
+                Err(message) => self.hits.set(Hits::Failed(message)),
             }
         });
+    }
+}
+
+/// The find screen: every match for the shared search, with the cursor in
+/// its box so typing carries on from the top bar.
+#[component]
+fn FindScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let search = use_context::<Search>();
+    use_effect(|| platform::focus(FIND_INPUT));
+    let on_input = move |value: String| search.edit(ctx, value);
+    rsx! { FindView { text: (search.text)(), hits: (search.hits)(), on_input } }
+}
+
+/// The top bar's search box: the shared search's first matches in a list
+/// under it, walked with the arrow keys. Enter opens the match the arrows
+/// are on, or the find screen with all of them.
+#[component]
+fn TopSearch() -> Element {
+    let ctx = use_context::<Ctx>();
+    let search = use_context::<Search>();
+    let nav = use_context::<Nav>();
+    let mut open = use_signal(|| false);
+    let mut active = use_signal(|| None::<usize>);
+    let suggestions = move || match &*search.hits.peek() {
+        Hits::Found(page) => page
+            .items
+            .iter()
+            .take(find::SUGGEST_LIMIT)
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
     };
-    rsx! { FindView { text: text(), hits: hits(), on_input } }
+    let on_key = move |evt: KeyboardEvent| match evt.key() {
+        Key::ArrowDown | Key::ArrowUp => {
+            evt.prevent_default();
+            open.set(true);
+            let down = evt.key() == Key::ArrowDown;
+            let next = find::step(*active.peek(), suggestions().len(), down);
+            active.set(next);
+        }
+        Key::Enter => {
+            evt.prevent_default();
+            let picked = active
+                .peek()
+                .and_then(|at| suggestions().into_iter().nth(at));
+            open.set(false);
+            active.set(None);
+            match picked {
+                Some(item) => nav.0.call(open_route(&item)),
+                None if !search.text.peek().trim().is_empty() => nav.0.call(Route::Find),
+                None => {}
+            }
+        }
+        // A search input clears itself on Escape; the first press only
+        // closes the list, and a second, with the list shut, clears.
+        Key::Escape if *open.peek() => {
+            evt.prevent_default();
+            open.set(false);
+            active.set(None);
+        }
+        _ => {}
+    };
+    rsx! {
+        SearchBox {
+            text: (search.text)(),
+            hits: (search.hits)(),
+            open: open(),
+            active: active(),
+            on_input: move |value| {
+                open.set(true);
+                active.set(None);
+                search.edit(ctx, value);
+            },
+            on_key,
+            on_open: move |_| open.set(true),
+            on_close: move |_| {
+                open.set(false);
+                active.set(None);
+            },
+        }
+    }
 }
 
 /// The group client for the signed-in session, `None` while signed out.

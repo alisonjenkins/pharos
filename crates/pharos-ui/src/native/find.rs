@@ -9,6 +9,10 @@ pub const DEBOUNCE_MS: u32 = 250;
 /// second request, well under the server's `QUERY_MAX` cap.
 pub const RESULT_LIMIT: u32 = 50;
 
+/// How many matches the top bar's box lists under itself: enough to pick
+/// from at a glance; the rest are a "see all" away on the find screen.
+pub const SUGGEST_LIMIT: usize = 6;
+
 /// The newest edit of the find box. Every edit takes a new generation, so a
 /// timer or reply from an older edit is recognised as stale and dropped.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -38,9 +42,42 @@ impl Find {
     }
 }
 
+/// The suggestion an arrow key moves to among `len` of them, from `active`
+/// (`None`: the box itself). Down from the box takes the first, up from the
+/// first returns to the box, and both ends stop rather than wrap.
+pub fn step(active: Option<usize>, len: usize, down: bool) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    match (active, down) {
+        (None, true) => Some(0),
+        (None, false) => None,
+        (Some(at), true) => Some(at.saturating_add(1).min(last)),
+        (Some(at), false) => at.checked_sub(1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrows_walk_the_suggestions_and_stop_at_the_ends() {
+        assert_eq!(step(None, 3, true), Some(0));
+        assert_eq!(step(Some(0), 3, true), Some(1));
+        assert_eq!(step(Some(2), 3, true), Some(2));
+        assert_eq!(step(Some(1), 3, false), Some(0));
+        assert_eq!(
+            step(Some(0), 3, false),
+            None,
+            "up from the first is the box"
+        );
+        assert_eq!(step(None, 3, false), None);
+    }
+
+    #[test]
+    fn arrows_do_nothing_without_suggestions() {
+        assert_eq!(step(None, 0, true), None);
+        assert_eq!(step(Some(4), 0, false), None);
+    }
 
     #[test]
     fn blank_text_asks_nothing() {
