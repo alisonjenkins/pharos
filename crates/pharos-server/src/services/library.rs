@@ -971,17 +971,24 @@ pub const HOME_LATEST_DEFAULT: u32 = 16;
 pub const HOME_RESUME_DEFAULT: u32 = 12;
 pub const HOME_NEXT_UP_DEFAULT: u32 = 24;
 
+/// The kinds the home page's "Continue watching" row resumes. Music resumes
+/// in [`Home::listening`]; a book in neither.
+pub const WATCHING_KINDS: [MediaKind; 2] = [MediaKind::Movie, MediaKind::Episode];
+
 /// Everything the home page shows, in one answer: each library the user
-/// may see with its newest items, what to resume, and what is next up.
+/// may see with its newest items, the films and episodes to resume, the
+/// music to resume, and what is next up.
 #[derive(Debug)]
 pub struct Home {
     pub rails: Vec<(LibraryView, Vec<(MediaItem, UserItemData)>)>,
     pub resume: ListPage,
+    pub listening: ListPage,
     pub next_up: ListPage,
 }
 
 /// The home page for `user`, from [`views`], [`latest`], [`resume`] and
-/// [`next_up`]. A limit of `None` takes that rail's `HOME_*_DEFAULT`.
+/// [`next_up`]. A limit of `None` takes that rail's `HOME_*_DEFAULT`;
+/// `resume_limit` sizes both resume rows.
 pub async fn home(
     state: &AppState,
     user: &User,
@@ -995,23 +1002,23 @@ pub async fn home(
         let items = latest(state, user, Some(&view.id), &KindFilter::Unset, latest_n).await?;
         Ok::<_, ListError>((view, items))
     }));
-    let resume = resume(
-        state,
-        user,
-        &KindFilter::Unset,
-        0,
-        Some(resume_limit.unwrap_or(HOME_RESUME_DEFAULT)),
-    );
+    let resume_n = Some(resume_limit.unwrap_or(HOME_RESUME_DEFAULT));
+    let watching = KindFilter::Kinds(WATCHING_KINDS.to_vec());
+    let audio = KindFilter::Kinds(vec![MediaKind::Audio]);
+    let listening = resume(state, user, &audio, 0, resume_n);
+    let resume = resume(state, user, &watching, 0, resume_n);
     let next_up = next_up(
         state,
         user,
         None,
         Some(next_up_limit.unwrap_or(HOME_NEXT_UP_DEFAULT)),
     );
-    let (rails, resume, next_up) = futures_util::try_join!(rails, resume, next_up)?;
+    let (rails, resume, listening, next_up) =
+        futures_util::try_join!(rails, resume, listening, next_up)?;
     Ok(Home {
         rails,
         resume,
+        listening,
         next_up,
     })
 }
