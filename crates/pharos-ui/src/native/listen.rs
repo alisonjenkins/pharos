@@ -118,6 +118,9 @@ pub fn ListenView(
                     onseeked: move |_| on_media.call(MediaEvent::Seeked),
                     ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
                     onended: move |_| on_media.call(MediaEvent::Ended),
+                    onvolumechange: move |_| on_media.call(MediaEvent::Changed),
+                    ondurationchange: move |_| on_media.call(MediaEvent::Changed),
+                    onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
                 }
                 div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
                     for s in Style::ALL {
