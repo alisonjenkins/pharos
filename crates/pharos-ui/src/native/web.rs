@@ -128,28 +128,38 @@ pub fn current_path() -> String {
         .unwrap_or_else(|| "/".into())
 }
 
+/// The `history.state` of every entry the app pushes, which tells an entry
+/// with an app page before it from one opened from outside.
+const IN_APP: &str = "pharos";
+
 /// `history.pushState` to `path`, so Back returns to the page before.
 pub fn push(path: &str) {
     if let Some(history) = web_sys::window().and_then(|w| w.history().ok()) {
-        let _ = history.push_state_with_url(&JsValue::NULL, "", Some(path));
+        let _ = history.push_state_with_url(&JsValue::from_str(IN_APP), "", Some(path));
     }
 }
 
-/// `history.back()`, when there is a page before this one to return to.
+/// `history.back()`, when the page before this one is the app's: an entry
+/// the app pushed. `history.length` would also count other sites' pages.
 pub fn go_back() -> bool {
     let Some(history) = web_sys::window().and_then(|w| w.history().ok()) else {
         return false;
     };
-    if history.length().unwrap_or(0) < 2 {
-        return false;
-    }
-    history.back().is_ok()
+    let pushed = history
+        .state()
+        .ok()
+        .and_then(|s| s.as_string())
+        .is_some_and(|s| s == IN_APP);
+    pushed && history.back().is_ok()
 }
 
 /// `history.replaceState` to `path`: a redirect, which Back should skip.
 pub fn replace(path: &str) {
     if let Some(history) = web_sys::window().and_then(|w| w.history().ok()) {
-        let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(path));
+        // Keeps the entry's state, so a replaced page still knows whether
+        // the app pushed it.
+        let state = history.state().unwrap_or(JsValue::NULL);
+        let _ = history.replace_state_with_url(&state, "", Some(path));
     }
 }
 
