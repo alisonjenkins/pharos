@@ -99,7 +99,8 @@ pub fn WatchView(
     let mut idle = use_signal(|| false);
     let mut stirred = use_signal(|| false);
     let mut ticking = use_signal(|| false);
-    // A tap that only brings the chrome back must not also pause.
+    // A tap that only brings the hidden chrome back must not also pause; a
+    // paused player's chrome is never hidden.
     let mut woke_by_tap = use_signal(|| false);
     let mut wake = move || {
         stirred.set(true);
@@ -177,7 +178,7 @@ pub fn WatchView(
                 onkeydown: on_key,
                 onpointermove: move |_| wake(),
                 onpointerdown: move |evt: PointerEvent| {
-                    woke_by_tap.set(evt.pointer_type() == "touch" && idle());
+                    woke_by_tap.set(evt.pointer_type() == "touch" && idle() && !media.paused);
                     wake();
                 },
                 video {
