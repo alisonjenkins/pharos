@@ -1540,6 +1540,7 @@ async fn home_in_one_batch() {
         );
     }
     assert_eq!(home.get_resume().unwrap().len(), 1);
+    assert!(home.get_listening().unwrap().is_empty());
     assert!(!home.get_next_up().unwrap().is_empty());
 }
 

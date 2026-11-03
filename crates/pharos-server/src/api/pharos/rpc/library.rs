@@ -446,6 +446,12 @@ fn write_home(
         server_id,
     );
     write_items(
+        out.reborrow()
+            .init_listening(len_u32(&home.listening.items)),
+        &home.listening.items,
+        server_id,
+    );
+    write_items(
         out.init_next_up(len_u32(&home.next_up.items)),
         &home.next_up.items,
         server_id,
