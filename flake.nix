@@ -144,7 +144,12 @@
             # lavfi synth): V30's lesson is that argv-string assertions pass
             # even when the muxer ignores the flag, so those guards must run
             # real ffmpeg in CI, not only in a devShell.
-            nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [ pkgs.ffmpeg-headless ];
+            # dvdauthor's spumux builds the real dvd_subtitle source the
+            # image-subtitle extraction test decodes (spec 019).
+            nativeBuildInputs = pharosCommonArgs.nativeBuildInputs ++ [
+              pkgs.ffmpeg-headless
+              pkgs.dvdauthor
+            ];
           }
         );
         # nextest doesn't run doctests — cover them separately (same deps).
@@ -1177,6 +1182,8 @@
             # 017 — Cap'n Proto compiler for pharos-api's capnpc build step.
             pkgs.capnproto
             pkgs.ffmpeg-headless
+            # 019 — spumux builds the dvd_subtitle test source.
+            pkgs.dvdauthor
             # 008 — resolves a URL-backed source's real locator. In the shell so
             # the resolver's tests and a manual `just`-driven check use the same
             # binary the image ships, rather than whatever the host happens to
