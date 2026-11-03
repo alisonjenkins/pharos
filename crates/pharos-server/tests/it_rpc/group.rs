@@ -498,3 +498,220 @@ async fn a_call_with_no_device_is_invalid() {
     assert_eq!(err, "invalid: ctx.device");
     assert!(rig.deps.registry.list().await.unwrap().is_empty());
 }
+
+/// One `Membership` command: `Ok` or the denial it answered.
+macro_rules! command {
+    ($member:expr, $method:ident $(, $setter:ident($value:expr))* $(,)?) => {{
+        let mut req = $member.$method();
+        {
+            let mut p = req.get();
+            set_device(p.reborrow().init_ctx(), "dev");
+            $(p.$setter($value);)*
+        }
+        let reply = req.send().promise.await.expect("call");
+        match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+            pharos_api::pharos_capnp::done::Ok(()) => Ok(()),
+            pharos_api::pharos_capnp::done::Error(e) => Err(denial(e.unwrap())),
+        }
+    }};
+}
+
+/// A group of two native members, past its readiness gate and playing.
+/// Returns the members and their sinks' receivers.
+struct Pair {
+    a: membership::Client,
+    b: membership::Client,
+    a_seen: mpsc::UnboundedReceiver<Seen>,
+    b_seen: mpsc::UnboundedReceiver<Seen>,
+}
+
+async fn playing_pair(rig: &Rig) -> Pair {
+    let a_session = rig.session(&rig.fx.admin_token).await;
+    let b_session = rig.session(&rig.fx.user_token).await;
+    let (a_sink, mut a_seen) = sink();
+    let a = create(&a_session, "dev-a", MOVIE, 5_000, a_sink)
+        .await
+        .unwrap();
+    let gid = only_group(rig).await;
+    let (b_sink, mut b_seen) = sink();
+    let b = join(&b_session, "dev-b", &gid, b_sink).await.unwrap();
+    // Both ack the queue entry, which opens the readiness gate.
+    for (member, seen) in [(&a, &mut a_seen), (&b, &mut b_seen)] {
+        let _ = until(seen, |s| matches!(s, Seen::Item { .. }).then_some(())).await;
+        command!(
+            member,
+            ready_request,
+            set_position_ms(5_000),
+            set_playing(false)
+        )
+        .unwrap();
+    }
+    Pair {
+        a,
+        b,
+        a_seen,
+        b_seen,
+    }
+}
+
+/// US1: A unpauses and both hear it; A pauses at a position and B's sink
+/// is told, with the time the group scheduled it for.
+/// Disarm check: with `pause` answering ok without calling `route_command`,
+/// B's sink never sees `pause` and this times out.
+#[actix_web::test]
+async fn a_pause_by_one_native_member_reaches_the_other() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.a, unpause_request).unwrap();
+    let played = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Play { .. }).then(|| s.clone())
+    })
+    .await;
+    assert!(
+        matches!(
+            played,
+            Seen::Play {
+                position_ms: 5_000..,
+                ..
+            }
+        ),
+        "{played:?}"
+    );
+    command!(pair.a, pause_request).unwrap();
+    let Seen::Pause { at, .. } = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Pause { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(
+        at.abs_diff(unix_ms()) < 60_000,
+        "scheduled in unix ms: {at}"
+    );
+    assert!(matches!(
+        next_pause(&mut pair.a_seen).await,
+        Seen::Pause { .. }
+    ));
+}
+
+async fn next_pause(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
+    until(rx, |s| matches!(s, Seen::Pause { .. }).then(|| s.clone())).await
+}
+
+/// V20: native and Jellyfin members share one group. A Jellyfin client's
+/// group is joined by a native one; a native pause is delivered to the
+/// Jellyfin member's socket sink as a `Pause`, and a Jellyfin pause (the
+/// message `/SyncPlay/Pause` sends) reaches the native member's sink.
+/// Disarm check: with `join` registering a private registry instead of the
+/// shared one, the Jellyfin member never sees the pause and this times out.
+#[actix_web::test]
+async fn native_and_jellyfin_members_command_each_other() {
+    let rig = rig().await;
+    let (handle, mut jelly_rx) = rig.jellyfin_group("Movie night").await;
+    let jelly = pharos_sync::hub::member_id_for_device(&format!(
+        "{}:dev-jelly",
+        rig.fx.admin_id.0.simple()
+    ));
+    let session = rig.session(&rig.fx.user_token).await;
+    let (sink, mut seen) = sink();
+    let native = join(&session, "dev-a", &handle.group_id.to_string(), sink)
+        .await
+        .unwrap();
+    let _ = until(&mut seen, |s| {
+        matches!(s, Seen::Joined { .. }).then_some(())
+    })
+    .await;
+
+    command!(native, unpause_request).unwrap();
+    command!(native, pause_request).unwrap();
+    let paused = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(1), jelly_rx.recv())
+            .await
+            .expect("the Jellyfin member hears the pause")
+            .unwrap();
+        if let ServerMsg::Pause { .. } = msg {
+            break msg;
+        }
+    };
+    assert!(matches!(paused, ServerMsg::Pause { .. }));
+
+    handle
+        .tx
+        .send(GroupMsg::PauseShared { sender: jelly })
+        .await
+        .unwrap();
+    let _ = until(&mut seen, |s| matches!(s, Seen::Pause { .. }).then_some(())).await;
+}
+
+/// `leave` ends the membership: the leaver's sink is told `ended(left)`, the
+/// group's other member is told it left, and the leaver's later commands are
+/// refused.
+/// Disarm check: with `leave_group` skipping the `GroupLeft` send, the sink
+/// never sees `ended` and this times out.
+#[actix_web::test]
+async fn leave_ends_the_membership_and_tells_the_group() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.b, leave_request).unwrap();
+    let ended = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Ended(_)).then(|| s.clone())
+    })
+    .await;
+    assert_eq!(ended, Seen::Ended("left"));
+    let gone = until(&mut pair.a_seen, |s| match s {
+        Seen::Left(id) => Some(id.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(!gone.is_empty());
+    assert_eq!(
+        command!(pair.b, pause_request).unwrap_err(),
+        "not found: group"
+    );
+    // A second leave is a no-op.
+    command!(pair.b, leave_request).unwrap();
+}
+
+/// V201: a user restricted away from the library an item is in neither sees
+/// a group playing it, nor joins it, nor can start one on it. The refused
+/// create leaves no group behind.
+/// Disarm check: with `listed_groups` or `may_join` skipping the queue check
+/// for the native route, the restricted user lists and joins the group.
+#[actix_web::test]
+async fn a_restricted_user_neither_sees_nor_joins_nor_starts_a_group_on_a_hidden_item() {
+    let rig = rig().await;
+    let (handle, _rx) = rig.jellyfin_group("Movie night").await;
+    let session = rig.session(&rig.fx.user_token).await;
+    rig.fx
+        .state
+        .stores
+        .set_policy(
+            rig.fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![rig.fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(list(&session).await.unwrap().is_empty());
+    let (sink_b, _seen) = sink();
+    let err = join(&session, "dev-b", &handle.group_id.to_string(), sink_b)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "not permitted: group");
+    let (sink_c, _seen) = sink();
+    let err = create(&session, "dev-b", MOVIE, 0, sink_c)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "not permitted: queueing");
+    assert_eq!(
+        rig.deps.registry.list().await.unwrap().len(),
+        1,
+        "only the Jellyfin group exists"
+    );
+}
