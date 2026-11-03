@@ -158,13 +158,15 @@ impl From<&ListedGroup> for Summary {
             id: group.id.clone(),
             name: group.name.clone(),
             item: real_item(group.item_id.as_deref()),
-            // A listing knows participants by name only.
+            // A listing knows no member's buffering.
             members: group
-                .participants
+                .participant_ids
                 .iter()
-                .map(|name| Member {
+                .zip(&group.participants)
+                .map(|(id, name)| Member {
+                    id: id.clone(),
                     name: name.clone(),
-                    ..Member::default()
+                    buffering: false,
                 })
                 .collect(),
         }

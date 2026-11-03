@@ -112,6 +112,7 @@ struct Listed {
     name: String,
     item: Option<u64>,
     members: Vec<String>,
+    member_ids: Vec<String>,
 }
 
 async fn list(session: &session::Client) -> Result<Vec<Listed>, String> {
@@ -143,6 +144,12 @@ async fn list(session: &session::Client) -> Result<Vec<Listed>, String> {
                     .iter()
                     .map(|m| m.get_name().unwrap().to_str().unwrap().into())
                     .collect(),
+                member_ids: g
+                    .get_members()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.get_id().unwrap().to_str().unwrap().into())
+                    .collect(),
             })
             .collect()),
         groups_result::Error(e) => Err(denial(e.unwrap())),
@@ -165,6 +172,11 @@ async fn list_shows_a_group_a_jellyfin_client_made() {
             name: "Movie night".into(),
             item: Some(MOVIE),
             members: vec!["jelly".into()],
+            member_ids: vec![pharos_sync::hub::member_id_for_device(&format!(
+                "{}:dev-jelly",
+                rig.fx.admin_id.0.simple()
+            ))
+            .to_string()],
         }]
     );
 }
@@ -228,6 +240,7 @@ enum Seen {
         name: String,
         item: Option<u64>,
         members: Vec<String>,
+        member_ids: Vec<String>,
     },
     Play {
         at: u64,
@@ -279,6 +292,7 @@ impl server::group_sink::Handler for TestSink {
                         .iter()
                         .map(|m| text(m.get_name()))
                         .collect(),
+                    member_ids: g.get_members()?.iter().map(|m| text(m.get_id())).collect(),
                 }
             }
             group_update::Play(a) => {
@@ -454,6 +468,7 @@ async fn a_native_member_joins_a_native_group_and_sees_who_is_in_it() {
         name,
         item,
         members,
+        ..
     } = joined
     else {
         unreachable!()
@@ -468,6 +483,34 @@ async fn a_native_member_joins_a_native_group_and_sees_who_is_in_it() {
     })
     .await;
     assert_eq!(arrived, "guest");
+}
+
+/// A listed member carries the same id the group's updates name it by, so a
+/// client can match the two.
+/// Disarm check: with the listing leaving the ids empty, the sets differ.
+#[actix_web::test]
+async fn listed_member_ids_are_the_ids_updates_use() {
+    let rig = rig().await;
+    let a = rig.session(&rig.fx.admin_token).await;
+    let b = rig.session(&rig.fx.user_token).await;
+    let (a_sink, _a_seen) = sink();
+    let _a_member = create(&a, "dev-a", MOVIE, 0, a_sink).await.unwrap();
+    let gid = only_group(&rig).await;
+    let (b_sink, mut b_seen) = sink();
+    let _b_member = join(&b, "dev-b", &gid, b_sink).await.unwrap();
+    let Seen::Joined { mut member_ids, .. } = until(&mut b_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    let mut listed = list(&b).await.unwrap().remove(0).member_ids;
+    member_ids.sort();
+    listed.sort();
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|id| !id.is_empty()));
+    assert_eq!(listed, member_ids);
 }
 
 /// Joining a group that does not exist answers notFound and creates nothing
