@@ -1547,7 +1547,13 @@ fn Player(
                 on_control,
             }
         } else {
-            WatchView { title: p.title.clone(), controls, on_media, on_control }
+            WatchView {
+                title: p.title.clone(),
+                controls,
+                on_media,
+                on_control,
+                item_id: p.detail.item.id,
+            }
         }
     }
 }
