@@ -7,12 +7,17 @@
 
 use dioxus::prelude::*;
 use futures_util::future::{join3, try_join};
+use futures_util::StreamExt as _;
 use pharos_client::api::{
     ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind, Page,
     PharosApi,
 };
 use pharos_client::{CallInfo, ClientError};
 
+use super::app::{call, Ctx};
+use super::machine::Event;
+use super::paging::{Pager, Trigger};
+use super::platform;
 use super::route::Route;
 use super::views::{progress_percent, runtime, Link, PosterTile};
 
@@ -350,7 +355,7 @@ pub async fn load<A: PharosApi>(
 #[component]
 pub fn BrowseLayout(browse: Browse) -> Element {
     match browse {
-        Browse::Grid { title, page, .. } => rsx! { GridView { title, page } },
+        Browse::Grid { title, page, more } => rsx! { GridView { title, page, more } },
         Browse::Show(show) => rsx! { ShowView { show } },
         Browse::Music {
             title,
@@ -363,11 +368,110 @@ pub fn BrowseLayout(browse: Browse) -> Element {
 }
 
 #[component]
-pub fn GridView(title: String, page: Page) -> Element {
+pub fn GridView(title: String, page: Page, more: Option<ListSource>) -> Element {
     rsx! {
         section { class: "pharos-browse",
             h2 { "{title}" }
-            PosterGrid { page }
+            match more {
+                Some(source) => rsx! {
+                    PagedGrid { key: "{source.parent}", first: page, source }
+                },
+                None => rsx! { PosterGrid { page } },
+            }
+        }
+    }
+}
+
+/// The `id` of the tile the scroll sentinel watches.
+const SENTINEL_ID: &str = "pharos-more-sentinel";
+
+/// The `id` of the marker after the last tile. A jump to the bottom (End,
+/// a fling) passes the lead tile without it ever being in view, so the
+/// observer watches this too.
+const END_ID: &str = "pharos-more-end";
+
+/// A grid that loads the rest of its listing as the viewer nears the end
+/// (V237): an observer on a tile `SENTINEL_LEAD` before the last, and on
+/// the end of the list, asks for the next page, and a button does the same by
+/// hand and retries a failure.
+#[component]
+fn PagedGrid(first: Page, source: ListSource) -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut pager = use_signal(|| Pager::new(first.clone()));
+    // The observer and the button fire outside any one render, so both send
+    // here; `Pager::begin` is what keeps a second request out while one is
+    // in flight.
+    let requests = use_coroutine(move |mut rx: UnboundedReceiver<Trigger>| async move {
+        while let Some(trigger) = rx.next().await {
+            let Some(start) = pager.write().begin(trigger) else {
+                continue;
+            };
+            let Some(api) = ctx.api.peek().clone() else {
+                pager.write().fail();
+                continue;
+            };
+            spawn(async move {
+                let result = fetch_more(
+                    &api,
+                    call,
+                    &source,
+                    start,
+                    |line| platform::warn(&line),
+                    platform::report_event,
+                )
+                .await;
+                match result {
+                    Ok(page) => pager.write().land(page),
+                    Err(e) => {
+                        if e.needs_sign_in() {
+                            let mut machine = ctx.machine;
+                            machine.write().apply(Event::NeedsSignIn);
+                        }
+                        pager.write().fail();
+                    }
+                }
+            });
+        }
+    });
+    let mut watch = use_signal(|| None::<platform::SentinelWatch>);
+    // Runs once the tiles are in the page, and again after every change to
+    // the pager so the observer is re-armed on the tile that is now
+    // `SENTINEL_LEAD` from the end (it reports a tile already in view).
+    use_effect(move || {
+        let armed = pager.read().sentinel().is_some();
+        watch.set(if armed {
+            platform::watch_sentinel(&[SENTINEL_ID, END_ID], move || {
+                requests.send(Trigger::Scroll)
+            })
+        } else {
+            None
+        });
+    });
+    let state = pager.read();
+    let page = Page {
+        items: state.items().to_vec(),
+        total: state.total(),
+        start: 0,
+    };
+    let label = if state.in_flight() {
+        "Loading…"
+    } else if state.failed() {
+        "Try again"
+    } else {
+        "Show more"
+    };
+    rsx! {
+        PosterList { page, sentinel: state.sentinel() }
+        if state.has_more() {
+            div { id: END_ID, aria_hidden: "true" }
+            p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
+            button {
+                class: "pharos-button",
+                r#type: "button",
+                disabled: state.in_flight(),
+                onclick: move |_| requests.send(Trigger::Button),
+                "{label}"
+            }
         }
     }
 }
@@ -375,6 +479,15 @@ pub fn GridView(title: String, page: Page) -> Element {
 /// Posters for a page, with the empty and "more than shown" notes.
 #[component]
 fn PosterGrid(page: Page, square: Option<bool>) -> Element {
+    rsx! {
+        PosterList { page: page.clone(), square }
+        MoreNote { page }
+    }
+}
+
+/// The tiles of a page; the one at `sentinel` carries [`SENTINEL_ID`].
+#[component]
+fn PosterList(page: Page, square: Option<bool>, sentinel: Option<usize>) -> Element {
     let class = match square {
         Some(true) => "pharos-grid pharos-grid-square",
         _ => "pharos-grid",
@@ -384,11 +497,14 @@ fn PosterGrid(page: Page, square: Option<bool>) -> Element {
             p { class: "pharos-empty", "Nothing in here yet." }
         }
         ul { class,
-            for item in page.items.iter() {
-                li { key: "{item.id}", PosterTile { item: item.clone() } }
+            for (at, item) in page.items.iter().enumerate() {
+                li {
+                    key: "{item.id}",
+                    id: if sentinel == Some(at) { SENTINEL_ID },
+                    PosterTile { item: item.clone() }
+                }
             }
         }
-        MoreNote { page }
     }
 }
 

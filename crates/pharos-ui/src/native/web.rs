@@ -322,6 +322,52 @@ pub fn spawn_detached(fut: impl std::future::Future<Output = ()> + 'static) {
     wasm_bindgen_futures::spawn_local(fut);
 }
 
+/// An `IntersectionObserver` on one element, disconnected on drop.
+pub struct SentinelWatch {
+    observer: web_sys::IntersectionObserver,
+    _callback: Closure<dyn FnMut(js_sys::Array)>,
+}
+
+impl Drop for SentinelWatch {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+/// Call `on_visible` whenever any element named in `ids` is in view,
+/// including when one is already in view as the watch starts. `None` when
+/// none of them is in the page or the browser has no observer.
+pub fn watch_sentinel(
+    ids: &[&str],
+    mut on_visible: impl FnMut() + 'static,
+) -> Option<SentinelWatch> {
+    let document = web_sys::window()?.document()?;
+    let elements: Vec<_> = ids
+        .iter()
+        .filter_map(|id| document.get_element_by_id(id))
+        .collect();
+    if elements.is_empty() {
+        return None;
+    }
+    let callback = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+        let seen = entries.iter().any(|e| {
+            e.unchecked_into::<web_sys::IntersectionObserverEntry>()
+                .is_intersecting()
+        });
+        if seen {
+            on_visible();
+        }
+    });
+    let observer = web_sys::IntersectionObserver::new(callback.as_ref().unchecked_ref()).ok()?;
+    for element in &elements {
+        observer.observe(element);
+    }
+    Some(SentinelWatch {
+        observer,
+        _callback: callback,
+    })
+}
+
 /// A `pagehide` listener; removed on drop.
 pub struct PageHide(Closure<dyn FnMut(web_sys::Event)>);
 
