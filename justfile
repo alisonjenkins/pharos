@@ -222,6 +222,10 @@ compat-dioxus-full native="on" port="8096":
     for n in $(seq -w 1 120); do
       l=${letters:$((10#$n % 26)):1}
       ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/$l$l Bulk $n.webm"
+      # Every other title is a Drama, so the genre filter has something to keep.
+      if (( 10#$n % 2 == 0 )); then
+        printf '<movie><title>%s</title><genre>Drama</genre></movie>\n' "$l$l Bulk $n" > "$TMP/media/Bulk/$l$l Bulk $n.nfo"
+      fi
     done
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
