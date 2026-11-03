@@ -12,6 +12,7 @@ mod client;
 mod client_api;
 mod connect;
 mod gate;
+mod group;
 mod library;
 mod limits;
 mod login;

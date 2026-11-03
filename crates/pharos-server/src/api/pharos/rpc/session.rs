@@ -10,6 +10,7 @@ use pharos_api::{server, Connection, Denial};
 use pharos_core::{AuthError, DomainResult, User, UserId, UserPrefStore};
 
 use super::bootstrap::token_denial;
+use super::group::Group;
 use super::library::Library;
 use super::playback::Playback;
 use super::prefs::{Prefs, DIAGNOSTICS_OPT_IN};
@@ -208,14 +209,18 @@ impl server::session::Handler for Session {
         Ok(())
     }
 
+    /// Never refused, like `library`; each `Group` call checks the session
+    /// itself.
     async fn group(
         self: Rc<Self>,
         _params: wire::GroupParams,
-        _results: &mut wire::GroupResults,
+        results: &mut wire::GroupResults,
     ) -> Result<(), capnp::Error> {
-        Err(capnp::Error::unimplemented(
-            "Session.group is not served yet".to_string(),
-        ))
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_group(server::group::client(Group::new(self), &conn));
+        Ok(())
     }
 
     /// Revokes this session's device token and announces the user, so every
