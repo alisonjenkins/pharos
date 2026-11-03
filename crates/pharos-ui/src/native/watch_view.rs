@@ -11,8 +11,8 @@ use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
-    clock, left_to_watch, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent,
-    MediaState, UP_NEXT_COUNTDOWN_MS,
+    clock, cues_at, left_to_watch, percent, segment_at, share, skip_label, thumb_at, track_label,
+    ImageCues, MediaEvent, MediaState, UP_NEXT_COUNTDOWN_MS,
 };
 use super::seen::SeenRow;
 use super::together::Member;
@@ -46,6 +46,12 @@ const WHEEL_SEEK_MS: u64 = 5_000;
 const WHEEL_NOTCH_PX: f64 = 100.0;
 /// A line of wheel travel (`deltaMode` 1, as Firefox reports a mouse).
 const WHEEL_LINE_PX: f64 = 40.0;
+/// How often an image subtitle manifest still being extracted is fetched
+/// again; the server rewrites it every 2 s.
+const IMAGE_CUES_POLL_MS: u32 = 3_000;
+/// Fetch failures with no HTTP answer an image subtitle survives before it
+/// gives up; an HTTP error (the extraction failed) ends it at once.
+const IMAGE_CUES_RETRIES: u32 = 3;
 
 /// Everything the controls show.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -277,6 +283,12 @@ pub fn WatchView(
         .filter(|t| t.vtt_url.is_some())
         .map(|t| (text_track_id(t.index), t.clone()))
         .collect();
+    // A list of at most one, so a new track's key mounts a new overlay.
+    let image_cues: Option<String> = c
+        .subtitles
+        .iter()
+        .find(|t| Some(t.index) == c.subtitle_pick)
+        .and_then(|t| t.images_url.clone());
 
     rsx! {
         section { class: "pharos-watch",
@@ -348,6 +360,9 @@ pub fn WatchView(
                         span { class: "pharos-watch-loading-label", "Loading" }
                         span { class: "pharos-watch-loading-caption", "Waiting for the server…" }
                     }
+                }
+                for url in image_cues {
+                    ImageSubtitles { key: "{url}", url: url.clone(), media }
                 }
                 div { class: "pharos-watch-top",
                     button {
@@ -646,6 +661,75 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
             },
             option { value: "follow", selected: !own_tracks, "Follow group" }
             option { value: "me", selected: own_tracks, "Just me" }
+        }
+    }
+}
+
+/// An image subtitle drawn over the picture (spec 019): the cues of the
+/// manifest at `url`, fetched again while the server is still extracting
+/// them. The canvas box matches the picture's `object-fit: contain` box, so
+/// an anamorphic canvas stretches with the picture.
+#[component]
+fn ImageSubtitles(url: String, media: MediaState) -> Element {
+    let mut cues = use_signal(ImageCues::default);
+    use_future(move || {
+        let url = url.clone();
+        async move {
+            let mut retries = IMAGE_CUES_RETRIES;
+            loop {
+                match platform::get_text(&url).await {
+                    Ok(body) => match serde_json::from_str::<ImageCues>(&body) {
+                        Ok(got) => {
+                            let complete = got.complete;
+                            cues.set(got);
+                            if complete {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            platform::warn(&format!("pharos: image subtitles {url}: {e}"));
+                            return;
+                        }
+                    },
+                    Err((status, reason)) => {
+                        platform::warn(&format!(
+                            "pharos: image subtitles {url}: status={status:?} {reason}"
+                        ));
+                        if status.is_some() || retries == 0 {
+                            return;
+                        }
+                        retries -= 1;
+                    }
+                }
+                platform::sleep_ms(IMAGE_CUES_POLL_MS).await;
+            }
+        }
+    });
+    let cues = cues.read();
+    let (w, h) = (cues.width, cues.height);
+    if w == 0 || h == 0 {
+        return rsx! {};
+    }
+    // The picture's display aspect; the canvas until the metadata is known.
+    let (aw, ah) = match (media.video_width, media.video_height) {
+        (0, _) | (_, 0) => (w, h),
+        size => size,
+    };
+    rsx! {
+        div { class: "pharos-image-subs",
+            div {
+                class: "pharos-image-subs-canvas",
+                style: "width: min(100cqw, calc(100cqh * {aw} / {ah})); aspect-ratio: {aw} / {ah};",
+                for cue in cues_at(&cues, media.position_ms) {
+                    img {
+                        key: "{cue.url}",
+                        class: "pharos-image-sub",
+                        src: "{cue.url}",
+                        alt: "",
+                        style: "left: {share(cue.x, w)}%; top: {share(cue.y, h)}%; width: {share(cue.width, w)}%; height: {share(cue.height, h)}%;",
+                    }
+                }
+            }
         }
     }
 }
