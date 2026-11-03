@@ -71,6 +71,7 @@ struct ItemSummary {
   parentId @7 :ItemId; seriesName @8 :Text;
   indexNumber @9 :OptU32; parentIndexNumber @10 :OptU32;   # season 0 / episode 0 are real
   libraryKind @11 :LibraryKind;                            # kind == library only
+  album @12 :Text; artist @13 :Text;                       # a track's tags; empty when untagged (B320)
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
