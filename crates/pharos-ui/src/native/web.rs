@@ -389,6 +389,106 @@ pub fn watch_sentinel(
     })
 }
 
+/// A `wheel` listener that steps through letters while Shift is held;
+/// removed on drop.
+pub struct ShiftWheel(Closure<dyn FnMut(web_sys::WheelEvent)>);
+
+impl Drop for ShiftWheel {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("wheel", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Call `on_turn` with each Shift+wheel turn (positive is down), keeping the
+/// page from scrolling or zooming on it; a plain wheel is left alone (B295).
+/// Browsers turn Shift+wheel into a sideways scroll, so the turn is whichever
+/// axis moved.
+pub fn on_shift_wheel(mut on_turn: impl FnMut(f64) + 'static) -> ShiftWheel {
+    let listener = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(move |e: web_sys::WheelEvent| {
+        if !e.shift_key() || e.ctrl_key() || e.meta_key() {
+            return;
+        }
+        e.prevent_default();
+        // A line or page delta is ~16 or ~800 px.
+        let scale = match e.delta_mode() {
+            web_sys::WheelEvent::DOM_DELTA_LINE => 16.0,
+            web_sys::WheelEvent::DOM_DELTA_PAGE => 800.0,
+            _ => 1.0,
+        };
+        let turn = if e.delta_y() != 0.0 {
+            e.delta_y()
+        } else {
+            e.delta_x()
+        };
+        on_turn(turn * scale);
+    });
+    if let Some(window) = web_sys::window() {
+        let options = web_sys::AddEventListenerOptions::new();
+        options.set_passive(false);
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
+            "wheel",
+            listener.as_ref().unchecked_ref(),
+            &options,
+        );
+    }
+    ShiftWheel(listener)
+}
+
+/// The tiles of the browse grid, in order.
+fn grid_tiles() -> Option<web_sys::HtmlCollection> {
+    let grid = web_sys::window()?
+        .document()?
+        .query_selector(".pharos-browse .pharos-grid")
+        .ok()??;
+    Some(grid.children())
+}
+
+/// The index of the first browse tile whose bottom is below the top of the
+/// viewport. Tiles run top to bottom, so a binary search finds it.
+pub fn first_visible_tile() -> Option<u32> {
+    let tiles = grid_tiles()?;
+    let (mut lo, mut hi) = (0, tiles.length());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let bottom = tiles.item(mid)?.get_bounding_client_rect().bottom();
+        if bottom <= 0.0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo < tiles.length()).then_some(lo)
+}
+
+/// Whether the browse tile at `at` is at least partly in the viewport.
+pub fn tile_in_view(at: u32) -> bool {
+    let Some(height) = web_sys::window()
+        .and_then(|w| w.inner_height().ok())
+        .and_then(|h| h.as_f64())
+    else {
+        return false;
+    };
+    grid_tiles()
+        .and_then(|tiles| tiles.item(at))
+        .map(|tile| tile.get_bounding_client_rect())
+        .is_some_and(|r| r.bottom() > 0.0 && r.top() < height)
+}
+
+/// Scrolls the browse tile at `at` to the top of the page; `false` when it
+/// is not in the page yet.
+pub fn scroll_to_tile(at: u32) -> bool {
+    match grid_tiles().and_then(|tiles| tiles.item(at)) {
+        Some(tile) => {
+            tile.scroll_into_view_with_bool(true);
+            true
+        }
+        None => false,
+    }
+}
+
 /// A `pagehide` listener; removed on drop.
 pub struct PageHide(Closure<dyn FnMut(web_sys::Event)>);
 
