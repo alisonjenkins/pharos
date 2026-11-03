@@ -133,6 +133,10 @@ pub fn WatchView(
     #[props(default)]
     members: Vec<Member>,
     #[props(default)] on_leave: EventHandler<()>,
+    /// The item playing, named on the `<video>` as `data-item-id` for tests
+    /// that watch several browsers (the sync oracle).
+    #[props(default)]
+    item_id: Option<ItemRef>,
 ) -> Element {
     let c = &controls;
     let total = c.total_ms();
@@ -216,6 +220,7 @@ pub fn WatchView(
                 video {
                     id: VIDEO_ID,
                     class: "pharos-video",
+                    "data-item-id": item_id.map(|id| id.to_string()),
                     autoplay: true,
                     playsinline: true,
                     onclick: move |evt: MouseEvent| {
@@ -808,6 +813,33 @@ mod tests {
         assert!(player.is_some() && top > player, "{html}");
         assert!(html.contains(r#"aria-label="Back""#), "{html}");
         assert!(html.contains("Pilot"), "{html}");
+    }
+
+    #[test]
+    fn the_video_carries_the_item_id_when_known() {
+        let render_with = |item_id: Option<ItemRef>| {
+            let mut dom = VirtualDom::new_with_props(
+                |item_id: Option<ItemRef>| {
+                    rsx! {
+                        WatchView {
+                            title: "Pilot",
+                            controls: Controls::default(),
+                            on_media: |_| {},
+                            on_control: |_| {},
+                            item_id,
+                        }
+                    }
+                },
+                item_id,
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        assert!(
+            render_with(Some(ItemRef::Real(42))).contains(r#"data-item-id="42""#),
+            "item id on the video"
+        );
+        assert!(!render_with(None).contains("data-item-id"));
     }
 
     #[test]
