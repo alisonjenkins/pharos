@@ -2344,3 +2344,97 @@ async fn native_browses_are_counted_by_level_and_kind() {
         "{text}"
     );
 }
+
+/// The names a `Library.query` page lists under `parent` for one genre and
+/// the play-state `filters`, by name.
+async fn listed_in(
+    session: &session::Client,
+    parent: &str,
+    kinds: &[Kind],
+    genre: &str,
+    filters: &[&str],
+) -> Vec<String> {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    match WireId::parse(parent).unwrap() {
+        WireId::Real(n) => q.reborrow().init_parent_id().set_real(n),
+        WireId::Synth(n) => q.reborrow().init_parent_id().set_synth(n),
+    }
+    let mut list = q.reborrow().init_kinds(kinds.len() as u32);
+    for (i, kind) in kinds.iter().enumerate() {
+        list.set(i as u32, *kind);
+    }
+    let mut list = q.reborrow().init_filters(filters.len() as u32);
+    for (i, f) in filters.iter().enumerate() {
+        list.set(i as u32, *f);
+    }
+    q.set_sort_by("SortName");
+    q.set_genre(genre);
+    let reply = req.send().promise.await.expect("query");
+    let (_, items) = summaries(reply.get().unwrap().get_result().unwrap());
+    items
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The library filter bar's genre (B312/V252): a film is in every genre it
+/// is linked to, so "Action, Sci-Fi" is in both; a series is in its show
+/// metadata's genres, whatever its episodes carry.
+/// Disarm check: with `build_media_query` leaving `genre_wire_id` unset the
+/// films list unfiltered; with the series genre check skipped "Mature" is
+/// listed under Comedy.
+#[actix_web::test]
+async fn a_listing_keeps_to_one_genre() {
+    use pharos_core::{GenreStore as _, SeriesMetadata, SeriesMetadataStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let links: [(u64, &[&str]); 2] = [(101, &["Action", "Sci-Fi"]), (102, &["Drama"])];
+    for (id, genres) in links {
+        let names: Vec<String> = genres.iter().map(|g| (*g).to_owned()).collect();
+        fx.state.stores.link_item_genres(id, &names).await.unwrap();
+    }
+    let tv = seed_tv_library(&fx).await;
+    for (show, genre) in [("Show", "Comedy"), ("Mature", "Drama")] {
+        fx.state
+            .stores
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: format!("/libTV/{show}"),
+                series_name: show.into(),
+                genres: vec![genre.into()],
+                ..SeriesMetadata::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let lib_a = fx.lib_a_wire.clone();
+    assert_eq!(
+        listed_in(&session, &lib_a, &[], "Sci-Fi", &[]).await,
+        ["Alpha"]
+    );
+    // seed_rich's film is Action and Drama too.
+    assert_eq!(
+        listed_in(&session, &lib_a, &[], "Action", &[]).await,
+        ["Alpha", "Rich Movie"]
+    );
+    assert_eq!(
+        listed_in(&session, &lib_a, &[], "Drama", &[]).await,
+        ["Beta", "Rich Movie"]
+    );
+    assert_eq!(listed_in(&session, &lib_a, &[], "", &[]).await.len(), 3);
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "Comedy", &[]).await,
+        ["Show"]
+    );
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &[]).await,
+        ["Mature", "Show"]
+    );
+}

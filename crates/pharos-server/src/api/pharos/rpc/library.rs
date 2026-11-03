@@ -163,6 +163,7 @@ impl server::library::Handler for Library {
             sort_order: q.get_descending().then(|| "Descending".to_owned()),
             name_starts_with: text(q.get_name_starts_with()?)?,
             filters: (!filters.is_empty()).then(|| filters.join(",")),
+            genre: text(q.get_genre()?)?,
             ..ItemQuery::default()
         };
         let grouping = grouping_of(q.get_kinds()?);
