@@ -780,6 +780,9 @@ pub struct GroupSnapshot {
     pub leader: Option<MemberId>,
     pub member_count: usize,
     pub buffering_member_count: usize,
+    /// Which members are buffering (a roster entry's flag), for a surface that
+    /// shows each member's state. `buffering_member_count` is its length.
+    pub buffering_members: Vec<MemberId>,
     /// Coarse playback state for the `/SyncPlay/List` `GroupInfoDto`.
     pub play_state: GroupPlayState,
     /// Human-readable group name (what the creator's client sent on `New`).
@@ -4486,6 +4489,12 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 leader: state.leader,
                 member_count: state.members.len(),
                 buffering_member_count: state.members.values().filter(|m| m.buffering).count(),
+                buffering_members: state
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.buffering)
+                    .map(|(id, _)| *id)
+                    .collect(),
                 play_state: state.play_state(),
                 group_name: state.group_name.clone(),
                 participants: state
@@ -7694,6 +7703,7 @@ mod tests {
             snap.buffering_member_count, 1,
             "re-add must NOT reset the buffering flag"
         );
+        assert_eq!(snap.buffering_members, [m2], "and the snapshot names it");
         let mut dup_join = false;
         while let Ok(msg) = rx1.try_recv() {
             if matches!(msg, ServerMsg::MemberJoined { .. }) {
