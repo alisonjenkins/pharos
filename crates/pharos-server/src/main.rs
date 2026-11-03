@@ -2044,6 +2044,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         directory.bind_registry(group_registry.get_ref().clone());
         directory.spawn_refresher(app_state.bus.clone());
     }
+    app_state.sync.install(pharos_server::group_ops::SyncDeps {
+        hub: session_hub.get_ref().clone(),
+        registry: group_registry.get_ref().clone(),
+        sinks: member_sinks.clone(),
+    });
     let member_sinks_data = web::Data::new(member_sinks);
     let token_resolver_data = web::Data::new(token_resolver);
 
