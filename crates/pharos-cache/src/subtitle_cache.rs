@@ -53,6 +53,10 @@ pub enum SubtitleKind {
 /// wrote are never read; the version is part of the directory name.
 pub const IMAGE_SUB_GEN_VERSION: u32 = 1;
 
+/// The manifest's name inside an image subtitle directory (the extractor's
+/// `MANIFEST_FILE`; a test pins the two together).
+pub const IMAGE_SUB_MANIFEST_FILE: &str = "manifest.json";
+
 /// Where a track's image extraction stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageSubs {
@@ -627,7 +631,7 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Whether `dir`'s manifest says its extraction read the whole stream.
 async fn manifest_complete(dir: &Path) -> bool {
-    let Ok(bytes) = tokio::fs::read(dir.join("manifest.json")).await else {
+    let Ok(bytes) = tokio::fs::read(dir.join(IMAGE_SUB_MANIFEST_FILE)).await else {
         return false;
     };
     serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -734,6 +738,15 @@ mod tests {
             failed,
             Some(DebugValue::Counter(1)),
             "one extraction, counted once"
+        );
+    }
+
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    #[test]
+    fn the_manifest_name_is_the_one_the_extractor_writes() {
+        assert_eq!(
+            IMAGE_SUB_MANIFEST_FILE,
+            pharos_transcode::libav::subtitle_images::MANIFEST_FILE
         );
     }
 
