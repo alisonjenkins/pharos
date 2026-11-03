@@ -1396,6 +1396,8 @@ fn find_item(id: u64, name: &str) -> pharos_client::api::Item {
         library_kind: None,
         imdb_rating: None,
         critic_rating: None,
+        album: None,
+        artist: None,
     }
 }
 
