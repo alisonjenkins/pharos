@@ -475,6 +475,22 @@ input:focus-visible {
 .pharos-title-art-square .pharos-art-placeholder {
   aspect-ratio: 1;
 }
+.pharos-title-byline {
+  margin: 0;
+  font-size: 1.1rem;
+}
+.pharos-title-album {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+}
+.pharos-title-album a {
+  color: inherit;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 0.2em;
+}
+.pharos-title-album a:hover {
+  color: var(--px-color-accent);
+}
 .pharos-title-body {
   flex: 1 1 auto;
   min-width: 0;

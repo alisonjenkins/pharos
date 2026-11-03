@@ -320,7 +320,7 @@ pub fn TitleView(detail: Detail) -> Element {
     let facts: Vec<String> = [
         item.year.map(|y| y.to_string()),
         runtime(item.runtime_ms),
-        episode_label(item),
+        index_label(item),
     ]
     .into_iter()
     .flatten()
@@ -328,6 +328,13 @@ pub fn TitleView(detail: Detail) -> Element {
     let facts = facts.join(" · ");
     let resume = progress_percent(item).is_some();
     let track = item.kind == ItemKind::Audio;
+    // A track's byline is its artist, where an episode's is its series.
+    let byline = if track {
+        &item.artist
+    } else {
+        &item.series_name
+    };
+    let album = item.album.as_ref().filter(|_| track);
     rsx! {
         article { class: "pharos-title",
             div { class: if track { "pharos-title-art pharos-title-art-square" } else { "pharos-title-art" },
@@ -337,10 +344,18 @@ pub fn TitleView(detail: Detail) -> Element {
                 }
             }
             div { class: "pharos-title-body",
-                if let Some(series) = &item.series_name {
-                    p { class: "pharos-muted", "{series}" }
+                if let Some(byline) = byline {
+                    p { class: "pharos-muted pharos-title-byline", "{byline}" }
                 }
                 h2 { "{item.name}" }
+                if let Some(album) = album {
+                    p { class: "pharos-title-album",
+                        match item.parent {
+                            Some(parent) => rsx! { Link { to: Route::Browse(parent), "{album}" } },
+                            None => rsx! { "{album}" },
+                        }
+                    }
+                }
                 if !facts.is_empty() {
                     p { class: "pharos-muted", "{facts}" }
                 }
@@ -464,11 +479,14 @@ pub fn runtime(ms: u64) -> Option<String> {
     }
 }
 
-/// "S1 · E3" for an episode with its numbers.
-pub fn episode_label(item: &Item) -> Option<String> {
+/// "S1 · E3" for an episode with its numbers; "Track 3", or "Disc 2 ·
+/// Track 3" past the first disc, for a song.
+pub fn index_label(item: &Item) -> Option<String> {
     match (item.kind, item.season, item.episode) {
         (ItemKind::Episode, Some(s), Some(e)) => Some(format!("S{s} · E{e}")),
         (ItemKind::Episode, None, Some(e)) => Some(format!("E{e}")),
+        (ItemKind::Audio, Some(d), Some(t)) if d > 1 => Some(format!("Disc {d} · Track {t}")),
+        (ItemKind::Audio, _, Some(t)) => Some(format!("Track {t}")),
         _ => None,
     }
 }
@@ -477,7 +495,7 @@ pub fn episode_label(item: &Item) -> Option<String> {
 /// each on its own line so a long series name cannot hide the numbers.
 fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
-        ItemKind::Episode => [item.series_name.clone(), episode_label(item)]
+        ItemKind::Episode => [item.series_name.clone(), index_label(item)]
             .into_iter()
             .flatten()
             .collect(),
@@ -865,5 +883,52 @@ mod tests {
         ] {
             assert!(html.contains(want), "missing {want} in {html}");
         }
+    }
+
+    /// B320: a song with no art of its own still gets a designed tile, and
+    /// its page names the artist and links the album.
+    #[test]
+    fn a_track_without_art_shows_a_tile_its_artist_and_album() {
+        let mut song = item(ItemKind::Audio);
+        song.name = "Enchanted".into();
+        song.image = None;
+        song.runtime_ms = 5 * 60_000;
+        song.artist = Some("Owl City".into());
+        song.album = Some("The Midsummer Station".into());
+        song.parent = Some(ItemRef::Synth(9));
+        song.season = Some(1);
+        song.episode = Some(3);
+        let detail = Detail {
+            item: song.clone(),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        for want in [
+            "pharos-title-art pharos-title-art-square",
+            r#"class="pharos-poster-placeholder pharos-art-placeholder" aria-hidden="true">♪<"#,
+            ">Owl City<",
+            r#"href="/ui/browse/s9""#,
+            ">The Midsummer Station<",
+            "2001 · 5m · Track 3",
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+    }
+
+    #[test]
+    fn a_song_numbers_its_disc_only_past_the_first() {
+        let mut song = item(ItemKind::Audio);
+        song.episode = Some(4);
+        assert_eq!(index_label(&song).as_deref(), Some("Track 4"));
+        song.season = Some(1);
+        assert_eq!(index_label(&song).as_deref(), Some("Track 4"));
+        song.season = Some(2);
+        assert_eq!(index_label(&song).as_deref(), Some("Disc 2 · Track 4"));
     }
 }
