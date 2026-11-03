@@ -208,6 +208,16 @@ impl server::session::Handler for Session {
         Ok(())
     }
 
+    async fn group(
+        self: Rc<Self>,
+        _params: wire::GroupParams,
+        _results: &mut wire::GroupResults,
+    ) -> Result<(), capnp::Error> {
+        Err(capnp::Error::unimplemented(
+            "Session.group is not served yet".to_string(),
+        ))
+    }
+
     /// Revokes this session's device token and announces the user, so every
     /// connection signed in with it closes (T025). The user's other devices
     /// stay signed in. A token already gone is a successful logout. This
