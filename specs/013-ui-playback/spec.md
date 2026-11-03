@@ -121,7 +121,9 @@ snapshot plus `PlaySessionId` to the client-log endpoint.
   `PlaySessionId` / `tag` handling as the server expects (B75).
 - **FR-003** Subtitles: WebVTT rendered by the DOM layer with token-styled cues;
   ASS/SSA via a JS renderer (libass-wasm/JASSUB) `[NEEDS CLARIFICATION]`;
-  image subs (PGS) via burn-in as the server decides today.
+  image subs (PGS) via burn-in as the server decides today. Superseded for
+  image subs by spec 019 / ADR-0058: the player draws them from server-extracted
+  PNGs.
 - **FR-004** Trickplay sprites fetched from `Videos/{id}/Trickplay/...` and
   uploaded as GPU textures for zero-latency scrubbing.
 - **FR-005** MediaSegments client (`GET MediaSegments/{itemId}`), with per-type
