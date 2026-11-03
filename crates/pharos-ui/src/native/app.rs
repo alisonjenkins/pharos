@@ -8,8 +8,8 @@ use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _, PlaybackGrant as _,
-    TrackChoice, TrackPicks,
+    Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _,
+    PlaybackGrant as _, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -703,6 +703,23 @@ fn NativeApp(route: Route) -> Element {
     let mut started = use_signal(|| None::<u32>);
     use_context_provider(|| Ctx { api, machine });
     let nav = use_context::<Nav>();
+    // The library buttons, read again for each signed-in API; a reconnect
+    // keeps the last list until the new one arrives.
+    let mut libraries = use_signal(Vec::<Item>::new);
+    use_effect(move || {
+        let Some(api) = api.read().clone() else {
+            return;
+        };
+        spawn(async move {
+            if let Ok(page) = api.views(&call("shell", "libraries")).await {
+                libraries.set(page.items);
+            }
+        });
+    });
+    let current = match route {
+        Route::Browse(id) => Some(id),
+        _ => None,
+    };
 
     use_effect(move || {
         let (phase, epoch, delay) = {
@@ -762,6 +779,8 @@ fn NativeApp(route: Route) -> Element {
         let me = me.read().clone().flatten();
         return rsx! {
             Shell {
+                libraries: libraries(),
+                current,
                 account: rsx! {
                     AccountMenu {
                         me,
