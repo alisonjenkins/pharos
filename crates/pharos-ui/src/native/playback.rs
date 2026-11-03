@@ -361,6 +361,18 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
+/// Where the players keep their volume between plays.
+pub const VOLUME_KEY: &str = "pharos.player.volume";
+
+/// The volume a player starts at from what [`VOLUME_KEY`] holds: an audible
+/// level up to 1, else nothing and the browser's own.
+pub fn remembered_volume(stored: Option<&str>) -> Option<f64> {
+    stored?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+}
+
 /// How a track is named in a picker: its language, an audio track's codec
 /// and channels, then its title when that says something more (a file's
 /// "Surround" on a 5.1 track does not), and the forced and SDH flags the

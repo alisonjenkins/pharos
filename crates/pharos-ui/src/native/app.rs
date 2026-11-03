@@ -21,8 +21,9 @@ use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
-    MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
+    choose_engine, position_at, preview_set, remembered_volume, start_ms, subtitle_switch, Engine,
+    MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
+    VOLUME_KEY,
 };
 use super::route::Route;
 use super::views::{
@@ -1305,7 +1306,15 @@ fn Player(
                     Err(e) => Err(e),
                 };
                 match attached {
-                    Ok(e) => *engine.borrow_mut() = Some(e),
+                    Ok(e) => {
+                        // Every playback, a track switch's too, starts at the
+                        // volume last set.
+                        let stored = platform::stored_theme(VOLUME_KEY).ok().flatten();
+                        if let Some(volume) = remembered_volume(stored.as_deref()) {
+                            platform::set_volume(VIDEO_ID, volume, false);
+                        }
+                        *engine.borrow_mut() = Some(e);
+                    }
                     Err(e) => failed.set(Some(format!("Could not start playback: {e}"))),
                 }
             });
@@ -1395,6 +1404,12 @@ fn Player(
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
                 Control::Volume { volume, muted } => {
                     platform::set_volume(VIDEO_ID, volume, muted);
+                    // Silence is a mute, not a level to come back to.
+                    if volume > 0.0 {
+                        if let Err(e) = platform::store_theme(VOLUME_KEY, &volume.to_string()) {
+                            platform::warn(&format!("pharos: volume not remembered: {e}"));
+                        }
+                    }
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
                 // In place of this episode, so Back leaves the show rather than
