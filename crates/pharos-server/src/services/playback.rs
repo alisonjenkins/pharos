@@ -14,6 +14,7 @@ use pharos_jellyfin_api::device_profile::{
 };
 
 use crate::api::jellyfin::dto::container_for;
+use crate::api::jellyfin::media_source;
 use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery};
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
 use crate::state::AppState;
@@ -1299,6 +1300,9 @@ pub struct GrantRequest<'a> {
     /// The session's device token: the playback ends with it (B256).
     pub token: &'a str,
     pub client_is_remote: bool,
+    /// A grouped edition's id (`AlternateMediaSource::id`); `None` plays the
+    /// primary file.
+    pub version: Option<&'a str>,
 }
 
 /// A playback a native player may start: the stream capability and the
@@ -1322,6 +1326,8 @@ pub enum GrantError {
     Item(crate::services::library::DetailError),
     /// A book is read, not streamed (004-books).
     NotPlayable,
+    /// The asked-for version is not one of the item's editions.
+    NoSuchVersion,
 }
 
 /// Negotiates `id` for a native player and registers the session that
@@ -1339,6 +1345,25 @@ pub async fn grant(
     if matches!(item.kind, MediaKind::Book) {
         return Err(GrantError::NotPlayable);
     }
+    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
+    // The same `{item}-{edition}` id PlaybackInfo hands Jellyfin clients, so
+    // the stream and playlist routes select the edition's file from it.
+    let source_id = r.version.map(|v| format!("{item_wire_id}-{v}"));
+    let item = match source_id.as_deref() {
+        None => item,
+        Some(raw) => match media_source::classify(&item, Some(raw)).0 {
+            media_source::Requested::Alternate => {
+                media_source::select(media_source::Route::Negotiate, item, Some(raw))
+            }
+            _ => return Err(GrantError::NoSuchVersion),
+        },
+    };
+    // `select` serves the primary when the edition cannot be served yet; the
+    // URLs must then not name the edition either.
+    let source_param = match (&item.edition, &source_id) {
+        (Some(_), Some(source_id)) => format!("&MediaSourceId={source_id}"),
+        _ => String::new(),
+    };
     let profile = r.capabilities.profile();
     // The same start tracks PlaybackInfo picks: the user's remembered track,
     // else their language rules.
@@ -1371,7 +1396,6 @@ pub async fn grant(
         },
     );
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
     let resume_ticks = if user_data.played {
         0
     } else {
@@ -1379,7 +1403,7 @@ pub async fn grant(
     };
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
-            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
+            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}{source_param}",
             if negotiated.is_video {
                 "videos"
             } else {
@@ -1392,7 +1416,7 @@ pub async fn grant(
                 profile: &profile,
                 probe: &item.probe,
                 item_wire_id: &item_wire_id,
-                source_param: "",
+                source_param: &source_param,
                 play_session_id: &play_session_id,
                 api_key: None,
                 audio_stream_index: audio.index.map(|i| i.to_string()),
@@ -1430,6 +1454,8 @@ pub async fn grant(
         client_is_remote = r.client_is_remote,
         audio_index = audio.index.map(i64::from).unwrap_or(-1),
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
+        edition = item.edition.as_deref().unwrap_or("primary"),
+        stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
         "native playback negotiated"
     );
     Ok(Grant {

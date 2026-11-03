@@ -21,6 +21,8 @@ pub(crate) enum Route {
     /// Background segment warming for a play session, with no request of its
     /// own: it names the source the session selected.
     Prewarm,
+    /// A native player's `Playback.negotiate` naming a version.
+    Negotiate,
 }
 
 impl Route {
@@ -31,6 +33,7 @@ impl Route {
             Self::PlaybackInfo => "playback_info",
             Self::Subtitles => "subtitles",
             Self::Prewarm => "prewarm",
+            Self::Negotiate => "negotiate",
         }
     }
 }
