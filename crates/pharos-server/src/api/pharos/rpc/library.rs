@@ -17,7 +17,7 @@ use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
-use crate::services::{segments, watch};
+use crate::services::{lyrics, segments, watch};
 use crate::state::AppState;
 
 pub(super) struct Library {
@@ -235,6 +235,47 @@ impl server::library::Handler for Library {
         let mut genres = out.init_genres(len_u32(&index.genres));
         for (i, genre) in (0..).zip(&index.genres) {
             genres.set(i, genre.as_str());
+        }
+        Ok(())
+    }
+
+    async fn lyrics(
+        self: Rc<Self>,
+        params: wire::LyricsParams,
+        results: &mut wire::LyricsResults,
+    ) -> Result<(), capnp::Error> {
+        let id = read_item_id(params.get()?.get_id()?)?;
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let out = results.get().init_result();
+        // Only a song has lyrics, and no song has a synthetic id.
+        let WireId::Real(id) = id else {
+            out.init_lyrics();
+            return Ok(());
+        };
+        let found = match lyrics::for_item(&self.session.state, &user, id).await {
+            Ok(found) => found,
+            Err(e) => {
+                item_denial(id, &e, "lyrics").write(out.init_error());
+                return Ok(());
+            }
+        };
+        let mut out = out.init_lyrics();
+        let Some(found) = found else {
+            return Ok(());
+        };
+        out.set_synced(found.synced());
+        out.set_source(found.origin.label());
+        let mut lines = out.init_lines(len_u32(&found.lines));
+        for (i, line) in (0..).zip(&found.lines) {
+            let mut w = lines.reborrow().get(i);
+            w.set_start_ms(line.start_ms.unwrap_or(0));
+            w.set_text(line.text.as_str());
         }
         Ok(())
     }
