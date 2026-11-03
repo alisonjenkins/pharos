@@ -78,6 +78,9 @@ web-sys = { version = "0.3", optional = true, features = [
     "TextTrackList",
     "TextTrackMode",
     "IntersectionObserver",
+    "WheelEvent",
+    "MouseEvent",
+    "HtmlCollection",
     "IntersectionObserverEntry",
     "DomRect",
 ] }

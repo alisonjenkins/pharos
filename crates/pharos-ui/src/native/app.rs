@@ -1203,7 +1203,7 @@ fn WatchScreen(id: ItemRef) -> Element {
 /// Mounts `body` afresh whenever `key` changes, dropping its hooks. Dioxus
 /// compares keys only between siblings of a list, so a lone keyed node keeps
 /// its old hooks and the new props never reach them; a one-item list does.
-fn remount_on(key: &str, body: Element) -> Element {
+pub(super) fn remount_on(key: &str, body: Element) -> Element {
     rsx! {
         for key in std::iter::once(key) {
             Fragment { key: "{key}", {body.clone()} }
