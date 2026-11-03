@@ -208,11 +208,13 @@ struct Track {
   index @0 :UInt32; language @1 :Text; title @2 :Text; codec @3 :Text;
   isDefault @4 :Bool; isForced @5 :Bool; isHearingImpaired @6 :Bool;
   delivery @7 :SubtitleDelivery;    # subtitles only
-  url @8 :Text;                     # WebVTT for an `external` subtitle (HTTP, 017 §Scope), else empty
+  url @8 :Text;                     # WebVTT for `external`, the PNG manifest for `image` (HTTP, 017 §Scope), else empty
 }
 # `external`: the player renders the WebVTT at Track.url itself. `burn`: an
 # image subtitle the server draws into the video, so choosing it renegotiates.
-enum SubtitleDelivery { external @0; burn @1; }
+# `image`: an image subtitle the player draws from the timed PNG manifest at
+# Track.url (spec 019), when it declared the codec in imageSubtitles.
+enum SubtitleDelivery { external @0; burn @1; image @2; }
 # A trickplay sprite set: tiles of grid × grid thumbnails, one every intervalMs.
 # tileUrl holds `{tile}`, the 0-based tile number. A tile the server has not
 # generated yet answers 404.
@@ -287,7 +289,7 @@ interface UserData {
 struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 
 # ---- playback -------------------------------------------------------------
-struct Capabilities { videoCodecs @0 :List(Text); audioCodecs @1 :List(Text); containers @2 :List(Text); maxBitrate @3 :UInt64; hdr @4 :Bool; }
+struct Capabilities { videoCodecs @0 :List(Text); audioCodecs @1 :List(Text); containers @2 :List(Text); maxBitrate @3 :UInt64; hdr @4 :Bool; imageSubtitles @5 :List(Text); }
 struct Decision {
   method @0 :Text;             # direct_play | audio_remux | video_remux | transcode (pharos_playback_decision_total's decision)
   directPlayBlock @1 :Text;    # same label values as pharos_playback_decision_total

@@ -109,6 +109,7 @@ pub fn capabilities(
         audio_codecs: pick(AUDIO_CODECS, &codec),
         containers: pick(CONTAINERS, &container),
         max_bitrate: 0,
+        image_subtitles: Vec::new(),
     }
 }
 
