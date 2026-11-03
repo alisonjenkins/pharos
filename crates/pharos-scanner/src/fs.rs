@@ -726,7 +726,7 @@ impl<P: Prober> FsScanner<P> {
                             // grouped under it live on its row too. A deleted, added
                             // or resized edition must re-put the row, or its
                             // alternate_sources and has_3d go stale.
-                            match edition_drift_for(store, row, &alts).await? {
+                            match edition_drift_for(store, row, state.has_editions, &alts).await? {
                                 None => {
                                     seen_batch.push((row, mtime, size));
                                     seen += 1;
@@ -2040,8 +2040,12 @@ pub(crate) fn edition_drift(
 async fn edition_drift_for<S: MediaStore>(
     store: &S,
     row: MediaId,
+    row_has_editions: bool,
     alts: &[(String, PathBuf)],
 ) -> DomainResult<Option<(ReprobeReason, PathBuf)>> {
+    if !row_has_editions && alts.is_empty() {
+        return Ok(None);
+    }
     let stored = store.alternate_sources(row).await?;
     if stored.is_empty() && alts.is_empty() {
         return Ok(None);
@@ -2689,6 +2693,8 @@ mod tests {
         put_batches: Mutex<Vec<usize>>,
         // Ids whose writes are refused, like a row the database rejects.
         reject_ids: Mutex<HashSet<MediaId>>,
+        // Number of `alternate_sources` reads, to prove the skip path avoids them.
+        alternate_sources_calls: AtomicUsize,
     }
 
     impl MediaStore for MemStore {
@@ -2806,12 +2812,34 @@ mod tests {
                 .map(|item| item.id))
         }
         async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
+            let has_editions = self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&id)
+                .is_some_and(|item| !item.probe.alternate_sources.is_empty());
             Ok(self
                 .states
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?
                 .get(&id)
-                .copied())
+                .map(|state| ScanState {
+                    has_editions,
+                    ..*state
+                }))
+        }
+        async fn alternate_sources(
+            &self,
+            id: MediaId,
+        ) -> DomainResult<Vec<pharos_core::AlternateMediaSource>> {
+            self.alternate_sources_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .inner
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .get(&id)
+                .map(|item| item.probe.alternate_sources.clone())
+                .unwrap_or_default())
         }
         async fn begin_scan(&self, _root: &Path) -> DomainResult<i64> {
             Ok(self.next_scan_id.fetch_add(1, Ordering::SeqCst) + 1)
@@ -2849,6 +2877,8 @@ mod tests {
                         file_mtime: mtime,
                         file_size: size,
                         last_seen_scan_id: scan_id,
+                        // Derived from the row at read time in `scan_state`.
+                        has_editions: false,
                         // Mirror the store: mark_seen stamps the version of
                         // the pipeline that produced the row, which for a book
                         // is the book parser (005-kindle-conversion).
@@ -5940,6 +5970,36 @@ mod tests {
         for reason in ReprobeReason::ALL {
             assert_eq!(reprobe_counter(&snapshotter, reason.label()), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_without_editions_reads_no_stored_editions() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(out.skipped, 1, "nothing changed: the file skips");
+        assert_eq!(
+            store.alternate_sources_calls.load(Ordering::SeqCst),
+            0,
+            "no editions stored or on disk: no extra store read"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_grouped_primary_still_reads_its_stored_editions() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), FILM, b"2d").await;
+        write_file(td.path(), FILM_3D, b"3dddd").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(store.alternate_sources_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
