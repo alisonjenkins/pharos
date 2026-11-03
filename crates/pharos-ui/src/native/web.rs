@@ -135,6 +135,17 @@ pub fn push(path: &str) {
     }
 }
 
+/// `history.back()`, when there is a page before this one to return to.
+pub fn go_back() -> bool {
+    let Some(history) = web_sys::window().and_then(|w| w.history().ok()) else {
+        return false;
+    };
+    if history.length().unwrap_or(0) < 2 {
+        return false;
+    }
+    history.back().is_ok()
+}
+
 /// `history.replaceState` to `path`: a redirect, which Back should skip.
 pub fn replace(path: &str) {
     if let Some(history) = web_sys::window().and_then(|w| w.history().ok()) {

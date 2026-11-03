@@ -67,6 +67,8 @@ pub enum Control {
     Audio(u32),
     Subtitle(Option<u32>),
     Fullscreen,
+    /// Leave the player for the page before it.
+    Back,
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -119,7 +121,6 @@ pub fn WatchView(
 
     rsx! {
         section { class: "pharos-watch",
-            h2 { class: "pharos-watch-title", "{title}" }
             div {
                 id: PLAYER_ID,
                 class,
@@ -149,6 +150,16 @@ pub fn WatchView(
                             label: track_label(&t, 0),
                         }
                     }
+                }
+                div { class: "pharos-watch-top",
+                    button {
+                        class: "pharos-control",
+                        r#type: "button",
+                        aria_label: "Back",
+                        onclick: move |_| on_control.call(Control::Back),
+                        "←"
+                    }
+                    h2 { class: "pharos-watch-title", "{title}" }
                 }
                 if let Some(seg) = skip {
                     button {
@@ -453,6 +464,16 @@ mod tests {
         assert!(html.contains(r#"value="2" selected"#), "{html}");
         // The browser's own controls are gone.
         assert!(!html.contains("controls=true"), "{html}");
+    }
+
+    #[test]
+    fn the_title_and_back_are_drawn_over_the_picture() {
+        let html = render(controls());
+        let player = html.find(r#"id="pharos-player""#);
+        let top = html.find("pharos-watch-top");
+        assert!(player.is_some() && top > player, "{html}");
+        assert!(html.contains(r#"aria-label="Back""#), "{html}");
+        assert!(html.contains("Pilot"), "{html}");
     }
 
     #[test]

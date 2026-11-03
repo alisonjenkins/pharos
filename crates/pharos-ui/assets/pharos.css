@@ -379,49 +379,71 @@ input:focus-visible {
   }
 }
 
+/* The watch page is the picture: it covers the viewport edge to edge, above
+   the shell, and everything else is drawn over it. */
 .pharos-watch {
-  width: 100%;
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: black; /* not themed: the letterbox around video is black in every theme */
 }
-.pharos-watch-title {
-  margin: 0 0 1rem;
+body:has(.pharos-watch) {
+  overflow: hidden;
+}
+/* A playback error stays readable over the picture. */
+body:has(.pharos-watch) .pharos-error {
+  position: fixed;
+  top: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 11;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  background: var(--px-color-surface);
 }
 .pharos-video {
-  box-sizing: border-box;
   display: block;
   width: 100%;
-  max-height: 80vh;
+  height: 100%;
+  object-fit: contain;
   background: black; /* not themed: the letterbox around video is black in every theme */
-  border-radius: 8px;
 }
 /* The controls sit on the picture, so they are light on a dark scrim in every
    theme; only the accent follows the theme. */
 .pharos-player {
   position: relative;
-  border-radius: 8px;
+  width: 100%;
+  height: 100%;
   outline: none;
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
 }
 .pharos-player:focus-visible {
-  box-shadow: 0 0 0 2px var(--px-color-accent);
+  box-shadow: inset 0 0 0 2px var(--px-color-accent);
 }
-.pharos-player:fullscreen .pharos-video {
-  max-height: none;
-  height: 100%;
-  border-radius: 0;
+.pharos-watch-top {
+  position: absolute;
+  inset: 0 0 auto 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 0.75rem 2.5rem;
+  background: linear-gradient(rgb(0 0 0 / 0.7), transparent); /* not themed: controls sit on the video, whose colours no theme sets */
+  transition: opacity 0.2s;
+}
+.pharos-watch-title {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .pharos-controls {
   position: absolute;
   inset: auto 0 0 0;
-  padding: 2rem 0.75rem 0.5rem;
-  border-radius: 0 0 8px 8px;
+  padding: 2.5rem 0.75rem 0.5rem;
   background: linear-gradient(transparent, rgb(0 0 0 / 0.75)); /* not themed: controls sit on the video, whose colours no theme sets */
   transition: opacity 0.2s;
-}
-/* A touch screen has no hover to bring hidden controls back. */
-@media (hover: hover) {
-  .pharos-player:not(.is-paused):not(:hover):not(:focus-within) .pharos-controls {
-    opacity: 0;
-  }
 }
 .pharos-control-row {
   display: flex;

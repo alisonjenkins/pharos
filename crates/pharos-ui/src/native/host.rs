@@ -51,6 +51,10 @@ pub fn push(_path: &str) {}
 
 pub fn replace(_path: &str) {}
 
+pub fn go_back() -> bool {
+    false
+}
+
 pub struct PopState;
 
 pub fn on_pop_state(_on_path: impl FnMut(String) + 'static) -> PopState {

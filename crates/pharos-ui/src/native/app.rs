@@ -1214,6 +1214,7 @@ fn Player(
     let p = playing.0;
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
+    let nav = use_context::<Nav>();
     let mut failed = use_signal(|| None::<String>);
     let mut media = use_signal(MediaState::default);
     let mut hover_ms = use_signal(|| None::<u64>);
@@ -1357,6 +1358,11 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::Back => {
+                    if !platform::go_back() {
+                        nav.0.call(Route::Home);
+                    }
+                }
                 Control::Audio(index) => {
                     if p.audio != Some(index) {
                         on_renegotiate.call(TrackPicks {
