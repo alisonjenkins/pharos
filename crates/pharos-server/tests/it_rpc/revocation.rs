@@ -29,7 +29,26 @@ pub(crate) async fn start() -> (actix_test::TestServer, Fixture) {
 
 /// A server whose timer re-checks every `revalidate_secs`.
 async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fixture) {
-    let fx = seed_rich().await;
+    serve(seed_rich().await, revalidate_secs)
+}
+
+/// A server whose state also extracts image subtitles (spec 019). Its pool
+/// never runs: nothing here asks for the images, only whether they can be.
+#[cfg(feature = "ffmpeg-lib")]
+pub(crate) async fn start_drawing_images(
+    cache_root: &std::path::Path,
+) -> (actix_test::TestServer, Fixture) {
+    let cache = pharos_cache::subtitle_cache::SubtitleCache::new(1 << 20, 16)
+        .with_disk(cache_root)
+        .with_pool(pharos_transcode::worker::LibavWorkerPool::new(
+            "/nonexistent/transcode-worker",
+            1,
+        ));
+    let fx = crate::common::seed_rich_with(|s| s.with_subtitle_cache(cache)).await;
+    serve(fx, NonZeroU32::MIN)
+}
+
+fn serve(fx: Fixture, revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fixture) {
     let state = fx.state.clone();
     let limits = rpc::limits::ConnectionLimits::default();
     let server = actix_test::start(move || {

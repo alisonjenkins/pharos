@@ -50,6 +50,11 @@ pub struct Fixture {
 
 /// Seed an in-memory store with the rich fixture and wrap it in `AppState`.
 pub async fn seed_rich() -> Fixture {
+    seed_rich_with(|state| state).await
+}
+
+/// [`seed_rich`], with `configure` adding to the state before it is shared.
+pub async fn seed_rich_with(configure: impl FnOnce(AppState) -> AppState) -> Fixture {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("hunter2")).unwrap();
@@ -187,7 +192,7 @@ pub async fn seed_rich() -> Fixture {
     // Path-prefix backfill so each item resolves to its library.
     stores.backfill_library_ids().await.unwrap();
 
-    let state = web::Data::new(AppState::new(stores, "test".into()));
+    let state = web::Data::new(configure(AppState::new(stores, "test".into())));
     let libraries = state.stores.libraries().await.unwrap();
     state.set_libraries(libraries);
 
