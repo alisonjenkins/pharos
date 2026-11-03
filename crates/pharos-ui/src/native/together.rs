@@ -78,6 +78,109 @@ fn median(mut values: Vec<i64>) -> Option<i64> {
     }
 }
 
+/// Inside this drift the player is left alone.
+pub const HOLD_BELOW_MS: u64 = 150;
+/// A player already nudging goes back to normal speed under this drift.
+pub const RELEASE_BELOW_MS: u64 = 50;
+/// Past this drift the player seeks (the oracle's `SYNC_TOL_MS`).
+pub const SEEK_ABOVE_MS: u64 = 1_500;
+/// `playbackRate` while ahead of the group.
+pub const RATE_AHEAD: f64 = 0.95;
+/// `playbackRate` while behind the group.
+pub const RATE_BEHIND: f64 = 1.05;
+/// After a server command (play, pause, seek, item) the client leaves the
+/// player alone this long: the command owns the position until it settles.
+pub const SETTLE_AFTER_COMMAND_MS: u64 = 3_000;
+
+/// What to do about the gap between where the player is and where the group
+/// says it should be.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Correction {
+    /// Leave it; a player that was nudging goes back to rate 1.0.
+    Hold,
+    /// Set `playbackRate` to this.
+    Rate(f64),
+    /// Seek to this position (ms).
+    Seek(u64),
+}
+
+/// The drift policy (plan clarification 8). Drift is `actual - expected`:
+/// positive means ahead. `nudging` is whether a rate nudge is in force, which
+/// gives hysteresis: a nudge starts at 150 ms and ends under 50 ms.
+/// `since_last_command_ms` is the time since the last server command; inside
+/// [`SETTLE_AFTER_COMMAND_MS`] the server's command wins and nothing is done.
+pub fn correct(
+    expected_ms: i64,
+    actual_ms: i64,
+    since_last_command_ms: u64,
+    nudging: bool,
+) -> Correction {
+    if since_last_command_ms < SETTLE_AFTER_COMMAND_MS {
+        return Correction::Hold;
+    }
+    let drift = actual_ms - expected_ms;
+    let size = drift.unsigned_abs();
+    if size > SEEK_ABOVE_MS {
+        return Correction::Seek(u64::try_from(expected_ms).unwrap_or(0));
+    }
+    let floor = if nudging {
+        RELEASE_BELOW_MS
+    } else {
+        HOLD_BELOW_MS
+    };
+    if size < floor {
+        Correction::Hold
+    } else if drift > 0 {
+        Correction::Rate(RATE_AHEAD)
+    } else {
+        Correction::Rate(RATE_BEHIND)
+    }
+}
+
+/// Runs [`correct`] over time: remembers whether a nudge is in force and
+/// counts hard seeks, for the `groupHardSeek` event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DriftTracker {
+    nudging: bool,
+    hard_seeks: u32,
+}
+
+impl DriftTracker {
+    pub fn check(
+        &mut self,
+        expected_ms: i64,
+        actual_ms: i64,
+        since_last_command_ms: u64,
+    ) -> Correction {
+        let c = correct(expected_ms, actual_ms, since_last_command_ms, self.nudging);
+        self.nudging = matches!(c, Correction::Rate(_));
+        if matches!(c, Correction::Seek(_)) {
+            self.hard_seeks += 1;
+        }
+        c
+    }
+
+    /// Hard seeks so far.
+    pub fn hard_seeks(&self) -> u32 {
+        self.hard_seeks
+    }
+}
+
+/// Where the group's playback is now, from an anchor the server stated
+/// (`position` at `anchor_server_ms`). Paused, it stays at the anchor; a
+/// `now` before the anchor does not run backwards.
+pub fn expected_position(
+    anchor_position_ms: u64,
+    anchor_server_ms: i64,
+    now_server_ms: i64,
+    playing: bool,
+) -> u64 {
+    if !playing {
+        return anchor_position_ms;
+    }
+    anchor_position_ms + u64::try_from(now_server_ms - anchor_server_ms).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +276,95 @@ mod tests {
     fn a_negative_offset_is_kept() {
         let e = estimator(&[sample(10_000, -400, 60)]);
         assert_eq!(e.offset_ms(), Some(-400));
+    }
+
+    const LONG_AGO: u64 = SETTLE_AFTER_COMMAND_MS;
+
+    #[test]
+    fn within_150_ms_either_way_holds() {
+        for d in [0, 149, -149] {
+            assert_eq!(
+                correct(10_000, 10_000 + d, LONG_AGO, false),
+                Correction::Hold
+            );
+        }
+    }
+
+    #[test]
+    fn from_150_to_1500_nudges_against_the_drift() {
+        for d in [150, 1_500] {
+            assert_eq!(
+                correct(10_000, 10_000 + d, LONG_AGO, false),
+                Correction::Rate(0.95)
+            );
+            assert_eq!(
+                correct(10_000, 10_000 - d, LONG_AGO, false),
+                Correction::Rate(1.05)
+            );
+        }
+    }
+
+    #[test]
+    fn past_1500_seeks_to_the_expected_position() {
+        assert_eq!(
+            correct(10_000, 11_501, LONG_AGO, false),
+            Correction::Seek(10_000)
+        );
+        assert_eq!(
+            correct(10_000, 8_499, LONG_AGO, true),
+            Correction::Seek(10_000)
+        );
+        assert_eq!(correct(-5, 9_000, LONG_AGO, false), Correction::Seek(0));
+    }
+
+    #[test]
+    fn a_nudge_holds_on_until_under_50_ms() {
+        assert_eq!(correct(10_000, 10_100, LONG_AGO, false), Correction::Hold);
+        assert_eq!(
+            correct(10_000, 10_100, LONG_AGO, true),
+            Correction::Rate(0.95)
+        );
+        assert_eq!(
+            correct(10_000, 10_050, LONG_AGO, true),
+            Correction::Rate(0.95)
+        );
+        assert_eq!(correct(10_000, 10_049, LONG_AGO, true), Correction::Hold);
+        assert_eq!(correct(10_000, 9_951, LONG_AGO, true), Correction::Hold);
+        assert_eq!(
+            correct(10_000, 9_950, LONG_AGO, true),
+            Correction::Rate(1.05)
+        );
+    }
+
+    #[test]
+    fn a_fresh_server_command_suppresses_every_correction() {
+        for since in [0, SETTLE_AFTER_COMMAND_MS - 1] {
+            assert_eq!(correct(10_000, 50_000, since, false), Correction::Hold);
+            assert_eq!(correct(10_000, 10_500, since, true), Correction::Hold);
+        }
+        assert_eq!(
+            correct(10_000, 50_000, SETTLE_AFTER_COMMAND_MS, false),
+            Correction::Seek(10_000)
+        );
+    }
+
+    #[test]
+    fn the_tracker_remembers_the_nudge_and_counts_hard_seeks() {
+        let mut t = DriftTracker::default();
+        assert_eq!(t.check(10_000, 10_100, LONG_AGO), Correction::Hold);
+        assert_eq!(t.check(10_000, 10_200, LONG_AGO), Correction::Rate(0.95));
+        assert_eq!(t.check(10_000, 10_100, LONG_AGO), Correction::Rate(0.95));
+        assert_eq!(t.check(10_000, 10_010, LONG_AGO), Correction::Hold);
+        assert_eq!(t.check(10_000, 10_100, LONG_AGO), Correction::Hold);
+        assert_eq!(t.hard_seeks(), 0);
+        assert_eq!(t.check(10_000, 20_000, LONG_AGO), Correction::Seek(10_000));
+        assert_eq!(t.hard_seeks(), 1);
+    }
+
+    #[test]
+    fn expected_position_runs_with_the_server_clock_only_while_playing() {
+        assert_eq!(expected_position(5_000, 100, 1_100, true), 6_000);
+        assert_eq!(expected_position(5_000, 100, 1_100, false), 5_000);
+        assert_eq!(expected_position(5_000, 100, 50, true), 5_000);
     }
 }
