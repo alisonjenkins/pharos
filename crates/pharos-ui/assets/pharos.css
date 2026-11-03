@@ -300,14 +300,19 @@ input:focus-visible {
   background: var(--px-color-accent);
 }
 
+/* Two lines before the ellipsis: one line cut most episode titles short.
+   The full name is the tile's tooltip. */
 .pharos-poster-name {
-  display: block;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   margin-top: 0.5rem;
   font-size: 0.875rem;
   font-weight: 500;
-  white-space: nowrap;
+  line-height: 1.25;
   overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .pharos-poster-sub {
