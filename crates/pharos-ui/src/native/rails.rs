@@ -1,5 +1,7 @@
 //! Rail gestures as plain arithmetic: how far a sideways wheel turn moves a
-//! rail. The listener that feeds it lives in the platform module.
+//! rail, and when a held mouse button becomes a drag. The listeners that
+//! feed these live in the platform module; touch is left to the browser,
+//! which already pans a rail with momentum.
 
 /// How much further a sideways wheel turn moves a rail than the browser
 /// would: one notch is ~100 px, under one poster, so crossing a shelf took
@@ -20,6 +22,10 @@ const TILT_NOTCH_PX: f64 = 100.0;
 /// heading rather than to where the rail is mid-glide, in ms. Without it a
 /// quick spin loses most of each notch to the glide still in flight.
 const GLIDE_MS: f64 = 300.0;
+
+/// How far the pointer moves with the button held before it is a drag, in
+/// CSS pixels; less is a click with a shaky hand.
+pub const DRAG_SLOP: f64 = 6.0;
 
 /// How far a wheel turn of `dx`, `dy` (in pixels) should move a rail, or
 /// `None` to leave it to the browser. Only a notch-sized sideways turn is
@@ -62,6 +68,35 @@ pub fn glide(last: Option<Glide>, now: f64, left: f64, max: f64, step: f64) -> O
         to: (from + step).clamp(0.0, max),
         at: now,
     })
+}
+
+/// A held primary button over a rail: a click until it moves past
+/// [`DRAG_SLOP`], then a drag that scrolls the rail with the pointer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Drag {
+    start_x: f64,
+    start_left: f64,
+    pub dragging: bool,
+}
+
+impl Drag {
+    pub fn new(x: f64, left: f64) -> Self {
+        Self {
+            start_x: x,
+            start_left: left,
+            dragging: false,
+        }
+    }
+
+    /// The scroll offset for the pointer at `x`, once it is a drag.
+    pub fn moved(&mut self, x: f64) -> Option<f64> {
+        let dx = x - self.start_x;
+        if !self.dragging && dx.abs() < DRAG_SLOP {
+            return None;
+        }
+        self.dragging = true;
+        Some(self.start_left - dx)
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +149,16 @@ mod tests {
         assert_eq!(glide(None, 0.0, 2000.0, 2000.0, 300.0), None);
         assert_eq!(glide(None, 0.0, 0.0, 2000.0, -300.0), None);
         assert_eq!(glide(None, 0.0, 0.0, 0.0, 300.0), None);
+    }
+
+    #[test]
+    fn a_small_wobble_is_a_click_and_a_longer_move_drags() {
+        let mut drag = Drag::new(500.0, 200.0);
+        assert_eq!(drag.moved(503.0), None);
+        assert!(!drag.dragging);
+        assert_eq!(drag.moved(450.0), Some(250.0));
+        assert!(drag.dragging);
+        // Once dragging, even a move back inside the slop scrolls.
+        assert_eq!(drag.moved(502.0), Some(198.0));
     }
 }
