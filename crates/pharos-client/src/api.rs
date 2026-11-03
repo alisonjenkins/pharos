@@ -8,8 +8,8 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, index_result, item_id, item_query,
-    item_summary, items_result, library, negotiate_result, opt_u16, opt_u32, playback,
-    playback_grant, pref_result, prefs, session, stream_choice, telemetry, track, Kind,
+    item_summary, items_result, library, lyrics_result, negotiate_result, opt_u16, opt_u32,
+    playback, playback_grant, pref_result, prefs, session, stream_choice, telemetry, track, Kind,
     LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
@@ -200,6 +200,21 @@ pub struct Detail {
     pub segments: Vec<Segment>,
 }
 
+/// A song's lyrics. When `synced`, every line has the time it is sung from;
+/// otherwise the lines are plain text and a blank one parts verses. No lines
+/// means the song has none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lyrics {
+    pub synced: bool,
+    pub lines: Vec<LyricLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LyricLine {
+    pub start_ms: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chapter {
     pub name: String,
@@ -353,6 +368,7 @@ pub trait PharosApi {
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
+    async fn lyrics(&self, call: &CallInfo, id: ItemRef) -> Result<Lyrics, ClientError>;
     /// Negotiate playback of `id` with the tracks in `picks`.
     async fn play(
         &self,
@@ -672,6 +688,40 @@ impl PharosApi for NativeApi {
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    async fn lyrics(&self, call: &CallInfo, id: ItemRef) -> Result<Lyrics, ClientError> {
+        let mut req = self.library.lyrics_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.init_id(), id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            lyrics_result::Lyrics(l) => {
+                let l = l?;
+                Ok(Lyrics {
+                    synced: l.get_synced(),
+                    lines: l
+                        .get_lines()?
+                        .iter()
+                        .map(|line| {
+                            Ok(LyricLine {
+                                start_ms: line.get_start_ms(),
+                                text: text(line.get_text())?,
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                })
+            }
+            lyrics_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
