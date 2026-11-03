@@ -1374,9 +1374,9 @@ body:has(.pharos-watch) .pharos-error {
   }
 }
 
-/* Rails (012): no scrollbar; a sideways swipe or Shift+wheel, touch,
-   keyboard focus and the controller still move them. A plain vertical
-   wheel turn scrolls the page, never the rail. */
+/* Rails (012): no scrollbar; a sideways swipe or Shift+wheel, a mouse
+   drag, touch, keyboard focus and the controller still move them. A plain
+   vertical wheel turn scrolls the page, never the rail. */
 
 .pharos-rail-items {
   /* Room for a lifted poster, its shadow and focus ring, which the
@@ -1390,6 +1390,22 @@ body:has(.pharos-watch) .pharos-error {
 }
 .pharos-rail-items::-webkit-scrollbar {
   display: none;
+}
+/* A mouse drag across a rail scrolls it (B315): no snapping or text
+   selection under it, and posters stay flat while they slide past. */
+.pharos-rail-items {
+  cursor: grab;
+}
+.pharos-rail-items.is-dragging {
+  cursor: grabbing;
+  scroll-snap-type: none;
+  user-select: none;
+}
+.pharos-rail-items.is-dragging .pharos-poster {
+  cursor: grabbing;
+}
+.pharos-rail-items.is-dragging .pharos-poster .pharos-poster-art {
+  transform: translateZ(0);
 }
 
 /* Depth (012): posters that lift and tilt.

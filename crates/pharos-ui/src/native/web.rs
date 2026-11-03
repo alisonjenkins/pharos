@@ -454,12 +454,26 @@ fn rail_at(e: &web_sys::Event) -> Option<web_sys::HtmlElement> {
         .ok()
 }
 
+/// A primary button held over a rail, and the rail it scrolls.
+struct Held {
+    rail: web_sys::HtmlElement,
+    pointer: i32,
+    drag: rails::Drag,
+}
+
 #[derive(Default)]
 struct RailState {
+    held: Option<Held>,
     glide: Option<(web_sys::HtmlElement, rails::Glide)>,
+    /// When the last drag ended, so the click its release makes is dropped.
+    dragged_at: Option<f64>,
 }
 
 type Handler = Box<dyn FnMut(web_sys::Event)>;
+
+/// How long after a drag ends its click is dropped, in ms: the click
+/// follows the release within one task, and a later real click must work.
+const DRAG_CLICK_MS: f64 = 100.0;
 
 /// The window listeners behind rail gestures; removed on drop.
 pub struct RailGestures(Vec<WindowListener>);
@@ -482,7 +496,9 @@ impl Drop for RailGestures {
     }
 }
 
-/// Scroll rails further on a sideways wheel notch (B315).
+/// Scroll rails further on a sideways wheel notch, and with a mouse or pen
+/// dragged across them; a click that ends a drag is dropped so it opens
+/// nothing (B315). Touch is left to the browser's own panning.
 pub fn rail_gestures() -> RailGestures {
     let state = Rc::new(RefCell::new(RailState::default()));
     let reduced = prefers("(prefers-reduced-motion: reduce)");
@@ -529,6 +545,123 @@ pub fn rail_gestures() -> RailGestures {
             });
             rail.scroll_to_with_scroll_to_options(&options);
             st.glide = Some((rail, glide));
+        }),
+    ));
+
+    let st = state.clone();
+    listeners.push((
+        "pointerdown",
+        false,
+        Box::new(move |e: web_sys::Event| {
+            let Some(e) = e.dyn_ref::<web_sys::PointerEvent>() else {
+                return;
+            };
+            let mut st = st.borrow_mut();
+            st.dragged_at = None;
+            if e.button() != 0 || e.pointer_type() == "touch" {
+                return;
+            }
+            let Some(rail) = rail_at(e) else {
+                return;
+            };
+            let left = f64::from(rail.scroll_left());
+            st.held = Some(Held {
+                rail,
+                pointer: e.pointer_id(),
+                drag: rails::Drag::new(f64::from(e.client_x()), left),
+            });
+        }),
+    ));
+
+    let st = state.clone();
+    listeners.push((
+        "pointermove",
+        false,
+        Box::new(move |e: web_sys::Event| {
+            let Some(e) = e.dyn_ref::<web_sys::PointerEvent>() else {
+                return;
+            };
+            let mut st = st.borrow_mut();
+            // A press let go outside the window before it became a drag
+            // never sends its pointerup here.
+            if e.buttons() & 1 == 0 {
+                st.held = None;
+                return;
+            }
+            let Some(held) = st.held.as_mut().filter(|h| h.pointer == e.pointer_id()) else {
+                return;
+            };
+            let was_dragging = held.drag.dragging;
+            let Some(left) = held.drag.moved(f64::from(e.client_x())) else {
+                return;
+            };
+            if !was_dragging {
+                // Capture only now: capturing on press would retarget a plain
+                // click away from the poster.
+                let _ = held.rail.set_pointer_capture(e.pointer_id());
+                let _ = held.rail.class_list().add_1("is-dragging");
+                if let Some(selection) =
+                    web_sys::window().and_then(|w| w.get_selection().ok().flatten())
+                {
+                    let _ = selection.remove_all_ranges();
+                }
+            }
+            held.rail.set_scroll_left(left.round() as i32);
+            e.prevent_default();
+        }),
+    ));
+
+    for name in ["pointerup", "pointercancel"] {
+        let st = state.clone();
+        listeners.push((
+            name,
+            false,
+            Box::new(move |e: web_sys::Event| {
+                let Some(e) = e.dyn_ref::<web_sys::PointerEvent>() else {
+                    return;
+                };
+                let mut st = st.borrow_mut();
+                if st.held.as_ref().map(|h| h.pointer) != Some(e.pointer_id()) {
+                    return;
+                }
+                let Some(held) = st.held.take() else {
+                    return;
+                };
+                if held.drag.dragging {
+                    let _ = held.rail.class_list().remove_1("is-dragging");
+                    let _ = held.rail.release_pointer_capture(e.pointer_id());
+                    st.dragged_at = Some(e.time_stamp());
+                }
+            }),
+        ));
+    }
+
+    // Capture on the window runs before Dioxus's own listener at the app
+    // root, so a poster link never sees the click.
+    let st = state.clone();
+    listeners.push((
+        "click",
+        true,
+        Box::new(move |e: web_sys::Event| {
+            let Some(at) = st.borrow_mut().dragged_at.take() else {
+                return;
+            };
+            if e.time_stamp() - at < DRAG_CLICK_MS {
+                e.prevent_default();
+                e.stop_immediate_propagation();
+            }
+        }),
+    ));
+
+    // A pressed link or image would start the browser's own drag of it,
+    // which ends the pointer events.
+    listeners.push((
+        "dragstart",
+        false,
+        Box::new(move |e: web_sys::Event| {
+            if rail_at(&e).is_some() {
+                e.prevent_default();
+            }
         }),
     ));
 
