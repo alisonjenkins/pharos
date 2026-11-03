@@ -126,7 +126,10 @@ pub struct HomeRail {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Home {
     pub rails: Vec<HomeRail>,
+    /// Films and episodes to resume.
     pub resume: Vec<Item>,
+    /// Music to resume.
+    pub listening: Vec<Item>,
     pub next_up: Vec<Item>,
 }
 
@@ -519,6 +522,7 @@ impl PharosApi for NativeApi {
                 Ok(Home {
                     rails,
                     resume: read_items(home.get_resume()?)?,
+                    listening: read_items(home.get_listening()?)?,
                     next_up: read_items(home.get_next_up()?)?,
                 })
             }
