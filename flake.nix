@@ -369,6 +369,45 @@
                    $out
           '';
 
+        # Image-subtitle fixture: an NTSC 16:9 DVD-style MPEG-2 programme
+        # with a real `dvd_subtitle` track, made by dvdauthor's spumux from
+        # two solid PNG cues (ffmpeg cannot encode a bitmap subtitle from
+        # text), re-encoded to VP9/Opus in Matroska
+        # with the subtitle copied.
+        dvdSubtitleMkv =
+          pkgs.runCommand "test-dvd-subtitle.mkv"
+            {
+              nativeBuildInputs = [
+                pkgs.ffmpeg-headless
+                pkgs.dvdauthor
+              ];
+            } ''
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "color=c=white:s=240x48,format=rgba" \
+                   -frames:v 1 cue1.png
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "color=c=yellow:s=160x48,format=rgba" \
+                   -frames:v 1 cue2.png
+            ffmpeg -hide_banner -loglevel error -nostdin \
+                   -f lavfi -i "testsrc=duration=10:size=720x480:rate=30000/1001" \
+                   -f lavfi -i "sine=frequency=440:duration=10:sample_rate=48000" \
+                   -target ntsc-dvd -aspect 16:9 -shortest base.mpg
+            cat > subs.xml <<XML
+            <subpictures><stream>
+            <spu start="00:00:00.50" end="00:00:02.50" image="cue1.png" xoffset="240" yoffset="400"/>
+            <spu start="00:00:04.00" end="00:00:06.00" image="cue2.png" xoffset="280" yoffset="400"/>
+            </stream></subpictures>
+            XML
+            spumux -m dvd subs.xml < base.mpg > subbed.mpg
+            ffmpeg -hide_banner -loglevel error -nostdin -i subbed.mpg \
+                   -map 0:v -map 0:a -map 0:s \
+                   -c:v libvpx-vp9 -deadline realtime -cpu-used 8 -row-mt 1 \
+                   -pix_fmt yuv420p -aspect 16:9 \
+                   -c:a libopus -b:a 64k -c:s copy \
+                   -metadata:s:s:0 language=eng \
+                   $out
+          '';
+
         # Assembly-only derivation. Pure cp + cat — no ffmpeg here.
         # Each cp is from an already-cached store path; the assembly
         # itself is cheap and re-runs trivially when any one sub-fixture
@@ -384,6 +423,7 @@
           cp ${subtitlesVtt}  $out/07-test-subtitles.vtt
           cp ${subtitlesWebm} $out/07-test-subtitles.webm
           cp ${dualAudioWebm} $out/08-test-dual-audio.webm
+          cp ${dvdSubtitleMkv} $out/09-test-dvd-subtitle.mkv
           cat > $out/LICENSES.txt <<EOF
         01-big-buck-bunny-360p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
         02-big-buck-bunny-720p.webm   CC-BY 3.0       https://peach.blender.org/about/  (silent Opus track muxed at build)
@@ -394,6 +434,7 @@
         07-test-subtitles.webm        Synthetic       testsrc + 523 Hz tone + embedded WebVTT track (English)
         07-test-subtitles.vtt         Synthetic       sidecar VTT for 07-test-subtitles.webm
         08-test-dual-audio.webm       Synthetic       testsrc + 440 Hz (eng) and 880 Hz (jpn) audio tracks
+        09-test-dvd-subtitle.mkv      Synthetic       720x480 16:9 VP9 + Opus + dvd_subtitle (spumux), two cues
         EOF
         '';
 
