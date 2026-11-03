@@ -131,6 +131,112 @@ pub async fn update(
     Ok((item, data))
 }
 
+/// The stored items under synthesised series or season `id` (its 32-hex
+/// wire id) that `user` may see.
+pub async fn folder_items(
+    state: &AppState,
+    user: &User,
+    id: &str,
+) -> Result<Vec<MediaItem>, DetailError> {
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    let all = state
+        .list_items_cached()
+        .await
+        .map_err(DetailError::Store)?;
+    let mut items: Vec<MediaItem> = all
+        .iter()
+        .filter(|item| {
+            let Some(series) = item.series.as_ref() else {
+                return false;
+            };
+            if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id {
+                return true;
+            }
+            series.season_number.is_some_and(|n| {
+                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n) == id
+            })
+        })
+        .cloned()
+        .collect();
+    crate::services::access::retain_visible(state, user, &mut items, |e| e.id, "user_data")
+        .await
+        .map_err(DetailError::Hidden)?;
+    Ok(items)
+}
+
+/// Applies `change` to `user`'s state on every item under synthesised
+/// series or season `id` they may see, and announces every new state plus
+/// a folder entry keyed on `id`, so a series or season page updates by its
+/// Key (B36). Answers the folder's state; `NotFound` when `id` names no
+/// series or season with a visible item.
+pub async fn update_folder(
+    state: &AppState,
+    user: &User,
+    id: &str,
+    change: impl Fn(&mut UserItemData),
+) -> Result<UserItemData, DetailError> {
+    let items = folder_items(state, user, id).await?;
+    if items.is_empty() {
+        return Err(DetailError::NotFound);
+    }
+    let mut entries = Vec::with_capacity(items.len() + 1);
+    let mut folder = UserItemData::default();
+    change(&mut folder);
+    let user_key = user.id.0.simple().to_string();
+    for item in items {
+        let data = match write_one(state, user, &item, &change).await {
+            Ok(data) => data,
+            Err(e) => {
+                // Announce what was written before the failure, so every
+                // client shows the episodes that did change.
+                if !entries.is_empty() {
+                    state.notify_user_data_changed(&user_key, entries);
+                }
+                return Err(e);
+            }
+        };
+        let runtime = item.probe.run_time_ticks().unwrap_or(0);
+        let dto = UserItemDataDto::from_domain_with_runtime(item.id, data, runtime);
+        match serde_json::to_value(&dto) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::warn!(media.id = item.id, error = %e, "user data: change not announced")
+            }
+        }
+    }
+    // Typed, so the kotlin-required UserData field set stays complete (B78/V38).
+    let folder_dto =
+        UserItemDataDto::folder(id, folder.played, folder.play_count, folder.is_favorite);
+    match serde_json::to_value(&folder_dto) {
+        Ok(entry) => entries.push(entry),
+        Err(e) => tracing::warn!(folder.id = id, error = %e, "user data: change not announced"),
+    }
+    state.notify_user_data_changed(&user_key, entries);
+    Ok(folder)
+}
+
+/// Applies `change` to `user`'s state on `item` under its write lock.
+async fn write_one(
+    state: &AppState,
+    user: &User,
+    item: &MediaItem,
+    change: &impl Fn(&mut UserItemData),
+) -> Result<UserItemData, DetailError> {
+    let _write_guard = state.user_data_writes.lock(user.id, item.id).await;
+    let mut data = state
+        .stores
+        .get_user_data(user.id, item.id)
+        .await
+        .map_err(DetailError::Store)?;
+    change(&mut data);
+    state
+        .stores
+        .set_user_data(user.id, item.id, data)
+        .await
+        .map_err(DetailError::Store)?;
+    Ok(data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
