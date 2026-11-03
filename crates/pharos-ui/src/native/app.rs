@@ -1162,15 +1162,28 @@ fn WatchScreen(id: ItemRef) -> Element {
     });
     let state = playing.read();
     loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
-        rsx! {
-            Player {
-                key: "{p.0.session}",
-                playing: p.clone(),
-                last_ms: LastMs(Rc::clone(&last_ms)),
-                on_renegotiate: move |next| picks.set(next),
-            }
-        }
+        remount_on(
+            &p.0.session,
+            rsx! {
+                Player {
+                    playing: p.clone(),
+                    last_ms: LastMs(Rc::clone(&last_ms)),
+                    on_renegotiate: move |next| picks.set(next),
+                }
+            },
+        )
     })
+}
+
+/// Mounts `body` afresh whenever `key` changes, dropping its hooks. Dioxus
+/// compares keys only between siblings of a list, so a lone keyed node keeps
+/// its old hooks and the new props never reach them; a one-item list does.
+fn remount_on(key: &str, body: Element) -> Element {
+    rsx! {
+        for key in std::iter::once(key) {
+            Fragment { key: "{key}", {body.clone()} }
+        }
+    }
 }
 
 /// The player's last known position, shared with its screen.
@@ -1399,6 +1412,48 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Counts the mounts of `remount_on`'s body as the key changes.
+    fn mounts_across(keys: &[&str]) -> u32 {
+        #[component]
+        fn Probe(mounts: Rc<Cell<u32>>) -> Element {
+            use_hook(|| mounts.set(mounts.get() + 1));
+            rsx! {}
+        }
+        #[derive(Clone)]
+        struct Props {
+            key: Rc<RefCell<String>>,
+            mounts: Rc<Cell<u32>>,
+        }
+        let props = Props {
+            key: Rc::new(RefCell::new(keys[0].to_owned())),
+            mounts: Rc::new(Cell::new(0)),
+        };
+        let mut dom = VirtualDom::new_with_props(
+            |p: Props| {
+                let key = p.key.borrow().clone();
+                remount_on(&key, rsx! { Probe { mounts: Rc::clone(&p.mounts) } })
+            },
+            props.clone(),
+        );
+        dom.rebuild_in_place();
+        for key in &keys[1..] {
+            *props.key.borrow_mut() = (*key).to_owned();
+            dom.mark_dirty(ScopeId::APP);
+            dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+        }
+        props.mounts.get()
+    }
+
+    #[test]
+    fn a_new_play_session_mounts_a_new_player() {
+        assert_eq!(mounts_across(&["a", "b", "c"]), 3);
+    }
+
+    #[test]
+    fn the_same_play_session_keeps_its_player() {
+        assert_eq!(mounts_across(&["a", "a"]), 1);
+    }
 
     #[test]
     fn the_app_starts_by_connecting() {
