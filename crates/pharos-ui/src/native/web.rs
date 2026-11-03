@@ -429,12 +429,7 @@ pub fn on_shift_wheel(mut on_turn: impl FnMut(f64) + 'static) -> ShiftWheel {
             return;
         }
         e.prevent_default();
-        // A line or page delta is ~16 or ~800 px.
-        let scale = match e.delta_mode() {
-            web_sys::WheelEvent::DOM_DELTA_LINE => 16.0,
-            web_sys::WheelEvent::DOM_DELTA_PAGE => 800.0,
-            _ => 1.0,
-        };
+        let scale = wheel_scale(&e);
         let turn = if e.delta_y() != 0.0 {
             e.delta_y()
         } else {
@@ -452,6 +447,16 @@ pub fn on_shift_wheel(mut on_turn: impl FnMut(f64) + 'static) -> ShiftWheel {
         );
     }
     ShiftWheel(listener)
+}
+
+/// Pixels per unit of a wheel event's delta: a line or page delta is ~16 or
+/// ~800 px.
+fn wheel_scale(e: &web_sys::WheelEvent) -> f64 {
+    match e.delta_mode() {
+        web_sys::WheelEvent::DOM_DELTA_LINE => 16.0,
+        web_sys::WheelEvent::DOM_DELTA_PAGE => 800.0,
+        _ => 1.0,
+    }
 }
 
 /// The tiles of the browse grid, in order.
