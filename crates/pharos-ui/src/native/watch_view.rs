@@ -18,8 +18,8 @@ pub const PLAYER_ID: &str = "pharos-player";
 /// The seek bar, whose width turns a pointer offset into a position.
 pub const SEEK_ID: &str = "pharos-seek";
 
-/// How far the arrow keys seek.
-const SEEK_STEP_MS: u64 = 10_000;
+/// How far the arrow keys and skip buttons seek.
+pub(super) const SEEK_STEP_MS: u64 = 10_000;
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
 /// How often a playing picture checks for a still pointer; the chrome fades
@@ -51,11 +51,38 @@ pub struct Controls {
 
 impl Controls {
     fn total_ms(&self) -> u64 {
-        match self.media.duration_ms {
-            0 => self.runtime_ms,
-            d => d,
-        }
+        total_ms(&self.media, self.runtime_ms)
     }
+}
+
+/// The length the seek bar spans: the element's duration, or the item's
+/// runtime until the element knows it.
+pub(super) fn total_ms(media: &MediaState, runtime_ms: u64) -> u64 {
+    match media.duration_ms {
+        0 => runtime_ms,
+        d => d,
+    }
+}
+
+/// What a key does to the transport, on the video and music pages alike:
+/// space or k plays and pauses, the arrows seek and set the volume, m mutes.
+pub(super) fn transport_key(key: &Key, media: &MediaState) -> Option<Control> {
+    let volume = |v: f64| Control::Volume {
+        volume: v.clamp(0.0, 1.0),
+        muted: false,
+    };
+    Some(match key {
+        Key::Character(k) if k == " " || k == "k" => Control::TogglePlay,
+        Key::Character(k) if k == "m" => Control::Volume {
+            volume: media.volume,
+            muted: !media.muted,
+        },
+        Key::ArrowLeft => Control::Seek(media.position_ms.saturating_sub(SEEK_STEP_MS)),
+        Key::ArrowRight => Control::Seek(media.position_ms.saturating_add(SEEK_STEP_MS)),
+        Key::ArrowUp => volume(media.volume + VOLUME_STEP),
+        Key::ArrowDown => volume(media.volume - VOLUME_STEP),
+        _ => return None,
+    })
 }
 
 /// What the viewer asked for.
@@ -132,11 +159,6 @@ pub fn WatchView(
     let (previous, next) = (c.previous, c.next);
     let on_key = move |evt: KeyboardEvent| {
         wake();
-        let back = |by: u64| Control::Seek(media.position_ms.saturating_sub(by));
-        let volume = |v: f64| Control::Volume {
-            volume: v.clamp(0.0, 1.0),
-            muted: false,
-        };
         let control = match evt.key() {
             Key::Character(k) if k == "N" => match next {
                 Some(id) => Control::Play(id),
@@ -146,17 +168,11 @@ pub fn WatchView(
                 Some(id) => Control::Play(id),
                 None => return,
             },
-            Key::Character(k) if k == " " || k == "k" => Control::TogglePlay,
-            Key::Character(k) if k == "m" => Control::Volume {
-                volume: media.volume,
-                muted: !media.muted,
-            },
             Key::Character(k) if k == "f" => Control::Fullscreen,
-            Key::ArrowLeft => back(SEEK_STEP_MS),
-            Key::ArrowRight => Control::Seek(media.position_ms.saturating_add(SEEK_STEP_MS)),
-            Key::ArrowUp => volume(media.volume + VOLUME_STEP),
-            Key::ArrowDown => volume(media.volume - VOLUME_STEP),
-            _ => return,
+            key => match transport_key(&key, &media) {
+                Some(control) => control,
+                None => return,
+            },
         };
         evt.prevent_default();
         on_control.call(control);
@@ -370,12 +386,26 @@ fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) ->
     }
 }
 
+/// The mute button and volume slider. The video page's chrome is the
+/// default; the music page passes its own classes and icon.
 #[component]
-fn Volume(media: MediaState, on_control: EventHandler<Control>) -> Element {
+pub(super) fn Volume(
+    media: MediaState,
+    on_control: EventHandler<Control>,
+    #[props(default = "pharos-control")] button_class: &'static str,
+    #[props(default = "pharos-volume")] range_class: &'static str,
+    /// Replaces the emoji on the mute button.
+    #[props(default)]
+    icon: Option<Element>,
+    /// Draws the slider's fill up to the thumb, for themes that style it.
+    #[props(default)]
+    filled: bool,
+) -> Element {
     let shown = if media.muted { 0.0 } else { media.volume };
+    let fill = format!("--pharos-fill: {:.0}%", shown * 100.0);
     rsx! {
         button {
-            class: "pharos-control",
+            class: button_class,
             r#type: "button",
             aria_label: if media.muted { "Unmute" } else { "Mute" },
             onclick: move |_| on_control.call(Control::Volume {
@@ -383,16 +413,20 @@ fn Volume(media: MediaState, on_control: EventHandler<Control>) -> Element {
                 volume: if media.muted && media.volume == 0.0 { 1.0 } else { media.volume },
                 muted: !media.muted,
             }),
-            if shown == 0.0 { "🔇" } else { "🔊" }
+            match icon {
+                Some(icon) => icon,
+                None => rsx! { if shown == 0.0 { "🔇" } else { "🔊" } },
+            }
         }
         input {
-            class: "pharos-volume",
+            class: range_class,
             r#type: "range",
             aria_label: "Volume",
             min: 0,
             max: 1,
             step: 0.05,
             value: "{shown}",
+            style: if filled { fill },
             // Arrows move the slider, not the player's volume and seek keys.
             onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
             oninput: move |evt: FormEvent| {
@@ -543,6 +577,42 @@ mod tests {
         assert!(html.contains(r#"value="2" selected"#), "{html}");
         // The browser's own controls are gone.
         assert!(!html.contains("controls=true"), "{html}");
+    }
+
+    #[test]
+    fn keys_drive_the_transport() {
+        let media = MediaState {
+            position_ms: 30_000,
+            volume: 0.5,
+            ..MediaState::default()
+        };
+        let key = |k: Key| transport_key(&k, &media);
+        let ch = |c: &str| key(Key::Character(c.into()));
+        assert_eq!(ch(" "), Some(Control::TogglePlay));
+        assert_eq!(ch("k"), Some(Control::TogglePlay));
+        assert_eq!(
+            ch("m"),
+            Some(Control::Volume {
+                volume: 0.5,
+                muted: true
+            })
+        );
+        assert_eq!(key(Key::ArrowLeft), Some(Control::Seek(20_000)));
+        assert_eq!(key(Key::ArrowRight), Some(Control::Seek(40_000)));
+        assert_eq!(
+            key(Key::ArrowUp),
+            Some(Control::Volume {
+                volume: 0.6,
+                muted: false
+            })
+        );
+        assert_eq!(ch("x"), None);
+        // Seeking back from the start stays at the start.
+        let start = MediaState::default();
+        assert_eq!(
+            transport_key(&Key::ArrowLeft, &start),
+            Some(Control::Seek(0))
+        );
     }
 
     #[test]

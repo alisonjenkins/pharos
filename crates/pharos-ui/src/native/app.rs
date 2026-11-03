@@ -1438,7 +1438,16 @@ fn Player(
             ErrorNote { message }
         }
         if p.kind == ItemKind::Audio {
-            ListenView { title: p.title.clone(), image: p.image.clone(), on_media }
+            ListenView {
+                title: p.title.clone(),
+                image: p.image.clone(),
+                year: p.detail.item.year,
+                genres: p.detail.genres.clone(),
+                runtime_ms: p.detail.item.runtime_ms,
+                media: media(),
+                on_media,
+                on_control,
+            }
         } else {
             WatchView { title: p.title.clone(), controls, on_media, on_control }
         }
