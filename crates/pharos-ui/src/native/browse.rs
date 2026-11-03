@@ -1399,6 +1399,13 @@ mod tests {
         async fn detail(&self, _: &CallInfo, id: ItemRef) -> Result<Detail, ClientError> {
             self.details.get(&id).cloned().ok_or_else(refused)
         }
+        async fn lyrics(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+        ) -> Result<pharos_client::api::Lyrics, ClientError> {
+            Ok(Default::default())
+        }
         async fn play(
             &self,
             _: &CallInfo,
