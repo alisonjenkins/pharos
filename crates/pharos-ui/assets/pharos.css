@@ -390,6 +390,11 @@ input:focus-visible {
 body:has(.pharos-watch) {
   overflow: hidden;
 }
+/* The shell under the player is out of sight, so out of the tab order and
+   the accessibility tree too. */
+body:has(.pharos-watch) .pharos-shell-bar {
+  visibility: hidden;
+}
 /* A playback error stays readable over the picture. */
 body:has(.pharos-watch) .pharos-error {
   position: fixed;
