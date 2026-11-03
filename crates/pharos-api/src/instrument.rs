@@ -387,6 +387,9 @@ pub enum Denial {
         name: &'static str,
         retry_after_secs: u64,
     },
+    /// An argument is unusable; `field` names it, a fixed string, never the
+    /// caller's input.
+    Invalid { field: &'static str },
     /// A cap was reached; resume again once the user holds fewer.
     Limit {
         name: &'static str,
@@ -415,6 +418,10 @@ impl Denial {
             Denial::NotFound { what } => {
                 error.set_reason(format!("{what} not found").as_str());
                 error.get_kind().set_not_found(what);
+            }
+            Denial::Invalid { field } => {
+                error.set_reason(format!("invalid {field}").as_str());
+                error.get_kind().init_invalid().set_field(field);
             }
             Denial::Throttled {
                 name,

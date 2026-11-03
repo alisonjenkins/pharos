@@ -3,9 +3,15 @@
 //! Jellyfin handlers' own, so a stand-in Jellyfin member here is a hub-
 //! registered sink exactly as `/socket` makes one.
 
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
-use pharos_api::pharos_capnp::{clock_result, error, groups_result, session};
+use pharos_api::pharos_capnp::{
+    clock_result, error, group_sink, group_update, groups_result, membership, membership_result,
+    session, EndReason,
+};
+use pharos_api::{server, Connection};
 use pharos_core::{UserPolicy, UserStore as _};
 use pharos_jellyfin_api::dto::wire_item_id;
 use pharos_server::group_ops::SyncDeps;
@@ -213,4 +219,278 @@ async fn list_is_refused_without_syncplay_access() {
         .await
         .unwrap();
     assert_eq!(list(&session).await.unwrap_err(), "not permitted: syncplay");
+}
+
+/// What a native member's sink was told, as plain values.
+#[derive(Debug, Clone, PartialEq)]
+enum Seen {
+    Joined {
+        name: String,
+        item: Option<u64>,
+        members: Vec<String>,
+    },
+    Play {
+        at: u64,
+        position_ms: u64,
+    },
+    Pause {
+        at: u64,
+        position_ms: u64,
+    },
+    Seek {
+        at: u64,
+        position_ms: u64,
+    },
+    Member {
+        name: String,
+        buffering: bool,
+    },
+    Left(String),
+    Item {
+        item: u64,
+        playing: bool,
+        position_ms: u64,
+    },
+    Ended(&'static str),
+}
+
+struct TestSink(mpsc::UnboundedSender<Seen>);
+
+impl server::group_sink::Handler for TestSink {
+    async fn update(
+        self: Rc<Self>,
+        params: group_sink::UpdateParams,
+        results: &mut group_sink::UpdateResults,
+    ) -> Result<(), capnp::Error> {
+        let update = params.get()?.get_update()?;
+        let text =
+            |t: capnp::Result<capnp::text::Reader<'_>>| t.unwrap().to_str().unwrap().to_owned();
+        let seen = match update.which()? {
+            group_update::Joined(g) => {
+                let g = g?;
+                Seen::Joined {
+                    name: text(g.get_name()),
+                    item: match g.get_item()?.which()? {
+                        pharos_api::pharos_capnp::item_id::Real(id) if id != 0 => Some(id),
+                        _ => None,
+                    },
+                    members: g
+                        .get_members()?
+                        .iter()
+                        .map(|m| text(m.get_name()))
+                        .collect(),
+                }
+            }
+            group_update::Play(a) => {
+                let a = a?;
+                Seen::Play {
+                    at: a.get_at_server_ms(),
+                    position_ms: a.get_position_ms(),
+                }
+            }
+            group_update::Pause(a) => {
+                let a = a?;
+                Seen::Pause {
+                    at: a.get_at_server_ms(),
+                    position_ms: a.get_position_ms(),
+                }
+            }
+            group_update::Seek(a) => {
+                let a = a?;
+                Seen::Seek {
+                    at: a.get_at_server_ms(),
+                    position_ms: a.get_position_ms(),
+                }
+            }
+            group_update::Member(m) => {
+                let m = m?;
+                Seen::Member {
+                    name: text(m.get_name()),
+                    buffering: m.get_buffering(),
+                }
+            }
+            group_update::Left(id) => Seen::Left(text(id)),
+            group_update::Item(i) => {
+                let i = i?;
+                let pharos_api::pharos_capnp::item_id::Real(item) = i.get_item()?.which()? else {
+                    panic!("synthetic item in a group");
+                };
+                Seen::Item {
+                    item,
+                    playing: i.get_playing(),
+                    position_ms: i.get_position_ms(),
+                }
+            }
+            group_update::Ended(reason) => Seen::Ended(match reason? {
+                EndReason::Left => "left",
+                EndReason::NotInGroup => "notInGroup",
+            }),
+        };
+        let _ = self.0.send(seen);
+        let _ = results;
+        Ok(())
+    }
+}
+
+fn sink() -> (group_sink::Client, mpsc::UnboundedReceiver<Seen>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (
+        server::group_sink::client(TestSink(tx), &Connection::new()),
+        rx,
+    )
+}
+
+/// The next update on `rx`, or a panic after a second.
+async fn next(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
+    tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("an update within a second")
+        .expect("sink open")
+}
+
+/// Updates until `want` returns Some, skipping those it does not want.
+async fn until<T>(rx: &mut mpsc::UnboundedReceiver<Seen>, want: impl Fn(&Seen) -> Option<T>) -> T {
+    loop {
+        let seen = next(rx).await;
+        if let Some(t) = want(&seen) {
+            return t;
+        }
+    }
+}
+
+fn set_device(session_ctx: pharos_api::pharos_capnp::call_context::Builder<'_>, device: &str) {
+    let mut ctx = session_ctx;
+    ctx.reborrow().init_device().set_value(device);
+}
+
+async fn create(
+    session: &session::Client,
+    device: &str,
+    item: u64,
+    position_ms: u64,
+    sink: group_sink::Client,
+) -> Result<membership::Client, String> {
+    let group = session.group_request().send().pipeline.get_group();
+    let mut req = group.create_request();
+    {
+        let mut p = req.get();
+        set_device(p.reborrow().init_ctx(), device);
+        p.reborrow().init_item().set_real(item);
+        p.set_position_ms(position_ms);
+        p.set_sink(sink);
+    }
+    read_membership(
+        req.send()
+            .promise
+            .await
+            .expect("create")
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap(),
+    )
+}
+
+async fn join(
+    session: &session::Client,
+    device: &str,
+    id: &str,
+    sink: group_sink::Client,
+) -> Result<membership::Client, String> {
+    let group = session.group_request().send().pipeline.get_group();
+    let mut req = group.join_request();
+    {
+        let mut p = req.get();
+        set_device(p.reborrow().init_ctx(), device);
+        p.reborrow().init_id().set_value(id);
+        p.set_sink(sink);
+    }
+    read_membership(
+        req.send()
+            .promise
+            .await
+            .expect("join")
+            .get()
+            .unwrap()
+            .get_result()
+            .unwrap(),
+    )
+}
+
+fn read_membership(result: membership_result::Reader<'_>) -> Result<membership::Client, String> {
+    match result.get_status().unwrap().which().unwrap() {
+        pharos_api::pharos_capnp::done::Ok(()) => Ok(result.get_membership().unwrap()),
+        pharos_api::pharos_capnp::done::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+/// The id of the one group in the registry.
+async fn only_group(rig: &Rig) -> String {
+    let groups = rig.deps.registry.list().await.unwrap();
+    assert_eq!(groups.len(), 1, "exactly one group");
+    groups[0].group_id.to_string()
+}
+
+/// US1: native A creates a group on an item, native B joins it and is told
+/// who is in it, what it plays and its name.
+/// Disarm check: with `join` registering the device but never calling
+/// `add_caller_to_group`, B's sink never sees `joined` and this times out.
+#[actix_web::test]
+async fn a_native_member_joins_a_native_group_and_sees_who_is_in_it() {
+    let rig = rig().await;
+    let a = rig.session(&rig.fx.admin_token).await;
+    let b = rig.session(&rig.fx.user_token).await;
+    let (a_sink, mut a_seen) = sink();
+    let _a_member = create(&a, "dev-a", MOVIE, 5_000, a_sink).await.unwrap();
+    let gid = only_group(&rig).await;
+    let (b_sink, mut b_seen) = sink();
+    let _b_member = join(&b, "dev-b", &gid, b_sink).await.unwrap();
+
+    let joined = until(&mut b_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then(|| s.clone())
+    })
+    .await;
+    let Seen::Joined {
+        name,
+        item,
+        members,
+    } = joined
+    else {
+        unreachable!()
+    };
+    assert_eq!(name, "ali's Group");
+    assert_eq!(item, Some(MOVIE));
+    assert!(members.contains(&"ali".to_owned()), "{members:?}");
+    // A is told B arrived.
+    let arrived = until(&mut a_seen, |s| match s {
+        Seen::Member { name, .. } => Some(name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(arrived, "guest");
+}
+
+/// Joining a group that does not exist answers notFound and creates nothing
+/// (spec edge case): the registry still holds no group afterwards.
+/// Disarm check: with `join` using `get_or_create`, a group appears and this
+/// fails.
+#[actix_web::test]
+async fn joining_a_missing_group_is_not_found_and_creates_nothing() {
+    let rig = rig().await;
+    let b = rig.session(&rig.fx.user_token).await;
+    let (b_sink, _seen) = sink();
+    let missing = pharos_sync::messages::GroupId::new().to_string();
+    let err = join(&b, "dev-b", &missing, b_sink).await.err().unwrap();
+    assert_eq!(err, "not found: group");
+    assert!(rig.deps.registry.list().await.unwrap().is_empty());
+}
+
+#[actix_web::test]
+async fn a_call_with_no_device_is_invalid() {
+    let rig = rig().await;
+    let a = rig.session(&rig.fx.admin_token).await;
+    let (a_sink, _seen) = sink();
+    let err = create(&a, "", MOVIE, 0, a_sink).await.err().unwrap();
+    assert_eq!(err, "invalid: ctx.device");
+    assert!(rig.deps.registry.list().await.unwrap().is_empty());
 }
