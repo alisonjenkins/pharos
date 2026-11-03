@@ -1,20 +1,34 @@
-//! `Group`: a native client listing, creating and joining the same SyncPlay
-//! groups jellyfin-web uses (spec 014). The groups, access rules and queue
-//! checks are the Jellyfin handlers' own (`api::jellyfin::syncplay`).
+//! `Group` and `Membership`: a native client listing, creating, joining and
+//! driving the same SyncPlay groups jellyfin-web uses (spec 014). The groups,
+//! access rules, queue checks and command routing are the Jellyfin handlers'
+//! own (`api::jellyfin::syncplay`, `group_ops`), so a native member and a
+//! Jellyfin member can share a group.
 
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pharos_api::pharos_capnp::{group as wire, group_summary};
-use pharos_api::{server, Denial};
-use pharos_jellyfin_api::dto::WireId;
+use pharos_api::pharos_capnp::{
+    group as wire, group_sink, group_summary, group_update, membership as member_wire,
+    membership_result, EndReason,
+};
+use pharos_api::{server, Connection, Denial};
+use pharos_jellyfin_api::dto::{wire_item_id, WireId};
+use pharos_sync::group::{GroupHandle, GroupMsg};
+use pharos_sync::messages::{GroupId, ServerMsg};
+use pharos_sync::MemberId;
+use tokio::sync::mpsc;
 
-use super::library::set_item_id;
+use super::library::{read_item_id, set_item_id};
 use super::session::Session;
 use crate::api::jellyfin::syncplay::{
-    listed_groups, sync_play_allows, GroupHiddenRoute, ListedGroup, SyncPlayNeed,
+    add_caller_to_group, listed_groups, may_join, may_queue, resolve_runtimes_ms, sync_play_allows,
+    GroupHiddenRoute, ListedGroup, QueueVia, SyncPlayNeed,
 };
-use crate::group_ops::SyncDeps;
+use crate::group_ops::{route_command, CommandOutcome, SyncDeps};
+
+/// Updates queued for a member's `GroupSink` before the actor's delivery to
+/// it backs up; the Jellyfin `/socket` queues the same.
+const SINK_QUEUE: usize = 64;
 
 pub(super) struct Group {
     session: Rc<Session>,
@@ -27,12 +41,87 @@ impl Group {
 
     /// The session's current user and the running SyncPlay machinery, or why
     /// neither is available.
-    async fn open(&self) -> Result<(pharos_core::User, &SyncDeps), Denial> {
+    async fn open(&self) -> Result<(pharos_core::User, SyncDeps), Denial> {
         let user = self.session.current_user().await?;
-        let deps = self.session.state.sync.get().ok_or(Denial::Unavailable {
-            dependency: "syncplay",
-        })?;
+        let deps = self
+            .session
+            .state
+            .sync
+            .get()
+            .cloned()
+            .ok_or(Denial::Unavailable {
+                dependency: "syncplay",
+            })?;
         Ok((user, deps))
+    }
+
+    /// The group `id` names, which must already exist: live, or held by a
+    /// fresh persisted snapshot a restart or another replica left (then it
+    /// is hydrated, as a Jellyfin join does). A group that is gone is
+    /// `None`; it is never created.
+    async fn existing_group(
+        &self,
+        deps: &SyncDeps,
+        id: GroupId,
+    ) -> Result<Option<GroupHandle>, Denial> {
+        use pharos_core::SyncGroupStore as _;
+        let unavailable = || Denial::Unavailable {
+            dependency: "syncplay",
+        };
+        if let Some(handle) = deps.registry.get(id).await.map_err(|_| unavailable())? {
+            return Ok(Some(handle));
+        }
+        let cutoff =
+            crate::sync_recovery::now_unix_secs() - crate::sync_recovery::RECOVERY_WINDOW_SECS;
+        let persisted = match self
+            .session
+            .state
+            .stores
+            .get_sync_group(&id.to_string())
+            .await
+        {
+            Ok(row) => row.is_some_and(|row| row.updated_at >= cutoff),
+            Err(e) => {
+                tracing::warn!(group = %id, error = %e, "syncplay: native join could not read the persisted group");
+                return Err(unavailable());
+            }
+        };
+        if !persisted {
+            return Ok(None);
+        }
+        deps.registry
+            .get_or_create(id)
+            .await
+            .map(Some)
+            .map_err(|_| unavailable())
+    }
+
+    /// Registers the call's device in the hub as a member bound to `sink`,
+    /// ready for `add_caller_to_group`. The member's identity is the user
+    /// folded into `ctx.device` (as `AuthSession::sync_key`), so a device's
+    /// member id is stable across reconnects (V25).
+    fn register(
+        &self,
+        deps: &SyncDeps,
+        user: &pharos_core::User,
+        device: &str,
+        sink: group_sink::Client,
+        group: &GroupHandle,
+    ) -> Membership {
+        let key = format!("{}:{device}", user.id.0.simple());
+        let (tx, rx) = mpsc::channel(SINK_QUEUE);
+        let reg = deps
+            .hub
+            .register(key.clone(), user.name.clone(), tx.clone());
+        deps.sinks.insert(reg.member_id, reg.gen, tx);
+        let pump = actix_web::rt::spawn(pump(rx, sink, group.clone()));
+        Membership {
+            deps: deps.clone(),
+            key,
+            member_id: reg.member_id,
+            gen: reg.gen,
+            pump: pump.abort_handle(),
+        }
     }
 }
 
@@ -43,15 +132,257 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn write_summary(mut out: group_summary::Builder<'_>, group: &ListedGroup) {
+/// A group as the wire shows it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Summary {
+    id: String,
+    name: String,
+    item: Option<u64>,
+    members: Vec<Member>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Member {
+    id: String,
+    name: String,
+    buffering: bool,
+}
+
+impl From<&ListedGroup> for Summary {
+    fn from(group: &ListedGroup) -> Self {
+        Self {
+            id: group.id.clone(),
+            name: group.name.clone(),
+            item: real_item(group.item_id.as_deref()),
+            // A listing knows participants by name only.
+            members: group
+                .participants
+                .iter()
+                .map(|name| Member {
+                    name: name.clone(),
+                    ..Member::default()
+                })
+                .collect(),
+        }
+    }
+}
+
+fn real_item(wire: Option<&str>) -> Option<u64> {
+    match wire.and_then(WireId::parse) {
+        Some(WireId::Real(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn write_member(mut out: pharos_api::pharos_capnp::group_member::Builder<'_>, m: &Member) {
+    out.set_id(m.id.as_str());
+    out.set_name(m.name.as_str());
+    out.set_buffering(m.buffering);
+}
+
+fn write_summary(mut out: group_summary::Builder<'_>, group: &Summary) {
     out.reborrow().init_id().set_value(group.id.as_str());
     out.set_name(group.name.as_str());
-    if let Some(WireId::Real(id)) = group.item_id.as_deref().and_then(WireId::parse) {
+    if let Some(id) = group.item {
         set_item_id(out.reborrow().init_item(), WireId::Real(id));
     }
-    let mut members = out.init_members(u32::try_from(group.participants.len()).unwrap_or(u32::MAX));
-    for (i, name) in (0u32..).zip(&group.participants) {
-        members.reborrow().get(i).set_name(name.as_str());
+    let mut members = out.init_members(u32::try_from(group.members.len()).unwrap_or(u32::MAX));
+    for (i, m) in (0u32..).zip(&group.members) {
+        write_member(members.reborrow().get(i), m);
+    }
+}
+
+/// What a group tells a native member, before it is written to the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Update {
+    Joined(Summary),
+    Play {
+        at_server_ms: u64,
+        position_ms: u64,
+    },
+    Pause {
+        at_server_ms: u64,
+        position_ms: u64,
+    },
+    Seek {
+        at_server_ms: u64,
+        position_ms: u64,
+    },
+    Member(Member),
+    Left(String),
+    Item {
+        item: u64,
+        playlist_item_id: String,
+        position_ms: u64,
+        playing: bool,
+    },
+    Ended(EndReason),
+}
+
+/// The native form of what the actor delivered, or `None` for a message the
+/// native protocol has no use for (the clock, leader changes, state labels).
+/// `epoch_unix_ms` turns the actor's monotonic times into unix ms, the base
+/// `Group.clock` answers in.
+fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Update> {
+    let at = |server_ms: u64| epoch_unix_ms.saturating_add(server_ms);
+    Some(match msg {
+        ServerMsg::Joined { members, .. } => Update::Joined(Summary {
+            id: group.to_string(),
+            members: members
+                .iter()
+                .map(|m| Member {
+                    id: m.member_id.to_string(),
+                    name: m.name.clone(),
+                    buffering: false,
+                })
+                .collect(),
+            ..Summary::default()
+        }),
+        ServerMsg::Play {
+            at_server_ms,
+            position_ms,
+        } => Update::Play {
+            at_server_ms: at(*at_server_ms),
+            position_ms: *position_ms,
+        },
+        ServerMsg::Pause {
+            at_server_ms,
+            position_ms,
+        } => Update::Pause {
+            at_server_ms: at(*at_server_ms),
+            position_ms: *position_ms,
+        },
+        ServerMsg::Seek {
+            at_server_ms,
+            position_ms,
+        } => Update::Seek {
+            at_server_ms: at(*at_server_ms),
+            position_ms: *position_ms,
+        },
+        ServerMsg::MemberJoined { member } => Update::Member(Member {
+            id: member.member_id.to_string(),
+            name: member.name.clone(),
+            buffering: false,
+        }),
+        ServerMsg::MemberLeft { member_id, .. } => Update::Left(member_id.to_string()),
+        ServerMsg::PlayQueue {
+            items,
+            playing_index,
+            start_position_ms,
+            is_playing,
+            ..
+        } => {
+            let entry = items.get(*playing_index)?;
+            Update::Item {
+                item: real_item(Some(&entry.item_id))?,
+                playlist_item_id: entry.playlist_item_id.clone(),
+                position_ms: *start_position_ms,
+                playing: *is_playing,
+            }
+        }
+        ServerMsg::GroupLeft => Update::Ended(EndReason::Left),
+        ServerMsg::NotInGroup => Update::Ended(EndReason::NotInGroup),
+        ServerMsg::Welcome { .. }
+        | ServerMsg::Pong { .. }
+        | ServerMsg::LeaderChange { .. }
+        | ServerMsg::StateUpdate { .. }
+        | ServerMsg::Error { .. } => return None,
+    })
+}
+
+fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
+    match update {
+        Update::Joined(summary) => write_summary(out.init_joined(), summary),
+        Update::Play {
+            at_server_ms,
+            position_ms,
+        } => {
+            let mut at = out.init_play();
+            at.set_at_server_ms(*at_server_ms);
+            at.set_position_ms(*position_ms);
+        }
+        Update::Pause {
+            at_server_ms,
+            position_ms,
+        } => {
+            let mut at = out.init_pause();
+            at.set_at_server_ms(*at_server_ms);
+            at.set_position_ms(*position_ms);
+        }
+        Update::Seek {
+            at_server_ms,
+            position_ms,
+        } => {
+            let mut at = out.init_seek();
+            at.set_at_server_ms(*at_server_ms);
+            at.set_position_ms(*position_ms);
+        }
+        Update::Member(member) => write_member(out.init_member(), member),
+        Update::Left(id) => out.set_left(id.as_str()),
+        Update::Item {
+            item,
+            playlist_item_id,
+            position_ms,
+            playing,
+        } => {
+            let mut at = out.init_item();
+            set_item_id(at.reborrow().init_item(), WireId::Real(*item));
+            at.set_playlist_item_id(playlist_item_id.as_str());
+            at.set_position_ms(*position_ms);
+            at.set_playing(*playing);
+        }
+        Update::Ended(reason) => out.set_ended(*reason),
+    }
+}
+
+/// Delivers a member's group messages to its `GroupSink` in order, until the
+/// member's channel closes or the sink goes away.
+async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group: GroupHandle) {
+    while let Some(msg) = rx.recv().await {
+        let Some(mut update) = translate(&msg, group.group_id, group.epoch_unix_ms) else {
+            continue;
+        };
+        if let Update::Joined(summary) = &mut update {
+            // `Joined` carries the roster only; the name and the item playing
+            // are the group's own.
+            if let Some(snap) = group.snapshot().await {
+                summary.name = snap.group_name;
+                summary.item = real_item(
+                    snap.current_item_id
+                        .as_deref()
+                        .or_else(|| snap.queue_item_ids.first().map(String::as_str)),
+                );
+            }
+        }
+        let mut req = sink.update_request();
+        req.get().init_ctx();
+        write_update(req.get().init_update(), &update);
+        if let Err(e) = req.send().promise.await {
+            tracing::info!(group = %group.group_id, error = %e, "syncplay: native sink gone — stopping its updates");
+            break;
+        }
+    }
+}
+
+/// Answers `create`/`join`: the membership, or a refused one whose every call
+/// fails with the same denial, so a pipelined call chain never dangles.
+fn answer(
+    mut out: membership_result::Builder<'_>,
+    conn: &Rc<Connection>,
+    made: Result<Membership, Denial>,
+) {
+    match made {
+        Ok(member) => {
+            out.reborrow().init_status().set_ok(());
+            out.set_membership(server::membership::client(member, conn));
+        }
+        Err(denial) => {
+            denial.write(out.reborrow().init_status().init_error());
+            out.set_membership(server::membership::client(
+                server::membership::Refused(Rc::clone(conn), Rc::new(denial)),
+                conn,
+            ));
+        }
     }
 }
 
@@ -80,7 +411,7 @@ impl server::group::Handler for Group {
             Ok(groups) => {
                 let mut list = out.init_groups(u32::try_from(groups.len()).unwrap_or(u32::MAX));
                 for (i, group) in (0u32..).zip(&groups) {
-                    write_summary(list.reborrow().get(i), group);
+                    write_summary(list.reborrow().get(i), &Summary::from(group));
                 }
             }
             Err(denial) => denial.write(out.init_error()),
@@ -90,22 +421,115 @@ impl server::group::Handler for Group {
 
     async fn create(
         self: Rc<Self>,
-        _params: wire::CreateParams,
-        _results: &mut wire::CreateResults,
+        params: wire::CreateParams,
+        results: &mut wire::CreateResults,
     ) -> Result<(), capnp::Error> {
-        Err(capnp::Error::unimplemented(
-            "Group.create is not served yet".to_string(),
-        ))
+        let params = params.get()?;
+        let device = params.get_ctx()?.get_device()?.get_value()?.to_string()?;
+        let item = read_item_id(params.get_item()?)?;
+        let position_ms = params.get_position_ms();
+        let sink = params.get_sink()?;
+        let made = async {
+            let (user, deps) = self.open().await?;
+            if device.is_empty() {
+                return Err(Denial::Invalid { field: "ctx.device" });
+            }
+            let WireId::Real(item) = item else {
+                return Err(Denial::Invalid { field: "item" });
+            };
+            if !sync_play_allows(&user, SyncPlayNeed::Create, "rpc_create") {
+                return Err(Denial::NotPermitted { what: "syncplay" });
+            }
+            let handle = deps.registry.create().await.map_err(|_| {
+                tracing::error!("syncplay: group registry unreachable on native create");
+                Denial::Unavailable {
+                    dependency: "syncplay",
+                }
+            })?;
+            let member = self.register(&deps, &user, &device, sink, &handle);
+            add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle.clone())
+                .await;
+            let name = format!("{}'s Group", user.name);
+            let _ = handle.tx.send(GroupMsg::SetGroupName { name }).await;
+            let queued = vec![wire_item_id(item)];
+            let item_runtimes_ms = resolve_runtimes_ms(&self.session.state, &queued).await;
+            let outcome = route_command(
+                &deps.hub,
+                &deps.registry,
+                &self.session.state.stores,
+                Some(&member.key),
+                "setnewqueue",
+                async |group| {
+                    may_queue(
+                        &self.session.state,
+                        &user,
+                        group,
+                        &queued,
+                        QueueVia::SetNewQueue,
+                    )
+                    .await
+                },
+                |sender| GroupMsg::SetNewQueue {
+                    sender,
+                    item_ids: queued.clone(),
+                    item_runtimes_ms,
+                    playing_index: 0,
+                    start_position_ms: position_ms,
+                },
+            )
+            .await;
+            match outcome {
+                CommandOutcome::Dispatched | CommandOutcome::Recovered => {
+                    tracing::info!(device_id = %member.key, group = %handle.group_id, "syncplay: native group created");
+                    Ok(member)
+                }
+                _ => {
+                    member.teardown().await;
+                    Err(Denial::NotPermitted { what: "queueing" })
+                }
+            }
+        }
+        .await;
+        answer(results.get().init_result(), &self.session.conn(), made);
+        Ok(())
     }
 
     async fn join(
         self: Rc<Self>,
-        _params: wire::JoinParams,
-        _results: &mut wire::JoinResults,
+        params: wire::JoinParams,
+        results: &mut wire::JoinResults,
     ) -> Result<(), capnp::Error> {
-        Err(capnp::Error::unimplemented(
-            "Group.join is not served yet".to_string(),
-        ))
+        let params = params.get()?;
+        let device = params.get_ctx()?.get_device()?.get_value()?.to_string()?;
+        let id = params.get_id()?.get_value()?.to_string()?;
+        let sink = params.get_sink()?;
+        let made = async {
+            let (user, deps) = self.open().await?;
+            if device.is_empty() {
+                return Err(Denial::Invalid { field: "ctx.device" });
+            }
+            let Ok(gid) = uuid::Uuid::parse_str(&id).map(GroupId) else {
+                return Err(Denial::Invalid { field: "id" });
+            };
+            if !sync_play_allows(&user, SyncPlayNeed::Join, "rpc_join") {
+                return Err(Denial::NotPermitted { what: "syncplay" });
+            }
+            let Some(handle) = self.existing_group(&deps, gid).await? else {
+                return Err(Denial::NotFound { what: "group" });
+            };
+            if !may_join(&self.session.state, &user, &handle, GroupHiddenRoute::RpcJoin).await {
+                return Err(Denial::NotPermitted { what: "group" });
+            }
+            // Only now is the device registered: a refused join leaves the
+            // device's existing membership, if any, as it was.
+            let member = self.register(&deps, &user, &device, sink, &handle);
+            tracing::info!(device_id = %member.key, group = %handle.group_id, "syncplay: native join");
+            add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle).await;
+            Ok(member)
+        }
+        .await;
+        answer(results.get().init_result(), &self.session.conn(), made);
+        Ok(())
     }
 
     async fn clock(
@@ -126,5 +550,110 @@ impl server::group::Handler for Group {
             Err(denial) => denial.write(out.init_error()),
         }
         Ok(())
+    }
+}
+
+/// One native member of one group: the device registered in the hub, the
+/// pump feeding its sink, and the commands it may send.
+pub(super) struct Membership {
+    deps: SyncDeps,
+    /// The device's key in the hub (user and `ctx.device`).
+    key: String,
+    member_id: MemberId,
+    /// The hub generation this registration holds; a newer registration of
+    /// the same device (a reconnect) supersedes it.
+    gen: u64,
+    pump: tokio::task::AbortHandle,
+}
+
+impl Membership {
+    /// Undoes `register`: no more updates, out of the roster, out of the hub.
+    async fn teardown(&self) {
+        self.pump.abort();
+        if let Some(group) = self.deps.hub.remove_if_current_gen(&self.key, self.gen) {
+            let _ = group
+                .tx
+                .send(GroupMsg::RemoveMember {
+                    member_id: self.member_id,
+                })
+                .await;
+        }
+        self.deps.sinks.remove(self.member_id, self.gen);
+    }
+}
+
+impl Drop for Membership {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
+}
+
+fn unimplemented_call(name: &str) -> capnp::Error {
+    capnp::Error::unimplemented(format!("Membership.{name} is not served yet"))
+}
+
+impl server::membership::Handler for Membership {
+    async fn unpause(
+        self: Rc<Self>,
+        _params: member_wire::UnpauseParams,
+        _results: &mut member_wire::UnpauseResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("unpause"))
+    }
+
+    async fn pause(
+        self: Rc<Self>,
+        _params: member_wire::PauseParams,
+        _results: &mut member_wire::PauseResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("pause"))
+    }
+
+    async fn seek(
+        self: Rc<Self>,
+        _params: member_wire::SeekParams,
+        _results: &mut member_wire::SeekResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("seek"))
+    }
+
+    async fn buffering(
+        self: Rc<Self>,
+        _params: member_wire::BufferingParams,
+        _results: &mut member_wire::BufferingResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("buffering"))
+    }
+
+    async fn ready(
+        self: Rc<Self>,
+        _params: member_wire::ReadyParams,
+        _results: &mut member_wire::ReadyResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("ready"))
+    }
+
+    async fn leave(
+        self: Rc<Self>,
+        _params: member_wire::LeaveParams,
+        _results: &mut member_wire::LeaveResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("leave"))
+    }
+
+    async fn ping(
+        self: Rc<Self>,
+        _params: member_wire::PingParams,
+        _results: &mut member_wire::PingResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("ping"))
+    }
+
+    async fn clock_report(
+        self: Rc<Self>,
+        _params: member_wire::ClockReportParams,
+        _results: &mut member_wire::ClockReportResults,
+    ) -> Result<(), capnp::Error> {
+        Err(unimplemented_call("clockReport"))
     }
 }
