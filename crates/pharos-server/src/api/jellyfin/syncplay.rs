@@ -1366,6 +1366,8 @@ pub(crate) struct ListedGroup {
     pub(crate) name: String,
     pub(crate) state: pharos_sync::messages::GroupPlayState,
     pub(crate) participants: Vec<String>,
+    /// The member id of each entry of `participants`, in the same order.
+    pub(crate) participant_ids: Vec<String>,
     /// Wire id of the queue entry playing, or the first when none is.
     pub(crate) item_id: Option<String>,
 }
@@ -1399,6 +1401,11 @@ pub(crate) async fn listed_groups(
             name: snap.group_name,
             state: snap.play_state,
             participants: snap.participants,
+            participant_ids: snap
+                .participant_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             item_id: snap
                 .current_item_id
                 .or_else(|| snap.queue_item_ids.first().cloned()),
@@ -1430,6 +1437,11 @@ pub(crate) async fn listed_groups(
                     name: summary.group_name,
                     state: summary.play_state,
                     participants: summary.participants,
+                    participant_ids: summary
+                        .participant_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
                     item_id: summary.queue_item_ids.first().cloned(),
                 });
             }

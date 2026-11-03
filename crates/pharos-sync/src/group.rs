@@ -780,12 +780,17 @@ pub struct GroupSnapshot {
     pub leader: Option<MemberId>,
     pub member_count: usize,
     pub buffering_member_count: usize,
+    /// Which members are buffering (a roster entry's flag), for a surface that
+    /// shows each member's state. `buffering_member_count` is its length.
+    pub buffering_members: Vec<MemberId>,
     /// Coarse playback state for the `/SyncPlay/List` `GroupInfoDto`.
     pub play_state: GroupPlayState,
     /// Human-readable group name (what the creator's client sent on `New`).
     pub group_name: String,
     /// Member display names — the `Participants` the join dialog renders.
     pub participants: Vec<String>,
+    /// The id of each entry of `participants`, in the same order.
+    pub participant_ids: Vec<MemberId>,
     /// Each member's user, `None` where none is recorded.
     pub member_users: Vec<Option<UserId>>,
     /// Wire item id of the queue entry currently playing (T87 — lets the
@@ -2757,6 +2762,8 @@ pub fn snapshot_contains_member(state_json: &str, member_id: MemberId) -> bool {
 pub struct SnapshotSummary {
     pub group_name: String,
     pub participants: Vec<String>,
+    /// The id of each entry of `participants`, in the same order.
+    pub participant_ids: Vec<MemberId>,
     /// Each member's user, `None` where the snapshot recorded none.
     pub member_users: Vec<Option<UserId>>,
     pub play_state: GroupPlayState,
@@ -2779,6 +2786,7 @@ pub fn snapshot_summary(state_json: &str) -> Option<SnapshotSummary> {
     Some(SnapshotSummary {
         group_name: ps.group_name,
         member_users: ps.members.iter().map(|m| m.user).collect(),
+        participant_ids: ps.members.iter().map(|m| m.id).collect(),
         participants: ps.members.into_iter().map(|m| m.name).collect(),
         play_state,
         queue_item_ids: ps.queue_items.into_iter().map(|q| q.item_id).collect(),
@@ -4481,18 +4489,22 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
         }
         GroupMsg::Snapshot { reply } => {
+            let summaries = state.member_summaries();
             let snap = GroupSnapshot {
                 id: state.id,
                 leader: state.leader,
                 member_count: state.members.len(),
                 buffering_member_count: state.members.values().filter(|m| m.buffering).count(),
+                buffering_members: state
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.buffering)
+                    .map(|(id, _)| *id)
+                    .collect(),
                 play_state: state.play_state(),
                 group_name: state.group_name.clone(),
-                participants: state
-                    .member_summaries()
-                    .into_iter()
-                    .map(|s| s.name)
-                    .collect(),
+                participants: summaries.iter().map(|s| s.name.clone()).collect(),
+                participant_ids: summaries.iter().map(|s| s.member_id).collect(),
                 member_users: state.members.values().map(|m| m.user).collect(),
                 current_item_id: state
                     .queue
@@ -7694,6 +7706,7 @@ mod tests {
             snap.buffering_member_count, 1,
             "re-add must NOT reset the buffering flag"
         );
+        assert_eq!(snap.buffering_members, [m2], "and the snapshot names it");
         let mut dup_join = false;
         while let Ok(msg) = rx1.try_recv() {
             if matches!(msg, ServerMsg::MemberJoined { .. }) {
