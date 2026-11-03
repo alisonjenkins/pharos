@@ -146,8 +146,8 @@ async fn native_user_data_agrees_with_the_jellyfin_routes() {
 }
 
 /// T036: writing to an item the policy hides answers `notFound` exactly like
-/// an id that names nothing, and writes nothing; a synthesised id has no
-/// native write yet.
+/// an id that names nothing, and writes nothing, as does a synthesised id
+/// that is no series or season.
 /// Disarm check: with the access check removed from
 /// `services::user_data::update`, the hidden item is marked played.
 #[actix_web::test]
@@ -198,6 +198,45 @@ async fn a_hidden_item_cannot_be_marked() {
         .await
         .unwrap();
     assert!(!stored.played && !stored.is_favorite);
+}
+
+/// Marking a season or a series marks every episode in it: played sets
+/// each one and counts the play, unplayed clears each one.
+/// Disarm check: with the native `setPlayed` refusing synthesised ids again,
+/// marking the season answers notFound.
+#[actix_web::test]
+async fn a_season_or_series_marks_every_episode_in_it() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_tv_library(&fx).await;
+    let played = |id: u64| {
+        let fx = &fx;
+        async move {
+            let d = fx.state.stores.get_user_data(fx.user_id, id).await.unwrap();
+            (d.played, d.play_count)
+        }
+    };
+
+    let season = WireId::parse(&season_id_for_key(Some("/libTV/Show"), "Show", 1)).unwrap();
+    assert_eq!(
+        wire_set(&session, season, Set::Played(true)).await,
+        Ok((true, false, 1, 0))
+    );
+    assert_eq!(played(601).await, (true, 1));
+    assert_eq!(played(602).await, (true, 1));
+    assert_eq!(played(603).await, (false, 0), "season 2 is not in season 1");
+    assert_eq!(played(604).await, (false, 0), "another show");
+
+    let show = WireId::parse(&series_id_for_key(Some("/libTV/Show"), "Show")).unwrap();
+    assert_eq!(
+        wire_set(&session, show, Set::Played(false)).await,
+        Ok((false, false, 0, 0))
+    );
+    for id in [601, 602, 603] {
+        assert!(!played(id).await.0, "episode {id}");
+    }
 }
 
 /// Pipelined writes to one item both land: a native client can send

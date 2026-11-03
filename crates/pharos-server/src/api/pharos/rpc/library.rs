@@ -1025,6 +1025,11 @@ fn write_synth_summary(
 /// it sends, recorded. A hidden item answers as a missing one, so its id says
 /// nothing about what exists.
 pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denial {
+    wire_denial(WireId::Real(id), e, call)
+}
+
+/// [`item_denial`] for any wire id, stored or synthesised.
+pub(super) fn wire_denial(id: WireId, e: &DetailError, call: &'static str) -> Denial {
     use crate::services::access::ItemHidden;
     let item_not_found = Denial::NotFound { what: "item" };
     let unavailable = Denial::Unavailable {
@@ -1046,7 +1051,7 @@ pub(super) fn item_denial(id: u64, e: &DetailError, call: &'static str) -> Denia
         ),
         DetailError::Store(e) => (unavailable, RefusalReason::StoreUnavailable, e.to_string()),
     };
-    record_refusal(call, WireId::Real(id), reason, &detail);
+    record_refusal(call, id, reason, &detail);
     denial
 }
 
