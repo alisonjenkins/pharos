@@ -21,6 +21,7 @@ mod platform;
 pub mod playback;
 pub mod rails;
 pub mod route;
+pub mod together;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;
