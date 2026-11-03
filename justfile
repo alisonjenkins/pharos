@@ -194,7 +194,7 @@ compat-dioxus-full native="on" port="8096":
       fi
       if [[ $status -ne 0 && -f "$TMP/pharos.log" ]]; then
         echo "compat-dioxus-full: pharos log tail:" >&2
-        tail -n 50 "$TMP/pharos.log" >&2 || true
+        grep -iE "scan|skip|bulk|stack|edition|group" "$TMP/pharos.log" | tail -n 300 >&2 || true
       fi
       if ! rm -rf "$TMP" 2>/dev/null; then sleep 1; rm -rf "$TMP"; fi
       exit "$status"
@@ -245,7 +245,7 @@ compat-dioxus-full native="on" port="8096":
     image_seek_seconds = 1
 
     [obs]
-    log_level = "warn"
+    log_level = "info"
 
     [media]
     roots = ["$TMP/media"]
