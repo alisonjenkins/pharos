@@ -139,8 +139,6 @@ pub fn WatchView(
     // A tap that only brings the hidden chrome back must not also pause; a
     // paused player's chrome is never hidden.
     let mut woke_by_tap = use_signal(|| false);
-    // Wheel travel short of a whole notch, kept for the next event.
-    let mut wheel_carry = use_signal(|| 0.0_f64);
     let mut wake = move || {
         stirred.set(true);
         if *idle.peek() {
@@ -168,23 +166,18 @@ pub fn WatchView(
         (false, true) => "pharos-player is-idle",
         (false, false) => "pharos-player",
     };
-    let (previous, next) = (c.previous, c.next);
+    let shortcuts = use_shortcuts(media, c.previous, c.next, on_control);
     let on_key = move |evt: KeyboardEvent| {
         wake();
-        let control = match evt.key() {
-            Key::Character(k) if k == "N" => match next {
-                Some(id) => Control::Play(id),
-                None => return,
-            },
-            Key::Character(k) if k == "P" => match previous {
-                Some(id) => Control::Play(id),
-                None => return,
-            },
-            Key::Character(k) if k == "f" => Control::Fullscreen,
-            key => match transport_key(&key, &media) {
-                Some(control) => control,
-                None => return,
-            },
+        let key = evt.key();
+        let control = shortcuts
+            .key(&key, evt.modifiers().shift())
+            .or_else(|| match &key {
+                Key::Character(k) if k == "f" => Some(Control::Fullscreen),
+                key => transport_key(key, &media),
+            });
+        let Some(control) = control else {
+            return;
         };
         evt.prevent_default();
         on_control.call(control);
@@ -210,13 +203,8 @@ pub fn WatchView(
                     wake();
                 },
                 onwheel: move |evt: WheelEvent| {
-                    evt.prevent_default();
                     wake();
-                    let (notches, rest) = wheel_notches(wheel_carry(), evt.delta());
-                    wheel_carry.set(rest);
-                    if let Some(control) = wheel_control(notches, evt.modifiers().shift(), media) {
-                        on_control.call(control);
-                    }
+                    shortcuts.wheel(&evt);
                 },
                 video {
                     id: VIDEO_ID,
@@ -226,31 +214,13 @@ pub fn WatchView(
                     onclick: move |evt: MouseEvent| {
                         if woke_by_tap() {
                             woke_by_tap.set(false);
-                        } else if evt.modifiers().shift() {
-                            if let Some(id) = previous {
-                                on_control.call(Control::Play(id));
-                            }
-                        } else {
+                        } else if !shortcuts.click(&evt) {
                             on_control.call(Control::TogglePlay);
                         }
                     },
-                    // Shift+right click is next, so it opens no menu. Firefox
-                    // shows its menu on Shift+right click whatever the page
-                    // says, but the click still counts.
-                    oncontextmenu: move |evt: MouseEvent| {
-                        if evt.modifiers().shift() {
-                            evt.prevent_default();
-                        }
-                    },
-                    onmouseup: move |evt: MouseEvent| {
-                        if evt.trigger_button() == Some(MouseButton::Secondary)
-                            && evt.modifiers().shift()
-                        {
-                            if let Some(id) = next {
-                                on_control.call(Control::Play(id));
-                            }
-                        }
-                    },
+                    oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
+                    onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
+                    onmouseup: move |evt: MouseEvent| shortcuts.mouse_up(&evt),
                     onplaying: move |_| on_media.call(MediaEvent::Playing),
                     onpause: move |_| on_media.call(MediaEvent::Pause),
                     onseeked: move |_| on_media.call(MediaEvent::Seeked),
@@ -522,6 +492,130 @@ fn TrackPicker(
     }
 }
 
+/// A neighbour a Shift+click asks for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Skip {
+    Previous,
+    Next,
+}
+
+/// The skip a mouse button asks for with Shift held: the main button is the
+/// previous episode or track, the secondary the next. A click that started on
+/// a control is that control's own, so it skips nothing.
+pub fn shift_skip(shift: bool, button: Option<MouseButton>, on_a_control: bool) -> Option<Skip> {
+    if !shift || on_a_control {
+        return None;
+    }
+    match button {
+        Some(MouseButton::Primary) => Some(Skip::Previous),
+        Some(MouseButton::Secondary) => Some(Skip::Next),
+        _ => None,
+    }
+}
+
+/// The mouse shortcuts both players share: the wheel changes the volume, or
+/// seeks with Shift, and Shift+click / Shift+right click play the previous /
+/// next item. Hand each handler the matching event of the player's surface.
+#[derive(Clone, Copy)]
+pub struct Shortcuts {
+    media: MediaState,
+    previous: Option<ItemRef>,
+    next: Option<ItemRef>,
+    on_control: EventHandler<Control>,
+    /// Wheel travel short of a whole notch, kept for the next event.
+    carry: Signal<f64>,
+    /// A Shift+right press began on the surface, so its release may skip.
+    armed: Signal<bool>,
+}
+
+pub fn use_shortcuts(
+    media: MediaState,
+    previous: Option<ItemRef>,
+    next: Option<ItemRef>,
+    on_control: EventHandler<Control>,
+) -> Shortcuts {
+    Shortcuts {
+        media,
+        previous,
+        next,
+        on_control,
+        carry: use_signal(|| 0.0),
+        armed: use_signal(|| false),
+    }
+}
+
+impl Shortcuts {
+    pub fn wheel(mut self, evt: &WheelEvent) {
+        evt.prevent_default();
+        let (notches, rest) = wheel_notches(*self.carry.peek(), evt.delta());
+        self.carry.set(rest);
+        if let Some(control) = wheel_control(notches, evt.modifiers().shift(), self.media) {
+            self.on_control.call(control);
+        }
+    }
+
+    /// A left click; true when it was a Shift+click this handled.
+    pub fn click(self, evt: &MouseEvent) -> bool {
+        let skip = shift_skip(
+            evt.modifiers().shift(),
+            evt.trigger_button(),
+            platform::on_a_control(evt),
+        );
+        if skip != Some(Skip::Previous) {
+            return false;
+        }
+        self.play(self.previous);
+        true
+    }
+
+    pub fn mouse_down(mut self, evt: &MouseEvent) {
+        let skip = shift_skip(
+            evt.modifiers().shift(),
+            evt.trigger_button(),
+            platform::on_a_control(evt),
+        );
+        self.armed.set(skip == Some(Skip::Next));
+    }
+
+    pub fn mouse_up(mut self, evt: &MouseEvent) {
+        if evt.trigger_button() != Some(MouseButton::Secondary) || !*self.armed.peek() {
+            return;
+        }
+        self.armed.set(false);
+        if evt.modifiers().shift() {
+            self.play(self.next);
+        }
+    }
+
+    /// Shift+right click is next, so it opens no menu. Firefox shows its
+    /// menu on Shift+right click whatever the page says, but the skip still
+    /// happens.
+    pub fn context_menu(self, evt: &MouseEvent) {
+        if evt.modifiers().shift() && !platform::on_a_control(evt) {
+            evt.prevent_default();
+        }
+    }
+
+    /// Shift+P / Shift+N.
+    pub fn key(self, key: &Key, shift: bool) -> Option<Control> {
+        match key {
+            Key::Character(k) if shift && k.eq_ignore_ascii_case("p") => {
+                self.previous.map(Control::Play)
+            }
+            Key::Character(k) if shift && k.eq_ignore_ascii_case("n") => {
+                self.next.map(Control::Play)
+            }
+            _ => None,
+        }
+    }
+
+    fn play(self, to: Option<ItemRef>) {
+        if let Some(id) = to {
+            self.on_control.call(Control::Play(id));
+        }
+    }
+}
+
 /// Adds `delta` to the wheel travel `carried` from earlier events: the
 /// whole notches it now makes, up (away from the viewer) counting positive,
 /// and the travel left over. Shift turns a wheel sideways on some systems, so
@@ -745,6 +839,21 @@ mod tests {
             wheel_control(sideways, true, media),
             Some(Control::Seek(65_000))
         );
+    }
+
+    #[test]
+    fn shift_with_a_mouse_button_skips_except_on_a_control() {
+        let primary = Some(MouseButton::Primary);
+        let secondary = Some(MouseButton::Secondary);
+        assert_eq!(shift_skip(true, primary, false), Some(Skip::Previous));
+        assert_eq!(shift_skip(true, secondary, false), Some(Skip::Next));
+        assert_eq!(shift_skip(false, primary, false), None);
+        assert_eq!(
+            shift_skip(true, primary, true),
+            None,
+            "a control's own click"
+        );
+        assert_eq!(shift_skip(true, Some(MouseButton::Auxiliary), false), None);
     }
 
     #[test]

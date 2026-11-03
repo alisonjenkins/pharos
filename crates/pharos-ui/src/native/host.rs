@@ -51,6 +51,10 @@ pub fn push(_path: &str) {}
 
 pub fn replace(_path: &str) {}
 
+pub fn on_a_control(_evt: &dioxus::prelude::MouseEvent) -> bool {
+    false
+}
+
 pub fn go_back() -> bool {
     false
 }
