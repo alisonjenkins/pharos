@@ -532,6 +532,38 @@ async fn resume_lists_what_the_user_started_that_the_policy_allows() {
     assert_eq!((seen, a.total), (vec![fx.rich_item_id, 300], 2));
 }
 
+/// B310: the home page resumes films and episodes in one row and music in
+/// another, so a part-played song never shows under "Continue watching".
+#[actix_web::test]
+async fn home_resumes_music_apart_from_what_is_watched() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _};
+
+    let fx = seed_rich().await;
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 300,
+            path: "/libA/song.flac".into(),
+            title: "Song".into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    start_watching(&fx, &[300, fx.rich_item_id]).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+
+    let home = library::home(&fx.state, &user, None, None, None)
+        .await
+        .unwrap();
+    let ids = |page: &library::ListPage| page.items.iter().map(|(i, _)| i.id).collect::<Vec<_>>();
+    assert_eq!(ids(&home.resume), [fx.rich_item_id]);
+    assert_eq!(ids(&home.listening), [300]);
+}
+
 /// `Library.resume` on `session` for `kinds`, as its total and items.
 async fn wire_resume(session: &session::Client, kinds: &[Kind]) -> (u32, Vec<serde_json::Value>) {
     let library = session.library_request().send().pipeline.get_library();
