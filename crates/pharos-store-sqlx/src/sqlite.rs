@@ -880,8 +880,9 @@ impl MediaStore for SqliteStore {
     async fn scan_state(&self, id: MediaId) -> DomainResult<Option<ScanState>> {
         let id_i64 =
             i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
-        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>)>(
-            "SELECT last_scanned, file_mtime, file_size_seen, last_seen_scan_id, probe_schema_version \
+        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, bool)>(
+            "SELECT last_scanned, file_mtime, file_size_seen, last_seen_scan_id, probe_schema_version, \
+             (alternate_sources_json IS NOT NULL AND alternate_sources_json <> '[]') \
              FROM media_items WHERE id = ?",
         )
         .bind(id_i64)
@@ -889,12 +890,15 @@ impl MediaStore for SqliteStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(row.map(
-            |(last_scanned, file_mtime, file_size, last_seen, schema_version)| ScanState {
-                last_scanned: last_scanned.unwrap_or(0),
-                file_mtime: file_mtime.unwrap_or(0),
-                file_size: file_size.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
-                last_seen_scan_id: last_seen.unwrap_or(0),
-                probe_schema_version: schema_version.unwrap_or(0),
+            |(last_scanned, file_mtime, file_size, last_seen, schema_version, has_editions)| {
+                ScanState {
+                    last_scanned: last_scanned.unwrap_or(0),
+                    file_mtime: file_mtime.unwrap_or(0),
+                    file_size: file_size.and_then(|v| u64::try_from(v).ok()).unwrap_or(0),
+                    last_seen_scan_id: last_seen.unwrap_or(0),
+                    probe_schema_version: schema_version.unwrap_or(0),
+                    has_editions,
+                }
             },
         ))
     }

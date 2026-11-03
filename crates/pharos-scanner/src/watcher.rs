@@ -533,6 +533,7 @@ mod tests {
                         file_mtime: mtime,
                         file_size: size,
                         last_seen_scan_id: scan_id,
+                        ..Default::default()
                     },
                 );
             Ok(())

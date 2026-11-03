@@ -2318,6 +2318,11 @@ pub struct ScanState {
     /// `--force`. Legacy rows (pre-migration) read back as 0, which is older
     /// than any real version, so they are re-probed exactly once.
     pub probe_schema_version: i64,
+    /// Whether the row stores grouped editions (`alternate_sources`). The
+    /// incremental scan reads the stored editions only when this is set or the
+    /// file has editions on disk, so an unchanged file with none on either
+    /// side costs no extra store read (B289).
+    pub has_editions: bool,
 }
 
 /// Bump this whenever [`MediaProbe`]'s extracted content changes (a new stream
