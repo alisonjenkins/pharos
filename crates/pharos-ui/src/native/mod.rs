@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod find;
 pub mod letters;
 pub mod listen;
+pub mod lyrics;
 pub mod machine;
 pub mod paging;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]

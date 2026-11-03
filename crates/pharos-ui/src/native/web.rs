@@ -773,6 +773,28 @@ pub fn scroll_to_tile(at: u32) -> bool {
     }
 }
 
+/// Scroll the element `id` so its child at `at` sits in the middle of it.
+/// The element must be the children's offset parent (`position: relative`).
+/// False when there is no such child yet.
+pub fn center_child(id: &str, at: u32) -> bool {
+    let Some(panel) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    else {
+        return false;
+    };
+    let Some(child) = panel
+        .children()
+        .item(at)
+        .and_then(|c| c.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return false;
+    };
+    let middle = child.offset_top() + child.offset_height() / 2;
+    panel.set_scroll_top((middle - panel.client_height() / 2).max(0));
+    true
+}
+
 /// A `pagehide` listener; removed on drop.
 pub struct PageHide(Closure<dyn FnMut(web_sys::Event)>);
 

@@ -1081,6 +1081,83 @@ body:has(.pharos-watch, .pharos-listen) .pharos-error {
   width: 1.2rem;
   height: 1.2rem;
 }
+.pharos-listen .pharos-lyrics-toggle {
+  border: 1px solid color-mix(in srgb, var(--px-color-fg) 10%, transparent);
+  background: color-mix(in srgb, var(--px-color-bg) 45%, transparent);
+}
+/* Lyrics (B360/V300): over the visualiser, between the top bar and the
+   bottom one. The panel scrolls itself, so it is the offset parent of its
+   lines, and the padding lets the first and last line reach the middle. */
+.pharos-lyrics {
+  position: absolute;
+  inset: 4.5rem 0 10rem;
+  width: min(40rem, calc(100% - 2rem));
+  margin: 0 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  scrollbar-width: none;
+  padding: 30vh 1rem;
+  box-sizing: border-box;
+  text-align: center;
+  /* A frosted pane like the bottom bar, so the words read over any style. */
+  border-radius: calc(var(--px-radius) * 2);
+  background: color-mix(in srgb, var(--px-color-overlay) 45%, transparent);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-mask-image: linear-gradient(transparent, var(--px-color-fg) 22%, var(--px-color-fg) 78%, transparent);
+  mask-image: linear-gradient(transparent, var(--px-color-fg) 22%, var(--px-color-fg) 78%, transparent);
+}
+.pharos-lyrics[data-synced="false"] {
+  padding-block: 2rem;
+}
+.pharos-lyrics::-webkit-scrollbar {
+  display: none;
+}
+.pharos-lyrics:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+.pharos-lyrics-line {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0.3rem 0.5rem;
+  border: 0;
+  border-radius: var(--px-radius);
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  font-size: clamp(1.05rem, 2.2vw, 1.35rem);
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+button.pharos-lyrics-line {
+  cursor: pointer;
+  color: var(--px-color-fg-muted);
+  opacity: 0.7;
+  transition: color 250ms ease, opacity 250ms ease, scale 250ms ease;
+}
+button.pharos-lyrics-line[data-state="past"] {
+  opacity: 0.45;
+}
+button.pharos-lyrics-line[data-state="current"] {
+  color: var(--px-color-fg);
+  opacity: 1;
+  scale: 1.06;
+  text-shadow: 0 0 18px var(--pharos-glow);
+}
+button.pharos-lyrics-line:hover {
+  opacity: 1;
+}
+button.pharos-lyrics-line:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+.pharos-lyrics-break {
+  height: 1rem;
+}
 .pharos-listen-note {
   flex-basis: 100%;
   margin: 0;
@@ -1094,6 +1171,9 @@ body:has(.pharos-watch, .pharos-listen) .pharos-error {
     bottom: 0.5rem;
     width: calc(100% - 1rem);
     padding: 0.75rem;
+  }
+  .pharos-lyrics {
+    inset: 6rem 0 14rem;
   }
   .pharos-listen-cover {
     width: 3.5rem;
@@ -1187,9 +1267,13 @@ body:has(.pharos-watch, .pharos-listen) .pharos-error {
     animation: none;
     transition: none;
   }
+  .pharos-lyrics {
+    scroll-behavior: auto;
+  }
   .pharos-listen-skip,
   .pharos-listen-play,
   .pharos-listen .pharos-chip,
+  button.pharos-lyrics-line,
   .pharos-listen-range::-webkit-slider-thumb,
   .pharos-listen-range::-moz-range-thumb {
     transition: none;
