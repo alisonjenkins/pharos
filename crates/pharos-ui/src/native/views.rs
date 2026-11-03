@@ -315,7 +315,11 @@ pub fn PosterTile(item: Item) -> Element {
 }
 
 #[component]
-pub fn TitleView(detail: Detail) -> Element {
+pub fn TitleView(
+    detail: Detail,
+    /// The audio and subtitle pickers, under the actions.
+    tracks: Option<Element>,
+) -> Element {
     let item = &detail.item;
     let facts: Vec<String> = [
         item.year.map(|y| y.to_string()),
@@ -352,6 +356,9 @@ pub fn TitleView(detail: Detail) -> Element {
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
+                }
+                if let Some(tracks) = tracks {
+                    {tracks}
                 }
                 if !detail.overview.is_empty() {
                     p { class: "pharos-overview", "{detail.overview}" }
