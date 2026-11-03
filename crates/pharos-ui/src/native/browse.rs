@@ -6,7 +6,7 @@
 //! parent whose detail cannot be read, is the plain grid of its children.
 
 use dioxus::prelude::*;
-use futures_util::future::{join3, try_join};
+use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind, Page,
@@ -800,8 +800,11 @@ pub async fn neighbours<A: PharosApi>(
     let Some(season) = episode.parent else {
         return Ok(Neighbours::default());
     };
-    let list = |parent, group, sort| api.list(info, parent, group, sort, 0, BROWSE_PAGE);
-    let here = list(season, None, INDEX_ORDER).await?.items;
+    let episodes = |season| list_all(api, info, season, None, INDEX_ORDER);
+    // The season's series is needed only at a season's edge, but asking for
+    // it alongside the episodes costs no extra round trip.
+    let (here, season_detail) = join(episodes(season), api.detail(info, season)).await;
+    let here = here?;
     let Some(at) = here.iter().position(|e| e.id == episode.id) else {
         return Ok(Neighbours::default());
     };
@@ -812,10 +815,10 @@ pub async fn neighbours<A: PharosApi>(
     if near.previous.is_some() && near.next.is_some() {
         return Ok(near);
     }
-    let Some(series) = api.detail(info, season).await?.item.parent else {
+    let Some(series) = season_detail?.item.parent else {
         return Ok(near);
     };
-    let mut seasons = list(series, Some(ItemKind::Season), "").await?.items;
+    let mut seasons = list_all(api, info, series, Some(ItemKind::Season), "").await?;
     seasons.sort_by_key(|s| s.episode.unwrap_or(u32::MAX));
     let Some(s) = seasons.iter().position(|x| x.id == season) else {
         return Ok(near);
@@ -824,25 +827,55 @@ pub async fn neighbours<A: PharosApi>(
     if seasons.get(s).is_some_and(|x| !regular(&x)) {
         return Ok(near);
     }
-    if near.previous.is_none() {
-        if let Some(before) = seasons.get(..s).and_then(|b| b.iter().rev().find(regular)) {
-            near.previous = list(before.id, None, INDEX_ORDER)
-                .await?
-                .items
-                .last()
-                .map(|e| e.id);
+    let before = near
+        .previous
+        .is_none()
+        .then(|| seasons.get(..s).and_then(|b| b.iter().rev().find(regular)))
+        .flatten();
+    let after = near
+        .next
+        .is_none()
+        .then(|| seasons.get(s + 1..).and_then(|a| a.iter().find(regular)))
+        .flatten();
+    let edge = |season: Option<&Item>| {
+        let id = season.map(|s| s.id);
+        async move {
+            match id {
+                Some(id) => episodes(id).await.map(Some),
+                None => Ok(None),
+            }
         }
+    };
+    let (before, after) = try_join(edge(before), edge(after)).await?;
+    if let Some(before) = before {
+        near.previous = before.last().map(|e| e.id);
     }
-    if near.next.is_none() {
-        if let Some(after) = seasons.get(s + 1..).and_then(|a| a.iter().find(regular)) {
-            near.next = list(after.id, None, INDEX_ORDER)
-                .await?
-                .items
-                .first()
-                .map(|e| e.id);
-        }
+    if let Some(after) = after {
+        near.next = after.first().map(|e| e.id);
     }
     Ok(near)
+}
+
+/// Every child of `parent`, page after page: a season can run past one page.
+async fn list_all<A: PharosApi>(
+    api: &A,
+    info: &CallInfo,
+    parent: ItemRef,
+    group: Option<ItemKind>,
+    sort_by: &str,
+) -> Result<Vec<Item>, ClientError> {
+    let mut items = Vec::new();
+    loop {
+        let start = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let page = api
+            .list(info, parent, group, sort_by, start, BROWSE_PAGE)
+            .await?;
+        let got = page.items.len();
+        items.extend(page.items);
+        if got == 0 || u32::try_from(items.len()).unwrap_or(u32::MAX) >= page.total {
+            return Ok(items);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -960,12 +993,20 @@ mod tests {
             if self.refuse_lists {
                 return Err(refused());
             }
-            Ok(page(
-                self.lists
-                    .get(&(parent, group))
-                    .cloned()
-                    .unwrap_or_default(),
-            ))
+            let all = self
+                .lists
+                .get(&(parent, group))
+                .cloned()
+                .unwrap_or_default();
+            Ok(Page {
+                total: all.len() as u32,
+                items: all
+                    .into_iter()
+                    .skip(start as usize)
+                    .take(limit as usize)
+                    .collect(),
+                start,
+            })
         }
         async fn search(&self, _: &CallInfo, _: &str, _: u32) -> Result<Page, ClientError> {
             Ok(Page::default())
@@ -1331,6 +1372,25 @@ mod tests {
                 next: None
             }
         );
+    }
+
+    #[test]
+    fn a_season_longer_than_a_page_is_read_to_its_end() {
+        let mut fake = run_fake();
+        let long: Vec<Item> = (100..100 + u64::from(BROWSE_PAGE) + 50)
+            .map(|n| episode_in(ItemRef::Real(n), S1))
+            .collect();
+        let last = long.last().map(|e| e.id);
+        fake.lists.insert((S1, None), long);
+        let beyond = ItemRef::Real(100 + u64::from(BROWSE_PAGE) + 10);
+        assert_eq!(
+            near(&fake, beyond, S1),
+            Neighbours {
+                previous: Some(ItemRef::Real(100 + u64::from(BROWSE_PAGE) + 9)),
+                next: Some(ItemRef::Real(100 + u64::from(BROWSE_PAGE) + 11)),
+            }
+        );
+        assert_eq!(near(&fake, ItemRef::Real(2), S2).previous, last);
     }
 
     #[test]
