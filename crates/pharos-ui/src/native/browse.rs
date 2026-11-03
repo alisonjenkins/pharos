@@ -393,7 +393,7 @@ const END_ID: &str = "pharos-more-end";
 /// A grid that loads the rest of its listing as the viewer nears the end
 /// (V237): an observer on a tile `SENTINEL_LEAD` before the last, and on
 /// the end of the list, asks for the next page, and a button does the same by
-/// hand and retries a failure.
+/// hand and retries a failure (V237; B294 was the dead end this replaces).
 #[component]
 fn PagedGrid(first: Page, source: ListSource) -> Element {
     let ctx = use_context::<Ctx>();
