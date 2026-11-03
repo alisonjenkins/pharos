@@ -971,7 +971,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
   accent-color: var(--px-color-accent);
 }
 .pharos-track-picker {
-  max-width: 12rem;
+  max-width: 16rem;
   padding: 0.25rem 0.5rem;
   border: 1px solid rgb(255 255 255 / 0.3); /* not themed: controls sit on the video, whose colours no theme sets */
   border-radius: 6px;
