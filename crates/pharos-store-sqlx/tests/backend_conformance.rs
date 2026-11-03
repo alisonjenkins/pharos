@@ -1473,6 +1473,77 @@ where
             .unwrap(),
         Some(SEGMENT_SCHEMA_VERSION + 7)
     );
+
+    // B289 — the stored editions read back on their own, and `scan_state`
+    // reports whether a row has any so the scanner can skip the read.
+    let with_editions: MediaId = 7000;
+    let without_editions: MediaId = 7001;
+    let editions = vec![pharos_core::AlternateMediaSource {
+        id: "3d".into(),
+        path: "/media/conformance-editions/Film - 3D.mkv".into(),
+        size_bytes: Some(4242),
+        ..Default::default()
+    }];
+    for (id, alts) in [
+        (with_editions, editions.clone()),
+        (without_editions, Vec::new()),
+    ] {
+        let mut it = media_item(id, "Editions");
+        it.path = format!("/media/conformance-editions/{id}.mkv").into();
+        it.probe.alternate_sources = alts;
+        MediaStore::put(&store, it).await.unwrap();
+    }
+    let edition_scan =
+        MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance-editions"))
+            .await
+            .unwrap();
+    MediaStore::mark_seen_batch(
+        &store,
+        &[
+            (with_editions, 1_700_000_300, 1),
+            (without_editions, 1_700_000_300, 1),
+        ],
+        edition_scan,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        MediaStore::alternate_sources(&store, with_editions)
+            .await
+            .unwrap(),
+        editions,
+        "a row with editions returns them"
+    );
+    assert!(
+        MediaStore::alternate_sources(&store, without_editions)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a row without editions returns none"
+    );
+    assert!(
+        MediaStore::alternate_sources(&store, 7999)
+            .await
+            .unwrap()
+            .is_empty(),
+        "an absent row returns none"
+    );
+    let with_state = MediaStore::scan_state(&store, with_editions)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        with_state.has_editions,
+        "scan_state flags a row with editions"
+    );
+    let without_state = MediaStore::scan_state(&store, without_editions)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !without_state.has_editions,
+        "scan_state does not flag a row without editions"
+    );
 }
 
 #[cfg(feature = "sqlite")]
