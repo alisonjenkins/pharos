@@ -109,7 +109,49 @@ pub fn capabilities(
         audio_codecs: pick(AUDIO_CODECS, &codec),
         containers: pick(CONTAINERS, &container),
         max_bitrate: 0,
-        image_subtitles: Vec::new(),
+        image_subtitles: IMAGE_SUBTITLES.iter().map(|c| (*c).to_owned()).collect(),
+    }
+}
+
+/// The image subtitle codecs the player draws (spec 019): the server sends
+/// each event as a PNG, which every browser shows.
+pub const IMAGE_SUBTITLES: &[&str] = &["dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle"];
+
+/// An image subtitle track as the server's manifest lists it: every event
+/// decoded so far, on a `width` x `height` canvas.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct ImageCues {
+    pub width: u32,
+    pub height: u32,
+    /// The whole track is listed; until then the player polls.
+    pub complete: bool,
+    pub events: Vec<ImageCue>,
+}
+
+/// One subtitle image and where it sits on the canvas.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ImageCue {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub url: String,
+}
+
+/// The images on screen at `ms`.
+pub fn cues_at(cues: &ImageCues, ms: u64) -> impl Iterator<Item = &ImageCue> {
+    cues.events
+        .iter()
+        .filter(move |c| c.start_ms <= ms && ms < c.end_ms)
+}
+
+/// `part` of `whole` in percent, for placing a cue on the canvas.
+pub fn share(part: u32, whole: u32) -> f64 {
+    match whole {
+        0 => 0.0,
+        w => f64::from(part) * 100.0 / f64::from(w),
     }
 }
 
@@ -122,6 +164,9 @@ pub struct MediaState {
     pub paused: bool,
     pub volume: f64,
     pub muted: bool,
+    /// The picture's display size; 0 until the metadata has loaded.
+    pub video_width: u32,
+    pub video_height: u32,
 }
 
 impl Default for MediaState {
@@ -132,6 +177,8 @@ impl Default for MediaState {
             paused: true,
             volume: 1.0,
             muted: false,
+            video_width: 0,
+            video_height: 0,
         }
     }
 }
@@ -531,13 +578,25 @@ pub enum SubtitleSwitch {
 /// track picked, `None` for off.
 pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
     match (burned, to) {
-        (true, _) | (false, Some(Track { vtt_url: None, .. })) => SubtitleSwitch::Renegotiate,
+        (true, _)
+        | (
+            false,
+            Some(Track {
+                vtt_url: None,
+                images_url: None,
+                ..
+            }),
+        ) => SubtitleSwitch::Renegotiate,
         (false, _) => SubtitleSwitch::InPlace,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
     #[test]
     fn max_bitrate_reads_only_the_offered_choices() {
         assert_eq!(parse_max_bitrate("4000000"), 4_000_000);
@@ -550,8 +609,6 @@ mod tests {
         assert_eq!(max_bitrate_label(0), "auto");
         assert_eq!(max_bitrate_label(2_000_000), "2000000");
     }
-
-    use super::*;
 
     #[test]
     fn crossfade_is_off_unless_a_listed_length_is_stored() {
@@ -710,6 +767,49 @@ mod tests {
     }
 
     #[test]
+    fn an_image_cue_shows_from_its_start_until_its_end() {
+        let cue = |start_ms, end_ms| ImageCue {
+            start_ms,
+            end_ms,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            url: format!("/{start_ms}.png"),
+        };
+        let cues = ImageCues {
+            width: 720,
+            height: 480,
+            complete: true,
+            events: vec![cue(500, 2_500), cue(4_000, 6_000)],
+        };
+        let at = |ms| cues_at(&cues, ms).map(|c| c.start_ms).collect::<Vec<_>>();
+        assert_eq!(at(499), Vec::<u64>::new());
+        assert_eq!(at(500), [500]);
+        assert_eq!(at(2_499), [500]);
+        assert_eq!(at(2_500), Vec::<u64>::new());
+        assert_eq!(at(5_000), [4_000]);
+    }
+
+    #[test]
+    fn the_server_manifest_reads_as_image_cues() {
+        let raw = r#"{"width":720,"height":480,"complete":false,"through_ms":6000,
+            "events":[{"start_ms":500,"end_ms":2500,"x":240,"y":400,"width":240,
+            "height":48,"forced":false,"url":"/videos/9/subtitles/3/images/0.png"}]}"#;
+        let cues: ImageCues = serde_json::from_str(raw).unwrap();
+        assert!(!cues.complete);
+        assert_eq!(cues.events[0].url, "/videos/9/subtitles/3/images/0.png");
+        assert_eq!(share(cues.events[0].x, cues.width), 240.0 * 100.0 / 720.0);
+        assert_eq!(share(1, 0), 0.0);
+    }
+
+    #[test]
+    fn every_browser_declares_the_image_subtitles_it_draws() {
+        let caps = capabilities(|_| false, |_| false);
+        assert_eq!(caps.image_subtitles, IMAGE_SUBTITLES);
+    }
+
+    #[test]
     fn tracks_are_named_by_title_then_language_then_position() {
         let mut t = Track {
             language: "eng".into(),
@@ -730,7 +830,19 @@ mod tests {
             ..Track::default()
         };
         let image = Track::default();
+        let drawn = Track {
+            images_url: Some("/videos/7/subtitles/4/images.json".into()),
+            ..Track::default()
+        };
         assert_eq!(subtitle_switch(false, Some(&text)), SubtitleSwitch::InPlace);
+        assert_eq!(
+            subtitle_switch(false, Some(&drawn)),
+            SubtitleSwitch::InPlace
+        );
+        assert_eq!(
+            subtitle_switch(true, Some(&drawn)),
+            SubtitleSwitch::Renegotiate
+        );
         assert_eq!(subtitle_switch(false, None), SubtitleSwitch::InPlace);
         assert_eq!(
             subtitle_switch(false, Some(&image)),

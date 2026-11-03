@@ -41,6 +41,10 @@ pub async fn sign_out() -> SignOutReply {
     SignOutReply::Failed(NO_BROWSER.into())
 }
 
+pub async fn get_text(_url: &str) -> Result<String, (Option<u16>, String)> {
+    Err((None, "no network on the host".into()))
+}
+
 pub async fn sleep_ms(_ms: u32) {}
 
 pub fn current_path() -> String {

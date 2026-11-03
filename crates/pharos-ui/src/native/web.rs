@@ -120,6 +120,19 @@ pub async fn sign_out() -> SignOutReply {
     }
 }
 
+/// The body of a same-origin GET, or why there is none: the HTTP status
+/// when the server answered.
+pub async fn get_text(url: &str) -> Result<String, (Option<u16>, String)> {
+    let resp = Request::get(url)
+        .send()
+        .await
+        .map_err(|e| (None, e.to_string()))?;
+    if !resp.ok() {
+        return Err((Some(resp.status()), resp.status_text()));
+    }
+    resp.text().await.map_err(|e| (None, e.to_string()))
+}
+
 pub async fn sleep_ms(ms: u32) {
     let ms = i32::try_from(ms).unwrap_or(i32::MAX);
     let promise = js_sys::Promise::new(&mut |resolve, _| {
@@ -344,7 +357,18 @@ pub fn media_state(video_id: &str) -> MediaState {
         paused: v.paused(),
         volume: v.volume(),
         muted: v.muted(),
+        video_width: video_dimension(&v, "videoWidth"),
+        video_height: video_dimension(&v, "videoHeight"),
     })
+}
+
+/// A `<video>`'s `videoWidth` or `videoHeight`, read off the element so the
+/// media element binding is all this needs.
+fn video_dimension(v: &web_sys::HtmlMediaElement, name: &str) -> u32 {
+    js_sys::Reflect::get(v, &JsValue::from_str(name))
+        .ok()
+        .and_then(|n| n.as_f64())
+        .map_or(0, |n| n as u32)
 }
 
 pub fn seek_ms(video_id: &str, ms: u64) {
