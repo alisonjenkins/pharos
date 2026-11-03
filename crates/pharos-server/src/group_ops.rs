@@ -6,7 +6,33 @@
 
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::MemberId;
-use pharos_sync::{GroupRegistry, SessionHub};
+use pharos_sync::{GroupRegistry, MemberSinks, SessionHub};
+use std::sync::{Arc, OnceLock};
+
+/// The SyncPlay machinery a surface needs to reach groups: who is connected,
+/// the groups, and where each member's messages are delivered.
+#[derive(Clone)]
+pub struct SyncDeps {
+    pub hub: SessionHub,
+    pub registry: GroupRegistry,
+    pub sinks: MemberSinks,
+}
+
+/// [`SyncDeps`], installed once the server has built them (the groups start
+/// after `AppState`). Empty until then, and in tests that do not need groups.
+#[derive(Clone, Default)]
+pub struct SyncRuntime(Arc<OnceLock<SyncDeps>>);
+
+impl SyncRuntime {
+    /// Attach the running machinery; the first install wins.
+    pub fn install(&self, deps: SyncDeps) {
+        let _ = self.0.set(deps);
+    }
+
+    pub fn get(&self) -> Option<&SyncDeps> {
+        self.0.get()
+    }
+}
 
 /// The disposition of a dispatched SyncPlay command — the observability
 /// contract for `pharos_syncplay_command_total`. Bounded, stable strings from
