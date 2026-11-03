@@ -214,9 +214,14 @@ compat-dioxus-full native="on" port="8096":
     cp -rL --no-preserve=mode "$MEDIA_SRC/." "$TMP/media/"
     # A movie library of more than one browse page (100), for the grid's
     # infinite scroll: 120 hard links to one small clip, under distinct names.
+    # Each name starts with a letter A to Z in turn, so the letter rail has
+    # every letter and Z lies past the first page (V252); doubled, as "A Bulk"
+    # would file under B with its article dropped.
     mkdir -p "$TMP/media/Bulk"
+    letters=ABCDEFGHIJKLMNOPQRSTUVWXYZ
     for n in $(seq -w 1 120); do
-      ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/Bulk $n.webm"
+      l=${letters:$((10#$n % 26)):1}
+      ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/$l$l Bulk $n.webm"
     done
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
