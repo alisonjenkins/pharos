@@ -16,15 +16,22 @@ use super::together::can_watch_together;
 pub struct Nav(pub EventHandler<Route>);
 
 /// An `<a>` to a route. A plain click navigates in place; a modified click
-/// (new tab, new window) is left to the browser.
+/// (new tab, new window) is left to the browser. `current` marks the link to
+/// the page already shown.
 #[component]
-pub fn Link(to: Route, class: Option<String>, children: Element) -> Element {
+pub fn Link(
+    to: Route,
+    class: Option<String>,
+    #[props(default)] current: bool,
+    children: Element,
+) -> Element {
     let nav = use_context::<Nav>();
     let href = to.path();
     rsx! {
         a {
             href: "{href}",
             class,
+            "aria-current": if current { "page" },
             onclick: move |evt: MouseEvent| {
                 if evt.modifiers().is_empty() {
                     evt.prevent_default();
@@ -36,20 +43,52 @@ pub fn Link(to: Route, class: Option<String>, children: Element) -> Element {
     }
 }
 
-/// The frame around every signed-in screen.
+/// The frame around every signed-in screen: the bar and a button per
+/// library.
 #[component]
-pub fn Shell(account: Element, children: Element) -> Element {
+pub fn Shell(
+    account: Element,
+    libraries: Vec<Item>,
+    current: Option<ItemRef>,
+    children: Element,
+) -> Element {
     rsx! {
         div { class: "pharos-app",
-            header { class: "pharos-banner pharos-shell-bar",
-                Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
-                nav { class: "pharos-shell-nav",
-                    Link { to: Route::Find, "Find" }
-                    Link { to: Route::Together, "Together" }
-                    {account}
+            header { class: "pharos-banner pharos-shell",
+                div { class: "pharos-shell-bar",
+                    Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
+                    nav { class: "pharos-shell-nav",
+                        Link { to: Route::Find, "Find" }
+                        Link { to: Route::Together, "Together" }
+                        {account}
+                    }
                 }
+                LibraryNav { libraries, current }
             }
             main { class: "pharos-main", {children} }
+        }
+    }
+}
+
+/// A button per library, in the home page's order.
+#[component]
+pub fn LibraryNav(libraries: Vec<Item>, current: Option<ItemRef>) -> Element {
+    if libraries.is_empty() {
+        return rsx! {};
+    }
+    let mut libraries = libraries;
+    libraries.sort_by_key(|library| rail_rank(library.library_kind));
+    rsx! {
+        nav { class: "pharos-library-nav", aria_label: "Libraries",
+            for library in libraries {
+                Link {
+                    key: "{library.id}",
+                    to: Route::Browse(library.id),
+                    class: "pharos-library-tab",
+                    current: current == Some(library.id),
+                    "{library.name}"
+                }
+            }
         }
     }
 }
@@ -496,8 +535,8 @@ pub fn progress_percent(item: &Item) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use pharos_client::api::ItemRef;
 
     fn item(kind: ItemKind) -> Item {
         Item {
@@ -888,5 +927,34 @@ mod tests {
         ] {
             assert!(html.contains(want), "missing {want} in {html}");
         }
+    }
+
+    fn library(id: u64, kind: LibraryKind, name: &str) -> Item {
+        let mut l = item(ItemKind::Library);
+        l.id = ItemRef::Synth(id);
+        l.library_kind = Some(kind);
+        l.name = name.into();
+        l
+    }
+
+    #[test]
+    fn library_buttons_follow_the_home_order_and_mark_the_one_shown() {
+        let libraries = vec![
+            library(1, LibraryKind::Music, "Music"),
+            library(2, LibraryKind::Movies, "Movies"),
+            library(3, LibraryKind::TvShows, "TV Shows"),
+        ];
+        let html = render(move || {
+            rsx! { LibraryNav { libraries: libraries.clone(), current: Some(ItemRef::Synth(2)) } }
+        });
+        let at = |name: &str| html.find(&format!(">{name}<")).expect(name);
+        assert!(
+            at("TV Shows") < at("Movies") && at("Movies") < at("Music"),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/ui/browse/s2""#), "{html}");
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        let current = html.find(r#"aria-current="page""#).unwrap();
+        assert!(current < at("Movies") && current > at("TV Shows"), "{html}");
     }
 }
