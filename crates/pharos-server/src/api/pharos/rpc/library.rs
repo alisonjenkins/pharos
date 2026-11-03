@@ -823,7 +823,7 @@ pub(super) fn read_item_id(id: item_id::Reader<'_>) -> Result<WireId, capnp::Err
     })
 }
 
-fn set_item_id(mut out: item_id::Builder<'_>, id: WireId) {
+pub(super) fn set_item_id(mut out: item_id::Builder<'_>, id: WireId) {
     match id {
         WireId::Real(id) => out.set_real(id),
         WireId::Synth(id) => out.set_synth(id),

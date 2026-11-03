@@ -1055,6 +1055,8 @@ pub(crate) enum GroupHiddenRoute {
     Socket,
     /// A `Join` on the native `/sync/v1/ws`.
     Native,
+    /// `Group.list` on the native RPC API.
+    RpcList,
 }
 
 impl GroupHiddenRoute {
@@ -1064,6 +1066,7 @@ impl GroupHiddenRoute {
             GroupHiddenRoute::Join => "join",
             GroupHiddenRoute::Socket => "socket",
             GroupHiddenRoute::Native => "native",
+            GroupHiddenRoute::RpcList => "rpc_list",
         }
     }
 }
@@ -1349,6 +1352,8 @@ pub(crate) struct ListedGroup {
     pub(crate) name: String,
     pub(crate) state: pharos_sync::messages::GroupPlayState,
     pub(crate) participants: Vec<String>,
+    /// Wire id of the queue entry playing, or the first when none is.
+    pub(crate) item_id: Option<String>,
 }
 
 /// Every group `user` may see (V201): live groups, then those only a fresh
@@ -1380,6 +1385,9 @@ pub(crate) async fn listed_groups(
             name: snap.group_name,
             state: snap.play_state,
             participants: snap.participants,
+            item_id: snap
+                .current_item_id
+                .or_else(|| snap.queue_item_ids.first().cloned()),
         });
     }
     // B28 — groups this process doesn't hold in memory but that still exist as
@@ -1408,6 +1416,7 @@ pub(crate) async fn listed_groups(
                     name: summary.group_name,
                     state: summary.play_state,
                     participants: summary.participants,
+                    item_id: summary.queue_item_ids.first().cloned(),
                 });
             }
         }
