@@ -702,6 +702,77 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // A track the <video> cannot switch itself (another audio track, an image
+    // subtitle to burn) negotiates a new playback. The player must load the
+    // new session's stream, not keep playing the old one.
+    test("picking another audio track loads the new playback's stream", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-renegotiate-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const dualAudio = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: { "X-Emby-Token": token } },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/08-test-dual-audio.webm"));
+      await expect.poll(dualAudio, { timeout: 60_000 }).toBeTruthy();
+      const movie = await dualAudio();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      // Every stream URL names its play session: `tag=` on direct play,
+      // `PlaySessionId=` on a transcode.
+      const sessions = new Set<string>();
+      page.on("request", (r) => {
+        const url = new URL(r.url());
+        if (!url.pathname.toLowerCase().startsWith(`/videos/${movie.Id}/`)) return;
+        const session = url.searchParams.get("tag") ?? url.searchParams.get("PlaySessionId");
+        if (session) sessions.add(session);
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/watch/${nativeId}`);
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(1);
+
+      const picker = page.getByRole("combobox", { name: "Audio" });
+      const second = await picker.locator("option").nth(1).getAttribute("value");
+      expect(second, "a second audio track is offered").toMatch(/^\d+$/);
+      await picker.selectOption(second!);
+      await expect
+        .poll(() => sessions.size, {
+          message: "the player loads the renegotiated session's stream",
+          timeout: 30_000,
+        })
+        .toBe(2);
+      await expect(picker).toHaveValue(second!);
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // A playlist that never loads is fatal to hls.js with nothing to restart
     // from, so the page must say so rather than show a black box.
     test("an HLS stream that cannot load shows why", async ({ page, request }) => {
