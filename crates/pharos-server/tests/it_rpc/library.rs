@@ -2564,6 +2564,76 @@ async fn a_listing_keeps_to_one_genre() {
     );
 }
 
+/// The library filter bar's date orders (B316): `descending` means newest
+/// first for both, whatever the Jellyfin route's legacy reading of a lone
+/// `DateCreated` (which lists newest first when asked ascending).
+/// Disarm check: with `read_query` passing one sort-order token, date added
+/// lists oldest first when asked newest first.
+#[actix_web::test]
+async fn date_orders_list_newest_first_when_descending() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaMetadata, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    // Name order is neither date order: Middle, Newest, Older.
+    for (id, title, at) in [
+        (701, "Older", 1_000),
+        (702, "Middle", 2_000),
+        (703, "Newest", 3_000),
+    ] {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libA/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                created_at: Some(at),
+                metadata: MediaMetadata {
+                    premiere_date: Some(at),
+                    production_year: Some(2000 + u32::try_from(at / 1_000).unwrap()),
+                    ..MediaMetadata::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let lib_a = fx.lib_a_wire.clone();
+    let ours = ["Older", "Middle", "Newest"];
+    for sort_by in [
+        "DateCreated,SortName",
+        "DateCreated",
+        "PremiereDate,ProductionYear,SortName",
+    ] {
+        for (descending, want) in [
+            (true, ["Newest", "Middle", "Older"]),
+            (false, ["Older", "Middle", "Newest"]),
+        ] {
+            let (_, page) = wire_query(
+                &session,
+                Some(&lib_a),
+                &[],
+                sort_by,
+                descending,
+                "",
+                &[],
+                0,
+                100,
+            )
+            .await;
+            let names: Vec<&str> = page
+                .iter()
+                .filter_map(|i| i["Name"].as_str())
+                .filter(|n| ours.contains(n))
+                .collect();
+            assert_eq!(names, want, "{sort_by}, descending {descending}");
+        }
+    }
+}
+
 /// The library filter bar's watched state (B312/V252): `IsPlayed` and
 /// `IsUnplayed` narrow films by their own play state and series tiles by
 /// whether every episode is played.
