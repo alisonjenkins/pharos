@@ -145,7 +145,10 @@ pub fn ErrorNote(message: String) -> Element {
 
 #[component]
 pub fn HomeView(home: Home) -> Element {
-    let empty = home.rails.is_empty() && home.resume.is_empty() && home.next_up.is_empty();
+    let empty = home.rails.is_empty()
+        && home.resume.is_empty()
+        && home.listening.is_empty()
+        && home.next_up.is_empty();
     rsx! {
         div { class: "pharos-home",
             if empty {
@@ -156,6 +159,9 @@ pub fn HomeView(home: Home) -> Element {
             }
             if !home.next_up.is_empty() {
                 Rail { title: "Next up", items: home.next_up.clone() }
+            }
+            if !home.listening.is_empty() {
+                Rail { title: "Continue listening", items: home.listening.clone() }
             }
             for rail in home.rails.iter() {
                 Rail {
@@ -471,10 +477,12 @@ mod tests {
                 latest: vec![movie.clone()],
             }],
             resume: vec![movie],
+            listening: vec![],
             next_up: vec![],
         };
         let html = render(move || rsx! { HomeView { home: home.clone() } });
         assert!(html.contains("Continue watching"), "{html}");
+        assert!(!html.contains("Continue listening"), "{html}");
         assert!(!html.contains("Next up"), "{html}");
         assert!(
             html.contains(r#"href="/ui/browse/7""#) && html.contains("Films"),
@@ -488,12 +496,24 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_home_points_at_manage() {
+    fn music_resumes_under_continue_listening_not_watching() {
+        let mut song = item(ItemKind::Audio);
+        song.id = ItemRef::Real(9);
+        song.name = "Carefree".into();
         let home = Home {
-            rails: vec![],
-            resume: vec![],
-            next_up: vec![],
+            listening: vec![song],
+            ..Home::default()
         };
+        let html = render(move || rsx! { HomeView { home: home.clone() } });
+        assert!(html.contains("Continue listening"), "{html}");
+        assert!(html.contains("Carefree"), "{html}");
+        assert!(!html.contains("Continue watching"), "{html}");
+        assert!(!html.contains("Add a library from Manage"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_home_points_at_manage() {
+        let home = Home::default();
         let html = render(move || rsx! { HomeView { home: home.clone() } });
         assert!(html.contains("Add a library from Manage"), "{html}");
     }
