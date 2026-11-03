@@ -885,7 +885,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant, TrackPicks};
+    use pharos_client::api::{
+        Capabilities, Decision, Home, ListIndex, Listing, PlaybackGrant, TrackPicks,
+    };
 
     use super::*;
     use crate::native::views::Nav;
@@ -972,18 +974,17 @@ mod tests {
         async fn home(&self, _: &CallInfo) -> Result<Home, ClientError> {
             Ok(Home::default())
         }
-        async fn list(
+        async fn query(
             &self,
             info: &CallInfo,
-            parent: ItemRef,
-            group: Option<ItemKind>,
-            sort_by: &str,
+            listing: &Listing,
             start: u32,
             limit: u32,
         ) -> Result<Page, ClientError> {
+            let (parent, group) = (listing.parent, listing.group);
             self.asked
                 .borrow_mut()
-                .push((parent, group, sort_by.into()));
+                .push((parent, group, listing.sort_by.clone()));
             self.stamped.borrow_mut().push((
                 info.ui_route.clone(),
                 info.ui_action.clone(),
@@ -1007,6 +1008,9 @@ mod tests {
                     .collect(),
                 start,
             })
+        }
+        async fn index(&self, _: &CallInfo, _: &Listing) -> Result<ListIndex, ClientError> {
+            Ok(ListIndex::default())
         }
         async fn search(&self, _: &CallInfo, _: &str, _: u32) -> Result<Page, ClientError> {
             Ok(Page::default())
