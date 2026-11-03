@@ -252,7 +252,7 @@ pub fn open_route(item: &Item) -> Route {
 
 #[component]
 pub fn PosterTile(item: Item) -> Element {
-    let subtitle = subtitle(&item);
+    let sub = sub_lines(&item);
     let progress = progress_percent(&item);
     rsx! {
         Link { to: open_route(&item), class: "pharos-poster",
@@ -270,9 +270,9 @@ pub fn PosterTile(item: Item) -> Element {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
             }
-            span { class: "pharos-poster-name", "{item.name}" }
-            if let Some(s) = subtitle {
-                span { class: "pharos-poster-sub", "{s}" }
+            span { class: "pharos-poster-name", title: "{item.name}", "{item.name}" }
+            for line in sub {
+                span { class: "pharos-poster-sub", title: "{line}", "{line}" }
             }
         }
     }
@@ -354,14 +354,15 @@ pub fn episode_label(item: &Item) -> Option<String> {
     }
 }
 
-fn subtitle(item: &Item) -> Option<String> {
+/// The lines under a poster's name: an episode's series, then its numbers,
+/// each on its own line so a long series name cannot hide the numbers.
+fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
-        ItemKind::Episode => match (&item.series_name, episode_label(item)) {
-            (Some(series), Some(label)) => Some(format!("{series} · {label}")),
-            (Some(series), None) => Some(series.clone()),
-            (None, label) => label,
-        },
-        _ => item.year.map(|y| y.to_string()),
+        ItemKind::Episode => [item.series_name.clone(), episode_label(item)]
+            .into_iter()
+            .flatten()
+            .collect(),
+        _ => item.year.map(|y| y.to_string()).into_iter().collect(),
     }
 }
 
@@ -624,7 +625,26 @@ mod tests {
         e.series_name = Some("Show".into());
         e.season = Some(1);
         e.episode = Some(3);
-        assert_eq!(subtitle(&e).as_deref(), Some("Show · S1 · E3"));
-        assert_eq!(subtitle(&item(ItemKind::Movie)).as_deref(), Some("2001"));
+        assert_eq!(sub_lines(&e), ["Show", "S1 · E3"]);
+        e.series_name = None;
+        assert_eq!(sub_lines(&e), ["S1 · E3"]);
+        assert_eq!(sub_lines(&item(ItemKind::Movie)), ["2001"]);
+    }
+
+    #[test]
+    fn a_tile_puts_series_and_numbers_on_their_own_lines_with_tooltips() {
+        let mut e = item(ItemKind::Episode);
+        e.name = "Murder House".into();
+        e.series_name = Some("American Horror Story".into());
+        e.season = Some(1);
+        e.episode = Some(1);
+        let html = render(move || rsx! { PosterTile { item: e.clone() } });
+        for want in [
+            r#"class="pharos-poster-name" title="Murder House""#,
+            r#"class="pharos-poster-sub" title="American Horror Story""#,
+            r#"class="pharos-poster-sub" title="S1 · E1""#,
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
     }
 }
