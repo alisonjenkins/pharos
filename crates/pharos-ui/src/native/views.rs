@@ -6,6 +6,7 @@ use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, LibraryKind, Page};
 
 use super::depth;
+use super::platform;
 use super::route::Route;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
@@ -145,6 +146,7 @@ pub fn ErrorNote(message: String) -> Element {
 
 #[component]
 pub fn HomeView(home: Home) -> Element {
+    use_hook(|| std::rc::Rc::new(platform::rail_gestures()));
     let empty = home.rails.is_empty()
         && home.resume.is_empty()
         && home.listening.is_empty()
