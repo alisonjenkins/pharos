@@ -1348,6 +1348,9 @@ mod tests {
         async fn home(&self, _: &CallInfo) -> Result<Home, ClientError> {
             Ok(Home::default())
         }
+        async fn views(&self, _: &CallInfo) -> Result<Page, ClientError> {
+            Ok(Page::default())
+        }
         async fn query(
             &self,
             info: &CallInfo,
