@@ -1241,6 +1241,7 @@ fn Player(
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let nav = use_context::<Nav>();
+    let replace = use_context::<Replace>();
     let mut failed = use_signal(|| None::<String>);
     let mut media = use_signal(MediaState::default);
     let mut hover_ms = use_signal(|| None::<u64>);
@@ -1384,7 +1385,9 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
-                Control::Play(id) => nav.0.call(Route::Watch(id)),
+                // In place of this episode, so Back leaves the show rather than
+                // replaying every episode watched.
+                Control::Play(id) => replace.0.call(Route::Watch(id)),
                 Control::Back => {
                     if !platform::go_back() {
                         nav.0.call(Route::Home);
