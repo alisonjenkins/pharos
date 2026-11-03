@@ -1442,6 +1442,8 @@ fn Player(
             ListenView {
                 title: p.title.clone(),
                 image: p.image.clone(),
+                artist: p.detail.item.artist.clone(),
+                album: p.detail.item.album.clone(),
                 year: p.detail.item.year,
                 genres: p.detail.genres.clone(),
                 runtime_ms: p.detail.item.runtime_ms,
