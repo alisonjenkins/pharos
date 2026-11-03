@@ -94,6 +94,8 @@ impl Scrub {
 pub fn ListenView(
     title: String,
     image: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
     year: Option<u16>,
     genres: Vec<String>,
     runtime_ms: u64,
@@ -135,7 +137,7 @@ pub fn ListenView(
     } else {
         0.0
     };
-    let meta = meta_line(year, &genres);
+    let meta = meta_line(album.as_deref(), year, &genres);
     let on_key = move |evt: KeyboardEvent| {
         let key = evt.key();
         let control = shortcuts
@@ -181,6 +183,9 @@ pub fn ListenView(
                 div { class: "pharos-listen-main",
                     p { class: "pharos-listen-eyebrow", "Now playing" }
                     h2 { class: "pharos-listen-title", "{title}" }
+                    if let Some(artist) = &artist {
+                        p { class: "pharos-listen-artist", "{artist}" }
+                    }
                     if let Some(meta) = meta {
                         p { class: "pharos-listen-meta", "{meta}" }
                     }
@@ -306,10 +311,11 @@ pub fn ListenView(
 }
 
 /// "2003 · Trip-hop, Electronic"; `None` when there is neither.
-fn meta_line(year: Option<u16>, genres: &[String]) -> Option<String> {
-    let parts: Vec<String> = year
-        .map(|y| y.to_string())
+fn meta_line(album: Option<&str>, year: Option<u16>, genres: &[String]) -> Option<String> {
+    let parts: Vec<String> = album
+        .map(str::to_owned)
         .into_iter()
+        .chain(year.map(|y| y.to_string()))
         .chain((!genres.is_empty()).then(|| genres.join(", ")))
         .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
@@ -469,6 +475,8 @@ mod tests {
                     ListenView {
                         title: title.clone(),
                         image: image.clone(),
+                        artist: Some("Massive Attack".to_owned()),
+                        album: Some("Mezzanine".to_owned()),
                         year: Some(1998),
                         genres: vec!["Trip-hop".to_owned()],
                         runtime_ms: 330_000,
@@ -502,7 +510,8 @@ mod tests {
                 "{label}"
             );
         }
-        assert!(html.contains("1998 · Trip-hop"), "{html}");
+        assert!(html.contains("Massive Attack"), "{html}");
+        assert!(html.contains("Mezzanine · 1998 · Trip-hop"), "{html}");
     }
 
     #[test]
@@ -563,13 +572,13 @@ mod tests {
 
     #[test]
     fn the_meta_line_shows_what_there_is() {
-        assert_eq!(meta_line(None, &[]), None);
-        assert_eq!(meta_line(Some(2003), &[]).as_deref(), Some("2003"));
+        assert_eq!(meta_line(None, None, &[]), None);
+        assert_eq!(meta_line(None, Some(2003), &[]).as_deref(), Some("2003"));
         let genres = ["Rock".to_owned(), "Pop".to_owned()];
-        assert_eq!(meta_line(None, &genres).as_deref(), Some("Rock, Pop"));
+        assert_eq!(meta_line(None, None, &genres).as_deref(), Some("Rock, Pop"));
         assert_eq!(
-            meta_line(Some(2003), &genres).as_deref(),
-            Some("2003 · Rock, Pop")
+            meta_line(Some("Meteora"), Some(2003), &genres).as_deref(),
+            Some("Meteora · 2003 · Rock, Pop")
         );
     }
 
