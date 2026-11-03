@@ -162,6 +162,18 @@ impl ScanProgress {
 /// shared atomic + broadcasts a socket message) across every root.
 pub type ProgressSink = std::sync::Arc<dyn Fn(ScanProgress) + Send + Sync>;
 
+/// One scan at a time in the process (B313/V253). Every scan stamps the rows
+/// it sees with its own scan id and then sweeps the unstamped ones under its
+/// root, so two scans over the same files (a library inside a mixed root, each
+/// with its own task) would sweep each other's stamps and drop files still on
+/// disk. Held for the whole of [`FsScanner::scan_into`] and of a watcher batch.
+static SCAN_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Waits for any other scan in the process to finish; the scan holds the guard.
+pub(crate) async fn scan_exclusively() -> tokio::sync::MutexGuard<'static, ()> {
+    SCAN_GATE.lock().await
+}
+
 #[derive(Clone)]
 pub struct FsScanner<P: Prober> {
     prober: P,
@@ -539,6 +551,7 @@ impl<P: Prober> FsScanner<P> {
         root: &Path,
         store: &S,
     ) -> DomainResult<ScanOutcome> {
+        let _exclusive = scan_exclusively().await;
         let started = std::time::Instant::now();
         // Boxed: `scan_run`'s future is a deep stack of store futures, and
         // inlining it into every caller's async block pushes the server's

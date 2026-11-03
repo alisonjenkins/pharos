@@ -318,6 +318,7 @@ where
     paths.sort_unstable();
     paths.dedup();
 
+    let _exclusive = crate::fs::scan_exclusively().await;
     let scan_id = store.begin_scan(root).await?;
     let mut outcome = ScanOutcome::default();
     let mut touched_media = false;
