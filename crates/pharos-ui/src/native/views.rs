@@ -304,6 +304,7 @@ pub fn PosterTile(item: Item) -> Element {
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
+                Ratings { item: item.clone(), class: "pharos-ratings pharos-ratings-tile" }
             }
             span { class: "pharos-poster-name", title: "{item.name}", "{item.name}" }
             for line in sub {
@@ -341,6 +342,7 @@ pub fn TitleView(detail: Detail) -> Element {
                 if !facts.is_empty() {
                     p { class: "pharos-muted", "{facts}" }
                 }
+                Ratings { item: item.clone(), class: "pharos-ratings" }
                 div { class: "pharos-actions",
                     if item.kind.playable() {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
@@ -356,6 +358,63 @@ pub fn TitleView(detail: Detail) -> Element {
                 }
                 if !detail.genres.is_empty() {
                     p { class: "pharos-muted", "{detail.genres.join(\", \")}" }
+                }
+            }
+        }
+    }
+}
+
+/// One outside score for a title, as a chip shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rating {
+    /// `imdb`, `fresh` or `rotten`: picks the chip's colour.
+    pub source: &'static str,
+    pub label: &'static str,
+    pub value: String,
+    /// The chip's tooltip, with the source spelled out.
+    pub tooltip: String,
+}
+
+/// The Tomatometer at which Rotten Tomatoes calls a title fresh.
+const FRESH_FROM: u16 = 60;
+
+/// An item's IMDb and Rotten Tomatoes scores, in that order, whichever it has.
+pub fn ratings(item: &Item) -> Vec<Rating> {
+    let imdb = item.imdb_rating.map(|tenths| {
+        let score = format!("{}.{}", tenths / 10, tenths % 10);
+        Rating {
+            source: "imdb",
+            label: "IMDb",
+            tooltip: format!("IMDb {score} out of 10"),
+            value: score,
+        }
+    });
+    let critics = item.critic_rating.map(|percent| Rating {
+        source: if percent >= FRESH_FROM {
+            "fresh"
+        } else {
+            "rotten"
+        },
+        label: "RT",
+        value: format!("{percent}%"),
+        tooltip: format!("Rotten Tomatoes {percent}%"),
+    });
+    imdb.into_iter().chain(critics).collect()
+}
+
+/// An item's outside scores as chips; nothing when it has none.
+#[component]
+pub fn Ratings(item: Item, class: &'static str) -> Element {
+    let ratings = ratings(&item);
+    if ratings.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        ul { class, aria_label: "Ratings",
+            for r in ratings {
+                li { class: "pharos-rating pharos-rating-{r.source}", title: "{r.tooltip}",
+                    span { class: "pharos-rating-source", "{r.label}" }
+                    " {r.value}"
                 }
             }
         }
@@ -433,6 +492,35 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
         }
+    }
+
+    #[test]
+    fn ratings_show_imdb_then_rotten_tomatoes() {
+        let mut m = item(ItemKind::Movie);
+        assert!(ratings(&m).is_empty());
+        m.imdb_rating = Some(78);
+        m.critic_rating = Some(92);
+        let r = ratings(&m);
+        assert_eq!(
+            r.iter()
+                .map(|r| (r.source, r.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("imdb", "7.8"), ("fresh", "92%")]
+        );
+        assert_eq!(r[0].tooltip, "IMDb 7.8 out of 10");
+        assert_eq!(r[1].tooltip, "Rotten Tomatoes 92%");
+    }
+
+    #[test]
+    fn a_whole_imdb_score_keeps_its_tenth_and_59_percent_is_rotten() {
+        let mut m = item(ItemKind::Movie);
+        m.imdb_rating = Some(80);
+        m.critic_rating = Some(59);
+        let r = ratings(&m);
+        assert_eq!(r[0].value, "8.0");
+        assert_eq!(r[1].source, "rotten");
+        m.critic_rating = Some(60);
+        assert_eq!(ratings(&m)[1].source, "fresh");
     }
 
     fn render(body: impl Fn() -> Element + 'static) -> String {

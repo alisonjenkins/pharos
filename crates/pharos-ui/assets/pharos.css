@@ -371,6 +371,54 @@ input:focus-visible {
   color: var(--px-color-fg);
 }
 
+/* Outside scores: chips under a title's facts, and small ones in a
+   poster's bottom-left corner, above the progress bar. */
+.pharos-ratings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-rating {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.2;
+  border-radius: 9999px;
+  background: var(--px-color-overlay);
+  border: 1px solid var(--px-color-border);
+  color: var(--px-color-fg);
+  white-space: nowrap;
+}
+.pharos-rating-source {
+  font-weight: 700;
+}
+.pharos-rating-imdb .pharos-rating-source {
+  color: var(--px-color-warning);
+}
+.pharos-rating-fresh .pharos-rating-source {
+  color: var(--px-color-danger);
+}
+.pharos-rating-rotten .pharos-rating-source {
+  color: var(--px-color-success);
+}
+.pharos-ratings-tile {
+  position: absolute;
+  left: 0.4rem;
+  bottom: 0.6rem;
+  margin: 0;
+  gap: 0.25rem;
+  pointer-events: none;
+}
+.pharos-ratings-tile .pharos-rating {
+  padding: 0.15rem 0.4rem;
+  font-size: 0.6875rem;
+  border: none;
+  background: var(--px-color-bg);
+}
+
 .pharos-progress {
   position: absolute;
   bottom: 0;
