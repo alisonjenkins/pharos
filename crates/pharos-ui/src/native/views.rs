@@ -3,7 +3,7 @@
 //! renders under `dioxus-ssr` in tests (009 FR-014).
 
 use dioxus::prelude::*;
-use pharos_client::api::{Detail, Home, Item, ItemKind, Page};
+use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, LibraryKind, Page};
 
 use super::depth;
 use super::route::Route;
@@ -146,6 +146,8 @@ pub fn ErrorNote(message: String) -> Element {
 #[component]
 pub fn HomeView(home: Home) -> Element {
     let empty = home.rails.is_empty() && home.resume.is_empty() && home.next_up.is_empty();
+    let mut rails: Vec<&HomeRail> = home.rails.iter().collect();
+    rails.sort_by_key(|rail| rail_rank(rail.library.library_kind));
     rsx! {
         div { class: "pharos-home",
             if empty {
@@ -157,7 +159,7 @@ pub fn HomeView(home: Home) -> Element {
             if !home.next_up.is_empty() {
                 Rail { title: "Next up", items: home.next_up.clone() }
             }
-            for rail in home.rails.iter() {
+            for rail in rails {
                 Rail {
                     key: "{rail.library.id}",
                     title: rail.library.name.clone(),
@@ -166,6 +168,19 @@ pub fn HomeView(home: Home) -> Element {
                 }
             }
         }
+    }
+}
+
+/// Where a library's rail sits on the home page: shows, films, music, books,
+/// then mixed libraries. The server's order holds within one kind.
+fn rail_rank(kind: Option<LibraryKind>) -> u8 {
+    match kind {
+        Some(LibraryKind::TvShows) => 0,
+        Some(LibraryKind::Movies) => 1,
+        Some(LibraryKind::Music) => 2,
+        Some(LibraryKind::Books) => 3,
+        Some(LibraryKind::Mixed) => 4,
+        None => 5,
     }
 }
 
@@ -486,6 +501,50 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("width: 25%"), "{html}");
+    }
+
+    #[test]
+    fn home_rails_run_shows_films_music_books_then_mixed() {
+        let rail = |id: u64, name: &str, kind: Option<LibraryKind>| {
+            let mut lib = item(ItemKind::Library);
+            lib.id = ItemRef::Real(id);
+            lib.name = name.into();
+            lib.library_kind = kind;
+            HomeRail {
+                library: lib,
+                latest: vec![],
+            }
+        };
+        let mut next = item(ItemKind::Episode);
+        next.id = ItemRef::Real(99);
+        let home = Home {
+            rails: vec![
+                rail(1, "Media", Some(LibraryKind::Mixed)),
+                rail(2, "Books", Some(LibraryKind::Books)),
+                rail(3, "Music", Some(LibraryKind::Music)),
+                rail(4, "Movies", Some(LibraryKind::Movies)),
+                rail(5, "TV Shows", Some(LibraryKind::TvShows)),
+            ],
+            resume: vec![item(ItemKind::Movie)],
+            next_up: vec![next],
+        };
+        let html = render(move || rsx! { HomeView { home: home.clone() } });
+        let at = |title: &str| {
+            html.find(&format!(">{title}<"))
+                .unwrap_or_else(|| panic!("no {title} in {html}"))
+        };
+        let order = [
+            "Continue watching",
+            "Next up",
+            "TV Shows",
+            "Movies",
+            "Music",
+            "Books",
+            "Media",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
+        }
     }
 
     #[test]
