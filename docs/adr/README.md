@@ -73,7 +73,7 @@ optional **Alternatives considered** / **References**).
 | [0028](0028-native-api-for-first-party-clients.md) | pharos-ui and future pharos apps use a pharos-native (Cap'n Proto) API; Jellyfin API stays for third-party clients | Accepted |
 | [0029](0029-native-api-transport-and-session.md) | Native API transport: per-worker Cap'n Proto RPC over a WebSocket, sessions resumed from a cookie or device token, off by default | Accepted |
 | [0030](0030-edition-full-probe.md) | Each grouped edition keeps its full probe in `alternate_sources_json` | Accepted |
-| [0031](0031-item-file-auth-cookie.md) | Item file routes require auth; the `JellyfinAuth` cookie authenticates only GET/HEAD byte routes | Accepted |
+| [0031](0031-item-file-auth-cookie.md) | Item file routes require auth; the `JellyfinAuth` cookie authenticates only GET/HEAD byte routes | Superseded in part by 0040 |
 | [0032](0032-syncplay-members-record-their-user.md) | SyncPlay group members record their user (persisted and on the bus, absent = sees nothing); a queue change needs every member to see it | Accepted |
 | [0033](0033-pharos-ui-served-at-the-root-from-the-pharos-image.md) | pharos-ui is baked into the pharos image and served at `/` (SPA fallback for browsers only, `/ui/*` → 308); the sidecar is off by default | Superseded by 0038 |
 | [0034](0034-native-ui-media-cookie.md) | The native web UI authenticates element fetches with a `pharos_media` cookie (same token as `pharos_session`, `JellyfinAuth`'s V191 scope) | Accepted |
@@ -82,5 +82,6 @@ optional **Alternatives considered** / **References**).
 | [0037](0037-per-user-prefs-store-and-telemetry-opt-in-gate.md) | Per-user prefs live in their own `UserPrefStore` (opaque bytes per key, policy in `rpc/prefs.rs`); `Telemetry.submit` drops batches from users who have not opted in (`diagnostics.opt_in`) | Accepted |
 | [0038](0038-pharos-ui-served-under-ui.md) | pharos-ui is served under `/ui/` (`/ui` → 308 `/ui/`), leaving `/` to the core root and jellyfin-web; supersedes 0033's root mount | Accepted |
 | [0039](0039-gpu-layer-webgl2-via-glow.md) | The native UI draws GPU effects with WebGL2 via `glow` behind a `Surface` port: compiled-in shader catalogue, bounded uniforms, CSS fallback for reduced motion, no WebGL2 or a lost context | Accepted |
-| [0040](0040-server-is-the-cast-sender.md) | pharos is the Cast sender (hand-rolled CASTV2 in `pharos-cast`); a TV joins a SyncPlay group as a non-gating `CastSeat`, offered to clients as a virtual session, TVs declared in config | Accepted |
-| [0041](0041-token-scopes.md) | Access tokens carry a scope (`Full`, `Playback`); a TV's token is playback-only on a deny-by-default route allowlist, device-bound, short-lived and revoked with the cast | Accepted |
+| [0040](0040-item-images-anonymous-for-native-apps.md) | Item images answer anonymous requests again (native apps' image loaders send no credential); a resolving credential still applies the library policy; supersedes 0031's image decision | Accepted |
+| [0041](0041-server-is-the-cast-sender.md) | pharos is the Cast sender (hand-rolled CASTV2 in `pharos-cast`); a TV joins a SyncPlay group as a non-gating `CastSeat`, offered to clients as a virtual session, TVs declared in config | Accepted |
+| [0042](0042-token-scopes.md) | Access tokens carry a scope (`Full`, `Playback`); a TV's token is playback-only on a deny-by-default route allowlist, device-bound, short-lived and revoked with the cast | Accepted |

@@ -1,4 +1,4 @@
-# ADR-0040: The server is the Cast sender; the TV is a non-gating group seat
+# ADR-0041: The server is the Cast sender; the TV is a non-gating group seat
 
 - **Status:** Accepted
 - **Date:** 2026-11-02T20:30:00Z
@@ -31,8 +31,8 @@ We will make pharos itself the Cast sender, in a new crate `pharos-cast`:
 - **Group role.** The TV joins the SyncPlay group as a new member kind,
   `MemberKind::CastSeat`, owned by the casting user, with member id
   `UUIDv5("{user}:cast:{tv}")`. The seat never gates the group: it is left out
-  of readiness gates and buffering freezes (V222). Commands addressed to the
-  TV act on the group (V223). The seat is persisted with the group and resumed
+  of readiness gates and buffering freezes (V226). Commands addressed to the
+  TV act on the group (V227). The seat is persisted with the group and resumed
   after a restart or takeover. Only the replica that runs the group holds the
   TV connection, enforced by a per-TV lease.
 - **Discovery.** TVs are declared in config (`[cast]` with `[[cast.tvs]]` name
@@ -52,7 +52,7 @@ We will make pharos itself the Cast sender, in a new crate `pharos-cast`:
   its source. Real-TV behaviour (seek accuracy, buffering reports, drift
   defaults) is still unmeasured (spec 009 T048).
 - New third-party dependencies: `prost`, `rustls`, `tokio-rustls`.
-- The TV needs its own credential. That is ADR-0041.
+- The TV needs its own credential. That is ADR-0042.
 - A TV whose address changes needs a config change: there is no discovery.
 
 ## Alternatives considered
@@ -71,4 +71,4 @@ We will make pharos itself the Cast sender, in a new crate `pharos-cast`:
 
 - `specs/009-syncplay-cast/` (spec, research R1-R8, spike S1)
 - `crates/pharos-cast/`, `crates/pharos-server/src/cast_service.rs`
-- Invariants V222-V225
+- Invariants V226-V229

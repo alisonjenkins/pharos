@@ -128,3 +128,71 @@ pub(crate) async fn require_bearer(
     auth_extractor::note_header_credential(req);
     Ok(user)
 }
+
+/// The bearer of an image request, or `None` for an anonymous one. Image
+/// GETs stay anonymous like Jellyfin's: jellyfin-web's `<img>` tags and the
+/// native apps' image loaders send no credential (B286, V225). A token that
+/// does not resolve counts as anonymous too, so a stale cookie or revoked
+/// token cannot cost a client its artwork, and neither counts as a refusal;
+/// 503 only when the store could not say.
+pub(crate) async fn optional_bearer(
+    state: &crate::state::AppState,
+    req: &actix_web::HttpRequest,
+    id: &str,
+    route: &'static str,
+) -> Result<Option<pharos_core::User>, actix_web::Error> {
+    use crate::services::{access::ItemHidden, auth::TokenRefusal};
+    let Some(token) = auth_extractor::media_token(Some(state), req).await else {
+        tracing::debug!(item_id = id, route, "anonymous image request");
+        return Ok(None);
+    };
+    match crate::services::auth::scoped_user_for_token(&state.stores, &token).await {
+        // A restricted token (a cast TV's) speaks for its user only on the
+        // routes its scope allows (V229); elsewhere the request is served
+        // like an anonymous one, which an image route permits anyway.
+        Ok((user, scope)) => {
+            let pattern = req.match_pattern();
+            if !auth_extractor::scope_permits(scope, req.method().as_str(), pattern.as_deref()) {
+                tracing::debug!(
+                    item_id = id,
+                    route,
+                    scope = scope.label(),
+                    "image request served anonymously: token scope does not cover the route"
+                );
+                return Ok(None);
+            }
+            auth_extractor::note_header_credential(req);
+            Ok(Some(user))
+        }
+        Err(TokenRefusal::Unavailable(detail)) => {
+            let hidden = ItemHidden::Unavailable(detail);
+            metrics::counter!("pharos_item_access_denied_total", "reason" => hidden.label())
+                .increment(1);
+            tracing::warn!(item_id = id, route, reason = hidden.label(), detail = %hidden, "item withheld: credential not checked");
+            Err(access_error(hidden))
+        }
+        Err(refusal) => {
+            tracing::debug!(
+                item_id = id,
+                route,
+                credential = refusal.label(),
+                "image request served anonymously: credential did not resolve"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// [`require_item_access`] for a signed-in requester; an anonymous one is
+/// served like on Jellyfin (see [`optional_bearer`]).
+pub(crate) async fn require_item_access_if_signed_in(
+    state: &crate::state::AppState,
+    user: Option<&pharos_core::User>,
+    id: pharos_core::MediaId,
+    route: &'static str,
+) -> Result<(), actix_web::Error> {
+    match user {
+        Some(user) => require_item_access(state, user, id, route).await,
+        None => Ok(()),
+    }
+}

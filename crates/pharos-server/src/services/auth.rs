@@ -18,7 +18,7 @@ pub enum TokenRefusal {
     Unavailable(String),
     /// The token is live but restricted (a cast TV's
     /// [`TokenScope::Playback`]), and the caller needs a full credential: a
-    /// restricted token reaches only the allowlisted HTTP routes (V225).
+    /// restricted token reaches only the allowlisted HTTP routes (V229).
     ScopeRestricted,
 }
 
@@ -672,7 +672,7 @@ mod tests {
     /// A cast TV's playback token is refused wherever a full credential is
     /// checked (the native API's resume, session calls and socket re-check
     /// all use `user_for_token`), and the refusal is counted; the scoped
-    /// lookup still resolves it for the allowlisted HTTP routes (V225).
+    /// lookup still resolves it for the allowlisted HTTP routes (V229).
     #[actix_web::test]
     async fn a_playback_token_is_not_a_full_credential() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};

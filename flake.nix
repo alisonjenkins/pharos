@@ -211,6 +211,21 @@
             '';
           }
         );
+        # The two server binaries in the `ci` profile, for the Playwright jobs.
+        # `ci` inherits `dev`, so `debug_assertions` stays on and the test-only
+        # `admin seed-playwright-user` command is compiled in (release strips
+        # it). Reusing `pharosCiDeps`, which `nix flake check` already builds,
+        # means a CI run compiles only the workspace crates, once per commit,
+        # in the shared store instead of a cold `cargo build` per job.
+        pharosTestBins = craneLib.buildPackage (
+          ciArgs
+          // {
+            pname = "pharos-test-bins";
+            cargoArtifacts = pharosCiDeps;
+            cargoExtraArgs = "--package pharos-server --package pharos-transcode";
+            doCheck = false;
+          }
+        );
         pharos = pharosBins;
         # Bundled into the OCI image + pointed at via PHAROS_TRANSCODE_WORKER
         # (the two binaries share one store path here, but the env var is the
@@ -543,6 +558,9 @@
             FONTCONFIG_FILE=$out/etc/fonts/fonts.conf fc-cache --force --system-only
           '';
 
+        # Enough to keep each big leaf package in its own layer; every layer is
+        # one more blob for skopeo to check on each tag pushed.
+        ociDepLayers = 32;
         ociImage = pkgs.dockerTools.streamLayeredImage {
           name = "pharos";
           tag = "latest";
@@ -565,6 +583,20 @@
             pkgs.tzdata
             subtitleFonts
             fontsConf
+          ];
+          # pharos is the only store path that changes per commit. Give it its
+          # own layer, stacked last, so a deploy re-pushes and re-unpacks just
+          # that layer: containerd keys each unpacked layer by its whole parent
+          # chain, so anything stacked above pharos is unpacked again too.
+          # The nixpkgs deps only change on a nixpkgs bump, which rewrites most
+          # of them anyway, so they share ociDepLayers layers. Reversing around
+          # limit_layers merges the small, widely shared libs into one base
+          # layer and leaves the big leaf packages (llvm, mesa, deno) their own.
+          layeringPipeline = [
+            [ "subcomponent_in" [ pharos ] ]
+            [ "over" "rest" [ "pipe" [ [ "popularity_contest" ] [ "reverse" ] [ "limit_layers" ociDepLayers ] [ "reverse" ] ] ] ]
+            [ "reorder" [ "rest" "main" ] ]
+            [ "flatten" ]
           ];
           # Real /etc + state dirs in the rootfs (see note above). chmod 1777
           # /tmp for ffmpeg + tokio getrandom; a passwd/group entry for the
@@ -1020,6 +1052,7 @@
         packages = {
           default = pharos;
           pharos = pharos;
+          pharosTestBins = pharosTestBins;
           integrationFixtures = pharosIntegrationFixtures;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # `oci` + `jellyfinWebOci` + compose only meaningful on

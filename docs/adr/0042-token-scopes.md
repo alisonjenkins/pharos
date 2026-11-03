@@ -1,4 +1,4 @@
-# ADR-0041: Access tokens carry a scope; a TV's token is playback-only
+# ADR-0042: Access tokens carry a scope; a TV's token is playback-only
 
 - **Status:** Accepted
 - **Date:** 2026-11-02T20:30:00Z
@@ -30,7 +30,7 @@ We will give every stored token a scope, `TokenScope { Full, Playback }`:
   matched route.
 - A TV token is minted per cast, bound to the TV's device id, lives 12 hours
   by default, is renewed at half its lifetime, and is revoked on every exit
-  from the cast (V225).
+  from the cast (V229).
 
 ## Consequences
 
@@ -54,4 +54,4 @@ We will give every stored token a scope, `TokenScope { Full, Playback }`:
 - `crates/pharos-core/src/auth.rs` (`TokenScope`),
   `crates/pharos-server/src/api/jellyfin/auth_extractor.rs`,
   `crates/pharos-server/src/services/auth.rs`
-- Invariant V225; ADR-0040
+- Invariant V229; ADR-0041

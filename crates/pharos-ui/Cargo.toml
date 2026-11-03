@@ -69,7 +69,7 @@ wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 # The GPU layer's WebGL2 binding (009 research R2, ADR-0039).
-glow = { version = "0.17", optional = true }
+glow = { version = "0.18", optional = true }
 # wasm32 has no default getrandom backend; dioxus 0.7's dep graph pulls
 # getrandom 0.2 transitively, so force its `js` feature for the web build.
 # Pinned to 0.2: 0.3+ replaced `js` with `wasm_js` and would not unify with
