@@ -1824,6 +1824,65 @@ async fn grouped_listings_follow_the_parental_cap() {
     );
 }
 
+/// The series tiles a TV library lists name the same things, in the same
+/// order, as the Jellyfin route lists for `IncludeItemTypes=Series`; a page
+/// holds the tiles it was asked for while the total counts them all; and a
+/// user barred from the library is listed none.
+#[actix_web::test]
+async fn series_tiles_agree_with_the_jellyfin_route_page_and_follow_library_access() {
+    use actix_web::test;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let series = |start, limit| {
+        wire_query(
+            &session,
+            Some(&tv),
+            &[Kind::Series],
+            "SortName",
+            false,
+            "",
+            &[],
+            start,
+            limit,
+        )
+    };
+
+    let (total, native) = series(0, 0).await;
+    assert_eq!(total, 2);
+    let req = test::TestRequest::get()
+        .uri(&format!(
+            "/Users/{}/Items?ParentId={tv}&IncludeItemTypes=Series&SortBy=SortName",
+            fx.user_id.0.simple()
+        ))
+        .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+        .to_request();
+    let web: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+    assert_eq!(native, project(web["Items"].as_array().unwrap()));
+
+    let (total, first) = series(0, 1).await;
+    let (_, second) = series(1, 1).await;
+    assert_eq!((total, first.len(), second.len()), (2, 1, 1));
+    assert_ne!(first[0]["Id"], second[0]["Id"]);
+
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_a_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(series(0, 0).await.0, 0);
+}
+
 /// Adds music libraries at /libMusic (artists "Alpha", with albums "First"
 /// on two discs and "Second", and "Beta", album "Third") and /libOther
 /// (artist "Gamma"), and returns the first's wire id.
