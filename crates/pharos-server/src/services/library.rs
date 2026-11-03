@@ -786,6 +786,132 @@ pub(crate) async fn grouped(
     }
 }
 
+/// What the library filter bar needs beside a listing (B312/V252): where
+/// each first letter starts in it, and the genres there are to pick from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListIndex {
+    /// Each letter the listing holds and the offset of its first item, in
+    /// listing order. `#` is any name not starting A to Z.
+    pub letters: Vec<(char, u32)>,
+    /// The genres under the parent and kind, by name; the query's own genre
+    /// and filters do not narrow it.
+    pub genres: Vec<String>,
+}
+
+/// The letter a sort key files under: its first character upper-cased when
+/// that is A to Z, else `#`.
+pub fn letter_of(key: &str) -> char {
+    match key.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => c.to_ascii_uppercase(),
+        _ => '#',
+    }
+}
+
+/// Where each letter first appears among `names` taken in listing order,
+/// filed by [`pharos_core::sort_name`] (the key `SortName` orders by, which
+/// drops a leading article). Walking the real order keeps every start an
+/// item of that letter whatever collation the store sorted with.
+pub fn letter_starts<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(char, u32)> {
+    let mut starts: Vec<(char, u32)> = Vec::new();
+    for (at, name) in (0u32..).zip(names) {
+        let letter = letter_of(&pharos_core::sort_name(name));
+        if !starts.iter().any(|&(seen, _)| seen == letter) {
+            starts.push((letter, at));
+        }
+    }
+    starts
+}
+
+/// The [`ListIndex`] of the listing `q` asks for under `parent_id`: the same
+/// listing unpaged, so its letters fall where its pages do.
+pub async fn index(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    grouping: Option<Grouping>,
+    q: &ItemQuery,
+) -> Result<ListIndex, GroupError> {
+    use crate::api::jellyfin::items::{
+        apply_policy_scope, build_media_query, resolve_parent_filter, ParentResolution,
+    };
+    let unpaged = ItemQuery {
+        start_index: 0,
+        limit: None,
+        ..q.clone()
+    };
+    let unfiltered = ItemQuery {
+        genre: None,
+        filters: None,
+        ..unpaged.clone()
+    };
+    let dto_name = |dto: &serde_json::Value| dto["Name"].as_str().unwrap_or_default().to_owned();
+    if let Some(grouping) = grouping {
+        let group = |q| grouped(state, user, parent_id, grouping, q);
+        let listed = group(&unpaged).await?;
+        let names: Vec<String> = listed.items.iter().map(dto_name).collect();
+        // Unnarrowed, the listing already is every group there is to pick
+        // genres from; folding the episodes again would only repeat it.
+        let pool = if q.genre.is_none() && q.filters.is_none() {
+            listed.items
+        } else {
+            group(&unfiltered).await?.items
+        };
+        let mut genres: Vec<String> = Vec::new();
+        for dto in pool {
+            for g in dto["Genres"].as_array().into_iter().flatten() {
+                if let Some(g) = g.as_str().filter(|g| !g.is_empty()) {
+                    if !genres.iter().any(|seen| seen.eq_ignore_ascii_case(g)) {
+                        genres.push(g.to_owned());
+                    }
+                }
+            }
+        }
+        genres.sort_by_key(|g| g.to_lowercase());
+        return Ok(ListIndex {
+            letters: letter_starts(names.iter().map(String::as_str)),
+            genres,
+        });
+    }
+    let store = |e: DomainError| GroupError::Store(e.to_string());
+    let listed = query(state, user, parent_id, &unpaged)
+        .await
+        .map_err(store)?;
+    let parent = resolve_parent_filter(state, parent_id)
+        .await
+        .map_err(store)?;
+    let genres = if matches!(parent, ParentResolution::Empty) {
+        Vec::new()
+    } else {
+        let mut base = build_media_query(user.id, &unfiltered, &parent, false);
+        apply_policy_scope(&mut base, &user.policy, &state.parental_ratings);
+        let only_genres = pharos_core::FacetRequest {
+            genres: true,
+            studios: false,
+            tags: false,
+            years: false,
+            official_ratings: false,
+            people: false,
+            audio_languages: false,
+            subtitle_languages: false,
+        };
+        let mut genres: Vec<String> = state
+            .stores
+            .facets(&base, &only_genres)
+            .await
+            .map_err(store)?
+            .genres
+            .into_iter()
+            .map(|f| f.value)
+            .collect();
+        genres.sort_by_key(|g| g.to_lowercase());
+        genres
+    };
+    Ok(ListIndex {
+        letters: letter_starts(listed.items.iter().map(|i| i.title.as_str())),
+        genres,
+    })
+}
+
 /// `page` with the user's play state for each item, read in one batch.
 pub async fn with_user_data(
     state: &AppState,
@@ -1146,5 +1272,27 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(labels.len(), 5);
+    }
+
+    #[test]
+    fn letters_start_where_their_first_name_is() {
+        let names = [
+            "2001",
+            "(500) Days",
+            "Alpha",
+            "The Beta",
+            "Bravo",
+            "Émile",
+            "Zulu",
+        ];
+        assert_eq!(
+            super::letter_starts(names),
+            [('#', 0), ('A', 2), ('B', 3), ('Z', 6)]
+        );
+    }
+
+    #[test]
+    fn a_leading_article_files_under_the_next_word() {
+        assert_eq!(super::letter_starts(["The Matrix"]), [('M', 0)]);
     }
 }
