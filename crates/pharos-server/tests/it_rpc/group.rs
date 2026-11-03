@@ -37,6 +37,7 @@ async fn rig() -> Rig {
         hub: SessionHub::new(),
         registry: GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone()))),
         sinks,
+        socket_loss_grace: Duration::from_millis(300),
     };
     fx.state.sync.install(deps.clone());
     Rig { server, fx, deps }
@@ -753,4 +754,49 @@ async fn a_restricted_user_neither_sees_nor_joins_nor_starts_a_group_on_a_hidden
         1,
         "only the Jellyfin group exists"
     );
+}
+
+async fn member_count(rig: &Rig) -> usize {
+    let groups = rig.deps.registry.list().await.unwrap();
+    groups[0].snapshot().await.unwrap().member_count
+}
+
+/// V65: dropping the Membership is a lost connection, not a leave. The seat
+/// is kept through the grace, nobody is told the member left, and when no
+/// reconnect comes the group removes it.
+/// Disarm check: with `Drop` sending `RemoveMember` at once, the member count
+/// is already 1 inside the grace and this fails.
+#[actix_web::test]
+async fn dropping_the_membership_keeps_the_seat_through_the_grace() {
+    let rig = rig().await;
+    let Pair {
+        a: _a,
+        b,
+        mut a_seen,
+        b_seen: _b_seen,
+    } = playing_pair(&rig).await;
+    assert_eq!(member_count(&rig).await, 2);
+    drop(b);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(member_count(&rig).await, 2, "still seated inside the grace");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(member_count(&rig).await, 1, "removed once the grace passed");
+    let _ = until(&mut a_seen, |s| matches!(s, Seen::Left(_)).then_some(())).await;
+}
+
+/// A reconnect inside the grace (the same device joining again) takes the
+/// seat over: the old drop's removal does not remove the new membership.
+/// Disarm check: with the removal skipping the generation fence, the member
+/// count falls to 1 after the grace and this fails.
+#[actix_web::test]
+async fn a_rejoin_inside_the_grace_keeps_the_member() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    let gid = only_group(&rig).await;
+    drop(pair.b);
+    let b_session = rig.session(&rig.fx.user_token).await;
+    let (sink, _seen) = sink();
+    let _again = join(&b_session, "dev-b", &gid, sink).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(member_count(&rig).await, 2);
 }

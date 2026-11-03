@@ -693,7 +693,7 @@ async fn handle_connection<S>(
     // member is removed. The sink is only dropped when the teardown actually
     // fires — a reconnect re-inserted a fresh sink under the same member id,
     // which must not be wiped.
-    const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+    const RECONNECT_GRACE: std::time::Duration = crate::group_ops::SOCKET_LOSS_GRACE;
     let hub2 = hub.clone();
     let dev2 = device_key.clone();
     let sinks2 = sinks.clone();
