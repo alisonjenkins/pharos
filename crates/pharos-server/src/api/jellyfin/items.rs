@@ -6076,7 +6076,14 @@ pub(crate) async fn virtual_shows_page(
                 let slot = reps.entry(sort_key).or_insert_with(|| {
                     (
                         ShowSortKeys::for_series(series, meta),
-                        series_dto(&state.server_id, series, season_count, episode_count, meta),
+                        series_dto(
+                            &state.server_id,
+                            series,
+                            season_count,
+                            episode_count,
+                            meta,
+                            library_parent_id(state, ep),
+                        ),
                     )
                 });
                 slot.0.created_at = slot.0.created_at.max(ep.created_at);
@@ -6185,6 +6192,7 @@ async fn synth_series_or_season(
                 seasons.len() as u32,
                 episode_count,
                 meta_map.get(series.series_key()),
+                library_parent_id(state, item),
             )));
         }
     }
@@ -6237,6 +6245,7 @@ fn series_dto(
     season_count: u32,
     episode_count: u32,
     meta: Option<&pharos_core::SeriesMetadata>,
+    library: Option<String>,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{format_iso8601, series_id_for_key};
     let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
@@ -6300,7 +6309,8 @@ fn series_dto(
         // Without ChildCount the Android TV app treats the show as empty.
         child_count: Some(season_count),
         recursive_item_count: Some(episode_count),
-        parent_id: None,
+        // The library the show's episodes sit in, as Jellyfin reports it.
+        parent_id: library,
         id,
     })
     .unwrap_or(serde_json::Value::Null)
@@ -7889,7 +7899,7 @@ mod series_dto_tests {
             },
             ..Default::default()
         };
-        let v = series_dto("srv", &series(), 7, 144, Some(&meta));
+        let v = series_dto("srv", &series(), 7, 144, Some(&meta), None);
         assert_eq!(v["Overview"], "One girl in all the world.");
         assert!((v["CommunityRating"].as_f64().unwrap() - 8.7).abs() < 1e-4);
         assert_eq!(v["OfficialRating"], "TV-14");
@@ -7913,7 +7923,7 @@ mod series_dto_tests {
 
     #[test]
     fn series_dto_without_metadata_is_the_bare_tile() {
-        let v = series_dto("srv", &series(), 7, 144, None);
+        let v = series_dto("srv", &series(), 7, 144, None, None);
         // Enriched fields are omitted entirely (skip_serializing_if) so a
         // never-matched show renders exactly as before.
         assert!(v.get("Overview").is_none());
@@ -7922,6 +7932,12 @@ mod series_dto_tests {
         assert_eq!(v["Genres"], serde_json::json!([]));
         assert_eq!(v["ProviderIds"], serde_json::json!({}));
         assert_eq!(v["Type"], "Series");
+    }
+
+    #[test]
+    fn series_dto_names_its_library_as_parent() {
+        let v = series_dto("srv", &series(), 7, 144, None, Some("lib1".into()));
+        assert_eq!(v["ParentId"], "lib1");
     }
 }
 
