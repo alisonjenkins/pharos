@@ -563,7 +563,7 @@ async fn leave_group(
         .and_then(|dev| hub.resolve(&dev))
         .map(|s| s.member_id)
     {
-        end_owned_cast(&state, &auth, member).await;
+        end_owned_cast(&state, auth.user.id, member).await;
     }
     if let Some(dev) = auth.sync_key() {
         if let Some(sess) = hub.resolve(&dev) {
@@ -596,11 +596,14 @@ async fn leave_group(
 /// before the owner's own removal is announced. Only the member that cast
 /// counts: the same user leaving from another device (jellyfin-web sends Leave
 /// on page unload) is not the seat's owner. Idempotent: no seat, no-op.
-async fn end_owned_cast(state: &crate::state::AppState, auth: &AuthSession, member: MemberId) {
+pub(crate) async fn end_owned_cast(
+    state: &crate::state::AppState,
+    user: pharos_core::UserId,
+    member: MemberId,
+) {
     let Some(service) = state.cast.service() else {
         return;
     };
-    let user = auth.user.id;
     if !service
         .snapshot()
         .await
@@ -689,28 +692,13 @@ async fn seek(
     body: web::Json<SeekBody>,
 ) -> HttpResponse {
     let pos = body.position_ticks / POSITION_TICKS_PER_MS;
-    // T87 — prewarm the target segments for every member's variant BEFORE
-    // dispatching: clients only apply the seek at `When` (lead time) and
-    // then re-buffer, so the transcodes get a multi-second head start and
-    // the slowest member's segments are ready (or nearly) when requested.
     if let Some(handle) = auth
         .device_id
         .as_deref()
         .and_then(|d| hub.resolve(d))
         .and_then(|sess| sess.group)
     {
-        let state = state.clone();
-        actix_web::rt::spawn(async move {
-            if let Some(snap) = handle.snapshot().await {
-                if let Some(mid) = snap
-                    .current_item_id
-                    .as_deref()
-                    .and_then(pharos_jellyfin_api::dto::parse_item_id)
-                {
-                    super::hls::prewarm_group_seek(&state, mid, pos);
-                }
-            }
-        });
+        prewarm_seek(&state, handle, pos);
     }
     dispatch(
         &hub,
@@ -724,6 +712,29 @@ async fn seek(
         },
     )
     .await
+}
+
+/// T87 — prewarm the target segments for every member's variant BEFORE a
+/// seek is dispatched: clients only apply the seek at `When` (lead time) and
+/// then re-buffer, so the transcodes get a multi-second head start and the
+/// slowest member's segments are ready (or nearly) when requested.
+pub(crate) fn prewarm_seek(
+    state: &web::Data<crate::state::AppState>,
+    handle: GroupHandle,
+    pos: u64,
+) {
+    let state = state.clone();
+    actix_web::rt::spawn(async move {
+        if let Some(snap) = handle.snapshot().await {
+            if let Some(mid) = snap
+                .current_item_id
+                .as_deref()
+                .and_then(pharos_jellyfin_api::dto::parse_item_id)
+            {
+                super::hls::prewarm_group_seek(&state, mid, pos);
+            }
+        }
+    });
 }
 
 async fn buffering(
