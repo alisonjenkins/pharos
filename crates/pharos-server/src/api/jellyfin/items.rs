@@ -3309,6 +3309,7 @@ impl From<&ListQuery> for ItemQuery {
             ids: q.ids.clone(),
             sort_seed: q.sort_seed,
             genres: q.genres.clone(),
+            genre: None,
             tags: q.tags.clone(),
             name_starts_with: q.name_starts_with.clone(),
             name_starts_with_or_greater: q.name_starts_with_or_greater.clone(),
@@ -4531,6 +4532,9 @@ pub(crate) fn build_media_query(
     if let KindFilter::Kinds(wanted) = kind_filter {
         mq.kinds = wanted.clone();
     }
+
+    // One genre by name, through the entity join (the native filter bar).
+    mq.genre_wire_id = q.genre.as_deref().map(pharos_core::genre_wire_id);
 
     // SearchTerm — case-insensitive substring on title.
     if let Some(term) = q.search_term.as_deref() {
@@ -5950,6 +5954,10 @@ pub(crate) async fn virtual_shows_page(
         .map(|s| s.to_lowercase())
         .filter(|s| !s.is_empty());
     mq.filters.name_starts_with = None;
+    // A series' genre is its show metadata's, not its episodes': applied to
+    // the collapsed tiles below.
+    mq.genre_wire_id = None;
+    let genre = q.genre.as_deref().filter(|g| !g.is_empty());
     let (episodes, _total) = state
         .stores
         .query(&mq)
@@ -6010,6 +6018,13 @@ pub(crate) async fn virtual_shows_page(
                     }
                 }
                 let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+                let meta = meta_map.get(series.series_key());
+                if let Some(want) = genre {
+                    if !meta.is_some_and(|m| m.genres.iter().any(|g| g.eq_ignore_ascii_case(want)))
+                    {
+                        continue;
+                    }
+                }
                 // Sort key: lowercase name for a stable case-insensitive order,
                 // with the folder-keyed id appended so same-name shows in
                 // distinct folders stay separate tiles.
@@ -6019,7 +6034,6 @@ pub(crate) async fn virtual_shows_page(
                     .map(|s| s.len() as u32)
                     .unwrap_or(0);
                 let episode_count = series_eps.get(&skey).copied().unwrap_or(0);
-                let meta = meta_map.get(series.series_key());
                 let slot = reps.entry(sort_key).or_insert_with(|| {
                     (
                         ShowSortKeys::for_series(series, meta),
