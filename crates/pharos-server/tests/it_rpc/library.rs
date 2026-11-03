@@ -2631,3 +2631,49 @@ async fn letters_start_where_the_listing_pages_them() {
     assert_eq!(letters, [("M".to_owned(), 0), ("S".to_owned(), 1)]);
     assert_eq!(genres, ["Comedy"]);
 }
+
+/// B320: a track's detail names its album and artist.
+/// Disarm check: with `write_item` leaving out the album, the assertions fail.
+#[actix_web::test]
+async fn a_track_names_its_album_and_artist() {
+    use pharos_api::pharos_capnp::detail_result;
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let track = |id: u64, title: &str, album: &str| {
+        let mut item = MediaItem {
+            id,
+            path: format!("/libA/{title}.flac").into(),
+            title: title.into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        };
+        item.probe.album = Some(album.into());
+        item.probe.artist = Some("Track Artist".into());
+        item.probe.album_artist = Some("Owl City".into());
+        item
+    };
+    fx.state
+        .stores
+        .put(track(401, "Enchanted", "Covered"))
+        .await
+        .unwrap();
+
+    let summary_of = |id: u64| {
+        let library = session.library_request().send().pipeline.get_library();
+        let mut req = library.detail_request();
+        req.get().init_ctx();
+        req.get().init_id().set_real(id);
+        req.send().promise
+    };
+    let reply = summary_of(401).await.unwrap();
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail of 401 failed");
+    };
+    let summary = d.unwrap().get_summary().unwrap();
+    assert_eq!(summary.get_album().unwrap().to_str().unwrap(), "Covered");
+    assert_eq!(summary.get_artist().unwrap().to_str().unwrap(), "Owl City");
+}
