@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 
 // T51 phase 3 — drive the pharos Dioxus UI (served at `/ui/` by
 // `[server].ui_dir`) end-to-end through a real Chromium: the native app
@@ -15,6 +15,57 @@ import { test, expect } from "@playwright/test";
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
 const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
+
+// Signs in on a small window and answers a home rail that overflows
+// sideways, skipping when the server has no native API or seeded user.
+async function overflowingRail(page: Page, request: APIRequestContext): Promise<Locator> {
+  const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+    headers: { Accept: "application/json" },
+  });
+  test.skip(
+    probe.status() !== 405,
+    `native API is not enabled (status ${probe.status()}); skipping native test`,
+  );
+  // Part-watch a few videos, so the home screen holds the same shelves
+  // whichever tests ran before this one.
+  const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-wheel-${Date.now()}", Version="0"`,
+    },
+    data: { Username: TEST_USER, Pw: TEST_PASS },
+  });
+  test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+  const { AccessToken: token, User: user } = await auth.json();
+  const api = { "X-Emby-Token": token };
+  const videos = await (
+    await request.get(
+      `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode,Movie&Limit=4`,
+      { headers: api },
+    )
+  ).json();
+  for (const v of videos.Items ?? []) {
+    await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+      headers: api,
+      data: { ItemId: v.Id, PlaySessionId: `pw-wheel-${v.Id}`, PositionTicks: 25_000_000, IsPaused: true },
+    });
+  }
+  // Narrow and short, so the rails overflow and the page scrolls.
+  await page.setViewportSize({ width: 320, height: 360 });
+  await page.goto("/ui/");
+  await page.locator("#signin-name").fill(TEST_USER);
+  await page.locator("#signin-password").fill(TEST_PASS);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  const rails = page.locator("ul.pharos-rail-items");
+  await expect(rails.first().locator("li").first()).toBeVisible({ timeout: 15_000 });
+  // Every shelf loaded, so the layout no longer moves under the pointer.
+  await page.waitForLoadState("networkidle");
+  const at = await rails.evaluateAll((els) =>
+    els.findIndex((el) => el.scrollWidth > el.clientWidth),
+  );
+  expect(at, "some rail overflows sideways").toBeGreaterThanOrEqual(0);
+  return rails.nth(at);
+}
 
 test.describe("pharos Dioxus UI", () => {
   test.beforeAll(async ({ request }) => {
@@ -374,52 +425,7 @@ test.describe("pharos Dioxus UI", () => {
     // sideways trapped the page under the shelves on the home screen.
     // Sideways input still scrolls the rail.
     test("a vertical wheel over a rail scrolls the page, a sideways one the rail", async ({ page, request }) => {
-      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
-        headers: { Accept: "application/json" },
-      });
-      test.skip(
-        probe.status() !== 405,
-        `native API is not enabled (status ${probe.status()}); skipping native test`,
-      );
-      // Part-watch a few videos, so the home screen holds the same shelves
-      // whichever tests ran before this one.
-      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-wheel-${Date.now()}", Version="0"`,
-        },
-        data: { Username: TEST_USER, Pw: TEST_PASS },
-      });
-      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
-      const { AccessToken: token, User: user } = await auth.json();
-      const api = { "X-Emby-Token": token };
-      const videos = await (
-        await request.get(
-          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode,Movie&Limit=4`,
-          { headers: api },
-        )
-      ).json();
-      for (const v of videos.Items ?? []) {
-        await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
-          headers: api,
-          data: { ItemId: v.Id, PlaySessionId: `pw-wheel-${v.Id}`, PositionTicks: 25_000_000, IsPaused: true },
-        });
-      }
-      // Narrow and short, so the rails overflow and the page scrolls.
-      await page.setViewportSize({ width: 320, height: 360 });
-      await page.goto("/ui/");
-      await page.locator("#signin-name").fill(TEST_USER);
-      await page.locator("#signin-password").fill(TEST_PASS);
-      await page.getByRole("button", { name: "Sign in" }).click();
-      const rails = page.locator("ul.pharos-rail-items");
-      await expect(rails.first().locator("li").first()).toBeVisible({ timeout: 15_000 });
-      // Every shelf loaded, so the layout no longer moves under the pointer.
-      await page.waitForLoadState("networkidle");
-      const at = await rails.evaluateAll((els) =>
-        els.findIndex((el) => el.scrollWidth > el.clientWidth),
-      );
-      expect(at, "some rail overflows sideways").toBeGreaterThanOrEqual(0);
-      const rail = rails.nth(at);
+      const rail = await overflowingRail(page, request);
 
       // Settle the page and the pointer before the wheel: a wheel sent while
       // the page is still scrolling to the rail can land on stale layout.
