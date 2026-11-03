@@ -2438,3 +2438,49 @@ async fn a_listing_keeps_to_one_genre() {
         ["Mature", "Show"]
     );
 }
+
+/// The library filter bar's watched state (B312/V252): `IsPlayed` and
+/// `IsUnplayed` narrow films by their own play state and series tiles by
+/// whether every episode is played.
+/// Disarm check: with the series play-state check in `virtual_shows_page`
+/// skipped, both series list under either filter.
+#[actix_web::test]
+async fn a_listing_keeps_to_watched_or_unwatched() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let tv = seed_tv_library(&fx).await;
+    // Alpha, and every episode of "Show" but none of "Mature".
+    for id in [101, 601, 602, 603] {
+        fx.state
+            .stores
+            .set_user_data(
+                fx.user_id,
+                id,
+                pharos_core::UserItemData {
+                    played: true,
+                    ..pharos_core::UserItemData::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let lib_a = fx.lib_a_wire.clone();
+    let played = listed_in(&session, &lib_a, &[], "", &["IsPlayed"]).await;
+    assert_eq!(played, ["Alpha"]);
+    let unplayed = listed_in(&session, &lib_a, &[], "", &["IsUnplayed"]).await;
+    assert!(!unplayed.contains(&"Alpha".to_owned()), "{unplayed:?}");
+    assert!(unplayed.contains(&"Beta".to_owned()), "{unplayed:?}");
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsPlayed"]).await,
+        ["Show"]
+    );
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsUnplayed"]).await,
+        ["Mature"]
+    );
+}
