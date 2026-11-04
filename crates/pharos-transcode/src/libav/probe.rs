@@ -202,6 +202,8 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             chapters,
             alternate_sources: Vec::new(),
             video_3d_format: v.video_3d_format,
+            // Written by the audio analysis sweep, never by the prober.
+            audio_analysis: None,
         },
     })
 }
