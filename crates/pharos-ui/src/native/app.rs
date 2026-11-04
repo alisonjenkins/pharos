@@ -2257,20 +2257,24 @@ fn Player(
             let api = ctx.api.read().clone();
             async move {
                 if kind != ItemKind::Audio {
-                    return None;
+                    return Ok(None);
                 }
-                match api?.lyrics(&call("watch", "lyrics"), id).await {
+                let Some(api) = api else {
+                    return Ok(None);
+                };
+                // A failed lookup is not "no lyrics": the chip says which.
+                match api.lyrics(&call("watch", "lyrics"), id).await {
                     Ok(lyrics) => {
                         platform::info(&format!(
                             "pharos: lyrics lines={} synced={}",
                             lyrics.lines.len(),
                             lyrics.synced
                         ));
-                        Some(lyrics)
+                        Ok(Some(lyrics))
                     }
                     Err(e) => {
                         platform::warn(&format!("pharos: lyrics unavailable: {e}"));
-                        None
+                        Err(())
                     }
                 }
             }
@@ -2795,8 +2799,9 @@ fn Player(
                 media: media(),
                 previous: near.previous,
                 next,
-                lyrics: lyrics.read().clone().flatten(),
+                lyrics: lyrics.read().clone().and_then(Result::ok).flatten(),
                 lyrics_loading: lyrics.read().is_none(),
+                lyrics_failed: matches!(*lyrics.read(), Some(Err(()))),
                 playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),

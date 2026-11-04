@@ -1621,6 +1621,12 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
     });
     await play();
     await expect.poll(volume).toBeCloseTo(0.3, 2);
+    // At least one frame must have been sampled before sampling stops.
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as unknown as { seenVolumes: string[] }).seenVolumes.length),
+      )
+      .toBeGreaterThan(0);
     const seen = await page.evaluate(() => {
       const w = window as unknown as { seenVolumes: string[]; stopSampling: boolean };
       w.stopSampling = true;

@@ -120,6 +120,9 @@ pub fn ListenView(
     /// The lyrics are still being asked for, so `None` is not yet an answer.
     #[props(default)]
     lyrics_loading: bool,
+    /// The lyrics lookup failed, so whether there are any is not known.
+    #[props(default)]
+    lyrics_failed: bool,
     /// What plays after this song (B435/V375).
     #[props(default)]
     queue: Vec<Entry>,
@@ -265,11 +268,11 @@ pub fn ListenView(
                         class: "pharos-chip pharos-lyrics-toggle",
                         r#type: "button",
                         disabled: lyrics.is_none(),
-                        title: lyrics_title(lyrics.is_some(), lyrics_loading),
+                        title: lyrics_title(lyrics.is_some(), lyrics_loading, lyrics_failed),
                         aria_pressed: if lyrics.is_some() && show_lyrics() { "true" } else { "false" },
                         aria_controls: (lyrics.is_some() && show_lyrics()).then_some(super::lyrics::PANEL_ID),
                         onclick: move |_| toggle_lyrics(),
-                        if lyrics.is_none() && !lyrics_loading { "No lyrics" } else { "Lyrics" }
+                        {lyrics_label(lyrics.is_some(), lyrics_loading, lyrics_failed)}
                     }
                     button {
                         class: "pharos-chip pharos-queue-toggle",
@@ -719,11 +722,23 @@ fn QueueRow(
 }
 
 /// The Lyrics chip's tooltip: what it does, or why it does nothing.
-fn lyrics_title(have: bool, loading: bool) -> &'static str {
-    match (have, loading) {
-        (true, _) => "Show or hide the lyrics",
-        (false, true) => "Looking for lyrics",
-        (false, false) => "No lyrics for this song",
+fn lyrics_title(have: bool, loading: bool, failed: bool) -> &'static str {
+    match (have, loading, failed) {
+        (true, _, _) => "Show or hide the lyrics",
+        (false, true, _) => "Looking for lyrics",
+        (false, false, true) => "The lyrics could not be loaded",
+        (false, false, false) => "No lyrics for this song",
+    }
+}
+
+/// The Lyrics chip's own words. A finished lookup that found none says so,
+/// and one that failed says the lyrics are unavailable, not that there are
+/// none (B479).
+fn lyrics_label(have: bool, loading: bool, failed: bool) -> &'static str {
+    match (have, loading, failed) {
+        (false, false, true) => "Lyrics unavailable",
+        (false, false, false) => "No lyrics",
+        _ => "Lyrics",
     }
 }
 
@@ -1117,9 +1132,18 @@ mod tests {
     /// The opening tag of the lyrics toggle.
     #[test]
     fn the_lyrics_chip_says_why_it_does_nothing() {
-        assert_eq!(lyrics_title(true, false), "Show or hide the lyrics");
-        assert_eq!(lyrics_title(false, true), "Looking for lyrics");
-        assert_eq!(lyrics_title(false, false), "No lyrics for this song");
+        assert_eq!(lyrics_title(true, false, false), "Show or hide the lyrics");
+        assert_eq!(lyrics_title(false, true, false), "Looking for lyrics");
+        assert_eq!(lyrics_title(false, false, false), "No lyrics for this song");
+        assert_eq!(
+            lyrics_title(false, false, true),
+            "The lyrics could not be loaded"
+        );
+        assert_eq!(lyrics_label(true, false, false), "Lyrics");
+        assert_eq!(lyrics_label(false, true, false), "Lyrics");
+        assert_eq!(lyrics_label(false, false, false), "No lyrics");
+        // B479: a failed lookup never claims the song has none.
+        assert_eq!(lyrics_label(false, false, true), "Lyrics unavailable");
     }
 
     fn lyrics_toggle(html: &str) -> &str {
