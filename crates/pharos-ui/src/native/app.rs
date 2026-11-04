@@ -1787,6 +1787,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
         let asked = picks();
+        // A song Previous went back to starts over (B464/V406).
+        let from_start = queue.is_some_and(|QueueCtx(q)| q.peek().plays_from_start(id));
         async move {
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
@@ -1821,6 +1823,13 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         );
                     }
                     let start_ms = match resume_from.get() {
+                        0 if from_start => {
+                            platform::info(&format!(
+                                "pharos: playback from_start item={id} reason=previous saved_ms={}",
+                                detail.item.position_ms
+                            ));
+                            0
+                        }
                         0 => start_ms(detail.item.position_ms, detail.item.played),
                         here => here,
                     };
