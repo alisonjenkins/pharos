@@ -713,7 +713,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 (inner.rate - 1.0).abs() > f64::EPSILON,
             )
         };
-        if player.paused() {
+        // Still loading after a seek of ours: another seek would restart the
+        // load and push back the grace that reports a real stall.
+        if player.paused() || self.inner.borrow().held_waiting {
             return;
         }
         let actual = player.position_ms();
@@ -1327,6 +1329,37 @@ mod tests {
         rig.env.now.set(105_000);
         assert!(rig.session.tick(2).now_or_never().is_some());
         rig.env.settle();
+        let sent = calls_with(&rig, "buffering");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].ends_with(",true)"), "got {sent:?}");
+    }
+
+    /// A playing player stuck after a hard drift seek is not sought again
+    /// each second, so the grace runs out and the stall is reported.
+    #[test]
+    fn a_stall_after_a_drift_seek_is_reported_without_reseeking() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.position.set(15_000);
+        rig.session.check_drift();
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        let seeks = || {
+            rig.player
+                .log
+                .borrow()
+                .iter()
+                .filter(|l| l.starts_with("seek("))
+                .count()
+        };
+        let before = seeks();
+
+        for (n, now) in [(1, 112_000), (2, 114_000), (3, 115_000)] {
+            rig.env.now.set(now);
+            assert!(rig.session.tick(n).now_or_never().is_some());
+            rig.env.settle();
+        }
+        assert_eq!(seeks(), before);
         let sent = calls_with(&rig, "buffering");
         assert_eq!(sent.len(), 1);
         assert!(sent[0].ends_with(",true)"), "got {sent:?}");
