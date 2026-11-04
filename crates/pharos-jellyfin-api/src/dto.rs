@@ -190,6 +190,10 @@ pub struct UserDto {
     pub policy: UserPolicyDto,
     pub configuration: UserConfigurationDto,
     pub primary_image_aspect_ratio: f32,
+    /// The avatar's tag; absent when the user has none, so clients draw
+    /// initials instead of a broken image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_image_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -248,6 +252,7 @@ impl UserDto {
             policy: UserPolicyDto::from_domain(&user.policy),
             configuration: UserConfigurationDto::default(),
             primary_image_aspect_ratio: 1.0,
+            primary_image_tag: None,
         }
     }
 }

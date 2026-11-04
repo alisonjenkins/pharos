@@ -412,10 +412,10 @@ async fn list_users(
         .list()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let dtos: Vec<UserDto> = users
-        .iter()
-        .map(|u| UserDto::from_domain(&u.clone().into_user(), &state.server_id))
-        .collect();
+    let mut dtos: Vec<UserDto> = Vec::with_capacity(users.len());
+    for u in users {
+        dtos.push(super::users::user_dto_with_avatar(&state, &u.into_user()).await);
+    }
     Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 

@@ -392,7 +392,7 @@ async fn authenticate_by_name(
             playable_media_types: vec!["Video".into(), "Audio".into(), "Photo".into()],
             supported_commands: Vec::new(),
         },
-        user: UserDto::from_domain(&user, &state.server_id),
+        user: user_dto_with_avatar(&state, &user).await,
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
@@ -503,7 +503,7 @@ async fn authenticate_with_quick_connect(
             playable_media_types: vec!["Video".into(), "Audio".into(), "Photo".into()],
             supported_commands: Vec::new(),
         },
-        user: UserDto::from_domain(&user, &state.server_id),
+        user: user_dto_with_avatar(&state, &user).await,
         access_token: token.0.expose().to_string(),
         server_id: state.server_id.clone(),
     };
@@ -556,10 +556,19 @@ async fn user_by_id(
     ))
 }
 
+/// A `UserDto` with the user's avatar tag, for replies that do not carry
+/// their configuration.
+pub(super) async fn user_dto_with_avatar(state: &AppState, user: &pharos_core::User) -> UserDto {
+    let mut dto = UserDto::from_domain(user, &state.server_id);
+    dto.primary_image_tag = crate::avatar::tag(&state.stores, user.id).await;
+    dto
+}
+
 /// Build a `UserDto` overriding the default `Configuration` block
 /// with whatever the user last POSTed to `/Users/{u}/Configuration`.
 async fn user_dto_with_config(state: &AppState, user: &pharos_core::User) -> UserDto {
     let mut dto = UserDto::from_domain(user, &state.server_id);
+    dto.primary_image_tag = crate::avatar::tag(&state.stores, user.id).await;
     if let Ok(Some(json)) = state.stores.get_user_configuration(user.id).await {
         if let Ok(cfg) = serde_json::from_str(&json) {
             dto.configuration = cfg;
