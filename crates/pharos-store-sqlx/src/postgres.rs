@@ -3908,6 +3908,17 @@ impl pharos_core::UserPrefStore for PostgresStore {
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(())
     }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn delete_user_pref(&self, user: UserId, key: &str) -> DomainResult<bool> {
+        let done = sqlx::query("DELETE FROM user_prefs WHERE user_id = $1 AND key = $2")
+            .bind(user.0.as_bytes().to_vec())
+            .bind(key)
+            .execute(self.pool())
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(done.rows_affected() > 0)
+    }
 }
 
 type SessionRow = crate::TranscodeSessionRow;

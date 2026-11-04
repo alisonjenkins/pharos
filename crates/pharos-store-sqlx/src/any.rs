@@ -1040,6 +1040,15 @@ impl pharos_core::UserPrefStore for AnyStore {
             }
         }
     }
+
+    async fn delete_user_pref(&self, user: UserId, key: &str) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => pharos_core::UserPrefStore::delete_user_pref(s, user, key).await,
+            AnyStore::Postgres(p) => {
+                pharos_core::UserPrefStore::delete_user_pref(p, user, key).await
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
