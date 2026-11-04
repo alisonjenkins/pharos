@@ -46,8 +46,8 @@ The client renegotiates with a lower cap; nothing changes server-side.
   changes: two stalls in 30 s (`reason=stalls`), or throughput under 1.3x the
   stream's bitrate (`reason=low_estimate`). The new cap is the highest rung
   below the stream that the link carries at 1.3x, else the lowest rung.
-  Two events within 2 s are one stall; a stall reported within 3 s before a
-  seek completes is the seek's own and is dropped.
+  Two events within 2 s are one stall; a `waiting` event between a seek
+  starting and its `seeked` event is the seek's own and is not counted.
 - **Step up**, one rung at a time: only after the throughput has stayed at 2x
   the next cap for 60 s with no stall in between. Reaching the source's own
   bitrate lifts the cap. A step up can land back in a step down; the 15 s
