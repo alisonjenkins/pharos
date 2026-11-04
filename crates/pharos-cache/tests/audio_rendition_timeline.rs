@@ -250,6 +250,89 @@ async fn a_seek_sessions_fragment_reports_the_session_it_came_from() {
     );
 }
 
+/// Where the source's audio packets stop and resume, in seconds: a zeroed
+/// stretch of the file, as in Buffy S02E11 (B468).
+const HOLE: (f64, f64) = (8.0, 12.5);
+
+/// An audio-only source whose packet timestamps jump over `HOLE`: `aselect`
+/// without `asetpts` drops the frames but keeps the survivors' timestamps.
+fn make_holed_audio_source(dir: &Path) -> PathBuf {
+    let src = dir.join("holed.mka");
+    let (from, to) = HOLE;
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!(
+                "sine=frequency=1000:sample_rate=48000:duration=40:samples_per_frame=480,\
+                 aselect=not(between(t\\,{from}\\,{to}))"
+            ),
+            "-c:a",
+            "pcm_s16le",
+            src.to_str().expect("utf-8 path"),
+        ],
+        "holed source",
+    );
+    src
+}
+
+/// Seconds of audio a standalone fragment decodes to.
+fn decoded_secs(fragment: &Path) -> f64 {
+    let raw = fragment.with_extension("raw");
+    ffmpeg(
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            fragment.to_str().expect("utf-8 path"),
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-f",
+            "s16le",
+            raw.to_str().expect("utf-8 path"),
+        ],
+        "decode fragment",
+    );
+    std::fs::metadata(&raw).expect("decoded fragment").len() as f64 / 2.0 / 8000.0
+}
+
+/// B468/V411 — a hole in the source's audio must come out as silence, so every
+/// fragment decodes to its full window.
+///
+/// Without the fill the mp4 muxer stretched the last sample before the hole
+/// across it: the fragment's timeline still spanned the window but held only
+/// the audio up to the hole. Firefox resuming inside that one long sample after
+/// a stall froze, or played the post-hole audio early.
+#[tokio::test]
+async fn a_hole_in_the_source_audio_is_filled_with_silence() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let src = make_holed_audio_source(td.path());
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+    let dir = cache
+        .ensure_audio_hls_covering(&src, None, 44, None, Some(128_000), 0)
+        .await
+        .expect("audio session");
+    // a1 spans [6, 12): the hole starts 2 s in and runs past its end.
+    let frag = td.path().join("holed.mp4");
+    fragment_file(&cache, &dir, &frag, 1).await;
+    let got = decoded_secs(&frag);
+    let want = HlsSegmentCache::AUDIO_SEGMENT_SECONDS;
+    assert!(
+        (got - want).abs() < 0.1,
+        "a1 covers [6, 12) and should decode to {want:.3}s of audio, silence included, \
+         but decoded to {got:.3}s — the hole at {:.1}–{:.1}s was not filled",
+        HOLE.0,
+        HOLE.1,
+    );
+}
+
 /// `baseMediaDecodeTime` of the first `tfdt` in a fragment, in timescale ticks.
 /// A deliberately minimal box walk — the fragment is `moof(traf(tfdt))`+`mdat`.
 fn first_tfdt(data: &[u8]) -> Option<u64> {
