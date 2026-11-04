@@ -84,6 +84,38 @@ async fn prefs_read_and_write_the_diagnostics_opt_in() {
     );
 }
 
+/// The watched toggle as the UI drives it: a title, then a whole season,
+/// and the detail read afterwards agrees.
+#[actix_web::test]
+async fn set_played_marks_a_title_and_a_season() {
+    let (api, fx, _server) = api().await;
+    let call = CallInfo::default();
+    let alpha = ItemRef::Real(MOVIE);
+    assert!(api.set_played(&call, alpha, true).await.expect("watched"));
+    assert!(api.detail(&call, alpha).await.unwrap().item.played);
+    assert!(!api
+        .set_played(&call, alpha, false)
+        .await
+        .expect("unwatched"));
+    assert!(!api.detail(&call, alpha).await.unwrap().item.played);
+
+    crate::library::seed_tv_library(&fx).await;
+    let season = pharos_jellyfin_api::dto::season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    let season = match pharos_jellyfin_api::dto::WireId::parse(&season).unwrap() {
+        pharos_jellyfin_api::dto::WireId::Synth(n) => ItemRef::Synth(n),
+        pharos_jellyfin_api::dto::WireId::Real(n) => ItemRef::Real(n),
+    };
+    assert!(api.set_played(&call, season, true).await.expect("season"));
+    assert!(api.detail(&call, season).await.unwrap().item.played);
+    let stored = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, 601)
+        .await
+        .unwrap();
+    assert!(stored.played);
+}
+
 #[actix_web::test]
 async fn a_missing_item_is_an_api_error_not_a_transport_failure() {
     let (api, _fx, _server) = api().await;
