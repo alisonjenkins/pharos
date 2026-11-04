@@ -109,7 +109,9 @@ fn real_songs() {
     let mut stack = vec![std::path::PathBuf::from(dir)];
     let mut n = 0;
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
