@@ -29,6 +29,13 @@ jobs:
         with:
           max-jobs: 2
           cores: 16
+      # The build node's auto-GC deletes any store path nothing roots (B284),
+      # and a `nix build --no-link` result has no root, so a job often
+      # recompiled all of crates.io that an earlier job had just built.
+      # Root the compiled deps in the host's gcroots drop box, which the
+      # host daemon can see (a root under the pod's $TMP dangles).
+      - name: Pin compiled deps against auto-GC
+        run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
 
       # One command builds `.#pharos` and runs the WHOLE workspace suite
       # (nextest, `--profile nix` timeouts), clippy (`-D warnings`), rustfmt,
@@ -48,6 +55,13 @@ jobs:
       # `just test-postgres` is the local equivalent of the same check.
       - name: nix flake check (build + tests + clippy + fmt + doctests + postgres)
         run: nix flake check -L
+      # `checks.workspace-build` and the `oci` job build the same release
+      # `pharos`; whichever runs second reuses it only if it survived GC.
+      # Root it for this run, and drop this repo's run roots older than 4 h.
+      - name: Pin this run's release build against auto-GC
+        run: |
+          find /nix/var/nix/gcroots/gha -maxdepth 1 -name 'pharos-run-*' -mmin +240 -delete || true
+          nix build .#pharos --out-link "/nix/var/nix/gcroots/gha/pharos-run-${GITHUB_RUN_ID}" || echo "::warning::could not pin the release build"
 
   audit:
     name: supply-chain
@@ -87,6 +101,10 @@ jobs:
         with:
           max-jobs: 2
           cores: 16
+      - name: Pin compiled deps against auto-GC
+        run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
+      - name: Pin this run's release build against auto-GC
+        run: nix build .#pharos --out-link "/nix/var/nix/gcroots/gha/pharos-run-${GITHUB_RUN_ID}" || echo "::warning::could not pin the release build"
       # Build both images into the (host-shared, warm) nix store. `publish`
       # reuses these exact store paths as instant cache hits — no artifact
       # upload/download round-trip of a ~100 MB tarball.
@@ -174,6 +192,8 @@ jobs:
         with:
           max-jobs: 2
           cores: 16
+      - name: Pin compiled deps against auto-GC
+        run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       # Browser binaries come from the nix-pinned playwright-driver
@@ -215,6 +235,8 @@ jobs:
         with:
           max-jobs: 2
           cores: 16
+      - name: Pin compiled deps against auto-GC
+        run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
       - name: Run Dioxus UI suite (native ${{ matrix.native }})
