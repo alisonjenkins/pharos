@@ -58,8 +58,12 @@ We will:
   octave off. Rules that compare tempos can treat half and double as close.
 - The sweep holds at most one pool worker, so a large first pass is slow (hours
   for tens of thousands of songs) by design; it yields during playback.
-- A file renamed or touched since the last scan is redone each pass until the
-  scan stamps its new signature (bounded by the scan cadence).
+- A file changed on disk since the last scan is skipped (`outcome="unscanned"`)
+  until the scan stamps its new signature, so it is decoded once, after the
+  scan, not once per pass.
+- Damaged frames in the window are skipped as ffmpeg skips them; only a
+  container libav cannot parse is stored as undecodable. An I/O error on open
+  (an NFS blip) is retried, never stored.
 
 ## Alternatives considered
 
