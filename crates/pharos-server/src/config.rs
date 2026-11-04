@@ -31,7 +31,7 @@ pub struct Config {
     /// `contact` rather than a key — see [`MusicBrainzConfig`].
     #[serde(default)]
     pub musicbrainz: MusicBrainzConfig,
-    /// Song lyrics; only the online provider switch is configurable.
+    /// Song lyrics: the online provider switch and where its answers are kept.
     #[serde(default)]
     pub lyrics: LyricsConfig,
     /// Online metadata/artwork enrichment tunables (refresh cadence, batch
@@ -299,6 +299,13 @@ pub struct LyricsConfig {
     /// length to that service. Env: `PHAROS_LYRICS_ONLINE`.
     #[serde(default)]
     pub online: bool,
+    /// Directory to keep online answers under, so each song is asked about
+    /// once rather than once per start (B361). When unset, pharos derives a
+    /// `lyrics` sibling of `transcode_cache_dir` / `image_cache_dir` if either
+    /// is set; otherwise answers are kept in memory only. Entries are a few
+    /// KiB each and need no cap.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// `[metadata]` — online metadata/artwork enrichment tunables. All fields
