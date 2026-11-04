@@ -1555,7 +1555,11 @@ where
     item.path = "/media/conformance/song.flac".into();
     MediaStore::put(&store, item.clone()).await.unwrap();
     assert_eq!(
-        MediaStore::get(&store, song).await.unwrap().probe.audio_analysis,
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
         None,
         "a new song is unanalysed"
     );
@@ -1575,14 +1579,23 @@ where
     // The list path decodes the same columns.
     let listed = MediaStore::list(&store).await.unwrap();
     assert_eq!(
-        listed.iter().find(|i| i.id == song).unwrap().probe.audio_analysis,
+        listed
+            .iter()
+            .find(|i| i.id == song)
+            .unwrap()
+            .probe
+            .audio_analysis,
         Some(analysis)
     );
 
     // A re-probe `put` carrying no analysis keeps the stored one.
     MediaStore::put(&store, item.clone()).await.unwrap();
     assert_eq!(
-        MediaStore::get(&store, song).await.unwrap().probe.audio_analysis,
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
         Some(analysis),
         "put never writes the analysis columns"
     );
@@ -1595,7 +1608,11 @@ where
         .await
         .unwrap();
     assert_eq!(
-        MediaStore::get(&store, song).await.unwrap().probe.audio_analysis,
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
         Some(analysis)
     );
     // The file changes: the analysis no longer applies.
@@ -1603,7 +1620,11 @@ where
         .await
         .unwrap();
     assert_eq!(
-        MediaStore::get(&store, song).await.unwrap().probe.audio_analysis,
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
         None,
         "a changed file reads as unanalysed"
     );
@@ -1617,7 +1638,11 @@ where
         .await
         .unwrap();
     assert_eq!(
-        MediaStore::get(&store, song).await.unwrap().probe.audio_analysis,
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
         Some(nothing)
     );
     // An absent row is a no-op.
