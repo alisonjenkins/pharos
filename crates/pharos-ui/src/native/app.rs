@@ -18,6 +18,8 @@ use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
+use super::group_app::{Together, VideoPlayer};
+use super::group_session::{GroupView, Ui};
 use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
@@ -73,6 +75,19 @@ pub fn Root() -> Element {
             route.set(to);
         }))
     });
+    let replace = use_context::<Replace>();
+    let mut group_view = use_signal(GroupView::default);
+    // The store's pushes arrive outside the Dioxus runtime; this task is how
+    // they reach the screens.
+    let group_ui = use_coroutine(move |mut rx: UnboundedReceiver<Ui>| async move {
+        while let Some(ui) = rx.next().await {
+            match ui {
+                Ui::View(view) => group_view.set(view),
+                Ui::Navigate(item) => replace.0.call(Route::Watch(item)),
+            }
+        }
+    });
+    use_context_provider(|| Together::new(group_view, group_ui));
     match route() {
         Route::Manage => rsx! { RootApp {} },
         route => rsx! {
@@ -1367,6 +1382,9 @@ fn Player(
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let nav = use_context::<Nav>();
     let replace = use_context::<Replace>();
+    let together = use_context::<Together>();
+    let group = (together.view)();
+    let session = together.current();
     let mut failed = use_signal(|| None::<String>);
     let mut media = use_signal(MediaState::default);
     let mut hover_ms = use_signal(|| None::<u64>);
@@ -1394,6 +1412,26 @@ fn Player(
     use_hook({
         let stop = stop.clone();
         move || Rc::new(platform::on_page_hide(stop))
+    });
+    // The group drives this video while it is mounted.
+    use_hook({
+        let session = session.clone();
+        let item = p.detail.item.id;
+        move || {
+            if let Some(session) = &session {
+                session.set_watching(Some(item));
+                session.set_player(Some(Rc::new(VideoPlayer(VIDEO_ID))));
+            }
+        }
+    });
+    use_drop({
+        let session = session.clone();
+        move || {
+            if let Some(session) = &session {
+                session.set_player(None);
+                session.set_watching(None);
+            }
+        }
     });
     use_drop({
         let (engine, stop) = (Rc::clone(&engine), stop.clone());
@@ -1447,7 +1485,11 @@ fn Player(
             Rc::clone(&last_ms.0),
             Rc::clone(&switched),
         );
+        let session = session.clone();
         move |event: MediaEvent| {
+            if let Some(session) = &session {
+                session.on_media(event);
+            }
             media.set(platform::media_state(VIDEO_ID));
             if event == MediaEvent::Changed && !burned {
                 // Text tracks load with the metadata; show the picked one.
@@ -1488,20 +1530,31 @@ fn Player(
 
     let on_control = {
         let p = Rc::clone(&p);
+        let session = session.clone();
         move |control: Control| {
+            // In a group the viewer's play, pause and seek are the group's.
+            let seek = |ms: u64| {
+                if !session.as_ref().is_some_and(|s| s.seek(ms)) {
+                    platform::seek_ms(VIDEO_ID, ms);
+                }
+            };
             let state = *media.peek();
             let total = match state.duration_ms {
                 0 => p.detail.item.runtime_ms,
                 d => d,
             };
             match control {
-                Control::TogglePlay => platform::toggle_play(VIDEO_ID),
+                Control::TogglePlay => {
+                    if !session.as_ref().is_some_and(|s| s.toggle_play()) {
+                        platform::toggle_play(VIDEO_ID);
+                    }
+                }
                 // An unknown length (0) clamps nothing rather than everything.
-                Control::Seek(ms) if total > 0 => platform::seek_ms(VIDEO_ID, ms.min(total)),
-                Control::Seek(ms) => platform::seek_ms(VIDEO_ID, ms),
+                Control::Seek(ms) if total > 0 => seek(ms.min(total)),
+                Control::Seek(ms) => seek(ms),
                 Control::SeekAt(x) => {
                     if let Some(ms) = position_at(x, platform::element_width(SEEK_ID), total) {
-                        platform::seek_ms(VIDEO_ID, ms);
+                        seek(ms);
                     }
                 }
                 Control::Hover(x) => hover_ms
@@ -1558,8 +1611,19 @@ fn Player(
         previous: near.previous,
         next: near.next,
     };
+    let on_leave = {
+        let session = session.clone();
+        move |()| {
+            if let Some(session) = session.clone() {
+                spawn(async move { session.leave().await });
+            }
+        }
+    };
     rsx! {
         if let Some(message) = failed() {
+            ErrorNote { message }
+        }
+        if let Some(message) = group.ended.clone() {
             ErrorNote { message }
         }
         if p.kind == ItemKind::Audio {
@@ -1582,6 +1646,9 @@ fn Player(
                 on_media,
                 on_control,
                 item_id: p.detail.item.id,
+                members: if group.active { group.members.clone() } else { Vec::new() },
+                on_leave,
+                autoplay: !group.active,
             }
         }
     }

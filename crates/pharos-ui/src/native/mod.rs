@@ -9,6 +9,7 @@ pub mod browse;
 pub mod depth;
 pub mod diagnostics;
 pub mod find;
+pub mod group_app;
 pub mod group_session;
 pub mod letters;
 pub mod listen;
