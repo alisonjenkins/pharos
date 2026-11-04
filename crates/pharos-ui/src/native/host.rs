@@ -101,6 +101,16 @@ pub fn toggle_fullscreen(_id: &str) {}
 
 pub fn focus(_id: &str) {}
 
+pub struct KeyListener;
+
+pub fn on_key(_on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> KeyListener {
+    KeyListener
+}
+
+pub fn palette_keys() -> &'static str {
+    "Ctrl+K"
+}
+
 pub fn now_ms() -> f64 {
     0.0
 }

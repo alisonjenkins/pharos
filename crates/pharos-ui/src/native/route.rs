@@ -18,7 +18,7 @@ pub enum Route {
     Manage,
     /// The theme picker and editor, under `/settings`.
     Appearance,
-    /// The search screen, `/find`: matches from `Library.search` as you type.
+    /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// No route matched; carries the path for the message.
     NotFound(String),

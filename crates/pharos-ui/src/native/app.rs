@@ -19,6 +19,7 @@ use super::diagnostics;
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
+use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
@@ -26,8 +27,8 @@ use super::playback::{
 };
 use super::route::Route;
 use super::views::{
-    open_route, ErrorNote, FindView, Hits, HomeView, Loading, Nav, SearchBox, Shell, SignInView,
-    StatusView, TitleView, FIND_INPUT,
+    open_route, ErrorNote, Hits, HomeView, Loading, Nav, PaletteView, SearchBox, Shell, SignInView,
+    StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     text_track_id, Control, Controls, WatchView, PLAYER_ID, SEEK_ID, VIDEO_ID,
@@ -689,6 +690,18 @@ fn NativeApp(route: Route) -> Element {
         hits: use_signal(|| Hits::Idle),
     };
     use_context_provider(|| search);
+    let mut palette = Palette(use_signal(|| false));
+    use_context_provider(|| palette);
+    use_hook(move || {
+        Rc::new(platform::on_key(move |key, ctrl, meta| {
+            let toggle = palette::is_toggle(key, ctrl, meta);
+            if toggle {
+                let shut = !*palette.0.peek();
+                palette.0.set(shut);
+            }
+            toggle
+        }))
+    });
     let nav = use_context::<Nav>();
 
     use_effect(move || {
@@ -730,7 +743,6 @@ fn NativeApp(route: Route) -> Element {
                 m.notice().map(str::to_owned)
             }
         };
-        let on_find = route == Route::Find;
         return rsx! {
             Shell {
                 on_sign_out: move |_| {
@@ -743,16 +755,14 @@ fn NativeApp(route: Route) -> Element {
                         machine.write().apply(Event::SignOutAnswered(reply));
                     });
                 },
-                // The find screen has its own box over the same search.
-                search: rsx! {
-                    if !on_find {
-                        TopSearch {}
-                    }
-                },
+                search: rsx! { TopSearch {} },
                 if let Some(message) = notice {
                     ErrorNote { message }
                 }
                 Screen { route }
+                if (palette.0)() {
+                    PaletteScreen {}
+                }
             }
         };
     }
@@ -854,13 +864,13 @@ fn Screen(route: Route) -> Element {
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
         Route::Appearance => rsx! { AppearanceScreen {} },
-        Route::Find => rsx! { FindScreen {} },
+        Route::Find => rsx! { FindRedirect {} },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
 }
 
-/// The one search the top bar's box and the find screen share, so a term
-/// typed in the bar is still there, with its matches, on the find screen.
+/// The one search the top bar's box and the palette share, so a term typed
+/// in the bar is still there, with its matches, in the palette.
 #[derive(Clone, Copy)]
 struct Search {
     text: Signal<String>,
@@ -901,25 +911,111 @@ impl Search {
     }
 }
 
-/// The find screen: every match for the shared search, with the cursor in
-/// its box so typing carries on from the top bar.
+/// Whether the Ctrl+K / Cmd+K palette is open.
+#[derive(Clone, Copy)]
+struct Palette(Signal<bool>);
+
+/// An old `/find` link: the palette took the find screen's place.
 #[component]
-fn FindScreen() -> Element {
+fn FindRedirect() -> Element {
+    let mut palette = use_context::<Palette>();
+    use_hook(move || palette.0.set(true));
+    rsx! { Redirect { to: Route::Home } }
+}
+
+/// The palette over the page: places to go and what to resume from the home
+/// reply, then the shared search's matches once something is typed.
+#[component]
+fn PaletteScreen() -> Element {
     let ctx = use_context::<Ctx>();
     let search = use_context::<Search>();
-    use_effect(|| platform::focus(FIND_INPUT));
-    let on_input = move |value: String| search.edit(ctx, value);
-    rsx! { FindView { text: (search.text)(), hits: (search.hits)(), on_input } }
+    let nav = use_context::<Nav>();
+    let mut palette = use_context::<Palette>();
+    let mut active = use_signal(|| Some(0_usize));
+    let mut home = use_signal(Home::default);
+    use_hook(move || {
+        spawn(async move {
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            match settle(ctx.machine, api.home(&call("palette", "home")).await) {
+                Ok(reply) => home.set(reply),
+                // Places and search still work without it.
+                Err(message) => platform::warn(&format!("palette: home failed: {message}")),
+            }
+        })
+    });
+    use_effect(|| platform::focus(PALETTE_INPUT));
+    let rows = use_memo(move || {
+        let home = home.read();
+        let libraries: Vec<_> = home.rails.iter().map(|rail| rail.library.clone()).collect();
+        let recent: Vec<_> = home.resume.iter().chain(&home.listening).cloned().collect();
+        let hits = search.hits.read();
+        let page = match &*hits {
+            Hits::Found(page) => Some(page),
+            _ => None,
+        };
+        palette::rows(
+            &palette::places(&libraries),
+            &recent,
+            &search.text.read(),
+            page,
+        )
+    });
+    let failed = match &*search.hits.read() {
+        Hits::Failed(message) => Some(message.clone()),
+        _ => None,
+    };
+    let mut close = move || palette.0.set(false);
+    let on_key = move |evt: KeyboardEvent| match evt.key() {
+        Key::ArrowDown | Key::ArrowUp => {
+            evt.prevent_default();
+            let down = evt.key() == Key::ArrowDown;
+            let next = find::step(*active.peek(), rows.peek().len(), down);
+            active.set(next);
+        }
+        Key::Enter => {
+            evt.prevent_default();
+            let picked = active
+                .peek()
+                .and_then(|at| rows.peek().get(at).map(Row::route));
+            if let Some(route) = picked {
+                close();
+                nav.0.call(route);
+            }
+        }
+        // Closes rather than letting the search input clear itself.
+        Key::Escape => {
+            evt.prevent_default();
+            close();
+        }
+        _ => {}
+    };
+    rsx! {
+        PaletteView {
+            text: (search.text)(),
+            rows: rows(),
+            active: active(),
+            failed,
+            on_input: move |value| {
+                active.set(Some(0));
+                search.edit(ctx, value);
+            },
+            on_key,
+            on_close: move |_| close(),
+        }
+    }
 }
 
 /// The top bar's search box: the shared search's first matches in a list
 /// under it, walked with the arrow keys. Enter opens the match the arrows
-/// are on, or the find screen with all of them.
+/// are on, or the palette with all of them.
 #[component]
 fn TopSearch() -> Element {
     let ctx = use_context::<Ctx>();
     let search = use_context::<Search>();
     let nav = use_context::<Nav>();
+    let mut palette = use_context::<Palette>();
     let mut open = use_signal(|| false);
     let mut active = use_signal(|| None::<usize>);
     let suggestions = move || match &*search.hits.peek() {
@@ -948,7 +1044,7 @@ fn TopSearch() -> Element {
             active.set(None);
             match picked {
                 Some(item) => nav.0.call(open_route(&item)),
-                None if !search.text.peek().trim().is_empty() => nav.0.call(Route::Find),
+                None if !search.text.peek().trim().is_empty() => palette.0.set(true),
                 None => {}
             }
         }
@@ -972,12 +1068,14 @@ fn TopSearch() -> Element {
                 active.set(None);
                 search.edit(ctx, value);
             },
+            hint: format!("Search ({})", platform::palette_keys()),
             on_key,
             on_open: move |_| open.set(true),
             on_close: move |_| {
                 open.set(false);
                 active.set(None);
             },
+            on_all: move |_| palette.0.set(true),
         }
     }
 }

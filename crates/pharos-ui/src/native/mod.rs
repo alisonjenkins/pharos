@@ -12,6 +12,7 @@ pub mod letters;
 pub mod listen;
 pub mod machine;
 pub mod paging;
+pub mod palette;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 #[path = "host.rs"]
 mod platform;
