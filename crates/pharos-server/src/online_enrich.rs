@@ -142,14 +142,22 @@ pub struct AppliedEnrichment {
 /// none of that kind (fill-if-empty) — a curated NFO genre list is never
 /// diluted by an online guess.
 ///
-/// Deliberately does not touch `title` (local title stays authoritative)
-/// or `metadata.provider_ids` (the orchestrator sets those once it knows
-/// which provider matched — T9).
+/// A local title stays authoritative, except an episode's placeholder
+/// (its file stem, or its show's name), which the record's episode name
+/// replaces. Does not touch `metadata.provider_ids` (the orchestrator sets
+/// those once it knows which provider matched — T9).
 pub fn apply_enrichment(
     item: &mut pharos_core::MediaItem,
     counts: pharos_core::EntityCounts,
     e: &EnrichedMetadata,
 ) -> AppliedEnrichment {
+    if let Some(title) = e.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        if is_placeholder_episode_title(item, &item.title)
+            && !is_placeholder_episode_title(item, title)
+        {
+            item.title = title.to_string();
+        }
+    }
     let md = &mut item.metadata;
     fill(&mut md.overview, e.overview.clone());
     fill(&mut md.tagline, e.tagline.clone());
@@ -170,6 +178,38 @@ pub fn apply_enrichment(
             vec![]
         },
     }
+}
+
+/// Whether `raw` is, for episode `item`, a stand-in rather than the
+/// episode's name: empty, the file stem the scanner starts from, the
+/// show's own name (a series-level record carries that, too), or a file
+/// name with an `S01E02` token. The native UI's `display_name` applies the
+/// same rule.
+fn is_placeholder_episode_title(item: &pharos_core::MediaItem, raw: &str) -> bool {
+    if item.kind != MediaKind::Episode {
+        return false;
+    }
+    let fold = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let title = fold(raw);
+    let stem = item
+        .path
+        .file_stem()
+        .map(|s| fold(&s.to_string_lossy()))
+        .unwrap_or_default();
+    let show = item
+        .series
+        .as_ref()
+        .map(|s| fold(&s.series_name))
+        .unwrap_or_default();
+    title.is_empty()
+        || title == stem
+        || (!show.is_empty() && title == show)
+        || pharos_scanner::fs::has_sxxeyy_token(raw)
 }
 
 /// The [`pharos_cache::image_cache::ImageRole`] that corresponds to an
@@ -251,6 +291,55 @@ mod tests {
         assert_eq!(item.metadata.overview.as_deref(), Some("local overview")); // local kept
         assert_eq!(item.metadata.production_year, Some(1999)); // gap filled
         assert_eq!(applied.genres, vec!["Sci-Fi"]); // item had 0 genres
+    }
+
+    #[test]
+    fn an_episode_titled_with_its_stem_or_show_takes_the_record_name() {
+        let episode = |title: &str| pharos_core::MediaItem {
+            kind: MediaKind::Episode,
+            title: title.into(),
+            path: "/tv/Star Trek/Season 03/Star Trek - S03E07 - WEBRip-1080p.mkv".into(),
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Star Trek The Next Generation".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let named = |title: &str| EnrichedMetadata {
+            title: Some(title.into()),
+            ..EnrichedMetadata::default()
+        };
+        let counts = pharos_core::EntityCounts::default;
+
+        for placeholder in [
+            "Star Trek: The Next Generation",
+            "Star Trek - S03E07 - WEBRip-1080p",
+        ] {
+            let mut item = episode(placeholder);
+            apply_enrichment(&mut item, counts(), &named("The Enemy"));
+            assert_eq!(item.title, "The Enemy", "{placeholder}");
+        }
+
+        let mut renamed = episode("Star Trek - S03E07 - WEBRip-720p");
+        apply_enrichment(&mut renamed, counts(), &named("The Enemy"));
+        assert_eq!(renamed.title, "The Enemy");
+
+        let mut kept = episode("The Enemy (Director's Cut)");
+        apply_enrichment(&mut kept, counts(), &named("The Enemy"));
+        assert_eq!(kept.title, "The Enemy (Director's Cut)");
+
+        let mut stem = episode("Star Trek - S03E07 - WEBRip-1080p");
+        apply_enrichment(
+            &mut stem,
+            counts(),
+            &named("Star Trek: The Next Generation"),
+        );
+        assert_eq!(stem.title, "Star Trek - S03E07 - WEBRip-1080p");
+
+        let mut movie = bare_movie();
+        movie.title = "Arrival".into();
+        apply_enrichment(&mut movie, counts(), &named("Arrival (2016)"));
+        assert_eq!(movie.title, "Arrival");
     }
 
     #[test]
