@@ -83,3 +83,18 @@ runs before each push (CLAUDE.md).
 - [ ] T027 Spec ids: record the native group path in
   `specs/001-pharos-baseline/` (bug or invariant as the work finds), and mark
   the 155-line `views/group.rs` stub superseded or remove it.
+- [x] T030 [US6] Contract: `Membership.seen`, `SeenResult`, `MemberSeen`,
+  `ItemSeen`; `schemaVersion` 11 → 12 in both capnp files.
+- [x] T031 [US6] Server: `services::group_seen` and `Membership.seen` for the
+  caller's own group, V201-bounded, capped at 200 ids, with
+  `pharos_group_seen_total{outcome}`; ADR-0054. `it_rpc` tests: B sees A's
+  played episode, series and season counts, an invisible item omitted, refused
+  outside the group and over the cap.
+- [x] T032 [US6] `GroupSnapshot.participant_users` so a participant's user is
+  not read from the unordered `member_users` (B425).
+- [x] T033 [US6] `pharos-client` `NativeMembership::seen`.
+- [x] T034 [US6] UI: `GroupClient::seen`, `Session::seen`, the `seen` marks,
+  "In this group" on title and show pages, dots on episode rows, a mark on the
+  watch page's member strip; unit and render tests.
+- [x] T035 [US6] Two-browser Playwright: A marks an episode played and B sees it
+  under "In this group".

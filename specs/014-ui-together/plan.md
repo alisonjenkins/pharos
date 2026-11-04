@@ -137,6 +137,22 @@ player-shortcut PR (#607), which touches the same files.
    SC-001's 10-minute drift run in `just compat-syncplay` with a pharos-ui
    member.
 
+## US6: who has seen what (schemaVersion 11 → 12)
+
+- **Contract.** `Membership.seen @8 (ids :List(ItemId)) -> SeenResult` with
+  `MemberSeen { member, items :List(ItemSeen) }` and `ItemSeen { id, played,
+  positionPct, playedCount, totalCount }`. At most 200 ids, else `limit`.
+- **Server.** `services::group_seen` resolves ids (a stored item, or a
+  synthesised series or season to its episodes), drops what the caller may not
+  see, then reads each participant's state with `user_data_bulk` for the user
+  recorded on that participant (`GroupSnapshot.participant_users`, B425).
+  Counted in `pharos_group_seen_total{outcome}`. ADR-0054 records the privacy
+  choice.
+- **UI.** `GroupClient::seen` and `Session::seen`; the pure `seen` module words
+  a mark; `use_group_seen` in app.rs fetches through the group session and
+  fetches again when the roster (Member/Joined/Left) or the ids change.
+  `InThisGroup`, `SeenDots` and the strip's mark are pure components.
+
 ## Observability (FR-005)
 
 "Group feels out of sync" is answered by `groupDrift` samples (ms, per group,
