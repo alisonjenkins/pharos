@@ -152,4 +152,4 @@ pushdown of the hard rules into the store query, not a change to the wire.
    the queue panel.
 3. Later: a similar-artists source behind an adapter trait, store
    pushdown if the call gets slow. Tempo and energy are read from the
-   probe once B445 lands (a one-line change in `services::mix::song`).
+   probe (`services::mix::song`), since B445 / ADR-0050 landed.
