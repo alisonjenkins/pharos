@@ -243,6 +243,34 @@ impl Drop for PopState {
     }
 }
 
+/// A window `keydown` listener for Escape, removed on drop.
+pub struct EscapeWatch(Closure<dyn FnMut(web_sys::KeyboardEvent)>);
+
+impl Drop for EscapeWatch {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("keydown", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Call `on_escape` for an Escape pressed anywhere on the page, focus in
+/// the app or not, unless a handler nearer the focus already took it.
+pub fn on_escape(mut on_escape: impl FnMut() + 'static) -> EscapeWatch {
+    let listener =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            if e.key() == "Escape" && !e.default_prevented() {
+                on_escape();
+            }
+        });
+    if let Some(window) = web_sys::window() {
+        let _ =
+            window.add_event_listener_with_callback("keydown", listener.as_ref().unchecked_ref());
+    }
+    EscapeWatch(listener)
+}
+
 /// Call `on_path` with the new path whenever Back or Forward moves history.
 pub fn on_pop_state(mut on_path: impl FnMut(String) + 'static) -> PopState {
     let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| on_path(current_path()));

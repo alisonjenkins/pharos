@@ -472,6 +472,18 @@ fn QueuePanel(
         confirming.set(false);
         platform::info(&format!("pharos: queue clear cancelled upcoming={total}"));
     };
+    // Escape cancels wherever focus has gone; the confirm does not hold it.
+    let mut escape = use_signal(|| None::<platform::EscapeWatch>);
+    use_effect(move || {
+        let watch = confirming().then(|| {
+            platform::on_escape(move || {
+                if *confirming.peek() {
+                    cancel();
+                }
+            })
+        });
+        escape.set(watch);
+    });
     rsx! {
         aside {
             id: QUEUE_PANEL_ID,
