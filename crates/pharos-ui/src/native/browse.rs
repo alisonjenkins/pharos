@@ -1580,6 +1580,7 @@ mod tests {
             subtitle_tracks: Vec::new(),
             trickplay: Vec::new(),
             segments: Vec::new(),
+            cast: Vec::new(),
         }
     }
 

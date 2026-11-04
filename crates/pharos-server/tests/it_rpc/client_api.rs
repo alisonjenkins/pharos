@@ -149,3 +149,110 @@ async fn play_negotiates_and_reports_progress() {
         .unwrap();
     assert_eq!(data.last_played_position_ticks, 200_000_000);
 }
+
+/// Cast as the title page reads it: an episode lists its actors then its
+/// guest stars (crew left out), with a photo only for a portrait the server
+/// passes through; a series ranks its regulars across its episodes.
+#[actix_web::test]
+async fn detail_carries_the_cast_and_a_series_ranks_its_regulars() {
+    use pharos_client::api::CreditKind;
+    use pharos_core::{PersonKind, PersonRef, PersonStore as _};
+
+    let (api, fx, _server) = api().await;
+    crate::library::seed_tv_library(&fx).await;
+    let call = CallInfo::default();
+    let person =
+        |name: &str, kind, character: Option<&str>, order, thumb: Option<&str>| PersonRef {
+            name: name.into(),
+            kind,
+            character: character.map(str::to_string),
+            sort_order: Some(order),
+            thumb: thumb.map(str::to_string),
+            ..PersonRef::default()
+        };
+    let lead = person(
+        "Lead Actor",
+        PersonKind::Actor,
+        Some("Captain"),
+        0,
+        Some("https://image.tmdb.org/t/p/w185/lead.jpg"),
+    );
+    let second = person(
+        "Second Actor",
+        PersonKind::Actor,
+        Some("Mate"),
+        1,
+        Some("https://img.example/s.jpg"),
+    );
+    let guest = person(
+        "Guest Star",
+        PersonKind::GuestStar,
+        Some("Stranger"),
+        2,
+        None,
+    );
+    let director = person("Some Director", PersonKind::Director, None, 3, None);
+    let links = [
+        (601, vec![lead.clone(), guest, director]),
+        (602, vec![lead.clone(), second.clone()]),
+        (603, vec![second, lead]),
+    ];
+    for (id, people) in links {
+        fx.state.stores.link_item_people(id, &people).await.unwrap();
+    }
+
+    let episode = api
+        .detail(&call, ItemRef::Real(601))
+        .await
+        .expect("episode");
+    let cast: Vec<_> = episode
+        .cast
+        .iter()
+        .map(|c| (c.name.as_str(), c.character.as_str(), c.kind))
+        .collect();
+    assert_eq!(
+        cast,
+        [
+            ("Lead Actor", "Captain", CreditKind::Actor),
+            ("Guest Star", "Stranger", CreditKind::GuestStar),
+        ]
+    );
+    let photo = episode.cast[0].image_url.as_deref().unwrap_or_default();
+    let lead_wire = pharos_core::person_wire_id("Lead Actor");
+    assert!(
+        photo.starts_with(&format!("/Items/{lead_wire}/Images/Primary?tag=")),
+        "{photo}"
+    );
+    assert_eq!(episode.cast[1].image_url, None);
+
+    let home = api.home(&call).await.expect("home");
+    let tv = home
+        .rails
+        .iter()
+        .find(|r| r.library.name == "TV")
+        .expect("tv rail")
+        .library
+        .id;
+    let shows = api
+        .list(&call, tv, Some(ItemKind::Series), "SortName", 0, 50)
+        .await
+        .expect("shows");
+    let show = shows
+        .items
+        .iter()
+        .find(|i| i.name == "Show")
+        .expect("show")
+        .id;
+    let series = api.detail(&call, show).await.expect("series");
+    let regulars: Vec<_> = series
+        .cast
+        .iter()
+        .map(|c| (c.name.as_str(), c.character.as_str()))
+        .collect();
+    assert_eq!(
+        regulars,
+        [("Lead Actor", "Captain"), ("Second Actor", "Mate")]
+    );
+    // img.example is not a provider host: the CSP would block its redirect.
+    assert_eq!(series.cast[1].image_url, None);
+}

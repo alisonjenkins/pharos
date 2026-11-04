@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
-    user_state, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
+    credit, home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
+    user_state, CreditKind, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
@@ -372,7 +372,10 @@ impl server::library::Handler for Library {
             synth @ WireId::Synth(_) => {
                 match synth_detail(state, &user, synth).await {
                     Ok(dto) => {
-                        write_synth_detail(results.get().init_result().init_detail(), synth, &dto)
+                        let cast = synth_cast(state, synth, &dto).await;
+                        let mut out = results.get().init_result().init_detail();
+                        write_synth_detail(out.reborrow(), synth, &dto);
+                        write_cast(out.init_cast(len(&cast)), &cast);
                     }
                     Err(denial) => denial.write(results.get().init_result().init_error()),
                 }
@@ -439,19 +442,27 @@ impl server::library::Handler for Library {
             .into_iter()
             .filter_map(|s| segment_kind(s.kind).map(|k| (k, s)))
             .collect();
-        let mut list = out.init_segments(len(&segments));
+        let mut list = out.reborrow().init_segments(len(&segments));
         for (i, (kind, s)) in (0..).zip(&segments) {
             let mut w = list.reborrow().get(i);
             w.set_kind(*kind);
             w.set_start_ms(s.start_ms);
             w.set_end_ms(s.end_ms);
         }
+        // The cast decorates the page; a store error leaves it empty rather
+        // than failing the whole detail.
+        let cast = library::cast(state, id).await.unwrap_or_else(|e| {
+            tracing::warn!(media.id = id, error = %e, "native detail: cast unavailable");
+            Vec::new()
+        });
+        write_cast(out.init_cast(len(&cast)), &cast);
         tracing::debug!(
             media.id = id,
             audio_tracks = tracks.audio.len(),
             subtitle_tracks = tracks.subtitles.len(),
             trickplay_widths = trickplay.len(),
             segments = segments.len(),
+            cast = cast.len(),
             "native detail: player facts"
         );
         Ok(())
@@ -1029,6 +1040,51 @@ async fn synth_detail(
         Err(e) => {
             record_refusal("detail", id, RefusalReason::SynthHidden, &e.to_string());
             Err(item_not_found)
+        }
+    }
+}
+
+/// The regular cast of a synthesised series or season; empty for any other
+/// synthesised item, or when the store cannot answer.
+async fn synth_cast(
+    state: &AppState,
+    id: WireId,
+    dto: &serde_json::Value,
+) -> Vec<pharos_core::ItemPerson> {
+    if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
+        return Vec::new();
+    }
+    let wire_id = id.to_string();
+    library::ensemble(state, &wire_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(wire_id, error = %e, "native detail: ensemble cast unavailable");
+            Vec::new()
+        })
+}
+
+/// `cast` as wire credits. A person gets a photo url only when the image
+/// route passes their portrait through from this origin: the UI's CSP would
+/// block a redirect to anywhere else.
+fn write_cast(
+    mut out: capnp::struct_list::Builder<'_, credit::Owned>,
+    cast: &[pharos_core::ItemPerson],
+) {
+    for (i, p) in (0..).zip(cast) {
+        let mut w = out.reborrow().get(i);
+        w.set_name(p.name.as_str());
+        w.set_character(p.character.as_deref().unwrap_or_default());
+        w.set_kind(match p.kind {
+            pharos_core::PersonKind::GuestStar => CreditKind::GuestStar,
+            _ => CreditKind::Actor,
+        });
+        if let Some(thumb) = p
+            .thumb_url
+            .as_deref()
+            .filter(|u| crate::portrait::is_proxied(u))
+        {
+            let tag = pharos_jellyfin_api::dto::person_image_tag_for(thumb);
+            w.set_image_url(format!("/Items/{}/Images/Primary?tag={tag}", p.wire_id).as_str());
         }
     }
 }
