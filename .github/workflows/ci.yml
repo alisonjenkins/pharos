@@ -39,10 +39,17 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A fork never reaches the home runners, whatever it names its branch.
+          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+            echo "$HEAD_REPO is a fork: no heavy jobs on the self-hosted runners"
+            echo "code=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           case "$HEAD_REF" in
@@ -76,7 +83,12 @@ jobs:
       - name: Require a batch or release-please head
         env:
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
+          if [[ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::$HEAD_REPO is a fork: its change lands through a batch/ PR from this repository"
+            exit 1
+          fi
           case "$HEAD_REF" in
             batch/*|release-please--*) echo "$HEAD_REF may merge" ;;
             *)
@@ -161,7 +173,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
     # NO `needs: [test]`: this nix build shares nothing with the cargo build in
     # `test`, so gating it behind test only serialised ~4 min after ~3 min. Run
     # it in PARALLEL — `publish` still `needs: [test, oci]`, so a failing test
@@ -254,7 +266,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
     # NO `needs: [test]`. This job builds what it needs through `just`, so
     # nothing it does depends on the flake check having passed — waiting for
     # it only serialised ~2m45s onto the end of every PR run (measured: the
@@ -303,7 +315,7 @@ jobs:
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
     needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
