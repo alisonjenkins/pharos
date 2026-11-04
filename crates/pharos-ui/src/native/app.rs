@@ -337,36 +337,36 @@ thread_local! {
     static LAST_VOLUME: Cell<Option<(f64, bool)>> = const { Cell::new(None) };
 }
 
-/// Set the new media element to the viewer's last volume: this page load's,
-/// else the stored one.
-fn restore_volume() {
+/// The viewer's last volume and mute: this page load's, else the stored one.
+fn last_volume() -> Option<(f64, bool, &'static str)> {
     if let Some((volume, muted)) = LAST_VOLUME.get() {
-        platform::set_volume(VIDEO_ID, volume, muted);
-        platform::info(&format!(
-            "pharos: volume restored volume={volume:.3} muted={muted} from=page"
-        ));
-        return;
+        return Some((volume, muted, "page"));
     }
     let stored = match platform::stored_theme(VOLUME_KEY) {
-        Ok(stored) => stored,
+        Ok(stored) => stored?,
         Err(e) => {
             platform::warn(&format!("pharos: volume storage read failed error={e}"));
-            return;
+            return None;
         }
-    };
-    let Some(stored) = stored else {
-        return;
     };
     match parse_volume_setting(&stored) {
-        Some((volume, muted)) => {
-            platform::set_volume(VIDEO_ID, volume, muted);
-            platform::info(&format!(
-                "pharos: volume restored volume={volume:.3} muted={muted} from=storage"
+        Some((volume, muted)) => Some((volume, muted, "storage")),
+        None => {
+            platform::warn(&format!(
+                "pharos: volume not restored reason=unreadable stored={stored:?}"
             ));
+            None
         }
-        None => platform::warn(&format!(
-            "pharos: volume not restored reason=unreadable stored={stored:?}"
-        )),
+    }
+}
+
+/// Set the new media element to `last`, the viewer's last volume.
+fn restore_volume(last: Option<(f64, bool, &'static str)>) {
+    if let Some((volume, muted, from)) = last {
+        platform::set_volume(VIDEO_ID, volume, muted);
+        platform::info(&format!(
+            "pharos: volume restored volume={volume:.3} muted={muted} from={from}"
+        ));
     }
 }
 
@@ -2206,7 +2206,8 @@ fn Player(
         }
     });
     let mut failed = use_signal(|| None::<String>);
-    let mut media = use_signal(MediaState::default);
+    let saved_volume = use_hook(last_volume);
+    let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
     let mut hover_ms = use_signal(|| None::<u64>);
     // The subtitle on screen: the server's pick, then the viewer's.
     let mut subtitle = use_signal(|| p.subtitle);
@@ -2388,7 +2389,7 @@ fn Player(
         }
     });
     // Before the stream attaches, so autoplay never starts at full volume.
-    use_effect(restore_volume);
+    use_effect(move || restore_volume(saved_volume));
     use_effect({
         let cancel = Rc::clone(&fade_in_cancel);
         move || {
