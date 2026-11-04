@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod account_settings;
+pub mod activity;
 pub mod app;
 pub mod appearance;
 pub mod backdrop;
