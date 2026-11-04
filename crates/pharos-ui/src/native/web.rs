@@ -19,6 +19,7 @@ use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{Engine, MediaState, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
+use super::track_follow::{GroupTracksView, TrackChoice};
 use pharos_client::api::ItemRef;
 
 const SESSION: &str = "/pharos/session";
@@ -1978,7 +1979,20 @@ fn member(m: pharos_client::group::GroupMember) -> Member {
         id: m.id,
         name: m.name,
         buffering: m.buffering,
+        own_tracks: m.own_tracks,
     }
+}
+
+fn tracks(t: &pharos_client::group::GroupTracks) -> GroupTracksView {
+    GroupTracksView {
+        audio: t.audio,
+        subtitle: t.subtitle,
+    }
+}
+
+/// The member id a command named; the wire's empty text means none.
+fn by(id: Option<String>) -> Option<String> {
+    id.filter(|id| !id.is_empty())
 }
 
 fn summary(g: pharos_client::group::GroupSummary) -> GroupSummary {
@@ -1986,6 +2000,7 @@ fn summary(g: pharos_client::group::GroupSummary) -> GroupSummary {
         id: g.id,
         name: g.name,
         item: g.item,
+        tracks: tracks(&g.tracks),
         members: g.members.into_iter().map(member).collect(),
     }
 }
@@ -1998,23 +2013,29 @@ fn update(u: GroupUpdate) -> together::GroupUpdate {
         GroupUpdate::Play {
             at_server_ms,
             position_ms,
+            by: who,
         } => U::Play {
             at_server_ms: ms(at_server_ms),
             position_ms,
+            by: by(who),
         },
         GroupUpdate::Pause {
             at_server_ms,
             position_ms,
+            by: who,
         } => U::Pause {
             at_server_ms: ms(at_server_ms),
             position_ms,
+            by: by(who),
         },
         GroupUpdate::Seek {
             at_server_ms,
             position_ms,
+            by: who,
         } => U::Seek {
             at_server_ms: ms(at_server_ms),
             position_ms,
+            by: by(who),
         },
         GroupUpdate::Member(m) => U::Member(member(m)),
         GroupUpdate::Left(id) => U::Left(id),
@@ -2028,6 +2049,10 @@ fn update(u: GroupUpdate) -> together::GroupUpdate {
             playlist_item_id,
             position_ms,
             playing,
+        },
+        GroupUpdate::Tracks(t) => U::Tracks {
+            tracks: tracks(&t),
+            by: by(Some(t.by)),
         },
         GroupUpdate::Ended => U::Ended,
     }
@@ -2206,6 +2231,25 @@ impl GroupClient for Groups {
     async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError> {
         let m = self.membership()?;
         m.seen(&self.call, &ids).await.map_err(group_error)
+    }
+
+    async fn set_tracks(
+        &self,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError> {
+        let m = self.membership()?;
+        m.set_tracks(&self.call, audio, subtitle, &playlist_item_id)
+            .await
+            .map_err(group_error)
+    }
+
+    async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError> {
+        let m = self.membership()?;
+        m.follow_tracks(&self.call, follow)
+            .await
+            .map_err(group_error)
     }
 
     async fn leave(&self) -> Result<(), GroupError> {
