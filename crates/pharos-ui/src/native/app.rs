@@ -2108,8 +2108,14 @@ fn Player(
             let grant = p.grant.borrow().clone();
             let at = last_ms.get();
             platform::spawn_detached(async move {
-                if let Err(e) = grant.stop(&call("watch", "stop"), at).await {
-                    platform::warn(&format!("pharos: playback stop failed: {e}"));
+                match grant.stop(&call("watch", "stop"), at).await {
+                    Ok(()) => {}
+                    // A reload or reconnect closed the playback's connection
+                    // first; the server ends a playback whose connection drops.
+                    Err(e) if e.is_disconnected() => platform::info(&format!(
+                        "pharos: playback stop skipped reason=disconnected detail={e}"
+                    )),
+                    Err(e) => platform::warn(&format!("pharos: playback stop failed: {e}")),
                 }
             });
         }
