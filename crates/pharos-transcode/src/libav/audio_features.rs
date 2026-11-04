@@ -49,7 +49,7 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         .iter()
         .find_map(|k| ictx.metadata().get(k).and_then(parse_bpm_tag));
 
-    let (stream_index, tb_num, tb_den, mut decoder) = {
+    let (stream_index, tb_num, tb_den, stream_start, mut decoder) = {
         let stream = ictx
             .streams()
             .best(media::Type::Audio)
@@ -68,7 +68,14 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
             .decoder()
             .audio()
             .map_err(|e| FrameError::BadInput(format!("audio decoder: {e}")))?;
-        (idx, num, den, decoder)
+        // Timestamps count from the stream's own origin, which is not 0 in
+        // every container (an MP3 with a leading ID3/encoder delay, a TS rip).
+        // Unknown (`AV_NOPTS_VALUE`) reads as 0.
+        let origin = match stream.start_time() {
+            ffi::AV_NOPTS_VALUE => 0,
+            t => t,
+        };
+        (idx, num, den, origin, decoder)
     };
 
     // Native (mask-order) layout for the channel count; see waveform.rs for
@@ -88,11 +95,24 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
     )
     .map_err(|e| FrameError::Other(format!("resampler: {e}")))?;
 
+    let tb_ms = |ts: i64| -> i64 {
+        if tb_den == 0 {
+            return 0;
+        }
+        (ts - stream_start) * 1000 * tb_num / tb_den
+    };
+    // The seek target is in AV_TIME_BASE (µs) on the same timeline, so it is
+    // offset by the stream's origin too.
+    let origin_us = if tb_den == 0 {
+        0
+    } else {
+        stream_start * 1_000_000 * tb_num / tb_den
+    };
     // Land at or before the window; the pts gate trims the lead-in. A
     // container that cannot seek is read from the top instead, so the gate
     // never waits for a start it will not reach.
     let start_ms = if start_ms > 0 {
-        let start_us = (start_ms as i64) * 1000;
+        let start_us = origin_us + (start_ms as i64) * 1000;
         if ictx.seek(start_us, ..start_us).is_ok() {
             start_ms
         } else {
@@ -102,12 +122,6 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         0
     };
     let end_ms = start_ms + dur_ms;
-    let tb_ms = |ts: i64| -> i64 {
-        if tb_den == 0 {
-            return 0;
-        }
-        ts * 1000 * tb_num / tb_den
-    };
 
     // The sample count bounds the decode whatever the timestamps say.
     let cap = (dur_ms as usize / 1000 + 1) * ANALYSIS_RATE as usize;
