@@ -18,6 +18,7 @@ mod library;
 mod limits;
 mod login;
 mod lyrics;
+mod mix;
 mod playback;
 mod prefs;
 mod quick_connect;
