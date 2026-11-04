@@ -16,6 +16,7 @@ pub mod letters;
 pub mod listen;
 pub mod lyrics;
 pub mod machine;
+pub mod mixes;
 pub mod paging;
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 #[path = "host.rs"]
