@@ -235,10 +235,19 @@ impl Drop for Grant {
             // A revoked session saves no position but still ends the
             // stream and the now-playing it owns.
             let (ended, saved) = match session.current_user().await {
-                Ok(user) => (
-                    play_state::stop(&session.state, &user, report).await,
-                    reported_ms.is_some(),
-                ),
+                Ok(user) => match play_state::stop(&session.state, &user, report).await {
+                    // The item was hidden from the user since the last
+                    // report: `stop` wrote nothing and ended nothing, so
+                    // end the playback without saving a position.
+                    Err(play_state::ReportError::Withheld(hidden)) => {
+                        tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
+                        (
+                            play_state::end(&session.state, user.id, &play_session_id).await,
+                            false,
+                        )
+                    }
+                    other => (other, reported_ms.is_some()),
+                },
                 Err(_) => (
                     play_state::end(&session.state, session.owner(), &play_session_id).await,
                     false,
