@@ -290,6 +290,32 @@ impl NativeMembership {
         command!(self, call, ping_request)
     }
 
+    /// Changes the group's audio and subtitle; a [`TrackChoice::Unset`] half
+    /// is left as the group has it. Advisory: each following member applies
+    /// it to their own player. `playlist_item_id` names the queue entry the
+    /// pick was made on; the group drops it once it has moved to another.
+    pub async fn set_tracks(
+        &self,
+        call: &CallInfo,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        playlist_item_id: &str,
+    ) -> Result<(), ClientError> {
+        command!(self, call, set_tracks_request, |p| {
+            pharos_api::track_choice::write(p.reborrow().init_audio(), audio);
+            pharos_api::track_choice::write(p.reborrow().init_subtitle(), subtitle);
+            p.set_playlist_item_id(playlist_item_id);
+        })
+    }
+
+    /// `false` puts this member on their own tracks ("Just me"); `true`
+    /// puts them back on the group's.
+    pub async fn follow_tracks(&self, call: &CallInfo, follow: bool) -> Result<(), ClientError> {
+        command!(self, call, follow_tracks_request, |p| {
+            p.set_follow(follow);
+        })
+    }
+
     /// What each member of the group has seen of `ids` (at most 200).
     pub async fn seen(
         &self,
