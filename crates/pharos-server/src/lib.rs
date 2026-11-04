@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod avatar;
 pub mod bg_io;
 pub mod book_convert;
 pub mod book_cover;
