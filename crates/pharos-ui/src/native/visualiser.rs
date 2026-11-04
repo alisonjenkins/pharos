@@ -11,7 +11,8 @@ pub const STYLE_KEY: &str = "pharos.visualiser";
 /// this port). Dropping it releases the audio graph.
 pub trait AudioTap {
     /// Fill `bins` with each analyser bin's level in dBFS (`-inf` for none)
-    /// and `wave` with time-domain samples from -1 to 1.
+    /// and `wave` with the frame's time-domain samples (twice `bins` of
+    /// them), from -1 to 1.
     fn read(&mut self, bins: &mut [f32], wave: &mut [f32]);
     /// Frequency bins the analyser produces.
     fn bins(&self) -> usize;
@@ -120,6 +121,10 @@ const GAIN_RELEASE: f32 = 0.004;
 const PEAK_FLOOR: f32 = 0.02;
 /// Where the followed waveform peak lands, short of clipping.
 const WAVE_TARGET: f32 = 0.9;
+/// Samples averaged into each waveform texel. Picking one sample in eight
+/// aliased the treble into spikes; four averaged keep up to ~6 kHz and
+/// show the first ~21 ms of the frame (B481).
+const WAVE_STEP: usize = 4;
 
 /// Move `followed` towards `now`: quickly up, slowly down.
 fn follow(followed: f32, now: f32) -> f32 {
@@ -150,7 +155,8 @@ pub struct Analysis {
 }
 
 impl Analysis {
-    /// For an analyser with `bins` bins at `sample_rate`; the spectrum row
+    /// For an analyser with `bins` bins (and twice as many samples) at
+    /// `sample_rate`; the spectrum row
     /// is spaced logarithmically so each octave gets equal width.
     pub fn new(bins: usize, sample_rate: f32) -> Self {
         let nyquist = sample_rate / 2.0;
@@ -173,7 +179,7 @@ impl Analysis {
             reference_db: REFERENCE_START_DB,
             peak: WAVE_TARGET,
             bins: vec![f32::NEG_INFINITY; bins],
-            wave: vec![0.0; DATA_WIDTH],
+            wave: vec![0.0; 2 * bins],
             texel_db: vec![f32::NEG_INFINITY; DATA_WIDTH],
             data,
         }
@@ -189,6 +195,17 @@ impl Analysis {
             self.wave.iter_mut().for_each(|s| *s /= volume);
         }
         self.update();
+    }
+
+    /// Where the waveform row starts: the first rising zero crossing that
+    /// leaves a full row after it, so a steady tone draws in place rather
+    /// than sliding between frames.
+    fn trigger(&self) -> usize {
+        let span = DATA_WIDTH * WAVE_STEP;
+        let last = self.wave.len().saturating_sub(span);
+        (1..=last)
+            .find(|&i| self.wave[i - 1] < 0.0 && self.wave[i] >= 0.0)
+            .unwrap_or(0)
     }
 
     /// Fold the current `bins` and `wave` into the texture.
@@ -228,17 +245,19 @@ impl Analysis {
         // bounds the gain so a transient is not clipped flat.
         let gain = WAVE_TARGET / self.peak.max(amplitude).max(PEAK_FLOOR);
 
+        let start = self.trigger();
         let (spectrum, wave) = self.data.split_at_mut(DATA_WIDTH);
         for (texel, band) in spectrum.iter_mut().zip(&self.bands) {
             *texel = (band.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
         let mut energy = 0.0;
-        for (texel, s) in wave.iter_mut().zip(&self.wave) {
+        for (texel, window) in wave.iter_mut().zip(self.wave[start..].chunks(WAVE_STEP)) {
+            let s = window.iter().sum::<f32>() / window.len() as f32;
             let s = (s * gain).clamp(-1.0, 1.0);
             energy += s * s;
             *texel = ((s * 0.5 + 0.5) * 255.0).round() as u8;
         }
-        let rms = (energy / self.wave.len().max(1) as f32).sqrt();
+        let rms = (energy / DATA_WIDTH as f32).sqrt();
         // Music peaking at WAVE_TARGET sits near 0.3 RMS; scale it near the top.
         let target = (rms * 2.8).min(1.0);
         let rate = if target > self.level { ATTACK } else { DECAY };
@@ -265,7 +284,7 @@ mod tests {
 
     /// Analyser bins in every test, and the samples per frame.
     const BINS: usize = 1024;
-    const SAMPLES: usize = DATA_WIDTH;
+    const SAMPLES: usize = 2 * BINS;
 
     struct Fixed {
         bins: Vec<f32>,
@@ -415,14 +434,22 @@ mod tests {
 
     #[test]
     fn a_loud_wave_raises_the_level_and_keeps_its_shape() {
+        // A square wave, 16 texels a cycle.
         let wave: Vec<f32> = (0..SAMPLES)
-            .map(|i| if i % 2 == 0 { -0.9 } else { 0.9 })
+            .map(|i| if (i / 32) % 2 == 0 { -0.9 } else { 0.9 })
             .collect();
         let (mut a, mut t) = tap(vec![NONE; BINS], wave);
         settle(&mut a, &mut t, 10);
         assert!(a.level() > 0.9, "{}", a.level());
         let row = &a.data()[DATA_WIDTH..];
-        assert!(row[0] < 20 && row[1] > 235, "{:?}", &row[..2]);
+        assert!(
+            row.iter().filter(|&&b| b < 20).count() > DATA_WIDTH / 3,
+            "{row:?}"
+        );
+        assert!(
+            row.iter().filter(|&&b| b > 235).count() > DATA_WIDTH / 3,
+            "{row:?}"
+        );
     }
 
     #[test]
@@ -453,5 +480,19 @@ mod tests {
         settle(&mut a, &mut t, 100);
         assert!(a.data()[..DATA_WIDTH].iter().all(|&b| b == 0));
         assert!(a.data()[DATA_WIDTH..].iter().all(|&b| b == 128));
+    }
+
+    #[test]
+    fn a_steady_tone_draws_in_place_whatever_its_phase_in_the_frame() {
+        let (mut a, mut t) = tap(vec![NONE; BINS], sine(0.5, 200.0, 0.0));
+        settle(&mut a, &mut t, 200);
+        let first = a.data()[DATA_WIDTH..].to_vec();
+        for phase in [37.0, 101.0, 163.0] {
+            t.wave = sine(0.5, 200.0, phase);
+            a.read(&mut t);
+            for (i, (x, y)) in first.iter().zip(&a.data()[DATA_WIDTH..]).enumerate() {
+                assert!(x.abs_diff(*y) <= 4, "phase {phase} texel {i}: {x} vs {y}");
+            }
+        }
     }
 }

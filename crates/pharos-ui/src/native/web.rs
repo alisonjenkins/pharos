@@ -1814,17 +1814,12 @@ struct WebAudioTap {
     context: web_sys::AudioContext,
     analyser: web_sys::AnalyserNode,
     media: web_sys::HtmlMediaElement,
-    samples: Vec<f32>,
 }
 
 impl super::visualiser::AudioTap for WebAudioTap {
     fn read(&mut self, bins: &mut [f32], wave: &mut [f32]) {
         self.analyser.get_float_frequency_data(bins);
-        self.analyser.get_float_time_domain_data(&mut self.samples);
-        let step = (self.samples.len() / wave.len().max(1)).max(1);
-        for (out, sample) in wave.iter_mut().zip(self.samples.iter().step_by(step)) {
-            *out = *sample;
-        }
+        self.analyser.get_float_time_domain_data(wave);
     }
 
     fn bins(&self) -> usize {
@@ -1890,7 +1885,6 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         context,
         analyser,
         media,
-        samples: vec![0.0; FFT_SIZE as usize],
     }))
 }
 
