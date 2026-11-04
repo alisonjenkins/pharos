@@ -342,6 +342,11 @@ impl FakeGroups {
         self.calls.borrow().clone()
     }
 
+    /// The sinks the fake holds, oldest first.
+    pub fn sinks(&self) -> Vec<GroupSink> {
+        self.sinks.borrow().clone()
+    }
+
     /// Push an update to every member the fake holds a sink for.
     pub fn push(&self, update: &GroupUpdate) {
         for sink in self.sinks.borrow().iter() {
