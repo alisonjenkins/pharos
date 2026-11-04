@@ -21,6 +21,15 @@ web = [
     "dep:getrandom02",
 ]
 
+# 025 slice 0 spike: the Android TV app (`dx bundle --platform android
+# --features mobile --bin pharos-tv`).
+mobile = ["dioxus/mobile", "dioxus/launch", "dioxus/document"]
+
+[[bin]]
+name = "pharos-tv"
+path = "src/bin/tv.rs"
+required-features = ["mobile"]
+
 [[bin]]
 name = "pharos-ui-web"
 path = "src/bin/web.rs"
@@ -113,6 +122,17 @@ thiserror.workspace = true
 # for wasm32 and the hack pulls the native-only stack (sqlx/tokio/mio). It is
 # listed under [final-excludes] in .config/hakari.toml so CI's hakari-check
 # does not try to re-add the dependency.
+
+[target.'cfg(target_os = "android")'.dependencies]
+pharos-api = { path = "../pharos-api" }
+capnp = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+futures-util = { version = "0.3", features = ["sink"] }
+futures = "0.3"
+android_logger = "0.15"
+log = "0.4"
 
 [dev-dependencies]
 # T51 phase 1: dioxus-ssr renders components to HTML strings inside

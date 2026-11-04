@@ -4,6 +4,9 @@
 pub mod account;
 pub mod account_settings;
 pub mod activity;
+// 025 slice 0 spike: socket, token file and sign-in for the Android TV app.
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod app;
 pub mod appearance;
 pub mod backdrop;
