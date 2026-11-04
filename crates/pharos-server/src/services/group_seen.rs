@@ -1,5 +1,5 @@
 //! What each member of a watch-together group has watched (spec 014 US6,
-//! ADR-0046). A member reads their peers' played state only through the
+//! ADR-0054). A member reads their peers' played state only through the
 //! `Membership` of the group they are in, and only for items they may see
 //! themselves, so the group never widens what anyone is shown (V201).
 
