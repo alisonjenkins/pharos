@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 8;
+const schemaVersion :UInt32 = 11;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -163,6 +163,7 @@ interface Library {
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
   index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
   lyrics @9 (ctx :CallContext, id :ItemId) -> (result :LyricsResult);
+  mix @10 (ctx :CallContext, spec :MixSpec, recent :List(ItemId), count :UInt32) -> (result :MixResult);
 }
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
@@ -200,6 +201,54 @@ struct DetailResult { union { detail @0 :ItemDetail; error @1 :Error; } }
 struct LyricLine { startMs @0 :UInt64; text @1 :Text; }
 struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; }
 struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
+
+# A dynamic mix (spec 024): rules the next songs must, should or should not
+# meet. The call is stateless: the client sends the spec, what was heard or
+# queued (`recent`, oldest first, at most 200 read) and how many songs it
+# wants (1 to 50), and gets that many back with the rules each matched.
+# Hard rules (require, exclude) never bend; a mix that runs out of songs
+# answers short with `exhausted`. Freshness, shares and spacing bend only
+# when they would leave nothing, and each bend is named in `relaxed`
+# (`repeat`, `share`, `spacing`).
+enum MixWeight { require @0; prefer @1; avoid @2; exclude @3; }
+struct MixRange { from @0 :UInt32; to @1 :UInt32; }   # inclusive both ends
+struct MixRule {
+  weight @0 :MixWeight;
+  share @1 :UInt8;   # 1-100: aim for about this % of songs to match (weight must be prefer); 0 = no share
+  test :union {
+    genre @2 :Text;
+    artist @3 :Text;            # the track or the album artist
+    album @4 :Text;
+    years @5 :MixRange;         # release year
+    favorite @6 :Void;
+    neverPlayed @7 :Void;
+    playCount @8 :MixRange;
+    notPlayedForDays @9 :UInt32;
+    playedWithinDays @10 :UInt32;
+    addedWithinDays @11 :UInt32;
+    lengthSecs @12 :MixRange;
+    likeSeed @13 :Void;         # same artist, or near in genre, era, tempo and energy; a prefer weights by how near
+    tempoBpm @14 :MixRange;     # beats per minute (the file's tag, else analysis); untempoed songs never match
+    energy @15 :MixRange;       # percent, 0 calm to 100 intense (analysis); unanalysed songs never match
+  }
+}
+struct MixSpec {
+  rules @0 :List(MixRule);      # at most 32
+  seed :union {
+    none @1 :Void;              # a likeSeed rule is refused
+    song @2 :ItemId;            # like this song
+    follow @3 :Void;            # like the last song in `recent`, then each pick like the one before: the mix walks
+  }
+  artistGap @4 :UInt8;          # no artist again within this many songs
+  albumGap @5 :UInt8;           # no album again within this many songs
+}
+struct MixPick { item @0 :ItemSummary; reasons @1 :List(Text); }   # reasons: the soft rules it matched, in words
+struct MixBatch { picks @0 :List(MixPick); pool @1 :UInt32; eligible @2 :UInt32; exhausted @3 :Bool; relaxed @4 :List(Text); }
+struct MixResult { union { batch @0 :MixBatch; error @1 :Error; } }
+# A user's saved mixes, stored whole as one Prefs value under `mix.saved`
+# (a capnp message of this struct), so every first-party client shares them.
+struct SavedMix { name @0 :Text; spec @1 :MixSpec; }
+struct SavedMixes { mixes @0 :List(SavedMix); }
 
 interface UserData {
   setPlayed @0 (ctx :CallContext, id :ItemId, played :Bool) -> (result :UserStateResult);
