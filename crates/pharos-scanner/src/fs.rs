@@ -2302,7 +2302,8 @@ pub fn is_episode_path(path: &Path) -> bool {
     false
 }
 
-fn has_sxxeyy_token(name: &str) -> bool {
+/// Whether `name` holds an `S01E02` token at a word start.
+pub fn has_sxxeyy_token(name: &str) -> bool {
     let bytes = name.as_bytes();
     let lower: Vec<u8> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
     let mut i = 0;
