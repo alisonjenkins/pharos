@@ -120,6 +120,15 @@ mod tests {
         ) -> Result<pharos_client::api::Lyrics, ClientError> {
             Ok(Default::default())
         }
+        async fn mix(
+            &self,
+            _: &CallInfo,
+            _: &pharos_client::mix::MixSpec,
+            _: &[ItemRef],
+            _: u32,
+        ) -> Result<pharos_client::mix::MixBatch, ClientError> {
+            Ok(Default::default())
+        }
         async fn play(
             &self,
             _: &CallInfo,
