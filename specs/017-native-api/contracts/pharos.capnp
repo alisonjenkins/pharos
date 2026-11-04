@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 13;
+const schemaVersion :UInt32 = 14;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -128,6 +128,9 @@ interface Session {
   # cropped square and re-encoded by the server; answers the new tag.
   setAvatar @11 (ctx :CallContext, image :Data) -> (result :AvatarResult);
   removeAvatar @12 (ctx :CallContext) -> (result :Done);
+  # Approves a pending Quick Connect code shown on another device, which then
+  # signs in as this user; an unknown or expired code answers notFound.
+  quickConnectAuthorize @13 (ctx :CallContext, code :Text) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
