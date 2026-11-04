@@ -1058,7 +1058,14 @@ fn write_synth_summary(
         .and_then(serde_json::Value::as_f64)
         .and_then(|r| tomatometer(r as f32))
     {
-        summary.init_critic_rating().set_some(score);
+        summary.reborrow().init_critic_rating().set_some(score);
+    }
+    if let Some(tenths) = dto
+        .get("PharosImdbRating")
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|r| imdb_tenths(r as f32))
+    {
+        summary.init_imdb_rating().set_some(tenths);
     }
 }
 
@@ -1136,8 +1143,21 @@ fn write_item(
         out.reborrow().init_parent_index_number().set_some(n);
     }
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
-        out.init_critic_rating().set_some(score);
+        out.reborrow().init_critic_rating().set_some(score);
     }
+    if let Some(tenths) = item.metadata.ratings.imdb.and_then(imdb_tenths) {
+        out.init_imdb_rating().set_some(tenths);
+    }
+}
+
+/// An IMDb score (0–10) in tenths; `None` outside 0–10.
+fn imdb_tenths(score: f32) -> Option<u16> {
+    let tenths = (score * 10.0).round();
+    if !(0.0..=100.0).contains(&tenths) {
+        tracing::debug!(imdb_rating = score, "IMDb rating outside 0-10 not sent");
+        return None;
+    }
+    Some(tenths as u16)
 }
 
 /// A stored `CriticRating` as a whole Tomatometer percentage; `None` for a
@@ -1216,8 +1236,23 @@ fn segment_kind(kind: &str) -> Option<SegmentKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tomatometer, BrowseLevel, RefusalReason};
+    use super::{imdb_tenths, tomatometer, BrowseLevel, RefusalReason};
     use crate::services::access::ItemHidden;
+
+    #[test]
+    fn an_imdb_score_goes_out_in_tenths_within_0_to_10() {
+        for (stored, sent) in [
+            (8.7, Some(87)),
+            (8.66, Some(87)),
+            (10.0, Some(100)),
+            (0.0, Some(0)),
+            (10.06, None),
+            (-0.1, None),
+            (f32::NAN, None),
+        ] {
+            assert_eq!(imdb_tenths(stored), sent, "{stored}");
+        }
+    }
 
     #[test]
     fn a_critic_rating_rounds_to_a_whole_percentage_within_0_to_100() {

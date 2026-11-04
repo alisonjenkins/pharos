@@ -320,6 +320,7 @@ fn summary(item: pharos_api::pharos_capnp::item_summary::Reader<'_>) -> serde_js
         "ParentIndexNumber": item.has_parent_index_number().then(|| opt32(item.get_parent_index_number().unwrap())).flatten(),
         "Primary": (!images.is_empty()).then(|| images.get(0).get_tag().unwrap().to_str().unwrap().to_owned()),
         "CriticRating": item.has_critic_rating().then(|| opt16(item.get_critic_rating().unwrap())).flatten(),
+        "ImdbRating": item.has_imdb_rating().then(|| opt16(item.get_imdb_rating().unwrap())).flatten(),
     })
 }
 
@@ -341,6 +342,10 @@ fn project(dtos: &[serde_json::Value]) -> Vec<serde_json::Value> {
                     .map(f64::round)
                     .filter(|r| (0.0..=100.0).contains(r))
                     .map(|r| r as u32),
+                "ImdbRating": d
+                    .get("PharosImdbRating")
+                    .and_then(|r| r.as_f64())
+                    .map(|r| (r * 10.0).round() as u32),
             })
         })
         .collect()
@@ -2642,4 +2647,85 @@ async fn letters_start_where_the_listing_pages_them() {
     let (letters, genres) = wire_index(&session, &tv, &[Kind::Series], "").await;
     assert_eq!(letters, [("M".to_owned(), 0), ("S".to_owned(), 1)]);
     assert_eq!(genres, ["Comedy"]);
+}
+
+/// B341/V281: a film's and a show's OMDb scores reach the native summary. A
+/// film's OMDb Tomatometer outranks its NFO critic score, and the show's
+/// scores, stored on its metadata row, reach its synthesised tile.
+/// Disarm check: with `write_item` skipping `imdbRating`, or `series_dto`
+/// leaving out `critic_rating`, the assertions fail.
+#[actix_web::test]
+async fn omdb_scores_reach_films_and_shows() {
+    use pharos_core::{
+        ExternalRatings, RatingsStore as _, RatingsTarget, SeriesMetadata, SeriesMetadataStore as _,
+    };
+    use pharos_jellyfin_api::dto::WireId;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let mut alpha = pharos_core::MediaStore::get(&fx.state.stores, 101)
+        .await
+        .unwrap();
+    alpha.metadata.critic_rating = Some(50.0);
+    pharos_core::MediaStore::put(&fx.state.stores, alpha)
+        .await
+        .unwrap();
+    let scores = ExternalRatings {
+        imdb: Some(8.7),
+        tomatometer: Some(83),
+    };
+    fx.state
+        .stores
+        .set_ratings(&RatingsTarget::Item(101), scores, 1_000)
+        .await
+        .unwrap();
+    let tv = seed_tv_library(&fx).await;
+    fx.state
+        .stores
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: "/libTV/Show".into(),
+            series_name: "Show".into(),
+            ..SeriesMetadata::default()
+        })
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .set_ratings(
+            &RatingsTarget::Series("/libTV/Show".into()),
+            ExternalRatings {
+                imdb: Some(9.5),
+                tomatometer: Some(96),
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+
+    let film = wire_detail(&session, WireId::Real(101)).await.unwrap();
+    assert_eq!(
+        (&film["ImdbRating"], &film["CriticRating"]),
+        (&87.into(), &83.into())
+    );
+    let (_, shows) = wire_query(
+        &session,
+        Some(&tv),
+        &[Kind::Series],
+        "SortName",
+        false,
+        "",
+        &[],
+        0,
+        50,
+    )
+    .await;
+    let show = shows.iter().find(|s| s["Name"] == "Show").unwrap();
+    assert_eq!(
+        (&show["ImdbRating"], &show["CriticRating"]),
+        (&95.into(), &96.into())
+    );
+    let mature = shows.iter().find(|s| s["Name"] == "Mature").unwrap();
+    assert!(mature["ImdbRating"].is_null() && mature["CriticRating"].is_null());
 }
