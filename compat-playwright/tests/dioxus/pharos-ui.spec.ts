@@ -1929,6 +1929,8 @@ test.describe("pharos Dioxus UI play queue", () => {
     await ask.getByRole("button", { name: "Clear queue" }).click();
     await expect(entries).toHaveCount(0);
     await expect(panel).toContainText("Nothing queued.");
+    // The dialog and Clear are gone; focus lands on Shuffle, not the body.
+    await expect(panel.getByRole("button", { name: "Shuffle" })).toBeFocused();
     await toggle.click();
     await expect(panel).toBeHidden();
   });
