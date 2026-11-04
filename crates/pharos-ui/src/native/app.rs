@@ -23,6 +23,7 @@ use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupView, Ui};
 use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
+use super::mixes::{self, ActiveMix, MixCtx};
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
@@ -707,6 +708,10 @@ fn NativeApp(route: Route) -> Element {
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
+    // The mix that is on keeps the queue topped up (spec 024, B441).
+    let mix = use_signal(|| None::<ActiveMix>);
+    use_context_provider(|| MixCtx(mix));
+    mixes::use_top_up(api, queue, mix);
     let nav = use_context::<Nav>();
     // The library buttons, read again for each signed-in API; a reconnect
     // keeps the last list until the new one arrives.
@@ -1356,6 +1361,7 @@ fn WatchScreen(id: ItemRef) -> Element {
     // rest of its album (B435/V375); once per song, as the screen remounts
     // per item.
     let queue = try_use_context::<QueueCtx>();
+    let mix_ctx = try_use_context::<MixCtx>();
     let mut seeded = use_signal(|| false);
     use_effect(move || {
         let read = near.read();
@@ -1379,6 +1385,9 @@ fn WatchScreen(id: ItemRef) -> Element {
             None if queue.peek().next() == Some(id) => None,
             None => return,
         };
+        // While a mix is on it decides what follows, not the song's album.
+        let mixing = mix_ctx.is_some_and(|m| m.0.peek().is_some());
+        let rest = if mixing { rest.map(|_| &[][..]) } else { rest };
         queue.write().started(id, rest, seed());
         let q = queue.peek();
         platform::info(&format!(
@@ -1823,6 +1832,7 @@ fn Player(
                 previous: near.previous,
                 next,
                 lyrics: lyrics.read().clone().flatten(),
+                playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),
                 on_queue: move |action: QueueAction| {
