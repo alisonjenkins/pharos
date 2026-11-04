@@ -707,16 +707,16 @@ input:focus-visible {
   z-index: 10;
   background: black; /* not themed: the letterbox around video is black in every theme */
 }
-body:has(.pharos-watch, .pharos-listen) {
+body:has(.pharos-stage.is-full) {
   overflow: hidden;
 }
 /* The shell under the player is out of sight, so out of the tab order and
    the accessibility tree too. */
-body:has(.pharos-watch, .pharos-listen) .pharos-shell {
+body:has(.pharos-stage.is-full) .pharos-shell {
   visibility: hidden;
 }
 /* A playback error stays readable over the picture. */
-body:has(.pharos-watch, .pharos-listen) .pharos-error {
+body:has(.pharos-stage.is-full) .pharos-error {
   position: fixed;
   top: 4rem;
   left: 50%;
@@ -2422,4 +2422,198 @@ body::before {
 .pharos-mix-problem {
   margin: 0;
   color: var(--px-color-danger);
+}
+
+/* The stage (spec 020): one player for the session. Full, it is the watch
+   page or the now-playing screen above. Elsewhere it is a floating window
+   the listener can drag anywhere, or a bar along the bottom; the media
+   element stays where it is and only these rules change. */
+.pharos-stage:not(.is-full) .pharos-watch-top,
+.pharos-stage:not(.is-full) .pharos-controls,
+.pharos-stage:not(.is-full) .pharos-skip,
+.pharos-stage:not(.is-full) .pharos-listen {
+  display: none;
+}
+.pharos-stage.is-floating {
+  --pharos-stage-w: min(20rem, 60vw);
+  --pharos-stage-h: calc(var(--pharos-stage-w) * 9 / 16 + 3.25rem + 3px);
+  position: fixed;
+  z-index: 20;
+  width: var(--pharos-stage-w);
+  height: var(--pharos-stage-h);
+  box-sizing: border-box;
+  /* The spot is a fraction of the room around the window, so it is always
+     in view; a window bigger than the viewport pins to the top-left. */
+  /* Percentages of the viewport less its scrollbars, as the drag measures. */
+  left: max(0px, calc((100% - var(--pharos-stage-w)) * var(--pharos-stage-x, 1)));
+  top: max(0px, calc((100% - var(--pharos-stage-h)) * var(--pharos-stage-y, 1)));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface-raised);
+  box-shadow: 0 0.75rem 2rem color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+}
+/* Music has no picture: the window is the strip alone. */
+.pharos-stage.is-floating:not(:has(.pharos-watch)) {
+  --pharos-stage-h: calc(3.25rem + 3px);
+}
+.pharos-stage.is-floating .pharos-watch,
+.pharos-stage.is-mini .pharos-watch {
+  position: static;
+  inset: auto;
+  z-index: auto;
+}
+.pharos-stage.is-floating .pharos-watch {
+  flex: 1;
+  min-height: 0;
+}
+.pharos-stage.is-floating .pharos-player,
+.pharos-stage.is-floating .pharos-video {
+  width: 100%;
+  height: 100%;
+}
+.pharos-stage.is-floating .pharos-video {
+  object-fit: contain;
+}
+.pharos-stage.is-floating .pharos-stage-bar {
+  order: 1;
+}
+.pharos-stage.is-mini {
+  position: fixed;
+  z-index: 20;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: stretch;
+  border-top: var(--px-border) solid var(--px-color-border);
+  background: var(--px-color-surface-raised);
+}
+/* The page keeps room for the bar, so it hides nothing. */
+body:has(.pharos-stage.is-mini) .pharos-main {
+  padding-bottom: calc(var(--px-gutter) + 4rem);
+}
+.pharos-stage.is-mini .pharos-watch {
+  order: -1;
+  flex: none;
+  width: 7rem;
+  aspect-ratio: 16 / 9;
+}
+.pharos-stage.is-mini .pharos-player,
+.pharos-stage.is-mini .pharos-video {
+  width: 100%;
+  height: 100%;
+}
+.pharos-stage.is-mini .pharos-stage-bar {
+  flex: 1;
+  min-width: 0;
+}
+.pharos-stage-bar {
+  display: flex;
+  flex-direction: column;
+  color: var(--px-color-fg);
+}
+.pharos-stage-strip {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-height: 3.25rem;
+  padding: 0.25rem 0.5rem;
+}
+.pharos-stage.is-floating .pharos-stage-strip {
+  cursor: grab;
+  /* A finger drag moves the window instead of scrolling the page. */
+  touch-action: none;
+  user-select: none;
+}
+.pharos-stage.is-floating .pharos-stage-strip:active {
+  cursor: grabbing;
+}
+.pharos-stage-strip:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+.pharos-stage-art {
+  flex: none;
+  width: 2.5rem;
+  height: 2.5rem;
+  object-fit: cover;
+  border-radius: calc(var(--px-radius) / 2);
+}
+.pharos-stage-text {
+  flex: 1;
+  min-width: 0;
+}
+.pharos-stage-title {
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+.pharos-stage-error {
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--px-color-fg-muted);
+  font-size: 0.85em;
+}
+.pharos-stage-transport,
+.pharos-stage-views {
+  display: flex;
+  flex: none;
+  align-items: center;
+}
+.pharos-stage-button {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.pharos-stage-button:hover:not(:disabled) {
+  background: var(--px-color-overlay);
+}
+.pharos-stage-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.pharos-stage-button:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+}
+.pharos-stage-play {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-stage-play:hover:not(:disabled) {
+  background: var(--px-color-accent);
+}
+.pharos-stage-progress {
+  height: 3px;
+  background: var(--px-color-overlay);
+}
+.pharos-stage-progress span {
+  display: block;
+  height: 100%;
+  background: var(--px-color-accent);
+}
+/* A narrow floating window keeps the transport and Full; the rest is in
+   the bar. */
+.pharos-stage.is-floating .pharos-stage-art {
+  display: none;
+}
+@media (max-width: 40rem) {
+  .pharos-stage.is-mini .pharos-stage-transport [aria-label="Previous"],
+  .pharos-stage.is-floating .pharos-stage-transport [aria-label="Previous"] {
+    display: none;
+  }
 }
