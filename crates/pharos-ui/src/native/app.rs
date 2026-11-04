@@ -30,9 +30,10 @@ use super::mixes::{self, ActiveMix, MixCtx};
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
-    parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
-    volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
-    ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
+    parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms,
+    styled_subtitle_url, subtitle_switch, volume_setting, Engine, MediaEvent, MediaState, OnFatal,
+    OnFragment, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch, CROSSFADE_KEY,
+    MAX_BITRATE_KEY, VOLUME_KEY,
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -2294,6 +2295,11 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    // An ASS subtitle drawn from its script (ADR-0057), and the pick it is
+    // for; its WebVTT stays on screen until the renderer is ready.
+    let styled = use_hook(|| Rc::new(RefCell::new(None::<platform::StyledSubtitles>)));
+    let styled_for = use_hook(|| Rc::new(Cell::new(0_u64)));
+    let mut styled_ready = use_signal(|| false);
     let StageCtx(stage) = use_context::<StageCtx>();
     // The view alone, so a drag (which moves the spot) does not redraw the
     // player.
@@ -2456,7 +2462,11 @@ fn Player(
     });
     use_drop({
         let (engine, stop) = (Rc::clone(&engine), stop.clone());
+        let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
         move || {
+            // A renderer still loading must not attach once the player is gone.
+            styled_for.set(styled_for.get().wrapping_add(1));
+            styled.borrow_mut().take();
             engine.borrow_mut().take();
             stop();
         }
@@ -2562,8 +2572,62 @@ fn Player(
     });
     // A burned subtitle is in the picture, not a text track.
     let burned = p.burned();
+    // The renderer calls back from worker events, outside the Dioxus runtime.
+    let styled_events = use_coroutine({
+        let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+        move |mut events: UnboundedReceiver<(u64, Result<(), String>)>| {
+            let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+            async move {
+                while let Some((pick, result)) = events.next().await {
+                    if pick != styled_for.get() {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => styled_ready.set(true),
+                        Err(e) => {
+                            platform::warn(&format!(
+                                "pharos: styled subtitles failed, showing plain text: {e}"
+                            ));
+                            styled.borrow_mut().take();
+                            styled_ready.set(false);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    use_effect({
+        let (p, styled, styled_for) = (Rc::clone(&p), Rc::clone(&styled), Rc::clone(&styled_for));
+        move || {
+            let shown = if burned { None } else { subtitle() };
+            let pick = styled_for.get().wrapping_add(1);
+            styled_for.set(pick);
+            styled.borrow_mut().take();
+            styled_ready.set(false);
+            let script = shown
+                .and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i))
+                .and_then(styled_subtitle_url);
+            let Some(url) = script else {
+                return;
+            };
+            let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+            spawn(async move {
+                let report: Rc<dyn Fn(Result<(), String>)> =
+                    Rc::new(move |result| styled_events.send((pick, result)));
+                match platform::styled_subtitles(VIDEO_ID, &url, Rc::clone(&report)).await {
+                    Ok(s) if styled_for.get() == pick => *styled.borrow_mut() = Some(s),
+                    Ok(_) => {}
+                    Err(e) => report(Err(e)),
+                }
+            });
+        }
+    });
     use_effect(move || {
-        let shown = if burned { None } else { subtitle() };
+        let shown = if burned || styled_ready() {
+            None
+        } else {
+            subtitle()
+        };
         let id = shown.map(text_track_id);
         platform::show_text_track(VIDEO_ID, id.as_deref());
     });
@@ -2643,8 +2707,13 @@ fn Player(
             }
             media.set(platform::media_state(VIDEO_ID));
             if event == MediaEvent::Changed && !burned {
-                // Text tracks load with the metadata; show the picked one.
-                let shown: Option<u32> = *subtitle.peek();
+                // Text tracks load with the metadata; show the picked one,
+                // unless its script is drawn instead.
+                let shown: Option<u32> = if *styled_ready.peek() {
+                    None
+                } else {
+                    *subtitle.peek()
+                };
                 let id = shown.map(text_track_id);
                 platform::show_text_track(VIDEO_ID, id.as_deref());
             }
