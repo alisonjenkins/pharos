@@ -112,6 +112,128 @@ async function signIn(browser: Browser, label: string) {
   return { context, page, lines };
 }
 
+/** Two signed-in browsers in one group on the seeded movie `file`. */
+async function startGroup(
+  browser: Browser,
+  request: APIRequestContext,
+  open: { context: BrowserContext; page: Page }[],
+  file: string,
+  opts: { subtitled?: boolean } = {},
+) {
+  const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+    headers: { Accept: "application/json" },
+  });
+  test.skip(
+    probe.status() !== 405,
+    `native API is not enabled (status ${probe.status()}); skipping native test`,
+  );
+  const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-together-${Date.now()}", Version="0"`,
+    },
+    data: { Username: TEST_USER, Pw: TEST_PASS },
+  });
+  test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+  const { AccessToken: token, User: user } = await auth.json();
+  const api = { "X-Emby-Token": token };
+  const movies = await (
+    await request.get(
+      `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+      { headers: api },
+    )
+  ).json();
+  const movie = movies.Items?.find((i: { Path?: string }) => i.Path?.endsWith(file));
+  test.skip(!movie, `pharos has no seeded ${file}`);
+  const nativeId = BigInt(`0x${movie.Id}`).toString();
+  if (opts.subtitled) {
+    // The startup rescan probes the fixture; its streams appear once it has.
+    await expect
+      .poll(
+        async () => {
+          const info = await request.post(`${PHAROS_URL}/Items/${movie.Id}/PlaybackInfo`, {
+            headers: api,
+            data: {},
+          });
+          return ((await info.json()).MediaSources?.[0]?.MediaStreams ?? []).filter(
+            (s: { Type: string }) => s.Type === "Subtitle",
+          ).length;
+        },
+        { message: `${file} has a probed subtitle stream`, timeout: 60_000 },
+      )
+      .toBeGreaterThan(0);
+  }
+
+  const a = await signIn(browser, "A");
+  open.push(a);
+  const b = await signIn(browser, "B");
+  open.push(b);
+  const logs = () => [...a.lines, ...b.lines].join("\n");
+  // Groups another test or an earlier try left are not A's.
+  const before = new Set(await listedGroups(request, api));
+
+  // A starts a group on the title and lands on the watch page as its member.
+  await a.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
+  await a.page.getByRole("button", { name: "Watch together" }).click();
+  await expect(a.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
+  await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+
+  // B follows the invite link and joins.
+  let groupId = "";
+  await expect
+    .poll(
+      async () => {
+        const made = (await listedGroups(request, api)).filter((g) => !before.has(g));
+        groupId = made[0] ?? "";
+        return made.length;
+      },
+      { message: "A's group is listed", timeout: 10_000 },
+    )
+    .toBe(1);
+  await b.page.goto(`${PHAROS_URL}/ui/together/${groupId.toLowerCase()}`);
+  await b.page.getByRole("button", { name: "Join" }).click();
+  await expect(b.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
+  await expect(b.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+  // Both see both members.
+  for (const p of [a.page, b.page]) {
+    await expect(p.locator(".pharos-member-list li")).toHaveCount(2, {
+      timeout: 15_000,
+    });
+  }
+  const people = [new Member("A", a.page), new Member("B", b.page)];
+  return { a, b, people, logs };
+}
+
+/** A failed step's error: its message, both pages' text and the browser logs. */
+async function failure(e: unknown, a: { page: Page }, b: { page: Page }, logs: () => string) {
+  const dom = async (p: Page) => p.locator("body").innerText().catch(() => "(no page)");
+  return new Error(
+    `${(e as Error).message}\n--- A page ---\n${await dom(a.page)}\n--- B page ---\n${await dom(b.page)}\n--- browser logs ---\n${logs()}`,
+  );
+}
+
+/**
+ * Pick `value` in `page`'s select named `name` until `landed` holds. A pick
+ * is a group command, lost if it is sent before the page has wired its player
+ * to the group, so it is sent again rather than waited on forever.
+ */
+async function pickUntil(
+  page: Page,
+  name: string,
+  value: string,
+  landed: () => Promise<unknown>,
+) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await page.getByRole("combobox", { name, exact: true }).selectOption(value);
+    const took = await landed().then(
+      () => true,
+      () => false,
+    );
+    if (took) return;
+  }
+  throw new Error(`"${name}" never took ${value}`);
+}
+
 test.describe("pharos Dioxus UI watch together", () => {
   // Each try's browsers, so afterEach leaves the group even when the test
   // fails. A group left behind would show in the next try's list (retries
@@ -134,74 +256,8 @@ test.describe("pharos Dioxus UI watch together", () => {
 
   test("two browsers play, pause and seek in step", async ({ browser, request }) => {
     test.setTimeout(150_000);
-    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
-      headers: { Accept: "application/json" },
-    });
-    test.skip(
-      probe.status() !== 405,
-      `native API is not enabled (status ${probe.status()}); skipping native test`,
-    );
-    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-together-${Date.now()}", Version="0"`,
-      },
-      data: { Username: TEST_USER, Pw: TEST_PASS },
-    });
-    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
-    const { AccessToken: token, User: user } = await auth.json();
-    const api = { "X-Emby-Token": token };
-    const movies = await (
-      await request.get(
-        `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
-        { headers: api },
-      )
-    ).json();
-    const movie = movies.Items?.find((i: { Path?: string }) =>
-      i.Path?.endsWith("/fixture-1.webm"),
-    );
-    test.skip(!movie, "pharos has no seeded movie");
-    const nativeId = BigInt(`0x${movie.Id}`).toString();
-
-    const a = await signIn(browser, "A");
-    open.push(a);
-    const b = await signIn(browser, "B");
-    open.push(b);
-    const logs = () => [...a.lines, ...b.lines].join("\n");
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm");
     try {
-      // Groups another test or an earlier try left are not A's.
-      const before = new Set(await listedGroups(request, api));
-
-      // A starts a group on the title and lands on the watch page as its member.
-      await a.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
-      await a.page.getByRole("button", { name: "Watch together" }).click();
-      await expect(a.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
-      await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
-
-      // B follows the invite link and joins.
-      let groupId = "";
-      await expect
-        .poll(
-          async () => {
-            const made = (await listedGroups(request, api)).filter((g) => !before.has(g));
-            groupId = made[0] ?? "";
-            return made.length;
-          },
-          { message: "A's group is listed", timeout: 10_000 },
-        )
-        .toBe(1);
-      await b.page.goto(`${PHAROS_URL}/ui/together/${groupId.toLowerCase()}`);
-      await b.page.getByRole("button", { name: "Join" }).click();
-      await expect(b.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
-      await expect(b.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
-      // Both see both members.
-      for (const p of [a.page, b.page]) {
-        await expect(p.locator(".pharos-member-list li")).toHaveCount(2, {
-          timeout: 15_000,
-        });
-      }
-
-      const people = [new Member("A", a.page), new Member("B", b.page)];
       const [byA] = people;
 
       // The group starts by itself once both members are ready.
@@ -230,11 +286,75 @@ test.describe("pharos Dioxus UI watch together", () => {
       const target = (await people[0].probe()).currentTime * 1000;
       await assertSeekConverged(people, target);
     } catch (e) {
-      const dom = async (p: Page) =>
-        p.locator("body").innerText().catch(() => "(no page)");
-      throw new Error(
-        `${(e as Error).message}\n--- A page ---\n${await dom(a.page)}\n--- B page ---\n${await dom(b.page)}\n--- browser logs ---\n${logs()}`,
+      throw await failure(e, a, b, logs);
+    }
+  });
+
+  // 014 US7 and US8 (T042). 07-test-subtitles.webm carries one audio track and
+  // one English WebVTT subtitle; fixture-1.webm has neither a second audio nor
+  // any subtitle, so the group's pick would have nothing to land on there.
+  test("the group's activity and subtitle pick reach B, unless B is on their own tracks", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(150_000);
+    const { a, b, people, logs } = await startGroup(
+      browser,
+      request,
+      open,
+      "/07-test-subtitles.webm",
+      { subtitled: true },
+    );
+    try {
+      const [byA] = people;
+      await waitUntilInSync(people);
+
+      // A pauses; B's page says so, naming the member (both browsers sign in
+      // as the same user, so the name is that user's).
+      await toggleUntil(byA, true);
+      await expect(b.page.locator(".pharos-activity-line").last()).toHaveText(
+        new RegExp(`^${TEST_USER} paused at \\d+:\\d\\d$`),
+        { timeout: 10_000 },
       );
+
+      // A picks the subtitle; the group moves B's picker with it.
+      const subtitles = (p: Page) => p.getByRole("combobox", { name: "Subtitles", exact: true });
+      const track = await subtitles(a.page).locator("option").nth(1).getAttribute("value");
+      expect(track, "a subtitle track is offered").toMatch(/^\d+$/);
+      await expect(subtitles(b.page)).toHaveValue("off");
+      await pickUntil(a.page, "Subtitles", track!, () =>
+        expect(subtitles(b.page)).toHaveValue(track!, { timeout: 5_000 }),
+      );
+      await expect(subtitles(a.page)).toHaveValue(track!);
+      await expect(b.page.locator(".pharos-activity-line").last()).toContainText(
+        "turned subtitles to",
+      );
+
+      // B takes "Just me"; A's strip marks B.
+      await pickUntil(b.page, "Tracks", "me", () =>
+        expect(a.page.locator(".pharos-activity-line").last()).toHaveText(
+          /is on their own tracks$/,
+          { timeout: 5_000 },
+        ),
+      );
+      await expect(b.page.getByRole("combobox", { name: "Tracks", exact: true })).toHaveValue("me");
+
+      // A turns subtitles off. B hears it (its page says so) and keeps its own.
+      await pickUntil(a.page, "Subtitles", "off", () =>
+        expect(b.page.locator(".pharos-activity-line").last()).toHaveText(
+          /turned subtitles off$/,
+          { timeout: 5_000 },
+        ),
+      );
+      await expect(subtitles(a.page)).toHaveValue("off");
+      await expect(subtitles(b.page)).toHaveValue(track!);
+
+      // Back on "Follow group": B takes the group's pick (off) again.
+      await pickUntil(b.page, "Tracks", "follow", () =>
+        expect(subtitles(b.page)).toHaveValue("off", { timeout: 5_000 }),
+      );
+    } catch (e) {
+      throw await failure(e, a, b, logs);
     }
   });
 });
