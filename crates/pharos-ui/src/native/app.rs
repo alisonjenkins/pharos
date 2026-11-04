@@ -2251,6 +2251,17 @@ fn Player(
                             to.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
                         subtitle_switch(p.burned(), track) == SubtitleSwitch::Renegotiate
                     });
+                    let verdict = if audio.is_some() || burn {
+                        "renegotiate"
+                    } else if to.is_some() {
+                        "in_place"
+                    } else {
+                        "none"
+                    };
+                    platform::info(&format!(
+                        "pharos: group tracks player verdict={verdict} audio_pick={:?} playing={:?} asked={:?} subtitle_to={to:?} burn={burn}",
+                        picks.audio, p.audio, p.asked_audio
+                    ));
                     if audio.is_some() || burn {
                         on_renegotiate.call(TrackPicks {
                             audio: audio

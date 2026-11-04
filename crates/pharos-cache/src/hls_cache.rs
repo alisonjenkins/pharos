@@ -5291,6 +5291,23 @@ mod tests {
     /// finds the record by its suffix rather than by reconstructing the name —
     /// which also means a sidecar written to the WRONG place still fails the
     /// assertion it is supposed to satisfy.
+    /// Every file under `root`, at any depth, whose name ends with `suffix`.
+    fn files_ending_with(root: &Path, suffix: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                found.extend(files_ending_with(&p, suffix));
+            } else if p.to_string_lossy().ends_with(suffix) {
+                found.push(p);
+            }
+        }
+        found
+    }
+
     fn provenance_files(root: &Path) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -7136,11 +7153,7 @@ mod tests {
             (got_end - window_end).abs() < 1e-6,
             "the filler must end at the window end {window_end:.6}s, got {got_end:.6}s"
         );
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
-            .collect();
+        let leftovers = files_ending_with(&dir.path().join("cache"), ".partial");
         assert!(leftovers.is_empty(), "partial left behind: {leftovers:?}");
     }
 

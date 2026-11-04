@@ -196,6 +196,8 @@ pub fn SeenDots(rows: Vec<SeenRow>) -> Element {
                     key: "{row.member_id}",
                     class: "pharos-seen-dot {row.mark.state()}",
                     title: "{row.name}: {row.mark.label()}",
+                    role: "img",
+                    aria_label: "{row.name}: {row.mark.label()}",
                     "{initial(&row.name)}"
                 }
             }
