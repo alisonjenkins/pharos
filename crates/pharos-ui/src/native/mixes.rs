@@ -242,15 +242,17 @@ pub fn status_text(mix: &ActiveMix) -> Option<String> {
 /// Edit and Stop, or a Mix button that opens the picker.
 #[component]
 pub fn MixBar(playing: Option<ItemRef>) -> Element {
+    // Every hook runs before the early return, so the hook order never
+    // depends on which contexts are present.
+    let ctx = try_use_context::<Ctx>();
+    let mut open = use_signal(|| false);
+    let mut editing = use_signal(|| None::<SavedMix>);
+    let mut saved = use_signal(|| None::<Vec<SavedMix>>);
     let (Some(MixCtx(mut mix)), Some(QueueCtx(mut queue))) =
         (try_use_context::<MixCtx>(), try_use_context::<QueueCtx>())
     else {
         return rsx! {};
     };
-    let ctx = try_use_context::<Ctx>();
-    let mut open = use_signal(|| false);
-    let mut editing = use_signal(|| None::<SavedMix>);
-    let mut saved = use_signal(|| None::<Vec<SavedMix>>);
     let load = move || {
         if saved.peek().is_some() {
             return;
