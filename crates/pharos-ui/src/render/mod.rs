@@ -22,6 +22,12 @@ const TIME_WRAP_S: f64 = 3600.0;
 pub trait Surface {
     /// Draw one frame, sizing the canvas to its box first.
     fn draw(&mut self, frame: &Frame<'_>) -> Result<(), Fallback>;
+
+    /// Whether the surface needs drawing even though nothing on screen
+    /// changed, as while it waits out or recovers from a lost context.
+    fn needs_frame(&self) -> bool {
+        false
+    }
 }
 
 /// What a shader gets for one frame.
@@ -95,7 +101,7 @@ pub enum Fallback {
     ReducedMotion,
     /// No WebGL2 context, or no browser at all.
     NoWebgl2,
-    /// The GPU dropped the context; the page does not try to restore it.
+    /// The GPU dropped the context and did not give it back in time.
     ContextLost,
     /// A catalogue shader failed to compile or link on this GPU.
     Shader(String),
