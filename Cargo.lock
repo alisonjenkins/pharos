@@ -4191,6 +4191,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "quire-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "quire",
+ "thiserror",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "zip",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6402,6 +6415,7 @@ dependencies = [
  "aho-corasick",
  "base64 0.22.1",
  "bitflags",
+ "bytemuck",
  "byteorder",
  "bytes",
  "cc",
@@ -6433,9 +6447,11 @@ dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
  "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "hyper",
  "indexmap",
  "itertools 0.13.0",
+ "js-sys",
  "libc",
  "libsqlite3-sys",
  "linux-raw-sys",
@@ -6464,6 +6480,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha2 0.11.1",
  "simd-adler32",
+ "simdutf8",
  "slab",
  "smallvec",
  "socket2 0.6.5",
@@ -6485,7 +6502,11 @@ dependencies = [
  "tracing",
  "tracing-core",
  "typenum",
+ "wasm-bindgen",
+ "web-sys",
+ "yoke",
  "zerocopy",
+ "zerofrom",
  "zip",
  "zlib-rs",
 ]

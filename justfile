@@ -86,6 +86,19 @@ hakari-regen:
 
 # P53 — fail the build if workspace-hack is stale. CI runs this so
 # a dep change without a regenerate is caught before merge.
+# 023 V352 (DOM half): build the quire-web harness for wasm32 and check in
+# headless Chromium that a reading position survives a font and window change.
+quire-web-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${CARGO_TARGET_DIR:-target}"
+    out="$(mktemp -d)"
+    nix develop --command cargo build --release -p quire-web --example harness --target wasm32-unknown-unknown
+    nix develop --command wasm-bindgen --target web --no-typescript --out-dir "$out/pkg" --out-name harness \
+        "$target/wasm32-unknown-unknown/release/examples/harness.wasm"
+    cp crates/quire-web/examples/harness/index.html "$out/"
+    nix develop --command bash -c "cd compat-playwright && npm ci --no-audit --no-fund >/dev/null && node ../crates/quire-web/examples/harness/check.mjs '$out'"
+
 hakari-check:
     nix develop --command cargo hakari generate --diff
     nix develop --command cargo hakari verify
