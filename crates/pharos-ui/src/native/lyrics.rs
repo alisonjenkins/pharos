@@ -5,8 +5,8 @@
 //!
 //! Karaoke mode (B483/V427), when the listener turns it on: the line being
 //! sung is drawn large and filled in from left to right as it is sung. LRC
-//! times lines, not words, so the fill runs evenly from a line's start to
-//! the next line's.
+//! times lines, not words, so the fill runs across each word by its
+//! syllables and ends early when a pause follows.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -30,6 +30,11 @@ const HOLD_MS: f64 = 4_000.0;
 /// How long the last line fills for, having no next line to end at.
 const LAST_LINE_MS: u64 = 5_000;
 
+/// The longest a sung syllable is assumed to take; a line whose next line is
+/// further off than its syllables need is taken to end early, leaving the
+/// rest as a pause.
+const SYLLABLE_MS: u64 = 700;
+
 /// The index of the line being sung at `position_ms`: the last line that has
 /// started. `None` before the first line.
 pub fn current_line(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
@@ -43,9 +48,45 @@ pub fn current_line(lyrics: &Lyrics, position_ms: u64) -> Option<usize> {
         .checked_sub(1)
 }
 
-/// How far through line `i` the singer is at `position_ms`, in percent: 0
-/// at its start, 100 at the next line's start (or [`LAST_LINE_MS`] later
-/// for the last line).
+/// About how many syllables `word` is sung in: its groups of vowels, less a
+/// silent final "e". Words with no Latin letters count a syllable a character.
+fn syllables(word: &str) -> u32 {
+    let mut groups = 0u32;
+    let mut in_vowels = false;
+    let mut prev_letter = None::<char>;
+    let mut last_letter = None::<char>;
+    for c in word.chars() {
+        if matches!(c, '\'' | '’') {
+            continue;
+        }
+        if c.is_alphabetic() && (c as u32) < 0x250 {
+            let lower = c.to_lowercase().next().unwrap_or(c);
+            let is_vowel = "aeiouyàáâãäåæèéêëìíîïòóôõöøùúûüýÿœ".contains(lower);
+            if is_vowel && !in_vowels {
+                groups += 1;
+            }
+            in_vowels = is_vowel;
+            prev_letter = last_letter;
+            last_letter = Some(lower);
+        } else {
+            in_vowels = false;
+        }
+    }
+    if last_letter.is_none() {
+        return u32::try_from(word.chars().count())
+            .unwrap_or(u32::MAX)
+            .max(1);
+    }
+    if groups > 1 && last_letter == Some('e') && prev_letter != Some('l') {
+        groups -= 1;
+    }
+    groups.max(1)
+}
+
+/// How far through line `i` the singer is at `position_ms`, in percent: 0 at
+/// its start, weighted across its words by syllable count, and reaching 100
+/// at the next line's start (or [`LAST_LINE_MS`] later for the last line) or
+/// after [`SYLLABLE_MS`] per syllable when a pause follows.
 pub fn line_progress(lyrics: &Lyrics, i: usize, position_ms: u64) -> f64 {
     let Some(line) = lyrics.lines.get(i) else {
         return 0.0;
@@ -53,15 +94,61 @@ pub fn line_progress(lyrics: &Lyrics, i: usize, position_ms: u64) -> f64 {
     let end = lyrics
         .lines
         .get(i + 1)
-        .map_or(line.start_ms + LAST_LINE_MS, |l| l.start_ms);
+        .map_or(line.start_ms.saturating_add(LAST_LINE_MS), |l| l.start_ms);
     let span = end.saturating_sub(line.start_ms);
     if span == 0 {
         return 100.0;
     }
-    // Lines are seconds long, so these fit an f64 exactly.
+    let mut words = Vec::new();
+    let mut in_word = None::<(usize, usize, usize)>;
+    let mut char_count = 0usize;
+    for (idx, (byte_idx, ch)) in line.text.char_indices().enumerate() {
+        char_count = idx + 1;
+        if ch.is_whitespace() {
+            if let Some((start_byte, offset, len)) = in_word.take() {
+                let s = syllables(&line.text[start_byte..byte_idx]);
+                words.push((offset, len, s));
+            }
+        } else if let Some((_, _, len)) = &mut in_word {
+            *len += 1;
+        } else {
+            in_word = Some((byte_idx, idx, 1));
+        }
+    }
+    if let Some((start_byte, offset, len)) = in_word {
+        let s = syllables(&line.text[start_byte..]);
+        words.push((offset, len, s));
+    }
+    if words.is_empty() {
+        // Lines are seconds long, so these fit an f64 exactly.
+        #[allow(clippy::cast_precision_loss)]
+        let done = position_ms.saturating_sub(line.start_ms) as f64 / span as f64;
+        return (done * 100.0).clamp(0.0, 100.0);
+    }
+    let total: u64 = words.iter().map(|&(_, _, s)| u64::from(s)).sum();
+    let sung = span.min(total.saturating_mul(SYLLABLE_MS));
+    // Lines and syllable counts are small, so these fit an f64 exactly.
     #[allow(clippy::cast_precision_loss)]
-    let done = position_ms.saturating_sub(line.start_ms) as f64 / span as f64;
-    (done * 100.0).clamp(0.0, 100.0)
+    let (char_pos, chars) = {
+        let t = (position_ms.saturating_sub(line.start_ms) as f64 / sung as f64).clamp(0.0, 1.0);
+        let w = t * total as f64;
+        if w >= total as f64 {
+            return 100.0;
+        }
+        let mut cum = 0.0;
+        let mut pos = char_count as f64;
+        for &(offset, len, s) in &words {
+            let s_f = f64::from(s);
+            if w <= cum + s_f {
+                let f = (w - cum) / s_f;
+                pos = offset as f64 + f * len as f64;
+                break;
+            }
+            cum += s_f;
+        }
+        (pos, char_count as f64)
+    };
+    (char_pos / chars * 100.0).clamp(0.0, 100.0)
 }
 
 #[component]
@@ -195,6 +282,19 @@ mod tests {
         }
     }
 
+    fn synced_lines(lines: &[(u64, &str)]) -> Lyrics {
+        Lyrics {
+            synced: true,
+            lines: lines
+                .iter()
+                .map(|&(start_ms, text)| LyricLine {
+                    start_ms,
+                    text: text.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn the_current_line_is_the_last_one_started_a_little_early() {
         let l = synced(&[1_000, 3_000, 5_000]);
@@ -209,12 +309,62 @@ mod tests {
     fn a_line_fills_from_its_start_to_the_next_lines() {
         let l = synced(&[1_000, 3_000, 5_000]);
         assert!((line_progress(&l, 0, 0) - 0.0).abs() < f64::EPSILON);
-        assert!((line_progress(&l, 0, 2_000) - 50.0).abs() < 1e-9);
+        // "line 0" has 2 syllables (sung = 1400 ms) and 6 chars; 700 ms in finishes "line" (4/6).
+        assert!((line_progress(&l, 0, 1_700) - 4.0 / 6.0 * 100.0).abs() < 1e-9);
         assert!((line_progress(&l, 0, 9_000) - 100.0).abs() < f64::EPSILON);
-        // The last line has no next one, so it fills over LAST_LINE_MS.
-        assert!((line_progress(&l, 2, 5_000 + LAST_LINE_MS / 2) - 50.0).abs() < 1e-9);
+        // The last line has no next one; 2 syllables cap its fill at 1400 ms (700 ms -> 4/6).
+        assert!((line_progress(&l, 2, 5_700) - 4.0 / 6.0 * 100.0).abs() < 1e-9);
         // Two lines at one time: the first is already done.
         assert!((line_progress(&synced(&[0, 0]), 0, 0) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn syllables_are_vowel_groups() {
+        assert_eq!(syllables("the"), 1);
+        assert_eq!(syllables("make"), 1);
+        assert_eq!(syllables("table"), 2);
+        assert_eq!(syllables("running"), 2);
+        assert_eq!(syllables("Honey"), 2);
+        assert_eq!(syllables("café"), 2);
+        assert_eq!(syllables("résumé"), 3);
+        assert_eq!(syllables("ma'am"), 1);
+        assert_eq!(syllables("don't"), 1);
+        assert_eq!(syllables("make,"), 1);
+        assert_eq!(syllables("♪"), 1);
+        assert_eq!(syllables("夜空"), 2);
+    }
+
+    #[test]
+    fn long_words_take_longer_to_fill() {
+        let l = synced_lines(&[(0, "a wonderful"), (10_000, "next")]);
+        // 1 + 3 = 4 syllables, sung = 2800 ms, 11 chars; 700 ms finishes "a" (1/11).
+        assert!((line_progress(&l, 0, 700) - 1.0 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 2_800) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_pause_after_the_line_does_not_slow_the_fill() {
+        let l = synced_lines(&[(0, "one two"), (20_000, "next")]);
+        // 2 syllables, sung = 1400 ms, 7 chars; 700 ms finishes "one" (3/7).
+        assert!((line_progress(&l, 0, 700) - 3.0 / 7.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 1_400) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_line_sung_faster_than_the_cap_fills_to_the_next_line() {
+        let l = synced_lines(&[(0, "one two three four"), (2_000, "next")]);
+        // 4 syllables * 700 ms = 2800 > 2000, so sung = 2000 ms, 18 chars; 1000 ms finishes "two" (7/18).
+        assert!((line_progress(&l, 0, 1_000) - 7.0 / 18.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 2_000) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_long_last_line_fills_over_last_line_ms() {
+        let l = synced_lines(&[(0, "one two three four five six seven eight")]);
+        // 9 syllables ("seven" is two) * 700 ms = 6300 > 5000, so sung = 5000 ms,
+        // 39 chars; 2500 ms is 4.5 syllables, halfway through "five" (21/39).
+        assert!((line_progress(&l, 0, 2_500) - 21.0 / 39.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 5_000) - 100.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -280,11 +430,12 @@ mod tests {
     #[test]
     fn karaoke_fills_only_the_line_being_sung() {
         let l = synced(&[1_000, 3_000, 5_000]);
-        // 2 s in plus the 200 ms lead is 60% of the first line.
-        let html = render_as(l.clone(), 2_000, true);
+        // 1800 ms + 200 ms lead = 1000 ms into "line 0" (sung = 1400 ms):
+        // w = 10/7 syllables -> 3/7 through "0", char 5.43 of 6 = 90.5%.
+        let html = render_as(l.clone(), 1_800, true);
         assert!(html.contains(r#"data-karaoke="true""#), "{html}");
         assert_eq!(html.matches("pharos-lyrics-words").count(), 1, "{html}");
-        assert!(html.contains("--pharos-wipe: 60.0%"), "{html}");
+        assert!(html.contains("--pharos-wipe: 90.5%"), "{html}");
         // The last frame before the next line takes over shows it full.
         let edge = render_as(l.clone(), 3_000 - LEAD_MS - 1, true);
         assert!(edge.contains("--pharos-wipe: 100.0%"), "{edge}");
