@@ -2221,6 +2221,9 @@ fn Player(
     // Handing over: the song is done with, so nothing it does is reported
     // or acted on any more.
     let retiring = use_hook(|| Rc::new(Cell::new(false)));
+    // The automatic quality has decided; one decision per video, whichever
+    // path (fragment or media event) reaches it first.
+    let decided = use_hook(|| Rc::new(Cell::new(false)));
     // The crossfade into the next song has begun (or there is none to make).
     let crossfading = use_hook(|| Rc::new(Cell::new(false)));
     // This song has handed the stage to the next under a crossfade: it plays
@@ -2438,8 +2441,7 @@ fn Player(
         }
     });
     let assess: Rc<dyn Fn()> = {
-        let (watch, retiring) = (watch.clone(), Rc::clone(&retiring));
-        let decided = Rc::new(Cell::new(false));
+        let (watch, retiring, decided) = (watch.clone(), Rc::clone(&retiring), Rc::clone(&decided));
         Rc::new(move || {
             if !auto || retiring.get() || decided.get() {
                 return;
