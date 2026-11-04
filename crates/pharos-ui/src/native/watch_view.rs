@@ -15,7 +15,7 @@ use super::playback::{
 };
 use super::seen::SeenRow;
 use super::together::Member;
-use super::together_view::MemberStrip;
+use super::together_view::{ActivityToast, MemberStrip};
 
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
@@ -152,7 +152,24 @@ pub fn WatchView(
     /// the group's play.
     #[props(default = true)]
     autoplay: bool,
+    /// Whether this member is off the group's tracks ("Just me").
+    #[props(default)]
+    own_tracks: bool,
+    /// Follow group (`false`) or Just me (`true`), picked in the track menus.
+    #[props(default)]
+    on_own_tracks: EventHandler<bool>,
+    /// Ids of the group members off the group's tracks, for the strip.
+    #[props(default)]
+    own_track_members: Vec<String>,
+    /// The activity log's lines, for the strip.
+    #[props(default)]
+    activity: Vec<String>,
+    /// The activity line to show over the video now, if any.
+    #[props(default)]
+    toast: Option<String>,
 ) -> Element {
+    // TODO(T040, T041): GroupSession wiring feeds own_tracks, activity and toast.
+    let in_group = !members.is_empty();
     let c = &controls;
     let total = c.total_ms();
     let media = c.media;
@@ -290,9 +307,10 @@ pub fn WatchView(
                         Icon { path: ICON_FLOAT }
                     }
                     if !members.is_empty() {
-                        MemberStrip { members, on_leave, seen }
+                        MemberStrip { members, on_leave, seen, own_tracks: own_track_members, activity }
                     }
                 }
+                ActivityToast { line: toast }
                 if let Some(seg) = skip {
                     button {
                         class: "pharos-skip",
@@ -334,6 +352,7 @@ pub fn WatchView(
                         }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
+                        TrackMode { in_group, own_tracks, on_change: on_own_tracks }
                         TrackPicker {
                             label: "Audio",
                             tracks: c.audio.clone(),
@@ -505,6 +524,28 @@ pub(super) fn Volume(
 
 /// A `<select>` of tracks; nothing at all for an item with one audio track
 /// or no subtitles.
+/// "Follow group" or "Just me" for the track menus. Only in a group.
+#[component]
+fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) -> Element {
+    if !in_group {
+        return rsx! {};
+    }
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-track-mode",
+            aria_label: "Tracks",
+            title: "Tracks",
+            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            onchange: move |evt: FormEvent| {
+                on_change.call(evt.value() == "me");
+                platform::focus_by_id(PLAYER_ID);
+            },
+            option { value: "follow", selected: !own_tracks, "Follow group" }
+            option { value: "me", selected: own_tracks, "Just me" }
+        }
+    }
+}
+
 #[component]
 fn TrackPicker(
     label: &'static str,
@@ -713,6 +754,8 @@ pub fn wheel_control(notches: i32, shift: bool, media: MediaState) -> Option<Con
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use pharos_client::api::SegmentKind;
 
     use super::*;
@@ -907,6 +950,87 @@ mod tests {
         };
         assert!(render_with(true).contains("autoplay"));
         assert!(!render_with(false).contains("autoplay"));
+    }
+
+    fn render_group(in_group: bool, own_tracks: bool, toast: Option<String>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            move |(in_group, own_tracks, toast): (bool, bool, Option<String>)| {
+                let members = if in_group {
+                    vec![Member {
+                        id: "a".into(),
+                        name: "Ada".into(),
+                        buffering: false,
+                    }]
+                } else {
+                    vec![]
+                };
+                rsx! {
+                    WatchView {
+                        title: "Pilot",
+                        controls: controls(),
+                        on_media: |_| {},
+                        on_control: |_| {},
+                        members,
+                        own_tracks,
+                        toast,
+                    }
+                }
+            },
+            (in_group, own_tracks, toast),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_track_menus_offer_follow_or_just_me_only_in_a_group() {
+        let alone = render_group(false, false, None);
+        assert!(
+            !alone.contains("Follow group") && !alone.contains("Just me"),
+            "{alone}"
+        );
+        let following = render_group(true, false, None);
+        assert!(
+            following.contains("Follow group") && following.contains("Just me"),
+            "{following}"
+        );
+    }
+
+    #[test]
+    fn the_selected_choice_follows_own_tracks() {
+        let selected = |html: &str, value: &str| {
+            let tag = format!(r#"value="{value}""#);
+            let after = html.split_once(tag.as_str()).expect("option").1;
+            after
+                .split('>')
+                .next()
+                .unwrap_or_default()
+                .contains("selected")
+        };
+        let following = render_group(true, false, None);
+        assert!(
+            selected(&following, "follow") && !selected(&following, "me"),
+            "{following}"
+        );
+        let own = render_group(true, true, None);
+        assert!(selected(&own, "me") && !selected(&own, "follow"), "{own}");
+    }
+
+    #[test]
+    fn the_toast_is_outside_the_chrome_that_idles() {
+        let html = render_group(true, false, Some("Sam paused at 12:04".into()));
+        let toast = html
+            .find(r#"<div class="pharos-activity-toast""#)
+            .expect("toast rendered");
+        let top = html.find(r#"class="pharos-watch-top""#).expect("top bar");
+        let controls = html.find(r#"class="pharos-controls""#).expect("controls");
+        assert!(top < toast && toast < controls, "{html}");
+        let between = &html[top..toast];
+        assert!(
+            between.matches("</div>").count() > between.matches("<div").count(),
+            "toast inside the top bar: {html}"
+        );
+        assert!(!render_group(true, false, None).contains("pharos-activity-toast"));
     }
 
     #[test]

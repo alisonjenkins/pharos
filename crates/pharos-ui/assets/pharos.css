@@ -799,6 +799,11 @@ body:has(.pharos-stage.is-full) .pharos-error {
 }
 /* A sibling of the chrome, not inside it: the .is-idle rule below fades
    .pharos-watch-top and .pharos-controls, and this stays up. */
+.pharos-track-mode {
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
 .pharos-activity-toast {
   position: absolute;
   left: 50%;
