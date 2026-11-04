@@ -697,6 +697,65 @@ input:focus-visible {
   line-height: 1.5;
 }
 
+/* Cast: a row of round photos that scrolls sideways on its own, so a long
+   cast never widens the page. */
+.pharos-cast {
+  margin-top: 2rem;
+}
+.pharos-cast h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+.pharos-cast-list {
+  display: flex;
+  gap: 1rem;
+  margin: 0;
+  padding: 0 0 0.5rem;
+  list-style: none;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+.pharos-cast-member {
+  flex: 0 0 7rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  min-width: 0;
+}
+.pharos-cast-photo {
+  width: 6rem;
+  height: 6rem;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--px-color-surface);
+  margin-bottom: 0.5rem;
+}
+.pharos-cast-initials {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.75rem;
+  font-weight: 600;
+  color: var(--px-color-fg-muted);
+  user-select: none;
+}
+.pharos-cast-name,
+.pharos-cast-character {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pharos-cast-name {
+  font-weight: 600;
+}
+.pharos-cast-character {
+  color: var(--px-color-fg-muted);
+  font-size: 0.9rem;
+}
+
 @media (max-width: 40rem) {
   .pharos-title {
     flex-direction: column;
