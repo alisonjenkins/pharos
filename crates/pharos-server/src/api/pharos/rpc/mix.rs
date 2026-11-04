@@ -54,6 +54,21 @@ fn read_rule(r: mix_rule::Reader<'_>) -> Result<Result<Rule, BadField>, capnp::E
             Test::Length { min_s, max_s }
         }
         Ok(T::LikeSeed(())) => Test::LikeSeed,
+        Ok(T::TempoBpm(m)) => {
+            let (min, max) = range(m?);
+            Test::Tempo {
+                min: u16_of(min),
+                max: u16_of(max),
+            }
+        }
+        Ok(T::Energy(m)) => {
+            let (min, max) = range(m?);
+            let pct = |v: u32| u8::try_from(v).unwrap_or(u8::MAX);
+            Test::Energy {
+                min: pct(min),
+                max: pct(max),
+            }
+        }
         Err(_) => return Ok(Err(BadField("rule.test"))),
     };
     Ok(Ok(Rule {

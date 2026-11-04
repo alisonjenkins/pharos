@@ -3,7 +3,7 @@
 - **Status:** Slice 1 (engine + native API) in progress; slice 2 (UI) next.
 - **Date:** 2026-11-04
 - **Asked by:** Alison, "an Amarok-style auto playlist generator (or better)".
-- **Ids:** B440–B444, V380–V384 (taken: B440, V380, V381). ADR-0048.
+- **Ids:** B440–B444, V380–V384 (taken: B440, B441, V380–V382). ADR-0048.
   Schema v11 (v9 and v10 are claimed by #653 and #661; renumber to main+1
   at merge).
 
@@ -49,14 +49,20 @@ A **mix** is a list of rules (at most 32), a seed, and two spacing gaps.
 | Played in the last *n* days | last played < *n* days ago | `user_data.last_played_at` |
 | Added in the last *n* days | added < *n* days ago | `media_items.created_at` |
 | Length *min–max* | its length in seconds is in range | `probe.duration_ms` |
-| Like the seed | same artist, or close in genre and era (likeness ≥ 0.35) | the seed song |
+| Like the seed | same artist, or close in genre, era, tempo and energy (likeness ≥ 0.35) | the seed song |
+| Tempo *min–max* BPM | its tempo is in range | `probe.bpm`: the file's BPM tag, else the scanner's analysis (B445) |
+| Energy *min–max* % | its energy is in range (0 calm, 100 intense) | `probe.energy`, from the scanner's analysis (B445) |
 
-**Likeness** (0–1): the same artist is 1; otherwise 0.7 × Jaccard of the
-genre sets + 0.3 × (1 − |year gap| / 20). A *More* like-seed rule weights
-by likeness, not just yes/no. There is no tempo, energy or
-"similar artists" data in the library today; those arrive as new tests
-when a scan reads BPM tags or an external similarity source is added
-(follow-up, not this spec).
+**Likeness** (0–1): the same artist is 1; otherwise a weighted mean of
+the genre sets' Jaccard (0.5), closeness in year, 1 − |gap| / 20 (0.2),
+closeness in tempo, counting half and double time as the same beat (0.15),
+and closeness in energy (0.15). Tempo and energy count only when the seed
+has them; a song not yet analysed scores halfway on them. So an unanalysed
+library scores as genre 0.7 / era 0.3. A *More* like-seed rule weights by
+likeness, not just yes/no. Tempo and energy come from the "tempo and
+energy" scanner work (B445, `MediaProbe.bpm` / `.energy`); until a track
+is analysed they are unknown and the tempo and energy rules skip it. A
+similar-artists source is still a follow-up.
 
 **Strengths**: *Only* (`require`) and *Never* (`exclude`) decide what is
 eligible. *More* (`prefer`) multiplies a song's chance by 4, *Less*
@@ -140,5 +146,6 @@ pushdown of the hard rules into the store query, not a change to the wire.
 2. UI: "Mix from this song" on song rows and the player, a mix picker
    with presets and saved mixes, a rule editor, queue top-up, reasons in
    the queue panel.
-3. Later: BPM/energy tests from tags, a similar-artists source behind an
-   adapter trait, store pushdown if the call gets slow.
+3. Later: a similar-artists source behind an adapter trait, store
+   pushdown if the call gets slow. Tempo and energy are read from the
+   probe once B445 lands (a one-line change in `services::mix::song`).

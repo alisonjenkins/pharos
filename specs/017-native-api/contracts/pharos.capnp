@@ -227,7 +227,9 @@ struct MixRule {
     playedWithinDays @10 :UInt32;
     addedWithinDays @11 :UInt32;
     lengthSecs @12 :MixRange;
-    likeSeed @13 :Void;         # same artist, or near in genre and era; a prefer weights by how near
+    likeSeed @13 :Void;         # same artist, or near in genre, era, tempo and energy; a prefer weights by how near
+    tempoBpm @14 :MixRange;     # beats per minute (the file's tag, else analysis); untempoed songs never match
+    energy @15 :MixRange;       # percent, 0 calm to 100 intense (analysis); unanalysed songs never match
   }
 }
 struct MixSpec {

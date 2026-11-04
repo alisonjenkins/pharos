@@ -1,7 +1,9 @@
 //! `Library.mix`: dynamic mixes over the native API (spec 024, B440/V380).
 
 use pharos_api::pharos_capnp::{mix_result, session, MixWeight};
-use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore as _, UserPolicy};
+use pharos_core::{
+    LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _, UserPolicy,
+};
 use pharos_server::services::mix::{self, MixAsk, Rule, Seed, Test, Weight};
 
 use crate::common::Fixture;
@@ -218,6 +220,8 @@ async fn a_mix_never_reaches_a_library_the_user_cannot_open() {
     let fx = crate::common::seed_rich().await;
     put_songs(&fx, 2_000, "/libA/music", &[("Seen", "Pop", 2001)], 5).await;
     put_songs(&fx, 2_100, "/libB/music", &[("Hidden", "Pop", 2001)], 5).await;
+    // Songs put after the fixture's backfill carry no library id yet.
+    fx.state.stores.backfill_library_ids().await.unwrap();
     let mut user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
         .await
         .unwrap();
