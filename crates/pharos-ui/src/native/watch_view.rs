@@ -137,6 +137,10 @@ pub fn WatchView(
     /// that watch several browsers (the sync oracle).
     #[props(default)]
     item_id: Option<ItemRef>,
+    /// Whether the video starts by itself. A group member's video waits for
+    /// the group's play.
+    #[props(default = true)]
+    autoplay: bool,
 ) -> Element {
     let c = &controls;
     let total = c.total_ms();
@@ -221,7 +225,7 @@ pub fn WatchView(
                     id: VIDEO_ID,
                     class: "pharos-video",
                     "data-item-id": item_id.map(|id| id.to_string()),
-                    autoplay: true,
+                    autoplay,
                     playsinline: true,
                     onclick: move |evt: MouseEvent| {
                         if woke_by_tap() {
@@ -843,6 +847,32 @@ mod tests {
             "item id on the video"
         );
         assert!(!render_with(None).contains("data-item-id"));
+    }
+
+    /// A group member's video waits for the group's play; any other starts
+    /// by itself.
+    #[test]
+    fn the_video_autoplays_unless_a_group_holds_it() {
+        let render_with = |autoplay: bool| {
+            let mut dom = VirtualDom::new_with_props(
+                |autoplay: bool| {
+                    rsx! {
+                        WatchView {
+                            title: "Pilot",
+                            controls: Controls::default(),
+                            on_media: |_| {},
+                            on_control: |_| {},
+                            autoplay,
+                        }
+                    }
+                },
+                autoplay,
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        assert!(render_with(true).contains("autoplay"));
+        assert!(!render_with(false).contains("autoplay"));
     }
 
     #[test]
