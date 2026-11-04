@@ -141,14 +141,17 @@ fn write(dir: &Path, path: &Path, record: &Record) -> std::io::Result<()> {
 }
 
 /// What an answer was asked about; the memo and the disk compare it alike.
+/// A JSON array, so a tag holding the separator cannot make two different
+/// songs read as one (a title "A\nB" by "C" is not "A" by "B\nC").
 pub(super) fn key(provider: &str, song: &Song) -> String {
-    format!(
-        "{provider}\n{}\n{}\n{}\n{}",
+    serde_json::json!([
+        provider,
         song.title,
         song.artist,
         song.album.as_deref().unwrap_or_default(),
         song.duration_ms.map_or(0, |ms| ms / 1000)
-    )
+    ])
+    .to_string()
 }
 
 fn now_secs() -> u64 {
@@ -232,6 +235,21 @@ mod tests {
         retagged.title = "Song (Live)".into();
         assert_eq!(cache.get(7, "lrclib", &retagged), None);
         assert_eq!(cache.get(7, "other", &song()), None);
+    }
+
+    #[test]
+    fn a_line_break_moved_between_tags_is_a_retag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        let mut before = song();
+        before.title = "Song\nGuest".into();
+        before.artist = "Band".into();
+        cache.put(7, "lrclib", &before, Some(&words()));
+        let mut after = song();
+        after.title = "Song".into();
+        after.artist = "Guest\nBand".into();
+        assert_ne!(key("lrclib", &before), key("lrclib", &after));
+        assert_eq!(cache.get(7, "lrclib", &after), None);
     }
 
     #[test]
