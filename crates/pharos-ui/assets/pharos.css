@@ -2455,6 +2455,16 @@ body::before {
 .pharos-stage:not(.is-full) .pharos-listen {
   display: none;
 }
+/* A song handing over to the next keeps its player mounted beside it:
+   the next waits out of sight until its playback is negotiated, then the
+   old one is hidden while it fades out. */
+.pharos-stage-slot {
+  display: contents;
+}
+.pharos-stage-slot.is-waiting,
+.pharos-stage-slot.is-retired {
+  display: none;
+}
 .pharos-stage.is-floating {
   --pharos-stage-w: min(20rem, 60vw);
   /* Never taller than the viewport: on a short one the video gives way
