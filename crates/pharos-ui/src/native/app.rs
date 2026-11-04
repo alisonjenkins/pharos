@@ -807,13 +807,25 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| MixCtx(mix));
     mixes::use_top_up(api, queue, mix);
     let nav = use_context::<Nav>();
-    // Signing out ends the session, and the player with it.
+    // Signing out ends the session, and the player with it; signing in
+    // again on the watch route, which never changed, plays its item.
     let StageCtx(mut stage) = use_context::<StageCtx>();
-    use_effect(move || {
-        if matches!(machine.read().phase(), Phase::SignIn { .. }) && stage.peek().item.is_some() {
-            stage.write().close();
+    let at = route.clone();
+    use_effect(use_reactive!(|(at,)| match machine.read().phase() {
+        Phase::SignIn { .. } if stage.peek().item.is_some() => stage.write().close(),
+        Phase::Ready => {
+            let mut next = stage.peek().clone();
+            if let Some(view) = next.resume(&at) {
+                platform::info(&format!(
+                    "pharos: stage view={} item={} reason=signin",
+                    view.label(),
+                    next.item.map(|i| i.to_string()).unwrap_or_default()
+                ));
+                stage.set(next);
+            }
         }
-    });
+        _ => {}
+    }));
     // The library buttons, read again for each signed-in API; a reconnect
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
