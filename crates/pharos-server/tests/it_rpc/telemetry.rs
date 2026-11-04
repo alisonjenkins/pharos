@@ -42,7 +42,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
+/// A capturing subscriber for `tracing::subscriber::set_default`.
+///
+/// While only one dispatcher is registered, tracing-core caches the interest
+/// of a callsite first hit on another thread from that thread's default (no
+/// subscriber), so a test running alongside could switch this test's events
+/// off for good (B426). A second dispatcher, registered once for the whole
+/// run, keeps tracing asking every registered dispatcher instead.
 pub(crate) fn subscriber(logs: &Captured) -> impl tracing::Subscriber + Send + Sync {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     tracing_subscriber::fmt()
         .with_writer(logs.clone())
         .with_ansi(false)
