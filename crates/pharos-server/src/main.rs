@@ -1706,6 +1706,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // cache PVC.
         state = state.with_integrity_memo(integrity_memo);
     }
+    // Spec 024 — tempo and energy for every song, for the mix rules. One song
+    // at a time behind the background-I/O gate; a song is decoded once.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pharos_server::audio_analysis::spawn(
+        state.stores.clone(),
+        state.is_bg_leader.clone(),
+        state.bg_io.clone(),
+        libav_pool.clone(),
+    );
     // T81 — resolve real cast portraits from TMDB when a key is configured.
     // Gated on the key: with none, this library's people rows keep their
     // legacy (unreachable) thumb paths and the /Persons image route 404s to a
