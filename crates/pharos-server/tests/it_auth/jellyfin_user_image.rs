@@ -106,6 +106,25 @@ async fn a_user_sets_their_avatar_and_anyone_can_fetch_the_re_encode() {
     let me: serde_json::Value = test::call_and_read_body_json(&app, req).await;
     let tag = me["PrimaryImageTag"].as_str().unwrap().to_owned();
 
+    // So does the admin's user listing, read in one go, and only for them.
+    let listed = |app, token: String| async move {
+        let req = test::TestRequest::get()
+            .uri("/Users")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request();
+        let users: Vec<serde_json::Value> = test::call_and_read_body_json(app, req).await;
+        users
+            .into_iter()
+            .map(|u| {
+                let name = u["Name"].as_str().unwrap().to_owned();
+                (name, u["PrimaryImageTag"].as_str().map(str::to_owned))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let tags = listed(&app, s.admin.1.clone()).await;
+    assert_eq!(tags["guest"].as_deref(), Some(tag.as_str()));
+    assert_eq!(tags["boss"], None);
+
     // Anonymous, by id, on either spelling: a square JPEG the server wrote.
     for uri in [
         format!("/UserImage?userId={}&tag={tag}", hex(s.guest.0)),
@@ -145,6 +164,7 @@ async fn a_user_sets_their_avatar_and_anyone_can_fetch_the_re_encode() {
         .to_request();
     let me: serde_json::Value = test::call_and_read_body_json(&app, req).await;
     assert!(me.get("PrimaryImageTag").is_none(), "{me}");
+    assert_eq!(listed(&app, s.admin.1.clone()).await["guest"], None);
 }
 
 #[actix_web::test]
