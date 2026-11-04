@@ -43,15 +43,19 @@ pub fn Link(
     }
 }
 
-/// The frame around every signed-in screen: the bar and a button per
-/// library.
+/// The frame around every signed-in screen: the bar, a button per library
+/// and the trail to the page shown (outermost first).
 #[component]
 pub fn Shell(
     account: Element,
     libraries: Vec<Item>,
-    current: Option<ItemRef>,
+    trail: Vec<Item>,
     children: Element,
 ) -> Element {
+    let current = trail
+        .first()
+        .filter(|item| item.kind == ItemKind::Library)
+        .map(|library| library.id);
     rsx! {
         div { class: "pharos-app",
             header { class: "pharos-banner pharos-shell",
@@ -64,6 +68,7 @@ pub fn Shell(
                     }
                 }
                 LibraryNav { libraries, current }
+                Crumbs { trail }
             }
             main { class: "pharos-main", {children} }
         }
@@ -87,6 +92,31 @@ pub fn LibraryNav(libraries: Vec<Item>, current: Option<ItemRef>) -> Element {
                     class: "pharos-library-tab",
                     current: current == Some(library.id),
                     "{library.name}"
+                }
+            }
+        }
+    }
+}
+
+/// The way down to the page shown, each step a link back up to it. A lone
+/// library needs no trail: its button already says where you are.
+#[component]
+pub fn Crumbs(trail: Vec<Item>) -> Element {
+    if trail.len() < 2 {
+        return rsx! {};
+    }
+    let last = trail.len() - 1;
+    rsx! {
+        nav { class: "pharos-crumbs", aria_label: "Breadcrumb",
+            ol {
+                for (i, item) in trail.into_iter().enumerate() {
+                    li { key: "{item.id}",
+                        if i == last {
+                            span { "aria-current": "page", "{item.name}" }
+                        } else {
+                            Link { to: open_route(&item), "{item.name}" }
+                        }
+                    }
                 }
             }
         }
@@ -956,5 +986,41 @@ mod tests {
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
         let current = html.find(r#"aria-current="page""#).unwrap();
         assert!(current < at("Movies") && current > at("TV Shows"), "{html}");
+    }
+
+    #[test]
+    fn crumbs_link_every_step_but_the_page_shown() {
+        let mut series = item(ItemKind::Series);
+        series.id = ItemRef::Synth(5);
+        series.name = "Breaking Bad".into();
+        let mut season = item(ItemKind::Season);
+        season.id = ItemRef::Synth(6);
+        season.name = "Season 1".into();
+        let mut episode = item(ItemKind::Episode);
+        episode.id = ItemRef::Real(7);
+        episode.name = "Pilot".into();
+        let trail = vec![
+            library(1, LibraryKind::TvShows, "TV Shows"),
+            series,
+            season,
+            episode,
+        ];
+        let html = render(move || rsx! { Crumbs { trail: trail.clone() } });
+        for want in [
+            r#"href="/ui/browse/s1""#,
+            r#"href="/ui/browse/s5""#,
+            r#"href="/ui/browse/s6""#,
+            r#"<span aria-current="page">Pilot</span>"#,
+        ] {
+            assert!(html.contains(want), "missing {want} in {html}");
+        }
+        assert!(!html.contains("/ui/title/7"), "{html}");
+    }
+
+    #[test]
+    fn a_library_alone_needs_no_crumbs() {
+        let trail = vec![library(1, LibraryKind::Movies, "Movies")];
+        let html = render(move || rsx! { Crumbs { trail: trail.clone() } });
+        assert!(!html.contains("pharos-crumbs"), "{html}");
     }
 }
