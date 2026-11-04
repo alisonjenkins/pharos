@@ -11,6 +11,7 @@ pub mod api;
 pub mod browser;
 pub mod byte_stream;
 pub mod group;
+pub mod mix;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use futures::io::{AsyncRead, AsyncWrite};
