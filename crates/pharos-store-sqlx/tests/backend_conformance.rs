@@ -807,9 +807,12 @@ where
     UserPrefStore::set_user_pref(&store, other_id, "binary", b"theirs")
         .await
         .unwrap();
+    // A persistent postgres keeps earlier runs' rows, so only this run's
+    // two users are compared.
     let mut by_key = UserPrefStore::user_prefs_for_key(&store, "binary")
         .await
         .unwrap();
+    by_key.retain(|(u, _)| *u == uid || *u == other_id);
     by_key.sort_by(|a, b| a.1.cmp(&b.1));
     assert_eq!(
         by_key,
@@ -820,7 +823,10 @@ where
             .await
             .unwrap()
             .iter()
-            .all(|(u, _)| *u == uid)
+            .filter(|(u, _)| *u == uid || *u == other_id)
+            .map(|(u, v)| (*u, v.as_slice()))
+            .eq([(uid, &b"false"[..])]),
+        "only the user who set it is listed, with the latest value"
     );
     // Deleted once: the second delete finds nothing.
     assert!(UserPrefStore::delete_user_pref(&store, other_id, "binary")
