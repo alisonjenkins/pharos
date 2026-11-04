@@ -842,7 +842,7 @@ impl Membership {
         let user = self.session.current_user().await?;
         let group = self.group.group_id.to_string();
         let record = |outcome: Outcome, answered: usize, members: usize| {
-            group_seen::record(outcome, &user, &group, ids.len(), answered, members);
+            group_seen::record(outcome, &user.name, &group, ids.len(), answered, members);
         };
         let in_group = !self.left.get()
             && self.deps.hub.resolve(&self.key).map_or(true, |s| {
