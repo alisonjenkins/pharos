@@ -23,6 +23,7 @@ mod platform;
 #[path = "web.rs"]
 mod platform;
 pub mod playback;
+pub mod queue;
 pub mod rails;
 pub mod route;
 pub mod together;
