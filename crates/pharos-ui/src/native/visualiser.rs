@@ -31,15 +31,17 @@ pub enum Style {
     Scope,
     Halo,
     Plasma,
+    Orbit,
     Off,
 }
 
 impl Style {
-    pub const ALL: [Style; 5] = [
+    pub const ALL: [Style; 6] = [
         Style::Spectrum,
         Style::Scope,
         Style::Halo,
         Style::Plasma,
+        Style::Orbit,
         Style::Off,
     ];
 
@@ -49,6 +51,7 @@ impl Style {
             Style::Scope => "scope",
             Style::Halo => "halo",
             Style::Plasma => "plasma",
+            Style::Orbit => "orbit",
             Style::Off => "off",
         }
     }
@@ -59,6 +62,7 @@ impl Style {
             Style::Scope => "Scope",
             Style::Halo => "Halo",
             Style::Plasma => "Plasma",
+            Style::Orbit => "Orbit",
             Style::Off => "Off",
         }
     }
@@ -77,6 +81,7 @@ impl Style {
             Style::Scope => Some(Program::Scope),
             Style::Halo => Some(Program::Halo),
             Style::Plasma => Some(Program::Plasma),
+            Style::Orbit => Some(Program::Orbit),
             Style::Off => None,
         }
     }
