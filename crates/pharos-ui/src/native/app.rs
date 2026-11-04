@@ -37,6 +37,7 @@ use super::seen::{self, MemberSeen};
 use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
+use super::track_follow;
 use super::trail;
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
@@ -2199,14 +2200,53 @@ fn Player(
         move || Rc::new(platform::on_page_hide(stop))
     });
     let retire_stop = stop.clone();
+    // The group's track picks arrive from outside the Dioxus runtime; this
+    // task switches the player's tracks.
+    let group_tracks = use_coroutine({
+        let (p, switched) = (Rc::clone(&p), Rc::clone(&switched));
+        move |mut rx: UnboundedReceiver<track_follow::TrackPicks>| {
+            let (p, switched) = (Rc::clone(&p), Rc::clone(&switched));
+            async move {
+                while let Some(picks) = rx.next().await {
+                    let audio = picks.audio.filter(|a| p.audio != Some(*a));
+                    let to = picks.subtitle.filter(|s| *subtitle.peek() != *s);
+                    let burn = to.is_some_and(|to| {
+                        let track =
+                            to.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
+                        subtitle_switch(p.burned(), track) == SubtitleSwitch::Renegotiate
+                    });
+                    if audio.is_some() || burn {
+                        on_renegotiate.call(TrackPicks {
+                            audio: audio
+                                .or(p.audio)
+                                .map_or(TrackChoice::Default, TrackChoice::Index),
+                            subtitle: choice(to.unwrap_or(*subtitle.peek())),
+                        });
+                    } else if let Some(to) = to {
+                        switched.set(Some(choice(to)));
+                        subtitle.set(to);
+                    }
+                }
+            }
+        }
+    });
     // The group drives this video while it is mounted.
     use_hook({
         let session = session.clone();
         let item = p.detail.item.id;
+        let (audio, subtitles) = (
+            p.detail.audio_tracks.iter().map(|t| t.index).collect(),
+            p.detail.subtitle_tracks.iter().map(|t| t.index).collect(),
+        );
         move || {
             if let Some(session) = &session {
                 session.set_watching(Some(item));
-                session.set_player(Some(Rc::new(VideoPlayer(VIDEO_ID))));
+                session.set_player(Some(Rc::new(VideoPlayer {
+                    id: VIDEO_ID,
+                    audio,
+                    subtitles,
+                    tracks: group_tracks,
+                })));
             }
         }
     });
@@ -2480,14 +2520,23 @@ fn Player(
                     }
                 }
                 Control::Audio(index) => {
-                    if p.audio != Some(index) {
-                        on_renegotiate.call(TrackPicks {
-                            audio: TrackChoice::Index(index),
-                            subtitle: choice(*subtitle.peek()),
-                        });
-                    }
+                    let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
+                        session.as_ref().is_some_and(|s| s.pick_audio(index))
+                    }) else {
+                        return;
+                    };
+                    on_renegotiate.call(TrackPicks {
+                        audio: TrackChoice::Index(index),
+                        subtitle: choice(*subtitle.peek()),
+                    });
                 }
                 Control::Subtitle(to) => {
+                    let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
+                        session.as_ref().is_some_and(|s| s.pick_subtitle(to))
+                    });
+                    if !here {
+                        return;
+                    }
                     let track =
                         to.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
                     match subtitle_switch(p.burned(), track) {
@@ -2524,6 +2573,14 @@ fn Player(
         move |()| {
             if let Some(session) = session.clone() {
                 spawn(async move { session.leave().await });
+            }
+        }
+    };
+    let on_own_tracks = {
+        let session = session.clone();
+        move |own: bool| {
+            if let Some(session) = &session {
+                session.follow_tracks(!own);
             }
         }
     };
@@ -2666,6 +2723,14 @@ fn Player(
                 on_control,
                 item_id: p.detail.item.id,
                 members: if group.active { group.members.clone() } else { Vec::new() },
+                own_tracks: group.own_tracks,
+                on_own_tracks,
+                own_track_members: group
+                    .members
+                    .iter()
+                    .filter(|m| m.own_tracks)
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>(),
                 seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
                 autoplay: !group.active,

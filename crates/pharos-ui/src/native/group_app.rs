@@ -12,6 +12,7 @@ use pharos_client::api::{ClientEvent, NativeApi};
 use super::group_session::{Env, GroupPlayer, GroupView, Session, Ui};
 use super::platform;
 use super::together::{group_api, Groups};
+use super::track_follow::TrackPicks;
 
 /// The one session type the app uses.
 pub type AppSession = Session<Groups, AppEnv>;
@@ -54,31 +55,47 @@ impl Env for AppEnv {
 }
 
 /// The page's `<video>` as the group drives it.
-pub struct VideoPlayer(pub &'static str);
+pub struct VideoPlayer {
+    pub id: &'static str,
+    /// Audio and subtitle stream indexes of the item.
+    pub audio: Vec<u32>,
+    pub subtitles: Vec<u32>,
+    /// Where the group's track picks go: the player screen switches tracks
+    /// there, inside the Dioxus runtime.
+    pub tracks: Coroutine<TrackPicks>,
+}
 
 impl GroupPlayer for VideoPlayer {
     fn position_ms(&self) -> u64 {
-        platform::position_ms(self.0)
+        platform::position_ms(self.id)
     }
 
     fn paused(&self) -> bool {
-        platform::media_state(self.0).paused
+        platform::media_state(self.id).paused
     }
 
     fn play(&self) {
-        platform::play(self.0);
+        platform::play(self.id);
     }
 
     fn pause(&self) {
-        platform::pause(self.0);
+        platform::pause(self.id);
     }
 
     fn seek_ms(&self, ms: u64) {
-        platform::seek_ms(self.0, ms);
+        platform::seek_ms(self.id, ms);
     }
 
     fn set_rate(&self, rate: f64) {
-        platform::set_rate(self.0, rate);
+        platform::set_rate(self.id, rate);
+    }
+
+    fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
+        (self.audio.clone(), self.subtitles.clone())
+    }
+
+    fn apply_tracks(&self, picks: TrackPicks) {
+        self.tracks.send(picks);
     }
 }
 
