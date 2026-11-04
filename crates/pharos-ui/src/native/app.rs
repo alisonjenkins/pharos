@@ -33,6 +33,7 @@ use super::playback::{
     volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
     ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
 };
+use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
@@ -380,15 +381,40 @@ fn remember_volume(volume: f64, muted: bool) {
 /// The capabilities to negotiate `kind` with: what the browser decodes, and
 /// for video the maximum bitrate the viewer chose (0, Auto, unless they set
 /// one). The choice limits video only: a song above it still plays as stored.
-fn negotiation_capabilities(kind: ItemKind) -> pharos_client::api::Capabilities {
-    let chosen = stored_max_bitrate();
-    let caps = with_max_bitrate(platform::capabilities(), kind, chosen);
+fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Capabilities {
+    let chosen = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
+    let caps = with_max_bitrate(
+        platform::capabilities(),
+        kind,
+        quality::effective_cap(chosen, auto),
+    );
     platform::info(&format!(
-        "pharos: playback max_bitrate={} chosen={} kind={kind:?}",
+        "pharos: playback max_bitrate={} chosen={} auto={} kind={kind:?}",
         max_bitrate_label(caps.max_bitrate),
-        max_bitrate_label(chosen)
+        max_bitrate_label(chosen),
+        max_bitrate_label(auto)
     ));
     caps
+}
+
+/// The bitrate stored under `key`, read by `parse`; 0 when none. The warn
+/// text names the key's last segment (`max_bitrate`, `auto_rung`).
+fn stored_bitrate(key: &str, parse: fn(&str) -> u64) -> u64 {
+    match platform::stored_theme(key) {
+        Ok(stored) => stored.as_deref().map_or(0, parse),
+        Err(e) => {
+            let name = key.rsplit('.').next().unwrap_or(key);
+            platform::warn(&format!("pharos: {name} storage read failed error={e}"));
+            0
+        }
+    }
+}
+
+fn store_bitrate(key: &str, bps: u64) {
+    if let Err(e) = platform::store_theme(key, &bps.to_string()) {
+        let name = key.rsplit('.').next().unwrap_or(key);
+        platform::warn(&format!("pharos: {name} storage write failed error={e}"));
+    }
 }
 
 /// `caps` with the bitrate to negotiate `kind` with, from the viewer's
@@ -408,26 +434,6 @@ fn video_max_bitrate(kind: ItemKind, chosen: u64) -> u64 {
         0
     } else {
         chosen
-    }
-}
-
-fn stored_max_bitrate() -> u64 {
-    match platform::stored_theme(MAX_BITRATE_KEY) {
-        Ok(stored) => stored.as_deref().map_or(0, parse_max_bitrate),
-        Err(e) => {
-            platform::warn(&format!(
-                "pharos: max_bitrate storage read failed error={e}"
-            ));
-            0
-        }
-    }
-}
-
-fn set_stored_max_bitrate(bps: u64) {
-    if let Err(e) = platform::store_theme(MAX_BITRATE_KEY, &bps.to_string()) {
-        platform::warn(&format!(
-            "pharos: max_bitrate storage write failed error={e}"
-        ));
     }
 }
 
@@ -1504,7 +1510,7 @@ fn AppearanceScreen() -> Element {
     let notice = use_signal(|| None::<Notice>);
     let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
-    let mut max_quality = use_signal(stored_max_bitrate);
+    let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -1550,7 +1556,7 @@ fn AppearanceScreen() -> Element {
             diagnostics_key,
             max_quality: max_quality_now,
             on_max_quality: move |bps: u64| {
-                set_stored_max_bitrate(bps);
+                store_bitrate(MAX_BITRATE_KEY, bps);
                 max_quality.set(bps);
                 platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
             },
@@ -1831,6 +1837,16 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
     // The tracks asked for; changing them negotiates a new playback.
     let mut picks = use_signal(TrackPicks::default);
+    // What the connection has shown about this video, kept across the
+    // reloads its own decisions cause; the cap it asks for rides the next
+    // negotiation.
+    let watch = use_hook(|| {
+        let ceiling = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
+        let rung = stored_bitrate(quality::AUTO_RUNG_KEY, quality::parse_rung);
+        let w = Watch::new(ceiling, rung, now_ms_u64());
+        QualityWatch(Rc::new(RefCell::new(w)))
+    });
+    let mut auto_cap = use_signal(|| watch.0.borrow().cap());
     let resume_from = Rc::clone(&last_ms);
     // The episodes either side follow the item, not the playback, so a track
     // change that renegotiates does not look them up again.
@@ -1923,6 +1939,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
         let asked = picks();
+        let auto = auto_cap();
         // A song Previous went back to starts over (B464/V406).
         let from_start = queue.is_some_and(|QueueCtx(q)| q.peek().plays_from_start(id));
         async move {
@@ -1931,7 +1948,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
                 let detail = api.detail(&info, id).await?;
-                let caps = negotiation_capabilities(detail.item.kind);
+                let caps = negotiation_capabilities(detail.item.kind, auto);
                 let (decision, grant) = api.play(&info, id, &caps, asked).await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
@@ -2025,7 +2042,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &negotiation_capabilities(kind), asked).await {
+                match api.play(&info, id, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).
@@ -2078,6 +2095,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     last_ms: LastMs(Rc::clone(&last_ms)),
                     near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
                     on_renegotiate: move |next| picks.set(next),
+                    watch: watch.clone(),
+                    on_quality: move |cap| {
+                        store_bitrate(quality::AUTO_RUNG_KEY, cap);
+                        auto_cap.set(cap);
+                    },
                     slot,
                     fade_in: fade_in.clone(),
                 }
@@ -2115,6 +2137,16 @@ const RENEW_FIRST_WAIT_MS: u32 = 1000;
 struct FadeIn(Rc<Cell<u64>>);
 
 impl PartialEq for FadeIn {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The connection history of the video on screen, shared with its player.
+#[derive(Clone)]
+struct QualityWatch(Rc<RefCell<Watch>>);
+
+impl PartialEq for QualityWatch {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
@@ -2163,6 +2195,8 @@ fn Player(
     last_ms: LastMs,
     near: Neighbours,
     on_renegotiate: EventHandler<TrackPicks>,
+    watch: QualityWatch,
+    on_quality: EventHandler<u64>,
     slot: Slot,
     fade_in: FadeIn,
 ) -> Element {
@@ -2171,6 +2205,9 @@ fn Player(
     // Handing over: the song is done with, so nothing it does is reported
     // or acted on any more.
     let retiring = use_hook(|| Rc::new(Cell::new(false)));
+    // The automatic quality has decided; one decision per video, whichever
+    // path (fragment or media event) reaches it first.
+    let decided = use_hook(|| Rc::new(Cell::new(false)));
     // The crossfade into the next song has begun (or there is none to make).
     let crossfading = use_hook(|| Rc::new(Cell::new(false)));
     // This song has handed the stage to the next under a crossfade: it plays
@@ -2381,6 +2418,39 @@ fn Player(
             stop();
         }
     });
+    // Auto quality judges video played by hls.js, the one engine that shows
+    // the downloads; a change reloads at the position, as a track change does.
+    let auto = p.engine == Engine::HlsJs && p.kind != ItemKind::Audio;
+    use_hook(|| {
+        if auto {
+            watch.0.borrow_mut().restarted(now_ms_u64());
+        }
+    });
+    let cap_changes = use_coroutine(move |mut rx: UnboundedReceiver<u64>| async move {
+        while let Some(cap) = rx.next().await {
+            on_quality.call(cap);
+        }
+    });
+    let assess: Rc<dyn Fn()> = {
+        let (watch, retiring, decided) = (watch.clone(), Rc::clone(&retiring), Rc::clone(&decided));
+        Rc::new(move || {
+            if !auto || retiring.get() || decided.get() {
+                return;
+            }
+            let Some(c) = watch.0.borrow_mut().evaluate(now_ms_u64()) else {
+                return;
+            };
+            decided.set(true);
+            platform::info(&format!(
+                "pharos: quality auto from={} to={} reason={} estimate_bps={}",
+                c.from_bps,
+                c.to_bps,
+                c.reason.label(),
+                c.estimate_bps
+            ));
+            cap_changes.send(c.cap);
+        })
+    };
     // The engines call back from browser events, outside the Dioxus runtime.
     let fatal = use_coroutine({
         let stop = stop.clone();
@@ -2412,11 +2482,28 @@ fn Player(
     });
     use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
+        let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+        let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
         move || {
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
+            let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+            let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
             spawn(async move {
                 let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
-                let on_fragment: OnFragment = Rc::new(|_| {});
+                let on_fragment: OnFragment = {
+                    let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+                    Rc::new(move |load| {
+                        // Handing over, or already decided: no more downloads count.
+                        if retiring.get() || decided.get() {
+                            return;
+                        }
+                        watch
+                            .0
+                            .borrow_mut()
+                            .fragment(load.bytes, load.load_ms, load.media_ms);
+                        assess();
+                    })
+                };
                 let attached = match platform::engine(p.engine).await {
                     Ok(mut e) => e
                         .attach(VIDEO_ID, &p.url, p.start_ms, on_fatal, on_fragment)
@@ -2448,9 +2535,18 @@ fn Player(
         let session = session.clone();
         let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
         let handed_off = Rc::clone(&handed_off);
+        let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
+            }
+            match event {
+                MediaEvent::Waiting => {
+                    watch.0.borrow_mut().stalled(now_ms_u64());
+                    assess();
+                }
+                MediaEvent::Seeked => watch.0.borrow_mut().seeked(),
+                _ => {}
             }
             if let Some(session) = session() {
                 session.on_media(event);
@@ -2543,6 +2639,7 @@ fn Player(
     let on_control = {
         let p = Rc::clone(&p);
         let session = session.clone();
+        let watch = watch.clone();
         let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
         move |control: Control| {
             if retiring.get() {
@@ -2550,6 +2647,7 @@ fn Player(
             }
             // In a group the viewer's play, pause and seek are the group's.
             let seek = |ms: u64| {
+                watch.0.borrow_mut().seeking(now_ms_u64());
                 if !session().is_some_and(|s| s.seek(ms)) {
                     platform::seek_ms(VIDEO_ID, ms);
                 }
