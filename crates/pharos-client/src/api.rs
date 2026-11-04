@@ -518,6 +518,23 @@ impl NativeApi {
         }
     }
 
+    /// Approves a Quick Connect code shown on another device, which then
+    /// signs in as the signed-in user.
+    pub async fn quick_connect_authorize(
+        &self,
+        call: &CallInfo,
+        code: &str,
+    ) -> Result<(), ClientError> {
+        let mut req = self.session.quick_connect_authorize_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_code(code);
+        }
+        let reply = req.send().promise.await?;
+        crate::read_done(reply.get()?.get_result()?)
+    }
+
     /// Sets the signed-in user's avatar from a picture's bytes; answers the
     /// new tag.
     pub async fn set_avatar(&self, call: &CallInfo, image: &[u8]) -> Result<String, ClientError> {
