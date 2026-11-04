@@ -77,6 +77,7 @@ pub fn Root() -> Element {
     });
     let replace = use_context::<Replace>();
     let mut group_view = use_signal(GroupView::default);
+    let group_error = use_signal(|| None::<String>);
     // The store's pushes arrive outside the Dioxus runtime; this task is how
     // they reach the screens.
     let group_ui = use_coroutine(move |mut rx: UnboundedReceiver<Ui>| async move {
@@ -87,7 +88,7 @@ pub fn Root() -> Element {
             }
         }
     });
-    use_context_provider(|| Together::new(group_view, group_ui));
+    use_context_provider(|| Together::new(group_view, group_error, group_ui));
     match route() {
         Route::Manage => rsx! { RootApp {} },
         route => rsx! {
@@ -918,17 +919,13 @@ async fn list_groups(api: Option<Groups>) -> Result<Vec<GroupSummary>, GroupErro
 
 /// Join `id` and go to what the group is watching. A group that has not
 /// said yet takes us there when it does (the store navigates on its item).
-fn join_group(
-    ctx: Ctx,
-    together: Together,
-    nav: Nav,
-    mut error: Signal<Option<String>>,
-    id: String,
-) {
+fn join_group(ctx: Ctx, together: Together, nav: Nav, id: String) {
     let Some(api) = ctx.api.peek().clone() else {
         return;
     };
     let session = together.session(&api);
+    let mut error = together.error;
+    error.set(None);
     // The server's Item navigates away before the join answers; the join must
     // outlive the page that started it, or the membership never begins.
     spawn_forever(async move {
@@ -949,8 +946,12 @@ fn TogetherScreen() -> Element {
     let nav = use_context::<Nav>();
     let ctx = use_context::<Ctx>();
     let together = use_context::<Together>();
+    // A failure shown here is not news to the next screen.
+    use_drop({
+        let mut error = together.error;
+        move || error.set(None)
+    });
     let api = use_hook(move || group_client(ctx));
-    let error = use_signal(|| None::<String>);
     let groups = use_resource({
         let api = api.clone();
         move || list_groups(api.clone())
@@ -960,12 +961,12 @@ fn TogetherScreen() -> Element {
         None => rsx! { Loading {} },
         Some(Err(e)) => rsx! { ErrorNote { message: e.0.clone() } },
         Some(Ok(groups)) => rsx! {
-            if let Some(message) = error() {
+            if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }
             }
             TogetherView {
                 groups: groups.clone(),
-                on_join: move |id: String| join_group(ctx, together.clone(), nav, error, id),
+                on_join: move |id: String| join_group(ctx, together.clone(), nav, id),
             }
         },
     }
@@ -977,8 +978,12 @@ fn InviteScreen(id: String) -> Element {
     let nav = use_context::<Nav>();
     let ctx = use_context::<Ctx>();
     let together = use_context::<Together>();
+    // A failure shown here is not news to the next screen.
+    use_drop({
+        let mut error = together.error;
+        move || error.set(None)
+    });
     let api = use_hook(move || group_client(ctx));
-    let error = use_signal(|| None::<String>);
     let groups = use_resource({
         let api = api.clone();
         move || list_groups(api.clone())
@@ -990,12 +995,12 @@ fn InviteScreen(id: String) -> Element {
         Some(Ok(groups)) => {
             let group: Option<GroupSummary> = groups.iter().find(|g| g.id == id).cloned();
             rsx! {
-                if let Some(message) = error() {
+                if let Some(message) = together.error.read().clone() {
                     ErrorNote { message }
                 }
                 InviteView {
                     group,
-                    on_join: move |id: String| join_group(ctx, together.clone(), nav, error, id),
+                    on_join: move |id: String| join_group(ctx, together.clone(), nav, id),
                     on_start_new: move |_| nav.0.call(Route::Together),
                 }
             }
@@ -1159,7 +1164,11 @@ fn TitleScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
     let nav = use_context::<Nav>();
     let together = use_context::<Together>();
-    let mut group_error = use_signal(|| None::<String>);
+    // A failure shown here is not news to the next screen.
+    use_drop({
+        let mut error = together.error;
+        move || error.set(None)
+    });
     let detail = use_resource(move || {
         let api = ctx.api.read().clone();
         async move {
@@ -1171,11 +1180,14 @@ fn TitleScreen(id: ItemRef) -> Element {
         }
     });
     // Start a group on this title from the start, then watch it as its member.
+    let group_error = together.error;
     let on_watch_together = move |_| {
         let Some(api) = ctx.api.peek().clone() else {
             return;
         };
         let session = together.session(&api);
+        let mut group_error = group_error;
+        group_error.set(None);
         spawn_forever(async move {
             match session.create(id, 0).await {
                 Ok(_) => nav.0.call(Route::Watch(id)),
@@ -1185,7 +1197,7 @@ fn TitleScreen(id: ItemRef) -> Element {
     };
     let state = detail.read();
     rsx! {
-        if let Some(message) = group_error() {
+        if let Some(message) = group_error.read().clone() {
             ErrorNote { message }
         }
         {loaded(
