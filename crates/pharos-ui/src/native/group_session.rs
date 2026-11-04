@@ -18,7 +18,9 @@ use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
     GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SELF_SEEK_GRACE_MS,
 };
-use super::track_follow::GroupTracksView;
+use super::track_follow::{
+    follows_group, route_pick, GroupTracksView, PickRoute, TrackChoice, TrackPicks,
+};
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
@@ -31,6 +33,8 @@ pub struct GroupView {
     /// In a group now.
     pub active: bool,
     pub members: Vec<Member>,
+    /// This member is on their own tracks ("Just me").
+    pub own_tracks: bool,
     /// Why the group is over, once it is.
     pub ended: Option<String>,
     /// Counts the group's updates, so a screen can fetch what an update may
@@ -68,6 +72,10 @@ pub trait GroupPlayer {
     fn pause(&self);
     fn seek_ms(&self, ms: u64);
     fn set_rate(&self, rate: f64);
+    /// The audio and subtitle stream indexes of the item playing.
+    fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>);
+    /// Switch the player's audio and subtitle, as its own menus do.
+    fn apply_tracks(&self, picks: TrackPicks);
 }
 
 /// When an anchor was struck.
@@ -117,6 +125,8 @@ pub struct GroupState {
     pub members: Vec<Member>,
     /// The group's audio and subtitle choice.
     pub tracks: GroupTracksView,
+    /// This member is on their own tracks ("Just me"), not the group's.
+    pub own_tracks: bool,
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
     pub ended: Option<String>,
@@ -312,6 +322,7 @@ impl GroupState {
         GroupView {
             active,
             members: self.members.clone(),
+            own_tracks: self.own_tracks,
             ended: self.ended.clone(),
             activity: self.activity,
         }
@@ -487,10 +498,12 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             inner.state.id = Some(summary.id.clone());
             if inner.state.members.is_empty() {
                 inner.state.members = summary.members.clone();
+                inner.state.tracks = summary.tracks;
             }
             inner.epoch
         };
         self.publish();
+        self.follow_group_tracks();
         if let Some(me) = self.me() {
             self.env.spawn(Box::pin(async move { me.run(epoch).await }));
         }
@@ -533,6 +546,103 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     pub fn set_player(&self, player: Option<Rc<dyn GroupPlayer>>) {
         self.inner.borrow_mut().player = player;
         self.catch_up();
+        self.follow_group_tracks();
+    }
+
+    /// Put the player on the group's audio and subtitle, unless this member is
+    /// on their own or the item has no such stream.
+    fn follow_group_tracks(&self) {
+        let (player, own, tracks) = {
+            let inner = self.inner.borrow();
+            if !inner.active {
+                return;
+            }
+            (
+                inner.player.clone(),
+                inner.state.own_tracks,
+                inner.state.tracks,
+            )
+        };
+        let Some(player) = player else {
+            return;
+        };
+        let (audio, subtitles) = player.stream_indexes();
+        if let Some(picks) = follows_group(own, tracks, &audio, &subtitles) {
+            player.apply_tracks(picks);
+        }
+    }
+
+    /// A menu pick of an audio stream. `true` when it went to the group, which
+    /// applies it to every following player, this one included; `false` when
+    /// the caller changes only its own player.
+    pub fn pick_audio(&self, index: u32) -> bool {
+        self.pick(TrackChoice::Index(index), TrackChoice::Unset)
+    }
+
+    /// A menu pick of a subtitle stream, or `None` for off; see [`Self::pick_audio`].
+    pub fn pick_subtitle(&self, index: Option<u32>) -> bool {
+        self.pick(
+            TrackChoice::Unset,
+            index.map_or(TrackChoice::Off, TrackChoice::Index),
+        )
+    }
+
+    fn pick(&self, audio: TrackChoice, subtitle: TrackChoice) -> bool {
+        let (active, own, playlist_item_id) = {
+            let inner = self.inner.borrow();
+            (
+                inner.active,
+                inner.state.own_tracks,
+                inner.state.playlist_item_id.clone(),
+            )
+        };
+        if route_pick(active, own) == PickRoute::ApplyLocally {
+            return false;
+        }
+        let client = self.client.clone();
+        self.command(async move { client.set_tracks(audio, subtitle, playlist_item_id).await });
+        true
+    }
+
+    /// "Follow group" (`true`) or "Just me" (`false`). Following puts the
+    /// player on the group's tracks at once. Does nothing outside a group.
+    pub fn follow_tracks(&self, follow: bool) {
+        let (before, epoch) = {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.active {
+                return;
+            }
+            let before = inner.state.own_tracks;
+            inner.state.own_tracks = !follow;
+            (before, inner.epoch)
+        };
+        self.publish();
+        if let Some(me) = self.me() {
+            let client = self.client.clone();
+            self.env.spawn(Box::pin(async move {
+                let Err(e) = client.follow_tracks(follow).await else {
+                    return;
+                };
+                me.env
+                    .warn(&format!("pharos: group command failed: {}", e.0));
+                // The server never heard it, so the flag it keeps is the old
+                // one; unless the membership has moved on, show that again.
+                let reverted = {
+                    let mut inner = me.inner.borrow_mut();
+                    let current = inner.active && inner.epoch == epoch;
+                    if current {
+                        inner.state.own_tracks = before;
+                    }
+                    current
+                };
+                if reverted {
+                    me.publish();
+                }
+            }));
+        }
+        if follow {
+            self.follow_group_tracks();
+        }
     }
 
     /// Put the player where the group is: there, and playing if it plays.
@@ -573,6 +683,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let now = self.env.now_ms();
         let ended = update == GroupUpdate::Ended;
         let is_play = matches!(update, GroupUpdate::Play { .. });
+        let tracks_changed = matches!(update, GroupUpdate::Joined(_) | GroupUpdate::Tracks { .. });
         let (actions, wait) = {
             let mut inner = self.inner.borrow_mut();
             if inner.leaving || inner.epoch != epoch {
@@ -601,6 +712,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             );
         }
         self.publish();
+        if tracks_changed {
+            self.follow_group_tracks();
+        }
         let epoch = self.inner.borrow().epoch;
         for action in actions {
             self.perform(action, epoch);
@@ -1057,6 +1171,9 @@ mod tests {
         position: Cell<u64>,
         paused: Cell<bool>,
         log: RefCell<Vec<String>>,
+        /// Audio and subtitle stream indexes of the item.
+        streams: RefCell<(Vec<u32>, Vec<u32>)>,
+        applied: RefCell<Vec<TrackPicks>>,
     }
 
     impl GroupPlayer for TestPlayer {
@@ -1080,6 +1197,12 @@ mod tests {
         }
         fn set_rate(&self, rate: f64) {
             self.log.borrow_mut().push(format!("rate({rate})"));
+        }
+        fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
+            self.streams.borrow().clone()
+        }
+        fn apply_tracks(&self, picks: TrackPicks) {
+            self.applied.borrow_mut().push(picks);
         }
     }
 
@@ -1769,5 +1892,154 @@ mod tests {
         assert!(matches!(next.join("g1").now_or_never(), Some(Ok(_))));
         assert_eq!(next.inner.borrow().state.watching, Some(ItemRef::Real(7)));
         assert!(next.inner.borrow().player.is_some());
+    }
+
+    fn groups_tracks() -> GroupTracksView {
+        GroupTracksView {
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Index(4),
+        }
+    }
+
+    fn picks_for_groups_tracks() -> TrackPicks {
+        TrackPicks {
+            audio: Some(2),
+            subtitle: Some(Some(4)),
+        }
+    }
+
+    fn tracks_update() -> GroupUpdate {
+        GroupUpdate::Tracks {
+            tracks: groups_tracks(),
+            by: Some("ada".into()),
+        }
+    }
+
+    fn rig_with_streams() -> Rig {
+        let rig = rig();
+        *rig.player.streams.borrow_mut() = (vec![1, 2], vec![3, 4]);
+        rig
+    }
+
+    #[test]
+    fn a_following_member_applies_the_groups_tracks() {
+        let rig = rig_with_streams();
+        rig.session.deliver(tracks_update());
+        assert_eq!(*rig.player.applied.borrow(), [picks_for_groups_tracks()]);
+    }
+
+    #[test]
+    fn an_own_tracks_member_never_applies_them() {
+        let rig = rig_with_streams();
+        rig.session.follow_tracks(false);
+        rig.env.settle();
+        rig.session.deliver(tracks_update());
+        rig.session.set_player(Some(rig.player.clone()));
+        assert!(rig.player.applied.borrow().is_empty());
+        assert!(rig.session.view().own_tracks);
+        assert_eq!(calls_with(&rig, "follow_tracks"), ["follow_tracks(false)"]);
+    }
+
+    #[test]
+    fn following_again_applies_what_the_group_is_on() {
+        let rig = rig_with_streams();
+        rig.session.follow_tracks(false);
+        rig.session.deliver(tracks_update());
+        rig.session.follow_tracks(true);
+        rig.env.settle();
+        assert_eq!(*rig.player.applied.borrow(), [picks_for_groups_tracks()]);
+        assert!(!rig.session.view().own_tracks);
+        assert_eq!(
+            calls_with(&rig, "follow_tracks"),
+            ["follow_tracks(false)", "follow_tracks(true)"]
+        );
+    }
+
+    #[test]
+    fn a_late_joiner_applies_the_tracks_from_joined() {
+        let rig = rig_with_streams();
+        rig.session.deliver(GroupUpdate::Joined(GroupSummary {
+            tracks: groups_tracks(),
+            ..summary()
+        }));
+        assert_eq!(*rig.player.applied.borrow(), [picks_for_groups_tracks()]);
+    }
+
+    #[test]
+    fn a_player_that_arrives_later_starts_on_the_groups_tracks() {
+        let rig = rig();
+        rig.session.deliver(tracks_update());
+        assert!(rig.player.applied.borrow().is_empty());
+        *rig.player.streams.borrow_mut() = (vec![2], vec![]);
+        rig.session.set_player(Some(rig.player.clone()));
+        assert_eq!(
+            *rig.player.applied.borrow(),
+            [TrackPicks {
+                audio: Some(2),
+                subtitle: None
+            }]
+        );
+    }
+
+    #[test]
+    fn menu_picks_go_to_the_group_while_following_and_stay_local_otherwise() {
+        let rig = rig_with_streams();
+        assert!(rig.session.pick_audio(2));
+        assert!(rig.session.pick_subtitle(None));
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "set_tracks"),
+            ["set_tracks(Index(2),Unset,)", "set_tracks(Unset,Off,)"]
+        );
+        rig.session.follow_tracks(false);
+        assert!(!rig.session.pick_audio(1));
+        let idle = Session::new(FakeGroups::default(), TestEnv::default());
+        assert!(!idle.pick_subtitle(Some(3)));
+    }
+
+    #[test]
+    fn a_just_me_the_server_refused_is_taken_back() {
+        let rig = rig();
+        rig.groups.refuse_follow();
+        rig.session.follow_tracks(false);
+        assert!(rig.session.view().own_tracks, "shown at once");
+        rig.env.settle();
+        assert!(!rig.session.view().own_tracks);
+        let shown = rig.env.ui.borrow().iter().rev().find_map(|u| match u {
+            Ui::View(v) => Some(v.own_tracks),
+            Ui::Navigate(_) => None,
+        });
+        assert_eq!(shown, Some(false), "the screen is told");
+    }
+
+    #[test]
+    fn a_pick_names_the_queue_entry_it_was_made_on() {
+        let rig = rig_with_streams();
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 0,
+            playing: false,
+        });
+        rig.session.pick_audio(2);
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "set_tracks"),
+            ["set_tracks(Index(2),Unset,pl-7)"]
+        );
+    }
+
+    #[test]
+    fn a_pick_reaches_every_following_player_through_the_group() {
+        let rig = rig_with_streams();
+        assert!(rig.session.pick_subtitle(Some(3)));
+        rig.env.settle();
+        assert_eq!(
+            *rig.player.applied.borrow(),
+            [TrackPicks {
+                audio: None,
+                subtitle: Some(Some(3))
+            }]
+        );
     }
 }
