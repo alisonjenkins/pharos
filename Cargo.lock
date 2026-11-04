@@ -4009,6 +4009,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quire"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "quick-xml 0.42.0",
+ "thiserror",
+ "zip 9.3.0",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6207,6 +6217,7 @@ dependencies = [
  "digest 0.11.3",
  "dioxus-core",
  "either",
+ "errno",
  "fastrand",
  "flate2",
  "foldhash",
@@ -6236,8 +6247,10 @@ dependencies = [
  "metrics-util",
  "mio",
  "num-traits",
+ "once_cell",
  "percent-encoding",
  "proc-macro2",
+ "quick-xml 0.42.0",
  "rand 0.10.3",
  "rand 0.9.5",
  "regex",
@@ -6274,6 +6287,8 @@ dependencies = [
  "tracing-core",
  "typenum",
  "zerocopy",
+ "zip 9.3.0",
+ "zlib-rs",
 ]
 
 [[package]]

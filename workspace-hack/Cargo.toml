@@ -55,7 +55,9 @@ memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
+once_cell = { version = "1" }
 percent-encoding = { version = "2" }
+quick-xml = { version = "0.42", features = ["escape-html"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9", default-features = false, features = ["small_rng", "thread_rng"] }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 regex = { version = "1" }
@@ -85,6 +87,8 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
 
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
@@ -117,6 +121,7 @@ md-5 = { version = "0.11" }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
+once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
@@ -181,6 +186,7 @@ libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -191,12 +197,14 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 
 [target.aarch64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -207,6 +215,7 @@ tower = { version = "0.5", default-features = false, features = ["balance", "buf
 
 [target.x86_64-apple-darwin.build-dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 libc = { version = "0.2", features = ["extra_traits"] }
