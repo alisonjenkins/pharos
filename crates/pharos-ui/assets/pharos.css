@@ -1842,3 +1842,289 @@ body::before {
 .pharos-backdrop[hidden] {
   display: none;
 }
+
+/* Play queue (B435–B437/V375–V377). The toggles sit together in the
+   player's top bar; the panel is a frosted drawer on the right that stays
+   closed until asked for, so the visualiser keeps the screen. */
+.pharos-listen-panels {
+  display: flex;
+  gap: 0.35rem;
+}
+.pharos-listen .pharos-queue-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--px-color-fg) 10%, transparent);
+  background: color-mix(in srgb, var(--px-color-bg) 45%, transparent);
+}
+.pharos-listen .pharos-queue-toggle[aria-pressed="true"] {
+  background: var(--px-color-accent);
+  border-color: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-listen .pharos-lyrics-toggle:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.pharos-queue-toggle .pharos-icon,
+.pharos-queue-shuffle .pharos-icon {
+  width: 1rem;
+  height: 1rem;
+}
+.pharos-queue-count {
+  min-width: 1.25rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--px-color-fg) 16%, transparent);
+  font-size: 0.75em;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.pharos-queue {
+  position: absolute;
+  top: 4.5rem;
+  right: 1rem;
+  /* As tall as its songs, short of the bottom bar. */
+  max-height: calc(100% - 14.5rem);
+  display: flex;
+  flex-direction: column;
+  width: min(22rem, calc(100% - 2rem));
+  box-sizing: border-box;
+  padding: 0.75rem;
+  border-radius: calc(var(--px-radius) * 2);
+  background: color-mix(in srgb, var(--px-color-overlay) 55%, transparent);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+}
+.pharos-queue-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  padding-bottom: 0.5rem;
+}
+.pharos-queue-title {
+  margin: 0;
+  font-size: 1rem;
+}
+.pharos-queue-total {
+  flex: 1;
+  font-size: 0.85rem;
+}
+.pharos-queue-shuffle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+.pharos-queue-head .pharos-chip {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.8rem;
+}
+.pharos-queue-empty {
+  margin: 0.5rem 0;
+  font-size: 0.9rem;
+}
+.pharos-queue-list {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+}
+.pharos-queue-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.25rem;
+  border-top: 2px solid transparent;
+  border-radius: var(--px-radius);
+  cursor: grab;
+}
+.pharos-queue-entry:hover,
+.pharos-queue-entry:focus-within {
+  background: color-mix(in srgb, var(--px-color-fg) 8%, transparent);
+}
+.pharos-queue-entry[data-drop="true"] {
+  border-top-color: var(--px-color-accent);
+}
+.pharos-queue-entry[data-dragging="true"] {
+  opacity: 0.4;
+}
+.pharos-queue-entry[data-source="album"] .pharos-queue-name {
+  color: var(--px-color-fg-muted);
+}
+.pharos-queue-grip {
+  color: var(--px-color-fg-muted);
+  user-select: none;
+}
+.pharos-queue-name {
+  overflow: hidden;
+  padding: 0.35rem 0.25rem;
+  border: 0;
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pharos-queue-length {
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+.pharos-queue-icon {
+  display: grid;
+  place-items: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--px-color-fg);
+  cursor: pointer;
+  opacity: 0;
+}
+.pharos-queue-icon .pharos-icon {
+  width: 1rem;
+  height: 1rem;
+}
+/* The row's buttons show on hover or focus, and always without a mouse. */
+.pharos-queue-entry:hover .pharos-queue-icon,
+.pharos-queue-entry:focus-within .pharos-queue-icon {
+  opacity: 1;
+}
+@media (hover: none) {
+  .pharos-queue-icon {
+    opacity: 1;
+  }
+}
+.pharos-queue-icon:disabled {
+  visibility: hidden;
+}
+.pharos-queue-icon:hover,
+.pharos-queue-icon:focus-visible {
+  background: color-mix(in srgb, var(--px-color-fg) 14%, transparent);
+}
+.pharos-queue-name:focus-visible,
+.pharos-queue-icon:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+@media (max-width: 40rem) {
+  .pharos-queue {
+    top: 6rem;
+    right: 0.5rem;
+    max-height: calc(100% - 20rem);
+    width: calc(100% - 1rem);
+  }
+}
+
+/* "Play next" / "Add to queue" (B436/V376) on song rows, album cards and
+   album pages. */
+.pharos-queue-buttons {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.pharos-queue-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  cursor: pointer;
+}
+.pharos-queue-button .pharos-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+.pharos-queue-button:hover,
+.pharos-queue-button:focus-visible {
+  background: color-mix(in srgb, var(--px-color-fg) 12%, transparent);
+}
+.pharos-queue-button:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: 2px;
+}
+.pharos-queue-note {
+  font-size: 0.8rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-queue-note:empty {
+  display: none;
+}
+.pharos-queue-buttons[data-target="album_page"] {
+  flex-wrap: wrap;
+  margin: 0 0 1rem;
+}
+.pharos-queue-buttons[data-target="album_page"] .pharos-queue-button {
+  padding: 0.45rem 0.9rem;
+  border-color: var(--px-color-border);
+  background: var(--px-color-surface);
+}
+.pharos-track-item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.pharos-track-item .pharos-track {
+  flex: 1;
+  min-width: 0;
+}
+.pharos-track-queued {
+  margin-left: 0.6rem;
+  font-size: 0.8rem;
+}
+.pharos-queue-buttons[data-target="song"] .pharos-queue-button {
+  opacity: 0;
+}
+.pharos-track-item:hover .pharos-queue-button,
+.pharos-track-item:focus-within .pharos-queue-button {
+  opacity: 1;
+}
+/* Over an album's cover, shown while the card is hovered or focused. */
+.pharos-album-tile {
+  position: relative;
+}
+.pharos-queue-buttons[data-target="album_card"] {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  flex-direction: column;
+  align-items: flex-end;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+.pharos-queue-buttons[data-target="album_card"] .pharos-queue-button {
+  background: color-mix(in srgb, var(--px-color-overlay) 70%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.pharos-queue-buttons[data-target="album_card"] .pharos-queue-note {
+  max-width: 8rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: var(--px-radius);
+  background: color-mix(in srgb, var(--px-color-overlay) 70%, transparent);
+  color: var(--px-color-fg);
+  text-align: right;
+}
+.pharos-album-tile:hover .pharos-queue-buttons,
+.pharos-album-tile:focus-within .pharos-queue-buttons,
+.pharos-queue-buttons[data-target="album_card"]:has(.pharos-queue-note:not(:empty)) {
+  opacity: 1;
+}
+@media (hover: none) {
+  .pharos-queue-buttons[data-target="song"] .pharos-queue-button,
+  .pharos-queue-buttons[data-target="album_card"] {
+    opacity: 1;
+  }
+}
