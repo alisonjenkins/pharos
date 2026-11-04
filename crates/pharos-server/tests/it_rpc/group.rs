@@ -948,6 +948,32 @@ async fn a_member_on_their_own_tracks_is_marked_in_the_roster() {
     assert_eq!(cleared, ());
 }
 
+/// `seen` rows carry the same own-tracks mark the roster does.
+#[actix_web::test]
+async fn seen_marks_the_member_on_their_own_tracks() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    command!(pair.b, follow_tracks_request, set_follow(false)).unwrap();
+    let marked = async {
+        loop {
+            let rows = seen(&pair.a, &[WireId::Real(801)]).await.unwrap();
+            let on: Vec<_> = rows
+                .iter()
+                .filter(|r| r.own_tracks)
+                .map(|r| r.name.clone())
+                .collect();
+            if !on.is_empty() {
+                return on;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let on = tokio::time::timeout(std::time::Duration::from_secs(5), marked)
+        .await
+        .expect("an own-tracks row");
+    assert_eq!(on, ["guest"]);
+}
+
 /// A member that has left cannot change the group's tracks.
 #[actix_web::test]
 async fn a_member_who_left_cannot_set_tracks() {
@@ -1407,6 +1433,7 @@ async fn joining_from_a_device_in_another_group_moves_it() {
 #[derive(Debug, PartialEq)]
 struct SeenRow {
     name: String,
+    own_tracks: bool,
     items: Vec<SeenItem>,
 }
 
@@ -1440,6 +1467,7 @@ async fn seen(member: &membership::Client, ids: &[WireId]) -> Result<Vec<SeenRow
             .unwrap()
             .iter()
             .map(|m| SeenRow {
+                own_tracks: m.get_member().unwrap().get_own_tracks(),
                 name: m
                     .get_member()
                     .unwrap()

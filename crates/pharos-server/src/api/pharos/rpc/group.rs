@@ -307,7 +307,7 @@ fn write_seen(out: seen_result::Builder<'_>, members: &[MemberSeen]) {
                 id: m.member_id.clone(),
                 name: m.name.clone(),
                 buffering: m.buffering,
-                own_tracks: false,
+                own_tracks: m.own_tracks,
             },
         );
         let mut items = entry.init_items(u32::try_from(m.items.len()).unwrap_or(u32::MAX));

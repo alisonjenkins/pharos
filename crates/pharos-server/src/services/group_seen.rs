@@ -80,6 +80,8 @@ pub struct MemberSeen {
     pub member_id: String,
     pub name: String,
     pub buffering: bool,
+    /// On their own audio and subtitles, not the group's.
+    pub own_tracks: bool,
     pub items: Vec<ItemSeen>,
 }
 
@@ -160,6 +162,7 @@ pub async fn seen(
                     member_id: member_id.to_string(),
                     name: group.participants.get(i).cloned().unwrap_or_default(),
                     buffering: group.buffering_members.contains(member_id),
+                    own_tracks: group.own_tracks_members.contains(member_id),
                     items,
                 })
             }
