@@ -2489,9 +2489,11 @@ fn Player(
         }
     };
     // Handing over: report this song done and stop it, at once on a cut or
-    // as it fades out under the next. Once, as the slot changes.
+    // as it fades out under the next. A fade waits for the next song's
+    // playback to be negotiated, so the two overlap and the old one plays on
+    // at full volume meanwhile. Once, as the slot changes.
     if let Slot::Outgoing(handoff) = slot {
-        if !retiring.replace(true) {
+        if (handoff.fade_ms == 0 || handoff.ready) && !retiring.replace(true) {
             fade_in_cancel.set(true);
             let (stop, last_ms) = (retire_stop, Rc::clone(&last_ms.0));
             let mut stage = stage;
