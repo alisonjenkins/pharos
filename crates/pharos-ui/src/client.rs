@@ -806,6 +806,35 @@ pub fn parse_plugins_response(bytes: &[u8]) -> Result<Vec<PluginEntry>, ClientEr
         .collect())
 }
 
+/// `/Admin/Media/Duplicates` row: one film the library holds more than once.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DuplicateFilm {
+    pub title: String,
+    pub production_year: Option<u32>,
+    pub provider_id: Option<String>,
+    pub versions: Vec<FilmVersion>,
+}
+
+/// One file of a [`DuplicateFilm`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FilmVersion {
+    pub id: String,
+    pub path: String,
+    pub size_bytes: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub video_codec: Option<String>,
+    /// Unix seconds.
+    pub date_added: Option<i64>,
+    pub edition_count: usize,
+}
+
+pub fn parse_duplicate_films_response(bytes: &[u8]) -> Result<Vec<DuplicateFilm>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -1611,6 +1640,25 @@ pub mod web {
         parse_plugins_response(&bytes)
     }
 
+    pub async fn list_duplicate_films(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<DuplicateFilm>, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Media/Duplicates"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_duplicate_films_response(&bytes)
+    }
+
     pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
@@ -2040,6 +2088,20 @@ mod tests {
         assert_eq!(v[0].last_execution_iso, "2026-05-28T05:00:00Z");
         assert_eq!(v[1].state, "Running");
         assert_eq!(v[1].last_execution_iso, "");
+    }
+
+    #[test]
+    fn parse_duplicate_films_keeps_each_version() {
+        let body = br#"[{"Title":"Heat","ProductionYear":1995,"ProviderId":"tmdb:949",
+            "Versions":[{"Id":"1","Path":"/m/Heat.mkv","SizeBytes":4000000000,"Width":1920,
+            "Height":1080,"VideoCodec":"hevc","DateAdded":1700000000,"EditionCount":0},
+            {"Id":"2","Path":"/m/Heat.avi"}]}]"#;
+        let v = parse_duplicate_films_response(body).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].provider_id.as_deref(), Some("tmdb:949"));
+        assert_eq!(v[0].versions[0].height, Some(1080));
+        assert_eq!(v[0].versions[1].path, "/m/Heat.avi");
+        assert_eq!(v[0].versions[1].size_bytes, None);
     }
 
     #[test]
