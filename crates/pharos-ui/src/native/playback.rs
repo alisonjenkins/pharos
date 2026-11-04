@@ -727,6 +727,19 @@ pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
     }
 }
 
+/// The original script of an ASS/SSA text subtitle, for a renderer that
+/// draws its typesetting (ADR-0057); `None` for any other track, which plays
+/// as WebVTT. The server serves the script beside the WebVTT it converts it
+/// to, at `stream.ass` in place of `stream.vtt`.
+pub fn styled_subtitle_url(track: &Track) -> Option<String> {
+    if !matches!(track.codec.to_ascii_lowercase().as_str(), "ass" | "ssa") {
+        return None;
+    }
+    let vtt = track.vtt_url.as_deref()?;
+    vtt.strip_suffix("/stream.vtt")
+        .map(|base| format!("{base}/stream.ass"))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1128,6 +1141,32 @@ mod tests {
             SubtitleSwitch::Renegotiate
         );
         assert_eq!(subtitle_switch(true, None), SubtitleSwitch::Renegotiate);
+    }
+
+    #[test]
+    fn only_an_ass_text_subtitle_is_drawn_from_its_script() {
+        let track = |codec: &str, vtt: Option<&str>| Track {
+            codec: codec.into(),
+            vtt_url: vtt.map(Into::into),
+            ..Track::default()
+        };
+        let vtt = Some("/videos/7/subtitles/3/stream.vtt");
+        assert_eq!(
+            styled_subtitle_url(&track("ass", vtt)).as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass")
+        );
+        assert_eq!(
+            styled_subtitle_url(&track("SSA", vtt)).as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass")
+        );
+        assert_eq!(styled_subtitle_url(&track("subrip", vtt)), None);
+        assert_eq!(styled_subtitle_url(&track("webvtt", vtt)), None);
+        // Burned, or a URL of another shape: nothing to fetch the script from.
+        assert_eq!(styled_subtitle_url(&track("ass", None)), None);
+        assert_eq!(
+            styled_subtitle_url(&track("ass", Some("/elsewhere.vtt"))),
+            None
+        );
     }
 
     #[test]

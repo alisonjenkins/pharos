@@ -294,43 +294,47 @@ pub fn WatchView(
                     wake();
                     shortcuts.wheel(&evt);
                 },
-                video {
-                    id: VIDEO_ID,
-                    class: "pharos-video",
-                    "data-item-id": item_id.map(|id| id.to_string()),
-                    autoplay,
-                    playsinline: true,
-                    onclick: move |evt: MouseEvent| {
-                        if woke_by_tap() {
-                            woke_by_tap.set(false);
-                        } else if !shortcuts.click(&evt) {
-                            on_control.call(Control::TogglePlay);
-                        }
-                    },
-                    oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
-                    onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
-                    onplaying: move |_| on_media.call(MediaEvent::Playing),
-                    onpause: move |_| on_media.call(MediaEvent::Pause),
-                    onseeking: move |_| on_media.call(MediaEvent::Changed),
-                    onseeked: move |_| on_media.call(MediaEvent::Seeked),
-                    ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
-                    onended: move |_| on_media.call(MediaEvent::Ended),
-                    onvolumechange: move |_| on_media.call(MediaEvent::Changed),
-                    ondurationchange: move |_| on_media.call(MediaEvent::Changed),
-                    onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
-                    onloadeddata: move |_| on_media.call(MediaEvent::Changed),
-                    onwaiting: move |_| on_media.call(MediaEvent::Waiting),
-                    onstalled: move |_| on_media.call(MediaEvent::Waiting),
-                    oncanplay: move |_| on_media.call(MediaEvent::CanPlay),
-                    oncanplaythrough: move |_| on_media.call(MediaEvent::Changed),
-                    for (id, t) in text_tracks {
-                        track {
-                            key: "{id}",
-                            id: "{id}",
-                            kind: "subtitles",
-                            src: t.vtt_url.clone().unwrap_or_default(),
-                            srclang: "{t.language}",
-                            label: track_label(&t, 0),
+                // The styled subtitle renderer lays its canvas after the
+                // video, so the video sits alone where Dioxus never diffs.
+                div { class: "pharos-video-frame",
+                    video {
+                        id: VIDEO_ID,
+                        class: "pharos-video",
+                        "data-item-id": item_id.map(|id| id.to_string()),
+                        autoplay,
+                        playsinline: true,
+                        onclick: move |evt: MouseEvent| {
+                            if woke_by_tap() {
+                                woke_by_tap.set(false);
+                            } else if !shortcuts.click(&evt) {
+                                on_control.call(Control::TogglePlay);
+                            }
+                        },
+                        oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
+                        onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
+                        onplaying: move |_| on_media.call(MediaEvent::Playing),
+                        onpause: move |_| on_media.call(MediaEvent::Pause),
+                        onseeking: move |_| on_media.call(MediaEvent::Changed),
+                        onseeked: move |_| on_media.call(MediaEvent::Seeked),
+                        ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
+                        onended: move |_| on_media.call(MediaEvent::Ended),
+                        onvolumechange: move |_| on_media.call(MediaEvent::Changed),
+                        ondurationchange: move |_| on_media.call(MediaEvent::Changed),
+                        onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                        onloadeddata: move |_| on_media.call(MediaEvent::Changed),
+                        onwaiting: move |_| on_media.call(MediaEvent::Waiting),
+                        onstalled: move |_| on_media.call(MediaEvent::Waiting),
+                        oncanplay: move |_| on_media.call(MediaEvent::CanPlay),
+                        oncanplaythrough: move |_| on_media.call(MediaEvent::Changed),
+                        for (id, t) in text_tracks {
+                            track {
+                                key: "{id}",
+                                id: "{id}",
+                                kind: "subtitles",
+                                src: t.vtt_url.clone().unwrap_or_default(),
+                                srclang: "{t.language}",
+                                label: track_label(&t, 0),
+                            }
                         }
                     }
                 }
