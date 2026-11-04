@@ -13,6 +13,44 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Decides whether this run needs the heavy jobs. A PR that touches only
+  # Markdown builds nothing and tests nothing, yet every job below used to
+  # take a home runner slot for it. Runs on a hosted runner so the decision
+  # itself never waits for a home slot. Every job below is gated with
+  # `needs.changes.outputs.code != 'false'`: a job skipped by its `if:`
+  # reports success, so required checks still pass, and if this job fails
+  # the output is empty and the heavy jobs run anyway (fail open).
+  changes:
+    name: classify changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r path; do
+            case "$path" in
+              # Read at test time by jellyfin_feature_inventory.rs.
+              docs/jellyfin-web-feature-matrix.md) code=true ;;
+              *.md) ;;
+              *) code=true ;;
+            esac
+            echo "$path -> code=$code"
+          done < <(git diff --name-only "$BASE_SHA"...HEAD)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   test:
     name: build + test + lint
     # Self-hosted home nix builder (host daemon + warm store). Other jobs stay
@@ -21,7 +59,8 @@ jobs:
     timeout-minutes: 120
     # Never run fork-PR code on the self-hosted runner (the enforcer's fork-PR
     # approval gate is the primary control; this is a backstop).
-    if: ${{ github.event.pull_request.head.repo.fork != true }}
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
 
@@ -59,7 +98,8 @@ jobs:
     continue-on-error: false
     # Never run fork-PR code on the self-hosted runner (backstop to the
     # enforcer's fork-PR approval gate; matches the `test` job).
-    if: ${{ github.event.pull_request.head.repo.fork != true }}
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
@@ -75,6 +115,8 @@ jobs:
     name: package + oci image
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # NO `needs: [test]`: this nix build shares nothing with the cargo build in
     # `test`, so gating it behind test only serialised ~4 min after ~3 min. Run
     # it in PARALLEL — `publish` still `needs: [test, oci]`, so a failing test
@@ -162,6 +204,8 @@ jobs:
     name: jellyfin-web crawl
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     # NO `needs: [test]`. This job builds what it needs through `just`, so
     # nothing it does depends on the flake check having passed — waiting for
     # it only serialised ~2m45s onto the end of every PR run (measured: the
@@ -207,6 +251,8 @@ jobs:
     name: dioxus UI
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
