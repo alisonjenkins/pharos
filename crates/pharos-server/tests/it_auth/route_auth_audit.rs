@@ -134,6 +134,7 @@ fn audit_rows() -> Vec<(Method, &'static str, Expect)> {
         (Method::GET, "/LiveTv/TunerHosts", Auth),
         (Method::GET, "/ScheduledTasks", Auth),
         (Method::GET, "/Plugins", Auth),
+        (Method::GET, "/Admin/Media/Duplicates", Auth),
         (Method::GET, "/System/Logs", Auth),
         (Method::GET, "/System/ActivityLog/Entries", Auth),
         (Method::POST, "/System/Configuration", Auth),

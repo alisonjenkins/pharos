@@ -45,6 +45,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Container-integrity sweep results — "which files are damaged",
         // not just a count.
         .route("/admin/integrity/damaged", web::get().to(damaged_files))
+        .route(
+            "/admin/media/duplicates",
+            web::get().to(super::duplicates::duplicate_movies),
+        )
         // Dashboard empty-stub surfaces.
         .route("/scheduledtasks", web::get().to(scheduled_tasks))
         .route(

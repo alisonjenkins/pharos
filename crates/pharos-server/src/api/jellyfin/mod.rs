@@ -6,6 +6,7 @@ pub mod auth_extractor;
 pub mod channels;
 pub mod ci_query;
 mod download;
+mod duplicates;
 pub use pharos_cache::fmp4;
 pub mod hls;
 pub mod images;
