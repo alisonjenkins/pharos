@@ -779,6 +779,10 @@ async fn an_admin_can_purge_a_time_range_of_an_items_segments() {
     std::fs::create_dir_all(&seg_dir).unwrap();
     let seg = seg_dir.join("5-a0-s0-v2971-bauto-c26.ts");
     std::fs::write(&seg, b"poisoned bytes").unwrap();
+    // Its audio rendition, encoded before whatever made the purge necessary.
+    let audio = cache.root().join("_audiohls").join("42-a0-b128");
+    std::fs::create_dir_all(&audio).unwrap();
+    std::fs::write(audio.join("a5.m4s"), b"old audio").unwrap();
 
     let state = web::Data::new(
         AppState::new(state.stores.clone(), "t".into()).with_hls_cache(cache.clone()),
@@ -811,6 +815,10 @@ async fn an_admin_can_purge_a_time_range_of_an_items_segments() {
     assert!(
         kept.iter().any(|b| b == b"poisoned bytes"),
         "the purged bytes must be retained for diagnosis"
+    );
+    assert!(
+        !audio.exists(),
+        "the item's cached audio must go with the purge, or it keeps serving"
     );
 }
 
