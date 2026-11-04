@@ -135,6 +135,7 @@ fn ms(v: u64) -> i64 {
 pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
     match msg {
         ServerMsg::Play {
+            by: _,
             at_server_ms,
             position_ms,
         } => Some(GroupIntent::Play {
@@ -142,6 +143,7 @@ pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
             apply_at: clock.instant_of(*at_server_ms),
         }),
         ServerMsg::Pause {
+            by: _,
             at_server_ms,
             position_ms,
         } => Some(GroupIntent::Pause {
@@ -149,6 +151,7 @@ pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
             apply_at: clock.instant_of(*at_server_ms),
         }),
         ServerMsg::Seek {
+            by: _,
             at_server_ms,
             position_ms,
         } => Some(GroupIntent::Seek {
@@ -281,6 +284,7 @@ mod tests {
     async fn play_pause_seek_are_scheduled_at_their_server_time() {
         let c = clock();
         let play = ServerMsg::Play {
+            by: None,
             at_server_ms: 10_750,
             position_ms: 42_000,
         };
@@ -292,6 +296,7 @@ mod tests {
             })
         );
         let pause = ServerMsg::Pause {
+            by: None,
             at_server_ms: 10_100,
             position_ms: 9,
         };
@@ -303,6 +308,7 @@ mod tests {
             })
         );
         let seek = ServerMsg::Seek {
+            by: None,
             at_server_ms: 11_000,
             position_ms: 5_000,
         };
@@ -320,6 +326,7 @@ mod tests {
     async fn a_time_already_past_applies_now() {
         let c = clock();
         let late = ServerMsg::Play {
+            by: None,
             at_server_ms: 9_000,
             position_ms: 1,
         };

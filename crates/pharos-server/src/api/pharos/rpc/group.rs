@@ -285,14 +285,20 @@ enum Update {
     Play {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Pause {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Seek {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Member(Member),
     Left(String),
@@ -327,23 +333,29 @@ fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Upda
         ServerMsg::Play {
             at_server_ms,
             position_ms,
+            by,
         } => Update::Play {
             at_server_ms: at(*at_server_ms),
             position_ms: *position_ms,
+            by: by.map(|m| m.to_string()),
         },
         ServerMsg::Pause {
             at_server_ms,
             position_ms,
+            by,
         } => Update::Pause {
             at_server_ms: at(*at_server_ms),
             position_ms: *position_ms,
+            by: by.map(|m| m.to_string()),
         },
         ServerMsg::Seek {
             at_server_ms,
             position_ms,
+            by,
         } => Update::Seek {
             at_server_ms: at(*at_server_ms),
             position_ms: *position_ms,
+            by: by.map(|m| m.to_string()),
         },
         ServerMsg::MemberJoined { member } => Update::Member(Member {
             id: member.member_id.to_string(),
@@ -382,26 +394,32 @@ fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
         Update::Play {
             at_server_ms,
             position_ms,
+            by,
         } => {
             let mut at = out.init_play();
             at.set_at_server_ms(*at_server_ms);
             at.set_position_ms(*position_ms);
+            at.set_by(by.as_deref().unwrap_or_default());
         }
         Update::Pause {
             at_server_ms,
             position_ms,
+            by,
         } => {
             let mut at = out.init_pause();
             at.set_at_server_ms(*at_server_ms);
             at.set_position_ms(*position_ms);
+            at.set_by(by.as_deref().unwrap_or_default());
         }
         Update::Seek {
             at_server_ms,
             position_ms,
+            by,
         } => {
             let mut at = out.init_seek();
             at.set_at_server_ms(*at_server_ms);
             at.set_position_ms(*position_ms);
+            at.set_by(by.as_deref().unwrap_or_default());
         }
         Update::Member(member) => write_member(out.init_member(), member),
         Update::Left(id) => out.set_left(id.as_str()),
@@ -1135,6 +1153,7 @@ mod tests {
     fn scheduled_times_are_offset_by_the_group_epoch() {
         let at = translate(
             &ServerMsg::Pause {
+                by: None,
                 at_server_ms: 250,
                 position_ms: 9_000,
             },
@@ -1145,8 +1164,49 @@ mod tests {
             at,
             Some(Update::Pause {
                 at_server_ms: 1_000_250,
-                position_ms: 9_000
+                position_ms: 9_000,
+                by: None,
             })
+        );
+    }
+
+    /// V395: the member who caused a play, pause or seek reaches the client
+    /// as its id; a change the group made has none.
+    #[test]
+    fn a_play_pause_or_seek_names_who_caused_it() {
+        let who = MemberId::new();
+        let named = |msg: ServerMsg| match translate(&msg, gid(), 0) {
+            Some(Update::Play { by, .. } | Update::Pause { by, .. } | Update::Seek { by, .. }) => {
+                by
+            }
+            other => panic!("not a transport update: {other:?}"),
+        };
+        for msg in [
+            ServerMsg::Play {
+                at_server_ms: 1,
+                position_ms: 2,
+                by: Some(who),
+            },
+            ServerMsg::Pause {
+                at_server_ms: 1,
+                position_ms: 2,
+                by: Some(who),
+            },
+            ServerMsg::Seek {
+                at_server_ms: 1,
+                position_ms: 2,
+                by: Some(who),
+            },
+        ] {
+            assert_eq!(named(msg), Some(who.to_string()));
+        }
+        assert_eq!(
+            named(ServerMsg::Play {
+                at_server_ms: 1,
+                position_ms: 2,
+                by: None
+            }),
+            None
         );
     }
 
