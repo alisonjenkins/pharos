@@ -8,6 +8,7 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
+use super::listen::{Icon, ICON_FLOAT};
 use super::platform;
 use super::playback::{
     clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
@@ -117,6 +118,8 @@ pub enum Control {
     Fullscreen,
     /// Leave the player for the page before it.
     Back,
+    /// Shrink the player to its floating window or mini bar (spec 020).
+    Shrink,
     /// Play another item: the previous or next episode.
     Play(ItemRef),
 }
@@ -272,6 +275,14 @@ pub fn WatchView(
                         "←"
                     }
                     h2 { class: "pharos-watch-title", "{title}" }
+                    button {
+                        class: "pharos-control pharos-shrink",
+                        r#type: "button",
+                        aria_label: "Shrink",
+                        title: "Shrink to a small window",
+                        onclick: move |_| on_control.call(Control::Shrink),
+                        Icon { path: ICON_FLOAT }
+                    }
                     if !members.is_empty() {
                         MemberStrip { members, on_leave }
                     }

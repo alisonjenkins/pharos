@@ -128,6 +128,10 @@ pub fn ListenView(
     playing: Option<ItemRef>,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
+    /// The player is a floating window or a mini bar (spec 020): the
+    /// screen is out of sight, so it draws no visualiser.
+    #[props(default)]
+    compact: bool,
 ) -> Element {
     let tap = use_hook(Tap::default);
     let shortcuts = use_shortcuts(media, previous, next, on_control);
@@ -209,7 +213,7 @@ pub fn ListenView(
             oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
             onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
             "data-playing": if media.paused { "false" } else { "true" },
-            if let (Some(program), None) = (current.program(), fallback()) {
+            if let (false, Some(program), None) = (compact, current.program(), fallback()) {
                 Visualiser {
                     key: "{current.label()}",
                     style: current,
@@ -225,6 +229,14 @@ pub fn ListenView(
                     aria_label: "Back",
                     onclick: move |_| on_control.call(Control::Back),
                     Icon { path: ICON_LEAVE }
+                }
+                button {
+                    class: "pharos-listen-skip pharos-shrink",
+                    r#type: "button",
+                    aria_label: "Shrink",
+                    title: "Shrink to a small window",
+                    onclick: move |_| on_control.call(Control::Shrink),
+                    Icon { path: ICON_FLOAT }
                 }
                 div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
                     for s in Style::ALL {
@@ -605,6 +617,8 @@ const ICON_PLAY: &str =
 const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
 const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
+/// A small window in a corner of a larger one: shrink the player.
+pub const ICON_FLOAT: &str = "M3 5h18v14H3V5Zm2 2v10h14V7H5Zm7 5h6v4h-6v-4Z";
 const ICON_LEAVE: &str = "M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20Z";
 const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
 /// The queue's icons (B435/V375).
