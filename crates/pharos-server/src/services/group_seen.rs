@@ -5,14 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pharos_core::{MediaKind, User, UserDataStore, UserItemData};
+use pharos_core::{MediaKind, MediaStore as _, User, UserDataStore, UserItemData};
 use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key, WireId};
 use pharos_sync::group::GroupSnapshot;
 
 use crate::state::AppState;
 
 /// Ids one `seen` call may ask about.
-pub const MAX_IDS: usize = 200;
+pub use pharos_api::MAX_SEEN_IDS as MAX_IDS;
 
 /// How a `seen` call ended: the label set of `pharos_group_seen_total`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,7 +46,7 @@ impl Outcome {
 /// not exist), for `members` members.
 pub fn record(
     outcome: Outcome,
-    caller: &User,
+    caller: &str,
     group: &str,
     asked: usize,
     answered: usize,
@@ -54,7 +54,7 @@ pub fn record(
 ) {
     metrics::counter!("pharos_group_seen_total", "outcome" => outcome.label()).increment(1);
     tracing::info!(
-        user = %caller.name,
+        user = caller,
         group,
         outcome = outcome.label(),
         asked,
@@ -130,35 +130,44 @@ pub async fn seen(
             }
         })
         .collect();
-    let lookup: Vec<u64> = candidates;
-    let mut out = Vec::with_capacity(group.participant_ids.len());
-    for (i, member_id) in group.participant_ids.iter().enumerate() {
-        let user = group.participant_users.get(i).copied().flatten();
-        let items = match user {
-            Some(user) => match state.stores.user_data_bulk(user, &lookup).await {
-                Ok(rows) => {
-                    let by_id: HashMap<u64, UserItemData> =
-                        lookup.iter().copied().zip(rows).collect();
-                    shown
-                        .iter()
-                        .map(|(wire, t)| item_seen(*wire, t, &by_id))
-                        .collect()
-                }
-                Err(e) => {
-                    tracing::warn!(user = %user.0, error = %e, "group seen: a member's state is unreadable");
-                    return Err(SeenError::Unavailable);
-                }
-            },
-            None => Vec::new(),
-        };
-        out.push(MemberSeen {
-            member_id: member_id.to_string(),
-            name: group.participants.get(i).cloned().unwrap_or_default(),
-            buffering: group.buffering_members.contains(member_id),
-            items,
+    // Members are read concurrently; `join_all` keeps the roster's order.
+    let reads = group
+        .participant_ids
+        .iter()
+        .enumerate()
+        .map(|(i, member_id)| {
+            let user = group.participant_users.get(i).copied().flatten();
+            let (candidates, shown) = (&candidates, &shown);
+            async move {
+                let items = match user {
+                    Some(user) => match state.stores.user_data_bulk(user, candidates).await {
+                        Ok(rows) => {
+                            let by_id: HashMap<u64, UserItemData> =
+                                candidates.iter().copied().zip(rows).collect();
+                            shown
+                                .iter()
+                                .map(|(wire, t)| item_seen(*wire, t, &by_id))
+                                .collect()
+                        }
+                        Err(e) => {
+                            tracing::warn!(user = %user.0, error = %e, "group seen: a member's state is unreadable");
+                            return Err(SeenError::Unavailable);
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                Ok(MemberSeen {
+                    member_id: member_id.to_string(),
+                    name: group.participants.get(i).cloned().unwrap_or_default(),
+                    buffering: group.buffering_members.contains(member_id),
+                    items,
+                })
+            }
         });
-    }
-    Ok(out)
+    futures_util::future::join_all(reads)
+        .await
+        .into_iter()
+        .collect()
 }
 
 fn item_seen(wire: WireId, target: &Target, data: &HashMap<u64, UserItemData>) -> ItemSeen {
@@ -207,6 +216,8 @@ fn position_pct(ticks: u64, duration_ms: Option<u64>) -> u8 {
 /// Resolves each id against the library: a stored item that exists, or the
 /// episodes of a synthesised series or season. Unknown ids are left out.
 async fn resolve(state: &AppState, ids: &[WireId]) -> Result<Vec<(WireId, Target)>, SeenError> {
+    // Stored items are looked up by id. The library is scanned only for
+    // series and seasons, which are no row but a grouping of episodes.
     let real: HashSet<u64> = ids
         .iter()
         .filter_map(|w| match w {
@@ -214,22 +225,36 @@ async fn resolve(state: &AppState, ids: &[WireId]) -> Result<Vec<(WireId, Target
             WireId::Synth(_) => None,
         })
         .collect();
+    let found = futures_util::future::join_all(real.iter().map(|id| async move {
+        match state.stores.get(*id).await {
+            Ok(item) => Ok(Some((*id, item.probe.duration_ms))),
+            Err(pharos_core::DomainError::NotFound(_)) => Ok(None),
+            Err(_) => Err(SeenError::Unavailable),
+        }
+    }))
+    .await;
+    let mut items: HashMap<u64, Option<u64>> = HashMap::new();
+    for entry in found {
+        if let Some((id, duration)) = entry? {
+            items.insert(id, duration);
+        }
+    }
     let synth: HashSet<String> = ids
         .iter()
         .filter(|w| matches!(w, WireId::Synth(_)))
         .map(ToString::to_string)
         .collect();
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(|_| SeenError::Unavailable)?;
-    let mut items: HashMap<u64, Option<u64>> = HashMap::new();
     let mut episodes: HashMap<String, Vec<u64>> = HashMap::new();
+    let all = if synth.is_empty() {
+        Default::default()
+    } else {
+        state
+            .list_items_cached()
+            .await
+            .map_err(|_| SeenError::Unavailable)?
+    };
     for item in all.iter() {
-        if real.contains(&item.id) {
-            items.insert(item.id, item.probe.duration_ms);
-        }
-        if synth.is_empty() || item.kind != MediaKind::Episode {
+        if item.kind != MediaKind::Episode {
             continue;
         }
         let Some(series) = item.series.as_ref() else {
@@ -269,6 +294,45 @@ async fn resolve(state: &AppState, ids: &[WireId]) -> Result<Vec<(WireId, Target
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ODD step 3: every outcome is counted under its own label.
+    /// Disarm check: with `record` not incrementing the counter, the snapshot
+    /// holds no `pharos_group_seen_total` and this fails.
+    #[test]
+    fn every_outcome_is_counted_under_its_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        for outcome in Outcome::ALL {
+            record(outcome, "ali", "g", 3, 2, 2);
+        }
+        let counted: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == "pharos_group_seen_total")
+            .filter_map(|(ck, _, _, v)| {
+                let outcome = ck
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "outcome")?
+                    .value()
+                    .to_owned();
+                match v {
+                    DebugValue::Counter(n) => Some((outcome, n)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for outcome in Outcome::ALL {
+            assert_eq!(
+                counted.get(outcome.label()),
+                Some(&1),
+                "{outcome:?}: {counted:?}"
+            );
+        }
+    }
 
     #[test]
     fn outcome_labels_are_distinct() {
