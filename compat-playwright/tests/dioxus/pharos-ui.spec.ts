@@ -1502,6 +1502,108 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
   });
 });
 
+// B452 / V392: a dropped connection reconnects without rebuilding the
+// player, so the song plays on from where it was in the same element.
+test.describe("pharos Dioxus UI now playing survives a reconnect", () => {
+  test("a dropped connection keeps the same audio element playing", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    await page.addInitScript(() => {
+      const sockets: WebSocket[] = [];
+      (window as unknown as { __sockets: WebSocket[] }).__sockets = sockets;
+      const Native = window.WebSocket;
+      window.WebSocket = class extends Native {
+        constructor(url: string | URL, protocols?: string | string[]) {
+          super(url, protocols);
+          sockets.push(this);
+        }
+      } as typeof WebSocket;
+    });
+    const at = () =>
+      page.evaluate(
+        () =>
+          (document.getElementById("pharos-video") as HTMLMediaElement | null)
+            ?.currentTime ?? 0,
+      );
+
+    await page.goto("/ui/");
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    const tile = page.locator(".pharos-poster").first();
+    await expect(tile).toBeVisible({ timeout: 15_000 });
+    await tile.click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(at, { timeout: 30_000 }).toBeGreaterThan(2);
+
+    await page.evaluate(() => {
+      (document.getElementById("pharos-video") as HTMLMediaElement & { __probe?: number })
+        .__probe = 1;
+      for (const s of (window as unknown as { __sockets: WebSocket[] }).__sockets) {
+        if (s.readyState === WebSocket.OPEN) s.close();
+      }
+    });
+    const before = await at();
+    // Reconnected: a newer socket is open and the screens settled.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const all = (window as unknown as { __sockets: WebSocket[] }).__sockets;
+            return all.filter((s) => s.readyState === WebSocket.OPEN).length;
+          }),
+        { timeout: 15_000 },
+      )
+      .toBeGreaterThan(0);
+    await expect(page.getByText("Connection lost. Reconnecting…")).toHaveCount(0, {
+      timeout: 15_000,
+    });
+    await page.waitForTimeout(3_000);
+
+    const kept = await page.evaluate(
+      () =>
+        (document.getElementById("pharos-video") as HTMLMediaElement & { __probe?: number })
+          ?.__probe ?? 0,
+    );
+    expect(kept, "the reconnect rebuilt the <audio>").toBe(1);
+    await expect.poll(at).toBeGreaterThan(before + 0.5);
+    expect(lines.join("\n")).toMatch(/pharos: playback grant renewed/);
+
+    // The stream is still served after the reconnect: a seek past what is
+    // buffered plays on without an error.
+    await page.evaluate(() => {
+      const a = document.getElementById("pharos-video") as HTMLMediaElement;
+      a.currentTime = Math.max(a.currentTime, a.duration - 5);
+    });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => (document.getElementById("pharos-video") as HTMLMediaElement).error?.code ?? 0,
+        ),
+      )
+      .toBe(0);
+  });
+});
+
 // V300: the seeded song has a synced .lrc sidecar (a line every 2 s, written
 // by `just compat-dioxus-full`). Its lines light up in time, a line seeks
 // when clicked, and the Lyrics chip hides the panel.
