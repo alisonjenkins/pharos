@@ -727,6 +727,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            cast: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -748,6 +749,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            cast: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -764,6 +766,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            cast: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("/watch/"), "{html}");
