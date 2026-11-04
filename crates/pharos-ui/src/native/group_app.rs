@@ -46,6 +46,10 @@ impl Env for AppEnv {
         self.ui.send(ui);
     }
 
+    fn info(&self, message: &str) {
+        platform::info(message);
+    }
+
     fn warn(&self, message: &str) {
         platform::warn(message);
     }

@@ -65,6 +65,7 @@ pub trait Env {
     /// A client event for telemetry (sent only when the viewer opted in).
     fn report(&self, event: ClientEvent);
     fn ui(&self, ui: Ui);
+    fn info(&self, message: &str);
     fn warn(&self, message: &str);
 }
 
@@ -716,7 +717,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             return;
         };
         let (audio, subtitles) = player.stream_indexes();
-        if let Some(picks) = follows_group(own, tracks, &audio, &subtitles) {
+        let picks = follows_group(own, tracks, &audio, &subtitles);
+        let (verdict, reason) = match (&picks, own) {
+            (Some(_), _) => ("apply", "following the group"),
+            (None, true) => ("skip", "own tracks"),
+            (None, false) => ("skip", "nothing the item has"),
+        };
+        self.env.info(&format!(
+            "pharos: group tracks follow verdict={verdict} reason={reason:?} own_tracks={own} group_audio={:?} group_subtitle={:?} item_audio={audio:?} item_subtitles={subtitles:?} picks={picks:?}",
+            tracks.audio, tracks.subtitle
+        ));
+        if let Some(picks) = picks {
             player.apply_tracks(picks);
         }
     }
@@ -746,7 +757,16 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 inner.epoch,
             )
         };
-        if route_pick(active, own) == PickRoute::ApplyLocally {
+        let route = route_pick(active, own);
+        let reason = match (active, own) {
+            (false, _) => "not in a group",
+            (true, true) => "own tracks",
+            (true, false) => "following the group",
+        };
+        self.env.info(&format!(
+            "pharos: group tracks pick route={route:?} reason={reason:?} audio={audio:?} subtitle={subtitle:?} item={playlist_item_id:?}"
+        ));
+        if route == PickRoute::ApplyLocally {
             return false;
         }
         if let Some(me) = self.me() {
@@ -1238,6 +1258,7 @@ mod tests {
         reports: Rc<RefCell<Vec<ClientEvent>>>,
         ui: Rc<RefCell<Vec<Ui>>>,
         tasks: Rc<RefCell<Vec<LocalBoxFuture<'static, ()>>>>,
+        logs: Rc<RefCell<Vec<String>>>,
     }
 
     impl Env for TestEnv {
@@ -1261,6 +1282,9 @@ mod tests {
         }
         fn ui(&self, ui: Ui) {
             self.ui.borrow_mut().push(ui);
+        }
+        fn info(&self, message: &str) {
+            self.logs.borrow_mut().push(message.to_owned());
         }
         fn warn(&self, _message: &str) {}
     }
@@ -2000,6 +2024,25 @@ mod tests {
         assert!(!rig.session.pick_audio(1));
         let idle = Session::new(FakeGroups::default(), TestEnv::default());
         assert!(!idle.pick_subtitle(Some(3)));
+    }
+
+    #[test]
+    fn track_decisions_are_logged_with_their_inputs_verdict_and_reason() {
+        let rig = rig_with_streams();
+        rig.session.deliver(tracks_update());
+        assert!(rig.session.pick_subtitle(Some(3)));
+        rig.session.follow_tracks(false);
+        assert!(!rig.session.pick_audio(1));
+        let logs = rig.env.logs.borrow().clone();
+        let has = |want: &str| {
+            assert!(
+                logs.iter().any(|l| l.contains(want)),
+                "no log line with {want}: {logs:#?}"
+            );
+        };
+        has("pharos: group tracks follow verdict=apply reason=\"following the group\" own_tracks=false group_audio=Index(2) group_subtitle=Index(4) item_audio=[1, 2] item_subtitles=[3, 4]");
+        has("pharos: group tracks pick route=SendToGroup reason=\"following the group\" audio=Unset subtitle=Index(3)");
+        has("pharos: group tracks pick route=ApplyLocally reason=\"own tracks\" audio=Index(1) subtitle=Unset");
     }
 
     #[test]
