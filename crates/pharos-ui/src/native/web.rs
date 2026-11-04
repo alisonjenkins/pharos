@@ -399,6 +399,100 @@ pub fn element_width(id: &str) -> f64 {
         .map_or(0.0, |e| e.get_bounding_client_rect().width())
 }
 
+/// The rendered width and height of the element `id`, zeros when it is gone.
+pub fn element_size(id: &str) -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .map_or((0.0, 0.0), |e| {
+            let rect = e.get_bounding_client_rect();
+            (rect.width(), rect.height())
+        })
+}
+
+/// The viewport's width and height in CSS px, less any scrollbars: the box
+/// a fixed element's percentages refer to.
+pub fn viewport() -> (f64, f64) {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .map_or((0.0, 0.0), |e| {
+            (f64::from(e.client_width()), f64::from(e.client_height()))
+        })
+}
+
+/// Whether a key event's target is the element carrying `class` itself, not
+/// a control inside it.
+pub fn key_on_itself(evt: &dioxus::prelude::KeyboardEvent, class: &str) -> bool {
+    use dioxus_web::WebEventExt;
+    use wasm_bindgen::JsCast;
+    evt.try_as_web_event()
+        .and_then(|web| web.target())
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|el| el.class_list().contains(class))
+}
+
+/// The element a pointer event started on.
+fn pointer_target(evt: &dioxus::prelude::PointerEvent) -> Option<web_sys::Element> {
+    use dioxus_web::WebEventExt;
+    use wasm_bindgen::JsCast;
+    evt.try_as_web_event()
+        .and_then(|web| web.target())
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+}
+
+/// Whether a pointer event started on a button rather than the surface
+/// around it.
+pub fn on_a_button(evt: &dioxus::prelude::PointerEvent) -> bool {
+    pointer_target(evt)
+        .and_then(|el| el.closest("button, a, input, [role=button]").ok().flatten())
+        .is_some()
+}
+
+/// Send the rest of this pointer's events to the element it went down on,
+/// so a drag keeps going when the pointer outruns the element.
+pub fn capture_pointer(evt: &dioxus::prelude::PointerEvent) {
+    if let Some(el) = pointer_target(evt) {
+        if let Err(e) = el.set_pointer_capture(evt.pointer_id()) {
+            warn(&format!("pharos: pointer capture failed: {e:?}"));
+        }
+    }
+}
+
+/// The value under `key` in `sessionStorage`, kept for the tab.
+pub fn session_get(key: &str) -> Result<Option<String>, String> {
+    storage(Kept::Tab)?
+        .get_item(key)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Write `value` under `key` in `sessionStorage`.
+pub fn session_set(key: &str, value: &str) -> Result<(), String> {
+    storage(Kept::Tab)?
+        .set_item(key, value)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// How long a stored value lasts.
+#[derive(Clone, Copy)]
+enum Kept {
+    /// `localStorage`: across visits.
+    Device,
+    /// `sessionStorage`: for the tab.
+    Tab,
+}
+
+fn storage(kept: Kept) -> Result<web_sys::Storage, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let (storage, name) = match kept {
+        Kept::Device => (window.local_storage(), "localStorage"),
+        Kept::Tab => (window.session_storage(), "sessionStorage"),
+    };
+    storage
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or_else(|| format!("{name} is unavailable"))
+}
+
 /// Moves keyboard focus to the element `id`, when it is there and focusable.
 pub fn focus_by_id(id: &str) {
     use wasm_bindgen::JsCast;
@@ -1295,12 +1389,9 @@ pub fn info(message: &str) {
 /// The theme name stored under `key`. `Err` carries the browser's reason
 /// when storage cannot be read at all.
 pub fn stored_theme(key: &str) -> Result<Option<String>, String> {
-    let window = web_sys::window().ok_or("no window")?;
-    let storage = window
-        .local_storage()
-        .map_err(|e| format!("{e:?}"))?
-        .ok_or("localStorage is unavailable")?;
-    storage.get_item(key).map_err(|e| format!("{e:?}"))
+    storage(Kept::Device)?
+        .get_item(key)
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Set every token on `<html>` in one `style` write, so the page restyles
@@ -1320,12 +1411,9 @@ pub fn apply_tokens(declarations: &[(String, String)]) -> Result<(), String> {
 
 /// Write `value` under `key` in `localStorage`.
 pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
-    let window = web_sys::window().ok_or("no window")?;
-    let storage = window
-        .local_storage()
-        .map_err(|e| format!("{e:?}"))?
-        .ok_or("localStorage is unavailable")?;
-    storage.set_item(key, value).map_err(|e| format!("{e:?}"))
+    storage(Kept::Device)?
+        .set_item(key, value)
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Whether the media `query` matches now, false when the browser lacks it.

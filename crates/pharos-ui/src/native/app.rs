@@ -30,6 +30,7 @@ use super::playback::{
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
+use super::stage::{Stage, StageAction, StageBar, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
 use super::trail;
@@ -64,8 +65,27 @@ pub fn Root() -> Element {
             route.set(Route::parse(&path))
         }))
     });
+    // One player for the session (spec 020): the stage follows the route,
+    // and a play while it is compact stays where the listener is.
+    let mut stage = use_signal(Stage::restore);
+    use_context_provider(|| StageCtx(stage));
+    use_effect(move || {
+        let at = route();
+        let mut next = stage.peek().clone();
+        if let Some(view) = next.follow(&at) {
+            platform::info(&format!(
+                "pharos: stage view={} item={} reason=nav",
+                view.label(),
+                next.item.map(|i| i.to_string()).unwrap_or_default()
+            ));
+            stage.set(next);
+        }
+    });
     use_context_provider(|| {
         Nav(EventHandler::new(move |to: Route| {
+            if plays_in_place(stage, &to) {
+                return;
+            }
             if *route.peek() != to {
                 platform::push(&to.path());
                 route.set(to);
@@ -74,6 +94,9 @@ pub fn Root() -> Element {
     });
     use_context_provider(|| {
         Replace(EventHandler::new(move |to: Route| {
+            if plays_in_place(stage, &to) {
+                return;
+            }
             platform::replace(&to.path());
             route.set(to);
         }))
@@ -99,6 +122,24 @@ pub fn Root() -> Element {
             NativeApp { route }
         },
     }
+}
+
+/// A play the compact player takes in place of a navigation to the watch
+/// page (spec 020 FR-001): the page stays and the stage plays the item.
+fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
+    if !matches!(to, Route::Watch(_)) || !stage.peek().compact_shown() {
+        return false;
+    }
+    let taken = stage.write().takes(to);
+    if taken {
+        let s = stage.peek();
+        platform::info(&format!(
+            "pharos: stage view={} item={} reason=play",
+            s.view.label(),
+            s.item.map(|i| i.to_string()).unwrap_or_default()
+        ));
+    }
+    taken
 }
 
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
@@ -708,6 +749,13 @@ fn NativeApp(route: Route) -> Element {
     let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
     let nav = use_context::<Nav>();
+    // Signing out ends the session, and the player with it.
+    let StageCtx(mut stage) = use_context::<StageCtx>();
+    use_effect(move || {
+        if matches!(machine.read().phase(), Phase::SignIn { .. }) && stage.peek().item.is_some() {
+            stage.write().close();
+        }
+    });
     // The library buttons, read again for each signed-in API; a reconnect
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
@@ -817,6 +865,7 @@ fn NativeApp(route: Route) -> Element {
                     ErrorNote { message }
                 }
                 Screen { route }
+                StageView {}
             }
         };
     }
@@ -911,9 +960,8 @@ fn Screen(route: Route) -> Element {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
         Route::Title(id) => rsx! { TitleScreen { id } },
-        // Another item (the next episode) mounts a new playback rather than
-        // re-rendering this one's.
-        Route::Watch(id) => remount_on(&id.to_string(), rsx! { WatchScreen { id } }),
+        // The stage beside the screen draws the player (spec 020).
+        Route::Watch(_) => rsx! {},
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
@@ -922,6 +970,30 @@ fn Screen(route: Route) -> Element {
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
+    }
+}
+
+/// The one player (spec 020): full on the watch route, else a floating
+/// window or a mini bar. It sits beside the routed screen, so a route change
+/// restyles it rather than unmounting it and its stream.
+#[component]
+fn StageView() -> Element {
+    let StageCtx(stage) = use_context::<StageCtx>();
+    let s = stage.read();
+    let Some(id) = s.item else {
+        return rsx! {};
+    };
+    let class = format!("pharos-stage is-{}", s.view.label());
+    let style = format!(
+        "--pharos-stage-x: {:.4}; --pharos-stage-y: {:.4};",
+        s.spot.x, s.spot.y
+    );
+    rsx! {
+        div { id: STAGE_ID, class, style,
+            // Another item (the next episode) mounts a new playback rather
+            // than re-rendering this one's.
+            {remount_on(&id.to_string(), rsx! { WatchScreen { id } })}
+        }
     }
 }
 
@@ -1316,6 +1388,7 @@ impl PartialEq for PlayingRef {
 #[component]
 fn WatchScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
+    let StageCtx(ctx_stage) = use_context::<StageCtx>();
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
@@ -1394,7 +1467,8 @@ fn WatchScreen(id: ItemRef) -> Element {
         let asked = picks();
         async move {
             let api = api?;
-            let info = call("watch", "play");
+            // A play outside the full view is the stage's (spec 020 FR-010).
+            let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let (decision, grant) = api
@@ -1482,6 +1556,15 @@ impl PartialEq for LastMs {
     }
 }
 
+/// The `ui_action` of a play RPC made in `view`.
+fn play_action(view: View) -> &'static str {
+    match view {
+        View::Full => "play",
+        View::Floating => "stage_floating",
+        View::Mini => "stage_mini",
+    }
+}
+
 /// A shuffle seed: a play order needs no more randomness than the clock.
 fn seed() -> u64 {
     platform::now_ms().to_bits()
@@ -1519,6 +1602,10 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    let StageCtx(stage) = use_context::<StageCtx>();
+    // The view alone, so a drag (which moves the spot) does not redraw the
+    // player.
+    let view = use_memo(move || stage.read().view)();
     let own_queue = use_signal(Queue::default);
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
     let audio = p.kind == ItemKind::Audio;
@@ -1752,7 +1839,21 @@ fn Player(
                 // In place of this episode, so Back leaves the show rather than
                 // replaying every episode watched.
                 Control::Play(id) => go(id),
+                // Leaving the watch page shrinks the player (spec 020).
                 Control::Back => {
+                    if !platform::go_back() {
+                        nav.0.call(Route::Home);
+                    }
+                }
+                Control::Shrink => {
+                    // A copy, so the handler stays `Fn`.
+                    let mut stage = stage;
+                    let compact = stage.peek().compact;
+                    stage.write().show(compact);
+                    platform::info(&format!(
+                        "pharos: stage view={} item={playing_id} reason=button",
+                        compact.label()
+                    ));
                     if !platform::go_back() {
                         nav.0.call(Route::Home);
                     }
@@ -1805,15 +1906,62 @@ fn Player(
             }
         }
     };
-    rsx! {
-        if let Some(message) = failed() {
-            ErrorNote { message }
+    let compact = view != View::Full;
+    let on_action = {
+        let mut on_control = on_control.clone();
+        move |action: StageAction| {
+            let mut stage = stage;
+            match action {
+                StageAction::Player(control) => on_control(control),
+                StageAction::Show(View::Full) => {
+                    stage.write().show(View::Full);
+                    platform::info(&format!(
+                        "pharos: stage view=full item={playing_id} reason=button"
+                    ));
+                    nav.0.call(Route::Watch(playing_id));
+                }
+                StageAction::Show(to) => {
+                    stage.write().show(to);
+                    platform::info(&format!(
+                        "pharos: stage view={} item={playing_id} reason=button",
+                        to.label()
+                    ));
+                }
+                StageAction::Close => {
+                    stage.write().close();
+                    platform::info(&format!(
+                        "pharos: stage view=closed item={playing_id} reason=close"
+                    ));
+                }
+                StageAction::Place(to) => stage.write().place(to),
+                StageAction::Keep => stage.peek().keep_spot(),
+            }
         }
-        if let Some(message) = group.ended.clone() {
-            ErrorNote { message }
+    };
+    rsx! {
+        if compact {
+            StageBar {
+                view,
+                title: p.title.clone(),
+                image: p.image.clone(),
+                media: media(),
+                runtime_ms: p.detail.item.runtime_ms,
+                previous: near.previous,
+                next,
+                error: failed().or_else(|| group.ended.clone()),
+                on_action,
+            }
+        } else {
+            if let Some(message) = failed() {
+                ErrorNote { message }
+            }
+            if let Some(message) = group.ended.clone() {
+                ErrorNote { message }
+            }
         }
         if p.kind == ItemKind::Audio {
             ListenView {
+                compact,
                 title: p.title.clone(),
                 image: p.image.clone(),
                 year: p.detail.item.year,
@@ -1911,6 +2059,28 @@ mod tests {
     #[test]
     fn the_same_play_session_keeps_its_player() {
         assert_eq!(mounts_across(&["a", "a"]), 1);
+    }
+
+    /// Spec 020 FR-001 (V400): the stage beside the screen draws the player,
+    /// so the watch route itself draws nothing that a route change could
+    /// unmount.
+    #[test]
+    fn the_watch_route_draws_no_player_of_its_own() {
+        let mut dom = VirtualDom::new_with_props(
+            Screen,
+            ScreenProps {
+                route: Route::Watch(ItemRef::Real(1)),
+            },
+        );
+        dom.rebuild_in_place();
+        assert_eq!(dioxus_ssr::render(&dom), "");
+    }
+
+    #[test]
+    fn a_play_outside_the_full_view_is_named_for_the_stage() {
+        assert_eq!(play_action(View::Full), "play");
+        assert_eq!(play_action(View::Floating), "stage_floating");
+        assert_eq!(play_action(View::Mini), "stage_mini");
     }
 
     #[test]

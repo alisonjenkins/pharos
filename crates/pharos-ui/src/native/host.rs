@@ -109,6 +109,32 @@ pub fn element_width(_id: &str) -> f64 {
     0.0
 }
 
+pub fn element_size(_id: &str) -> (f64, f64) {
+    (0.0, 0.0)
+}
+
+pub fn viewport() -> (f64, f64) {
+    (0.0, 0.0)
+}
+
+pub fn key_on_itself(_evt: &dioxus::prelude::KeyboardEvent, _class: &str) -> bool {
+    false
+}
+
+pub fn on_a_button(_evt: &dioxus::prelude::PointerEvent) -> bool {
+    false
+}
+
+pub fn capture_pointer(_evt: &dioxus::prelude::PointerEvent) {}
+
+pub fn session_get(_key: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+pub fn session_set(_key: &str, _value: &str) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn toggle_fullscreen(_id: &str) {}
 
 pub fn focus_by_id(_id: &str) {}
