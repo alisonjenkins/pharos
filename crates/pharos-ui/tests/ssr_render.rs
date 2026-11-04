@@ -1511,6 +1511,8 @@ fn appearance_page_with(diagnostics: bool) -> Element {
             notice: None,
             diagnostics,
             diagnostics_key: 0,
+            max_quality: 0,
+            on_max_quality: |_| {},
             on_diagnostics: |_| {},
             on_pick: |_| {},
             on_auto: |_| {},
