@@ -761,3 +761,74 @@ async fn a_rejoin_inside_the_grace_keeps_the_member() {
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(member_count(&rig).await, 2);
 }
+
+/// US2: when a member buffers, the group's other members are told which one,
+/// and told again when it recovers.
+/// Disarm check: with `changes_buffering` returning false, no `member` update
+/// arrives and this times out.
+#[actix_web::test]
+async fn a_members_buffering_reaches_the_others_as_a_member_update() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.a, unpause_request).unwrap();
+    let _ = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Play { .. }).then_some(())
+    })
+    .await;
+    command!(
+        pair.b,
+        buffering_request,
+        set_position_ms(6_000),
+        set_buffering(true)
+    )
+    .unwrap();
+    // Skip the join announcement still queued ahead of it.
+    let stalled = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: true,
+        } => Some((name.clone(), true)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(stalled, ("guest".to_owned(), true));
+    command!(
+        pair.b,
+        ready_request,
+        set_position_ms(6_000),
+        set_playing(true)
+    )
+    .unwrap();
+    let recovered = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: false,
+        } => Some((name.clone(), false)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(recovered, ("guest".to_owned(), false));
+}
+
+/// The liveness beacon and the clock report are accepted from a member, and
+/// refused once it has left.
+#[actix_web::test]
+async fn ping_and_clock_report_are_accepted_until_the_member_leaves() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    command!(pair.a, ping_request).unwrap();
+    command!(
+        pair.a,
+        clock_report_request,
+        set_t1(1),
+        set_t2(2),
+        set_t3(3),
+        set_t4(4)
+    )
+    .unwrap();
+    command!(pair.a, leave_request).unwrap();
+    assert_eq!(
+        command!(pair.a, ping_request).unwrap_err(),
+        "not found: group"
+    );
+}
