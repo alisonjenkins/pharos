@@ -28,7 +28,7 @@ use super::playback::{
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
-use super::together::{group_api, GroupClient as _, GroupError, GroupSink, GroupSummary, Groups};
+use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
@@ -938,14 +938,21 @@ async fn list_groups(api: Option<Groups>) -> Result<Vec<GroupSummary>, GroupErro
     }
 }
 
-/// Join `id` and go to what the group is watching.
-fn join_group(api: Option<Groups>, nav: Nav, mut error: Signal<Option<String>>, id: String) {
-    let Some(api) = api else {
+/// Join `id` and go to what the group is watching. A group that has not
+/// said yet takes us there when it does (the store navigates on its item).
+fn join_group(
+    ctx: Ctx,
+    together: Together,
+    nav: Nav,
+    mut error: Signal<Option<String>>,
+    id: String,
+) {
+    let Some(api) = ctx.api.peek().clone() else {
         return;
     };
+    let session = together.session(&api);
     spawn(async move {
-        let sink: GroupSink = Rc::new(|_| {});
-        match api.join(&id, sink).await {
+        match session.join(&id).await {
             Ok(group) => {
                 if let Some(item) = group.item {
                     nav.0.call(Route::Watch(item));
@@ -961,6 +968,7 @@ fn join_group(api: Option<Groups>, nav: Nav, mut error: Signal<Option<String>>, 
 fn TogetherScreen() -> Element {
     let nav = use_context::<Nav>();
     let ctx = use_context::<Ctx>();
+    let together = use_context::<Together>();
     let api = use_hook(move || group_client(ctx));
     let error = use_signal(|| None::<String>);
     let groups = use_resource({
@@ -977,7 +985,7 @@ fn TogetherScreen() -> Element {
             }
             TogetherView {
                 groups: groups.clone(),
-                on_join: move |id: String| join_group(api.clone(), nav, error, id),
+                on_join: move |id: String| join_group(ctx, together.clone(), nav, error, id),
             }
         },
     }
@@ -988,6 +996,7 @@ fn TogetherScreen() -> Element {
 fn InviteScreen(id: String) -> Element {
     let nav = use_context::<Nav>();
     let ctx = use_context::<Ctx>();
+    let together = use_context::<Together>();
     let api = use_hook(move || group_client(ctx));
     let error = use_signal(|| None::<String>);
     let groups = use_resource({
@@ -1006,7 +1015,7 @@ fn InviteScreen(id: String) -> Element {
                 }
                 InviteView {
                     group,
-                    on_join: move |id: String| join_group(api.clone(), nav, error, id),
+                    on_join: move |id: String| join_group(ctx, together.clone(), nav, error, id),
                     on_start_new: move |_| nav.0.call(Route::Together),
                 }
             }
@@ -1169,6 +1178,8 @@ fn BrowseScreen(id: ItemRef) -> Element {
 fn TitleScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
     let nav = use_context::<Nav>();
+    let together = use_context::<Together>();
+    let mut group_error = use_signal(|| None::<String>);
     let detail = use_resource(move || {
         let api = ctx.api.read().clone();
         async move {
@@ -1179,20 +1190,36 @@ fn TitleScreen(id: ItemRef) -> Element {
             ))
         }
     });
-    let state = detail.read();
-    loaded(
-        state.as_ref().and_then(Option::as_ref),
-        |detail: &Detail| {
-            // The group seam is not on the network yet: go to the Together
-            // page, where groups are listed and joined.
-            rsx! {
-                TitleView {
-                    detail: detail.clone(),
-                    on_watch_together: move |_| nav.0.call(Route::Together),
-                }
+    // Start a group on this title from the start, then watch it as its member.
+    let on_watch_together = move |_| {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        let session = together.session(&api);
+        spawn(async move {
+            match session.create(id, 0).await {
+                Ok(_) => nav.0.call(Route::Watch(id)),
+                Err(e) => group_error.set(Some(e.0)),
             }
-        },
-    )
+        });
+    };
+    let state = detail.read();
+    rsx! {
+        if let Some(message) = group_error() {
+            ErrorNote { message }
+        }
+        {loaded(
+            state.as_ref().and_then(Option::as_ref),
+            |detail: &Detail| {
+                rsx! {
+                    TitleView {
+                        detail: detail.clone(),
+                        on_watch_together: on_watch_together.clone(),
+                    }
+                }
+            },
+        )}
+    }
 }
 
 /// A negotiated playback, ready for the player.
