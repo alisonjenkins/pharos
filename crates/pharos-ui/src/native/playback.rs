@@ -119,6 +119,21 @@ impl Default for MediaState {
     }
 }
 
+impl MediaState {
+    /// A new player's state: at the viewer's saved volume and mute, so its
+    /// controls never draw the fresh element's full volume first.
+    pub fn at_volume(saved: Option<(f64, bool)>) -> Self {
+        match saved {
+            Some((volume, muted)) => Self {
+                volume,
+                muted,
+                ..Self::default()
+            },
+            None => Self::default(),
+        }
+    }
+}
+
 /// Where the viewer's volume and mute are kept, so the next player (each
 /// track and each renegotiated stream mounts a new media element) starts
 /// where they left it rather than at full volume.
@@ -558,6 +573,13 @@ mod tests {
             );
         }
         assert_eq!(volume_setting(1.7, false), "1.000");
+    }
+
+    #[test]
+    fn a_new_player_starts_at_the_saved_volume() {
+        let state = MediaState::at_volume(Some((0.3, true)));
+        assert_eq!((state.volume, state.muted), (0.3, true));
+        assert_eq!(MediaState::at_volume(None), MediaState::default());
     }
 
     #[test]
