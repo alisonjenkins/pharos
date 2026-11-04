@@ -1536,16 +1536,41 @@ test.describe("pharos Dioxus UI now playing", () => {
     await page.getByRole("button", { name: "Play" }).click();
     await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
 
-    await page.getByRole("button", { name: "Halo" }).click();
-    await expect(page.getByRole("button", { name: "Halo" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    // One button in the middle of the top strip opens a grid of every
+    // style; each style's shader compiles (B480/V423).
+    const trigger = page.locator("#pharos-style-trigger");
+    const box = await trigger.boundingBox();
+    const width = page.viewportSize()?.width ?? 0;
+    expect(Math.abs((box?.x ?? 0) + (box?.width ?? 0) / 2 - width / 2)).toBeLessThan(2);
+    await trigger.click();
+    const picker = page.getByRole("group", { name: "Visualiser" });
+    await expect(picker).toBeVisible();
+    const styles = await picker.getByRole("button").allTextContents();
+    expect(styles.length).toBeGreaterThanOrEqual(9);
+    // Spectrum, the default, logged its decision above.
+    for (const name of styles.filter((s) => s !== "Off" && s !== "Spectrum")) {
+      lines.length = 0;
+      await picker.getByRole("button", { name, exact: true }).click();
+      const decided = new RegExp(`pharos: renderer mode=\\S+ reason=\\S+ style=${name.toLowerCase()} `);
+      await expect
+        .poll(() => lines.find((l) => decided.test(l)) ?? "", { timeout: 15_000 })
+        .toMatch(decided);
+      expect(lines.find((l) => decided.test(l))).not.toMatch(/reason=shader/);
+    }
+    await picker.getByRole("button", { name: "Halo", exact: true }).click();
+    await expect(
+      picker.getByRole("button", { name: "Halo", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
     await expect
       .poll(() =>
         page.evaluate(() => localStorage.getItem("pharos.visualiser")),
       )
       .toBe("halo");
+    // Escape closes the grid and leaves the song playing.
+    await page.keyboard.press("Escape");
+    await expect(picker).toBeHidden();
+    await expect(trigger).toContainText("Halo");
+    await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
   });
 });
 
