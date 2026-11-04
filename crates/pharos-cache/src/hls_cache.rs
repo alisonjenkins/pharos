@@ -6151,33 +6151,43 @@ mod tests {
     /// WHICH job comes back short is a parameter because a test may need to
     /// establish some scheduler state — a stream's playhead, say — with a job
     /// that simply succeeds before the one under observation arrives.
+    ///
+    /// Every job waits on the returned [`EncodeGate`] before it finishes, so
+    /// the test steps through the attempts instead of racing wall-clock
+    /// sleeps against them (B427).
     fn retries_the_nth_encode(
         attempts: Arc<std::sync::atomic::AtomicU64>,
         short_at: u64,
-    ) -> pharos_transcode::scheduler::TranscodeScheduler {
+    ) -> (pharos_transcode::scheduler::TranscodeScheduler, EncodeGate) {
         use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
         use pharos_transcode::scheduler::{
             RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
         };
 
-        struct Retrying(Arc<std::sync::atomic::AtomicU64>, u64);
+        struct Retrying {
+            attempts: Arc<std::sync::atomic::AtomicU64>,
+            short_at: u64,
+            started: tokio::sync::mpsc::UnboundedSender<u64>,
+            release: Arc<tokio::sync::Semaphore>,
+        }
         impl WorkerSpawner for Retrying {
             fn spawn(&self, id: WorkerId) -> SpawnFuture {
-                let attempts = self.0.clone();
-                let short_at = self.1;
-                Box::pin(async move {
-                    Ok(Box::new(RetryWorker {
-                        id,
-                        attempts,
-                        short_at,
-                    }) as Box<dyn Worker>)
-                })
+                let worker = RetryWorker {
+                    id,
+                    attempts: self.attempts.clone(),
+                    short_at: self.short_at,
+                    started: self.started.clone(),
+                    release: self.release.clone(),
+                };
+                Box::pin(async move { Ok(Box::new(worker) as Box<dyn Worker>) })
             }
         }
         struct RetryWorker {
             id: WorkerId,
             attempts: Arc<std::sync::atomic::AtomicU64>,
             short_at: u64,
+            started: tokio::sync::mpsc::UnboundedSender<u64>,
+            release: Arc<tokio::sync::Semaphore>,
         }
         impl Worker for RetryWorker {
             fn id(&self) -> WorkerId {
@@ -6186,18 +6196,18 @@ mod tests {
             fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
                 let attempts = self.attempts.clone();
                 let short_at = self.short_at;
+                let started = self.started.clone();
+                let release = self.release.clone();
                 Box::pin(async move {
                     let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let short = n == short_at;
-                    // The attempt AFTER the short one is the one under
-                    // observation, so it has to still be running when the
-                    // snapshot is taken; the short one gets out of the way.
-                    let hold = if short {
-                        std::time::Duration::from_millis(250)
-                    } else {
-                        std::time::Duration::from_millis(600)
-                    };
-                    tokio::time::sleep(hold).await;
+                    let _ = started.send(n);
+                    // Held until the test lets this attempt finish.
+                    release
+                        .acquire()
+                        .await
+                        .expect("the gate's semaphore is never closed")
+                        .forget();
                     let OutputSink::FileDirect { path } = &job.sink else {
                         return WorkerRunResult::Died;
                     };
@@ -6215,11 +6225,76 @@ mod tests {
             }
         }
 
-        TranscodeScheduler::spawn(
+        let (started, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let sched = TranscodeScheduler::spawn(
             pharos_transcode::device::DeviceTable::from_probe(&[], 4),
-            Arc::new(Retrying(attempts, short_at)),
+            Arc::new(Retrying {
+                attempts,
+                short_at,
+                started,
+                release: release.clone(),
+            }),
             pharos_transcode::scheduler::SchedConfig::default(),
+        );
+        (
+            sched,
+            EncodeGate {
+                started: started_rx,
+                release,
+            },
         )
+    }
+
+    /// The test's side of [`retries_the_nth_encode`]: hears each attempt
+    /// start and lets attempts finish one at a time.
+    struct EncodeGate {
+        started: tokio::sync::mpsc::UnboundedReceiver<u64>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl EncodeGate {
+        /// The attempt number of the next encode to start. Bounded only so a
+        /// missing attempt fails the test rather than hanging it.
+        async fn started(&mut self) -> u64 {
+            tokio::time::timeout(std::time::Duration::from_secs(30), self.started.recv())
+                .await
+                .expect("the expected encode attempt never started")
+                .expect("the scheduler outlives the test")
+        }
+
+        /// Lets one held attempt (or the next to start) finish.
+        fn finish_one(&self) {
+            self.release.add_permits(1);
+        }
+    }
+
+    /// Waits until the scheduler counts `n` interactive encodes in flight,
+    /// which is how a joiner's promotion shows. A bound only so a broken
+    /// promotion fails rather than hangs; nothing here races a clock.
+    async fn until_interactive_inflight(
+        sched: &pharos_transcode::scheduler::TranscodeScheduler,
+        n: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let snap = sched.snapshot().await.expect("snapshot");
+                if snap
+                    .devices
+                    .iter()
+                    .map(|d| d.inflight_interactive)
+                    .sum::<usize>()
+                    == n
+                {
+                    return;
+                }
+                // A poll interval, not an ordering: the loop waits on the
+                // condition itself.
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the joiner never promoted the encode");
     }
 
     /// A scheduler whose worker writes a REAL segment (plus a complete
@@ -6460,7 +6535,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (cache, _) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
         let attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let sched = retries_the_nth_encode(attempts.clone(), 0);
+        let (sched, mut gate) = retries_the_nth_encode(attempts.clone(), 0);
         let cache = Arc::new(cache.with_scheduler(sched.clone()));
         // Video, so `frame=0` is a shortfall rather than a legitimate
         // audio-only segment.
@@ -6478,7 +6553,7 @@ mod tests {
             })
         };
         // A client joins the first attempt and promotes it.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(gate.started().await, 0);
         let joiner = {
             let c = cache.clone();
             let o = opts.clone();
@@ -6487,10 +6562,12 @@ mod tests {
                     .await
             })
         };
+        until_interactive_inflight(&sched, 1).await;
 
-        // The first attempt comes back short at ~250 ms and the driver
-        // re-submits; this lands inside the second attempt.
-        tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+        // The first attempt comes back short and the driver re-submits; the
+        // second attempt is held while the scheduler is read.
+        gate.finish_one();
+        assert_eq!(gate.started().await, 1);
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -6516,6 +6593,7 @@ mod tests {
             "...it is still the client's own work"
         );
 
+        gate.finish_one();
         let bytes = driver.await.unwrap().expect("the retry must succeed");
         assert_eq!(bytes.len(), 256);
         let joined = joiner
@@ -6812,7 +6890,7 @@ mod tests {
         // Job 0 succeeds — it is only here to put a reading on the viewer's
         // stream. Job 1, the speculative driver, is the one that comes back
         // short and retries.
-        let sched = retries_the_nth_encode(attempts.clone(), 1);
+        let (sched, mut gate) = retries_the_nth_encode(attempts.clone(), 1);
         let cache = Arc::new(cache.with_scheduler(sched.clone()));
         let opts = SegmentOpts {
             video: Some(SegmentVideo::H264),
@@ -6822,6 +6900,7 @@ mod tests {
 
         // Viewer A asks for its own segment 100: an interactive submission, so
         // the scheduler now knows where A stands.
+        gate.finish_one();
         cache
             .segment_bytes_keyed(
                 50,
@@ -6865,7 +6944,8 @@ mod tests {
             })
         };
         // ...and somebody else turns out to want that segment now, promoting it.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(gate.started().await, 0, "the priming job");
+        assert_eq!(gate.started().await, 1, "the speculative driver");
         let joiner = {
             let c = cache.clone();
             let o = opts.clone();
@@ -6885,6 +6965,10 @@ mod tests {
                 .await
             })
         };
+        until_interactive_inflight(&sched, 1).await;
+        // The short attempt, then its retry.
+        gate.finish_one();
+        gate.finish_one();
         driver.await.unwrap().expect("the retry must succeed");
         joiner
             .await
