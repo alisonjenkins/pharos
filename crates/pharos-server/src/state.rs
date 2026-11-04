@@ -333,6 +333,8 @@ pub struct AppState {
     /// Default at `AppState::new` is the spawn backend so tests get
     /// the production behaviour without extra wiring.
     pub ffmpeg: Arc<dyn FfmpegBackend>,
+    /// Where provider-hosted cast portraits are fetched from (ADR-0074).
+    pub portraits: Arc<dyn crate::portrait::PortraitSource>,
     /// Memoises a synthesised Series/Season/Artist/Album wire id → the
     /// representative member item id whose frame/cover is its poster. Without
     /// this, every synth-item image request would re-scan the whole library
@@ -787,6 +789,7 @@ impl AppState {
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
+            portraits: Arc::new(crate::portrait::HttpPortraits::new()),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -913,6 +916,7 @@ impl AppState {
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
+            portraits: Arc::new(crate::portrait::HttpPortraits::new()),
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1065,6 +1069,16 @@ impl AppState {
     /// the `pharos-transcode` cargo features.
     pub fn with_ffmpeg_backend(mut self, backend: Arc<dyn FfmpegBackend>) -> Self {
         self.ffmpeg = backend;
+        self
+    }
+
+    /// Install the [`crate::portrait::PortraitSource`] the person image
+    /// route passes provider portraits through from.
+    pub fn with_portrait_source(
+        mut self,
+        source: Arc<dyn crate::portrait::PortraitSource>,
+    ) -> Self {
+        self.portraits = source;
         self
     }
 
