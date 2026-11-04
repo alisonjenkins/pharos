@@ -27,9 +27,9 @@ use super::machine::{Event, Machine, Phase};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
-    volume_setting, Engine, MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock,
-    SubtitleSwitch, VOLUME_KEY,
+    choose_engine, crossfade_ms, fade_volume, parse_crossfade, parse_volume_setting, position_at,
+    preview_set, start_ms, subtitle_switch, volume_setting, Engine, MediaEvent, MediaState,
+    OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch, CROSSFADE_KEY, VOLUME_KEY,
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
@@ -370,6 +370,51 @@ fn remember_volume(volume: f64, muted: bool) {
     LAST_VOLUME.set(Some((volume, muted)));
     if let Err(e) = platform::store_theme(VOLUME_KEY, &volume_setting(volume, muted)) {
         platform::warn(&format!("pharos: volume storage write failed error={e}"));
+    }
+}
+
+thread_local! {
+    /// The crossfade length this page load, in seconds, once read or set.
+    static CROSSFADE_S: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// The listener's crossfade length in seconds; 0 (off) unless they chose one.
+pub(super) fn crossfade_seconds() -> u32 {
+    if let Some(seconds) = CROSSFADE_S.get() {
+        return seconds;
+    }
+    let seconds = match platform::stored_theme(CROSSFADE_KEY) {
+        Ok(stored) => stored.as_deref().map_or(0, parse_crossfade),
+        Err(e) => {
+            platform::warn(&format!("pharos: crossfade storage read failed error={e}"));
+            0
+        }
+    };
+    CROSSFADE_S.set(Some(seconds));
+    seconds
+}
+
+/// How often a fade steps the volume; a hidden tab's timers may run slower,
+/// which only makes the steps coarser.
+const FADE_STEP_MS: u32 = 50;
+
+/// Ramp the media element `id`'s volume from `from` to `to` over `fade_ms`,
+/// unless `cancel` is set first. Dropped with the player that spawned it.
+async fn fade(id: &'static str, from: f64, to: f64, fade_ms: u64, cancel: Rc<Cell<bool>>) {
+    let start = platform::now_ms();
+    #[allow(clippy::cast_precision_loss)]
+    let fade_ms = fade_ms as f64;
+    loop {
+        if cancel.get() {
+            return;
+        }
+        let elapsed = platform::now_ms() - start;
+        let muted = platform::media_state(id).muted;
+        platform::set_volume(id, fade_volume(from, to, elapsed, fade_ms), muted);
+        if elapsed >= fade_ms {
+            return;
+        }
+        platform::sleep_ms(FADE_STEP_MS).await;
     }
 }
 
@@ -1624,6 +1669,13 @@ impl PartialEq for PlayingRef {
 fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
     let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
+    // A song that follows one handing over fades in as that one fades out.
+    // Taken by the first player mounted, so a renegotiated one starts as is.
+    let fade_in = use_hook(|| {
+        FadeIn(Rc::new(Cell::new(
+            ctx_stage.peek().outgoing().map_or(0, |(h, _)| h.fade_ms),
+        )))
+    });
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
@@ -1864,6 +1916,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
                     on_renegotiate: move |next| picks.set(next),
                     slot,
+                    fade_in: fade_in.clone(),
                 }
             },
         )
@@ -1892,6 +1945,17 @@ pub(super) fn remount_on(key: &str, body: Element) -> Element {
 /// enough to ride out a server that is still starting.
 const RENEW_ATTEMPTS: u32 = 4;
 const RENEW_FIRST_WAIT_MS: u32 = 1000;
+
+/// How long the screen's first player fades in from silence, in ms, as the
+/// song before fades out; taken (left 0) by the player that uses it.
+#[derive(Clone)]
+struct FadeIn(Rc<Cell<u64>>);
+
+impl PartialEq for FadeIn {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 /// The player's last known position, shared with its screen.
 #[derive(Clone)]
@@ -1932,12 +1996,17 @@ fn Player(
     near: Neighbours,
     on_renegotiate: EventHandler<TrackPicks>,
     slot: Slot,
+    fade_in: FadeIn,
 ) -> Element {
     let ctx = use_context::<Ctx>();
     let p = playing.0;
     // Handing over: the song is done with, so nothing it does is reported
     // or acted on any more.
     let retiring = use_hook(|| Rc::new(Cell::new(false)));
+    // The crossfade into the next song has begun (or there is none to make).
+    let crossfading = use_hook(|| Rc::new(Cell::new(false)));
+    let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
+    let fade_in_ms = use_hook(|| fade_in.0.take());
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let nav = use_context::<Nav>();
@@ -2079,6 +2148,20 @@ fn Player(
     // Before the stream attaches, so autoplay never starts at full volume.
     use_effect(restore_volume);
     use_effect({
+        let cancel = Rc::clone(&fade_in_cancel);
+        move || {
+            if fade_in_ms == 0 {
+                return;
+            }
+            let to = platform::media_state(VIDEO_ID).volume;
+            platform::info(&format!(
+                "pharos: crossfade in item={playing_id} fade_ms={fade_in_ms} volume={to:.3}"
+            ));
+            platform::set_volume(VIDEO_ID, 0.0, platform::media_state(VIDEO_ID).muted);
+            spawn(fade(VIDEO_ID, 0.0, to, fade_in_ms, Rc::clone(&cancel)));
+        }
+    });
+    use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
         move || {
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
@@ -2111,13 +2194,43 @@ fn Player(
             Rc::clone(&switched),
         );
         let session = session.clone();
-        let retiring = Rc::clone(&retiring);
+        let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
             }
             if let Some(session) = &session {
                 session.on_media(event);
+            }
+            // Near the end, with a crossfade chosen, the next song starts
+            // under this one as it fades.
+            if event == MediaEvent::TimeUpdate && queued && !crossfading.get() {
+                let state = platform::media_state(VIDEO_ID);
+                let fade = crossfade_ms(crossfade_seconds(), state.duration_ms);
+                if let (false, Some(fade)) = (state.paused, fade) {
+                    if state.position_ms.saturating_add(fade) >= state.duration_ms {
+                        crossfading.set(true);
+                        let (to, line) = queue.peek().advance(playing_id, near.next);
+                        match to.filter(|to| *to != playing_id) {
+                            Some(to) => {
+                                platform::info(&format!(
+                                    "pharos: crossfade start item={playing_id} next={to} fade_ms={fade} at_ms={}",
+                                    state.position_ms
+                                ));
+                                platform::info(&line);
+                                let mut stage = stage;
+                                stage.write().hand_off(playing_id, fade);
+                                replace.0.call(Route::Watch(to));
+                                return;
+                            }
+                            // The end of the queue, or the same song again:
+                            // it plays out and `Ended` decides.
+                            None => platform::info(&format!(
+                                "pharos: crossfade skipped item={playing_id} reason=no_next"
+                            )),
+                        }
+                    }
+                }
             }
             // A song that ends plays what is next; in a group the group
             // decides what plays.
@@ -2169,7 +2282,7 @@ fn Player(
     let on_control = {
         let p = Rc::clone(&p);
         let session = session.clone();
-        let retiring = Rc::clone(&retiring);
+        let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
         move |control: Control| {
             if retiring.get() {
                 return;
@@ -2202,6 +2315,7 @@ fn Player(
                 Control::Hover(x) => hover_ms
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
                 Control::Volume { volume, muted } => {
+                    fade_in_cancel.set(true);
                     platform::set_volume(VIDEO_ID, volume, muted);
                     remember_volume(volume, muted);
                 }
@@ -2309,14 +2423,36 @@ fn Player(
             }
         }
     };
-    // Handing over: report this song done and stop it. Once, as the slot
-    // changes.
-    if let Slot::Outgoing(_) = slot {
+    // Handing over: report this song done and stop it, at once on a cut or
+    // as it fades out under the next. Once, as the slot changes.
+    if let Slot::Outgoing(handoff) = slot {
         if !retiring.replace(true) {
-            let stop = retire_stop;
+            fade_in_cancel.set(true);
+            let (stop, last_ms) = (retire_stop, Rc::clone(&last_ms.0));
+            let mut stage = stage;
+            let runtime_ms = p.detail.item.runtime_ms;
             spawn(async move {
+                let state = platform::media_state(OUTGOING_ID);
+                if handoff.fade_ms > 0 {
+                    // It plays out under the next song, so it counts as heard.
+                    last_ms.set(match state.duration_ms {
+                        0 => runtime_ms,
+                        d => d,
+                    });
+                }
                 stop();
+                if handoff.fade_ms == 0 {
+                    platform::pause(OUTGOING_ID);
+                    return;
+                }
+                let never = Rc::new(Cell::new(false));
+                fade(OUTGOING_ID, state.volume, 0.0, handoff.fade_ms, never).await;
                 platform::pause(OUTGOING_ID);
+                platform::info(&format!(
+                    "pharos: crossfade out item={playing_id} fade_ms={}",
+                    handoff.fade_ms
+                ));
+                stage.write().faded(handoff.from_play);
             });
         }
     }
