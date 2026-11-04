@@ -395,8 +395,11 @@ mod tests {
         let (i, counter) = counting(dir.path(), "5", BANNER);
         // The timeout must leave the fake ffmpeg time to write its spawn
         // marker before it is killed: at 100 ms a busy CI runner killed it
-        // first, and the third spawn went uncounted.
-        let i = i.with_limits(Duration::from_millis(300), Duration::from_millis(250));
+        // first, and the third spawn went uncounted. The TTL counts from
+        // before the inspection, so it must outlast the timeout by enough
+        // for the second call to land inside it on a busy runner.
+        let ttl = Duration::from_millis(1500);
+        let i = i.with_limits(ttl, Duration::from_millis(250));
         let t = Instant::now();
         assert_eq!(i.inspect(&p).await, Some(ResidentBlock::Unreadable));
         assert!(t.elapsed() < Duration::from_secs(2), "timeout not applied");
@@ -407,7 +410,7 @@ mod tests {
             "second call paid again"
         );
         assert_eq!(spawns(&counter), 1);
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        tokio::time::sleep(ttl + Duration::from_millis(100)).await;
         i.inspect(&p).await;
         assert_eq!(spawns(&counter), 2, "TTL expired, ask again");
     }
