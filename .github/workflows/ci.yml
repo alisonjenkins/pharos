@@ -219,16 +219,14 @@ jobs:
           retention-days: 7
 
   # Dioxus UI suite, once per native-API mode. Each mode seeds its own pharos
-  # (see `just compat-dioxus-full`), so the two legs share nothing. `fail-fast:
-  # false` keeps the other mode running when one fails, so both results show.
+  # (see `just compat-dioxus-full`), so the two runs share nothing. They run
+  # one after the other in ONE job: every job waits for a home runner on its
+  # own, so a matrix leg was a second trip through the queue for a ~3 min
+  # suite. The `off` step runs even when `on` failed, so both results show.
   dioxus-ui:
-    name: dioxus UI (native ${{ matrix.native }})
+    name: dioxus UI
     runs-on: pharos-nix-builder-amd64
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        native: ["on", "off"]
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
@@ -239,13 +237,28 @@ jobs:
         run: nix build .#ciWarmRoots --out-link /nix/var/nix/gcroots/gha/pharos-ci-warm-roots || echo "::warning::could not pin compiled deps"
       - name: npm install
         run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
-      - name: Run Dioxus UI suite (native ${{ matrix.native }})
-        run: nix develop --command bash -c 'just compat-dioxus-full ${{ matrix.native }}'
-      - name: Upload Dioxus UI artifacts on failure
-        if: failure()
+      - name: Run Dioxus UI suite (native on)
+        id: native-on
+        run: nix develop --command bash -c 'just compat-dioxus-full on'
+      - name: Upload Dioxus UI artifacts (native on) on failure
+        if: failure() && steps.native-on.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
-          name: dioxus-ui-native-${{ matrix.native }}-${{ github.sha }}
+          name: dioxus-ui-native-on-${{ github.sha }}
+          path: |
+            compat-playwright/test-results
+            compat-playwright/playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Run Dioxus UI suite (native off)
+        id: native-off
+        if: ${{ !cancelled() && steps.native-on.conclusion != 'skipped' }}
+        run: nix develop --command bash -c 'just compat-dioxus-full off'
+      - name: Upload Dioxus UI artifacts (native off) on failure
+        if: ${{ !cancelled() && steps.native-off.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dioxus-ui-native-off-${{ github.sha }}
           path: |
             compat-playwright/test-results
             compat-playwright/playwright-report
