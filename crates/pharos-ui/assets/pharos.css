@@ -2140,7 +2140,8 @@ body::before {
   cursor: default;
 }
 .pharos-queue-toggle .pharos-icon,
-.pharos-queue-shuffle .pharos-icon {
+.pharos-queue-shuffle .pharos-icon,
+.pharos-mix-toggle .pharos-icon {
   width: 1rem;
   height: 1rem;
 }
@@ -2199,7 +2200,8 @@ body::before {
   flex: 1;
   font-size: 0.85rem;
 }
-.pharos-queue-shuffle {
+.pharos-queue-shuffle,
+.pharos-mix-toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
