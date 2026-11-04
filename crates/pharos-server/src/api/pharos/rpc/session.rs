@@ -9,7 +9,7 @@ use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
 use pharos_core::{AuthError, DomainResult, SecretString, User, UserId, UserPrefStore};
 
-use super::bootstrap::token_denial;
+use super::bootstrap::{qc_denial, token_denial};
 use super::group::Group;
 use super::library::Library;
 use super::playback::Playback;
@@ -311,6 +311,72 @@ impl server::session::Handler for Session {
         match changed {
             Ok(_) => done.set_ok(()),
             Err(e) => write_change_password_error(&e, done.init_error()),
+        }
+        Ok(())
+    }
+
+    /// Approves a Quick Connect code shown on another device (V428), which
+    /// then signs in as this user; an unknown or expired code answers notFound.
+    async fn quick_connect_authorize(
+        self: Rc<Self>,
+        params: wire::QuickConnectAuthorizeParams,
+        results: &mut wire::QuickConnectAuthorizeResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let code = match params.get()?.get_code().ok().and_then(|r| r.to_str().ok()) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                let done = results.get().init_result();
+                let mut error = done.init_error();
+                error.set_reason("a quick connect code is required");
+                let mut invalid = error.get_kind().init_invalid();
+                invalid.set_field("code");
+                invalid.set_value("");
+                return Ok(());
+            }
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let sent = self
+            .state
+            .quick_connect
+            .tx
+            .send(crate::quick_connect::QcMsg::Authorize {
+                code,
+                by: user.id,
+                reply: reply_tx,
+            })
+            .await;
+        if sent.is_err() {
+            Denial::Unavailable {
+                dependency: "quick connect",
+            }
+            .write(results.get().init_result().init_error());
+            return Ok(());
+        }
+        let res = match reply_rx.await {
+            Ok(res) => res,
+            Err(_) => {
+                Denial::Unavailable {
+                    dependency: "quick connect",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let mut done = results.get().init_result();
+        match res {
+            Ok(true) => done.set_ok(()),
+            Ok(false) => Denial::NotFound {
+                what: "quick connect code",
+            }
+            .write(done.init_error()),
+            Err(refusal) => qc_denial(refusal).write(done.init_error()),
         }
         Ok(())
     }
