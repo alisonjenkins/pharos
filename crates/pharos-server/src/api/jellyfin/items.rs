@@ -6247,6 +6247,8 @@ fn series_dto(
     }
     let overview = meta.and_then(|m| m.overview.clone());
     let community_rating = meta.and_then(|m| m.community_rating);
+    let critic_rating = meta.and_then(|m| m.ratings.tomatometer).map(f32::from);
+    let imdb_rating = meta.and_then(|m| m.ratings.imdb);
     let official_rating = meta.and_then(|m| m.official_rating.clone());
     let premiere_date = meta.and_then(|m| m.premiere_date).map(format_iso8601);
     // Advertise a Primary + Thumb tag so jellyfin-web requests the poster.
@@ -6284,6 +6286,8 @@ fn series_dto(
         production_year: series.series_year.map(|y| y as i32),
         overview,
         community_rating,
+        critic_rating,
+        imdb_rating,
         official_rating,
         premiere_date,
         // B93 — a series' direct children are its seasons; recursive = episodes.
@@ -6340,6 +6344,8 @@ fn season_dto(
         // Series-level metadata lives on the Series tile, not per-season.
         overview: None,
         community_rating: None,
+        critic_rating: None,
+        imdb_rating: None,
         official_rating: None,
         premiere_date: None,
         // B93 — a season's children are its episodes (ChildCount ==
