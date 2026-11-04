@@ -143,6 +143,43 @@ pub fn parse_volume_setting(stored: &str) -> Option<(f64, bool)> {
     Some((volume, muted))
 }
 
+/// Where the listener's crossfade length is kept, in whole seconds; absent
+/// or `0` is off, the default (opt-in).
+pub const CROSSFADE_KEY: &str = "pharos.player.crossfade";
+
+/// The crossfade lengths offered, in seconds; `0` is off.
+pub const CROSSFADE_CHOICES: [u32; 6] = [0, 2, 4, 6, 8, 12];
+
+/// The crossfade length a stored [`CROSSFADE_KEY`] value holds, in seconds;
+/// anything that is not one of [`CROSSFADE_CHOICES`] is off.
+pub fn parse_crossfade(stored: &str) -> u32 {
+    stored
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|s| CROSSFADE_CHOICES.contains(s))
+        .unwrap_or(0)
+}
+
+/// The fade between this song and the next, in ms, for a crossfade of
+/// `seconds` on a song `duration_ms` long: never more than a third of the
+/// song, so a short song is still mostly heard on its own. `None` when off
+/// or when the length is not yet known.
+pub fn crossfade_ms(seconds: u32, duration_ms: u64) -> Option<u64> {
+    let fade = u64::from(seconds).saturating_mul(1000).min(duration_ms / 3);
+    (seconds > 0 && fade > 0).then_some(fade)
+}
+
+/// The volume `elapsed_ms` into a fade of `fade_ms` from `from` to `to`,
+/// straight-line; the end volume once the fade is over.
+pub fn fade_volume(from: f64, to: f64, elapsed_ms: f64, fade_ms: f64) -> f64 {
+    if fade_ms <= 0.0 || elapsed_ms >= fade_ms {
+        return to.clamp(0.0, 1.0);
+    }
+    let t = (elapsed_ms / fade_ms).max(0.0);
+    (from + (to - from) * t).clamp(0.0, 1.0)
+}
+
 /// A `<video>` event the report clock cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaEvent {
@@ -430,6 +467,33 @@ pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossfade_is_off_unless_a_listed_length_is_stored() {
+        assert_eq!(parse_crossfade(""), 0);
+        assert_eq!(parse_crossfade("6"), 6);
+        assert_eq!(parse_crossfade(" 12 "), 12);
+        assert_eq!(parse_crossfade("5"), 0);
+        assert_eq!(parse_crossfade("-2"), 0);
+        assert_eq!(parse_crossfade("on"), 0);
+    }
+
+    #[test]
+    fn a_crossfade_is_at_most_a_third_of_the_song() {
+        assert_eq!(crossfade_ms(0, 200_000), None);
+        assert_eq!(crossfade_ms(6, 0), None);
+        assert_eq!(crossfade_ms(6, 200_000), Some(6_000));
+        assert_eq!(crossfade_ms(12, 9_000), Some(3_000));
+    }
+
+    #[test]
+    fn a_fade_runs_in_a_straight_line_and_ends_on_its_target() {
+        assert!((fade_volume(0.8, 0.0, 0.0, 4000.0) - 0.8).abs() < 1e-9);
+        assert!((fade_volume(0.8, 0.0, 2000.0, 4000.0) - 0.4).abs() < 1e-9);
+        assert!((fade_volume(0.0, 0.6, 1000.0, 4000.0) - 0.15).abs() < 1e-9);
+        assert_eq!(fade_volume(0.8, 0.0, 9000.0, 4000.0), 0.0);
+        assert_eq!(fade_volume(0.8, 0.5, 10.0, 0.0), 0.5);
+    }
 
     #[test]
     fn a_stored_volume_reads_back_as_it_was_set() {
