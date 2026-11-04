@@ -2499,3 +2499,109 @@ test.describe("pharos Dioxus UI song handover", () => {
     await expect.poll(() => audio.evaluate((a: HTMLMediaElement) => a.volume)).toBeGreaterThan(0.99);
   });
 });
+
+
+// V406: the now-playing bar has previous and next track buttons either side
+// of the seek buttons. Next plays the queue's first song; Previous past the
+// opening seconds starts the song again.
+test.describe("pharos Dioxus UI previous and next track", () => {
+  test("next plays what is queued and previous restarts a song", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-skip-${Date.now()}", Version="0"`,
+      },
+      data: { Username: TEST_USER, Pw: TEST_PASS },
+    });
+    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+    const { AccessToken: token, User: user } = await auth.json();
+    const api = { "X-Emby-Token": token };
+    const json = async (path: string) =>
+      (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+    const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+    const tracks = await json(
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=Album`,
+    );
+    // Long enough to seek past the restart point and back.
+    const track = tracks.Items?.find(
+      (t: { AlbumId?: string; RunTimeTicks?: number }) =>
+        t.AlbumId && (t.RunTimeTicks ?? 0) > 200_000_000,
+    );
+    test.skip(!track, "the seed has no track of over 20 s on an album");
+    // Two copies of a one-song album queue the same song, so Next is known.
+    const siblings = await json(
+      `/Users/${user.Id}/Items?ParentId=${track.AlbumId}&IncludeItemTypes=Audio`,
+    );
+    test.skip(
+      (siblings.Items?.length ?? 0) !== 1,
+      "the queue steps in this test assume a one-song album",
+    );
+
+    await page.goto("/ui/");
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await page.goto(`/ui/browse/${nativeSynth(track.AlbumId)}`);
+    // A cold server reads the album's art and tracks on first visit.
+    await expect(page.locator("section.pharos-album h2")).toHaveText(track.Album, {
+      timeout: 30_000,
+    });
+    // Twice, so a song is still queued once the first copy starts.
+    const addAlbum = page.getByRole("button", { name: `Add ${track.Album} to the queue` });
+    for (let i = 0; i < 2; i++) {
+      await addAlbum.click();
+      await expect(page.locator(".pharos-queue-note").first()).toHaveText(/added to the queue/);
+    }
+    await page
+      .locator("ol.pharos-tracks li", { hasText: track.Name })
+      .first()
+      .locator("a")
+      .click();
+
+    const audio = page.locator("#pharos-video");
+    const previous = page.getByRole("button", { name: "Previous track" });
+    const next = page.getByRole("button", { name: "Next track" });
+    await expect(previous).toBeVisible({ timeout: 15_000 });
+    await expect(previous).toBeEnabled();
+    await expect(next).toBeEnabled({ timeout: 15_000 });
+    const at = () => audio.evaluate((a: HTMLMediaElement) => a.currentTime);
+    const seekTo = async (s: number) => {
+      await audio.evaluate((a: HTMLMediaElement, s: number) => {
+        a.currentTime = s;
+      }, s);
+      await expect.poll(at).toBeGreaterThan(s - 1);
+    };
+    await expect
+      .poll(() => audio.evaluate((a: HTMLMediaElement) => a.readyState), { timeout: 15_000 })
+      .toBeGreaterThan(0);
+
+    // Next plays the queue's first song, the second copy, from its start.
+    await seekTo(12);
+    await next.click();
+    await expect.poll(at).toBeLessThan(5);
+    await expect(page.locator("h2.pharos-listen-title")).toHaveText(track.Name);
+    await expect(next).toBeDisabled();
+
+    // Past the opening seconds, Previous starts the same song again.
+    await expect
+      .poll(() => audio.evaluate((a: HTMLMediaElement) => a.duration))
+      .toBeGreaterThan(20);
+    await seekTo(15);
+    const song = page.url();
+    await previous.click();
+    await expect.poll(at).toBeLessThan(5);
+    expect(page.url()).toBe(song);
+  });
+});
