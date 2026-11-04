@@ -1721,23 +1721,35 @@ fn WatchScreen(id: ItemRef) -> Element {
         let asked = *picks.peek();
         spawn(async move {
             let info = call("watch", "renew");
-            let renewed = api.play(&info, id, &platform::capabilities(), asked).await;
-            // A newer reconnect has taken over.
-            if *api_gen.peek() != gen {
-                return;
-            }
-            match renewed {
-                Ok((decision, grant)) => {
-                    *p.0.grant.borrow_mut() = grant;
-                    // The play session id is a stream credential (B256).
-                    platform::info(&format!(
-                        "pharos: playback grant renewed after reconnect method={}",
-                        decision.method
-                    ));
+            let mut wait_ms = RENEW_FIRST_WAIT_MS;
+            for attempt in 1..=RENEW_ATTEMPTS {
+                // A newer reconnect has taken over.
+                if *api_gen.peek() != gen {
+                    return;
                 }
-                Err(e) => platform::warn(&format!(
-                    "pharos: playback grant renewal failed, reports stop: {e}"
-                )),
+                match api.play(&info, id, &platform::capabilities(), asked).await {
+                    Ok((decision, grant)) if *api_gen.peek() == gen => {
+                        *p.0.grant.borrow_mut() = grant;
+                        // The play session id is a stream credential (B256).
+                        platform::info(&format!(
+                            "pharos: playback grant renewed after reconnect method={} attempt={attempt}",
+                            decision.method
+                        ));
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(_) if *api_gen.peek() != gen => return,
+                    Err(e) if attempt == RENEW_ATTEMPTS => platform::warn(&format!(
+                        "pharos: playback grant renewal failed, reports stop attempts={attempt}: {e}"
+                    )),
+                    Err(e) => {
+                        platform::warn(&format!(
+                            "pharos: playback grant renewal retry attempt={attempt}: {e}"
+                        ));
+                        platform::sleep_ms(wait_ms).await;
+                        wait_ms *= 2;
+                    }
+                }
             }
         });
     });
@@ -1767,6 +1779,12 @@ pub(super) fn remount_on(key: &str, body: Element) -> Element {
         }
     }
 }
+
+/// Tries at renewing a playback grant after a reconnect, the first retry
+/// after [`RENEW_FIRST_WAIT_MS`] and each later one twice as long (1, 2, 4 s):
+/// enough to ride out a server that is still starting.
+const RENEW_ATTEMPTS: u32 = 4;
+const RENEW_FIRST_WAIT_MS: u32 = 1000;
 
 /// The player's last known position, shared with its screen.
 #[derive(Clone)]
