@@ -40,9 +40,12 @@ pub struct GroupView {
     pub log: ActivityLog,
     /// Why the group is over, once it is.
     pub ended: Option<String>,
-    /// Counts the group's updates, so a screen can fetch what an update may
-    /// have changed (what members have seen) without comparing the rest.
+    /// Counts the group's updates, so a screen can show what each one adds
+    /// (the toast) without comparing the rest.
     pub activity: u64,
+    /// Counts the group's moves to another item. What members have seen
+    /// changes with these and with the roster, not with every update.
+    pub item_changes: u64,
 }
 
 /// What the store asks the screens to do.
@@ -139,6 +142,8 @@ pub struct GroupState {
     pub ended: Option<String>,
     /// The group's updates so far.
     activity: u64,
+    /// The group's moves to another item so far.
+    item_changes: u64,
     /// The item the watch page shows.
     watching: Option<ItemRef>,
     clock: ClockEstimator,
@@ -388,6 +393,7 @@ impl GroupState {
                     self.tracks = GroupTracksView::default();
                 }
                 self.playlist_item_id = playlist_item_id;
+                self.item_changes = self.item_changes.wrapping_add(1);
                 self.owes_ready = true;
                 self.last_command_ms = Some(now_ms);
                 self.anchor = Some(Anchor {
@@ -481,6 +487,7 @@ impl GroupState {
             log: self.log.clone(),
             ended: self.ended.clone(),
             activity: self.activity,
+            item_changes: self.item_changes,
         }
     }
 }
@@ -543,9 +550,12 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         }
         // The server answers at most MAX_IDS at a time; ask in chunks so every
         // id gets its marks.
+        let asks = ids
+            .chunks(seen::MAX_IDS)
+            .map(|chunk| self.client.seen(chunk.to_vec()));
         let mut all = Vec::new();
-        for chunk in ids.chunks(seen::MAX_IDS) {
-            seen::merge(&mut all, self.client.seen(chunk.to_vec()).await?);
+        for answer in futures_util::future::try_join_all(asks).await? {
+            seen::merge(&mut all, answer);
         }
         Ok(all)
     }
@@ -1990,6 +2000,31 @@ mod tests {
         assert!(!rig.session.pick_audio(1));
         let idle = Session::new(FakeGroups::default(), TestEnv::default());
         assert!(!idle.pick_subtitle(Some(3)));
+    }
+
+    #[test]
+    fn only_a_move_to_another_item_counts_as_an_item_change() {
+        let mut state = GroupState::default();
+        let _ = state.apply(GroupUpdate::Joined(summary()), 0);
+        let _ = state.apply(
+            GroupUpdate::Member(Member {
+                buffering: true,
+                ..member("me", false)
+            }),
+            0,
+        );
+        let _ = state.apply(
+            GroupUpdate::Pause {
+                at_server_ms: 0,
+                position_ms: 0,
+                by: None,
+            },
+            0,
+        );
+        assert_eq!(state.view(true).item_changes, 0);
+        assert_eq!(state.view(true).activity, 3, "every update is activity");
+        let _ = state.apply(item_update(0, true), 0);
+        assert_eq!(state.view(true).item_changes, 1);
     }
 
     #[test]

@@ -1479,9 +1479,10 @@ fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
     let together = use_context::<Together>();
     let view = (together.view)();
     let roster: Vec<String> = view.members.iter().map(|m| m.id.clone()).collect();
-    let (active, activity) = (view.active, view.activity);
+    let (active, item_changes) = (view.active, view.item_changes);
     // Another member's progress moves without the roster changing: fetch
-    // again on any group update, and every 30 s while the group is active.
+    // again when the group moves to another item, and every 30 s while the
+    // group is active. Not on every update: buffering flips every 2 s.
     let mut tick = use_signal(|| 0u32);
     use_future(move || async move {
         loop {
@@ -1493,10 +1494,16 @@ fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
         }
     });
     let tick = tick();
-    let found = use_resource(use_reactive!(|(ids, roster, active, activity, tick)| {
+    let found = use_resource(use_reactive!(|(
+        ids,
+        roster,
+        active,
+        item_changes,
+        tick,
+    )| {
         let session = together.current();
         async move {
-            let _ = (roster, activity, tick);
+            let _ = (roster, item_changes, tick);
             let (true, Some(session), false) = (active, session, ids.is_empty()) else {
                 return Vec::new();
             };
