@@ -15,6 +15,7 @@ use pharos_client::{CallInfo, ClientError};
 
 use super::account::AccountMenu;
 use super::account_settings;
+use super::activity;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
@@ -1904,6 +1905,11 @@ fn play_action(view: View) -> &'static str {
     }
 }
 
+/// The wall clock in unix milliseconds, as the activity log stamps its lines.
+fn now_ms_u64() -> u64 {
+    u64::try_from(platform::unix_ms()).unwrap_or(0)
+}
+
 /// A shuffle seed: a play order needs no more randomness than the clock.
 fn seed() -> u64 {
     platform::now_ms().to_bits()
@@ -1934,6 +1940,19 @@ fn Player(
     let group = (together.view)();
     let watch_seen = use_group_seen(vec![p.detail.item.id]);
     let session = together.current();
+    // Bumped when the toast's time is up, so the page draws without it.
+    let toast_expired = use_signal(|| 0u32);
+    let _ = toast_expired();
+    use_effect(move || {
+        let view = (together.view)();
+        if view.log.toast(now_ms_u64()).is_some() {
+            let mut expired = toast_expired;
+            spawn(async move {
+                platform::sleep_ms(u32::try_from(activity::TOAST_MS).unwrap_or(u32::MAX)).await;
+                expired += 1;
+            });
+        }
+    });
     let mut failed = use_signal(|| None::<String>);
     let mut media = use_signal(MediaState::default);
     let mut hover_ms = use_signal(|| None::<u64>);
@@ -2411,6 +2430,8 @@ fn Player(
                 members: if group.active { group.members.clone() } else { Vec::new() },
                 own_tracks: group.own_tracks,
                 on_own_tracks,
+                activity: group.log.lines(),
+                toast: group.log.toast(now_ms_u64()).map(str::to_owned),
                 own_track_members: group
                     .members
                     .iter()
