@@ -58,6 +58,7 @@ mod tests {
             name: name.into(),
             stereo,
             primary: id.is_empty(),
+            ..Default::default()
         }
     }
 
