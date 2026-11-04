@@ -381,14 +381,24 @@ fn remember_volume(volume: f64, muted: bool) {
 /// for video the maximum bitrate the viewer chose (0, Auto, unless they set
 /// one). The choice limits video only: a song above it still plays as stored.
 fn negotiation_capabilities(kind: ItemKind) -> pharos_client::api::Capabilities {
-    let mut caps = platform::capabilities();
     let chosen = stored_max_bitrate();
-    caps.max_bitrate = video_max_bitrate(kind, chosen);
+    let caps = with_max_bitrate(platform::capabilities(), kind, chosen);
     platform::info(&format!(
         "pharos: playback max_bitrate={} chosen={} kind={kind:?}",
         max_bitrate_label(caps.max_bitrate),
         max_bitrate_label(chosen)
     ));
+    caps
+}
+
+/// `caps` with the bitrate to negotiate `kind` with, from the viewer's
+/// `chosen` limit.
+fn with_max_bitrate(
+    mut caps: pharos_client::api::Capabilities,
+    kind: ItemKind,
+    chosen: u64,
+) -> pharos_client::api::Capabilities {
+    caps.max_bitrate = video_max_bitrate(kind, chosen);
     caps
 }
 
@@ -2853,6 +2863,9 @@ mod tests {
         assert_eq!(video_max_bitrate(ItemKind::Episode, 1_000_000), 1_000_000);
         assert_eq!(video_max_bitrate(ItemKind::Audio, 2_000_000), 0);
         assert_eq!(video_max_bitrate(ItemKind::Movie, 0), 0);
+        let caps = |kind| with_max_bitrate(Default::default(), kind, 2_000_000).max_bitrate;
+        assert_eq!(caps(ItemKind::Audio), 0);
+        assert_eq!(caps(ItemKind::Movie), 2_000_000);
     }
 
     /// Counts the mounts of `remount_on`'s body as the key changes.
