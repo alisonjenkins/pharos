@@ -3627,6 +3627,13 @@ impl HlsSegmentCache {
     /// produces boundaries no other session can reproduce.
     pub const AUDIO_SEGMENT_SECONDS: f64 = 6.0;
 
+    /// B468/V411 — fills a hole in the source's audio timestamps (zeroed bytes,
+    /// a damaged cluster) with silence, so the encode stays gap-free. Without it
+    /// the mp4 muxer stretches the last sample before the hole across it, and
+    /// Firefox resuming playback inside that one long sample after a stall
+    /// freezes or plays the post-hole audio early.
+    const FILL_AUDIO_HOLES: &str = "aresample=async=1";
+
     /// Start time (seconds) of audio segment `seg`: the plain uniform grid.
     ///
     /// This deliberately does NOT frame-snap to the video's grid. The audio
@@ -4233,13 +4240,16 @@ impl HlsSegmentCache {
         // leave it at zero (measured, ffmpeg 8.1); padding the front is what
         // actually restores the source timeline. A SEEK session needs no pad —
         // `-ss X` lands on source X exactly.
+        let mut filters = Vec::new();
         if start_seg == 0 && audio_start_secs > 0.0 {
-            args.push("-af".into());
-            args.push(format!(
+            filters.push(format!(
                 "adelay=delays={:.3}ms:all=1",
                 audio_start_secs * 1000.0
             ));
         }
+        filters.push(Self::FILL_AUDIO_HOLES.to_string());
+        args.push("-af".into());
+        args.push(filters.join(","));
         args.extend(
             ["-c:a", "libopus", "-b:a", &bitrate.to_string(), "-ac", "2"]
                 .into_iter()
@@ -4380,6 +4390,8 @@ impl HlsSegmentCache {
             Some(i) => format!("0:a:{i}"),
             None => "0:a:0?".into(),
         });
+        args.push("-af".into());
+        args.push(Self::FILL_AUDIO_HOLES.into());
         args.extend(
             [
                 "-c:a",
@@ -9559,6 +9571,47 @@ mod tests {
         let af = a.iter().position(|x| x == "-af").unwrap();
         let ca = a.iter().position(|x| x == "-c:a").unwrap();
         assert!(af < ca, "{joined}");
+    }
+
+    /// B468/V411 — every audio session fills source holes with silence, and
+    /// the fill follows any start pad so the pad itself is never treated as one.
+    #[test]
+    fn every_opus_audio_session_fills_source_holes() {
+        for (start_seg, audio_start, want) in [
+            (0, 0.0, "aresample=async=1"),
+            (30, 1.7, "aresample=async=1"),
+            (0, 1.7, "adelay=delays=1700.000ms:all=1,aresample=async=1"),
+        ] {
+            let a = HlsSegmentCache::audio_hls_args(
+                Path::new("/m/x.mkv"),
+                Path::new("/c/d"),
+                None,
+                Some(128_000),
+                start_seg,
+                audio_start,
+            )
+            .unwrap();
+            let af = a.iter().position(|x| x == "-af").unwrap();
+            let ca = a.iter().position(|x| x == "-c:a").unwrap();
+            assert_eq!(a[af + 1], want, "{a:?}");
+            assert!(af < ca, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn the_continuous_aac_encode_fills_source_holes() {
+        let a = HlsSegmentCache::continuous_audio_args(
+            Path::new("/m/x.mkv"),
+            Path::new("/c/_contaudio/1-a0-b128"),
+            None,
+            None,
+            0.0,
+        )
+        .unwrap();
+        let af = a.iter().position(|x| x == "-af").unwrap();
+        let ca = a.iter().position(|x| x == "-c:a").unwrap();
+        assert_eq!(a[af + 1], "aresample=async=1", "{a:?}");
+        assert!(af < ca, "{a:?}");
     }
 
     /// A track that starts with its video needs no pad — the overwhelming
