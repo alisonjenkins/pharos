@@ -1,4 +1,4 @@
-# ADR-0049: One player for the session, on a stage beside the routed screen
+# ADR-0052: One player for the session, on a stage beside the routed screen
 
 - **Status:** Accepted
 - **Date:** 2026-11-04T16:00:00Z
