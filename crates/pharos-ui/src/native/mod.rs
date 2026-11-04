@@ -28,6 +28,7 @@ pub mod playback;
 pub mod queue;
 pub mod rails;
 pub mod route;
+pub mod seen;
 pub mod stage;
 pub mod together;
 pub mod together_view;

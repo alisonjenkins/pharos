@@ -13,6 +13,7 @@ use futures_util::future::LocalBoxFuture;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
 use super::playback::MediaEvent;
+use super::seen::MemberSeen;
 use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
     GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS,
@@ -346,6 +347,14 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// Whether a membership is active.
     pub fn active(&self) -> bool {
         self.inner.borrow().active
+    }
+
+    /// What each member has seen of `ids`; empty when not in a group.
+    pub async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError> {
+        if !self.active() {
+            return Ok(Vec::new());
+        }
+        self.client.seen(ids).await
     }
 
     pub fn view(&self) -> GroupView {
@@ -993,6 +1002,18 @@ mod tests {
             .into_iter()
             .filter(|c| c.starts_with(prefix))
             .collect()
+    }
+
+    #[test]
+    fn seen_asks_the_group_only_while_in_one() {
+        let rig = rig();
+        let ids = vec![ItemRef::Real(1), ItemRef::Real(2)];
+        let asked = rig.session.seen(ids.clone()).now_or_never();
+        assert!(matches!(asked, Some(Ok(_))));
+        assert_eq!(calls_with(&rig, "seen("), vec!["seen(2)".to_owned()]);
+        let idle = Session::new(FakeGroups::default(), TestEnv::default());
+        let none = idle.seen(ids).now_or_never();
+        assert!(matches!(none, Some(Ok(v)) if v.is_empty()));
     }
 
     #[test]
