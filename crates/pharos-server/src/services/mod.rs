@@ -4,6 +4,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod group_seen;
 pub mod library;
 pub mod lyrics;
 pub mod mix;
