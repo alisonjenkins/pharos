@@ -11,6 +11,7 @@ use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
 use super::together_view::InThisGroup;
+use super::versions;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
 /// instead of reloading the page.
@@ -436,6 +437,9 @@ pub fn PosterTile(item: Item) -> Element {
     }
 }
 
+/// A title's page. With more than one version (a 2D file and its 3D
+/// edition) it offers a choice beside Play: `version` is the one chosen,
+/// and `on_version` hears a new pick.
 #[component]
 pub fn TitleView(
     detail: Detail,
@@ -445,6 +449,8 @@ pub fn TitleView(
     /// What the group's members have seen, when in one.
     #[props(default)]
     seen: Vec<MemberSeen>,
+    #[props(default)] version: String,
+    #[props(default)] on_version: Option<EventHandler<String>>,
 ) -> Element {
     let item = &detail.item;
     let in_group = if seen.is_empty() {
@@ -479,6 +485,23 @@ pub fn TitleView(
                 }
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 div { class: "pharos-actions",
+                    if item.kind.playable() && detail.versions.len() > 1 {
+                        label { class: "pharos-filter",
+                            span { aria_hidden: "true", "Version" }
+                            select {
+                                aria_label: "Version",
+                                value: "{version}",
+                                onchange: move |e| {
+                                    if let Some(h) = on_version {
+                                        h.call(e.value());
+                                    }
+                                },
+                                for v in detail.versions.iter() {
+                                    option { value: "{v.id}", selected: v.id == version, {versions::version_label(v)} }
+                                }
+                            }
+                        }
+                    }
                     if item.kind.playable() {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
                             if resume { "Resume" } else { "Play" }
@@ -1013,6 +1036,60 @@ mod tests {
         assert!(html.contains("Showing 1 of 3."), "{html}");
     }
 
+    /// Spec 022 US1: a 3D title is badged, and a title with a 3D edition
+    /// offers both versions beside Play with the chosen one selected.
+    #[test]
+    fn a_3d_title_is_badged_and_offers_its_versions() {
+        use pharos_client::api::{Stereo, Version};
+        let mut movie = item(ItemKind::Movie);
+        let flat = render({
+            let movie = movie.clone();
+            move || rsx! { PosterTile { item: movie.clone() } }
+        });
+        assert!(!flat.contains("pharos-badge-3d"), "{flat}");
+        movie.stereo = Some(Stereo::HalfSideBySide);
+        let tile = render({
+            let movie = movie.clone();
+            move || rsx! { PosterTile { item: movie.clone() } }
+        });
+        assert!(
+            tile.contains("pharos-badge-3d") && tile.contains(">3D<"),
+            "{tile}"
+        );
+
+        let version = |id: &str, stereo| Version {
+            id: id.into(),
+            name: String::new(),
+            stereo,
+            primary: id.is_empty(),
+        };
+        let detail = Detail {
+            item: movie,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            versions: vec![
+                version("", None),
+                version("3d-hsbs", Some(Stereo::HalfSideBySide)),
+            ],
+        };
+        let html = render(move || {
+            rsx! { TitleView { detail: detail.clone(), version: "3d-hsbs".to_string() } }
+        });
+        assert!(html.contains(r#"aria-label="Version""#), "{html}");
+        assert!(html.contains(">2D<"), "{html}");
+        assert!(
+            html.contains(
+                r#"<option value="3d-hsbs" selected=true>3D (half side-by-side)</option>"#
+            ),
+            "{html}"
+        );
+    }
+
     #[test]
     fn a_title_offers_play_or_resume() {
         let mut movie = item(ItemKind::Movie);
@@ -1029,6 +1106,10 @@ mod tests {
             versions: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(
+            !html.contains(r#"aria-label="Version""#),
+            "one version, no choice"
+        );
         assert!(
             html.contains(r#"href="/ui/watch/1""#) && html.contains(">Play<"),
             "{html}"
