@@ -824,6 +824,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if !inner.active
                 || !inner.held_waiting
                 || inner.buffering_sent
+                || inner.state.owes_ready
                 || inner.within_self_seek_grace(now)
             {
                 return;
@@ -831,7 +832,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let Some(player) = inner.player.clone() else {
                 return;
             };
-            inner.held_waiting = false;
+            // `held_waiting` stays set: the drift check keeps off a player
+            // still waiting until `canplay` or `playing` clears it.
             inner.buffering_sent = true;
             (
                 inner.state.playlist_item_id.clone(),
@@ -1354,7 +1356,9 @@ mod tests {
         };
         let before = seeks();
 
-        for (n, now) in [(1, 112_000), (2, 114_000), (3, 115_000)] {
+        // Past the report too: a player still waiting is not sought again
+        // until it can play.
+        for (n, now) in [(1, 112_000), (2, 114_000), (3, 115_000), (4, 125_000)] {
             rig.env.now.set(now);
             assert!(rig.session.tick(n).now_or_never().is_some());
             rig.env.settle();

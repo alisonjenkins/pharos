@@ -2028,6 +2028,9 @@ fn Player(
     let retiring = use_hook(|| Rc::new(Cell::new(false)));
     // The crossfade into the next song has begun (or there is none to make).
     let crossfading = use_hook(|| Rc::new(Cell::new(false)));
+    // This song has handed the stage to the next under a crossfade: it plays
+    // out until the next is ready, but its end no longer moves the queue.
+    let handed_off = use_hook(|| Rc::new(Cell::new(false)));
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
     let fade_in_ms = use_hook(|| fade_in.0.take());
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
@@ -2224,6 +2227,7 @@ fn Player(
         );
         let session = session.clone();
         let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
+        let handed_off = Rc::clone(&handed_off);
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
@@ -2247,6 +2251,7 @@ fn Player(
                                     state.position_ms
                                 ));
                                 platform::info(&line);
+                                handed_off.set(true);
                                 let mut stage = stage;
                                 stage.write().hand_off(playing_id, fade);
                                 replace.0.call(Route::Watch(to));
@@ -2266,7 +2271,11 @@ fn Player(
             }
             // A song that ends plays what is next; in a group the group
             // decides what plays.
-            if event == MediaEvent::Ended && queued {
+            if event == MediaEvent::Ended && queued && handed_off.get() {
+                platform::info(&format!(
+                    "pharos: queue advance skipped item={playing_id} reason=handed_off"
+                ));
+            } else if event == MediaEvent::Ended && queued {
                 let (to, line) = queue.peek().advance(playing_id, near.next);
                 platform::info(&line);
                 if let Some(to) = to {
