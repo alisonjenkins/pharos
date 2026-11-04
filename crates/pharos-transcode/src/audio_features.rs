@@ -63,7 +63,10 @@ pub const WINDOW_MS: u64 = 30_000;
 
 /// Bumped whenever the decode window or a formula here changes, so a stored
 /// result from an older analyser is recomputed (V385).
-pub const ANALYSIS_VERSION: u32 = 1;
+///
+/// 2: the window is measured from the stream's own origin (B445), so a
+/// song analysed at 1 with a non-zero start time is redone.
+pub const ANALYSIS_VERSION: u32 = 2;
 
 /// Samples between envelope frames (5.8 ms at [`ANALYSIS_RATE`]).
 const HOP: usize = 64;
