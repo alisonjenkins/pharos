@@ -28,9 +28,10 @@ use super::machine::{Event, Machine, Phase};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, crossfade_ms, fade_volume, parse_crossfade, parse_volume_setting, position_at,
-    preview_set, start_ms, subtitle_switch, volume_setting, Engine, MediaEvent, MediaState,
-    OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch, CROSSFADE_KEY, VOLUME_KEY,
+    choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
+    parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
+    volume_setting, Engine, MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock,
+    SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
 };
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
@@ -373,6 +374,38 @@ fn remember_volume(volume: f64, muted: bool) {
     LAST_VOLUME.set(Some((volume, muted)));
     if let Err(e) = platform::store_theme(VOLUME_KEY, &volume_setting(volume, muted)) {
         platform::warn(&format!("pharos: volume storage write failed error={e}"));
+    }
+}
+
+/// The capabilities to negotiate with: what the browser decodes, and the
+/// maximum bitrate the viewer chose (0, Auto, unless they set one).
+fn negotiation_capabilities() -> pharos_client::api::Capabilities {
+    let mut caps = platform::capabilities();
+    caps.max_bitrate = stored_max_bitrate();
+    platform::info(&format!(
+        "pharos: playback max_bitrate={}",
+        max_bitrate_label(caps.max_bitrate)
+    ));
+    caps
+}
+
+fn stored_max_bitrate() -> u64 {
+    match platform::stored_theme(MAX_BITRATE_KEY) {
+        Ok(stored) => stored.as_deref().map_or(0, parse_max_bitrate),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: max_bitrate storage read failed error={e}"
+            ));
+            0
+        }
+    }
+}
+
+fn set_stored_max_bitrate(bps: u64) {
+    if let Err(e) = platform::store_theme(MAX_BITRATE_KEY, &bps.to_string()) {
+        platform::warn(&format!(
+            "pharos: max_bitrate storage write failed error={e}"
+        ));
     }
 }
 
@@ -1449,6 +1482,7 @@ fn AppearanceScreen() -> Element {
     let notice = use_signal(|| None::<Notice>);
     let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
+    let mut max_quality = use_signal(stored_max_bitrate);
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -1481,6 +1515,7 @@ fn AppearanceScreen() -> Element {
         .map(|state| editor_view(state, &themes.catalogue.read()));
     let notice_now = notice.read().clone();
     let diagnostics_on = *diagnostics.read();
+    let max_quality_now = *max_quality.read();
     let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
@@ -1491,6 +1526,12 @@ fn AppearanceScreen() -> Element {
             notice: notice_now,
             diagnostics: diagnostics_on,
             diagnostics_key,
+            max_quality: max_quality_now,
+            on_max_quality: move |bps: u64| {
+                set_stored_max_bitrate(bps);
+                max_quality.set(bps);
+                platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
+            },
             on_diagnostics: move |on: bool| {
                 let api = ctx.api.peek().clone();
                 let server_before = *diagnostics.peek();
@@ -1869,7 +1910,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             let result = async {
                 let detail = api.detail(&info, id).await?;
                 let (decision, grant) = api
-                    .play(&info, id, &platform::capabilities(), asked)
+                    .play(&info, id, &negotiation_capabilities(), asked)
                     .await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
@@ -1962,7 +2003,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &platform::capabilities(), asked).await {
+                match api.play(&info, id, &negotiation_capabilities(), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).

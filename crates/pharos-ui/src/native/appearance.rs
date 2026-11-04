@@ -4,6 +4,7 @@
 
 use dioxus::prelude::*;
 
+use super::playback::MAX_BITRATE_CHOICES;
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -79,6 +80,8 @@ pub fn AppearanceView(
     diagnostics: bool,
     diagnostics_key: u32,
     on_diagnostics: EventHandler<bool>,
+    max_quality: u64,
+    on_max_quality: EventHandler<u64>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -108,6 +111,30 @@ pub fn AppearanceView(
                 aria_pressed: if auto { "true" } else { "false" },
                 onclick: move |_| on_auto.call(()),
                 "Auto (follow the system)"
+            }
+            fieldset { class: "pharos-max-quality",
+                legend { "Maximum quality" }
+                label { r#for: "max-quality", "Limit video bitrate on this device" }
+                select {
+                    id: "max-quality",
+                    aria_describedby: "max-quality-help",
+                    onchange: move |ev| {
+                        if let Ok(bps) = ev.value().parse::<u64>() {
+                            on_max_quality.call(bps);
+                        }
+                    },
+                    for (bps , label) in MAX_BITRATE_CHOICES {
+                        option {
+                            key: "{bps}",
+                            value: "{bps}",
+                            selected: bps == max_quality,
+                            "{label}"
+                        }
+                    }
+                }
+                p { id: "max-quality-help",
+                    "Auto sends the video as stored. Pick a lower limit on a slow connection; it applies from the next title you play."
+                }
             }
             fieldset { class: "pharos-diagnostics",
                 legend { "Diagnostics" }
@@ -385,6 +412,16 @@ mod tests {
         notice: Option<Notice>,
         diagnostics: bool,
     ) -> String {
+        page_full(themes, editor, notice, diagnostics, 0)
+    }
+
+    fn page_full(
+        themes: Vec<ThemeCard>,
+        editor: Option<EditorView>,
+        notice: Option<Notice>,
+        diagnostics: bool,
+        max_quality: u64,
+    ) -> String {
         render(move || {
             rsx! {
                 AppearanceView {
@@ -394,6 +431,8 @@ mod tests {
                     notice: notice.clone(),
                     diagnostics,
                     diagnostics_key: 0,
+                    max_quality,
+                    on_max_quality: |_| {},
                     on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
@@ -435,6 +474,25 @@ mod tests {
             "a server value of off must render unchecked: {}",
             diagnostics_box(&off)
         );
+    }
+
+    #[test]
+    fn max_quality_select_marks_only_the_stored_choice() {
+        let html = page_full(Vec::new(), None, None, false, 2_000_000);
+        let start = html.find("id=\"max-quality\"").unwrap_or(usize::MAX);
+        assert!(start != usize::MAX, "select missing: {html}");
+        let sel = &html[start
+            ..html[start..]
+                .find("</select>")
+                .map_or(html.len(), |e| start + e)];
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(
+            sel.contains("value=\"2000000\" selected") || sel.contains("selected=\"true\""),
+            "{sel}"
+        );
+        for (_, label) in MAX_BITRATE_CHOICES {
+            assert!(sel.contains(label), "{label} missing: {sel}");
+        }
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {
