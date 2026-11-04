@@ -527,6 +527,70 @@ pub fn toggle_fullscreen(id: &str) {
     }
 }
 
+// The Picture-in-Picture API is not among the enabled web-sys features.
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = web_sys::Document, js_name = Document)]
+    type PipDocument;
+    /// Missing (`None`) in Firefox.
+    #[wasm_bindgen(method, getter, js_name = pictureInPictureEnabled)]
+    fn picture_in_picture_enabled(this: &PipDocument) -> Option<bool>;
+    #[wasm_bindgen(method, getter, js_name = pictureInPictureElement)]
+    fn picture_in_picture_element(this: &PipDocument) -> Option<web_sys::Element>;
+    #[wasm_bindgen(method, catch, js_name = exitPictureInPicture)]
+    fn exit_picture_in_picture(this: &PipDocument) -> Result<js_sys::Promise, JsValue>;
+
+    #[wasm_bindgen(js_name = HTMLVideoElement)]
+    type PipVideo;
+    #[wasm_bindgen(method, catch, js_name = requestPictureInPicture)]
+    fn request_picture_in_picture(this: &PipVideo) -> Result<js_sys::Promise, JsValue>;
+}
+
+fn pip_document() -> Option<PipDocument> {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .map(|d| d.unchecked_into())
+}
+
+/// Whether the browser can hand a video to its own picture-in-picture
+/// window (`document.pictureInPictureEnabled`; missing in Firefox).
+pub fn pip_supported() -> bool {
+    pip_document().and_then(|d| d.picture_in_picture_enabled()) == Some(true)
+}
+
+/// Hands the video `id` to the browser's picture-in-picture window, or
+/// takes it back when it is already there.
+pub fn toggle_pip(id: &str) {
+    let Some(document) = pip_document() else {
+        return;
+    };
+    let (action, call) = if document.picture_in_picture_element().is_some() {
+        ("close", document.exit_picture_in_picture())
+    } else {
+        let Some(video) = document.get_element_by_id(id) else {
+            warn(&format!(
+                "pharos: pip action=open refused reason=no-video id={id}"
+            ));
+            return;
+        };
+        (
+            "open",
+            video
+                .unchecked_into::<PipVideo>()
+                .request_picture_in_picture(),
+        )
+    };
+    info(&format!("pharos: pip action={action} id={id}"));
+    match call {
+        Ok(promise) => spawn_detached(async move {
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                warn(&format!("pharos: pip action={action} refused reason={e:?}"));
+            }
+        }),
+        Err(e) => warn(&format!("pharos: pip action={action} refused reason={e:?}")),
+    }
+}
+
 fn seconds_to_ms(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
         // Saturating cast; a position past u64 milliseconds is not real.

@@ -686,6 +686,7 @@ const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
 const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
 /// A small window in a corner of a larger one: shrink the player.
 pub const ICON_FLOAT: &str = "M3 5h18v14H3V5Zm2 2v10h14V7H5Zm7 5h6v4h-6v-4Z";
+pub const ICON_PIP: &str = "M19 11h-8v6h8v-6Zm4 8V5a2 2 0 0 0-2-2H3a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h18a2 2 0 0 0 2-2Zm-2 0H3V5h18v14Z";
 const ICON_LEAVE: &str = "M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20Z";
 const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
 /// The queue's icons (B435/V375).
