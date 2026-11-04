@@ -2366,3 +2366,136 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
   });
 });
+
+// V408/V409: a song hands the stage over to the next without a Loading
+// screen in between, and with a crossfade chosen the two overlap, the old
+// one fading out under the new one (ADR-0053).
+test.describe("pharos Dioxus UI song handover", () => {
+  // Signs in, queues Carefree's album and plays the short seeded song (6 s)
+  // before it, with `crossfade` seconds chosen on the Account page.
+  async function playIntoQueuedSong(page: Page, request: APIRequestContext, crossfade: number) {
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-handover-${Date.now()}", Version="0"`,
+      },
+      data: { Username: TEST_USER, Pw: TEST_PASS },
+    });
+    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+    const { AccessToken: token, User: user } = await auth.json();
+    const tracks = await (
+      await request.get(
+        `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=Album`,
+        { headers: { "X-Emby-Token": token } },
+      )
+    ).json();
+    type Track = { Id: string; Name: string; Album?: string; AlbumId?: string; RunTimeTicks?: number };
+    const songs: Track[] = tracks.Items ?? [];
+    const queued = songs.find((t) => t.AlbumId);
+    const first = songs.find((t) => !t.AlbumId && (t.RunTimeTicks ?? 0) < 200_000_000);
+    test.skip(!queued || !first, "the seed has no album song and a short song apart from it");
+    // Earlier cases leave both part or wholly played; start each from 0.
+    for (const t of [queued!, first!]) {
+      await request.delete(`${PHAROS_URL}/Users/${user.Id}/PlayedItems/${t.Id}`, {
+        headers: { "X-Emby-Token": token },
+      });
+    }
+    const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+    const native = (t: Track) => BigInt(`0x${t.Id}`).toString();
+
+    await page.goto("/ui/");
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    if (crossfade > 0) {
+      // Off until the listener turns it on.
+      await page.goto("/ui/settings/account");
+      const choice = page.locator("#crossfade");
+      await expect(choice).toHaveValue("0");
+      await choice.selectOption(String(crossfade));
+    }
+    await page.goto(`/ui/browse/${nativeSynth(queued!.AlbumId!)}`);
+    await expect(page.locator("section.pharos-album h2")).toHaveText(queued!.Album!, {
+      timeout: 30_000,
+    });
+    await page.getByRole("button", { name: `Add ${queued!.Album} to the queue` }).click();
+    await expect(page.locator(".pharos-queue-note").first()).toHaveText(/added to the queue/);
+    // The queue lives in the page, so go on without a reload; then click
+    // Play, so the play is a gesture and the page may autoplay.
+    await page.evaluate((path) => {
+      history.pushState(null, "", path);
+      dispatchEvent(new PopStateEvent("popstate"));
+    }, `/ui/title/${native(first!)}`);
+    await page.locator(`a[href$="/ui/watch/${native(first!)}"]`).first().click();
+    const audio = page.locator("#pharos-video");
+    await expect
+      .poll(() => audio.evaluate((a: HTMLMediaElement) => a.readyState), { timeout: 15_000 })
+      .toBeGreaterThan(0);
+    return { audio, next: `/ui/watch/${native(queued!)}` };
+  }
+
+  test("the next song takes over without a loading screen", async ({ page, request }) => {
+    test.setTimeout(90_000);
+    // Anything drawn as Loading on the stage from here on is the flash.
+    await page.addInitScript(() => {
+      const w = window as unknown as { pharosLoading: number };
+      w.pharosLoading = 0;
+      new MutationObserver(() => {
+        const loading = document.querySelector("#pharos-stage .pharos-loading");
+        if (loading && loading.getClientRects().length > 0) w.pharosLoading++;
+      }).observe(document, { childList: true, subtree: true, attributes: true });
+    });
+    const { audio, next } = await playIntoQueuedSong(page, request, 0);
+    await expect.poll(() => audio.evaluate((a: HTMLMediaElement) => !a.paused)).toBe(true);
+    const before = await page.evaluate(
+      () => (window as unknown as { pharosLoading: number }).pharosLoading,
+    );
+    // The short song plays out and the queued one follows it.
+    await expect(page).toHaveURL(new RegExp(`${next}$`), { timeout: 20_000 });
+    await expect(page.locator("#pharos-video-out")).toHaveCount(0, { timeout: 10_000 });
+    await expect(page.locator(".pharos-listen")).toHaveCount(1);
+    await expect.poll(() => audio.evaluate((a: HTMLMediaElement) => !a.paused)).toBe(true);
+    expect(
+      await page.evaluate(() => (window as unknown as { pharosLoading: number }).pharosLoading),
+    ).toBe(before);
+  });
+
+  test("a crossfade plays the next song under the end of this one", async ({ page, request }) => {
+    test.setTimeout(90_000);
+    // A 6 s song caps the fade at a third of it, about 2 s.
+    const { audio, next } = await playIntoQueuedSong(page, request, 4);
+    const sample = () =>
+      page.evaluate(() => {
+        const at = (id: string) => document.getElementById(id) as HTMLMediaElement | null;
+        const [o, i] = [at("pharos-video-out"), at("pharos-video")];
+        return {
+          both: !!o && !!i && !o.paused && !i.paused,
+          out: o?.volume ?? -1,
+          in: i?.volume ?? -1,
+        };
+      });
+    await expect.poll(async () => (await sample()).both, { timeout: 15_000, intervals: [50] }).toBe(
+      true,
+    );
+    await expect(page).toHaveURL(new RegExp(`${next}$`));
+    const first = await sample();
+    await page.waitForTimeout(500);
+    const later = await sample();
+    expect(later.both).toBe(true);
+    expect(later.out).toBeLessThan(first.out);
+    expect(later.in).toBeGreaterThan(first.in);
+    // Faded out, the old song is gone and only the new one plays, at the
+    // listener's volume.
+    await expect(page.locator("#pharos-video-out")).toHaveCount(0, { timeout: 10_000 });
+    await expect(page.locator(".pharos-listen")).toHaveCount(1);
+    await expect.poll(() => audio.evaluate((a: HTMLMediaElement) => a.volume)).toBeGreaterThan(0.99);
+  });
+});
