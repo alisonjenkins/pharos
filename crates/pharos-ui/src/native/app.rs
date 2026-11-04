@@ -394,6 +394,14 @@ pub(super) fn crossfade_seconds() -> u32 {
     seconds
 }
 
+pub(super) fn set_crossfade_seconds(seconds: u32) {
+    CROSSFADE_S.set(Some(seconds));
+    platform::info(&format!("pharos: crossfade set seconds={seconds}"));
+    if let Err(e) = platform::store_theme(CROSSFADE_KEY, &seconds.to_string()) {
+        platform::warn(&format!("pharos: crossfade storage write failed error={e}"));
+    }
+}
+
 /// How often a fade steps the volume; a hidden tab's timers may run slower,
 /// which only makes the steps coarser.
 const FADE_STEP_MS: u32 = 50;
@@ -1330,6 +1338,7 @@ fn AccountScreen() -> Element {
     let mut outcome = use_signal(|| None::<account_settings::Outcome>);
     let mut avatar_busy = use_signal(|| false);
     let mut avatar_outcome = use_signal(|| None::<account_settings::Outcome>);
+    let mut crossfade = use_signal(crossfade_seconds);
     let me = account.0.read().clone().flatten();
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
@@ -1418,6 +1427,11 @@ fn AccountScreen() -> Element {
                     avatar_outcome.set(result.err().map(|e| Err(account_settings::avatar_refusal_message(&e))));
                     avatar_busy.set(false);
                 });
+            },
+            crossfade_s: crossfade(),
+            on_crossfade: move |seconds| {
+                set_crossfade_seconds(seconds);
+                crossfade.set(seconds);
             },
         }
     }
