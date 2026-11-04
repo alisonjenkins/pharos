@@ -287,6 +287,7 @@ pub fn open_route(item: &Item) -> Route {
 
 #[component]
 pub fn PosterTile(item: Item) -> Element {
+    let name = display_name(&item);
     let sub = sub_lines(&item);
     let progress = progress_percent(&item);
     rsx! {
@@ -306,7 +307,7 @@ pub fn PosterTile(item: Item) -> Element {
                 }
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
             }
-            span { class: "pharos-poster-name", title: "{item.name}", "{item.name}" }
+            span { class: "pharos-poster-name", title: "{name}", "{name}" }
             for line in sub {
                 span { class: "pharos-poster-sub", title: "{line}", "{line}" }
             }
@@ -456,6 +457,49 @@ pub fn episode_label(item: &Item) -> Option<String> {
         (ItemKind::Episode, None, Some(e)) => Some(format!("E{e}")),
         _ => None,
     }
+}
+
+/// The name to show for an item. An episode the library knows no title
+/// for is often stored under its show's name or its file name, which the
+/// tile already shows beneath; it reads "Episode 7" instead.
+pub fn display_name(item: &Item) -> String {
+    if item.kind == ItemKind::Episode && is_placeholder_episode_name(item) {
+        return match item.episode {
+            Some(e) => format!("Episode {e}"),
+            None => "Episode".to_owned(),
+        };
+    }
+    item.name.clone()
+}
+
+/// Empty, the show's own name, or a file name with an `S01E02` in it; the
+/// server's `apply_enrichment` replaces the same stand-ins.
+pub fn is_placeholder_episode_name(item: &Item) -> bool {
+    let fold = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let name = fold(&item.name);
+    name.is_empty()
+        || item.series_name.as_deref().is_some_and(|s| fold(s) == name)
+        || has_season_episode_token(&item.name)
+}
+
+/// `S01E02` / `s1e2` at a word start, as a release or Sonarr file name has.
+fn has_season_episode_token(name: &str) -> bool {
+    let b = name.as_bytes();
+    (0..b.len()).any(|i| {
+        let starts_word = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let digits = |from: usize| b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !starts_word || !b[i].eq_ignore_ascii_case(&b's') {
+            return false;
+        }
+        let s = digits(i + 1);
+        let e_at = i + 1 + s;
+        s > 0 && b.get(e_at).is_some_and(|c| c.eq_ignore_ascii_case(&b'e')) && digits(e_at + 1) > 0
+    })
 }
 
 /// The lines under a poster's name: an episode's series, then its numbers,
@@ -831,6 +875,31 @@ mod tests {
         e.series_name = None;
         assert_eq!(sub_lines(&e), ["S1 · E3"]);
         assert_eq!(sub_lines(&item(ItemKind::Movie)), ["2001"]);
+    }
+
+    #[test]
+    fn an_episode_without_a_title_reads_as_its_number() {
+        let mut e = item(ItemKind::Episode);
+        e.series_name = Some("Star Trek The Next Generation".into());
+        e.season = Some(3);
+        e.episode = Some(7);
+        for stand_in in [
+            "Star Trek: The Next Generation",
+            "Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p",
+            "Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE",
+            "",
+        ] {
+            e.name = stand_in.into();
+            assert_eq!(display_name(&e), "Episode 7", "{stand_in}");
+        }
+        e.name = "The Enemy".into();
+        assert_eq!(display_name(&e), "The Enemy");
+        e.name = "Mass Effect".into();
+        assert_eq!(display_name(&e), "Mass Effect");
+
+        let mut film = item(ItemKind::Movie);
+        film.name = "Show.S01E01".into();
+        assert_eq!(display_name(&film), "Show.S01E01");
     }
 
     #[test]
