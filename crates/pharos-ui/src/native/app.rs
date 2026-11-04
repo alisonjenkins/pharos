@@ -1315,7 +1315,11 @@ struct Playing {
     engine: Engine,
     /// The server's play session; a new one remounts the player.
     session: String,
-    grant: NativeGrant,
+    /// Reports and the stop go through this. It dies with the connection,
+    /// so a reconnect swaps in a fresh one under the same player.
+    grant: RefCell<NativeGrant>,
+    /// The API generation `grant` was negotiated on.
+    grant_gen: Cell<u32>,
     detail: Detail,
     /// The tracks the server started this playback on.
     audio: Option<u32>,
@@ -1420,8 +1424,21 @@ fn WatchScreen(id: ItemRef) -> Element {
             q.shuffled()
         ));
     });
+    // A reconnect replaces the API but must not renegotiate: that would mount
+    // a new player mid-song. Only gaining or losing the API does.
+    let connected = use_memo(move || ctx.api.read().is_some());
+    // Counts the APIs seen, so a grant can tell whether its socket is the
+    // current one.
+    let api_count = use_hook(|| Rc::new(Cell::new(0u32)));
+    let api_gen = use_memo(move || {
+        ctx.api.read();
+        api_count.set(api_count.get().wrapping_add(1));
+        api_count.get()
+    });
     let playing = use_resource(move || {
-        let api = ctx.api.read().clone();
+        connected();
+        let api = ctx.api.peek().clone();
+        let grant_gen = *api_gen.peek();
         let resume_from = Rc::clone(&resume_from);
         let asked = picks();
         async move {
@@ -1468,7 +1485,8 @@ fn WatchScreen(id: ItemRef) -> Element {
                         start_ms,
                         engine,
                         session: decision.play_session,
-                        grant,
+                        grant: RefCell::new(grant),
+                        grant_gen: Cell::new(grant_gen),
                         detail,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
@@ -1476,6 +1494,43 @@ fn WatchScreen(id: ItemRef) -> Element {
                 }),
             )
         }
+    });
+    // When the grant is from an older API (a reconnect, even one during the
+    // first negotiation), the stream keeps going and only the grant is
+    // negotiated again.
+    use_effect(move || {
+        let gen = api_gen();
+        let Some(Some(Ok(p))) = playing.read().clone() else {
+            return;
+        };
+        if p.0.grant_gen.replace(gen) == gen {
+            return;
+        }
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        let asked = *picks.peek();
+        spawn(async move {
+            let info = call("watch", "renew");
+            let renewed = api.play(&info, id, &platform::capabilities(), asked).await;
+            // A newer reconnect has taken over.
+            if *api_gen.peek() != gen {
+                return;
+            }
+            match renewed {
+                Ok((decision, grant)) => {
+                    *p.0.grant.borrow_mut() = grant;
+                    // The play session id is a stream credential (B256).
+                    platform::info(&format!(
+                        "pharos: playback grant renewed after reconnect method={}",
+                        decision.method
+                    ));
+                }
+                Err(e) => platform::warn(&format!(
+                    "pharos: playback grant renewal failed, reports stop: {e}"
+                )),
+            }
+        });
     });
     let state = playing.read();
     loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
@@ -1609,7 +1664,7 @@ fn Player(
             if !clock.borrow_mut().stop() {
                 return;
             }
-            let grant = p.grant.clone();
+            let grant = p.grant.borrow().clone();
             let at = last_ms.get();
             platform::spawn_detached(async move {
                 if let Err(e) = grant.stop(&call("watch", "stop"), at).await {
@@ -1731,7 +1786,7 @@ fn Player(
             let Outgoing::Report { paused } = send else {
                 return;
             };
-            let grant = p.grant.clone();
+            let grant = p.grant.borrow().clone();
             let at = last_ms.get();
             let tracks = TrackPicks {
                 audio: TrackChoice::Default,
