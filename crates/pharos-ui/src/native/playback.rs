@@ -329,6 +329,84 @@ pub fn skip_label(kind: SegmentKind) -> &'static str {
     }
 }
 
+/// How long the "Up next" card counts down before the next episode plays.
+pub const UP_NEXT_COUNTDOWN_MS: u64 = 15_000;
+/// Without detected credits, how long before the end the card shows.
+pub const UP_NEXT_LEAD_MS: u64 = 20_000;
+
+/// Where the "Up next" card shows: where the credits start, when the server
+/// detected them in the second half, else [`UP_NEXT_LEAD_MS`] before the end.
+/// `None` while the length is unknown.
+pub fn up_next_at(segments: &[Segment], total_ms: u64) -> Option<u64> {
+    if total_ms == 0 {
+        return None;
+    }
+    let credits = segments
+        .iter()
+        .filter(|s| s.kind == SegmentKind::Outro && s.start_ms >= total_ms / 2)
+        .filter(|s| s.start_ms < total_ms)
+        .map(|s| s.start_ms)
+        .max();
+    Some(credits.unwrap_or_else(|| total_ms.saturating_sub(UP_NEXT_LEAD_MS)))
+}
+
+/// What the "Up next" card does at a position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpNextStep {
+    Hidden,
+    /// Shown, with this long until the next episode plays.
+    Counting {
+        left_ms: u64,
+    },
+    /// Play the next episode now.
+    Go,
+}
+
+/// The "Up next" countdown. It follows the video's position, so pausing
+/// pauses it; seeking back before the card hides it and starts it over, and
+/// Cancel hides it for the rest of this episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpNext {
+    shown_at: Option<u64>,
+    cancelled: bool,
+}
+
+impl UpNext {
+    /// The card's state at `at_ms`, when it shows from `from_ms` in a video
+    /// `total_ms` long.
+    pub fn step(&mut self, at_ms: u64, from_ms: Option<u64>, total_ms: u64) -> UpNextStep {
+        let Some(from) = from_ms.filter(|_| !self.cancelled) else {
+            return UpNextStep::Hidden;
+        };
+        if at_ms < from {
+            self.shown_at = None;
+            return UpNextStep::Hidden;
+        }
+        let shown = *self.shown_at.get_or_insert(at_ms);
+        let due = shown
+            .saturating_add(UP_NEXT_COUNTDOWN_MS)
+            .min(total_ms.max(shown));
+        match due.checked_sub(at_ms) {
+            Some(left_ms) if left_ms > 0 => UpNextStep::Counting { left_ms },
+            _ => UpNextStep::Go,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    /// Why the player should move on to the next episode after `event`,
+    /// which left the card at `step`; `None` to stay.
+    pub fn moves_on(&self, step: UpNextStep, event: MediaEvent) -> Option<&'static str> {
+        match (step, event) {
+            (UpNextStep::Go, _) => Some("countdown"),
+            (_, MediaEvent::Ended) if !self.cancelled => Some("ended"),
+            _ => None,
+        }
+    }
+}
+
 /// `at_ms` as a percentage of `total_ms`, for a left offset on the seek bar.
 pub fn percent(at_ms: u64, total_ms: u64) -> f64 {
     if total_ms == 0 {
@@ -449,6 +527,87 @@ mod tests {
         let sets = [wide, sprites()];
         assert_eq!(preview_set(&sets).map(|s| s.width), Some(320));
         assert_eq!(preview_set(&[]), None);
+    }
+
+    #[test]
+    fn up_next_shows_at_the_credits_or_twenty_seconds_from_the_end() {
+        let at = |kind, start_ms| Segment {
+            kind,
+            start_ms,
+            end_ms: start_ms + 60_000,
+        };
+        let total = 1_200_000;
+        assert_eq!(up_next_at(&[], total), Some(1_180_000));
+        assert_eq!(up_next_at(&[], 0), None);
+        assert_eq!(
+            up_next_at(&[at(SegmentKind::Outro, 1_100_000)], total),
+            Some(1_100_000)
+        );
+        // An intro, or credits in the first half (a cold open's), are not the end.
+        assert_eq!(
+            up_next_at(
+                &[
+                    at(SegmentKind::Intro, 1_100_000),
+                    at(SegmentKind::Outro, 30_000)
+                ],
+                total
+            ),
+            Some(1_180_000)
+        );
+        assert_eq!(up_next_at(&[], 5_000), Some(0));
+    }
+
+    #[test]
+    fn up_next_counts_down_from_where_it_showed_and_then_goes() {
+        let mut up = UpNext::default();
+        let (from, total) = (Some(100_000), 400_000);
+        assert_eq!(up.step(99_999, from, total), UpNextStep::Hidden);
+        assert_eq!(
+            up.step(100_000, from, total),
+            UpNextStep::Counting { left_ms: 15_000 }
+        );
+        assert_eq!(
+            up.step(110_000, from, total),
+            UpNextStep::Counting { left_ms: 5_000 }
+        );
+        assert_eq!(up.step(115_000, from, total), UpNextStep::Go);
+        // Seeking back hides it; coming back starts the count again.
+        assert_eq!(up.step(50_000, from, total), UpNextStep::Hidden);
+        assert_eq!(
+            up.step(200_000, from, total),
+            UpNextStep::Counting { left_ms: 15_000 }
+        );
+        up.cancel();
+        assert_eq!(up.step(210_000, from, total), UpNextStep::Hidden);
+    }
+
+    #[test]
+    fn up_next_moves_on_at_the_count_or_the_end_unless_cancelled() {
+        let mut up = UpNext::default();
+        let counting = UpNextStep::Counting { left_ms: 3_000 };
+        assert_eq!(
+            up.moves_on(UpNextStep::Go, MediaEvent::TimeUpdate),
+            Some("countdown")
+        );
+        assert_eq!(up.moves_on(counting, MediaEvent::TimeUpdate), None);
+        assert_eq!(
+            up.moves_on(UpNextStep::Hidden, MediaEvent::Ended),
+            Some("ended")
+        );
+        assert_eq!(up.moves_on(UpNextStep::Hidden, MediaEvent::Pause), None);
+        up.cancel();
+        assert_eq!(up.moves_on(UpNextStep::Hidden, MediaEvent::Ended), None);
+    }
+
+    #[test]
+    fn up_next_never_counts_past_the_end() {
+        let mut up = UpNext::default();
+        assert_eq!(
+            up.step(395_000, Some(390_000), 400_000),
+            UpNextStep::Counting { left_ms: 5_000 }
+        );
+        assert_eq!(up.step(400_000, Some(390_000), 400_000), UpNextStep::Go);
+        assert_eq!(UpNext::default().step(0, None, 0), UpNextStep::Hidden);
     }
 
     #[test]
