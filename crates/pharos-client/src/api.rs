@@ -10,8 +10,8 @@ use pharos_api::pharos_capnp::{
     avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
     item_query, item_summary, items_result, library, lyrics_result, me_result, negotiate_result,
     opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session, stream_choice,
-    telemetry, track, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind,
-    SubtitleDelivery,
+    telemetry, track, user_data, user_state_result, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -418,6 +418,7 @@ pub struct NativeApi {
     prefs: prefs::Client,
     telemetry: telemetry::Client,
     group: NativeGroup,
+    user_data: user_data::Client,
 }
 
 /// The signed-in user, as `Session.me` reports them.
@@ -451,6 +452,35 @@ impl NativeApi {
             prefs: session.prefs_request().send().pipeline.get_prefs(),
             telemetry: session.telemetry_request().send().pipeline.get_telemetry(),
             group: NativeGroup::new(session),
+            user_data: session.user_data_request().send().pipeline.get_user_data(),
+        }
+    }
+
+    /// Marks `id` watched or not for the signed-in user; a series or season
+    /// marks every episode in it. Unwatched also forgets where it was left.
+    /// Answers whether it is now watched.
+    pub async fn set_played(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        played: bool,
+    ) -> Result<bool, ClientError> {
+        let mut req = self.user_data.set_played_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_played(played);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            user_state_result::State(s) => Ok(s?.get_played()),
+            user_state_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
