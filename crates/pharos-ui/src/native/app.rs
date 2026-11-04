@@ -2240,8 +2240,8 @@ fn Player(
                     if state.position_ms.saturating_add(fade) >= state.duration_ms {
                         crossfading.set(true);
                         let (to, line) = queue.peek().advance(playing_id, near.next);
-                        match to.filter(|to| *to != playing_id) {
-                            Some(to) => {
+                        match to {
+                            Some(to) if to != playing_id => {
                                 platform::info(&format!(
                                     "pharos: crossfade start item={playing_id} next={to} fade_ms={fade} at_ms={}",
                                     state.position_ms
@@ -2252,8 +2252,11 @@ fn Player(
                                 replace.0.call(Route::Watch(to));
                                 return;
                             }
-                            // The end of the queue, or the same song again:
+                            // The same song again, or the end of the queue:
                             // it plays out and `Ended` decides.
+                            Some(same) => platform::info(&format!(
+                                "pharos: crossfade skipped item={playing_id} reason=same_song next={same}"
+                            )),
                             None => platform::info(&format!(
                                 "pharos: crossfade skipped item={playing_id} reason=no_next"
                             )),
