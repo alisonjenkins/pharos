@@ -1781,7 +1781,7 @@ impl GroupState {
                 self.send_one(
                     member_id,
                     ServerMsg::Play {
-                        by: None,
+                        by: Some(MemberId::CATCH_UP),
                         at_server_ms,
                         position_ms: sent_position_ms,
                     },
@@ -1810,7 +1810,7 @@ impl GroupState {
                 self.send_one(
                     member_id,
                     ServerMsg::Pause {
-                        by: None,
+                        by: Some(MemberId::CATCH_UP),
                         at_server_ms,
                         position_ms,
                     },
@@ -1876,7 +1876,7 @@ impl GroupState {
         self.send_one(
             member_id,
             ServerMsg::Seek {
-                by: None,
+                by: Some(MemberId::CATCH_UP),
                 at_server_ms,
                 position_ms: sent_position_ms,
             },
@@ -3860,7 +3860,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.broadcast_except(
                     member_id,
                     ServerMsg::Pause {
-                        by: None,
+                        by: Some(MemberId::CATCH_UP),
                         at_server_ms,
                         position_ms,
                     },
@@ -6421,6 +6421,52 @@ mod tests {
             }
         }
         assert_eq!(extra_pauses, 0, "buffer storm: extra Pauses observed");
+    }
+
+    /// V395: a command that only catches a member up, or freezes the group for
+    /// a buffering member, is marked so the activity log does not report it as
+    /// the group's own play or pause.
+    #[tokio::test]
+    async fn catch_up_and_buffering_commands_carry_the_catch_up_marker() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (m2, mut m2_rx) = add_member(&h, &sinks, "b").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 10_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while leader_rx.try_recv().is_ok() {}
+        while m2_rx.try_recv().is_ok() {}
+
+        h.tx.send(GroupMsg::BufferingStart {
+            member_id: m2,
+            position_ms: 0,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let buffering = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Pause { .. })
+        })
+        .await
+        .expect("a buffering pause");
+        let ServerMsg::Pause { by, .. } = buffering else {
+            unreachable!()
+        };
+        assert_eq!(by, Some(MemberId::CATCH_UP));
+
+        let (_late, mut late_rx) = add_member(&h, &sinks, "late").await;
+        let catch_up = recv_matching(&mut late_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Pause { .. })
+        })
+        .await
+        .expect("a catch-up pause");
+        let ServerMsg::Pause { by, .. } = catch_up else {
+            unreachable!()
+        };
+        assert_eq!(by, Some(MemberId::CATCH_UP));
     }
 
     #[tokio::test]
