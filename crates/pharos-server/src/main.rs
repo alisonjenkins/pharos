@@ -1451,11 +1451,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         // Same "explicit dir, else a sibling of an existing cache dir" rule
         // the subtitle and book caches use (B361).
         let cache_dir = cfg.lyrics.cache_dir.clone().or_else(|| {
-            cfg.server
-                .transcode_cache_dir
-                .as_ref()
-                .or(cfg.server.image_cache_dir.as_ref())
-                .and_then(|d| d.parent().map(|p| p.join("lyrics")))
+            // The first of them that has a parent: a cache at a filesystem
+            // root has no sibling, so the next one is tried.
+            [
+                cfg.server.transcode_cache_dir.as_ref(),
+                cfg.server.image_cache_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|d| d.parent().map(|p| p.join("lyrics")))
         });
         tracing::info!(
             provider = "lrclib",
