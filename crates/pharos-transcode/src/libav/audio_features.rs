@@ -33,7 +33,15 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
     if dur_ms == 0 {
         return Err(FrameError::Other("dur_ms = 0".into()));
     }
-    let mut ictx = format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
+    // Only a container libav cannot make sense of is the file's fault. An I/O
+    // error (EIO/ESTALE on an NFS blip, EACCES, ENOENT mid-rename) says
+    // nothing about the file, so it stays `Other` and the sweep retries it.
+    let mut ictx = format::input(src).map_err(|e| match e {
+        ffmpeg::Error::InvalidData
+        | ffmpeg::Error::DemuxerNotFound
+        | ffmpeg::Error::StreamNotFound => FrameError::BadInput(format!("open: {e}")),
+        other => FrameError::Other(format!("open: {other}")),
+    })?;
 
     // The tag first: read before any decode, from the container and then the
     // audio stream (Ogg keeps Vorbis comments on the stream).
@@ -80,11 +88,19 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
     )
     .map_err(|e| FrameError::Other(format!("resampler: {e}")))?;
 
-    let start_us = (start_ms as i64) * 1000;
-    if start_ms > 0 {
-        // Land at or before the window; the pts gate trims the lead-in.
-        let _ = ictx.seek(start_us, ..start_us);
-    }
+    // Land at or before the window; the pts gate trims the lead-in. A
+    // container that cannot seek is read from the top instead, so the gate
+    // never waits for a start it will not reach.
+    let start_ms = if start_ms > 0 {
+        let start_us = (start_ms as i64) * 1000;
+        if ictx.seek(start_us, ..start_us).is_ok() {
+            start_ms
+        } else {
+            0
+        }
+    } else {
+        0
+    };
     let end_ms = start_ms + dur_ms;
     let tb_ms = |ts: i64| -> i64 {
         if tb_den == 0 {
@@ -93,23 +109,35 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         ts * 1000 * tb_num / tb_den
     };
 
+    // The sample count bounds the decode whatever the timestamps say.
     let cap = (dur_ms as usize / 1000 + 1) * ANALYSIS_RATE as usize;
     let mut pcm: Vec<f32> = Vec::with_capacity(cap);
+    // A damaged frame is skipped, as ffmpeg itself does; only a window that is
+    // nothing but damage gives up early.
+    let mut bad_frames = 0u32;
+    const MAX_BAD_FRAMES: u32 = 200;
     let mut decoded = frame::Audio::empty();
     // Drain every decodable frame; `true` once the window end (or EOF) is
     // reached, so no further packets are read.
     let mut drain = |decoder: &mut ffmpeg::decoder::Audio,
-                     pcm: &mut Vec<f32>|
+                     pcm: &mut Vec<f32>,
+                     bad_frames: &mut u32|
      -> Result<bool, FrameError> {
         loop {
             match decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
-                    let pts_ms = decoded.pts().map(tb_ms).unwrap_or(0);
-                    if pts_ms >= end_ms as i64 || pcm.len() >= cap {
+                    if pcm.len() >= cap {
                         return Ok(true);
                     }
-                    if pts_ms + 100 < start_ms as i64 {
-                        continue; // pre-window straggler after the seek
+                    // A frame without a timestamp is taken as it comes; the
+                    // sample cap ends the window.
+                    if let Some(pts_ms) = decoded.pts().map(tb_ms) {
+                        if pts_ms >= end_ms as i64 {
+                            return Ok(true);
+                        }
+                        if pts_ms + 100 < start_ms as i64 {
+                            continue; // pre-window straggler after the seek
+                        }
                     }
                     // SAFETY: `decoded` owns a valid AVFrame; force the native
                     // layout order the resampler was built with.
@@ -130,9 +158,10 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
                 }
                 Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(false),
                 Err(ffmpeg::Error::Eof) => return Ok(true),
-                // The file's fault, not the worker's: `BadInput`, so the sweep
-                // remembers it rather than retrying every pass.
-                Err(e) => return Err(FrameError::BadInput(format!("decode: {e}"))),
+                Err(_) => {
+                    *bad_frames += 1;
+                    return Ok(*bad_frames > MAX_BAD_FRAMES);
+                }
             }
         }
     };
@@ -146,16 +175,20 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         if s.index() != stream_index {
             continue;
         }
-        decoder
-            .send_packet(&packet)
-            .map_err(|e| FrameError::BadInput(format!("send packet: {e}")))?;
-        done = drain(&mut decoder, &mut pcm)?;
+        if decoder.send_packet(&packet).is_err() {
+            bad_frames += 1;
+            done = bad_frames > MAX_BAD_FRAMES;
+            continue;
+        }
+        done = drain(&mut decoder, &mut pcm, &mut bad_frames)?;
     }
     if !done {
         let _ = decoder.send_eof();
-        drain(&mut decoder, &mut pcm)?;
+        drain(&mut decoder, &mut pcm, &mut bad_frames)?;
     }
 
+    // From here the result stands even if the window was all damage: the tag
+    // read above is still the song's tempo.
     let mut features = analyse(&pcm, tag_bpm.is_some());
     features.tag_bpm = tag_bpm;
     Ok(features)

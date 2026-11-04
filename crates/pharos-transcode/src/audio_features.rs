@@ -50,6 +50,7 @@
 //! intense" rules, not a calibrated measurement, and [`ANALYSIS_VERSION`]
 //! changes when the formula does so stored values are recomputed.
 
+pub use pharos_core::TempoSource;
 use serde::{Deserialize, Serialize};
 
 /// Sample rate the window is resampled to before analysis. 11 025 Hz keeps
@@ -79,13 +80,6 @@ pub const MIN_TEMPO_CONFIDENCE: f32 = 0.08;
 /// Shortest window worth analysing: eight beats at the slowest tempo.
 const MIN_SECONDS: f32 = 10.0;
 
-/// Where a stored tempo came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TempoOrigin {
-    Tag,
-    Analysis,
-}
-
 /// What the worker reports for one song.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct AudioFeatures {
@@ -106,10 +100,10 @@ pub struct AudioFeatures {
 
 impl AudioFeatures {
     /// The tempo a mix rule should use: the tag when present, else analysis.
-    pub fn bpm(&self) -> Option<(f32, TempoOrigin)> {
+    pub fn bpm(&self) -> Option<(f32, TempoSource)> {
         self.tag_bpm
-            .map(|b| (b, TempoOrigin::Tag))
-            .or(self.analysed_bpm.map(|b| (b, TempoOrigin::Analysis)))
+            .map(|b| (b, TempoSource::Tag))
+            .or(self.analysed_bpm.map(|b| (b, TempoSource::Analysis)))
     }
 }
 
@@ -242,7 +236,7 @@ fn tempo(onset: &[f32]) -> Option<(f32, f32)> {
     let fps = frame_rate();
     let min_lag = (60.0 * fps / MAX_BPM).floor() as usize;
     let max_lag = (60.0 * fps / MIN_BPM).ceil() as usize;
-    if o.len() <= 2 * max_lag + 2 {
+    if o.len() <= 2 * max_lag {
         return None;
     }
     let ac = |lag: usize| -> f32 {
@@ -257,11 +251,11 @@ fn tempo(onset: &[f32]) -> Option<(f32, f32)> {
     if r0 <= f32::EPSILON {
         return None;
     }
-    // Normalised autocorrelation for every lag the scoring may touch.
-    let r: Vec<f32> = (0..=2 * max_lag + 1).map(|l| ac(l) / r0).collect();
-    // A beat period sits on a duple grid: the bar-level pulse at twice the lag
-    // and the subdivision at half of it both repeat. A lag at 1.5 or 0.75 of
-    // the beat lines up with one of them but not the other, which is what
+    // Normalised autocorrelation for every lag the scoring reads: the lags
+    // themselves, their halves, and `max_lag` for the parabolic fit.
+    let r: Vec<f32> = (0..=max_lag).map(|l| ac(l) / r0).collect();
+    // A beat is subdivided, so half its lag repeats too. A lag of 1.5 beats
+    // lines a kick up with a hat, but its half lines up nothing, which is what
     // keeps 174 BPM from reading as 116.
     let half = |lag: usize| -> f32 {
         if lag % 2 == 0 {
@@ -507,11 +501,11 @@ mod tests {
             analysed_bpm: Some(60.0),
             ..Default::default()
         };
-        assert_eq!(f.bpm(), Some((120.0, TempoOrigin::Tag)));
+        assert_eq!(f.bpm(), Some((120.0, TempoSource::Tag)));
         let f = AudioFeatures {
             analysed_bpm: Some(60.0),
             ..Default::default()
         };
-        assert_eq!(f.bpm(), Some((60.0, TempoOrigin::Analysis)));
+        assert_eq!(f.bpm(), Some((60.0, TempoSource::Analysis)));
     }
 }
