@@ -1429,6 +1429,51 @@ body:has(.pharos-watch, .pharos-listen) .pharos-error {
 .pharos-episode-play {
   flex: 0 0 auto;
 }
+/* The watched tick: an outline ring until marked, then filled. */
+.pharos-episode-mark {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  border: 2px solid var(--px-color-border);
+  border-radius: 50%;
+  background: none;
+  color: var(--px-color-fg-muted);
+  cursor: pointer;
+}
+.pharos-episode-mark:hover {
+  border-color: var(--px-color-accent);
+  color: var(--px-color-fg);
+}
+.pharos-episode-mark.is-watched {
+  border-color: var(--px-color-accent);
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-episode-mark svg {
+  width: 1.1rem;
+  height: 1.1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.pharos-season-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0.75rem 0 0.25rem;
+}
+.pharos-season-bar .pharos-section-title {
+  margin: 0;
+}
+.pharos-season-bar .pharos-button {
+  margin-left: auto;
+}
 
 .pharos-track {
   display: grid;

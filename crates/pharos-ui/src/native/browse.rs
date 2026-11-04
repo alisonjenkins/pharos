@@ -20,7 +20,9 @@ use super::machine::Event;
 use super::paging::{Pager, Trigger};
 use super::platform;
 use super::route::Route;
-use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
+use super::views::{
+    progress_percent, runtime, Link, MarkPlayed, PosterTile, Ratings, WatchedToggle,
+};
 
 /// Most children one browse page lists.
 pub const BROWSE_PAGE: u32 = 100;
@@ -893,9 +895,16 @@ fn MoreNote(page: Page) -> Element {
     }
 }
 
-/// A hero for a series, artist or album: art, name, facts and overview.
+/// A hero for a series, artist or album: art, name, facts and overview, and
+/// for a series its watched mark.
 #[component]
-fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool) -> Element {
+fn Hero(
+    title: String,
+    detail: Option<Detail>,
+    facts: Vec<String>,
+    square: bool,
+    #[props(default)] mark: bool,
+) -> Element {
     let art_class = if square {
         "pharos-hero-art pharos-hero-art-square"
     } else {
@@ -917,6 +926,11 @@ fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool)
                 }
                 if let Some(d) = detail.as_ref() {
                     Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
+                }
+                if let Some(d) = detail.as_ref().filter(|_| mark) {
+                    div { class: "pharos-actions",
+                        WatchedToggle { id: d.item.id, played: d.item.played, what: "show" }
+                    }
                 }
                 if let Some(d) = detail.as_ref().filter(|d| !d.overview.is_empty()) {
                     p { class: "pharos-overview", "{d.overview}" }
@@ -949,7 +963,13 @@ pub fn ShowView(show: Show) -> Element {
     .collect();
     rsx! {
         section { class: "pharos-show",
-            Hero { title: show.title.clone(), detail: show.series.clone(), facts, square: false }
+            Hero {
+                title: show.title.clone(),
+                detail: show.series.clone(),
+                facts,
+                square: false,
+                mark: true,
+            }
             if show.seasons.len() > 1 {
                 nav { class: "pharos-tabs", aria_label: "Seasons",
                     for season in show.seasons.iter() {
@@ -961,12 +981,31 @@ pub fn ShowView(show: Show) -> Element {
                         }
                     }
                 }
-            } else if let Some(season) = show.seasons.first() {
-                h3 { class: "pharos-section-title", "{season.name}" }
+            }
+            div { class: "pharos-season-bar",
+                if show.seasons.len() == 1 {
+                    h3 { class: "pharos-section-title", "{show.seasons[0].name}" }
+                }
+                if let Some(season) = show.selected.filter(|_| !show.episodes.items.is_empty()) {
+                    WatchedToggle {
+                        id: season,
+                        played: all_played(&show.episodes),
+                        what: "season",
+                    }
+                }
             }
             EpisodeList { page: show.episodes.clone() }
         }
     }
+}
+
+/// Whether every episode of a season is watched, as far as `page` shows:
+/// a season longer than one page reads as unwatched, which still offers to
+/// mark it.
+fn all_played(page: &Page) -> bool {
+    !page.items.is_empty()
+        && page.items.len() == page.total as usize
+        && page.items.iter().all(|e| e.played)
 }
 
 /// A season's episodes as rows: still, number and name, runtime, watched
@@ -1013,8 +1052,33 @@ fn EpisodeRow(episode: Item) -> Element {
                     }
                 }
             }
+            EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
             Link { to: Route::Watch(episode.id), class: "pharos-button pharos-episode-play",
                 if progress.is_some() { "Resume" } else { "Play" }
+            }
+        }
+    }
+}
+
+/// A round tick on an episode row that marks it watched, or unwatched once
+/// it is.
+#[component]
+fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
+    let mark = use_context::<MarkPlayed>();
+    let what = if played {
+        format!("Mark {label} unwatched")
+    } else {
+        format!("Mark {label} watched")
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            class: if played { "pharos-episode-mark is-watched" } else { "pharos-episode-mark" },
+            title: "{what}",
+            "aria-label": "{what}",
+            onclick: move |_| mark.0.call((id, !played)),
+            svg { view_box: "0 0 24 24", "aria-hidden": "true",
+                path { d: "M5 12.5l4.5 4.5L19 7.5" }
             }
         }
     }
@@ -1604,11 +1668,60 @@ mod tests {
         assert!(html.contains("Resume"), "{html}");
     }
 
+    #[test]
+    fn a_show_page_marks_each_episode_its_season_and_the_show_watched() {
+        let mut pilot = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
+        pilot.episode = Some(1);
+        let mut second = item(ItemRef::Real(2), ItemKind::Episode, "Second");
+        second.episode = Some(2);
+        second.played = true;
+        let mut series = item(ItemRef::Synth(9), ItemKind::Series, "Show");
+        series.played = false;
+        let show = |episodes: Vec<Item>| Show {
+            title: "Show".into(),
+            series: Some(detail(series.clone())),
+            seasons: vec![item(S1, ItemKind::Season, "Season 1")],
+            selected: Some(S1),
+            episodes: page(episodes),
+        };
+
+        let part = show(vec![pilot.clone(), second.clone()]);
+        let html = render(move || rsx! { ShowView { show: part.clone() } });
+        assert!(html.contains("Mark 1. Pilot watched"), "{html}");
+        assert!(
+            html.contains("pharos-episode-mark is-watched")
+                && html.contains("Mark 2. Second unwatched"),
+            "{html}"
+        );
+        assert!(
+            html.contains(">Season 1<") && html.contains(">Mark season watched<"),
+            "{html}"
+        );
+        assert!(html.contains(">Mark show watched<"), "{html}");
+
+        pilot.played = true;
+        let all = show(vec![pilot, second]);
+        let html = render(move || rsx! { ShowView { show: all.clone() } });
+        assert!(html.contains(">Mark season unwatched<"), "{html}");
+    }
+
+    #[test]
+    fn a_season_longer_than_its_page_offers_to_mark_it_watched() {
+        let mut ep = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
+        ep.played = true;
+        let mut partial = page(vec![ep]);
+        assert!(all_played(&partial));
+        partial.total = 30;
+        assert!(!all_played(&partial));
+        assert!(!all_played(&page(vec![])));
+    }
+
     fn render(body: impl Fn() -> Element + 'static) -> String {
         let body: std::rc::Rc<dyn Fn() -> Element> = std::rc::Rc::new(body);
         let mut dom = VirtualDom::new_with_props(
             |body: std::rc::Rc<dyn Fn() -> Element>| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+                use_context_provider(|| MarkPlayed(EventHandler::new(|_: (ItemRef, bool)| {})));
                 body()
             },
             body,

@@ -26,7 +26,8 @@ use super::playback::{
 };
 use super::route::Route;
 use super::views::{
-    ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
+    ErrorNote, FindView, Hits, HomeView, Loading, MarkPlayed, Nav, Shell, SignInView, StatusView,
+    TitleView,
 };
 use super::watch_view::{
     text_track_id, Control, Controls, WatchView, PLAYER_ID, SEEK_ID, VIDEO_ID,
@@ -673,6 +674,9 @@ struct Replace(EventHandler<Route>);
 pub(super) struct Ctx {
     pub(super) api: Signal<Option<NativeApi>>,
     pub(super) machine: Signal<Machine>,
+    /// Counts stored watched marks; a screen that shows them reads it, so a
+    /// mark reloads it.
+    pub(super) marks: Signal<u32>,
 }
 
 #[component]
@@ -681,7 +685,28 @@ fn NativeApp(route: Route) -> Element {
     let mut api = use_signal(|| None::<NativeApi>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
-    use_context_provider(|| Ctx { api, machine });
+    let mut marks = use_signal(|| 0u32);
+    use_context_provider(|| Ctx {
+        api,
+        machine,
+        marks,
+    });
+    use_context_provider(|| {
+        MarkPlayed(EventHandler::new(move |(id, played): (ItemRef, bool)| {
+            let Some(api) = api.peek().clone() else {
+                return;
+            };
+            spawn(async move {
+                let result = api.set_played(&call("mark", "played"), id, played).await;
+                if let Err(e) = settle(machine, result) {
+                    platform::warn(&format!("pharos: marking {id} played={played} failed: {e}"));
+                }
+                // Reload either way: a season that failed part way through
+                // has some episodes marked, and the screen shows what is stored.
+                marks += 1;
+            });
+        }))
+    });
     let nav = use_context::<Nav>();
 
     use_effect(move || {
@@ -1023,6 +1048,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
     // parent, so the load follows `id` instead of running once.
     let listing = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
         async move {
             let api = api?;
             let result = browse::load(&api, &call("browse", "load"), id, |line| {
@@ -1046,6 +1072,7 @@ fn TitleScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
     let detail = use_resource(move || {
         let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
         async move {
             let api = api?;
             Some(settle(
@@ -1654,6 +1681,7 @@ mod tests {
         let ctx = Ctx {
             api: use_signal(|| None::<NativeApi>),
             machine: use_signal(Machine::new),
+            marks: use_signal(|| 0),
         };
         use_context_provider(|| ctx);
         rsx! { AppearanceScreen {} }
