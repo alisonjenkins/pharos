@@ -13,6 +13,7 @@ use pharos_api::pharos_capnp::{
     track, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
+pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
 
 use crate::group::NativeGroup;
 use crate::{CallInfo, ClientError};
@@ -471,6 +472,33 @@ impl NativeApi {
     /// Watch together: the session's `Group`.
     pub fn group(&self) -> &NativeGroup {
         &self.group
+    }
+
+    /// Changes the signed-in user's password. The server checks `current`
+    /// and signs the user's other sessions out; this one stays signed in.
+    pub async fn change_password(
+        &self,
+        call: &CallInfo,
+        current: &str,
+        new: &str,
+    ) -> Result<(), ClientError> {
+        let mut req = self.session.change_password_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_current(current);
+            p.set_new(new);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
+        }
     }
 
     /// The signed-in user's stored value for `key`, `None` when never set.
