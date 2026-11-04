@@ -393,7 +393,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = source(dir.path(), "a.mkv", b"x");
         let (i, counter) = counting(dir.path(), "5", BANNER);
-        let i = i.with_limits(Duration::from_millis(300), Duration::from_millis(100));
+        // The timeout must leave the fake ffmpeg time to write its spawn
+        // marker before it is killed: at 100 ms a busy CI runner killed it
+        // first, and the third spawn went uncounted.
+        let i = i.with_limits(Duration::from_millis(300), Duration::from_millis(250));
         let t = Instant::now();
         assert_eq!(i.inspect(&p).await, Some(ResidentBlock::Unreadable));
         assert!(t.elapsed() < Duration::from_secs(2), "timeout not applied");
