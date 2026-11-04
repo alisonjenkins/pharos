@@ -527,6 +527,46 @@ pub fn toggle_fullscreen(id: &str) {
     }
 }
 
+/// Whether the browser can hand a video to its own picture-in-picture
+/// window (`document.pictureInPictureEnabled`; false in Firefox).
+pub fn pip_supported() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| js_sys::Reflect::get(&d, &JsValue::from_str("pictureInPictureEnabled")).ok())
+        .is_some_and(|v| v.is_truthy())
+}
+
+/// Hands the video `id` to the browser's picture-in-picture window, or
+/// takes it back. Neither is in the web-sys features, so both go by name.
+pub fn toggle_pip(id: &str) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let open = js_sys::Reflect::get(&document, &JsValue::from_str("pictureInPictureElement"))
+        .is_ok_and(|e| !e.is_null() && !e.is_undefined());
+    let (target, method): (JsValue, &str) = if open {
+        (document.into(), "exitPictureInPicture")
+    } else {
+        match document.get_element_by_id(id) {
+            Some(video) => (video.into(), "requestPictureInPicture"),
+            None => return,
+        }
+    };
+    let call = js_sys::Reflect::get(&target, &JsValue::from_str(method))
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .ok_or_else(|| JsValue::from_str("unsupported"))
+        .and_then(|f| f.call0(&target));
+    match call.and_then(|p| p.dyn_into::<js_sys::Promise>().map_err(|_| JsValue::NULL)) {
+        Ok(promise) => spawn_detached(async move {
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                warn(&format!("pharos: picture-in-picture refused: {e:?}"));
+            }
+        }),
+        Err(e) => warn(&format!("pharos: picture-in-picture refused: {e:?}")),
+    }
+}
+
 fn seconds_to_ms(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
         // Saturating cast; a position past u64 milliseconds is not real.

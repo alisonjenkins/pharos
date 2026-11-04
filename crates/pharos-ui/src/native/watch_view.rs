@@ -8,7 +8,7 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
-use super::listen::{Icon, ICON_FLOAT};
+use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
     clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
@@ -116,6 +116,8 @@ pub enum Control {
     Audio(u32),
     Subtitle(Option<u32>),
     Fullscreen,
+    /// Hand the video to the browser's picture-in-picture window (spec 020).
+    PictureInPicture,
     /// Leave the player for the page before it.
     Back,
     /// Shrink the player to its floating window or mini bar (spec 020).
@@ -345,6 +347,16 @@ pub fn WatchView(
                             pick: c.subtitle_pick,
                             offer_off: true,
                             on_pick: move |p| on_control.call(Control::Subtitle(p)),
+                        }
+                        if platform::pip_supported() {
+                            button {
+                                class: "pharos-control",
+                                r#type: "button",
+                                aria_label: "Picture in picture",
+                                title: "Picture in picture",
+                                onclick: move |_| on_control.call(Control::PictureInPicture),
+                                Icon { path: ICON_PIP }
+                            }
                         }
                         button {
                             class: "pharos-control",
