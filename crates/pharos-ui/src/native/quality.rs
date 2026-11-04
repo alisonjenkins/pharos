@@ -115,7 +115,8 @@ pub enum Decision {
 
 /// The cap one step above `cap`, and the bitrate it plays at: a higher rung
 /// within the ceiling, or no auto cap (0) once a rung reaches the source.
-/// `None` at the top, or when the source is unknown at the top rung.
+/// `None` at the manual ceiling. At the top rung with no ceiling and the
+/// source unknown (a remembered cap never learns it), the auto cap lifts.
 pub fn up_target(cap: u64, ceiling: u64, source_bps: Option<u64>) -> Option<(u64, u64)> {
     if cap == 0 {
         return None;
@@ -129,6 +130,7 @@ pub fn up_target(cap: u64, ceiling: u64, source_bps: Option<u64>) -> Option<(u64
         (Some(r), Some(source)) if r >= source => Some((0, source)),
         (Some(r), _) => Some((r, r)),
         (None, Some(source)) if ceiling == 0 || source <= ceiling => Some((0, source)),
+        (None, None) if ceiling == 0 => Some((0, cap)),
         (None, _) => None,
     }
 }
@@ -531,7 +533,11 @@ mod tests {
     fn up_targets_walk_the_rungs_and_stop_at_the_top() {
         assert_eq!(up_target(0, 0, None), None);
         assert_eq!(up_target(1_000_000, 0, None), Some((2_000_000, 2_000_000)));
-        assert_eq!(up_target(8_000_000, 0, None), None);
+        // A remembered top cap never learns the source: it lifts, so a
+        // source above 8 Mbps is not held there for good.
+        assert_eq!(up_target(8_000_000, 0, None), Some((0, 8_000_000)));
+        // At a manual ceiling nothing is above it.
+        assert_eq!(up_target(8_000_000, 8_000_000, None), None);
         // A source below the next rung is reached by lifting the cap.
         assert_eq!(
             up_target(2_000_000, 0, Some(3_000_000)),
