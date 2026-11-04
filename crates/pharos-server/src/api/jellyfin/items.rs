@@ -7253,8 +7253,8 @@ async fn reload_libraries_and_backfill(state: &AppState) -> Result<(), actix_web
 ///
 /// One library scan runs at a time (B100). If a scan is already running, this
 /// does NOT spawn a second concurrent scan — it coalesces the request into a
-/// single pending re-run (`force` OR'd) that fires once the current scan
-/// finishes. Stacked concurrent scans re-probing the whole catalog over NFS
+/// single pending re-run over the requested roots (`force` OR'd per root) that
+/// fires once the current scan finishes. Stacked concurrent scans re-probing the whole catalog over NFS
 /// I/O-starved the single node and stalled the control plane during the B98
 /// recovery. `start_or_mark_pending` hands back the run's cancel flag; a
 /// `DELETE /ScheduledTasks/Running/{id}` sets it and the root loop stops after
@@ -7269,11 +7269,16 @@ pub(crate) fn spawn_scan_tracked(
     use std::sync::atomic::{AtomicU64, Ordering};
     // Acquire the single scan slot. `None` → a scan is already running and this
     // request was folded into one pending re-run; there is nothing to spawn.
-    let Some(initial_cancel) = state
-        .scan_tasks
-        .start_or_mark_pending(crate::scan_tasks::TASK_REFRESH_LIBRARY, force)
-    else {
-        tracing::info!("scan: already running — coalesced into one pending re-run (B100)");
+    let Some(initial_cancel) = state.scan_tasks.start_or_mark_pending(
+        crate::scan_tasks::TASK_REFRESH_LIBRARY,
+        &roots,
+        force,
+    ) else {
+        tracing::info!(
+            roots = ?roots,
+            force,
+            "scan: already running — coalesced into one pending re-run (B100)"
+        );
         return;
     };
     actix_web::rt::spawn(async move {
@@ -7303,52 +7308,56 @@ pub(crate) fn spawn_scan_tracked(
             })
         };
 
-        // First pass scans the requested roots; a coalesced re-run rescans the
-        // full current media-root set (so a library added while a scan ran is
-        // still picked up). `force`/`cancel` may change on the re-run.
-        let mut pass_roots = roots;
+        // First pass scans the requested roots; a coalesced re-run scans the
+        // roots its requests asked for, each forced only if one of them asked
+        // (B429, V367). Widening it to every root with `force` turned a
+        // queued one-folder item refresh into a forced whole-library re-probe.
+        let mut pass_roots: Vec<crate::scan_tasks::QueuedRoot> =
+            roots.into_iter().map(|r| (r, force)).collect();
         let mut cancel_flag = initial_cancel;
-        let mut force = force;
         loop {
             num_roots.store(pass_roots.len().max(1) as u64, Ordering::Relaxed);
             completed_roots.store(0, Ordering::Relaxed);
-            // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build
-            // probes in-process via the resident libav worker (the distroless
-            // OCI image ships no `ffprobe` binary); the spawn build keeps
-            // `FfmpegProber`. `force` bypasses the incremental `(mtime,size)`
-            // skip. Every probe read draws through the shared I/O gate the
-            // server shrinks during live playback, so the re-scan paces down to
-            // a trickle while streaming instead of saturating shared storage.
-            #[cfg(all(unix, feature = "ffmpeg-lib"))]
-            let scanner =
-                pharos_scanner::FsScanner::new(pharos_scanner::LibavProber::with_discovered_bin())
-                    .with_rate_limit_ms(state.scan_rate_limit_ms)
-                    .with_probe_concurrency_opt(state.scan_probe_concurrency)
-                    .with_io_gate(state.bg_io.clone())
-                    .with_force(force)
-                    .with_progress(sink.clone())
-                    .with_cancel(cancel_flag.clone());
-            #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
-            let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+            let mut added: Vec<pharos_core::MediaId> = Vec::new();
+            let mut removed: Vec<pharos_core::MediaId> = Vec::new();
+            let mut cancelled = false;
+            for (root, force) in &pass_roots {
+                let force = *force;
+                if cancel_flag.load(Ordering::SeqCst) {
+                    cancelled = true;
+                    tracing::info!("scan: cancellation requested; stopping between roots");
+                    break;
+                }
+                // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build
+                // probes in-process via the resident libav worker (the distroless
+                // OCI image ships no `ffprobe` binary); the spawn build keeps
+                // `FfmpegProber`. `force` bypasses the incremental `(mtime,size)`
+                // skip. Every probe read draws through the shared I/O gate the
+                // server shrinks during live playback, so the re-scan paces down to
+                // a trickle while streaming instead of saturating shared storage.
+                #[cfg(all(unix, feature = "ffmpeg-lib"))]
+                let scanner = pharos_scanner::FsScanner::new(
+                    pharos_scanner::LibavProber::with_discovered_bin(),
+                )
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
                 .with_force(force)
                 .with_progress(sink.clone())
                 .with_cancel(cancel_flag.clone());
-            let mut added: Vec<pharos_core::MediaId> = Vec::new();
-            let mut removed: Vec<pharos_core::MediaId> = Vec::new();
-            let mut cancelled = false;
-            for root in &pass_roots {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    cancelled = true;
-                    tracing::info!("scan: cancellation requested; stopping between roots");
-                    break;
-                }
+                #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
+                let scanner = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
+                    .with_rate_limit_ms(state.scan_rate_limit_ms)
+                    .with_probe_concurrency_opt(state.scan_probe_concurrency)
+                    .with_io_gate(state.bg_io.clone())
+                    .with_force(force)
+                    .with_progress(sink.clone())
+                    .with_cancel(cancel_flag.clone());
                 match scanner.scan_into(root, &state.stores).await {
                     Ok(outcome) => {
                         tracing::info!(
                             root = %root.display(),
+                            force,
                             added = outcome.added.len(),
                             updated = outcome.updated.len(),
                             removed = outcome.removed.len(),
@@ -7384,14 +7393,17 @@ pub(crate) fn spawn_scan_tracked(
                 .finish_or_rerun(crate::scan_tasks::TASK_REFRESH_LIBRARY, status)
             {
                 // A request arrived mid-scan: run exactly one coalesced re-run
-                // over the full current root set, keeping the shared task bar
-                // Running the whole time (no Idle gap a concurrent start could
-                // exploit).
-                Some((next_cancel, next_force)) => {
-                    tracing::info!("scan: running one coalesced re-run (B100)");
+                // over the roots those requests named, keeping the shared task
+                // bar Running the whole time (no Idle gap a concurrent start
+                // could exploit).
+                Some((next_cancel, next_roots)) => {
+                    tracing::info!(
+                        roots = ?next_roots,
+                        forced = next_roots.iter().filter(|(_, f)| *f).count(),
+                        "scan: running one coalesced re-run over the queued roots (B100)"
+                    );
                     cancel_flag = next_cancel;
-                    force = next_force;
-                    pass_roots = state.media_roots.clone();
+                    pass_roots = next_roots;
                 }
                 None => {
                     // A terminal RefreshProgress so a per-library card settles at
