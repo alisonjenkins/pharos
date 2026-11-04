@@ -1716,15 +1716,16 @@ fn WatchScreen(id: ItemRef) -> Element {
         let current = playing.read().clone();
         let p = match current {
             Some(Some(Ok(p))) => p,
-            // A first negotiation that failed, perhaps on the socket that
-            // dropped, is tried again once on each newer one.
-            Some(Some(Err(_))) => {
+            // A first negotiation that failed, or is still waiting, on a
+            // socket that has since been replaced starts again on the new
+            // one, once per connection.
+            None | Some(Some(Err(_))) => {
                 if negotiated_gen.get() != gen {
                     playing.restart();
                 }
                 return;
             }
-            _ => return,
+            Some(None) => return,
         };
         if p.0.grant_gen.replace(gen) == gen {
             return;
