@@ -23,6 +23,10 @@ pub struct Config {
     /// `PHAROS_TVDB_API_KEY` rather than committing it to `config.toml`.
     #[serde(default)]
     pub tvdb: TvdbConfig,
+    /// B341 — optional OMDb integration for IMDb and Rotten Tomatoes scores.
+    /// Supply `api_key` via `PHAROS_OMDB_API_KEY`, never `config.toml`.
+    #[serde(default)]
+    pub omdb: OmdbConfig,
     /// Optional MusicBrainz + Cover Art Archive album artwork. Gated on
     /// `contact` rather than a key — see [`MusicBrainzConfig`].
     #[serde(default)]
@@ -225,6 +229,37 @@ pub struct TvdbConfig {
     /// TVDB v4 API key. `None` (the default) disables the feature.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// `[omdb]` — OMDb (omdbapi.com): IMDb and Rotten Tomatoes scores for films
+/// and shows (B341). Supply the key via `PHAROS_OMDB_API_KEY` (a k8s Secret
+/// env var) rather than committing it to `config.toml`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct OmdbConfig {
+    /// OMDb API key. `None` (the default) leaves the ratings sweep off.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Lookups per UTC day. Default 900: under the free tier's 1000, leaving
+    /// room for anything else using the same key.
+    #[serde(default = "default_omdb_daily_limit")]
+    pub daily_limit: u32,
+    /// Days before a title's scores are looked up again. Default 30.
+    #[serde(default = "default_refresh_ttl_days")]
+    pub refresh_ttl_days: u32,
+}
+
+fn default_omdb_daily_limit() -> u32 {
+    900
+}
+
+impl Default for OmdbConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            daily_limit: default_omdb_daily_limit(),
+            refresh_ttl_days: default_refresh_ttl_days(),
+        }
+    }
 }
 
 /// `[musicbrainz]` — MusicBrainz + Cover Art Archive album artwork.
@@ -1363,6 +1398,13 @@ impl Config {
             let v = v.trim();
             if !v.is_empty() {
                 self.tvdb.api_key = Some(v.to_string());
+            }
+        }
+        // Mirrors PHAROS_TMDB_API_KEY above. Overrides `[omdb].api_key`.
+        if let Ok(v) = std::env::var("PHAROS_OMDB_API_KEY") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.omdb.api_key = Some(v.to_string());
             }
         }
         // MusicBrainz needs no key, but it does need a contact address in the
