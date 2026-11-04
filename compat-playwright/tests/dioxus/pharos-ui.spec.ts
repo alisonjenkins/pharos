@@ -1579,7 +1579,21 @@ test.describe("pharos Dioxus UI play queue", () => {
     await expect(shuffle).toHaveAttribute("aria-pressed", "true");
     await expect(entries).toHaveCount(count);
 
-    await panel.getByRole("button", { name: "Clear" }).click();
+    // Clear asks first (spec 020 US3): Cancel and Escape keep the queue.
+    const ask = panel.getByRole("alertdialog", { name: "Clear the queue?" });
+    await panel.getByRole("button", { name: "Clear", exact: true }).click();
+    await expect(ask).toContainText(`This removes ${count} songs.`);
+    await expect(ask.getByRole("button", { name: "Cancel" })).toBeFocused();
+    await ask.getByRole("button", { name: "Cancel" }).click();
+    await expect(ask).toBeHidden();
+    await expect(entries).toHaveCount(count);
+    await panel.getByRole("button", { name: "Clear", exact: true }).click();
+    await page.keyboard.press("Escape");
+    await expect(ask).toBeHidden();
+    await expect(entries).toHaveCount(count);
+    await expect(page.locator(".pharos-listen")).toBeVisible();
+    await panel.getByRole("button", { name: "Clear", exact: true }).click();
+    await ask.getByRole("button", { name: "Clear queue" }).click();
     await expect(entries).toHaveCount(0);
     await expect(panel).toContainText("Nothing queued.");
     await toggle.click();
