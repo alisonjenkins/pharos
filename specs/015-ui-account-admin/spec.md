@@ -73,6 +73,16 @@ read-only (D14).
 If the server has no users, pharos-ui shows a single "create admin, add first
 library" sheet (replaces the wizard, D2).
 
+### US9 — media management (P2, admin)
+
+An admin finds what the library holds twice. First view (Alison, 2026-11-03):
+**Duplicates** under Manage lists every film held as more than one item, each
+with its versions' path, size, resolution, codec and date added, so the admin
+can choose what to keep. Read-only: nothing is deleted from pharos (V285).
+Served by `GET /Admin/Media/Duplicates` (admin-only) in the Manage panes; a
+native method follows when Manage moves onto 017. Episodes, music and
+deletion from this view are later stories.
+
 ## Functional Requirements
 
 - **FR-001** Every admin page gated by `IsAdministrator` on both client and
