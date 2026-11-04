@@ -63,6 +63,17 @@ fn audit_rows() -> Vec<(Method, &'static str, Expect)> {
         (Method::HEAD, "/Items/1/Images/Primary/0", Public),
         (Method::HEAD, "/Items/1/Images/chapter", Public),
         (Method::HEAD, "/Items/1/Images/chapter/0", Public),
+        // A user's avatar likewise (V362); setting or removing it is not.
+        (Method::GET, "/UserImage", Public),
+        (Method::HEAD, "/UserImage", Public),
+        (Method::GET, "/Users/1/Images/Primary", Public),
+        (Method::GET, "/Users/1/Images/Primary/0", Public),
+        (Method::POST, "/UserImage", Auth),
+        (Method::DELETE, "/UserImage", Auth),
+        (Method::POST, "/Users/1/Images/Primary", Auth),
+        (Method::DELETE, "/Users/1/Images/Primary", Auth),
+        (Method::POST, "/Users/1/Images/Primary/0", Auth),
+        (Method::DELETE, "/Users/1/Images/Primary/0", Auth),
         // Live-TV channel logos likewise.
         (Method::GET, "/LiveTv/Channels/x/Images/Primary", Public),
         // Bitrate test ships the user the actual bytes; semi-public OK.

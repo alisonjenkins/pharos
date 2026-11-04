@@ -13,6 +13,7 @@ mod jellyfin_admin;
 mod jellyfin_quick_connect;
 mod jellyfin_session_logout;
 mod jellyfin_sessions;
+mod jellyfin_user_image;
 mod jellyfin_user_password;
 mod last_admin_guard_audit;
 mod login_throttle;
