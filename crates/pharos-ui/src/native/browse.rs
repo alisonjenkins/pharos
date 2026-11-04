@@ -17,14 +17,17 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::app::{call, remount_on, Ctx};
+use super::group_app::Together;
 use super::letters::{self, Wheel, LETTERS};
 use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
 use super::machine::Event;
+use super::mixes::{self, MixCtx, ICON_MIX};
 use super::paging::{Pager, Trigger};
 use super::platform;
 use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
 use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
+use pharos_client::mix::radio;
 
 /// Most children one browse page lists.
 pub const BROWSE_PAGE: u32 = 100;
@@ -1265,6 +1268,15 @@ pub fn QueueButtons(
     );
     let queue = try_use_context::<QueueCtx>();
     let ctx = try_use_context::<Ctx>();
+    // A song row can also start a mix like it, playing at once (spec 024).
+    // No mix in a SyncPlay group, where the group picks the songs.
+    let in_group = try_use_context::<Together>().as_ref().is_some_and(|t| t.view.read().active);
+    let mix = try_use_context::<MixCtx>().filter(|_| !in_group);
+    let mix_song = (kind == QueueTarget::Song)
+        .then(|| tracks.first().map(|t| t.id))
+        .flatten()
+        .filter(|_| mix.is_some());
+    let mix_label = format!("Start a mix like {name}");
     let Some(QueueCtx(mut queue)) = queue else {
         return rsx! {};
     };
@@ -1349,6 +1361,20 @@ pub fn QueueButtons(
                 },
                 Icon { path: ICON_QUEUE_ADD }
                 if labelled { span { "Add to queue" } }
+            }
+            if let (Some(song), Some(MixCtx(mut mix))) = (mix_song, mix) {
+                button {
+                    class: "pharos-queue-button pharos-mix-from",
+                    r#type: "button",
+                    title: "{mix_label}",
+                    aria_label: "{mix_label}",
+                    onclick: move |evt: MouseEvent| {
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                        mixes::start(&mut queue.write(), &mut mix.write(), "More like this".to_owned(), radio(song), true);
+                    },
+                    Icon { path: ICON_MIX }
+                }
             }
             span { class: "pharos-queue-note", role: "status",
                 if let Some(text) = note() { "{text}" }
