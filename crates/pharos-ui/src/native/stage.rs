@@ -475,6 +475,28 @@ pub const ICON_FULL: &str =
     "M5 5h5v2H7v3H5V5Zm9 0h5v5h-2V7h-3V5ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z";
 /// A bar along the bottom of a window.
 const ICON_MINI: &str = "M3 5h18v14H3V5Zm2 2v7h14V7H5Zm0 9v1h14v-1H5Z";
+/// Close for a compact window whose player has not loaded, or failed to:
+/// the stage bar that carries Close comes only with a loaded player.
+#[component]
+pub fn StageClose(item: ItemRef) -> Element {
+    let StageCtx(mut stage) = use_context::<StageCtx>();
+    rsx! {
+        button {
+            class: "pharos-stage-button pharos-stage-close",
+            r#type: "button",
+            aria_label: "Close",
+            title: "Stop and close",
+            onclick: move |_| {
+                stage.write().close();
+                platform::info(&format!(
+                    "pharos: stage view=closed item={item} reason=close"
+                ));
+            },
+            Icon { path: ICON_CLOSE }
+        }
+    }
+}
+
 const ICON_CLOSE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4Z";
 
 #[cfg(test)]
