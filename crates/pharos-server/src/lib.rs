@@ -1,4 +1,6 @@
 pub mod api;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod audio_analysis;
 pub mod auth;
 pub mod bg_io;
 pub mod book_convert;
@@ -14,8 +16,6 @@ pub mod config;
 pub mod dlna;
 pub mod group_ops;
 pub mod health;
-#[cfg(all(unix, feature = "ffmpeg-lib"))]
-pub mod audio_analysis;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
