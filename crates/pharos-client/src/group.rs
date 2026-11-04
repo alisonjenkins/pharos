@@ -51,6 +51,8 @@ pub struct GroupSummary {
     pub members: Vec<GroupMember>,
     /// What a late joiner starts on.
     pub tracks: GroupTracks,
+    /// The receiving member's own id, in the `joined` update; empty in a listing.
+    pub you: String,
 }
 
 /// The server's half of one clock round trip: it received the client's
@@ -416,6 +418,7 @@ fn read_summary(g: group_summary::Reader<'_>) -> Result<GroupSummary, capnp::Err
             .map(read_member)
             .collect::<Result<_, _>>()?,
         tracks: read_tracks(g.get_tracks()?)?,
+        you: text(g.get_you())?,
     })
 }
 

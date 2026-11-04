@@ -364,8 +364,9 @@ struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; ownTracks @
 struct TrackChoice { set @0 :Bool; index @1 :UInt32; off @2 :Bool; }
 # The group's audio and subtitle choice; `by` is the member id that made it.
 struct GroupTracks { audio @0 :TrackChoice; subtitle @1 :TrackChoice; by @2 :Text; }
-# `tracks` is what a late joiner starts on.
-struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); tracks @4 :GroupTracks; }
+# `tracks` is what a late joiner starts on. `you` is the receiving member's own
+# id, set only in the `joined` update ("" elsewhere).
+struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); tracks @4 :GroupTracks; you @5 :Text; }
 struct GroupsResult { union { groups @0 :List(GroupSummary); error @1 :Error; } }
 # Not a union, like ResumeResult, so a call on `membership` pipelines. A refused
 # create or join still returns a membership whose every call fails with the
