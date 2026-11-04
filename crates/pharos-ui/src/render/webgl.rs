@@ -21,6 +21,22 @@ use super::{Fallback, Frame, Surface, DATA_ROWS, DATA_WIDTH};
 /// (Quest, Steam Frame) spends GPU time on detail a soft shader never shows.
 const MAX_PIXEL_RATIO: f64 = 1.25;
 
+/// How long a lost context may take to come back before the page settles
+/// for its CSS look. A GPU reset or switch restores in well under this.
+const RESTORE_WAIT_MS: f64 = 5000.0;
+
+type Listener = Closure<dyn FnMut(web_sys::Event)>;
+
+/// Where the context is, as its events report it, with when it was lost
+/// (`Date.now()` ms).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Context {
+    Live,
+    Lost(f64),
+    /// Back, but every handle made before the loss is dead.
+    Restored(f64),
+}
+
 /// `a_corner` for the one triangle that covers the screen, in 0 to 2.
 const CORNERS: [u8; 6] = [0, 0, 2, 0, 0, 2];
 
@@ -45,10 +61,11 @@ struct Resources {
 pub struct WebglSurface {
     gl: Gl,
     canvas: web_sys::HtmlCanvasElement,
+    program: Program,
     resources: Resources,
     silence: Vec<u8>,
-    lost: Rc<Cell<bool>>,
-    on_lost: Closure<dyn FnMut(web_sys::Event)>,
+    context: Rc<Cell<Context>>,
+    listeners: Vec<(&'static str, Listener)>,
     /// Kept to release the context on drop: browsers cap live contexts
     /// (~16) and free a dropped one only when it is garbage collected.
     lose: Option<web_sys::WebglLoseContext>,
@@ -83,22 +100,44 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
         .flatten()
         .map(|e| e.unchecked_into::<web_sys::WebglLoseContext>());
 
-    let lost = Rc::new(Cell::new(false));
-    let on_lost = {
-        let lost = Rc::clone(&lost);
-        Closure::<dyn FnMut(web_sys::Event)>::new(move |_| lost.set(true))
-    };
-    let _ = canvas
-        .add_event_listener_with_callback("webglcontextlost", on_lost.as_ref().unchecked_ref());
-
     let resources = build(&gl, program)?;
+
+    let context = Rc::new(Cell::new(Context::Live));
+    let on_lost = {
+        let context = Rc::clone(&context);
+        Listener::new(move |e: web_sys::Event| {
+            // Without this the browser never fires `webglcontextrestored`.
+            e.prevent_default();
+            web_sys::console::warn_1(
+                &format!("pharos: webgl context lost program={program:?}, waiting for restore")
+                    .into(),
+            );
+            context.set(Context::Lost(js_sys::Date::now()));
+        })
+    };
+    let on_restored = {
+        let context = Rc::clone(&context);
+        Listener::new(move |_: web_sys::Event| {
+            if let Context::Lost(at) = context.get() {
+                context.set(Context::Restored(at));
+            }
+        })
+    };
+    let listeners = vec![
+        ("webglcontextlost", on_lost),
+        ("webglcontextrestored", on_restored),
+    ];
+    for (name, listener) in &listeners {
+        let _ = canvas.add_event_listener_with_callback(name, listener.as_ref().unchecked_ref());
+    }
     Ok(Box::new(WebglSurface {
         gl,
         canvas,
+        program,
         resources,
         silence: silence(),
-        lost,
-        on_lost,
+        context,
+        listeners,
         lose,
     }))
 }
@@ -221,10 +260,41 @@ impl WebglSurface {
     }
 }
 
+impl WebglSurface {
+    /// Whether the context can be drawn on now: waits out a loss, rebuilds
+    /// after a restore, and gives up [`RESTORE_WAIT_MS`] after the loss.
+    fn ready(&mut self) -> Result<bool, Fallback> {
+        match self.context.get() {
+            Context::Live => Ok(true),
+            Context::Lost(at) if js_sys::Date::now() - at > RESTORE_WAIT_MS => {
+                Err(Fallback::ContextLost)
+            }
+            Context::Lost(_) => Ok(false),
+            Context::Restored(at) => {
+                self.resources = build(&self.gl, self.program)?;
+                web_sys::console::info_1(
+                    &format!(
+                        "pharos: webgl context restored program={:?} waited_ms={:.0}",
+                        self.program,
+                        js_sys::Date::now() - at
+                    )
+                    .into(),
+                );
+                self.context.set(Context::Live);
+                Ok(true)
+            }
+        }
+    }
+}
+
 impl Surface for WebglSurface {
+    fn needs_frame(&self) -> bool {
+        self.context.get() != Context::Live
+    }
+
     fn draw(&mut self, frame: &Frame<'_>) -> Result<(), Fallback> {
-        if self.lost.get() {
-            return Err(Fallback::ContextLost);
+        if !self.ready()? {
+            return Ok(());
         }
         let (width, height) = self.fit();
         let data = frame
@@ -266,10 +336,11 @@ impl Surface for WebglSurface {
 
 impl Drop for WebglSurface {
     fn drop(&mut self) {
-        let _ = self.canvas.remove_event_listener_with_callback(
-            "webglcontextlost",
-            self.on_lost.as_ref().unchecked_ref(),
-        );
+        for (name, listener) in &self.listeners {
+            let _ = self
+                .canvas
+                .remove_event_listener_with_callback(name, listener.as_ref().unchecked_ref());
+        }
         let r = &self.resources;
         self.gl.delete_texture(Some(&r.texture));
         self.gl.delete_vertex_array(Some(&r.vao));

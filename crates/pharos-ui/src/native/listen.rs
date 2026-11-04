@@ -472,7 +472,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
     let mut drawn = false;
     loop {
         platform::animation_frame().await;
-        if drawn && !platform::media_playing(VIDEO_ID) {
+        if drawn && !platform::media_playing(VIDEO_ID) && !surface.needs_frame() {
             continue;
         }
         let now = platform::now_ms();
