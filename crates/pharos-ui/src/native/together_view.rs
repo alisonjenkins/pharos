@@ -245,6 +245,7 @@ mod tests {
             item: None,
             members: vec![member("a", "Ada", false), member("b", "Bo", true)],
             tracks: crate::native::track_follow::GroupTracksView::default(),
+            you: String::new(),
         }
     }
 

@@ -132,6 +132,8 @@ pub struct GroupState {
     pub tracks: GroupTracksView,
     /// This member is on their own tracks ("Just me"), not the group's.
     pub own_tracks: bool,
+    /// This member's own id in `members`; empty until a `Joined` names it.
+    me: String,
     /// Who did what, as the updates came.
     pub log: ActivityLog,
     /// The queue entry the group is on, which readiness reports carry.
@@ -168,6 +170,19 @@ impl GroupState {
         };
         anchor.stamp = Stamp::Server(server_ms);
         true
+    }
+
+    /// Learn which roster entry is this member (`you`, empty when the server
+    /// did not say) and take its own-tracks flag from the roster, which is
+    /// what a rejoining member's server remembers.
+    fn know_self(&mut self, you: &str) {
+        if you.is_empty() {
+            return;
+        }
+        self.me = you.to_owned();
+        if let Some(m) = self.members.iter().find(|m| m.id == you) {
+            self.own_tracks = m.own_tracks;
+        }
     }
 
     pub fn set_watching(&mut self, item: Option<ItemRef>) {
@@ -345,9 +360,13 @@ impl GroupState {
                 self.id = Some(g.id);
                 self.members = g.members;
                 self.tracks = g.tracks;
+                self.know_self(&g.you);
                 Vec::new()
             }
             GroupUpdate::Member(m) => {
+                if !self.me.is_empty() && m.id == self.me {
+                    self.own_tracks = m.own_tracks;
+                }
                 match self.members.iter_mut().find(|x| x.id == m.id) {
                     Some(x) => *x = m,
                     None => self.members.push(m),
@@ -638,6 +657,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if inner.state.members.is_empty() {
                 inner.state.members = summary.members.clone();
                 inner.state.tracks = summary.tracks;
+                inner.state.know_self(&summary.you);
             }
             inner.epoch
         };
@@ -1423,6 +1443,7 @@ mod tests {
             item: None,
             members: vec![member("me", false)],
             tracks: GroupTracksView::default(),
+            you: String::new(),
         }
     }
 
@@ -2220,6 +2241,42 @@ mod tests {
         assert!(!rig.session.pick_audio(1));
         let idle = Session::new(FakeGroups::default(), TestEnv::default());
         assert!(!idle.pick_subtitle(Some(3)));
+    }
+
+    #[test]
+    fn own_tracks_come_from_the_roster_on_joining_and_from_the_members_own_update() {
+        let mut state = GroupState::default();
+        let mine = Member {
+            own_tracks: true,
+            ..member("me", false)
+        };
+        let joined = GroupSummary {
+            members: vec![member("other", false), mine.clone()],
+            you: "me".into(),
+            ..summary()
+        };
+        let _ = state.apply(GroupUpdate::Joined(joined), 0);
+        assert!(state.own_tracks, "a rejoining member's server-side mark");
+
+        let other_on = Member {
+            own_tracks: true,
+            ..member("other", false)
+        };
+        let _ = state.apply(GroupUpdate::Member(other_on), 0);
+        let back = Member {
+            own_tracks: false,
+            ..mine
+        };
+        let _ = state.apply(GroupUpdate::Member(back), 0);
+        assert!(!state.own_tracks, "the member's own update");
+        let _ = state.apply(
+            GroupUpdate::Member(Member {
+                own_tracks: true,
+                ..member("other", false)
+            }),
+            0,
+        );
+        assert!(!state.own_tracks, "another member's update is not ours");
     }
 
     #[test]
