@@ -108,7 +108,11 @@ impl Song {
             // An untagged song's `item.title` is its filename stem, which is
             // the guess this rule refuses, so the stem is not a title.
             title: tag(&probe.title).or_else(|| {
-                let stem = item.path.file_stem().and_then(|s| s.to_str());
+                let stem = item
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::trim);
                 tag(&Some(item.title.clone())).filter(|t| Some(t.as_str()) != stem)
             })?,
             artist: tag(&probe.artist).or_else(|| tag(&probe.album_artist))?,
@@ -590,6 +594,9 @@ mod tests {
         assert_eq!(Song::of(&item), None);
         // An untagged song's stored title is its filename stem: not a title.
         item.title = "song".into();
+        assert_eq!(Song::of(&item), None);
+        // `tag` trims the title, so the stem is trimmed too: `song .mp3`.
+        item.path = dir.path().join("song .mp3");
         assert_eq!(Song::of(&item), None);
     }
 

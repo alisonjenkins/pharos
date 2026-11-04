@@ -2259,8 +2259,10 @@ fn Player(
                 if kind != ItemKind::Audio {
                     return Ok(None);
                 }
+                // No connection is no lookup, so not "no lyrics" either (V423).
                 let Some(api) = api else {
-                    return Ok(None);
+                    platform::warn("pharos: lyrics unavailable: no native api");
+                    return Err(());
                 };
                 // A failed lookup is not "no lyrics": the chip says which.
                 match api.lyrics(&call("watch", "lyrics"), id).await {

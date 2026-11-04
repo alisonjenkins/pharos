@@ -377,6 +377,11 @@ impl Inner {
             let Some(p) = e.dyn_ref::<PointerEvent>() else {
                 return;
             };
+            // A mouse drag selects text; only touch and pen swipe.
+            if p.pointer_type() == "mouse" {
+                dx.set(f64::NAN);
+                return;
+            }
             let moved = f64::from(p.client_x()) - dx.get();
             dx.set(f64::NAN);
             if moved.abs() >= SWIPE_PX {
@@ -448,12 +453,11 @@ impl Inner {
 
     fn observe(&self) -> Result<(), ViewError> {
         let actions = self.actions.clone();
-        let first = Cell::new(true);
+        // Every report counts, the first included: a host shown before that
+        // first report arrives gets its size only there. `relayout` ignores
+        // a zero-size host and a section still opening.
         let closure = Closure::<dyn FnMut()>::new(move || {
-            // The observer reports once on observe(); that is not a resize.
-            if !first.replace(false) {
-                Inner::emit(&actions, Action::Relayout);
-            }
+            Inner::emit(&actions, Action::Relayout);
         });
         let observer = ResizeObserver::new(closure.as_ref().unchecked_ref())?;
         observer.observe(&self.host);
