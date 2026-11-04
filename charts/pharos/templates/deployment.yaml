@@ -121,6 +121,15 @@ spec:
                   name: {{ .Values.tmdb.apiKey.secretName }}
                   key: {{ .Values.tmdb.apiKey.secretKey | default "api-key" }}
             {{- end }}
+            {{- if .Values.omdb.apiKey.secretName }}
+            # B341 — OMDb key from a Secret (never config.toml/git). Enables the
+            # IMDb / Rotten Tomatoes ratings sweep; absent → it stays off.
+            - name: PHAROS_OMDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.omdb.apiKey.secretName }}
+                  key: {{ .Values.omdb.apiKey.secretKey | default "api-key" }}
+            {{- end }}
             {{- with .Values.musicbrainz.contact }}
             # MusicBrainz + Cover Art Archive album artwork. No API key exists;
             # the gate is a contact address, which their policy requires in the
