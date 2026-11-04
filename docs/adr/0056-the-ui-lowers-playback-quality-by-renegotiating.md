@@ -79,8 +79,10 @@ The client renegotiates with a lower cap; nothing changes server-side.
 - Throughput is measured from fragments as hls.js fetches them; a server that
   is slow to start a transcode is not read as a slow link (first byte to last
   only), but a browser-cached fragment can overstate the link.
-- The cap is not applied to Safari native HLS or direct play; a ladder would
-  be needed there.
+- The cap is sent in every video negotiation, but only judged (changed) on the
+  hls.js engine. Safari native HLS and direct play keep whatever cap was
+  stored, so a slow-link viewer there is not stepped down; a ladder would be
+  needed there.
 
 ## Alternatives considered
 
