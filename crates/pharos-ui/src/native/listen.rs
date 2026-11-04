@@ -396,6 +396,13 @@ pub fn ListenView(
     }
 }
 
+/// The confirm's Cancel, focused when it opens so Enter cannot clear by
+/// accident.
+const CLEAR_CANCEL_ID: &str = "pharos-queue-clear-cancel";
+/// The drawer's Clear, which gets focus back when the confirm is cancelled.
+const CLEAR_ID: &str = "pharos-queue-clear";
+const CLEAR_NOTE_ID: &str = "pharos-queue-clear-note";
+
 /// What plays next, over the visualiser's edge (B435/V375): pick a song to
 /// skip to it, drag a row (or use its arrows) to move it, shuffle, remove
 /// or clear.
@@ -414,6 +421,32 @@ fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAct
         dragging.set(None);
         over.set(None);
     };
+    // Clear asks first (spec 020 US3); an emptied queue has nothing to ask.
+    let mut confirming = use_signal(|| false);
+    // A queue that drains while the confirm is open has nothing left to
+    // ask about, and must not ask again once a song is added.
+    use_effect(use_reactive!(|(total,)| {
+        if total == 0 && *confirming.peek() {
+            confirming.set(false);
+        }
+    }));
+    let asking = confirming() && total > 0;
+    // Focus follows the confirm: to Cancel when it opens, back to Clear when
+    // it is cancelled.
+    let mut returning = use_signal(|| false);
+    use_effect(move || {
+        if confirming() {
+            platform::focus_by_id(CLEAR_CANCEL_ID);
+        } else if returning() {
+            returning.set(false);
+            platform::focus_by_id(CLEAR_ID);
+        }
+    });
+    let mut cancel = move || {
+        returning.set(true);
+        confirming.set(false);
+        platform::info(&format!("pharos: queue clear cancelled upcoming={total}"));
+    };
     rsx! {
         aside {
             id: QUEUE_PANEL_ID,
@@ -429,6 +462,11 @@ fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAct
                 if own {
                     evt.stop_propagation();
                 }
+                if key == Key::Escape && *confirming.peek() {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    cancel();
+                }
             },
             div { class: "pharos-queue-head",
                 h2 { class: "pharos-queue-title", "Up next" }
@@ -441,12 +479,41 @@ fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAct
                     Icon { path: ICON_SHUFFLE }
                     "Shuffle"
                 }
-                if total > 0 {
+                if total > 0 && !confirming() {
                     button {
+                        id: CLEAR_ID,
                         class: "pharos-chip",
                         r#type: "button",
-                        onclick: move |_| on_queue.call(QueueAction::Clear),
+                        aria_haspopup: "dialog",
+                        onclick: move |_| confirming.set(true),
                         "Clear"
+                    }
+                }
+            }
+            if asking {
+                div {
+                    class: "pharos-queue-confirm",
+                    role: "alertdialog",
+                    aria_label: "Clear the queue?",
+                    aria_describedby: CLEAR_NOTE_ID,
+                    p { id: CLEAR_NOTE_ID, "Clear the queue? This removes {count}." }
+                    div { class: "pharos-queue-confirm-actions",
+                        button {
+                            id: CLEAR_CANCEL_ID,
+                            class: "pharos-chip",
+                            r#type: "button",
+                            onclick: move |_| cancel(),
+                            "Cancel"
+                        }
+                        button {
+                            class: "pharos-chip pharos-queue-confirm-clear",
+                            r#type: "button",
+                            onclick: move |_| {
+                                confirming.set(false);
+                                on_queue.call(QueueAction::Clear);
+                            },
+                            "Clear queue"
+                        }
                     }
                 }
             }
