@@ -61,6 +61,7 @@ async fn drain_until_play(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(u64, u6
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Some(ServerMsg::Play {
+                by: _,
                 at_server_ms,
                 position_ms,
             })) => return Some((at_server_ms, position_ms)),
@@ -169,6 +170,7 @@ async fn drain_until_seek(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(u64, u6
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Some(ServerMsg::Seek {
+                by: _,
                 at_server_ms,
                 position_ms,
             })) => return Some((at_server_ms, position_ms)),

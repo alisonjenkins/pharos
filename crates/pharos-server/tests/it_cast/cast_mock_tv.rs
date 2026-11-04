@@ -59,14 +59,17 @@ impl GroupClock {
         for msg in drain(rx) {
             let (at_server_ms, position_ms, playing) = match msg {
                 ServerMsg::Play {
+                    by: _,
                     at_server_ms,
                     position_ms,
                 } => (at_server_ms, position_ms, true),
                 ServerMsg::Pause {
+                    by: _,
                     at_server_ms,
                     position_ms,
                 } => (at_server_ms, position_ms, false),
                 ServerMsg::Seek {
+                    by: _,
                     at_server_ms,
                     position_ms,
                 } => (at_server_ms, position_ms, self.playing),

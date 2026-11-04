@@ -1689,6 +1689,7 @@ impl GroupState {
                 self.send_one(
                     member_id,
                     ServerMsg::Play {
+                        by: None,
                         at_server_ms,
                         position_ms: sent_position_ms,
                     },
@@ -1717,6 +1718,7 @@ impl GroupState {
                 self.send_one(
                     member_id,
                     ServerMsg::Pause {
+                        by: None,
                         at_server_ms,
                         position_ms,
                     },
@@ -1782,6 +1784,7 @@ impl GroupState {
         self.send_one(
             member_id,
             ServerMsg::Seek {
+                by: None,
                 at_server_ms,
                 position_ms: sent_position_ms,
             },
@@ -2038,7 +2041,7 @@ impl GroupState {
                 metrics::histogram!("pharos_syncplay_resume_catch_up_seconds")
                     .record(catch_up_ms as f64 / 1000.0);
             }
-            self.start_playing_after(position_ms, "Ready", catch_up_ms);
+            self.start_playing_after(position_ms, "Ready", catch_up_ms, None);
         } else {
             self.playback = PlaybackState::Paused { position_ms };
             self.broadcast(ServerMsg::StateUpdate {
@@ -2079,15 +2082,21 @@ impl GroupState {
     /// Start group playback NOW: anchor `Playing` and broadcast the scheduled
     /// `Play` + `StateUpdate`. `reason` must be one of jellyfin-web's OSD
     /// strings ('Unpause' / 'Ready' — matched case-sensitively).
-    fn start_playing(&mut self, position_ms: u64, reason: &str) {
-        self.start_playing_after(position_ms, reason, 0);
+    fn start_playing(&mut self, position_ms: u64, reason: &str, by: Option<MemberId>) {
+        self.start_playing_after(position_ms, reason, 0, by);
     }
 
     /// `start_playing` with the schedule pushed out by `extra_lead_ms` beyond
     /// the ordinary transport lead — the room waits that much longer before
     /// unpausing, which is how a member already playing from behind catches
     /// it up (B210). A member already at the position simply unpauses later.
-    fn start_playing_after(&mut self, position_ms: u64, reason: &str, extra_lead_ms: u64) {
+    fn start_playing_after(
+        &mut self,
+        position_ms: u64,
+        reason: &str,
+        extra_lead_ms: u64,
+        by: Option<MemberId>,
+    ) {
         let server_ms = self.server_ms_now();
         let at_server_ms = server_ms + self.lead_time_ms().max(extra_lead_ms);
         // C — anchor at the SCHEDULED start instant (`at_server_ms`), NOT `now`.
@@ -2107,6 +2116,7 @@ impl GroupState {
         self.broadcast(ServerMsg::Play {
             at_server_ms,
             position_ms,
+            by,
         });
         self.broadcast(ServerMsg::StateUpdate {
             state: GroupPlayState::Playing,
@@ -2227,7 +2237,7 @@ impl GroupState {
         );
         record_gate_outcome(w.reason, w.opened_at, outcome);
         if w.resume_playing {
-            self.start_playing(w.position_ms, "Ready");
+            self.start_playing(w.position_ms, "Ready", None);
         } else {
             // The members already applied the Seek broadcast at gate entry and
             // sit paused at the position — re-sending it would re-trigger their
@@ -2321,7 +2331,7 @@ impl GroupState {
     /// a readiness gate on the followers with `not_before = at_server_ms` so a
     /// pre-schedule ack can't resolve it early (B38). Shared by the HTTP
     /// `SeekTo` and the leader/native `LeaderSeek` so both behave identically.
-    fn seek_to(&mut self, position_ms: u64) {
+    fn seek_to(&mut self, position_ms: u64, by: Option<MemberId>) {
         let was_frozen_playing =
             self.group_paused_due_to_buffering && self.buffering_resume_playing;
         self.clear_buffering_freeze(FreezeOutcome::Superseded);
@@ -2334,6 +2344,7 @@ impl GroupState {
         self.broadcast(ServerMsg::Seek {
             at_server_ms,
             position_ms,
+            by,
         });
         let pending = self.follower_ids();
         self.enter_waiting(pending, resume, position_ms, GateReason::Seek, at_server_ms);
@@ -3590,6 +3601,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.broadcast(ServerMsg::Play {
                 at_server_ms,
                 position_ms,
+                by: Some(sender),
             });
         }
         GroupMsg::LeaderPause { sender } => {
@@ -3618,6 +3630,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
                 position_ms,
+                by: Some(sender),
             });
         }
         GroupMsg::LeaderSeek {
@@ -3640,7 +3653,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             // latency), ignored an in-flight V19 freeze (settled Paused + left
             // the anti-wedge armed for a ~30s phantom resume), and re-anchored
             // Playing at `now`. `seek_to` fixes all three.
-            state.seek_to(position_ms);
+            state.seek_to(position_ms, Some(sender));
         }
         GroupMsg::ObserveClock {
             member_id,
@@ -3736,6 +3749,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 state.broadcast_except(
                     member_id,
                     ServerMsg::Pause {
+                        by: None,
                         at_server_ms,
                         position_ms,
                     },
@@ -3946,7 +3960,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 .map(|(id, _)| *id)
                 .collect();
             if buffering.is_empty() {
-                state.start_playing(position_ms, "Unpause");
+                state.start_playing(position_ms, "Unpause", Some(sender));
             } else {
                 // not_before = 0 is correct here: unlike a Seek, the Unpause gate
                 // broadcasts NO scheduled command that clients execute at a future
@@ -3963,7 +3977,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 );
             }
         }
-        GroupMsg::PauseShared { sender: _ } => {
+        GroupMsg::PauseShared { sender } => {
             // Immediate group pause (no readiness gate). Freeze the position so
             // a late joiner gets the correct still-frame, then broadcast.
             let at_server_ms = state.server_ms_now() + state.lead_time_ms();
@@ -3977,6 +3991,7 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.broadcast(ServerMsg::Pause {
                 at_server_ms,
                 position_ms,
+                by: Some(sender),
             });
             state.broadcast(ServerMsg::StateUpdate {
                 state: GroupPlayState::Paused,
@@ -3984,11 +3999,11 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             });
         }
         GroupMsg::SeekTo {
-            sender: _,
+            sender,
             position_ms,
         } => {
             // Shared with LeaderSeek — see `GroupState::seek_to`.
-            state.seek_to(position_ms);
+            state.seek_to(position_ms, Some(sender));
         }
         GroupMsg::MemberReady {
             member_id,
@@ -5688,6 +5703,7 @@ mod tests {
         let m2 = other_rx.recv().await.unwrap();
         let check = |m: ServerMsg| match m {
             ServerMsg::Play {
+                by: _,
                 at_server_ms,
                 position_ms,
             } => {
@@ -5698,6 +5714,118 @@ mod tests {
         };
         check(m1);
         check(m2);
+    }
+
+    /// V395: a group play, pause or seek carries the member whose command
+    /// caused it, whichever command path it came by.
+    #[tokio::test]
+    async fn a_group_play_pause_and_seek_name_the_sender() {
+        let (h, sinks, mut leader_rx, leader) = fresh().await;
+        let (other, mut other_rx) = add_member(&h, &sinks, "second").await;
+        let _ = leader_rx.recv().await.unwrap();
+        let by_of = |m: ServerMsg| match m {
+            ServerMsg::Play { by, .. }
+            | ServerMsg::Pause { by, .. }
+            | ServerMsg::Seek { by, .. } => by,
+            other => panic!("expected a transport message, got {other:?}"),
+        };
+        let next = async |rx: &mut mpsc::Receiver<ServerMsg>| {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let m = rx.recv().await.unwrap();
+                    if matches!(
+                        m,
+                        ServerMsg::Play { .. } | ServerMsg::Pause { .. } | ServerMsg::Seek { .. }
+                    ) {
+                        return m;
+                    }
+                }
+            })
+            .await
+            .expect("a transport message within 2 s")
+        };
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: leader,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            by_of(next(&mut other_rx).await),
+            Some(leader),
+            "leader play"
+        );
+        h.tx.send(GroupMsg::LeaderPause { sender: leader })
+            .await
+            .unwrap();
+        assert_eq!(
+            by_of(next(&mut other_rx).await),
+            Some(leader),
+            "leader pause"
+        );
+        h.tx.send(GroupMsg::Unpause { sender: other })
+            .await
+            .unwrap();
+        assert_eq!(by_of(next(&mut other_rx).await), Some(other), "unpause");
+        h.tx.send(GroupMsg::LeaderSeek {
+            sender: leader,
+            position_ms: 4_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            by_of(next(&mut other_rx).await),
+            Some(leader),
+            "leader seek"
+        );
+        h.tx.send(GroupMsg::PauseShared { sender: other })
+            .await
+            .unwrap();
+        assert_eq!(
+            by_of(next(&mut other_rx).await),
+            Some(other),
+            "shared pause"
+        );
+        h.tx.send(GroupMsg::SeekTo {
+            sender: other,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(by_of(next(&mut other_rx).await), Some(other), "shared seek");
+    }
+
+    /// V395: a start the group makes on its own (the readiness gate gives up
+    /// waiting) names no one.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_resolved_start_names_no_one() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (_m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+        while rx2.try_recv().is_ok() {}
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 9_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        tokio::time::advance(Duration::from_millis(SEEK_GATE_TIMEOUT_MS + 500)).await;
+        let _ = snapshot_of(&h).await;
+        let mut started = None;
+        while let Ok(m) = rx2.try_recv() {
+            if let ServerMsg::Play { by, .. } = m {
+                started = Some(by);
+            }
+        }
+        assert_eq!(started, Some(None), "the gate's start is the group's own");
     }
 
     #[tokio::test]
@@ -7631,6 +7759,7 @@ mod tests {
         .await
         {
             Some(ServerMsg::Pause {
+                by: _,
                 at_server_ms,
                 position_ms,
             }) => (at_server_ms, position_ms),
@@ -7652,6 +7781,7 @@ mod tests {
         .await
         {
             Some(ServerMsg::Play {
+                by: _,
                 at_server_ms,
                 position_ms,
             }) => (at_server_ms, position_ms),
@@ -8927,6 +9057,7 @@ mod tests {
             .await
             {
                 Some(ServerMsg::Pause {
+                    by: _,
                     at_server_ms,
                     position_ms,
                 }) => (at_server_ms, position_ms),

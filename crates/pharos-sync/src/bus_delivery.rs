@@ -176,6 +176,7 @@ mod tests {
         delivery_a.deliver(
             member,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 42,
                 position_ms: 0,
             },
@@ -188,6 +189,7 @@ mod tests {
         assert!(matches!(
             got,
             ServerMsg::Pause {
+                by: _,
                 at_server_ms: 42,
                 position_ms: 0
             }
@@ -253,6 +255,7 @@ mod tests {
         delivery.deliver(
             MemberId::new(),
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },
@@ -297,6 +300,7 @@ mod tests {
         delivery.deliver(
             MemberId::new(),
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },
@@ -338,6 +342,7 @@ mod tests {
             delivery.deliver(
                 member,
                 ServerMsg::Seek {
+                    by: None,
                     at_server_ms: i,
                     position_ms: i,
                 },
