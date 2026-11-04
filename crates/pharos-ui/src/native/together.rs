@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use pharos_client::api::{ItemKind, ItemRef};
+use pharos_client::api::{ItemKind, ItemRef, NativeApi};
 
 /// How many clock samples the estimator keeps; older ones fall off.
 pub const CLOCK_WINDOW: usize = 9;
@@ -238,15 +238,6 @@ impl ClockReply {
     }
 }
 
-/// Why a group ended for this member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndReason {
-    Left,
-    Dissolved,
-    NotInGroup,
-    Removed,
-}
-
 /// What the server pushes to a member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupUpdate {
@@ -274,8 +265,8 @@ pub enum GroupUpdate {
         position_ms: u64,
         playing: bool,
     },
-    Ended(EndReason),
-    Error(String),
+    /// The group is over for this member, for whatever reason.
+    Ended,
 }
 
 /// Where a membership's pushed updates go.
@@ -319,10 +310,14 @@ pub trait GroupClient {
 }
 
 /// The seam's one place of construction: the screens ask for the client
-/// here. Until the real adapter lands this is the in-memory [`FakeGroups`].
-pub fn group_api() -> FakeGroups {
-    FakeGroups::default()
+/// here. In the browser it is the network adapter over the session's `Group`;
+/// on the host, the in-memory [`FakeGroups`].
+pub fn group_api(api: &NativeApi) -> Groups {
+    super::platform::groups(api)
 }
+
+/// The [`GroupClient`] this build talks to.
+pub use super::platform::Groups;
 
 /// An in-memory [`GroupClient`] for tests and the pre-network screens. It
 /// keeps its groups and a log of the calls it received.
@@ -727,7 +722,7 @@ mod tests {
             Rc::new(move |u| seen.borrow_mut().push(u))
         };
         assert!(matches!(now(api.join("g1", sink)), Some(Ok(_))));
-        api.push(&GroupUpdate::Ended(EndReason::Dissolved));
-        assert_eq!(*seen.borrow(), [GroupUpdate::Ended(EndReason::Dissolved)]);
+        api.push(&GroupUpdate::Ended);
+        assert_eq!(*seen.borrow(), [GroupUpdate::Ended]);
     }
 }
