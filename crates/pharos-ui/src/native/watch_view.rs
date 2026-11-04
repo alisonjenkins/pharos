@@ -503,6 +503,8 @@ fn TrackPicker(
             onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
             onchange: move |evt: FormEvent| {
                 on_pick.call(evt.value().parse::<u32>().ok());
+                // The picker swallows keys; once picked, they go to the shortcuts again.
+                platform::focus_by_id(PLAYER_ID);
             },
             if offer_off {
                 option { value: "off", selected: pick.is_none(), "{label} off" }
