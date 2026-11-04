@@ -2546,7 +2546,7 @@ fn Player(
                     watch.0.borrow_mut().stalled(now_ms_u64());
                     assess();
                 }
-                MediaEvent::Seeked => watch.0.borrow_mut().seeked(now_ms_u64()),
+                MediaEvent::Seeked => watch.0.borrow_mut().seeked(),
                 _ => {}
             }
             if let Some(session) = session() {
@@ -2640,6 +2640,7 @@ fn Player(
     let on_control = {
         let p = Rc::clone(&p);
         let session = session.clone();
+        let watch = watch.clone();
         let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
         move |control: Control| {
             if retiring.get() {
@@ -2647,6 +2648,7 @@ fn Player(
             }
             // In a group the viewer's play, pause and seek are the group's.
             let seek = |ms: u64| {
+                watch.0.borrow_mut().seeking(now_ms_u64());
                 if !session().is_some_and(|s| s.seek(ms)) {
                     platform::seek_ms(VIDEO_ID, ms);
                 }
