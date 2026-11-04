@@ -2126,9 +2126,11 @@ fn Player(
     // Bumped when the toast's time is up, so the page draws without it.
     let toast_expired = use_signal(|| 0u32);
     let _ = toast_expired();
+    let timed_toast = use_hook(|| Rc::new(Cell::new(None::<u64>)));
     use_effect(move || {
         let view = (together.view)();
-        if view.log.toast(now_ms_u64()).is_some() {
+        if let Some(at) = view.log.toast_to_time(timed_toast.get(), now_ms_u64()) {
+            timed_toast.set(Some(at));
             let mut expired = toast_expired;
             spawn(async move {
                 platform::sleep_ms(u32::try_from(activity::TOAST_MS).unwrap_or(u32::MAX)).await;
