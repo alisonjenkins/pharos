@@ -771,9 +771,28 @@ test.describe("pharos Dioxus UI", () => {
           }),
       );
       expect(start).toBeLessThan(1.5);
-      await request.delete(`${PHAROS_URL}/Users/${user.Id}/PlayedItems/${episode.Id}`, {
-        headers: api,
-      });
+
+      // Leave the player first, so its stop report lands before the reset and
+      // no later test finds this episode part watched.
+      await page.goto("/ui/");
+      await expect
+        .poll(
+          async () => {
+            await request.delete(`${PHAROS_URL}/Users/${user.Id}/PlayedItems/${episode.Id}`, {
+              headers: api,
+            });
+            const data = (
+              await (
+                await request.get(`${PHAROS_URL}/Users/${user.Id}/Items/${episode.Id}`, {
+                  headers: api,
+                })
+              ).json()
+            ).UserData;
+            return [data?.Played, data?.PlaybackPositionTicks];
+          },
+          { timeout: 15_000 },
+        )
+        .toEqual([false, 0]);
     });
 
     // 012 US5: artist, then album, then track list.
