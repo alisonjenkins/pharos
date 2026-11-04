@@ -4,6 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
@@ -951,7 +952,9 @@ fn join_group(
         return;
     };
     let session = together.session(&api);
-    spawn(async move {
+    // The server's Item navigates away before the join answers; the join must
+    // outlive the page that started it, or the membership never begins.
+    spawn_forever(async move {
         match session.join(&id).await {
             Ok(group) => {
                 if let Some(item) = group.item {
@@ -1196,7 +1199,7 @@ fn TitleScreen(id: ItemRef) -> Element {
             return;
         };
         let session = together.session(&api);
-        spawn(async move {
+        spawn_forever(async move {
             match session.create(id, 0).await {
                 Ok(_) => nav.0.call(Route::Watch(id)),
                 Err(e) => group_error.set(Some(e.0)),
