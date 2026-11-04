@@ -2634,6 +2634,18 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   display: none;
 }
 @media (max-width: 40rem) {
+  /* The strip needs about 15rem with picture-in-picture; at 320px the
+     60vw window clipped Close. */
+  .pharos-stage.is-floating {
+    --pharos-stage-w: min(20rem, 100vw);
+  }
+  .pharos-stage.is-mini .pharos-watch {
+    width: 5rem;
+  }
+  /* The video is its own picture; the poster beside it pushed Close out. */
+  .pharos-stage.is-mini:has(.pharos-watch) .pharos-stage-art {
+    display: none;
+  }
   .pharos-stage.is-mini .pharos-stage-transport [aria-label="Previous"],
   .pharos-stage.is-floating .pharos-stage-transport [aria-label="Previous"] {
     display: none;

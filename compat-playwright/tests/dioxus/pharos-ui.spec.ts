@@ -2170,6 +2170,48 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
 
+  test("the compact player keeps every control in view at 320px", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    await signIn(page);
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("Playwright");
+    await page.locator(".pharos-poster").first().click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.setViewportSize({ width: 320, height: 640 });
+    // Every button of the bar lies wholly inside the stage, which clips.
+    const clipped = () =>
+      page.evaluate(() => {
+        const stage = document.querySelector(".pharos-stage")!.getBoundingClientRect();
+        return [...document.querySelectorAll<HTMLElement>(".pharos-stage-bar button")]
+          .filter((b) => b.offsetParent !== null)
+          .filter((b) => {
+            const r = b.getBoundingClientRect();
+            return (
+              r.left < stage.left - 0.5 ||
+              r.right > stage.right + 0.5 ||
+              r.right > document.documentElement.clientWidth + 0.5
+            );
+          })
+          .map((b) => b.getAttribute("aria-label"));
+      });
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    const close = page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" });
+    await expect(close).toBeVisible();
+    expect(await clipped(), "floating at 320px").toEqual([]);
+    await page.locator(".pharos-stage").getByRole("button", { name: "Mini bar" }).click();
+    await expect(page.locator(".pharos-stage.is-mini")).toBeVisible();
+    expect(await clipped(), "mini bar at 320px").toEqual([]);
+  });
+
   test("picture in picture hands the film to the browser and back", async ({ page, request }) => {
     test.setTimeout(120_000);
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
