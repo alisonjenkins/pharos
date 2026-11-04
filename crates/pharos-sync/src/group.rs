@@ -791,8 +791,11 @@ pub struct GroupSnapshot {
     pub participants: Vec<String>,
     /// The id of each entry of `participants`, in the same order.
     pub participant_ids: Vec<MemberId>,
-    /// Each member's user, `None` where none is recorded.
+    /// Each member's user, `None` where none is recorded. In no particular
+    /// order: it is not aligned with `participants`; use `participant_users`.
     pub member_users: Vec<Option<UserId>>,
+    /// The user of each entry of `participants`, in the same order.
+    pub participant_users: Vec<Option<UserId>>,
     /// Wire item id of the queue entry currently playing (T87 — lets the
     /// HTTP seek handler prewarm that item's segments). None on an empty
     /// queue.
@@ -4507,6 +4510,10 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 participants: summaries.iter().map(|s| s.name.clone()).collect(),
                 participant_ids: summaries.iter().map(|s| s.member_id).collect(),
                 member_users: state.members.values().map(|m| m.user).collect(),
+                participant_users: summaries
+                    .iter()
+                    .map(|s| state.members.get(&s.member_id).and_then(|m| m.user))
+                    .collect(),
                 current_item_id: state
                     .queue
                     .items
@@ -10469,6 +10476,38 @@ mod tests {
         .unwrap();
         joined.await.unwrap();
         assert_eq!(snapshot_of(&h).await.member_users, vec![Some(owner)]);
+    }
+
+    /// `participant_users` pairs each listed member with its own user, which
+    /// `member_users` (map order) cannot.
+    /// Disarm check: with `participant_users` built from `member_users`, the
+    /// pairs come out swapped on some runs and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn participant_users_line_up_with_participants() {
+        let h = GroupHandle::spawn(
+            GroupId::new(),
+            Arc::new(LocalDelivery::new(MemberSinks::new())),
+        );
+        let mut users = std::collections::HashMap::new();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            let (user, member) = (UserId::new(), MemberId::new());
+            let (reply, joined) = oneshot::channel();
+            h.tx.send(GroupMsg::AddMember {
+                member_id: member,
+                name: name.into(),
+                user: Some(user),
+                reply,
+            })
+            .await
+            .unwrap();
+            joined.await.unwrap();
+            users.insert(member, Some(user));
+        }
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.participant_ids.len(), 6);
+        for (id, user) in snap.participant_ids.iter().zip(&snap.participant_users) {
+            assert_eq!(user, &users[id]);
+        }
     }
 
     /// A member records the user behind it: on the snapshot the HTTP layer
