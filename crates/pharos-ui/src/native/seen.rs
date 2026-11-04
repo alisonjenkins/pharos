@@ -151,6 +151,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             buffering: false,
+            own_tracks: false,
         };
         let answer = vec![
             MemberSeen {
@@ -176,6 +177,7 @@ mod tests {
         let member = |id: &str| GroupMember {
             id: id.into(),
             name: id.into(),
+            own_tracks: false,
             buffering: false,
         };
         let mut all = vec![MemberSeen {
