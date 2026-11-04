@@ -6,6 +6,7 @@
 //! The native `Prefs` API offers neither key, so only these functions write
 //! them.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
@@ -154,15 +155,29 @@ pub fn normalise(upload: &[u8]) -> Result<Vec<u8>, AvatarError> {
     Ok(out)
 }
 
-/// [`normalise`] on a blocking thread, at most [`DECODE_SLOTS`] at once.
-pub async fn normalise_off_worker(upload: Vec<u8>) -> Result<Vec<u8>, AvatarError> {
+/// How a transport's upload body becomes picture bytes: [`raw`] when the
+/// body is the picture, or an unwrapping such as base64. It runs inside the
+/// decode slot, so its CPU and copies are bounded like the decode's.
+pub type Unwrap = fn(&[u8]) -> Result<Cow<'_, [u8]>, AvatarError>;
+
+/// An upload body that is the picture itself.
+pub fn raw(body: &[u8]) -> Result<Cow<'_, [u8]>, AvatarError> {
+    Ok(Cow::Borrowed(body))
+}
+
+/// `unwrap` then [`normalise`] on a blocking thread, at most
+/// [`DECODE_SLOTS`] at once.
+pub async fn normalise_off_worker<B>(upload: B, unwrap: Unwrap) -> Result<Vec<u8>, AvatarError>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
     let permit = tokio::time::timeout(DECODE_QUEUE_TIMEOUT, SLOTS.clone().acquire_owned())
         .await
         .map_err(|_| AvatarError::Busy)?
         .map_err(|_| AvatarError::Busy)?;
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        normalise(&upload)
+        normalise(&unwrap(upload.as_ref())?)
     })
     .await
     .map_err(|e| AvatarError::Decode(format!("decode task: {e}")))?;
@@ -207,10 +222,18 @@ pub async fn tags(stores: &Stores) -> HashMap<UserId, String> {
 
 /// Checks, re-encodes and stores `upload` as `user`'s avatar; returns the
 /// new tag. Logged with the sizes either way, never the bytes.
-pub async fn set(stores: &Stores, user: UserId, upload: Vec<u8>) -> Result<String, AvatarError> {
-    let uploaded = upload.len();
+pub async fn set<B>(
+    stores: &Stores,
+    user: UserId,
+    upload: B,
+    unwrap: Unwrap,
+) -> Result<String, AvatarError>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
+    let uploaded = upload.as_ref().len();
     let result = async {
-        let bytes = normalise_off_worker(upload).await?;
+        let bytes = normalise_off_worker(upload, unwrap).await?;
         stores.set_user_pref(user, AVATAR_PREF_KEY, &bytes).await?;
         let tag = tag_of(&bytes);
         stores
