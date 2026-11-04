@@ -59,6 +59,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlElement",
     "HtmlCanvasElement",
     "WebGl2RenderingContext",
+    "WebGlBuffer",
     "WebGlProgram",
     "WebGlShader",
     "WebGlTexture",
