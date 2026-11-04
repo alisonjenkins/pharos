@@ -243,6 +243,51 @@ input:focus-visible {
   letter-spacing: 0.02em;
   user-select: none;
 }
+.pharos-avatar-picture {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.pharos-avatar-settings {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+}
+.pharos-avatar-settings h3 {
+  margin: 0;
+}
+.pharos-avatar-large {
+  display: grid;
+  place-items: center;
+  width: 6rem;
+  height: 6rem;
+  border-radius: 50%;
+  overflow: hidden;
+  border: var(--px-border) solid var(--px-color-border);
+  background: var(--px-color-surface-raised);
+  font-size: var(--px-type-step-3);
+}
+.pharos-avatar-large .pharos-avatar {
+  font-size: inherit;
+}
+.pharos-avatar-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.pharos-avatar-actions button {
+  padding: 0.5rem 0.9rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 4px;
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
+  font: inherit;
+  cursor: pointer;
+}
+.pharos-avatar-actions button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
 .pharos-account-scrim {
   position: fixed;
   inset: 0;

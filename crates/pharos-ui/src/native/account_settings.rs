@@ -1,9 +1,33 @@
-//! The Account page (`/settings/account`) as a pure view: change your own
-//! password over `Session.changePassword`.
+//! The Account page (`/settings/account`) as a pure view: your avatar over
+//! `Session.setAvatar` / `removeAvatar`, and your password over
+//! `Session.changePassword`.
 
 use dioxus::prelude::*;
-use pharos_client::api::PASSWORD_CHANGED_REVOKE_FAILED;
+use pharos_client::api::{Me, PASSWORD_CHANGED_REVOKE_FAILED};
 use pharos_client::ClientError;
+
+use super::account::Avatar;
+
+/// Largest picture sent as an avatar: the server's `setAvatar` cap, under
+/// one WebSocket message. A bigger one is scaled down in the browser first.
+pub const MAX_AVATAR_BYTES: usize = 768 * 1024;
+
+/// What to tell the user when the server would not take a picture.
+pub fn avatar_refusal_message(error: &ClientError) -> String {
+    match error {
+        ClientError::Api {
+            kind: "invalid",
+            reason,
+            ..
+        } => format!("That picture cannot be used: {reason}."),
+        ClientError::Api { kind: "limit", .. } => "That picture is too large.".to_owned(),
+        ClientError::Api {
+            kind: "unavailable",
+            ..
+        } => "The server could not save your picture just now. Try again.".to_owned(),
+        other => format!("Could not change your picture: {other}"),
+    }
+}
 
 /// How the last change went: `Ok` shows the confirmation, `Err` the message.
 pub type Outcome = Result<(), String>;
@@ -54,11 +78,17 @@ pub fn form_problem(current: &str, new: &str, confirm: &str) -> Option<&'static 
 
 #[component]
 pub fn AccountView(
-    name: Option<String>,
+    me: Option<Me>,
     busy: bool,
     outcome: Option<Outcome>,
+    avatar_busy: bool,
+    avatar_outcome: Option<Outcome>,
     on_change_password: EventHandler<(String, String)>,
+    on_pick_avatar: EventHandler<()>,
+    on_remove_avatar: EventHandler<()>,
 ) -> Element {
+    let name = me.as_ref().map(|me| me.name.clone());
+    let has_avatar = me.as_ref().is_some_and(|me| me.avatar_url.is_some());
     let mut current = use_signal(String::new);
     let mut new = use_signal(String::new);
     let mut confirm = use_signal(String::new);
@@ -76,6 +106,32 @@ pub fn AccountView(
             h2 { "Account" }
             if let Some(name) = &name {
                 p { class: "pharos-account-signed-in", "Signed in as {name}" }
+            }
+            div { class: "pharos-avatar-settings", id: "avatar-settings",
+                h3 { "Picture" }
+                div { class: "pharos-avatar-large", Avatar { me: me.clone() } }
+                div { class: "pharos-avatar-actions",
+                    button {
+                        r#type: "button",
+                        id: "avatar-choose",
+                        disabled: avatar_busy,
+                        onclick: move |_| on_pick_avatar.call(()),
+                        if avatar_busy { "Saving…" } else if has_avatar { "Change picture" } else { "Choose a picture" }
+                    }
+                    if has_avatar {
+                        button {
+                            r#type: "button",
+                            id: "avatar-remove",
+                            disabled: avatar_busy,
+                            onclick: move |_| on_remove_avatar.call(()),
+                            "Remove"
+                        }
+                    }
+                }
+                match &avatar_outcome {
+                    Some(Err(text)) => rsx! { p { class: "pharos-error", role: "alert", "{text}" } },
+                    _ => rsx! {},
+                }
             }
             form {
                 class: "pharos-password-form",
@@ -162,10 +218,19 @@ mod tests {
             |(outcome, busy): (Option<Outcome>, bool)| {
                 rsx! {
                     AccountView {
-                        name: Some("ali".to_owned()),
+                        me: Some(Me {
+                            id: "0123".to_owned(),
+                            name: "ali".to_owned(),
+                            is_admin: false,
+                            avatar_url: None,
+                        }),
                         busy,
                         outcome,
+                        avatar_busy: false,
+                        avatar_outcome: None,
                         on_change_password: |_| {},
+                        on_pick_avatar: |_| {},
+                        on_remove_avatar: |_| {},
                     }
                 }
             },
@@ -184,6 +249,27 @@ mod tests {
         assert!(html.contains("autocomplete=\"current-password\""), "{html}");
         assert!(html.contains("Signed in as ali"), "{html}");
         assert!(!html.contains("role=\"alert\""), "{html}");
+    }
+
+    #[test]
+    fn without_an_avatar_the_page_offers_to_choose_one_and_shows_initials() {
+        let html = render(None, false);
+        assert!(html.contains("Choose a picture"), "{html}");
+        assert!(!html.contains("avatar-remove"), "{html}");
+        assert!(html.contains(">A<"), "{html}");
+    }
+
+    #[test]
+    fn avatar_refusals_say_why() {
+        assert!(
+            avatar_refusal_message(&api("invalid", "not a PNG, JPEG, WebP or GIF picture"))
+                .contains("not a PNG")
+        );
+        assert!(avatar_refusal_message(&api("limit", "avatar_bytes")).contains("too large"));
+        assert!(
+            avatar_refusal_message(&api("unavailable", "user store unavailable"))
+                .contains("Try again")
+        );
     }
 
     #[test]

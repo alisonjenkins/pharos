@@ -690,6 +690,11 @@ struct Editing {
 #[derive(Clone, Copy)]
 struct Replace(EventHandler<Route>);
 
+/// Who is signed in, as the account menu shows them; a screen that changes
+/// the avatar restarts it.
+#[derive(Clone, Copy)]
+pub(super) struct AccountMe(Resource<Option<pharos_client::api::Me>>);
+
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
 #[derive(Clone, Copy)]
@@ -782,6 +787,8 @@ fn NativeApp(route: Route) -> Element {
             }
         }
     });
+
+    use_context_provider(|| AccountMe(me));
 
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
@@ -1081,18 +1088,26 @@ fn Redirect(to: Route) -> Element {
 #[component]
 fn AccountScreen() -> Element {
     let ctx = use_context::<Ctx>();
+    let mut account = use_context::<AccountMe>();
     let mut busy = use_signal(|| false);
     let mut outcome = use_signal(|| None::<account_settings::Outcome>);
-    let me = use_resource(move || {
-        let api = ctx.api.read().clone();
-        async move { api?.me(&call("account", "me")).await.ok() }
-    });
-    let name = me.read().clone().flatten().map(|me| me.name);
+    let mut avatar_busy = use_signal(|| false);
+    let mut avatar_outcome = use_signal(|| None::<account_settings::Outcome>);
+    let me = account.0.read().clone().flatten();
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("account: {what} failed: {e}"));
+    };
     rsx! {
         account_settings::AccountView {
-            name,
+            me,
             busy: busy(),
             outcome: outcome(),
+            avatar_busy: avatar_busy(),
+            avatar_outcome: avatar_outcome(),
             on_change_password: move |(current, new): (String, String)| {
                 let Some(api) = ctx.api.peek().clone() else {
                     return;
@@ -1107,14 +1122,64 @@ fn AccountScreen() -> Element {
                         .change_password(&call("account", "change_password"), &current, &new)
                         .await;
                     if let Err(e) = &result {
-                        if e.needs_sign_in() {
-                            let mut machine = ctx.machine;
-                            machine.write().apply(Event::NeedsSignIn);
-                        }
-                        platform::warn(&format!("account: change password failed: {e}"));
+                        report(e, "change password");
                     }
                     outcome.set(Some(result.map_err(|e| account_settings::refusal_message(&e))));
                     busy.set(false);
+                });
+            },
+            on_pick_avatar: move |_| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *avatar_busy.peek() {
+                    return;
+                }
+                // Busy from the dialog on, so a second click opens no second picker.
+                avatar_busy.set(true);
+                avatar_outcome.set(None);
+                spawn(async move {
+                    let picture = match platform::pick_picture(account_settings::MAX_AVATAR_BYTES).await {
+                        Ok(Some(picture)) => picture,
+                        Ok(None) => {
+                            avatar_busy.set(false);
+                            return;
+                        }
+                        Err(e) => {
+                            platform::warn(&format!("account: picture not read: {e}"));
+                            avatar_outcome.set(Some(Err(format!("Could not use that picture: {e}"))));
+                            avatar_busy.set(false);
+                            return;
+                        }
+                    };
+                    let result = api.set_avatar(&call("account", "set_avatar"), &picture).await;
+                    match &result {
+                        Ok(_) => account.0.restart(),
+                        Err(e) => report(e, "set avatar"),
+                    }
+                    avatar_outcome.set(Some(
+                        result.map(|_| ()).map_err(|e| account_settings::avatar_refusal_message(&e)),
+                    ));
+                    avatar_busy.set(false);
+                });
+            },
+            on_remove_avatar: move |_| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *avatar_busy.peek() {
+                    return;
+                }
+                avatar_busy.set(true);
+                avatar_outcome.set(None);
+                spawn(async move {
+                    let result = api.remove_avatar(&call("account", "remove_avatar")).await;
+                    match &result {
+                        Ok(()) => account.0.restart(),
+                        Err(e) => report(e, "remove avatar"),
+                    }
+                    avatar_outcome.set(result.err().map(|e| Err(account_settings::avatar_refusal_message(&e))));
+                    avatar_busy.set(false);
                 });
             },
         }
