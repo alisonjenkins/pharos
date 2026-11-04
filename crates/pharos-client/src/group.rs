@@ -15,6 +15,11 @@ use pharos_api::{server, Connection};
 use crate::api::{read_item_ref, set_item_ref, text, ItemRef};
 use crate::{read_done, CallInfo, ClientError};
 
+/// The `by` of a command that only caught a member up, or froze the group for
+/// a buffering member. Nobody chose it, so it is not a line in the activity log.
+/// Equal to `MemberId::CATCH_UP` in `pharos-sync`.
+pub const CATCH_UP_BY: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Someone in a group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMember {
