@@ -140,6 +140,15 @@ impl ActivityLog {
         let (text, at) = self.lines.back()?;
         (now_ms.saturating_sub(*at) < TOAST_MS).then_some(text.as_str())
     }
+
+    /// The arrival time of the toast showing at `now_ms` when no timer is yet
+    /// armed for it: `armed` is the time of the line the last timer was set
+    /// for. One timer per toast line, however often the screen redraws.
+    pub fn toast_to_time(&self, armed: Option<u64>, now_ms: u64) -> Option<u64> {
+        self.toast(now_ms)?;
+        let (_, at) = self.lines.back()?;
+        (armed != Some(*at)).then_some(*at)
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +164,19 @@ mod tests {
 
     fn group(action: Action) -> Event {
         Event { by: None, action }
+    }
+
+    #[test]
+    fn a_toast_line_is_timed_once_however_often_the_screen_redraws() {
+        let mut log = ActivityLog::default();
+        assert_eq!(log.toast_to_time(None, 0), None, "nothing to time");
+        log.push(&group(Action::Joined), 1_000);
+        let armed = log.toast_to_time(None, 1_000);
+        assert_eq!(armed, Some(1_000));
+        assert_eq!(log.toast_to_time(armed, 2_000), None, "same line");
+        log.push(&group(Action::Left), 2_500);
+        assert_eq!(log.toast_to_time(armed, 2_500), Some(2_500), "a new line");
+        assert_eq!(log.toast_to_time(Some(2_500), 9_000), None, "expired");
     }
 
     #[test]
