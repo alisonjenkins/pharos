@@ -743,6 +743,8 @@ struct PurgeSegmentsResultDto {
     /// The item's new cache epoch. Reported so a caller can confirm that
     /// clients were actually told to let go, not just that bytes were moved.
     cache_epoch: u32,
+    /// The item's cached audio sessions that were dropped, whatever the range.
+    audio_dropped: Vec<String>,
 }
 
 async fn purge_segments(
@@ -799,6 +801,9 @@ async fn purge_segments(
     // until she disabled her browser cache. Bumping the epoch changes every
     // segment URL for this item, which is the only thing that makes a client
     // let go (T121).
+    // An audio session spans the whole title, so the range does not apply to
+    // it; the epoch bump below moves its URLs too.
+    let audio_dropped = cache.drop_item_audio(q.item_id).await;
     let epoch = cache.bump_item_epoch(q.item_id);
 
     Ok(web::Json(PurgeSegmentsResultDto {
@@ -808,6 +813,7 @@ async fn purge_segments(
         quarantined: report.quarantined,
         failed: report.failed,
         cache_epoch: epoch,
+        audio_dropped,
     }))
 }
 
