@@ -36,7 +36,7 @@ use tracing::Instrument;
 
 use pharos_transcode::scheduler::{JobClass, JobHint, PlayheadSeed, StreamKey};
 use pharos_transcode::{
-    progress_sidecar_path, AudioCodec, FfmpegTranscoder, FillerSpec, SegmentAudio,
+    progress_sidecar_path, AudioCodec, Container, FfmpegTranscoder, FillerSpec, SegmentAudio,
     SegmentContainer, SegmentOpts, SegmentVideo, TranscodeOptions, VideoCodec,
 };
 use tokio::io::AsyncReadExt;
@@ -1078,6 +1078,100 @@ fn short_of_frames(
         }
     }
     None
+}
+
+/// Where a short attempt's bytes wait while the retry ladder runs (B469).
+fn partial_segment_path(tmp: &Path) -> PathBuf {
+    tmp.with_extension("tmp.partial")
+}
+
+/// The leading part of a window that a short attempt really encoded.
+#[derive(Clone, Copy)]
+struct KeptWindow {
+    frames: u64,
+    secs: f64,
+    filler_start_ticks: u64,
+    rest_ticks: u64,
+}
+
+/// Where the partial's video really stops decoding (its first `tfdt` plus every
+/// sample duration), so the filler's first frame follows its last one on the
+/// same clock. The source's frame grid need not line up with the window start,
+/// so `frames / rate` alone can overlap the two by part of a frame.
+/// `None` when there is nothing to keep or nothing left to fill.
+async fn kept_window(frames: u64, partial: &Path, opts: &TranscodeOptions) -> Option<KeptWindow> {
+    use pharos_core::time::{Ticks, TICKS_PER_SECOND};
+    let raw = tokio::fs::read(partial).await.ok()?;
+    let video = crate::fmp4::segment_track_timing(&raw).into_iter().next()?;
+    let end = video.tfdt_secs + video.duration_secs;
+    let window_start = Ticks(opts.start_position_ticks).seconds();
+    let window_end = opts
+        .start_position_ticks
+        .checked_add(opts.duration_ticks?)?;
+    // The muxer offset is written to the microsecond; rounding up keeps the
+    // filler's first decode time at or after the partial's end.
+    let ticks_per_us = TICKS_PER_SECOND / 1_000_000;
+    let filler_start_ticks = (end * 1e6).ceil() as u64 * ticks_per_us;
+    if frames == 0 || end <= window_start {
+        return None;
+    }
+    let rest_ticks = window_end
+        .checked_sub(filler_start_ticks)
+        .filter(|t| *t > 0)?;
+    Some(KeptWindow {
+        frames,
+        secs: end - window_start,
+        filler_start_ticks,
+        rest_ticks,
+    })
+}
+
+/// Top-level ISO-BMFF boxes as `(type, byte range)`, or `None` when a box size
+/// runs past the end of the buffer.
+fn top_level_boxes(raw: &[u8]) -> Option<Vec<([u8; 4], std::ops::Range<usize>)>> {
+    let mut boxes = Vec::new();
+    let mut at = 0usize;
+    while at < raw.len() {
+        let size32 = u32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?);
+        let kind: [u8; 4] = raw.get(at + 4..at + 8)?.try_into().ok()?;
+        let size = match size32 {
+            0 => raw.len() - at,
+            1 => usize::try_from(u64::from_be_bytes(
+                raw.get(at + 8..at + 16)?.try_into().ok()?,
+            ))
+            .ok()?,
+            n => n as usize,
+        };
+        let end = at
+            .checked_add(size)
+            .filter(|e| *e <= raw.len() && size >= 8)?;
+        boxes.push((kind, at..end));
+        at = end;
+    }
+    Some(boxes)
+}
+
+/// Appends the filler's fragments to the frames before the hole, writing the
+/// result over `filler`. The filler is encoded for the rest of the window under
+/// the same rendition, so its `moov` matches the partial's and only its
+/// `moof`/`mdat` pairs are kept.
+async fn splice_partial_and_filler(partial: &Path, filler: &Path) -> Result<(), HlsCacheError> {
+    let mut joined = tokio::fs::read(partial).await?;
+    let tail = tokio::fs::read(filler).await?;
+    let boxes = top_level_boxes(&tail)
+        .ok_or_else(|| HlsCacheError::Transcode("filler segment is not well-formed fMP4".into()))?;
+    if top_level_boxes(&joined).is_none() {
+        return Err(HlsCacheError::Transcode(
+            "partial segment before the hole is not well-formed fMP4".into(),
+        ));
+    }
+    for (kind, range) in boxes {
+        if &kind != b"ftyp" && &kind != b"moov" && &kind != b"mfra" {
+            joined.extend_from_slice(&tail[range]);
+        }
+    }
+    tokio::fs::write(filler, joined).await?;
+    Ok(())
 }
 
 /// The SOURCE container's own advertised frame size, for a B228 filler.
@@ -2958,6 +3052,10 @@ impl HlsSegmentCache {
         // right `SegmentOutcome` and provenance marker instead of reporting a
         // filler as an ordinary hit.
         let mut is_filler = false;
+        // B469 — what the last short attempt produced, kept at
+        // `partial_segment_path(&tmp)`. Its frames are real picture up to the
+        // hole, so a filler only has to finish the window.
+        let mut partial: Option<(u64, f64)> = None;
         // Hoisted out of the loop: the filler attempt below is a THIRD
         // `write_segment` call, made after the loop ends, and reuses whatever
         // class/hint the last real attempt resolved to rather than
@@ -3022,6 +3120,7 @@ impl HlsSegmentCache {
                     // ERROR this would drown the real failures it sits beside.
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
                     tracing::debug!(
                         media.id = media_id,
                         seg = seg_index,
@@ -3034,6 +3133,7 @@ impl HlsSegmentCache {
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                    let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
                     // A source that would not open is not an encode failure:
                     // re-classify it so the log, the outcome counter and the
                     // HTTP status all say "storage", and remember it so the
@@ -3088,7 +3188,13 @@ impl HlsSegmentCache {
             match &shortfall {
                 None => break,
                 Some(why) => {
-                    let _ = tokio::fs::remove_file(&tmp).await;
+                    partial = match tokio::fs::rename(&tmp, partial_segment_path(&tmp)).await {
+                        Ok(()) => reported,
+                        Err(_) => {
+                            let _ = tokio::fs::remove_file(&tmp).await;
+                            None
+                        }
+                    };
                     tracing::warn!(
                         media.id = media_id,
                         seg = seg_index,
@@ -3099,6 +3205,9 @@ impl HlsSegmentCache {
                     );
                 }
             }
+        }
+        if shortfall.is_none() {
+            let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
         }
         if let Some(why) = shortfall {
             // B228/V171 — the retry ladder (max decode preroll) is exhausted
@@ -3126,6 +3235,33 @@ impl HlsSegmentCache {
                          (B228/V171)"
                     );
                     let mut filler_opts = attempt_opts.clone();
+                    // B469/V412 — keep the short attempt's frames and fill
+                    // only the rest of the window, so a hole late in a window
+                    // does not blank the good picture before it.
+                    let kept = match partial {
+                        Some((frames, _))
+                            if attempt_opts.container == Container::Fmp4
+                                && attempt_opts.muxed_audio_source.is_none() =>
+                        {
+                            kept_window(frames, &partial_segment_path(&tmp), &attempt_opts).await
+                        }
+                        _ => None,
+                    };
+                    match kept {
+                        Some(k) => {
+                            filler_opts.start_position_ticks = k.filler_start_ticks;
+                            filler_opts.duration_ticks = Some(k.rest_ticks);
+                        }
+                        None => {
+                            let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
+                        }
+                    }
+                    tracing::info!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        kept_frames = kept.map_or(0, |k| k.frames),
+                        "hls filler covers the window after the frames the source still had"
+                    );
                     filler_opts.filler = Some(FillerSpec {
                         width,
                         height,
@@ -3155,16 +3291,41 @@ impl HlsSegmentCache {
                             timing = t;
                             reported = read_progress(&tmp).await;
                             is_filler = true;
+                            if let Some(k) = kept {
+                                let joined =
+                                    splice_partial_and_filler(&partial_segment_path(&tmp), &tmp)
+                                        .await;
+                                let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
+                                if let Err(e) = joined {
+                                    let _ = tokio::fs::remove_file(&tmp).await;
+                                    tracing::error!(
+                                        media.id = media_id,
+                                        seg = seg_index,
+                                        error = %e,
+                                        "hls filler could not be joined to the frames before the hole"
+                                    );
+                                    record_segment_failure(
+                                        SegmentOutcome::Failed,
+                                        failure_reason(&e),
+                                        class,
+                                    );
+                                    return Err(e);
+                                }
+                                reported = reported
+                                    .map(|(frames, secs)| (frames + k.frames, secs + k.secs));
+                            }
                         }
                         Err(HlsCacheError::SchedulerBusy) => {
                             let _ = tokio::fs::remove_file(&tmp).await;
                             let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                            let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
                             record_segment_failure(SegmentOutcome::Shed, "scheduler_busy", class);
                             return Err(HlsCacheError::SchedulerBusy);
                         }
                         Err(e) => {
                             let _ = tokio::fs::remove_file(&tmp).await;
                             let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
+                            let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
                             tracing::error!(
                                 media.id = media_id,
                                 seg = seg_index,
@@ -6799,6 +6960,176 @@ mod tests {
             ),
             "pharos_segment_produced_total{{outcome=\"filler\"}} must fire; got {filler_count:?}"
         );
+    }
+
+    /// One top-level ISO-BMFF box: big-endian size, type, payload.
+    fn bmff_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut b = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    /// B469/V412 — a window whose source runs out part-way keeps the frames it
+    /// did encode, and the filler covers only the rest of the window.
+    ///
+    /// The fake worker answers every real attempt with 85 frames (the Buffy
+    /// S02E11 seg 91 shape) whose `tfdt` sits 0.147 s after the window start,
+    /// as a real source's frame grid can, and the filler with its own
+    /// `ftyp moov moof mdat`. The cached segment must be the real fragments
+    /// followed by the filler's, and the filler must start where the real
+    /// frames stop decoding, not at the window start plus 85 frame times.
+    #[tokio::test]
+    async fn a_window_cut_short_by_a_hole_keeps_its_frames_before_the_hole() {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        const KEPT: u32 = 85;
+        const TIMESCALE: u32 = 90_000;
+        const SAMPLE: u32 = 3_754;
+        const LEAD: u64 = 13_230;
+        let rate = pharos_core::FrameRate::from_mille(23_976).unwrap();
+        let window = pharos_core::SegmentWindow::for_segment(91, Some(rate), Some(2693.0));
+        let tfdt = (window.start_seconds() * f64::from(TIMESCALE)).round() as u64 + LEAD;
+        let real_segment = {
+            let mut mdhd = vec![0u8; 12];
+            mdhd.extend_from_slice(&TIMESCALE.to_be_bytes());
+            mdhd.extend_from_slice(&[0u8; 8]);
+            let moov = bmff_box(
+                b"moov",
+                &bmff_box(b"trak", &bmff_box(b"mdia", &bmff_box(b"mdhd", &mdhd))),
+            );
+            let mut tfdt_body = vec![1u8, 0, 0, 0];
+            tfdt_body.extend_from_slice(&tfdt.to_be_bytes());
+            let mut trun = vec![0u8, 0, 0x01, 0];
+            trun.extend_from_slice(&KEPT.to_be_bytes());
+            for _ in 0..KEPT {
+                trun.extend_from_slice(&SAMPLE.to_be_bytes());
+            }
+            let traf = [bmff_box(b"tfdt", &tfdt_body), bmff_box(b"trun", &trun)].concat();
+            [
+                bmff_box(b"ftyp", b"iso6"),
+                moov,
+                bmff_box(b"moof", &bmff_box(b"traf", &traf)),
+                bmff_box(b"mdat", &[b'r'; 64]),
+            ]
+            .concat()
+        };
+        type Seen = Arc<std::sync::Mutex<Option<(u64, Option<u64>)>>>;
+        struct Spawner(Seen, Vec<u8>);
+        impl WorkerSpawner for Spawner {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let (seen, real) = (self.0.clone(), self.1.clone());
+                Box::pin(async move { Ok(Box::new(W { id, seen, real }) as Box<dyn Worker>) })
+            }
+        }
+        struct W {
+            id: WorkerId,
+            seen: Seen,
+            real: Vec<u8>,
+        }
+        impl Worker for W {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let (seen, real) = (self.seen.clone(), self.real.clone());
+                Box::pin(async move {
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let (body, progress) = if job.filler.is_some() {
+                        *seen.lock().unwrap() =
+                            Some((job.opts.start_position_ticks, job.opts.duration_ticks));
+                        (
+                            [
+                                bmff_box(b"ftyp", b"iso6"),
+                                bmff_box(b"moov", b"filler-moov"),
+                                bmff_box(b"moof", b"filler-moof"),
+                                bmff_box(b"mdat", &[b'f'; 64]),
+                            ]
+                            .concat(),
+                            "frame=59\nout_time_us=2461000\n",
+                        )
+                    } else {
+                        (real, "frame=85\nout_time_us=3503000\n")
+                    };
+                    let n = body.len() as u64;
+                    let _ = tokio::fs::write(path, body).await;
+                    let _ =
+                        tokio::fs::write(pharos_transcode::progress_sidecar_path(path), progress)
+                            .await;
+                    WorkerRunResult::Done { out_bytes: n }
+                })
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let source = real_tiny_source(&dir).await;
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let seen: Seen = Arc::default();
+        let cache = cache.with_scheduler(TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Spawner(seen.clone(), real_segment.clone())),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        ));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            container: SegmentContainer::Fmp4,
+            window,
+            ..slow_opts()
+        };
+
+        let bytes = cache
+            .segment_bytes(42, 91, &source, &opts, JobClass::Interactive)
+            .await
+            .expect("a window cut short by a hole still serves");
+
+        let kept_names: Vec<[u8; 4]> = top_level_boxes(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            kept_names,
+            [*b"ftyp", *b"moov", *b"moof", *b"mdat", *b"moof", *b"mdat"],
+            "the real fragments, then the filler's, under the real init"
+        );
+        assert!(
+            bytes.starts_with(&real_segment),
+            "the real attempt's bytes come first, unchanged"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("filler-moov") && text.contains("filler-moof"),
+            "{text}"
+        );
+
+        let (start, dur) = seen.lock().unwrap().expect("a filler was encoded");
+        let decode_end = (tfdt + u64::from(KEPT) * u64::from(SAMPLE)) as f64 / f64::from(TIMESCALE);
+        let (num, den) = rate.as_ratio();
+        let frame_grid_end =
+            window.start_seconds() + f64::from(KEPT) * f64::from(den) / f64::from(num);
+        let got_start = pharos_core::time::Ticks(start).seconds();
+        assert!(
+            got_start >= decode_end && got_start - decode_end < 2e-6,
+            "the filler must start where the real frames stop decoding, \
+             {decode_end:.6}s (not {frame_grid_end:.6}s), but started at {got_start:.6}s"
+        );
+        let window_end = window.start_seconds() + window.duration_seconds();
+        let got_end = got_start + pharos_core::time::Ticks(dur.unwrap()).seconds();
+        assert!(
+            (got_end - window_end).abs() < 1e-6,
+            "the filler must end at the window end {window_end:.6}s, got {got_end:.6}s"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty(), "partial left behind: {leftovers:?}");
     }
 
     /// B228/V171 — the "no video frames at all" case reaches filler too, and
