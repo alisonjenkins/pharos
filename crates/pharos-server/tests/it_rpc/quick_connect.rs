@@ -2,13 +2,18 @@
 //! and a secret to keep; once a signed-in user authorizes the code (on the
 //! Jellyfin side, `/QuickConnect/Authorize`), `quickConnectPoll(secret)`
 //! answers once with a session and device token, as `login` does. The poll
-//! may come over a new connection: an unauthenticated one closes after
-//! `AUTH_DEADLINE`, well inside the code's lifetime.
+//! may come over a new connection. An unauthenticated connection closes at
+//! its auth deadline, which a pending poll re-arms up to
+//! `max_unauthenticated_secs` in all (B541).
+
+use std::num::NonZeroU32;
+use std::time::Duration;
 
 use pharos_api::pharos_capnp::{bootstrap, error, login_result, me_result, quick_connect_result};
 use pharos_api::Connection;
 use pharos_core::{TokenStore, UserId, UserStore};
 use pharos_server::api::pharos::rpc;
+use pharos_server::config::NativeApiConfig;
 use pharos_server::quick_connect::QcMsg;
 
 use crate::bootstrap::LOCAL;
@@ -61,36 +66,41 @@ enum Poll {
     Other(String),
 }
 
-async fn poll(client: &bootstrap::Client, secret: &str) -> Poll {
+async fn try_poll(client: &bootstrap::Client, secret: &str) -> Result<Poll, capnp::Error> {
     let mut req = client.quick_connect_poll_request();
     req.get().init_ctx();
     req.get().set_secret(secret);
-    let reply = req.send().promise.await.unwrap();
-    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+    let reply = req.send().promise.await?;
+    let res = match reply.get()?.get_result()?.which()? {
         login_result::Ok(ok) => {
-            let ok = ok.unwrap();
-            let mut me = ok.get_session().unwrap().me_request();
+            let ok = ok?;
+            let mut me = ok.get_session()?.me_request();
             me.get().init_ctx();
-            let me = me.send().promise.await.unwrap();
-            let name = match me.get().unwrap().get_result().unwrap().which().unwrap() {
-                me_result::Me(me) => me.unwrap().get_name().unwrap().to_string().unwrap(),
+            let me = me.send().promise.await?;
+            let name = match me.get()?.get_result()?.which()? {
+                me_result::Me(me) => me?.get_name()?.to_string().unwrap_or_default(),
                 me_result::Error(_) => panic!("the quick connect session must serve"),
             };
             Poll::Ok {
                 name,
-                token: ok.get_device_token().unwrap().to_string().unwrap(),
+                token: ok.get_device_token()?.to_string().unwrap_or_default(),
             }
         }
         login_result::Error(e) => {
-            let e = e.unwrap();
-            let reason = e.get_reason().unwrap().to_string().unwrap();
-            match e.get_kind().which().unwrap() {
+            let e = e?;
+            let reason = e.get_reason()?.to_string().unwrap_or_default();
+            match e.get_kind().which()? {
                 error::kind::NotPermitted(_) => Poll::NotPermitted(reason),
                 error::kind::NotFound(_) => Poll::NotFound,
                 _ => Poll::Other(reason),
             }
         }
-    }
+    };
+    Ok(res)
+}
+
+async fn poll(client: &bootstrap::Client, secret: &str) -> Poll {
+    try_poll(client, secret).await.unwrap()
 }
 
 #[actix_web::test]
@@ -222,4 +232,206 @@ async fn racing_polls_sign_in_once_and_leave_no_slot_behind() {
     assert!([&ra, &rb].contains(&&Poll::NotFound), "{ra:?} {rb:?}");
     assert_eq!(limits.held_by(fx.user_id), 1);
     assert_eq!(limits.unauthenticated(), 1);
+}
+
+async fn start_with_auth_deadline(
+    auth_deadline_secs: NonZeroU32,
+    max_unauthenticated_secs: NonZeroU32,
+    recorder: Option<&'static metrics_util::debugging::DebuggingRecorder>,
+) -> (actix_test::TestServer, Fixture) {
+    let fx = seed_rich().await;
+    let state = fx.state.clone();
+    let limits = rpc::limits::ConnectionLimits::default();
+    let server = actix_test::start(move || {
+        if let Some(recorder) = recorder {
+            std::mem::forget(metrics::set_default_local_recorder(recorder));
+        }
+        let cfg = NativeApiConfig {
+            enabled: true,
+            auth_deadline_secs,
+            max_unauthenticated_secs,
+            ..NativeApiConfig::default()
+        };
+        actix_web::App::new()
+            .app_data(state.clone())
+            .configure(rpc::configure(cfg, limits.clone()))
+    });
+    (server, fx)
+}
+
+fn extended_count(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> u64 {
+    counter(
+        snapshotter,
+        "pharos_rpc_auth_deadline_extended_total",
+        "quick_connect_pending",
+    )
+}
+
+fn counter(
+    snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
+    name: &str,
+    reason: &str,
+) -> u64 {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == name
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == reason)
+        })
+        .map(|(.., v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum::<u64>()
+}
+
+/// B541, V436: a connection that initiates QuickConnect and polls every 500 ms
+/// stays open past its auth deadline (2 s) for 5 s, every poll answers
+/// notPermitted, and the extension counter increments for each pending poll.
+#[actix_web::test]
+async fn polling_pending_quick_connect_keeps_connection_open_past_deadline() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = Box::leak(Box::new(DebuggingRecorder::new()));
+    let snapshotter = pharos_test_metrics::snapshotter(recorder);
+    let _metrics = metrics::set_default_local_recorder(recorder);
+
+    let (server, _fx) = start_with_auth_deadline(
+        NonZeroU32::new(2).unwrap(),
+        NonZeroU32::new(300).unwrap(),
+        Some(recorder),
+    )
+    .await;
+    let (client, mut closed) = crate::revocation::connect(&server).await;
+    let (_code, secret) = initiate(&client).await;
+
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(closed.try_recv().is_err(), "connection closed unexpectedly");
+        let res = tokio::time::timeout(Duration::from_secs(1), try_poll(&client, &secret))
+            .await
+            .expect("poll timed out")
+            .expect("poll failed");
+        assert!(
+            matches!(res, Poll::NotPermitted(ref r) if r.contains("not yet authorized")),
+            "every poll answers notPermitted while pending: {res:?}"
+        );
+    }
+    assert!(
+        closed.try_recv().is_err(),
+        "connection must stay open after 5 s"
+    );
+    // The counter is bumped by the socket's timer task after the reply is
+    // sent, so the last poll's increment may not have landed yet.
+    assert!(
+        extended_count(&snapshotter) >= 9,
+        "extension counter must go up on pending polls: {}",
+        extended_count(&snapshotter)
+    );
+}
+
+/// B541, V436: a connection that initiates QuickConnect and never polls closes
+/// with reason "auth_deadline" within ~4 s (auth deadline = 2 s).
+#[actix_web::test]
+async fn an_initiator_that_never_polls_closes_at_the_auth_deadline() {
+    let (server, _fx) = start_with_auth_deadline(
+        NonZeroU32::new(2).unwrap(),
+        NonZeroU32::new(300).unwrap(),
+        None,
+    )
+    .await;
+    let (client, closed) = crate::revocation::connect(&server).await;
+    let (_code, _secret) = initiate(&client).await;
+
+    let reason = tokio::time::timeout(Duration::from_secs(4), closed)
+        .await
+        .expect("connection must close within ~4 s")
+        .expect("close frame");
+    assert_eq!(reason.as_deref(), Some("auth_deadline"));
+}
+
+/// B541, V436: a connection that polls only with an unknown secret (answers
+/// notFound) closes with "auth_deadline" within ~4 s, and the extension counter
+/// does not increment.
+#[actix_web::test]
+async fn polling_with_an_unknown_secret_does_not_extend_auth_deadline() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = Box::leak(Box::new(DebuggingRecorder::new()));
+    let snapshotter = pharos_test_metrics::snapshotter(recorder);
+    let _metrics = metrics::set_default_local_recorder(recorder);
+
+    let (server, _fx) = start_with_auth_deadline(
+        NonZeroU32::new(2).unwrap(),
+        NonZeroU32::new(300).unwrap(),
+        Some(recorder),
+    )
+    .await;
+    let (client, closed) = crate::revocation::connect(&server).await;
+
+    let reason = tokio::select! {
+        _ = async {
+            loop {
+                if let Ok(res) = try_poll(&client, "unknown-secret").await {
+                    assert_eq!(res, Poll::NotFound);
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        } => unreachable!(),
+        r = tokio::time::timeout(Duration::from_secs(4), closed) => {
+            r.expect("connection must close within ~4 s").expect("close frame")
+        }
+    };
+    assert_eq!(reason.as_deref(), Some("auth_deadline"));
+    assert_eq!(
+        extended_count(&snapshotter),
+        0,
+        "extension counter must not increment on unknown secret"
+    );
+}
+
+/// B541, V436: pending polls stop extending the deadline once the connection
+/// would stay unauthenticated past `max_unauthenticated_secs`, so re-minting
+/// codes cannot hold one socket open forever. Deadline 2 s, cap 3 s, a poll
+/// every 500 ms: the poll at 1.5 s would run to 3.5 s and is refused, so the
+/// connection closes at about 3 s.
+#[actix_web::test]
+async fn pending_polls_stop_extending_at_the_unauthenticated_cap() {
+    use metrics_util::debugging::DebuggingRecorder;
+    let recorder = Box::leak(Box::new(DebuggingRecorder::new()));
+    let snapshotter = pharos_test_metrics::snapshotter(recorder);
+    let _metrics = metrics::set_default_local_recorder(recorder);
+
+    let (server, _fx) = start_with_auth_deadline(
+        NonZeroU32::new(2).unwrap(),
+        NonZeroU32::new(3).unwrap(),
+        Some(recorder),
+    )
+    .await;
+    let (client, closed) = crate::revocation::connect(&server).await;
+    let (_code, secret) = initiate(&client).await;
+
+    let reason = tokio::select! {
+        _ = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = try_poll(&client, &secret).await;
+            }
+        } => unreachable!(),
+        r = tokio::time::timeout(Duration::from_secs(5), closed) => {
+            r.expect("connection must close at the cap").expect("close frame")
+        }
+    };
+    assert_eq!(reason.as_deref(), Some("auth_deadline"));
+    assert!(
+        counter(
+            &snapshotter,
+            "pharos_rpc_auth_deadline_extension_refused_total",
+            "max_unauthenticated",
+        ) >= 1,
+        "the refused extension must be counted"
+    );
 }

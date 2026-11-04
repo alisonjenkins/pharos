@@ -21,9 +21,7 @@ use pharos_core::UserId;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::broadcast;
 
-use super::limits::{
-    ConnectionLimits, Refusal, AUTH_DEADLINE, MAX_UNAUTHENTICATED, MAX_UNAUTHENTICATED_PER_IP,
-};
+use super::limits::{ConnectionLimits, Refusal, MAX_UNAUTHENTICATED, MAX_UNAUTHENTICATED_PER_IP};
 use super::{bootstrap_client, origin, ConnectionCtx};
 use crate::config::NativeApiConfig;
 use crate::services::auth::{user_for_token, TokenRefusal};
@@ -141,7 +139,8 @@ pub enum CloseCause {
     SendFailed,
     /// A text frame: this endpoint speaks binary capnp only.
     TextFrame,
-    /// No successful `resume` within [`AUTH_DEADLINE`].
+    /// No session within `auth_deadline_secs`, as extended by pending
+    /// QuickConnect polls (B541).
     AuthDeadline,
     /// Nothing heard from the client for [`IDLE_DROP`].
     IdleTimeout,
@@ -219,6 +218,72 @@ impl Recheck {
             Recheck::Lagged => "lagged",
         }
     }
+}
+
+/// Why the auth deadline was extended. The `reason` label of
+/// `pharos_rpc_auth_deadline_extended_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthDeadlineExtension {
+    QuickConnectPending,
+}
+
+impl AuthDeadlineExtension {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::QuickConnectPending => "quick_connect_pending",
+        }
+    }
+}
+
+/// Counts and logs an auth deadline extension.
+pub fn record_auth_deadline_extended(connection: u64, reason: AuthDeadlineExtension) {
+    metrics::counter!(
+        "pharos_rpc_auth_deadline_extended_total",
+        "reason" => reason.label()
+    )
+    .increment(1);
+    tracing::debug!(
+        connection,
+        reason = reason.label(),
+        "native api auth deadline extended"
+    );
+}
+
+/// Why an auth deadline extension was refused. The `reason` label of
+/// `pharos_rpc_auth_deadline_extension_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthDeadlineRefusal {
+    /// The extension would keep the connection unauthenticated past
+    /// `max_unauthenticated_secs`.
+    MaxUnauthenticated,
+}
+
+impl AuthDeadlineRefusal {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::MaxUnauthenticated => "max_unauthenticated",
+        }
+    }
+}
+
+/// Counts and logs a refused auth deadline extension, with how long the
+/// connection has been unauthenticated.
+pub fn record_auth_deadline_extension_refused(
+    connection: u64,
+    reason: AuthDeadlineRefusal,
+    unauthenticated_for: Duration,
+) {
+    metrics::counter!(
+        "pharos_rpc_auth_deadline_extension_refused_total",
+        "reason" => reason.label()
+    )
+    .increment(1);
+    tracing::debug!(
+        connection,
+        reason = reason.label(),
+        unauthenticated_secs = unauthenticated_for.as_secs(),
+        "native api auth deadline extension refused"
+    );
 }
 
 /// Token bucket over one connection's inbound binary messages. It refills at
@@ -399,9 +464,26 @@ pub(super) async fn upgrade(
         .aggregate_continuations()
         .max_continuation_size(MAX_FRAME);
     // R2: the RpcSystem is !Send, so it stays on this worker.
-    let revalidate = Duration::from_secs(u64::from(cfg.revalidate_secs.get()));
-    actix_web::rt::spawn(run(state, ctx, session, stream, peer, revalidate));
+    let timing = Timing {
+        revalidate: Duration::from_secs(u64::from(cfg.revalidate_secs.get())),
+        auth_deadline: Duration::from_secs(u64::from(cfg.auth_deadline_secs.get())),
+        max_unauthenticated: Duration::from_secs(u64::from(cfg.max_unauthenticated_secs.get())),
+    };
+    actix_web::rt::spawn(run(state, ctx, session, stream, peer, timing));
     Ok(response)
+}
+
+/// A connection's timers, from `[server.native_api]`.
+#[derive(Debug, Clone, Copy)]
+struct Timing {
+    /// The `revalidate_secs` re-check interval.
+    revalidate: Duration,
+    /// How long a connection may stay unauthenticated without a pending
+    /// QuickConnect poll.
+    auth_deadline: Duration,
+    /// How long a connection may stay unauthenticated however many pending
+    /// polls extend its deadline (B541, V436).
+    max_unauthenticated: Duration,
 }
 
 async fn run<S>(
@@ -410,7 +492,7 @@ async fn run<S>(
     session: Session,
     mut inbound: S,
     peer: String,
-    revalidate: Duration,
+    timing: Timing,
 ) where
     S: futures_util::Stream<Item = Result<AggregatedMessage, actix_ws::ProtocolError>> + Unpin,
 {
@@ -496,16 +578,20 @@ async fn run<S>(
 
     let mut pinger = session.clone();
     let deadline = ctx.clone();
+    let connection_id = conn.id();
     // Subscribed before any resume, so no announcement can slip between a
     // resume and the first poll (T025).
     let mut announced = state.revocations.subscribe();
     let timers = async move {
         let mut keepalive = tokio::time::interval(KEEPALIVE);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
+        let auth_deadline = tokio::time::sleep(timing.auth_deadline);
+        // When the connection last became unauthenticated; extensions stop
+        // at `max_unauthenticated` past it.
+        let mut unauthenticated_since = tokio::time::Instant::now();
         tokio::pin!(auth_deadline);
         let mut checked_auth = false;
-        let mut recheck = tokio::time::interval(revalidate);
+        let mut recheck = tokio::time::interval(timing.revalidate);
         recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         recheck.reset();
         let mut announcing = true;
@@ -527,10 +613,31 @@ async fn run<S>(
                 () = deadline.signed_out.notified() => {
                     // A stale wake (signed in again since) changes nothing.
                     if !deadline.is_signed_in() {
-                        auth_deadline
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + AUTH_DEADLINE);
+                        let now = tokio::time::Instant::now();
+                        auth_deadline.as_mut().reset(now + timing.auth_deadline);
+                        unauthenticated_since = now;
                         checked_auth = false;
+                    }
+                    None
+                }
+                () = deadline.extend_auth.notified() => {
+                    if !deadline.is_signed_in() {
+                        let now = tokio::time::Instant::now();
+                        let until = now + timing.auth_deadline;
+                        if until <= unauthenticated_since + timing.max_unauthenticated {
+                            auth_deadline.as_mut().reset(until);
+                            checked_auth = false;
+                            record_auth_deadline_extended(
+                                connection_id,
+                                AuthDeadlineExtension::QuickConnectPending,
+                            );
+                        } else {
+                            record_auth_deadline_extension_refused(
+                                connection_id,
+                                AuthDeadlineRefusal::MaxUnauthenticated,
+                                now.duration_since(unauthenticated_since),
+                            );
+                        }
                     }
                     None
                 }
@@ -636,6 +743,18 @@ mod tests {
         ];
         let labels: std::collections::HashSet<_> = refused.iter().map(|r| r.label()).collect();
         assert_eq!(labels.len(), refused.len());
+
+        assert_eq!(
+            AuthDeadlineRefusal::MaxUnauthenticated.label(),
+            "max_unauthenticated"
+        );
+        let extensions = [AuthDeadlineExtension::QuickConnectPending];
+        let labels: std::collections::HashSet<_> = extensions.iter().map(|e| e.label()).collect();
+        assert_eq!(labels.len(), extensions.len());
+        assert_eq!(
+            AuthDeadlineExtension::QuickConnectPending.label(),
+            "quick_connect_pending"
+        );
     }
 
     #[test]

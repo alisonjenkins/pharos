@@ -334,6 +334,10 @@ impl server::bootstrap::Handler for Bootstrap {
                 // A lost consume race or a failed issue comes after `admit`;
                 // the slot must not stay held with no session.
                 self.ctx.settle_slot();
+                if matches!(e, QuickConnectLoginError::Pending) {
+                    // B541, V436: re-arm auth deadline while the user approves.
+                    self.ctx.extend_auth_deadline();
+                }
                 quick_connect_denial(&e).write(result.init_error());
             }
         }
