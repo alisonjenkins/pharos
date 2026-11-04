@@ -1751,7 +1751,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             Some((_, None)) => return,
             // The album could not be read; a song played from the queue
             // still leaves it.
-            None if queue.peek().next() == Some(id) => None,
+            None if queue.peek().expects(id) => None,
             None => return,
         };
         // While a mix is on it decides what follows, not the song's album.
