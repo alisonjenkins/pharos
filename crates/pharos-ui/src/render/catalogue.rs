@@ -63,7 +63,7 @@ impl Program {
     }
 }
 
-/// A triangle covering the viewport, from `gl_VertexID` alone.
+/// A triangle covering the viewport, from the `a_corner` array at location 0.
 pub const VERTEX: &str = include_str!("shaders/fullscreen.vert");
 
 /// Shared uniforms and samplers every fragment shader starts with.
@@ -88,6 +88,14 @@ mod tests {
         Program::MatrixRain,
         Program::Grain,
     ];
+
+    /// Firefox on macOS emulates attribute 0 on every draw unless it is an
+    /// enabled array, so the vertex shader must read one there.
+    #[test]
+    fn the_vertex_shader_reads_an_array_at_location_0() {
+        assert!(VERTEX.contains("layout(location = 0) in vec2 a_corner;"));
+        assert!(!VERTEX.contains("gl_VertexID"));
+    }
 
     #[test]
     fn every_program_is_glsl_es_300_with_one_main() {
