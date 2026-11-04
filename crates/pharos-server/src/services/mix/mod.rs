@@ -17,6 +17,9 @@ use crate::services::library::{self, ItemQuery, KindFilter};
 use crate::state::AppState;
 pub use select::{Batch, Relax, Rule, Spec, SpecError, Test, Weight};
 
+/// How many ids one `user_data_bulk` call binds.
+const USER_DATA_CHUNK: usize = 10_000;
+
 /// The most `recent` ids a call reads; older ones are dropped.
 pub const MAX_RECENT: usize = 200;
 
@@ -27,8 +30,9 @@ pub enum Seed {
     None,
     /// This song.
     Song(u64),
-    /// The song heard last, so the mix drifts as it plays. Before anything
-    /// has played the like-seed rules sit out.
+    /// The last song heard or queued, then each pick in turn, so the mix
+    /// walks from song to song. Before anything has played or been queued
+    /// the like-seed rules sit out.
     Follow,
 }
 
@@ -141,7 +145,7 @@ fn song(item: &MediaItem, ud: UserItemData) -> select::Song {
         play_count: ud.play_count,
         last_played_at: ud.last_played_at,
         favorite: ud.is_favorite,
-        // Filled from `probe.bpm` / `probe.energy` once the scanner reads
+        // Filled from `probe.bpm()` / `probe.energy()` once the scanner reads
         // tempo tags and analyses energy (B445); until then the tempo and
         // energy rules match nothing and likeness ignores them.
         bpm: None,
@@ -200,9 +204,13 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         ask.recent.drain(..ask.recent.len() - MAX_RECENT);
     }
     // Validate before the store is touched: a bad spec costs nothing.
+    if ask.count == 0 {
+        return Err(MixError::Invalid(SpecError::NoSongsAsked));
+    }
     let mut spec = Spec {
         rules: ask.rules,
         seed: None,
+        follow: ask.seed == Seed::Follow,
         artist_gap: ask.artist_gap,
         album_gap: ask.album_gap,
     };
@@ -226,11 +234,18 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         .await
         .map_err(|e| MixError::Store(e.to_string()))?;
     let ids: Vec<u64> = page.items.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.id, &ids)
-        .await
-        .map_err(|e| MixError::Store(e.to_string()))?;
+    // In chunks: the store binds one variable per id, and SQLite allows
+    // 32766 in one statement.
+    let mut user_data = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(USER_DATA_CHUNK) {
+        let mut part = state
+            .stores
+            .user_data_bulk(user.id, chunk)
+            .await
+            .map_err(|e| MixError::Store(e.to_string()))?;
+        part.resize(chunk.len(), UserItemData::default());
+        user_data.extend(part);
+    }
     let pool: Vec<select::Song> = page
         .items
         .iter()
@@ -238,20 +253,21 @@ async fn run(state: &AppState, user: &User, mut ask: MixAsk, now: i64) -> Result
         .map(|(i, item)| song(item, user_data.get(i).copied().unwrap_or_default()))
         .collect();
 
+    let at: HashMap<u64, usize> = pool.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
     spec.seed = match ask.seed {
         Seed::None => None,
         Seed::Song(id) => Some(
-            pool.iter()
-                .find(|s| s.id == id)
-                .cloned()
+            at.get(&id)
+                .map(|&i| pool[i].clone())
                 .ok_or(MixError::SeedNotFound(id))?,
         ),
+        // The last song heard or queued: the batch carries on from it.
         Seed::Follow => ask
             .recent
             .iter()
             .rev()
-            .find_map(|id| pool.iter().find(|s| s.id == *id))
-            .cloned(),
+            .find_map(|id| at.get(id))
+            .map(|&i| pool[i].clone()),
     };
     if spec.seed.is_none() {
         // Following with nothing heard yet: nothing to be like.

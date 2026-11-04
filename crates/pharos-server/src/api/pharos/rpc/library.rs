@@ -285,9 +285,12 @@ impl server::library::Handler for Library {
         params: wire::MixParams,
         results: &mut wire::MixResults,
     ) -> Result<(), capnp::Error> {
-        let params = params.get()?;
-        let ask =
-            super::mix::read_ask(params.get_spec()?, params.get_recent()?, params.get_count())?;
+        // Read now (the params do not outlive the await below), refuse
+        // after the user is known, so a malformed ask is counted and logged
+        // like any other refusal.
+        let read = params
+            .get()
+            .and_then(|p| super::mix::read_ask(p.get_spec()?, p.get_recent()?, p.get_count()));
         let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
@@ -296,35 +299,19 @@ impl server::library::Handler for Library {
             }
         };
         let out = results.get().init_result();
-        let ask = match ask {
-            Ok(ask) => ask,
-            Err(super::mix::BadField(field)) => {
-                metrics::counter!("pharos_mix_total", "outcome" => "invalid").increment(1);
-                tracing::warn!(user.id = %user.id, outcome = "invalid", field, "mix: no batch");
-                Denial::Invalid { field }.write(out.init_error());
+        let (field, error) = match read {
+            Ok(Ok(ask)) => {
+                run_mix(&self.session.state, out, &user, ask).await;
                 return Ok(());
             }
+            Ok(Err(super::mix::BadField(field))) => (field, String::new()),
+            Err(e) => ("spec", e.to_string()),
         };
-        let state = &self.session.state;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-        match mix::mix(state, &user, ask, now).await {
-            Ok(mixed) => super::mix::write_batch(out.init_batch(), &mixed, &state.server_id),
-            Err(mix::MixError::Invalid(e)) => {
-                Denial::Invalid { field: e.label() }.write(out.init_error())
-            }
-            Err(mix::MixError::SeedNotFound(_)) => {
-                Denial::NotFound { what: "seed song" }.write(out.init_error());
-            }
-            Err(mix::MixError::Store(_)) => Denial::Unavailable {
-                dependency: "media store",
-            }
-            .write(out.init_error()),
-        }
+        metrics::counter!("pharos_mix_total", "outcome" => "invalid").increment(1);
+        tracing::warn!(user.id = %user.id, outcome = "invalid", field, %error, "mix: no batch");
+        Denial::Invalid { field }.write(out.init_error());
         Ok(())
     }
-
     async fn search(
         self: Rc<Self>,
         params: wire::SearchParams,
@@ -629,6 +616,29 @@ fn list_error_detail(e: &ListError) -> String {
     match e {
         ListError::Hidden(hidden) => hidden.label().to_owned(),
         ListError::Store(e) => e.to_string(),
+    }
+}
+
+/// Runs a readable mix ask and writes its batch or refusal into `out`.
+async fn run_mix(
+    state: &AppState,
+    out: pharos_api::pharos_capnp::mix_result::Builder<'_>,
+    user: &pharos_core::User,
+    ask: mix::MixAsk,
+) {
+    let now = crate::sync_recovery::now_unix_secs();
+    match mix::mix(state, user, ask, now).await {
+        Ok(mixed) => super::mix::write_batch(out.init_batch(), &mixed, &state.server_id),
+        Err(mix::MixError::Invalid(e)) => {
+            Denial::Invalid { field: e.label() }.write(out.init_error())
+        }
+        Err(mix::MixError::SeedNotFound(_)) => {
+            Denial::NotFound { what: "seed song" }.write(out.init_error());
+        }
+        Err(mix::MixError::Store(_)) => Denial::Unavailable {
+            dependency: "media store",
+        }
+        .write(out.init_error()),
     }
 }
 

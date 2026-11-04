@@ -10,18 +10,22 @@
 //!    They are never relaxed: a mix that runs out says so (`exhausted`).
 //! 2. **Freshness**: a song in `recent` (played or already queued) or picked
 //!    earlier in this call is not picked again while a fresh one exists.
-//! 3. **Shares** ("about 30% from the 90s"): for each share rule the engine
+//! 3. **Spacing**: no song by an artist heard in the last `artist_gap`
+//!    songs, nor from an album heard in the last `album_gap`.
+//! 4. **Shares** ("about 30% from the 90s"): for each share rule the engine
 //!    looks at the last [`SHARE_WINDOW`] songs, sees how far the window is
 //!    from the target, and decides whether the next song must match. The
 //!    correction overshoots the target by the gap, so the proportion
 //!    converges instead of drifting.
-//! 4. **Spacing**: no song by an artist heard in the last `artist_gap`
-//!    songs, nor from an album heard in the last `album_gap`.
 //! 5. **Soft rules** (`Prefer`, `Avoid`, and the seed's likeness) weight a
 //!    random draw among what is left.
 //!
-//! Steps 2 to 4 relax, in that order of last resort, when they would leave
-//! nothing; each relaxation is reported, so a mix that bends is visible.
+//! Steps 2 to 4 each narrow what the step before left, and each bends
+//! (freshness least readily, shares most) only when it would leave
+//! nothing; every bend is reported, so a mix that bends is visible.
+//!
+//! **Following**: with `Spec::follow`, each pick becomes the seed for the
+//! next, so a like-seed mix walks from song to song instead of circling one.
 
 use std::collections::{HashMap, HashSet};
 
@@ -210,8 +214,10 @@ pub struct Rule {
 pub struct Spec {
     pub rules: Vec<Rule>,
     /// What `LikeSeed` compares against. The service resolves it: a chosen
-    /// song, or (following) the song heard last.
+    /// song, or (following) the last song heard or queued.
     pub seed: Option<Song>,
+    /// Each pick becomes the seed for the next.
+    pub follow: bool,
     /// No artist again within this many songs.
     pub artist_gap: u8,
     /// No album again within this many songs.
@@ -222,6 +228,8 @@ pub struct Spec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecError {
     TooManyRules(usize),
+    /// A call asked for no songs.
+    NoSongsAsked,
     /// A share outside 1..=100, or on a rule that is not `Prefer`.
     BadShare {
         rule: usize,
@@ -232,6 +240,13 @@ pub enum SpecError {
     BackwardsRange {
         rule: usize,
         test: &'static str,
+    },
+    /// A value past the most its test allows: energy over 100%.
+    OutOfRange {
+        rule: usize,
+        test: &'static str,
+        value: u32,
+        max: u32,
     },
     /// Text that is empty after trimming.
     EmptyText {
@@ -248,8 +263,10 @@ impl SpecError {
     pub fn label(&self) -> &'static str {
         match self {
             SpecError::TooManyRules(_) => "too_many_rules",
+            SpecError::NoSongsAsked => "no_songs_asked",
             SpecError::BadShare { .. } => "bad_share",
             SpecError::BackwardsRange { .. } => "backwards_range",
+            SpecError::OutOfRange { .. } => "out_of_range",
             SpecError::EmptyText { .. } => "empty_text",
             SpecError::NoSeed { .. } => "no_seed",
         }
@@ -260,6 +277,7 @@ impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SpecError::TooManyRules(n) => write!(f, "{n} rules; a mix holds at most {MAX_RULES}"),
+            SpecError::NoSongsAsked => write!(f, "count 0; ask for 1 to {MAX_COUNT} songs"),
             SpecError::BadShare {
                 rule,
                 share,
@@ -271,6 +289,12 @@ impl std::fmt::Display for SpecError {
             SpecError::BackwardsRange { rule, test } => {
                 write!(f, "rule {rule}: the {test} range ends before it starts")
             }
+            SpecError::OutOfRange {
+                rule,
+                test,
+                value,
+                max,
+            } => write!(f, "rule {rule}: {test} {value} is past the most, {max}"),
             SpecError::EmptyText { rule, test } => write!(f, "rule {rule}: the {test} is empty"),
             SpecError::NoSeed { rule } => write!(f, "rule {rule}: like-seed with no seed song"),
         }
@@ -309,7 +333,15 @@ impl Spec {
                 Test::Tempo { min, max } if max < min => {
                     return Err(SpecError::BackwardsRange { rule, test });
                 }
-                Test::Energy { min, max } if max < min || *max > 100 => {
+                Test::Energy { max, .. } if *max > 100 => {
+                    return Err(SpecError::OutOfRange {
+                        rule,
+                        test,
+                        value: u32::from(*max),
+                        max: 100,
+                    });
+                }
+                Test::Energy { min, max } if max < min => {
                     return Err(SpecError::BackwardsRange { rule, test });
                 }
                 Test::LikeSeed if self.seed.is_none() => return Err(SpecError::NoSeed { rule }),
@@ -386,8 +418,45 @@ impl Draw for XorShift {
     }
 }
 
+/// Equal ignoring case and surrounding space. Allocates only for non-ASCII
+/// text that differs bytewise; [`select`] trims and lowercases the pool and
+/// the rules once, so its comparisons take the first branch.
 fn eq_ci(a: &str, b: &str) -> bool {
-    a.trim().to_lowercase() == b.trim().to_lowercase()
+    let (a, b) = (a.trim(), b.trim());
+    a == b
+        || if a.is_ascii() && b.is_ascii() {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a.to_lowercase() == b.to_lowercase()
+        }
+}
+
+fn lower(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+impl Song {
+    /// This song with its text trimmed and lowercased, as [`select`] compares.
+    fn normalised(&self) -> Song {
+        Song {
+            artist: self.artist.as_deref().map(lower),
+            album_artist: self.album_artist.as_deref().map(lower),
+            album: self.album.as_deref().map(lower),
+            genres: self.genres.iter().map(|g| lower(g)).collect(),
+            ..self.clone()
+        }
+    }
+}
+
+impl Test {
+    fn normalised(&self) -> Test {
+        match self {
+            Test::Genre(t) => Test::Genre(lower(t)),
+            Test::Artist(t) => Test::Artist(lower(t)),
+            Test::Album(t) => Test::Album(lower(t)),
+            other => other.clone(),
+        }
+    }
 }
 
 fn opt_eq(a: Option<&str>, b: &str) -> bool {
@@ -418,17 +487,17 @@ pub fn likeness(seed: &Song, s: &Song) -> f64 {
             return 1.0;
         }
     }
-    let sg: HashSet<String> = seed
+    // Jaccard over the (few) genres each song has, without allocating.
+    let shared = seed
         .genres
         .iter()
-        .map(|g| g.trim().to_lowercase())
-        .collect();
-    let tg: HashSet<String> = s.genres.iter().map(|g| g.trim().to_lowercase()).collect();
-    let union = sg.union(&tg).count();
+        .filter(|g| s.genres.iter().any(|t| eq_ci(g, t)))
+        .count();
+    let union = seed.genres.len() + s.genres.len() - shared;
     let genre = if union == 0 {
         0.0
     } else {
-        sg.intersection(&tg).count() as f64 / union as f64
+        shared as f64 / union as f64
     };
     let era = match (seed.year, s.year) {
         (Some(a), Some(b)) => (1.0 - f64::from(a.abs_diff(b)) / 20.0).max(0.0),
@@ -494,11 +563,25 @@ fn matches(test: &Test, s: &Song, seed: Option<&Song>, now: i64) -> bool {
     }
 }
 
+/// A song's weight in the draw from the soft rules: `Prefer` multiplies,
+/// `Avoid` divides, a like-seed `Prefer` scales by how alike.
+fn soft_weight(rules: &[Rule], s: &Song, seed: Option<&Song>, now: i64) -> f64 {
+    rules.iter().fold(1.0, |w, r| match (r.share, r.weight) {
+        (None, Weight::Prefer) => match r.test {
+            Test::LikeSeed => w * (1.0 + (PREFER_FACTOR - 1.0) * degree(&r.test, s, seed, now)),
+            _ if matches(&r.test, s, seed, now) => w * PREFER_FACTOR,
+            _ => w,
+        },
+        (None, Weight::Avoid) if matches(&r.test, s, seed, now) => w / PREFER_FACTOR,
+        _ => w,
+    })
+}
+
 /// Pick up to `count` songs from `pool` for `spec`. `recent` is what was
 /// heard or queued, oldest first; it feeds freshness, spacing and shares.
 /// The spec must have passed [`Spec::validate`].
 pub fn select(
-    pool: &[Song],
+    original: &[Song],
     spec: &Spec,
     recent: &[u64],
     count: usize,
@@ -506,37 +589,40 @@ pub fn select(
     draw: &mut dyn Draw,
 ) -> Batch {
     let count = count.min(MAX_COUNT);
-    let seed = spec.seed.as_ref();
+    // Normalise text once, so every comparison below is a plain one.
+    let pool: Vec<Song> = original.iter().map(Song::normalised).collect();
+    // The listener reads reasons in the songs' and rules' own spelling.
+    let as_given: HashMap<u64, &Song> = original.iter().map(|s| (s.id, s)).collect();
+    let mut seed_as_given: Option<&Song> = spec.seed.as_ref();
+    let rules: Vec<Rule> = spec
+        .rules
+        .iter()
+        .map(|r| Rule {
+            test: r.test.normalised(),
+            ..r.clone()
+        })
+        .collect();
+    let mut seed: Option<Song> = spec.seed.as_ref().map(Song::normalised);
     let by_id: HashMap<u64, &Song> = pool.iter().map(|s| (s.id, s)).collect();
+    // Hard rules hold against the seed the mix started from.
     let eligible: Vec<&Song> = pool
         .iter()
         .filter(|s| {
-            spec.rules.iter().all(|r| match (r.share, r.weight) {
-                (None, Weight::Require) => matches(&r.test, s, seed, now),
-                (None, Weight::Exclude) => !matches(&r.test, s, seed, now),
+            rules.iter().all(|r| match (r.share, r.weight) {
+                (None, Weight::Require) => matches(&r.test, s, seed.as_ref(), now),
+                (None, Weight::Exclude) => !matches(&r.test, s, seed.as_ref(), now),
                 _ => true,
             })
         })
         .collect();
-    // Each song's base weight from the soft rules, computed once.
-    let base: Vec<f64> = eligible
-        .iter()
-        .map(|s| {
-            spec.rules
-                .iter()
-                .fold(1.0, |w, r| match (r.share, r.weight) {
-                    (None, Weight::Prefer) => match r.test {
-                        Test::LikeSeed => {
-                            w * (1.0 + (PREFER_FACTOR - 1.0) * degree(&r.test, s, seed, now))
-                        }
-                        _ if matches(&r.test, s, seed, now) => w * PREFER_FACTOR,
-                        _ => w,
-                    },
-                    (None, Weight::Avoid) if matches(&r.test, s, seed, now) => w / PREFER_FACTOR,
-                    _ => w,
-                })
-        })
-        .collect();
+    let has_like = rules.iter().any(|r| r.test == Test::LikeSeed);
+    let weigh = |seed: Option<&Song>| -> Vec<f64> {
+        eligible
+            .iter()
+            .map(|s| soft_weight(&rules, s, seed, now))
+            .collect()
+    };
+    let mut base = weigh(seed.as_ref());
 
     let mut batch = Batch {
         pool: pool.len(),
@@ -555,7 +641,13 @@ pub fn select(
         .collect();
     let mut taken: HashSet<u64> = HashSet::new();
     let heard: HashSet<u64> = recent.iter().copied().collect();
-    let shares: Vec<&Rule> = spec.rules.iter().filter(|r| r.share.is_some()).collect();
+    let newest: HashSet<u64> = recent
+        .iter()
+        .rev()
+        .take(recent.len() / 2)
+        .copied()
+        .collect();
+    let shares: Vec<&Rule> = rules.iter().filter(|r| r.share.is_some()).collect();
 
     while batch.picks.len() < count {
         let not_taken: Vec<usize> = (0..eligible.len())
@@ -574,12 +666,6 @@ pub fn select(
             .collect();
         if cands.is_empty() {
             relax(&mut batch, Relax::Repeat);
-            let newest: HashSet<u64> = recent
-                .iter()
-                .rev()
-                .take(recent.len() / 2)
-                .copied()
-                .collect();
             cands = not_taken
                 .iter()
                 .copied()
@@ -597,6 +683,26 @@ pub fn select(
                 cands = not_taken;
             }
         }
+        // Spacing: no artist or album heard too lately.
+        let lately = |gap: u8| history.iter().rev().take(usize::from(gap));
+        let artists: HashSet<&str> = lately(spec.artist_gap).filter_map(|s| s.by()).collect();
+        let albums: HashSet<&str> = lately(spec.album_gap)
+            .filter_map(|s| s.album.as_deref())
+            .collect();
+        let spaced: Vec<usize> = cands
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let s = eligible[i];
+                !s.by().is_some_and(|a| artists.contains(a))
+                    && !s.album.as_deref().is_some_and(|a| albums.contains(a))
+            })
+            .collect();
+        if spaced.is_empty() {
+            relax(&mut batch, Relax::Spacing);
+        } else {
+            cands = spaced;
+        }
         // Shares: decide whether this turn must match, toward the target.
         for rule in &shares {
             let target = f64::from(rule.share.unwrap_or(0)) / 100.0;
@@ -606,7 +712,7 @@ pub fn select(
             } else {
                 window
                     .iter()
-                    .filter(|s| matches(&rule.test, s, seed, now))
+                    .filter(|s| matches(&rule.test, s, seed.as_ref(), now))
                     .count() as f64
                     / window.len() as f64
             };
@@ -615,39 +721,13 @@ pub fn select(
             let kept: Vec<usize> = cands
                 .iter()
                 .copied()
-                .filter(|&i| matches(&rule.test, eligible[i], seed, now) == must)
+                .filter(|&i| matches(&rule.test, eligible[i], seed.as_ref(), now) == must)
                 .collect();
             if kept.is_empty() {
                 relax(&mut batch, Relax::Share);
             } else {
                 cands = kept;
             }
-        }
-        // Spacing: no artist or album heard too lately.
-        let lately = |gap: u8| history.iter().rev().take(usize::from(gap));
-        let artists: HashSet<String> = lately(spec.artist_gap)
-            .filter_map(|s| s.by().map(|a| a.trim().to_lowercase()))
-            .collect();
-        let albums: HashSet<String> = lately(spec.album_gap)
-            .filter_map(|s| s.album.as_deref().map(|a| a.trim().to_lowercase()))
-            .collect();
-        let spaced: Vec<usize> = cands
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let s = eligible[i];
-                !s.by()
-                    .is_some_and(|a| artists.contains(&a.trim().to_lowercase()))
-                    && !s
-                        .album
-                        .as_deref()
-                        .is_some_and(|a| albums.contains(&a.trim().to_lowercase()))
-            })
-            .collect();
-        if spaced.is_empty() {
-            relax(&mut batch, Relax::Spacing);
-        } else {
-            cands = spaced;
         }
         // The weighted draw.
         let total: f64 = cands.iter().map(|&i| base[i]).sum();
@@ -665,21 +745,36 @@ pub fn select(
         history.push(song);
         batch.picks.push(Pick {
             id: song.id,
-            reasons: reasons(spec, song, now),
+            reasons: reasons(&spec.rules, &rules, seed.as_ref(), seed_as_given, song, now),
         });
+        if spec.follow {
+            seed = Some(song.clone());
+            seed_as_given = as_given.get(&song.id).copied();
+            if has_like {
+                base = weigh(seed.as_ref());
+            }
+        }
     }
     batch
 }
 
-/// The soft and share rules `s` matches, in the words a listener sees.
-/// Hard rules are left out: every song in the mix matches them.
-fn reasons(spec: &Spec, s: &Song, now: i64) -> Vec<String> {
-    let seed = spec.seed.as_ref();
-    spec.rules
+/// The soft and share rules `s` matches, in the words a listener sees:
+/// matched as `rules` (normalised), worded as `given`. Hard rules are left
+/// out: every song in the mix matches them.
+fn reasons(
+    given: &[Rule],
+    rules: &[Rule],
+    seed: Option<&Song>,
+    seed_given: Option<&Song>,
+    s: &Song,
+    now: i64,
+) -> Vec<String> {
+    given
         .iter()
-        .filter(|r| r.share.is_some() || r.weight == Weight::Prefer)
-        .filter(|r| matches(&r.test, s, seed, now))
-        .map(|r| r.test.describe(seed))
+        .zip(rules)
+        .filter(|(_, r)| r.share.is_some() || r.weight == Weight::Prefer)
+        .filter(|(_, r)| matches(&r.test, s, seed, now))
+        .map(|(g, _)| g.test.describe(seed_given))
         .collect()
 }
 
@@ -826,6 +921,77 @@ mod tests {
         let b = select(&lib, &one_artist, &[], 4, NOW, &mut XorShift::new(11));
         assert_eq!(b.picks.len(), 4);
         assert_eq!(b.relaxed, vec![Relax::Spacing]);
+    }
+
+    #[test]
+    fn spacing_wins_over_a_share_and_the_share_is_what_bends() {
+        // Every jazz song is by Artist 5, who just played; a 100% jazz share
+        // would repeat them, so the share gives way and spacing holds.
+        let lib: Vec<Song> = library()
+            .into_iter()
+            .filter(|s| s.id < 10 || (50..60).contains(&s.id))
+            .collect();
+        let spec = Spec {
+            artist_gap: 1,
+            rules: vec![Rule {
+                weight: Weight::Prefer,
+                share: Some(100),
+                test: Test::Genre("Jazz".into()),
+            }],
+            ..Spec::default()
+        };
+        let b = select(&lib, &spec, &[55], 1, NOW, &mut XorShift::new(3));
+        let pick = by_id(&lib, b.picks[0].id);
+        assert_eq!(pick.artist.as_deref(), Some("Artist 0"), "{b:?}");
+        assert_eq!(b.relaxed, vec![Relax::Share]);
+    }
+
+    #[test]
+    fn spacing_holds_whenever_a_fresh_song_satisfies_it() {
+        let lib = library();
+        let spec = Spec {
+            artist_gap: 2,
+            album_gap: 3,
+            ..Spec::default()
+        };
+        let recent: Vec<u64> = (0..95).collect();
+        let b = select(&lib, &spec, &recent, 5, NOW, &mut XorShift::new(8));
+        // Only Artist 9's last five songs are fresh: spacing cannot hold
+        // among them, so it bends; nothing repeats.
+        assert!(b.picks.iter().all(|p| p.id >= 95));
+        assert_eq!(b.relaxed, vec![Relax::Spacing]);
+    }
+
+    #[test]
+    fn following_walks_from_each_pick_to_the_next() {
+        let lib = library();
+        let spec = Spec {
+            rules: vec![
+                rule(Weight::Require, Test::Genre("Rock".into())),
+                rule(Weight::Prefer, Test::LikeSeed),
+            ],
+            seed: Some(by_id(&lib, 0).clone()),
+            follow: true,
+            artist_gap: 1,
+            ..Spec::default()
+        };
+        let b = select(&lib, &spec, &[0], 8, NOW, &mut XorShift::new(13));
+        assert_eq!(b.picks[0].reasons, vec!["Like Artist 0".to_owned()]);
+        for pair in b.picks.windows(2) {
+            let before = by_id(&lib, pair[0].id).artist.clone().unwrap();
+            assert_eq!(pair[1].reasons, vec![format!("Like {before}")], "{b:?}");
+        }
+    }
+
+    #[test]
+    fn reasons_keep_the_spelling_the_listener_gave() {
+        let lib = library();
+        let spec = Spec {
+            rules: vec![rule(Weight::Prefer, Test::Genre("ROCK".into()))],
+            ..Spec::default()
+        };
+        let b = select(&lib[..10], &spec, &[], 1, NOW, &mut XorShift::new(1));
+        assert_eq!(b.picks[0].reasons, vec!["ROCK".to_owned()]);
     }
 
     #[test]
@@ -976,7 +1142,10 @@ mod tests {
             ..Spec::default()
         };
         let s = by_id(&lib, 5); // Rock, 1975
-        assert_eq!(reasons(&spec, s, NOW), vec!["1970–1979".to_owned()]);
+        assert_eq!(
+            reasons(&spec.rules, &spec.rules, None, None, s, NOW),
+            vec!["1970–1979".to_owned()]
+        );
     }
 
     #[test]
@@ -1011,6 +1180,13 @@ mod tests {
             ..Spec::default()
         };
         assert_eq!(no_seed.validate().map_err(|e| e.label()), Err("no_seed"));
+        let loud = Spec {
+            rules: vec![rule(Weight::Prefer, Test::Energy { min: 10, max: 150 })],
+            ..Spec::default()
+        };
+        let e = loud.validate().expect_err("energy past 100%");
+        assert_eq!(e.label(), "out_of_range");
+        assert!(e.to_string().contains("150"), "{e}");
     }
 
     #[test]

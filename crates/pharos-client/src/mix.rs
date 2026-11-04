@@ -6,7 +6,7 @@ use pharos_api::pharos_capnp::{
     mix_batch, mix_rule, mix_spec, saved_mixes, MixWeight as WireWeight,
 };
 
-use crate::api::{read_item, read_item_ref, set_item_ref, Item, ItemRef};
+use crate::api::{read_item, read_item_ref, set_item_ref, text, Item, ItemRef};
 
 /// The pref key a user's saved mixes live under.
 pub const SAVED_KEY: &str = "mix.saved";
@@ -152,6 +152,25 @@ pub struct MixSpec {
 pub struct SavedMix {
     pub name: String,
     pub spec: MixSpec,
+    /// Set when a newer client saved it with a rule or seed this client does
+    /// not know: `spec` is then incomplete, so the mix must not be played or
+    /// edited here, and saving the list writes this stored copy back whole.
+    pub newer: Option<NewerSpec>,
+}
+
+/// A saved mix's spec exactly as it was stored (one capnp `MixSpec`
+/// message), kept so an older client never drops a newer client's rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerSpec(Vec<u8>);
+
+impl SavedMix {
+    pub fn new(name: impl Into<String>, spec: MixSpec) -> Self {
+        Self {
+            name: name.into(),
+            spec,
+            newer: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,14 +224,17 @@ pub fn presets() -> Vec<SavedMix> {
     };
     vec![
         SavedMix {
+            newer: None,
             name: "Drift".into(),
             spec: spaced(vec![rule(Weight::Prefer, Test::LikeSeed)], Seed::Follow),
         },
         SavedMix {
+            newer: None,
             name: "Favourites".into(),
             spec: spaced(vec![rule(Weight::Require, Test::Favorite)], Seed::None),
         },
         SavedMix {
+            newer: None,
             name: "Rediscover".into(),
             spec: spaced(
                 vec![
@@ -230,6 +252,7 @@ pub fn presets() -> Vec<SavedMix> {
             ),
         },
         SavedMix {
+            newer: None,
             name: "Deep cuts".into(),
             spec: spaced(
                 vec![
@@ -246,6 +269,7 @@ pub fn presets() -> Vec<SavedMix> {
             ),
         },
         SavedMix {
+            newer: None,
             name: "New arrivals".into(),
             spec: spaced(
                 vec![Rule {
@@ -324,10 +348,6 @@ pub(crate) fn write_spec(mut out: mix_spec::Builder<'_>, spec: &MixSpec) {
     }
 }
 
-fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
-    Ok(t?.to_string()?)
-}
-
 fn read_rule(r: mix_rule::Reader<'_>) -> Result<Option<Rule>, capnp::Error> {
     use mix_rule::test::Which as T;
     let weight = match r.get_weight() {
@@ -394,24 +414,42 @@ fn read_rule(r: mix_rule::Reader<'_>) -> Result<Option<Rule>, capnp::Error> {
     }))
 }
 
-fn read_spec(s: mix_spec::Reader<'_>) -> Result<MixSpec, capnp::Error> {
+/// The spec, and whether it held a rule or seed this client does not know
+/// (which [`read_rule`] left out).
+fn read_spec(s: mix_spec::Reader<'_>) -> Result<(MixSpec, bool), capnp::Error> {
+    let mut newer = false;
     let seed = match s.get_seed().which() {
         Ok(mix_spec::seed::Song(id)) => Seed::Song(read_item_ref(id?)?),
         Ok(mix_spec::seed::Follow(())) => Seed::Follow,
-        Ok(mix_spec::seed::None(())) | Err(_) => Seed::None,
+        Ok(mix_spec::seed::None(())) => Seed::None,
+        Err(_) => {
+            newer = true;
+            Seed::None
+        }
     };
     let mut rules = Vec::new();
     for r in s.get_rules()?.iter() {
-        if let Some(r) = read_rule(r)? {
-            rules.push(r);
+        match read_rule(r)? {
+            Some(r) => rules.push(r),
+            None => newer = true,
         }
     }
-    Ok(MixSpec {
+    let spec = MixSpec {
         rules,
         seed,
         artist_gap: s.get_artist_gap(),
         album_gap: s.get_album_gap(),
-    })
+    };
+    Ok((spec, newer))
+}
+
+/// `spec` as a message of its own, to keep a newer client's mix whole.
+fn keep(spec: mix_spec::Reader<'_>) -> Result<NewerSpec, capnp::Error> {
+    let mut message = capnp::message::Builder::new_default();
+    message.set_root(spec)?;
+    Ok(NewerSpec(capnp::serialize::write_message_to_words(
+        &message,
+    )))
 }
 
 fn texts(list: capnp::Result<capnp::text_list::Reader<'_>>) -> Result<Vec<String>, capnp::Error> {
@@ -447,13 +485,31 @@ pub fn encode_saved(mixes: &[SavedMix]) -> Vec<u8> {
         for (i, m) in (0..list.len()).zip(mixes) {
             let mut out = list.reborrow().get(i);
             out.set_name(m.name.as_str());
+            if let Some(kept) = &m.newer {
+                // Written back exactly as stored; it was readable when kept.
+                if let Ok(spec) = read_kept(kept) {
+                    let copied = spec
+                        .get_root::<mix_spec::Reader<'_>>()
+                        .and_then(|r| out.set_spec(r));
+                    if copied.is_ok() {
+                        continue;
+                    }
+                }
+            }
             write_spec(out.init_spec(), &m.spec);
         }
     }
     capnp::serialize::write_message_to_words(&message)
 }
 
-/// The saved mixes in `bytes`; rules this client does not know are dropped.
+fn read_kept(
+    kept: &NewerSpec,
+) -> Result<capnp::message::Reader<capnp::serialize::OwnedSegments>, capnp::Error> {
+    capnp::serialize::read_message(&mut &kept.0[..], capnp::message::ReaderOptions::new())
+}
+
+/// The saved mixes in `bytes`. A mix with a rule this client does not know
+/// comes back with `newer` set, its stored spec kept whole.
 pub fn decode_saved(bytes: &[u8]) -> Result<Vec<SavedMix>, capnp::Error> {
     let message = capnp::serialize::read_message_from_flat_slice(
         &mut &bytes[..],
@@ -463,9 +519,12 @@ pub fn decode_saved(bytes: &[u8]) -> Result<Vec<SavedMix>, capnp::Error> {
     root.get_mixes()?
         .iter()
         .map(|m| {
+            let stored = m.get_spec()?;
+            let (spec, newer) = read_spec(stored)?;
             Ok(SavedMix {
                 name: text(m.get_name())?,
-                spec: read_spec(m.get_spec()?)?,
+                spec,
+                newer: if newer { Some(keep(stored)?) } else { None },
             })
         })
         .collect()
@@ -489,6 +548,7 @@ mod tests {
             .collect();
         let mixes = vec![
             SavedMix {
+                newer: None,
                 name: "All".into(),
                 spec: MixSpec {
                     rules,
@@ -498,6 +558,7 @@ mod tests {
                 },
             },
             SavedMix {
+                newer: None,
                 name: "Follow".into(),
                 spec: MixSpec {
                     seed: Seed::Follow,
@@ -508,6 +569,68 @@ mod tests {
         let mut all = mixes.clone();
         all.extend(presets());
         assert_eq!(decode_saved(&encode_saved(&all)).unwrap(), all);
+    }
+
+    /// A saved list with a known Exclude-favourites rule then `second`.
+    fn two_rules(second: Test) -> Vec<u8> {
+        let rule = |test| Rule {
+            weight: Weight::Exclude,
+            share: 0,
+            test,
+        };
+        encode_saved(&[SavedMix::new(
+            "Future",
+            MixSpec {
+                rules: vec![rule(Test::Favorite), rule(second)],
+                ..MixSpec::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn a_rule_from_a_newer_client_is_kept_whole_through_a_save() {
+        // Two encodings that differ only in the second rule's test tag
+        // (both void tests) locate that tag; 99 is a tag no variant has,
+        // as a newer schema would write.
+        let a = two_rules(Test::Favorite);
+        let b = two_rules(Test::NeverPlayed);
+        let at: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        assert_eq!(at.len(), 1, "only the tag differs");
+        let mut future = a.clone();
+        future[at[0]] = 99;
+
+        let decoded = decode_saved(&future).unwrap();
+        assert!(
+            decode_saved(&a).unwrap()[0].newer.is_none(),
+            "every rule known"
+        );
+        assert!(
+            decoded[0].newer.is_some(),
+            "an unknown rule marks the mix newer"
+        );
+        assert_eq!(
+            decoded[0].spec.rules.len(),
+            1,
+            "only the known rule is readable"
+        );
+        // Saving the list again writes the stored spec back whole.
+        let saved = encode_saved(&decoded);
+        let message = capnp::serialize::read_message_from_flat_slice(
+            &mut &saved[..],
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let root = message.get_root::<saved_mixes::Reader<'_>>().unwrap();
+        let rules = root
+            .get_mixes()
+            .unwrap()
+            .get(0)
+            .get_spec()
+            .unwrap()
+            .get_rules()
+            .unwrap();
+        assert_eq!(rules.len(), 2, "the newer rule survives the save");
+        assert!(decode_saved(&saved).unwrap()[0].newer.is_some());
     }
 
     #[test]

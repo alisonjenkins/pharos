@@ -205,7 +205,7 @@ struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
 # A dynamic mix (spec 024): rules the next songs must, should or should not
 # meet. The call is stateless: the client sends the spec, what was heard or
 # queued (`recent`, oldest first, at most 200 read) and how many songs it
-# wants (at most 50), and gets that many back with the rules each matched.
+# wants (1 to 50), and gets that many back with the rules each matched.
 # Hard rules (require, exclude) never bend; a mix that runs out of songs
 # answers short with `exhausted`. Freshness, shares and spacing bend only
 # when they would leave nothing, and each bend is named in `relaxed`
@@ -237,7 +237,7 @@ struct MixSpec {
   seed :union {
     none @1 :Void;              # a likeSeed rule is refused
     song @2 :ItemId;            # like this song
-    follow @3 :Void;            # like the song heard last, drifting as the mix plays
+    follow @3 :Void;            # like the last song in `recent`, then each pick like the one before: the mix walks
   }
   artistGap @4 :UInt8;          # no artist again within this many songs
   albumGap @5 :UInt8;           # no album again within this many songs

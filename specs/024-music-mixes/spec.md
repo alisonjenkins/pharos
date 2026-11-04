@@ -69,7 +69,10 @@ eligible. *More* (`prefer`) multiplies a song's chance by 4, *Less*
 (`avoid`) divides it by 4. A *More* rule with a share instead aims for
 that percentage of songs.
 
-**Seed**: none, a song (radio), or *follow* (the song heard last).
+**Seed**: none, a song (radio), or *follow*: the last song heard or
+queued, then each pick in turn, so the mix walks from song to song
+("Drift"). Hard like-seed rules hold against the song the batch started
+from; the soft ones follow the walk.
 
 ## How a batch is picked
 
@@ -80,13 +83,14 @@ The server engine (`services::mix::select`, pure) runs per pick:
 2. Freshness: songs in `recent` or already picked are out while a fresh
    one is left. Otherwise the older half of `recent` may repeat
    (`relaxed: repeat`).
-3. Shares: for each share rule, look at the last 20 songs; with target *p*
-   and observed *q*, the next song must match with probability
-   clamp(2*p* − *q*). If nothing satisfies that, the share sits out this
-   pick (`relaxed: share`).
-4. Spacing: drop songs whose artist was in the last `artistGap` songs or
+3. Spacing: drop songs whose artist was in the last `artistGap` songs or
    whose album was in the last `albumGap`; if that leaves nothing, ignore
    spacing for this pick (`relaxed: spacing`).
+4. Shares: for each share rule, look at the last 20 songs; with target *p*
+   and observed *q*, the next song must match with probability
+   clamp(2*p* − *q*). If nothing satisfies that, the share sits out this
+   pick (`relaxed: share`). Shares bend before spacing: a share corrects
+   itself over the next picks, a repeated artist cannot be taken back.
 5. Weighted random draw over what's left.
 
 If eligible songs run out before `count`, the batch comes back short with
