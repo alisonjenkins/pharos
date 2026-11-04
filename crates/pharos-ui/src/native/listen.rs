@@ -6,9 +6,11 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use super::browse::track_length;
 use super::lyrics::LyricsPanel;
 use super::platform;
 use super::playback::{clock, MediaEvent, MediaState};
+use super::queue::{Entry, QueueAction};
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
     total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
@@ -33,6 +35,12 @@ const SEEK_GIVE_UP_MS: u32 = 5_000;
 /// Device-local: whether the listener hid the lyrics panel.
 const LYRICS_KEY: &str = "pharos.listen.lyrics";
 const LYRICS_HIDDEN: &str = "hidden";
+
+/// Device-local: whether the listener opened the queue. It starts closed,
+/// so the visualiser keeps the screen (B435/V375).
+const QUEUE_KEY: &str = "pharos.listen.queue";
+const QUEUE_SHOWN: &str = "shown";
+pub const QUEUE_PANEL_ID: &str = "pharos-queue";
 
 /// The analyser on this screen's media element. Web Audio routes an element
 /// once, so it outlives style changes and is shared with each visualiser.
@@ -108,6 +116,11 @@ pub fn ListenView(
     next: Option<ItemRef>,
     /// The song's lyrics; `None` while they load or when the server has none.
     lyrics: Option<Lyrics>,
+    /// What plays after this song (B435/V375).
+    #[props(default)]
+    queue: Vec<Entry>,
+    #[props(default)] shuffled: bool,
+    #[props(default)] on_queue: EventHandler<QueueAction>,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
 ) -> Element {
@@ -129,6 +142,19 @@ pub fn ListenView(
         }
     };
     let lyrics = lyrics.filter(|l| !l.lines.is_empty());
+    let mut show_queue = use_signal(|| {
+        platform::stored_theme(QUEUE_KEY).ok().flatten().as_deref() == Some(QUEUE_SHOWN)
+    });
+    let mut toggle_queue = move || {
+        let show = !show_queue();
+        show_queue.set(show);
+        platform::info(&format!("pharos: queue panel shown={show}"));
+        if let Err(e) = platform::store_theme(QUEUE_KEY, if show { QUEUE_SHOWN } else { "hidden" })
+        {
+            platform::warn(&format!("pharos: queue choice not stored error={e}"));
+        }
+    };
+    let queued = queue.len();
     let mut choose = move |next: Style| {
         style.set(next);
         fallback.set(None);
@@ -207,14 +233,31 @@ pub fn ListenView(
                         }
                     }
                 }
-                if lyrics.is_some() {
+                div { class: "pharos-listen-panels", role: "group", aria_label: "Panels",
+                    // Always drawn, so the listener can see where lyrics
+                    // live even on a song that has none (B437/V377).
                     button {
                         class: "pharos-chip pharos-lyrics-toggle",
                         r#type: "button",
-                        aria_pressed: if show_lyrics() { "true" } else { "false" },
-                        aria_controls: show_lyrics().then_some(super::lyrics::PANEL_ID),
+                        disabled: lyrics.is_none(),
+                        title: if lyrics.is_none() { "No lyrics for this song" } else { "Show or hide the lyrics" },
+                        aria_pressed: if lyrics.is_some() && show_lyrics() { "true" } else { "false" },
+                        aria_controls: (lyrics.is_some() && show_lyrics()).then_some(super::lyrics::PANEL_ID),
                         onclick: move |_| toggle_lyrics(),
                         "Lyrics"
+                    }
+                    button {
+                        class: "pharos-chip pharos-queue-toggle",
+                        r#type: "button",
+                        title: "Show or hide what plays next",
+                        aria_pressed: if show_queue() { "true" } else { "false" },
+                        aria_controls: show_queue().then_some(QUEUE_PANEL_ID),
+                        onclick: move |_| toggle_queue(),
+                        Icon { path: ICON_QUEUE_NEXT }
+                        "Queue"
+                        if queued > 0 {
+                            span { class: "pharos-queue-count", aria_label: "{queued} songs", "{queued}" }
+                        }
                     }
                 }
                 if let Some(note) = note {
@@ -227,6 +270,9 @@ pub fn ListenView(
                     position_ms: media.position_ms,
                     on_seek: move |ms| on_control.call(Control::Seek(ms)),
                 }
+            }
+            if show_queue() {
+                QueuePanel { queue: queue.clone(), shuffled, on_queue }
             }
             div { class: "pharos-listen-body",
                 div { class: "pharos-listen-cover",
@@ -351,6 +397,173 @@ pub fn ListenView(
     }
 }
 
+/// What plays next, over the visualiser's edge (B435/V375): pick a song to
+/// skip to it, drag a row (or use its arrows) to move it, shuffle, remove
+/// or clear.
+#[component]
+fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAction>) -> Element {
+    // The row being dragged, by key, and the position it would drop at.
+    let mut dragging = use_signal(|| None::<u64>);
+    let mut over = use_signal(|| None::<usize>);
+    let total = queue.len();
+    let count = match total {
+        0 => String::new(),
+        1 => "1 song".to_owned(),
+        n => format!("{n} songs"),
+    };
+    let mut end_drag = move || {
+        dragging.set(None);
+        over.set(None);
+    };
+    rsx! {
+        aside {
+            id: QUEUE_PANEL_ID,
+            class: "pharos-queue",
+            aria_label: "Queue",
+            // The screen's wheel moves the volume; here it scrolls the list.
+            onwheel: move |evt: WheelEvent| evt.stop_propagation(),
+            // Keys on the queue's own buttons are theirs, not the player's.
+            onkeydown: move |evt: KeyboardEvent| {
+                let key = evt.key();
+                let own = matches!(key, Key::Enter | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown)
+                    || matches!(&key, Key::Character(k) if k == " ");
+                if own {
+                    evt.stop_propagation();
+                }
+            },
+            div { class: "pharos-queue-head",
+                h2 { class: "pharos-queue-title", "Up next" }
+                span { class: "pharos-muted pharos-queue-total", "{count}" }
+                button {
+                    class: "pharos-chip pharos-queue-shuffle",
+                    r#type: "button",
+                    aria_pressed: if shuffled { "true" } else { "false" },
+                    onclick: move |_| on_queue.call(QueueAction::Shuffle(!shuffled)),
+                    Icon { path: ICON_SHUFFLE }
+                    "Shuffle"
+                }
+                if total > 0 {
+                    button {
+                        class: "pharos-chip",
+                        r#type: "button",
+                        onclick: move |_| on_queue.call(QueueAction::Clear),
+                        "Clear"
+                    }
+                }
+            }
+            if queue.is_empty() {
+                p { class: "pharos-muted pharos-queue-empty",
+                    "Nothing queued. Use Play next or Add to queue on any song or album."
+                }
+            }
+            ol { class: "pharos-queue-list",
+                for (at, entry) in queue.into_iter().enumerate() {
+                    QueueRow {
+                        key: "{entry.key}",
+                        is_dragged: dragging() == Some(entry.key),
+                        entry,
+                        at,
+                        total,
+                        drop_here: over() == Some(at) && dragging().is_some(),
+                        on_queue,
+                        on_drag: move |key| dragging.set(Some(key)),
+                        on_over: move |at| over.set(Some(at)),
+                        on_drop: move |at: usize| {
+                            if let Some(key) = *dragging.peek() {
+                                platform::info(&format!("pharos: queue drag to={at}"));
+                                on_queue.call(QueueAction::Move { key, to: at });
+                            }
+                            end_drag();
+                        },
+                        on_end: move |()| end_drag(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QueueRow(
+    entry: Entry,
+    at: usize,
+    total: usize,
+    is_dragged: bool,
+    drop_here: bool,
+    on_queue: EventHandler<QueueAction>,
+    on_drag: EventHandler<u64>,
+    on_over: EventHandler<usize>,
+    on_drop: EventHandler<usize>,
+    on_end: EventHandler<()>,
+) -> Element {
+    let key = entry.key;
+    let name = entry.name.clone();
+    let length = track_length(entry.runtime_ms);
+    rsx! {
+        li {
+            class: "pharos-queue-entry",
+            draggable: "true",
+            "data-source": entry.source.label(),
+            "data-key": "{key}",
+            "data-drop": if drop_here && !is_dragged { "true" } else { "false" },
+            "data-dragging": if is_dragged { "true" } else { "false" },
+            ondragstart: move |evt: DragEvent| {
+                // Firefox starts a drag only once it carries some data.
+                if let Err(e) = evt.data_transfer().set_data("text/plain", &key.to_string()) {
+                    platform::warn(&format!("pharos: queue drag data not set error={e}"));
+                }
+                on_drag.call(key);
+            },
+            ondragover: move |evt: DragEvent| {
+                evt.prevent_default();
+                on_over.call(at);
+            },
+            ondrop: move |evt: DragEvent| {
+                evt.prevent_default();
+                on_drop.call(at);
+            },
+            ondragend: move |_| on_end.call(()),
+            span { class: "pharos-queue-grip", aria_hidden: "true", "⠿" }
+            button {
+                class: "pharos-queue-name",
+                r#type: "button",
+                title: "Play {name} now",
+                onclick: move |_| on_queue.call(QueueAction::Play(key)),
+                "{name}"
+            }
+            span { class: "pharos-queue-length pharos-muted",
+                if let Some(l) = length { "{l}" }
+            }
+            button {
+                class: "pharos-queue-icon",
+                r#type: "button",
+                aria_label: "Move {name} up",
+                title: "Move up",
+                disabled: at == 0,
+                onclick: move |_| on_queue.call(QueueAction::Move { key, to: at.saturating_sub(1) }),
+                Icon { path: ICON_UP }
+            }
+            button {
+                class: "pharos-queue-icon",
+                r#type: "button",
+                aria_label: "Move {name} down",
+                title: "Move down",
+                disabled: at + 1 >= total,
+                onclick: move |_| on_queue.call(QueueAction::Move { key, to: at + 1 }),
+                Icon { path: ICON_DOWN }
+            }
+            button {
+                class: "pharos-queue-icon",
+                r#type: "button",
+                aria_label: "Remove {name} from the queue",
+                title: "Remove",
+                onclick: move |_| on_queue.call(QueueAction::Remove(key)),
+                Icon { path: ICON_REMOVE }
+            }
+        }
+    }
+}
+
 /// "2003 · Trip-hop, Electronic"; `None` when there is neither.
 fn meta_line(year: Option<u16>, genres: &[String]) -> Option<String> {
     let parts: Vec<String> = year
@@ -368,10 +581,18 @@ const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
 const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
 const ICON_LEAVE: &str = "M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20Z";
 const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
+/// The queue's icons (B435/V375).
+pub const ICON_QUEUE_NEXT: &str = "M19 9H2v2h17V9Zm0-4H2v2h17V5ZM2 15h13v-2H2v2Zm15-2v6l5-3-5-3Z";
+pub const ICON_QUEUE_ADD: &str =
+    "M14 10H3v2h11v-2Zm0-4H3v2h11V6Zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4ZM3 16h7v-2H3v2Z";
+const ICON_SHUFFLE: &str = "M10.6 9.2 5.4 4 4 5.4l5.2 5.2 1.4-1.4ZM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4h-5.5Zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2-3.2-3.1Z";
+const ICON_REMOVE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4Z";
+const ICON_UP: &str = "m12 8-6 6 1.4 1.4 4.6-4.6 4.6 4.6L18 14l-6-6Z";
+const ICON_DOWN: &str = "M16.6 8.6 12 13.2 7.4 8.6 6 10l6 6 6-6-1.4-1.4Z";
 const ICON_MUTED: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4L16.6 12Z";
 
 #[component]
-fn Icon(path: &'static str) -> Element {
+pub fn Icon(path: &'static str) -> Element {
     rsx! {
         svg {
             class: "pharos-icon",
@@ -503,6 +724,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::native::queue::Source;
 
     fn render(title: &str, image: Option<&str>) -> String {
         render_with(title, image, MediaState::default())
@@ -630,17 +852,22 @@ mod tests {
     }
 
     #[test]
-    fn lyrics_get_a_panel_and_a_toggle_only_when_there_are_some() {
+    fn lyrics_get_a_panel_only_when_there_are_some_but_the_toggle_always_shows() {
         use pharos_client::api::LyricLine;
+        // B437/V377: the toggle is always there, greyed out with nothing to show.
         let none = render_full("Teardrop", None, MediaState::default(), None);
-        assert!(!none.contains("pharos-lyrics"), "{none}");
+        assert!(!none.contains(r#"id="pharos-lyrics""#), "{none}");
+        let toggle = lyrics_toggle(&none);
+        assert!(toggle.contains("disabled"), "{toggle}");
+        assert!(toggle.contains("No lyrics for this song"), "{toggle}");
         let empty = render_full(
             "Teardrop",
             None,
             MediaState::default(),
             Some(Lyrics::default()),
         );
-        assert!(!empty.contains("pharos-lyrics"), "{empty}");
+        assert!(!empty.contains(r#"id="pharos-lyrics""#), "{empty}");
+        assert!(lyrics_toggle(&empty).contains("disabled"), "{empty}");
 
         let words = Lyrics {
             synced: true,
@@ -653,6 +880,127 @@ mod tests {
         assert!(html.contains(r#"aria-label="Lyrics""#), "{html}");
         assert!(html.contains("Love, love is a verb"), "{html}");
         assert!(html.contains(r#"aria-controls="pharos-lyrics""#), "{html}");
+        assert!(!lyrics_toggle(&html).contains("disabled"), "{html}");
+    }
+
+    /// The opening tag of the lyrics toggle.
+    fn lyrics_toggle(html: &str) -> &str {
+        html.split_once("pharos-lyrics-toggle")
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(tag, _)| tag)
+            .expect("a lyrics toggle")
+    }
+
+    fn entry(key: u64, name: &str, source: Source) -> Entry {
+        Entry {
+            key,
+            id: ItemRef::Real(key),
+            name: name.to_owned(),
+            runtime_ms: 187_000,
+            source,
+        }
+    }
+
+    #[test]
+    fn the_queue_starts_closed_beside_the_lyrics_toggle_with_its_count() {
+        let queue = vec![
+            entry(1, "Angel", Source::Album),
+            entry(2, "Inertia Creeps", Source::Added),
+        ];
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                rsx! {
+                    ListenView {
+                        title: "Teardrop".to_owned(),
+                        image: None,
+                        year: None,
+                        genres: Vec::new(),
+                        runtime_ms: 330_000,
+                        media: MediaState::default(),
+                        lyrics: None,
+                        queue: queue.clone(),
+                        on_media: |_| {},
+                        on_control: |_| {},
+                    }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        // The visualiser keeps the screen until the listener opens the queue.
+        assert!(!html.contains(r#"id="pharos-queue""#), "{html}");
+        let panels = html
+            .split_once(r#"aria-label="Panels""#)
+            .map(|(_, rest)| rest)
+            .expect("the panel toggles");
+        let (lyrics, queue) = (
+            panels.find("pharos-lyrics-toggle").expect("lyrics"),
+            panels.find("pharos-queue-toggle").expect("queue"),
+        );
+        assert!(lyrics < queue, "{panels}");
+        assert!(html.contains(r#"aria-label="2 songs""#), "{html}");
+        assert!(html.contains(r#"aria-pressed="false""#), "{html}");
+    }
+
+    fn render_panel(queue: Vec<Entry>, shuffled: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                rsx! {
+                    QueuePanel { queue: queue.clone(), shuffled, on_queue: |_| {} }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_queue_panel_lists_each_song_with_its_controls() {
+        let html = render_panel(
+            vec![
+                entry(1, "Angel", Source::Album),
+                entry(2, "Inertia Creeps", Source::Added),
+            ],
+            true,
+        );
+        assert!(html.contains(r#"id="pharos-queue""#), "{html}");
+        assert!(html.contains("2 songs"), "{html}");
+        assert!(html.contains(r#"draggable="true""#), "{html}");
+        assert!(html.contains(r#"data-source="added""#), "{html}");
+        assert!(html.contains("3:07"), "{html}");
+        for label in [
+            "Move Angel up",
+            "Move Angel down",
+            "Remove Angel from the queue",
+            "Remove Inertia Creeps from the queue",
+        ] {
+            assert!(
+                html.contains(&format!(r#"aria-label="{label}""#)),
+                "{label}"
+            );
+        }
+        // The first cannot go up, the last cannot go down.
+        let up = html
+            .split_once(r#"aria-label="Move Angel up""#)
+            .map(|(_, rest)| rest.split_once('>').map_or("", |(t, _)| t))
+            .expect("move up");
+        assert!(up.contains("disabled"), "{up}");
+        let shuffle = html
+            .split_once("pharos-queue-shuffle")
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(tag, _)| tag)
+            .expect("shuffle");
+        assert!(shuffle.contains(r#"aria-pressed="true""#), "{shuffle}");
+        assert!(html.contains("Clear"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_queue_says_how_to_fill_it() {
+        let html = render_panel(Vec::new(), false);
+        assert!(html.contains("Nothing queued."), "{html}");
+        assert!(!html.contains("Clear"), "{html}");
     }
 
     #[test]
