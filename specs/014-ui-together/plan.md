@@ -73,7 +73,7 @@ UI lands.
 # Session
 group @9 (ctx :CallContext) -> (group :Group);
 
-struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; isPharos @3 :Bool; }
+struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; }
 struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); }
 struct GroupsResult { union { groups @0 :List(GroupSummary); error @1 :Error; } }
 # The ResumeResult pattern, not a union, so calls on `membership` pipeline. A
@@ -99,7 +99,7 @@ interface Membership {
   ping        @6 (ctx :CallContext) -> (result :Done);   # MemberPing, every 30 s (T83 ghost TTL is 150 s)
   clockReport @7 (ctx :CallContext, t1 :UInt64, t2 :UInt64, t3 :UInt64, t4 :UInt64) -> (result :Done);   # ObserveClock: the server's RTT for its lead time
 }
-enum EndReason { left @0; dissolved @1; notInGroup @2; removed @3; }
+enum EndReason { left @0; notInGroup @1; }
 struct GroupUpdate {
   union {
     joined  @0 :GroupSummary;
@@ -108,7 +108,6 @@ struct GroupUpdate {
     left    @5 :Text;                  # member id
     item    @6 :ItemAt;                # the group's current entry, from PlayQueue
     ended   @7 :EndReason;
-    error   @8 :Error;
   }
   struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; }
   struct ItemAt { item @0 :ItemId; playlistItemId @1 :Text; positionMs @2 :UInt64; playing @3 :Bool; }
