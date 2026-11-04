@@ -1184,7 +1184,7 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     match kind {
         Engine::Direct | Engine::NativeHls => Ok(Box::new(NativeVideo::default())),
         Engine::HlsJs => {
-            load_hlsjs().await?;
+            load_script(HLSJS_SRC, "Hls").await?;
             Ok(Box::new(HlsJs::default()))
         }
         Engine::Unsupported => Err("this browser cannot play HLS".into()),
@@ -1302,10 +1302,11 @@ extern "C" {
     fn recover_media_error(this: &HlsPlayer);
 }
 
-/// Add hls.js's `<script>` once and wait for it.
-async fn load_hlsjs() -> Result<(), String> {
+/// Add the `<script>` at `src` once and wait for it; `global` is the name
+/// it defines, which shows it already ran.
+async fn load_script(src: &str, global: &str) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
-    if js_sys::Reflect::has(&window, &JsValue::from_str("Hls")).unwrap_or(false) {
+    if js_sys::Reflect::has(&window, &JsValue::from_str(global)).unwrap_or(false) {
         return Ok(());
     }
     let document = window.document().ok_or("no document")?;
@@ -1314,7 +1315,7 @@ async fn load_hlsjs() -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?
         .dyn_into::<web_sys::HtmlScriptElement>()
         .map_err(|_| "not a script element")?;
-    script.set_src(HLSJS_SRC);
+    script.set_src(src);
     let loaded = js_sys::Promise::new(&mut |resolve, reject| {
         script.set_onload(Some(&resolve));
         script.set_onerror(Some(&reject));
@@ -1326,8 +1327,114 @@ async fn load_hlsjs() -> Result<(), String> {
         .map_err(|e| format!("{e:?}"))?;
     wasm_bindgen_futures::JsFuture::from(loaded)
         .await
-        .map_err(|_| format!("could not load {HLSJS_SRC}"))?;
+        .map_err(|_| format!("could not load {src}"))?;
     Ok(())
+}
+
+/// The vendored JASSUB (ADR-0057), served from this origin like hls.js.
+const JASSUB_DIR: &str = "/ui/assets/vendor/jassub";
+/// How long the renderer may take to load its wasm, fonts and script and get
+/// ready to draw before the player gives up on it and keeps the WebVTT; a
+/// cold extraction of an embedded track takes the server up to about 30 s.
+const STYLED_READY_MS: u32 = 45_000;
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = JASSUB)]
+    type Jassub;
+    #[wasm_bindgen(catch, constructor, js_class = "JASSUB")]
+    fn new(options: &JsValue) -> Result<Jassub, JsValue>;
+    #[wasm_bindgen(method, getter, js_class = "JASSUB")]
+    fn ready(this: &Jassub) -> js_sys::Promise;
+    #[wasm_bindgen(method, js_class = "JASSUB")]
+    fn destroy(this: &Jassub) -> js_sys::Promise;
+}
+
+/// An ASS/SSA script drawn over the `<video>` by libass in a worker. It
+/// lays its canvas right after the video, so the video's parent must hold
+/// nothing else Dioxus diffs. Dropping it removes the canvas and the worker.
+pub struct StyledSubtitles {
+    jassub: Jassub,
+    live: Rc<std::cell::Cell<bool>>,
+}
+
+impl Drop for StyledSubtitles {
+    fn drop(&mut self) {
+        self.live.set(false);
+        let _ = self.jassub.destroy();
+    }
+}
+
+/// Starts drawing the script at `url` over `<video id=video_id>`. While it
+/// is not dropped, `report` hears `Ok` once the renderer is ready, or why it
+/// failed or did not get ready in time.
+pub async fn styled_subtitles(
+    video_id: &str,
+    url: &str,
+    report: Rc<dyn Fn(Result<(), String>)>,
+) -> Result<StyledSubtitles, String> {
+    let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
+    load_script(&format!("{JASSUB_DIR}/jassub.js"), "JASSUB").await?;
+    let set = |o: &js_sys::Object, k: &str, v: &JsValue| {
+        js_sys::Reflect::set(o, &JsValue::from_str(k), v).map_err(|e| format!("{e:?}"))
+    };
+    let fonts = js_sys::Object::new();
+    set(
+        &fonts,
+        "liberation sans",
+        &JsValue::from_str(&format!("{JASSUB_DIR}/default.woff2")),
+    )?;
+    let options = js_sys::Object::new();
+    set(&options, "video", &video)?;
+    set(&options, "subUrl", &JsValue::from_str(url))?;
+    for (key, file) in [
+        ("workerUrl", "jassub-worker.js"),
+        ("wasmUrl", "jassub-worker.wasm"),
+        ("modernWasmUrl", "jassub-worker-modern.wasm"),
+    ] {
+        set(
+            &options,
+            key,
+            &JsValue::from_str(&format!("{JASSUB_DIR}/{file}")),
+        )?;
+    }
+    set(&options, "availableFonts", &fonts)?;
+    set(
+        &options,
+        "defaultFont",
+        &JsValue::from_str("liberation sans"),
+    )?;
+    // Not the Local Font Access API: it asks the viewer for a permission.
+    set(&options, "queryFonts", &JsValue::FALSE)?;
+    let jassub = Jassub::new(&options).map_err(|e| format!("{e:?}"))?;
+    let live = Rc::new(std::cell::Cell::new(true));
+    let ready = wasm_bindgen_futures::JsFuture::from(jassub.ready());
+    spawn_detached({
+        let live = Rc::clone(&live);
+        async move {
+            let ready = std::pin::pin!(ready);
+            let timeout = std::pin::pin!(sleep_ms(STYLED_READY_MS));
+            let result = match futures_util::future::select(ready, timeout).await {
+                futures_util::future::Either::Left((Ok(_), _)) => Ok(()),
+                futures_util::future::Either::Left((Err(e), _)) => Err(js_message(&e)),
+                futures_util::future::Either::Right(_) => {
+                    Err(format!("not ready after {STYLED_READY_MS} ms"))
+                }
+            };
+            if live.get() {
+                report(result);
+            }
+        }
+    });
+    Ok(StyledSubtitles { jassub, live })
+}
+
+/// A thrown value's `message`, or its debug form.
+fn js_message(e: &JsValue) -> String {
+    js_sys::Reflect::get(e, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|m| m.as_string())
+        .unwrap_or_else(|| format!("{e:?}"))
 }
 
 /// Plays an HLS playlist through hls.js and Media Source Extensions.
