@@ -110,6 +110,9 @@ pub struct Queue {
     /// The song a step back went to, which starts without reseeding the
     /// album part of the queue.
     returning: Option<(ItemRef, Source)>,
+    /// The song a step back went to, which plays from its start rather than
+    /// from where it was left.
+    from_start: Option<ItemRef>,
     /// The song the queue was last told started: once it knows the playing
     /// song, the queue alone says what is next.
     current: Option<ItemRef>,
@@ -167,6 +170,12 @@ impl Queue {
     /// started yet.
     pub fn stepping_back(&self) -> bool {
         self.returning.is_some()
+    }
+
+    /// Whether `id` plays from 0 s, as the song a step back went to does,
+    /// whatever position the server saved for it.
+    pub fn plays_from_start(&self, id: ItemRef) -> bool {
+        self.from_start == Some(id)
     }
 
     pub fn contains(&self, id: ItemRef) -> bool {
@@ -232,6 +241,9 @@ impl Queue {
             self.recent.truncate(RECENT);
         }
         self.current = Some(id);
+        if self.from_start != Some(id) {
+            self.from_start = None;
+        }
         let returning = self.returning.take().filter(|(r, _)| *r == id);
         if self.next() == Some(id) {
             let source = self.upcoming.remove(0).source;
@@ -324,6 +336,7 @@ impl Queue {
         }
         self.upcoming.insert(0, again);
         self.returning = Some(previous);
+        self.from_start = Some(previous.0);
         Some(previous.0)
     }
 
@@ -636,11 +649,16 @@ mod tests {
         assert_eq!(q.back(track(2)), Some(ItemRef::Real(1)));
         assert!(q.expects(ItemRef::Real(1)));
         assert!(q.stepping_back());
+        assert!(q.plays_from_start(ItemRef::Real(1)));
         // The song stepped back to starts without reseeding the album.
         q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
         assert_eq!(ids(&q), [2, 3]);
         assert_eq!(q.next(), Some(ItemRef::Real(2)));
         assert!(!q.stepping_back());
+        // Still from the start if the song remounts; not once another starts.
+        assert!(q.plays_from_start(ItemRef::Real(1)));
+        q.started(ItemRef::Real(2), None, 0);
+        assert!(!q.plays_from_start(ItemRef::Real(1)));
     }
 
     #[test]
