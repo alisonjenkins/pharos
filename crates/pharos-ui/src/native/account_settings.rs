@@ -1,12 +1,13 @@
 //! The Account page (`/settings/account`) as a pure view: your avatar over
-//! `Session.setAvatar` / `removeAvatar`, and your password over
-//! `Session.changePassword`.
+//! `Session.setAvatar` / `removeAvatar`, your password over
+//! `Session.changePassword`, and this device's playback choices.
 
 use dioxus::prelude::*;
 use pharos_client::api::{Me, PASSWORD_CHANGED_REVOKE_FAILED};
 use pharos_client::ClientError;
 
 use super::account::Avatar;
+use super::playback::{parse_crossfade, CROSSFADE_CHOICES};
 
 /// Largest picture sent as an avatar: the server's `setAvatar` cap, under
 /// one WebSocket message. A bigger one is scaled down in the browser first.
@@ -86,6 +87,10 @@ pub fn AccountView(
     on_change_password: EventHandler<(String, String)>,
     on_pick_avatar: EventHandler<()>,
     on_remove_avatar: EventHandler<()>,
+    /// The crossfade between songs, in seconds; 0 is off.
+    #[props(default)]
+    crossfade_s: u32,
+    #[props(default)] on_crossfade: EventHandler<u32>,
 ) -> Element {
     let name = me.as_ref().map(|me| me.name.clone());
     let has_avatar = me.as_ref().is_some_and(|me| me.avatar_url.is_some());
@@ -131,6 +136,27 @@ pub fn AccountView(
                 match &avatar_outcome {
                     Some(Err(text)) => rsx! { p { class: "pharos-error", role: "alert", "{text}" } },
                     _ => rsx! {},
+                }
+            }
+            div { class: "pharos-playback-settings", id: "playback-settings",
+                h3 { "Playback" }
+                label {
+                    "Crossfade between songs"
+                    select {
+                        id: "crossfade",
+                        aria_describedby: "crossfade-help",
+                        onchange: move |e| on_crossfade.call(parse_crossfade(&e.value())),
+                        for seconds in CROSSFADE_CHOICES {
+                            option {
+                                value: "{seconds}",
+                                selected: seconds == crossfade_s,
+                                if seconds == 0 { "Off" } else { "{seconds} seconds" }
+                            }
+                        }
+                    }
+                }
+                p { id: "crossfade-help", class: "pharos-muted",
+                    "Off by default. When on, the next song in the queue starts under the end of this one as it fades out. Kept on this device."
                 }
             }
             form {
@@ -249,6 +275,15 @@ mod tests {
         assert!(html.contains("autocomplete=\"current-password\""), "{html}");
         assert!(html.contains("Signed in as ali"), "{html}");
         assert!(!html.contains("role=\"alert\""), "{html}");
+    }
+
+    #[test]
+    fn crossfade_is_offered_and_starts_off() {
+        let html = render(None, false);
+        assert!(html.contains("id=\"crossfade\""), "{html}");
+        assert!(html.contains("Crossfade between songs"), "{html}");
+        assert!(html.contains("<option value=\"0\" selected"), "{html}");
+        assert!(html.contains("12 seconds"), "{html}");
     }
 
     #[test]
