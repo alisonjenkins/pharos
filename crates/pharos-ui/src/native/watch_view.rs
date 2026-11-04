@@ -173,7 +173,6 @@ pub fn WatchView(
     #[props(default)]
     toast: Option<String>,
 ) -> Element {
-    // TODO(T041): GroupSession wiring feeds activity and toast.
     let in_group = !members.is_empty();
     let c = &controls;
     let total = c.total_ms();
