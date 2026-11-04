@@ -2503,7 +2503,8 @@ test.describe("pharos Dioxus UI song handover", () => {
 
 // V406: the now-playing bar has previous and next track buttons either side
 // of the seek buttons. Next plays the queue's first song; Previous past the
-// opening seconds starts the song again.
+// opening seconds starts the song again, and within them steps back to the
+// song before (or starts it again when there is none).
 test.describe("pharos Dioxus UI previous and next track", () => {
   test("next plays what is queued and previous restarts a song", async ({
     page,
@@ -2570,6 +2571,12 @@ test.describe("pharos Dioxus UI previous and next track", () => {
       .locator("a")
       .click();
 
+    // The branch each Previous press took, from the UI's decision log.
+    const previousReasons: string[] = [];
+    page.on("console", (m) => {
+      const reason = /^pharos: previous .*reason=(\w+)/.exec(m.text())?.[1];
+      if (reason) previousReasons.push(reason);
+    });
     const audio = page.locator("#pharos-video");
     const previous = page.getByRole("button", { name: "Previous track" });
     const next = page.getByRole("button", { name: "Next track" });
@@ -2603,5 +2610,22 @@ test.describe("pharos Dioxus UI previous and next track", () => {
     await previous.click();
     await expect.poll(at).toBeLessThan(5);
     expect(page.url()).toBe(song);
+    await expect.poll(() => previousReasons.at(-1)).toBe("past_start");
+    // A restart steps nowhere, so nothing is queued yet.
+    await expect(next).toBeDisabled();
+
+    // In the opening seconds Previous steps back instead. Both copies are one
+    // song, so history has nothing before it (the step back to a different
+    // song is covered in queue.rs); the album has no track before either, so
+    // the song starts again, by the early branch rather than the restart one.
+    await seekTo(1);
+    await expect.poll(at).toBeLessThan(2.5);
+    // Let a timeupdate carry the new position to the UI before pressing.
+    await page.waitForTimeout(500);
+    await previous.click();
+    await expect.poll(() => previousReasons.at(-1)).toBe("nothing_before");
+    await expect.poll(at).toBeLessThan(5);
+    expect(page.url()).toBe(song);
+    await expect(page.locator("h2.pharos-listen-title")).toHaveText(track.Name);
   });
 });
