@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     clock_result, group, group_member, group_sink, group_summary, group_update, groups_result,
-    membership, membership_result, session,
+    member_seen, membership, membership_result, seen_result, session,
 };
 use pharos_api::{server, Connection};
 
@@ -40,6 +40,29 @@ pub struct ClockSample {
     pub client_ms_echo: u64,
     pub recv_ms: u64,
     pub send_ms: u64,
+}
+
+/// Ids one `seen` call may ask about.
+pub use pharos_api::MAX_SEEN_IDS;
+
+/// One item as one member has seen it. A film or episode has `played` and
+/// `position_pct`; a series or season has `played_count` of `total_count`
+/// episodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemSeen {
+    pub id: ItemRef,
+    pub played: bool,
+    pub position_pct: u8,
+    pub played_count: u32,
+    pub total_count: u32,
+}
+
+/// What one group member has seen of the items asked about. An item the
+/// caller may not see is missing from every member's `items`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSeen {
+    pub member: GroupMember,
+    pub items: Vec<ItemSeen>,
 }
 
 /// What the server pushes to a member.
@@ -244,6 +267,36 @@ impl NativeMembership {
         command!(self, call, ping_request)
     }
 
+    /// What each member of the group has seen of `ids` (at most 200).
+    pub async fn seen(
+        &self,
+        call: &CallInfo,
+        ids: &[ItemRef],
+    ) -> Result<Vec<MemberSeen>, ClientError> {
+        let mut req = self.0.seen_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            let mut list = p.init_ids(u32::try_from(ids.len()).unwrap_or(u32::MAX));
+            for (i, id) in (0u32..).zip(ids) {
+                set_item_ref(list.reborrow().get(i), *id);
+            }
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            seen_result::Members(members) => Ok(members?
+                .iter()
+                .map(read_member_seen)
+                .collect::<Result<_, _>>()?),
+            seen_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
     /// Closes a clock round trip for the server's own estimate of the RTT.
     pub async fn clock_report(
         &self,
@@ -265,6 +318,25 @@ impl NativeMembership {
 fn read_membership(result: membership_result::Reader<'_>) -> Result<NativeMembership, ClientError> {
     read_done(result.get_status()?)?;
     Ok(NativeMembership(result.get_membership()?))
+}
+
+fn read_member_seen(m: member_seen::Reader<'_>) -> Result<MemberSeen, capnp::Error> {
+    Ok(MemberSeen {
+        member: read_member(m.get_member()?)?,
+        items: m
+            .get_items()?
+            .iter()
+            .map(|i| {
+                Ok(ItemSeen {
+                    id: read_item_ref(i.get_id()?)?,
+                    played: i.get_played(),
+                    position_pct: i.get_position_pct(),
+                    played_count: i.get_played_count(),
+                    total_count: i.get_total_count(),
+                })
+            })
+            .collect::<Result<_, capnp::Error>>()?,
+    })
 }
 
 fn read_member(m: group_member::Reader<'_>) -> Result<GroupMember, capnp::Error> {
