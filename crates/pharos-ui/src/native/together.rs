@@ -362,9 +362,15 @@ pub struct FakeGroups {
     joined: Rc<RefCell<Option<GroupId>>>,
     seen: Rc<RefCell<Vec<MemberSeen>>>,
     refuse_follow: Rc<Cell<bool>>,
+    refuse_tracks: Rc<Cell<bool>>,
 }
 
 impl FakeGroups {
+    /// Makes every `set_tracks` fail, as a dropped connection would.
+    pub fn refuse_tracks(&self) {
+        self.refuse_tracks.set(true);
+    }
+
     /// Makes every `follow_tracks` fail, as a dropped connection would.
     pub fn refuse_follow(&self) {
         self.refuse_follow.set(true);
@@ -532,6 +538,9 @@ impl GroupClient for FakeGroups {
         self.log(format!(
             "set_tracks({audio:?},{subtitle:?},{playlist_item_id})"
         ));
+        if self.refuse_tracks.get() {
+            return Err(GroupError("Refused".into()));
+        }
         let Some(tracks) = self.with_joined(|g| {
             if audio != TrackChoice::Unset {
                 g.tracks.audio = audio;

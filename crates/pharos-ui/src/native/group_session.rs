@@ -727,20 +727,77 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     }
 
     fn pick(&self, audio: TrackChoice, subtitle: TrackChoice) -> bool {
-        let (active, own, playlist_item_id) = {
+        let (active, own, playlist_item_id, epoch) = {
             let inner = self.inner.borrow();
             (
                 inner.active,
                 inner.state.own_tracks,
                 inner.state.playlist_item_id.clone(),
+                inner.epoch,
             )
         };
         if route_pick(active, own) == PickRoute::ApplyLocally {
             return false;
         }
-        let client = self.client.clone();
-        self.command(async move { client.set_tracks(audio, subtitle, playlist_item_id).await });
+        if let Some(me) = self.me() {
+            let client = self.client.clone();
+            self.env.spawn(Box::pin(async move {
+                let Err(e) = client.set_tracks(audio, subtitle, playlist_item_id).await else {
+                    return;
+                };
+                me.env
+                    .warn(&format!("pharos: group command failed: {}", e.0));
+                me.apply_pick_here(audio, subtitle, epoch);
+            }));
+        }
         true
+    }
+
+    /// The group did not take a pick (the call failed), so change this player
+    /// alone and say so. The server drops a stale, unchanged or non-member pick
+    /// without an answer; none of those needs a local change.
+    fn apply_pick_here(&self, audio: TrackChoice, subtitle: TrackChoice, epoch: u64) {
+        let picks = TrackPicks {
+            audio: match audio {
+                TrackChoice::Index(i) => Some(i),
+                _ => None,
+            },
+            subtitle: match subtitle {
+                TrackChoice::Off => Some(None),
+                TrackChoice::Index(i) => Some(Some(i)),
+                _ => None,
+            },
+        };
+        let player = {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.active || inner.epoch != epoch {
+                return;
+            }
+            let at = u64::try_from(self.env.now_ms()).unwrap_or(0);
+            let kinds = [
+                (picks.audio.is_some(), TrackKind::Audio),
+                (picks.subtitle.is_some(), TrackKind::Subtitles),
+            ];
+            for kind in kinds.into_iter().filter_map(|(set, k)| set.then_some(k)) {
+                inner.state.log.push(
+                    &Event {
+                        by: None,
+                        action: activity::Action::PickNotShared { kind },
+                    },
+                    at,
+                );
+            }
+            inner.state.activity = inner.state.activity.wrapping_add(1);
+            inner.player.clone()
+        };
+        self.env.warn(&format!(
+            "pharos: group refused the track pick, applied here audio={:?} subtitle={:?}",
+            picks.audio, picks.subtitle
+        ));
+        self.publish();
+        if let Some(player) = player {
+            player.apply_tracks(picks);
+        }
     }
 
     /// "Follow group" (`true`) or "Just me" (`false`). Following puts the
@@ -2163,6 +2220,29 @@ mod tests {
         assert!(!rig.session.pick_audio(1));
         let idle = Session::new(FakeGroups::default(), TestEnv::default());
         assert!(!idle.pick_subtitle(Some(3)));
+    }
+
+    #[test]
+    fn a_pick_the_group_cannot_take_is_applied_here_and_said_so() {
+        let rig = rig_with_streams();
+        rig.groups.refuse_tracks();
+        assert!(rig.session.pick_subtitle(Some(3)));
+        assert!(
+            rig.player.applied.borrow().is_empty(),
+            "not before it fails"
+        );
+        rig.env.settle();
+        assert_eq!(
+            *rig.player.applied.borrow(),
+            [TrackPicks {
+                audio: None,
+                subtitle: Some(Some(3))
+            }]
+        );
+        assert_eq!(
+            rig.session.view().log.lines(),
+            ["Couldn't change the group's subtitles; changed yours"]
+        );
     }
 
     #[test]

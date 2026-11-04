@@ -43,6 +43,10 @@ pub enum Action {
     OwnTracks {
         on: bool,
     },
+    /// The group did not take this member's pick, so only their player changed.
+    PickNotShared {
+        kind: TrackKind,
+    },
 }
 
 /// An event and who caused it.
@@ -88,6 +92,13 @@ pub fn line(event: &Event) -> String {
         Action::OwnTracks { on: false } => {
             format!("{} is following the group's tracks", subject(who))
         }
+        Action::PickNotShared { kind } => format!(
+            "Couldn't change the group's {}; changed yours",
+            match kind {
+                TrackKind::Audio => "audio",
+                TrackKind::Subtitles => "subtitles",
+            }
+        ),
     }
 }
 
