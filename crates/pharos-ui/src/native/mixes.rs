@@ -64,6 +64,17 @@ pub fn needs_more(queue: &Queue, mix: &ActiveMix) -> bool {
         && (mix.play_first || queue.upcoming().len() < LOW_WATER)
 }
 
+/// The rest of a started song's album that the queue takes: none while a
+/// mix is on, because the mix decides what follows (V382). `None` (the
+/// album could not be read) stays `None`.
+pub fn album_rest<T>(mixing: bool, rest: Option<&[T]>) -> Option<&[T]> {
+    if mixing {
+        rest.map(|_| &[][..])
+    } else {
+        rest
+    }
+}
+
 /// What the server reads as heard or queued, oldest first: the songs
 /// started (the queue keeps them newest first), then what is still queued.
 pub fn history(queue: &Queue) -> Vec<ItemRef> {
@@ -743,6 +754,11 @@ fn MixEditor(
                     on_close.call(());
                 }
             },
+            // Mouse input in the dialog must not reach the player's
+            // Shift-click shortcuts, which skip tracks.
+            onclick: move |e: MouseEvent| e.stop_propagation(),
+            onmousedown: move |e: MouseEvent| e.stop_propagation(),
+            oncontextmenu: move |e: MouseEvent| e.stop_propagation(),
             label { class: "pharos-mix-field",
                 span { "Name" }
                 input {
@@ -1072,6 +1088,18 @@ mod tests {
         q.add(vec![track(1)]);
         apply_batch(&mut q, vec![track(5)], None);
         assert_eq!(q.upcoming().last().map(|e| e.id), Some(ItemRef::Real(5)));
+    }
+
+    #[test]
+    fn a_song_started_during_a_mix_queues_none_of_its_album() {
+        let album = [item(2), item(3)];
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), album_rest(true, Some(&album)), 0);
+        assert!(q.upcoming().is_empty(), "the mix decides what follows");
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), album_rest(false, Some(&album)), 0);
+        assert_eq!(q.upcoming().len(), 2, "without a mix the album follows");
+        assert_eq!(album_rest::<Item>(true, None), None);
     }
 
     #[test]

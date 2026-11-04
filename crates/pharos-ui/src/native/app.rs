@@ -1634,7 +1634,7 @@ fn WatchScreen(id: ItemRef) -> Element {
         };
         // While a mix is on it decides what follows, not the song's album.
         let mixing = mix_ctx.is_some_and(|m| m.0.peek().is_some());
-        let rest = if mixing { rest.map(|_| &[][..]) } else { rest };
+        let rest = mixes::album_rest(mixing, rest);
         queue.write().started(id, rest, seed());
         let q = queue.peek();
         platform::info(&format!(
