@@ -668,6 +668,7 @@ mod tests {
                     id: "a".into(),
                     name: "Ada".into(),
                     buffering: false,
+                    own_tracks: false,
                 },
                 items: vec![seen::ItemSeen {
                     id: ItemRef::Real(1),
@@ -682,6 +683,7 @@ mod tests {
                     id: "b".into(),
                     name: "Bo".into(),
                     buffering: false,
+                    own_tracks: false,
                 },
                 items: vec![],
             },

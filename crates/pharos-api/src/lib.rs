@@ -10,6 +10,7 @@
 pub mod instrument;
 pub mod labels;
 pub mod redact;
+pub mod track_choice;
 
 /// Ids one `Membership.seen` call may ask about; more is `limit`. The server
 /// enforces it and the client sizes its calls by it.

@@ -268,6 +268,20 @@ enum Seen {
         position_ms: u64,
     },
     Ended(&'static str),
+    Tracks {
+        audio: String,
+        subtitle: String,
+        by: String,
+    },
+}
+
+/// A track choice as "unset", "off" or the stream index.
+fn choice(c: pharos_api::pharos_capnp::track_choice::Reader<'_>) -> String {
+    match (c.get_set(), c.get_off()) {
+        (false, _) => "unset".into(),
+        (true, true) => "off".into(),
+        (true, false) => c.get_index().to_string(),
+    }
 }
 
 struct TestSink(mpsc::UnboundedSender<Seen>);
@@ -348,6 +362,14 @@ impl server::group_sink::Handler for TestSink {
                 EndReason::Left => "left",
                 EndReason::NotInGroup => "notInGroup",
             }),
+            group_update::Tracks(t) => {
+                let t = t?;
+                Seen::Tracks {
+                    audio: choice(t.get_audio()?),
+                    subtitle: choice(t.get_subtitle()?),
+                    by: text(t.get_by()),
+                }
+            }
         };
         let _ = self.0.send(seen);
         let _ = results;

@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 12;
+const schemaVersion :UInt32 = 13;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -357,8 +357,15 @@ interface Admin {
 # call's `ctx.device` (per user): a call with no device is refused
 # `invalid{field "ctx.device"}`. Dropping a Membership is a socket loss (the
 # member's TTL applies), not a leave; `leave` is explicit.
-struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; }
-struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); }
+# `ownTracks`: the member is not following the group's audio and subtitles (US7).
+struct GroupMember { id @0 :Text; name @1 :Text; buffering @2 :Bool; ownTracks @3 :Bool; }
+# A stream index of the playing item. `set` false means no choice yet (each
+# member keeps the player's default); `off` is subtitles off.
+struct TrackChoice { set @0 :Bool; index @1 :UInt32; off @2 :Bool; }
+# The group's audio and subtitle choice; `by` is the member id that made it.
+struct GroupTracks { audio @0 :TrackChoice; subtitle @1 :TrackChoice; by @2 :Text; }
+# `tracks` is what a late joiner starts on.
+struct GroupSummary { id @0 :GroupId; name @1 :Text; item @2 :ItemId; members @3 :List(GroupMember); tracks @4 :GroupTracks; }
 struct GroupsResult { union { groups @0 :List(GroupSummary); error @1 :Error; } }
 # Not a union, like ResumeResult, so a call on `membership` pipelines. A refused
 # create or join still returns a membership whose every call fails with the
@@ -392,6 +399,14 @@ interface Membership {
   # 200 ids, else `limit`. An id the caller may not see is left out of every
   # member's `items`; a member with no recorded user is listed with no items.
   seen      @8 (ctx :CallContext, ids :List(ItemId)) -> (result :SeenResult);
+  # Change the group's audio and/or subtitle (US7); a `set` false choice leaves
+  # that one as it is. Advisory: each following member applies it themselves.
+  # `playlistItemId` names the queue entry the pick was made on: the group drops
+  # one that is no longer the playing entry, since stream indexes belong to one
+  # item. Empty skips that check.
+  setTracks @9 (ctx :CallContext, audio :TrackChoice, subtitle :TrackChoice, playlistItemId :Text) -> (result :Done);
+  # false = "Just me" (own tracks), true = back on the group's tracks.
+  followTracks @10 (ctx :CallContext, follow :Bool) -> (result :Done);
 }
 # For a film or episode `played` and `positionPct` (0-100, the resume point)
 # apply. For a series or season `playedCount` of `totalCount` episodes (the ones
@@ -410,8 +425,10 @@ struct GroupUpdate {
     left    @5 :Text;                  # member id
     item    @6 :ItemAt;                # the group moved to another item
     ended   @7 :EndReason;
+    tracks  @8 :GroupTracks;           # the group's audio or subtitle changed
   }
-  struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; }
+  # `by` is the member id that caused it; "" when the group did (all ready).
+  struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; by @2 :Text; }
   struct ItemAt { item @0 :ItemId; playlistItemId @1 :Text; positionMs @2 :UInt64; playing @3 :Bool; }
 }
 interface GroupSink { update @0 (ctx :CallContext, update :GroupUpdate) -> (result :Done); }
