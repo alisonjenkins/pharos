@@ -1723,6 +1723,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             tracing::info!("T81 person-image backfill disabled (no [tmdb].api_key)");
         }
     }
+    // B341 — IMDb and Rotten Tomatoes scores from OMDb, gated on its key.
+    match cfg.omdb.api_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            pharos_server::ratings::spawn(
+                state.stores.clone(),
+                pharos_server::omdb::OmdbClient::new(key.to_string()),
+                pharos_server::ratings::SweepConfig {
+                    daily_limit: cfg.omdb.daily_limit,
+                    refresh_ttl_days: cfg.omdb.refresh_ttl_days,
+                },
+            );
+        }
+        _ => tracing::info!("B341 ratings sweep disabled (no [omdb].api_key)"),
+    }
     // T9 — online metadata/artwork enrichment (TMDB movies, TVDB→TMDB
     // episodes). Gated on a provider key AND the extracted-image cache being
     // configured (art download has nowhere to land otherwise); mirrors the
