@@ -109,10 +109,10 @@ runs before each push (CLAUDE.md).
   joiners get them in `joined`; `pharos_group_tracks_total{outcome}`; V396; ADR.
 - [x] T039 [US7] `pharos-client` wrappers for `setTracks`, `followTracks` and
   the new update fields.
-- [ ] T040 [US7] UI: a following member applies group tracks; the audio and
+- [x] T040 [US7] UI: a following member applies group tracks; the audio and
   subtitle menus send `setTracks`, or change only the local player under
   "Just me"; "Follow group" re-applies; the strip marks own-tracks members.
-- [ ] T041 [US8] UI: the `activity` lines in the member strip and over the
+- [x] T041 [US8] UI: the `activity` lines in the member strip and over the
   video; buffering shown per member.
-- [ ] T042 [US7][US8] Two-browser Playwright: B sees "A paused"; A picks a
+- [x] T042 [US7][US8] Two-browser Playwright: B sees "A paused"; A picks a
   subtitle and B follows; B ticks "Just me", A changes again, B stays.
