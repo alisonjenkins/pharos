@@ -7,8 +7,9 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use futures_util::future::LocalBoxFuture;
 use futures_util::FutureExt as _;
-use pharos_client::api::{ClientEvent, NativeApi};
+use pharos_client::api::{ClientEvent, NativeApi, Track};
 
+use super::activity::TrackKind;
 use super::group_session::{Env, GroupPlayer, GroupView, Session, Ui};
 use super::platform;
 use super::together::{group_api, Groups};
@@ -57,9 +58,9 @@ impl Env for AppEnv {
 /// The page's `<video>` as the group drives it.
 pub struct VideoPlayer {
     pub id: &'static str,
-    /// Audio and subtitle stream indexes of the item.
-    pub audio: Vec<u32>,
-    pub subtitles: Vec<u32>,
+    /// The item's audio and subtitle streams.
+    pub audio: Vec<Track>,
+    pub subtitles: Vec<Track>,
     /// Where the group's track picks go: the player screen switches tracks
     /// there, inside the Dioxus runtime.
     pub tracks: Coroutine<TrackPicks>,
@@ -91,7 +92,20 @@ impl GroupPlayer for VideoPlayer {
     }
 
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
-        (self.audio.clone(), self.subtitles.clone())
+        let indexes = |tracks: &[Track]| tracks.iter().map(|t| t.index).collect();
+        (indexes(&self.audio), indexes(&self.subtitles))
+    }
+
+    fn track_label(&self, kind: TrackKind, index: u32) -> Option<String> {
+        let tracks = match kind {
+            TrackKind::Audio => &self.audio,
+            TrackKind::Subtitles => &self.subtitles,
+        };
+        let track = tracks.iter().find(|t| t.index == index)?;
+        [&track.title, &track.language]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .cloned()
     }
 
     fn apply_tracks(&self, picks: TrackPicks) {

@@ -2235,8 +2235,8 @@ fn Player(
         let session = session.clone();
         let item = p.detail.item.id;
         let (audio, subtitles) = (
-            p.detail.audio_tracks.iter().map(|t| t.index).collect(),
-            p.detail.subtitle_tracks.iter().map(|t| t.index).collect(),
+            p.detail.audio_tracks.clone(),
+            p.detail.subtitle_tracks.clone(),
         );
         move || {
             if let Some(session) = &session {
