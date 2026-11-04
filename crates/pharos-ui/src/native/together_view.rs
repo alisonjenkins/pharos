@@ -5,6 +5,7 @@
 
 use dioxus::prelude::*;
 
+use super::activity::LOG_LINES;
 use super::seen::{initial, SeenRow};
 use super::together::{GroupSummary, Member};
 
@@ -92,7 +93,14 @@ pub fn MemberStrip(
     /// shows it.
     #[props(default)]
     seen: Vec<SeenRow>,
+    /// Ids of the members not following the group's tracks.
+    #[props(default)]
+    own_tracks: Vec<String>,
+    /// The activity log's lines, oldest first; the last three show.
+    #[props(default)]
+    activity: Vec<String>,
 ) -> Element {
+    let shown = activity.len().saturating_sub(LOG_LINES);
     rsx! {
         div { class: "pharos-members", role: "group", aria_label: "Watching together",
             ul { class: "pharos-member-list",
@@ -112,6 +120,9 @@ pub fn MemberStrip(
                         if member.buffering {
                             span { class: "pharos-member-buffering", role: "status", " buffering" }
                         }
+                        if own_tracks.contains(&member.id) {
+                            span { class: "pharos-member-own-tracks", " own tracks" }
+                        }
                     }
                 }
             }
@@ -121,8 +132,26 @@ pub fn MemberStrip(
                 onclick: move |_| on_leave.call(()),
                 "Leave"
             }
+            if !activity.is_empty() {
+                ul { class: "pharos-activity-log", aria_label: "Recent activity",
+                    for line in activity.into_iter().skip(shown) {
+                        li { class: "pharos-activity-line", "{line}" }
+                    }
+                }
+            }
         }
     }
+}
+
+/// The newest activity line over the video. It sits beside the chrome, not in
+/// it, so it stays visible while the controls are hidden; the caller passes
+/// `None` once the line is older than the toast time.
+#[component]
+pub fn ActivityToast(line: Option<String>) -> Element {
+    let Some(line) = line else {
+        return rsx! {};
+    };
+    rsx! { div { class: "pharos-activity-toast", role: "status", aria_live: "polite", "{line}" } }
 }
 
 /// "In this group": what each member has seen of the item shown. `rows` has
@@ -187,6 +216,8 @@ fn member_names(members: &[Member]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
     use crate::native::seen::Mark;
 
@@ -297,6 +328,62 @@ mod tests {
             html.contains("40%") && html.contains("is-partway"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn the_strip_marks_members_on_their_own_tracks() {
+        let html = render(|| {
+            rsx! { MemberStrip {
+                members: vec![member("a", "Ada", false), member("b", "Bo", false)],
+                on_leave: |_| {},
+                own_tracks: vec!["b".to_owned()],
+            } }
+        });
+        assert_eq!(
+            html.matches("pharos-member-own-tracks").count(),
+            1,
+            "{html}"
+        );
+        let (ada, bo) = html.split_once("Bo").expect("Bo is listed");
+        assert!(
+            !ada.contains("own-tracks") && bo.contains("own tracks"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_strip_lists_the_last_three_activity_lines() {
+        let lines = ["one", "two", "three", "four"].map(String::from).to_vec();
+        let html = render(move || {
+            rsx! { MemberStrip {
+                members: vec![member("a", "Ada", false)],
+                on_leave: |_| {},
+                activity: lines.clone(),
+            } }
+        });
+        assert_eq!(html.matches("pharos-activity-line").count(), 3, "{html}");
+        assert!(!html.contains(">one<"), "{html}");
+        assert!(html.contains(">four<"), "{html}");
+    }
+
+    #[test]
+    fn no_activity_shows_no_log() {
+        let html = render(|| {
+            rsx! { MemberStrip { members: vec![member("a", "Ada", false)], on_leave: |_| {} } }
+        });
+        assert!(!html.contains("pharos-activity"), "{html}");
+    }
+
+    #[test]
+    fn the_toast_shows_a_line_and_nothing_without_one() {
+        let html =
+            render(|| rsx! { ActivityToast { line: Some("Sam paused at 12:04".to_owned()) } });
+        assert!(
+            html.contains("pharos-activity-toast") && html.contains("Sam paused at 12:04"),
+            "{html}"
+        );
+        let html = render(|| rsx! { ActivityToast { line: None } });
+        assert!(!html.contains("pharos-activity-toast"), "{html}");
     }
 
     #[test]
