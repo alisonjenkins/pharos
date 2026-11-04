@@ -354,6 +354,36 @@ pub fn now_ms() -> f64 {
         .map_or(0.0, |p| p.now())
 }
 
+/// Milliseconds since the epoch, for times shown on the wall clock.
+pub fn wall_clock_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+thread_local! {
+    /// Built once: a formatter costs far more than a format, and the player
+    /// asks on every position tick.
+    static TIME_FORMAT: Option<js_sys::Intl::DateTimeFormat> = time_format();
+}
+
+fn time_format() -> Option<js_sys::Intl::DateTimeFormat> {
+    let options = js_sys::Object::new();
+    // The locale's own short time: "10:42 PM" in the US, "22:42" in the UK.
+    js_sys::Reflect::set(&options, &"timeStyle".into(), &"short".into()).ok()?;
+    Some(js_sys::Intl::DateTimeFormat::new(
+        &js_sys::Array::new(),
+        &options,
+    ))
+}
+
+/// The hour and minute of `epoch_ms` in the browser's locale.
+pub fn local_time(epoch_ms: f64) -> Option<String> {
+    TIME_FORMAT.with(|format| {
+        let format = format.as_ref()?;
+        let date = js_sys::Date::new(&JsValue::from_f64(epoch_ms));
+        format.format().call1(format, &date).ok()?.as_string()
+    })
+}
+
 /// Run `fut` to completion even after the component that started it is
 /// gone (a stop sent on unmount).
 pub fn spawn_detached(fut: impl std::future::Future<Output = ()> + 'static) {
