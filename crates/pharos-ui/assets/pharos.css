@@ -547,6 +547,11 @@ body:has(.pharos-watch) .pharos-error {
   object-fit: contain;
   background: black; /* not themed: the letterbox around video is black in every theme */
 }
+.pharos-video-frame {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
 /* WebVTT cues: an outline and soft shadow instead of the browser's opaque
    box. `::cue` takes no border-radius or padding, so any box stays square;
    the dark outline keeps white text readable on a white frame. */

@@ -93,6 +93,16 @@ pub fn set_volume(_video_id: &str, _volume: f64, _muted: bool) {}
 
 pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}
 
+pub struct StyledSubtitles;
+
+pub async fn styled_subtitles(
+    _video_id: &str,
+    _url: &str,
+    _report: std::rc::Rc<dyn Fn(Result<(), String>)>,
+) -> Result<StyledSubtitles, String> {
+    Err("no renderer on the host".into())
+}
+
 pub fn element_width(_id: &str) -> f64 {
     0.0
 }
