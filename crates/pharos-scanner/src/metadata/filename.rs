@@ -410,7 +410,13 @@ impl MetadataProvider for FilenameProvider {
             return Ok(MetadataResult::default());
         };
         let with_year = req.kind == MediaKind::Movie;
-        let parsed = Self::parse_stem(stem, with_year);
+        let mut parsed = Self::parse_stem(stem, with_year);
+        // An episode's stem leads with the show, so its cleaned stem is the
+        // show's name; the episode's title is what follows its number. An
+        // absolute-numbered name ("Show - 487 - Title") keeps the cleaned stem.
+        if req.kind == MediaKind::Episode && fs::episode_token_end(stem).is_some() {
+            parsed.title = episode_title(stem);
+        }
 
         let mut tags = parsed.tags;
         if let Some(ed) = parsed.edition {
@@ -424,6 +430,50 @@ impl MetadataProvider for FilenameProvider {
             ..MetadataResult::default()
         })
     }
+}
+
+/// The episode title in an episode filename: the words after its
+/// `S03E07` token, less a multi-episode tail (`-E08`), an absolute number
+/// (`487 - `) and the release tail (`WEBRip-1080p`, `.720p.HDTV.x264-GRP`).
+/// `None` when nothing is left, as in a bare scene name.
+pub fn episode_title(stem: &str) -> Option<String> {
+    static LEAD: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^[ ._-]*(?:e\d+[ ._-]*)*(?:\d{1,4} - )?")
+            .map_err(|e| tracing::error!(error = %e, "invalid episode-title regex"))
+            .ok()
+    });
+    let rest = &stem[fs::episode_token_end(stem)?..];
+    let rest = match LEAD.as_ref() {
+        Some(re) => re.replace(rest, ""),
+        None => rest.into(),
+    };
+    let spaced: String = if rest.contains(' ') {
+        rest.replace(['[', ']'], " ")
+    } else {
+        rest.replace(['.', '_', '[', ']'], " ")
+    };
+    let words: Vec<&str> = spaced
+        .split_whitespace()
+        .take_while(|w| !is_release_word(w))
+        .collect();
+    let title = words.join(" ");
+    let title = title.trim_matches(|c: char| c == '-' || c.is_whitespace());
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// A word that starts a release tail: a resolution, a source with an
+/// optional resolution (`WEBDL-1080p`, `Bluray-2160p`), a codec, or an
+/// upper-case `WEB`. Weak tags that are also English words (`Web`, `cam`,
+/// `dvd`) do not count, so "Charlotte's Web" keeps its last word.
+fn is_release_word(word: &str) -> bool {
+    static RELEASE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|[xh]26[45](?:-\w+)?|hevc)$",
+            )
+            .map_err(|e| tracing::error!(error = %e, "invalid release-word regex"))
+            .ok()
+    });
+    word == "WEB" || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
 }
 
 /// Replace scene-release separators with spaces so token-splitting and the
@@ -692,6 +742,62 @@ mod tests {
         // Year suppressed for episodes (C11 owns it).
         assert_eq!(r.production_year, None);
         assert!(r.tags.iter().any(|t| t == "720p"));
+    }
+
+    #[test]
+    fn an_episode_title_is_what_follows_its_number() {
+        let cases = [
+            (
+                "Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p",
+                Some("The Enemy"),
+            ),
+            (
+                "2 Broke Girls - S03E21 - And the Wedding Cake Cake Cake WEBDL-1080p",
+                Some("And the Wedding Cake Cake Cake"),
+            ),
+            (
+                "One Piece - S14E06 - 487 - The Insatiable Akainu! Lava Fists Pummel Luffy!",
+                Some("The Insatiable Akainu! Lava Fists Pummel Luffy!"),
+            ),
+            ("Show - S01E01-E02 - Pilot [Bluray-1080p]", Some("Pilot")),
+            (
+                "Show.S02E05.The.Long.Night.1080p.WEB.H264-GRP",
+                Some("The Long Night"),
+            ),
+            (
+                "Charlotte - S01E01 - Charlotte's Web HDTV-720p",
+                Some("Charlotte's Web"),
+            ),
+            ("Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE", None),
+            ("Show - S01E04", None),
+            ("Movie (1999)", None),
+        ];
+        for (stem, want) in cases {
+            assert_eq!(episode_title(stem).as_deref(), want, "{stem}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_episode_titles_it_from_the_name_not_the_show() {
+        let probe = MediaProbe::default();
+        let path = Path::new(
+            "/tv/Star Trek/Season 03/Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p.mkv",
+        );
+        let r = FilenameProvider::new()
+            .fetch(&req(path, MediaKind::Episode, &probe))
+            .await
+            .unwrap();
+        assert_eq!(r.title.as_deref(), Some("The Enemy"));
+
+        let absolute = Path::new("/tv/One Piece/One Piece - 487 - The Insatiable Akainu.mkv");
+        let r = FilenameProvider::new()
+            .fetch(&req(absolute, MediaKind::Episode, &probe))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.title.as_deref(),
+            Some("One Piece - 487 - The Insatiable Akainu")
+        );
     }
 
     #[tokio::test]
