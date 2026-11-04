@@ -1480,3 +1480,107 @@ test.describe("pharos Dioxus UI lyrics", () => {
     await expect(panel).toBeVisible();
   });
 });
+
+// V375/V376: an album page queues songs, the player shows them in a
+// collapsible queue, and a dragged row moves.
+test.describe("pharos Dioxus UI play queue", () => {
+  test("queue an album, open the queue, drag, shuffle and clear", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-queue-${Date.now()}", Version="0"`,
+      },
+      data: { Username: TEST_USER, Pw: TEST_PASS },
+    });
+    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+    const { AccessToken: token, User: user } = await auth.json();
+    const api = { "X-Emby-Token": token };
+    const json = async (path: string) =>
+      (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+    const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+    const tracks = await json(
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+    );
+    const track = tracks.Items?.find(
+      (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
+    );
+    test.skip(!track, "the seed has no track tagged with an album and artist");
+    const artists = await json(`/Artists`);
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
+    expect(artist, "the track's album artist is listed").toBeTruthy();
+
+    await page.goto("/ui/");
+    await page.evaluate(() => localStorage.removeItem("pharos.listen.queue"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+    // The album card offers the queue buttons too.
+    await page.goto(`/ui/browse/${nativeSynth(artist.Id)}`);
+    const card = page
+      .locator("section.pharos-artist ul.pharos-grid li", { hasText: track.Album })
+      .first();
+    await expect(card).toBeVisible({ timeout: 15_000 });
+    await card.hover();
+    await expect(
+      card.getByRole("button", { name: `Play ${track.Album} next` }),
+    ).toBeVisible();
+    await card.locator("a").first().click();
+    await expect(page.locator("section.pharos-album h2")).toHaveText(track.Album, {
+      timeout: 15_000,
+    });
+
+    // Three copies of the album, so the queue holds at least two rows once
+    // the first song starts and takes its own first copy out.
+    const addAlbum = page.getByRole("button", { name: `Add ${track.Album} to the queue` });
+    for (let i = 0; i < 3; i++) {
+      await addAlbum.click();
+      await expect(page.locator(".pharos-queue-note").first()).toHaveText(/added to the queue/);
+    }
+    const rows = page.locator("ol.pharos-tracks li");
+    await expect(rows.first().locator(".pharos-track-queued")).toHaveText("In queue");
+    await rows.first().locator("a").click();
+
+    const toggle = page.locator(".pharos-queue-toggle");
+    await expect(toggle).toBeVisible({ timeout: 15_000 });
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: "Lyrics", exact: true })).toBeVisible();
+    const panel = page.getByRole("complementary", { name: "Queue" });
+    await expect(panel).toBeHidden();
+    await toggle.click();
+    await expect(panel).toBeVisible();
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("pharos.listen.queue")))
+      .toBe("shown");
+
+    const entries = panel.locator("li.pharos-queue-entry");
+    await expect.poll(() => entries.count()).toBeGreaterThanOrEqual(2);
+    const count = await entries.count();
+    const last = await entries.nth(count - 1).getAttribute("data-key");
+    await entries.nth(count - 1).dragTo(entries.first());
+    await expect(entries.first()).toHaveAttribute("data-key", last ?? "");
+
+    const shuffle = panel.getByRole("button", { name: "Shuffle" });
+    await shuffle.click();
+    await expect(shuffle).toHaveAttribute("aria-pressed", "true");
+    await expect(entries).toHaveCount(count);
+
+    await panel.getByRole("button", { name: "Clear" }).click();
+    await expect(entries).toHaveCount(0);
+    await expect(panel).toContainText("Nothing queued.");
+    await toggle.click();
+    await expect(panel).toBeHidden();
+  });
+});
