@@ -10,6 +10,7 @@ pub mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 pub mod byte_stream;
+pub mod group;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use futures::io::{AsyncRead, AsyncWrite};
