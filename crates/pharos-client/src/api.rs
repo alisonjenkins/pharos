@@ -14,6 +14,7 @@ use pharos_api::pharos_capnp::{
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
+use crate::group::NativeGroup;
 use crate::{CallInfo, ClientError};
 
 /// An item's id. Stored items are `real`; series, seasons, albums and
@@ -386,6 +387,7 @@ pub struct NativeApi {
     playback: playback::Client,
     prefs: prefs::Client,
     telemetry: telemetry::Client,
+    group: NativeGroup,
 }
 
 /// The signed-in user, as `Session.me` reports them.
@@ -413,6 +415,7 @@ impl NativeApi {
             playback: session.playback_request().send().pipeline.get_playback(),
             prefs: session.prefs_request().send().pipeline.get_prefs(),
             telemetry: session.telemetry_request().send().pipeline.get_telemetry(),
+            group: NativeGroup::new(session),
         }
     }
 
@@ -436,6 +439,11 @@ impl NativeApi {
             }
             me_result::Error(e) => Err(ClientError::from_api(e?)),
         }
+    }
+
+    /// Watch together: the session's `Group`.
+    pub fn group(&self) -> &NativeGroup {
+        &self.group
     }
 
     /// The signed-in user's stored value for `key`, `None` when never set.
