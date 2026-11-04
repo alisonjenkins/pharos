@@ -5755,6 +5755,21 @@ mod tests {
     }
 
     #[test]
+    fn a_release_folder_with_a_bracketed_tag_names_its_show() {
+        let p = Path::new(
+            "/tv/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION [PublicHD]/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION.mkv",
+        );
+        let info = parse_series_info(p).expect("series info");
+        assert_eq!(info.series_name, "The Vampire Diaries");
+        assert_eq!(
+            info.series_folder.as_deref(),
+            Some("/tv/The Vampire Diaries")
+        );
+        assert_eq!(info.season_number, Some(4));
+        assert_eq!(info.episode_number, Some(21));
+    }
+
+    #[test]
     fn a_release_folder_drops_its_tags_and_keeps_its_year() {
         let p =
             Path::new("/tv/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION [PublicHD]/x.mkv");
