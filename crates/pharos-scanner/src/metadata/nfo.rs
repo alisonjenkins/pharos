@@ -94,7 +94,10 @@ impl MetadataProvider for NfoProvider {
         for candidate in nfo_candidates(req) {
             match std::fs::read(&candidate) {
                 Ok(bytes) => {
-                    let parsed = parse_nfo(&bytes, &candidate)?;
+                    let mut parsed = parse_nfo(&bytes, &candidate)?;
+                    if req.kind == MediaKind::Episode && is_show_nfo(req, &candidate) {
+                        drop_episode_fields(&mut parsed);
+                    }
                     fold_under(&mut result, parsed);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -175,6 +178,26 @@ fn nfo_candidates(req: &MetadataRequest<'_>) -> Vec<PathBuf> {
 /// `<basename>.nfo` beside `path` (same directory, file stem + `.nfo`).
 fn sibling_nfo(path: &Path) -> Option<PathBuf> {
     Some(path.with_extension("nfo"))
+}
+
+/// The show folder's `tvshow.nfo`, not an episode's own sidecar (an
+/// episode file named `tvshow.mkv` has a sibling of the same name).
+fn is_show_nfo(req: &MetadataRequest<'_>, candidate: &Path) -> bool {
+    sibling_nfo(req.path).as_deref() != Some(candidate)
+        && req
+            .series
+            .and_then(|s| s.series_folder.as_deref())
+            .is_some_and(|f| Path::new(f).join("tvshow.nfo") == candidate)
+}
+
+/// A `tvshow.nfo` describes the show, so its title, plot, tagline and
+/// premiere are not the episode's: an episode without its own NFO would
+/// otherwise be titled with the show's name.
+fn drop_episode_fields(show: &mut MetadataResult) {
+    show.title = None;
+    show.overview = None;
+    show.tagline = None;
+    show.premiere_date = None;
 }
 
 /// Fold `under` beneath `acc`: `acc` (more-specific source) keeps its set
