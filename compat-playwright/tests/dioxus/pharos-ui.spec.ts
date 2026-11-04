@@ -646,6 +646,76 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
     });
 
+    // B318: the library buttons and the breadcrumb trail.
+    test("library buttons and breadcrumbs lead back up from an episode", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-crumbs-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      // The TV library's button comes before the films', and opens it.
+      const libraries = page.locator("nav.pharos-library-nav a");
+      const names = await libraries.allInnerTexts();
+      expect(names.indexOf("TV")).toBeGreaterThanOrEqual(0);
+      expect(names.indexOf("TV")).toBeLessThan(names.indexOf("Bulk"));
+      await libraries.filter({ hasText: /^TV$/ }).click();
+      await expect(page.locator("section.pharos-browse h2")).toHaveText("TV", {
+        timeout: 15_000,
+      });
+      await expect(libraries.filter({ hasText: /^TV$/ })).toHaveAttribute("aria-current", "page");
+
+      // Down to an episode: the trail runs library, show, season, episode.
+      await page
+        .locator("ul.pharos-grid .pharos-poster-name")
+        .filter({ hasText: "Playwright Show" })
+        .click();
+      const episodes = page.locator("ol.pharos-episodes li");
+      await expect(episodes).toHaveCount(3, { timeout: 15_000 });
+      await episodes.first().locator("a.pharos-episode-link").click();
+      const title = (await page.locator("article.pharos-title h2").innerText()).trim();
+      const crumbs = page.locator("nav.pharos-crumbs li");
+      await expect(crumbs).toHaveCount(4, { timeout: 15_000 });
+      await expect(crumbs.nth(0)).toHaveText("TV");
+      await expect(crumbs.nth(1)).toHaveText("Playwright Show");
+      await expect(crumbs.nth(3)).toHaveText(title);
+      await expect(crumbs.nth(3).locator("[aria-current=page]")).toHaveCount(1);
+
+      // Each step back up is a link.
+      await crumbs.nth(1).locator("a").click();
+      await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show", {
+        timeout: 15_000,
+      });
+      await page.locator("nav.pharos-crumbs a", { hasText: /^TV$/ }).click();
+      await expect(page.locator("section.pharos-browse h2")).toHaveText("TV", {
+        timeout: 15_000,
+      });
+      await libraries.filter({ hasText: /^Bulk$/ }).click();
+      await expect(page.locator("section.pharos-browse h2")).toHaveText("Bulk", {
+        timeout: 15_000,
+      });
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+    });
+
     // 012 US5: artist, then album, then track list.
     test("browse walks an artist to an album and its tracks", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
