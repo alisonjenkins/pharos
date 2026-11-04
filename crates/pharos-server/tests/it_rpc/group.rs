@@ -23,13 +23,13 @@ use tokio::sync::{mpsc, oneshot};
 use crate::common::Fixture;
 use crate::playback::{seed_playable, MOVIE};
 
-struct Rig {
-    server: actix_test::TestServer,
-    fx: Fixture,
-    deps: SyncDeps,
+pub(crate) struct Rig {
+    pub(crate) server: actix_test::TestServer,
+    pub(crate) fx: Fixture,
+    pub(crate) deps: SyncDeps,
 }
 
-async fn rig() -> Rig {
+pub(crate) async fn rig() -> Rig {
     let (server, fx) = crate::revocation::start().await;
     seed_playable(&fx).await;
     let sinks = MemberSinks::new();
@@ -44,7 +44,7 @@ async fn rig() -> Rig {
 }
 
 impl Rig {
-    async fn session(&self, token: &str) -> session::Client {
+    pub(crate) async fn session(&self, token: &str) -> session::Client {
         let (client, _closed) = crate::revocation::connect(&self.server).await;
         crate::revocation::signed_in(&client, token).await
     }

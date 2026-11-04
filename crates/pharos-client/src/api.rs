@@ -811,7 +811,7 @@ fn read_tracks(
         .collect()
 }
 
-fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
+pub(crate) fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
     Ok(t?.to_string()?)
 }
 
@@ -829,14 +829,14 @@ fn set_texts(mut out: capnp::text_list::Builder<'_>, values: &[String]) {
     }
 }
 
-fn set_item_ref(mut out: item_id::Builder<'_>, id: ItemRef) {
+pub(crate) fn set_item_ref(mut out: item_id::Builder<'_>, id: ItemRef) {
     match id {
         ItemRef::Real(n) => out.set_real(n),
         ItemRef::Synth(n) => out.set_synth(n),
     }
 }
 
-fn read_item_ref(id: item_id::Reader<'_>) -> Result<ItemRef, capnp::Error> {
+pub(crate) fn read_item_ref(id: item_id::Reader<'_>) -> Result<ItemRef, capnp::Error> {
     Ok(match id.which()? {
         item_id::Real(n) => ItemRef::Real(n),
         item_id::Synth(n) => ItemRef::Synth(n),
