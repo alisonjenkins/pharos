@@ -17,6 +17,8 @@ pub enum Program {
     Plasma,
     /// Three rings that ripple with the waveform around a pulsing core.
     Orbit,
+    /// A striped sun over spectrum mountains and a rolling grid floor.
+    Horizon,
     /// Backdrop: slow curtains of the accent along the top of the page.
     Aurora,
     /// Backdrop: fine scanlines with a rolling band, like a CRT.
@@ -36,6 +38,7 @@ impl Program {
             Program::Halo => include_str!("shaders/halo.frag"),
             Program::Plasma => include_str!("shaders/plasma.frag"),
             Program::Orbit => include_str!("shaders/orbit.frag"),
+            Program::Horizon => include_str!("shaders/horizon.frag"),
             Program::Aurora => concat!(
                 include_str!("shaders/noise.frag"),
                 include_str!("shaders/aurora.frag")
@@ -81,12 +84,13 @@ pub fn fragment_source(program: Program) -> String {
 mod tests {
     use super::*;
 
-    const ALL: [Program; 9] = [
+    const ALL: [Program; 10] = [
         Program::Spectrum,
         Program::Scope,
         Program::Halo,
         Program::Plasma,
         Program::Orbit,
+        Program::Horizon,
         Program::Aurora,
         Program::Scanlines,
         Program::MatrixRain,

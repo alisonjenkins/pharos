@@ -10,16 +10,18 @@ void main() {
     vec3 c = mix(u_bg, mix(u_bg, u_accent, 0.35), exp(-max(above, 0.0) * 5.0));
 
     // A striped sun, the stripes widening towards the horizon.
-    vec2 s = vec2((uv.x - 0.5) * aspect, above - SUN * 0.9);
+    vec2 s = vec2((uv.x - 0.5) * aspect, above - SUN * 0.75);
     float disc = smoothstep(SUN, SUN - 0.004, length(s));
-    float band = fract(s.y * 28.0 - u_time * 0.4);
-    float cut = s.y > 0.0 ? 1.0 : step(0.35 * (-s.y / SUN), band);
+    float below = clamp((0.35 * SUN - s.y) / (1.35 * SUN), 0.0, 1.0);
+    float band = fract(s.y * 22.0 - u_time * 0.4);
+    float cut = step(0.6 * below, band);
     vec3 sun = mix(u_accent, u_fg, smoothstep(-SUN, SUN, s.y) * 0.75);
     c = mix(c, sun, disc * cut * (0.85 + 0.15 * u_level));
 
-    // Mountains: the spectrum, bass in the middle, mirrored to the edges.
+    // Mountains: the spectrum, treble low in the middle under the sun and
+    // the bass rising to the edges.
     float x = abs(uv.x - 0.5) * 2.0;
-    float peak = pow(spectrum(x), 1.2) * 0.24 * (1.0 - 0.35 * x);
+    float peak = pow(spectrum(1.0 - x), 1.2) * 0.26 * (0.35 + 0.65 * x);
     float ridge = HORIZON + peak;
     float hill = step(0.0, above) * step(uv.y, ridge);
     float edge = exp(-abs(uv.y - ridge) * 260.0) * step(0.0, above);
