@@ -16,6 +16,7 @@ members = [
     "crates/pharos-test-metrics",
     "crates/pharos-transcode",
     "crates/pharos-ui",
+    "crates/quire",
     "workspace-hack",
 ]
 
