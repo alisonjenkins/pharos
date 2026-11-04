@@ -382,7 +382,7 @@ fn remember_volume(volume: f64, muted: bool) {
 /// for video the maximum bitrate the viewer chose (0, Auto, unless they set
 /// one). The choice limits video only: a song above it still plays as stored.
 fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Capabilities {
-    let chosen = stored_max_bitrate();
+    let chosen = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
     let caps = with_max_bitrate(
         platform::capabilities(),
         kind,
@@ -397,20 +397,23 @@ fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Ca
     caps
 }
 
-/// The cap auto quality last settled on, 0 when none.
-fn stored_auto_rung() -> u64 {
-    match platform::stored_theme(quality::AUTO_RUNG_KEY) {
-        Ok(stored) => stored.as_deref().map_or(0, quality::parse_rung),
+/// The bitrate stored under `key`, read by `parse`; 0 when none. The warn
+/// text names the key's last segment (`max_bitrate`, `auto_rung`).
+fn stored_bitrate(key: &str, parse: fn(&str) -> u64) -> u64 {
+    match platform::stored_theme(key) {
+        Ok(stored) => stored.as_deref().map_or(0, parse),
         Err(e) => {
-            platform::warn(&format!("pharos: auto_rung storage read failed error={e}"));
+            let name = key.rsplit('.').next().unwrap_or(key);
+            platform::warn(&format!("pharos: {name} storage read failed error={e}"));
             0
         }
     }
 }
 
-fn set_stored_auto_rung(bps: u64) {
-    if let Err(e) = platform::store_theme(quality::AUTO_RUNG_KEY, &bps.to_string()) {
-        platform::warn(&format!("pharos: auto_rung storage write failed error={e}"));
+fn store_bitrate(key: &str, bps: u64) {
+    if let Err(e) = platform::store_theme(key, &bps.to_string()) {
+        let name = key.rsplit('.').next().unwrap_or(key);
+        platform::warn(&format!("pharos: {name} storage write failed error={e}"));
     }
 }
 
@@ -431,26 +434,6 @@ fn video_max_bitrate(kind: ItemKind, chosen: u64) -> u64 {
         0
     } else {
         chosen
-    }
-}
-
-fn stored_max_bitrate() -> u64 {
-    match platform::stored_theme(MAX_BITRATE_KEY) {
-        Ok(stored) => stored.as_deref().map_or(0, parse_max_bitrate),
-        Err(e) => {
-            platform::warn(&format!(
-                "pharos: max_bitrate storage read failed error={e}"
-            ));
-            0
-        }
-    }
-}
-
-fn set_stored_max_bitrate(bps: u64) {
-    if let Err(e) = platform::store_theme(MAX_BITRATE_KEY, &bps.to_string()) {
-        platform::warn(&format!(
-            "pharos: max_bitrate storage write failed error={e}"
-        ));
     }
 }
 
@@ -1527,7 +1510,7 @@ fn AppearanceScreen() -> Element {
     let notice = use_signal(|| None::<Notice>);
     let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
-    let mut max_quality = use_signal(stored_max_bitrate);
+    let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -1573,7 +1556,7 @@ fn AppearanceScreen() -> Element {
             diagnostics_key,
             max_quality: max_quality_now,
             on_max_quality: move |bps: u64| {
-                set_stored_max_bitrate(bps);
+                store_bitrate(MAX_BITRATE_KEY, bps);
                 max_quality.set(bps);
                 platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
             },
@@ -1858,8 +1841,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // reloads its own decisions cause; the cap it asks for rides the next
     // negotiation.
     let watch = use_hook(|| {
-        let ceiling = stored_max_bitrate();
-        let w = Watch::new(ceiling, stored_auto_rung(), now_ms_u64());
+        let ceiling = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
+        let rung = stored_bitrate(quality::AUTO_RUNG_KEY, quality::parse_rung);
+        let w = Watch::new(ceiling, rung, now_ms_u64());
         QualityWatch(Rc::new(RefCell::new(w)))
     });
     let mut auto_cap = use_signal(|| watch.0.borrow().cap());
@@ -2113,7 +2097,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     on_renegotiate: move |next| picks.set(next),
                     watch: watch.clone(),
                     on_quality: move |cap| {
-                        set_stored_auto_rung(cap);
+                        store_bitrate(quality::AUTO_RUNG_KEY, cap);
                         auto_cap.set(cap);
                     },
                     slot,
