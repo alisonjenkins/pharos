@@ -1584,3 +1584,238 @@ test.describe("pharos Dioxus UI play queue", () => {
     await expect(panel).toBeHidden();
   });
 });
+
+// Spec 020: one player for the session. A song keeps playing through 20
+// route changes in its floating window (013 SC-004), the window drags
+// anywhere and stays in view, and swaps to the mini bar and back to full,
+// all on the one stream the first play negotiated.
+test.describe("pharos Dioxus UI stage", () => {
+  const signIn = async (page: Page) => {
+    await page.goto("/ui/");
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+  };
+  const at = (page: Page) =>
+    page.evaluate(
+      () => (document.getElementById("pharos-video") as HTMLMediaElement | null)?.currentTime ?? 0,
+    );
+  const plays = (lines: string[]) => lines.filter((l) => /pharos: playback method=/.test(l)).length;
+
+  test("a song plays on through route changes, floating, mini and full again", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    await page.setViewportSize({ width: 1200, height: 800 });
+    await signIn(page);
+
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    const tile = page.locator(".pharos-poster").first();
+    await expect(tile).toBeVisible({ timeout: 15_000 });
+    await tile.click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.5);
+    expect(plays(lines)).toBe(1);
+
+    // Back leaves the screen and the song floats.
+    await page.locator(".pharos-listen").getByRole("button", { name: "Back", exact: true }).click();
+    const stage = page.locator(".pharos-stage.is-floating");
+    await expect(stage).toBeVisible();
+    await expect(page.locator(".pharos-listen")).toBeHidden();
+
+    let last = await at(page);
+    const stops = ["Find", "Together"];
+    for (let i = 0; i < 20; i++) {
+      if (i % 3 === 0) {
+        await page.locator(".pharos-brand").click();
+      } else {
+        await page.getByRole("link", { name: stops[i % 3 - 1] }).first().click();
+      }
+    }
+    await expect.poll(() => at(page), { timeout: 10_000 }).toBeGreaterThan(last);
+    expect(
+      await page.evaluate(() => (document.getElementById("pharos-video") as HTMLMediaElement).paused),
+    ).toBe(false);
+    expect(plays(lines), "no second play for a route change").toBe(1);
+
+    // Drag the window by its strip to the top-left corner.
+    const strip = stage.locator(".pharos-stage-strip");
+    const box = (await strip.boundingBox())!;
+    await page.mouse.move(box.x + 60, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x - 2000, box.y - 2000, { steps: 8 });
+    await page.mouse.up();
+    await expect.poll(async () => (await stage.boundingBox())!.x).toBeLessThan(1);
+    expect((await stage.boundingBox())!.y).toBeLessThan(1);
+    await expect
+      .poll(() => page.evaluate(() => sessionStorage.getItem("pharos.stage.spot")))
+      .toBe("0.0000,0.0000");
+
+    // From the bottom-right, a smaller window keeps it wholly in view.
+    await strip.focus();
+    for (let i = 0; i < 100; i++) await page.keyboard.press("ArrowRight");
+    for (let i = 0; i < 100; i++) await page.keyboard.press("ArrowDown");
+    await page.setViewportSize({ width: 400, height: 600 });
+    const small = (await stage.boundingBox())!;
+    expect(small.x).toBeGreaterThanOrEqual(0);
+    expect(small.y).toBeGreaterThanOrEqual(0);
+    expect(small.x + small.width).toBeLessThanOrEqual(400.5);
+    expect(small.y + small.height).toBeLessThanOrEqual(600.5);
+    await page.setViewportSize({ width: 1200, height: 800 });
+
+    await stage.getByRole("button", { name: "Mini bar" }).click();
+    const bar = page.locator(".pharos-stage.is-mini");
+    await expect(bar).toBeVisible();
+    await expect(bar.getByRole("button", { name: "Pause" })).toBeVisible();
+
+    last = await at(page);
+    await bar.getByRole("button", { name: "Expand" }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible();
+    await expect(page).toHaveURL(/\/ui\/watch\//);
+    await expect.poll(() => at(page)).toBeGreaterThan(last);
+    expect(plays(lines), "the full view keeps the stream").toBe(1);
+
+    // The shrink button swaps without Back; it remembers the bar.
+    await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
+    await expect(bar).toBeVisible();
+    await bar.getByRole("button", { name: "Close" }).click();
+    await expect(page.locator(".pharos-stage")).toHaveCount(0);
+    expect(lines.some((l) => /pharos: stage view=closed/.test(l))).toBe(true);
+    // Full → shrink → Close ends on a page, never a blank watch route.
+    await expect(page).not.toHaveURL(/\/ui\/watch\//);
+    await expect(page.locator(".pharos-main > *").first()).toBeVisible();
+  });
+
+  test("a queued song plays next in the floating window without opening it", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-stage-${Date.now()}", Version="0"`,
+      },
+      data: { Username: TEST_USER, Pw: TEST_PASS },
+    });
+    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+    const { AccessToken: token, User: user } = await auth.json();
+    const json = async (path: string) =>
+      (await request.get(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token } })).json();
+    const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+    const tracks = await json(
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+    );
+    const track = tracks.Items?.find(
+      (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
+    );
+    test.skip(!track, "the seed has no track tagged with an album and artist");
+    const artists = await json(`/Artists`);
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
+    expect(artist, "the track's album artist is listed").toBeTruthy();
+
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    await signIn(page);
+    await page.goto(`/ui/browse/${nativeSynth(artist.Id)}`);
+    const card = page
+      .locator("section.pharos-artist ul.pharos-grid li", { hasText: track.Album })
+      .first();
+    await expect(card).toBeVisible({ timeout: 15_000 });
+    await card.locator("a").first().click();
+    await expect(page.locator("section.pharos-album h2")).toHaveText(track.Album, {
+      timeout: 15_000,
+    });
+    // The whole album again behind the first song, so something follows it.
+    await page.getByRole("button", { name: `Add ${track.Album} to the queue` }).click();
+    await page.locator("ol.pharos-tracks li").first().locator("a").click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.5);
+    await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await expect(page.locator("section.pharos-album")).toBeVisible();
+    const route = page.url();
+    const before = lines.length;
+
+    await page.evaluate(() => {
+      const a = document.getElementById("pharos-video") as HTMLMediaElement;
+      a.currentTime = Math.max(0, a.duration - 0.5);
+    });
+    // The next song is a new playback, or the same song again in place.
+    await expect
+      .poll(
+        () =>
+          lines
+            .slice(before)
+            .some((l) => /pharos: playback method=|pharos: queue replay/.test(l)),
+        { timeout: 20_000 },
+      )
+      .toBe(true);
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await expect.poll(() => at(page), { timeout: 15_000 }).toBeGreaterThan(0.2);
+    expect(page.url(), "the page stays where the listener is").toBe(route);
+    expect(lines.slice(before).some((l) => /ui_action|stage view=full/.test(l))).toBe(false);
+  });
+
+  test("a Play while the player floats plays there and leaves the page alone", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    await signIn(page);
+
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    await page.locator(".pharos-poster").first().click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.5);
+    await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+
+    // A film from its title page: the page stays, the window plays it.
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("Playwright");
+    await page.locator(".pharos-poster").first().click();
+    await expect(page).toHaveURL(/\/ui\/title\//);
+    const title = page.url();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    const video = page.locator(".pharos-stage.is-floating .pharos-watch video");
+    await expect(video).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.2);
+    expect(page.url(), "the title page stays").toBe(title);
+    expect(plays(lines)).toBe(2);
+    expect(lines.some((l) => /pharos: stage view=floating item=\S+ reason=play/.test(l))).toBe(
+      true,
+    );
+
+    // Expand shows the film full, on its own watch route.
+    await page.locator(".pharos-stage").getByRole("button", { name: "Expand" }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+    await expect(page).toHaveURL(/\/ui\/watch\//);
+    expect(plays(lines), "expanding keeps the stream").toBe(2);
+  });
+});
