@@ -12,7 +12,7 @@ use pharos_api::pharos_capnp::{
     session, EndReason,
 };
 use pharos_api::{server, Connection};
-use pharos_core::{UserPolicy, UserStore as _};
+use pharos_core::{TokenStore as _, UserPolicy, UserStore as _};
 use pharos_jellyfin_api::dto::wire_item_id;
 use pharos_server::group_ops::SyncDeps;
 use pharos_sync::group::{GroupHandle, GroupMsg};
@@ -811,6 +811,44 @@ async fn dropping_the_membership_keeps_the_seat_through_the_grace() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(member_count(&rig).await, 2, "still seated inside the grace");
     tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(member_count(&rig).await, 1, "removed once the grace passed");
+    let _ = until(&mut a_seen, |s| matches!(s, Seen::Left(_)).then_some(())).await;
+}
+
+/// A connection that closes while it holds a membership loses the seat the
+/// same way a dropped capability does: the capnp exports die with their
+/// connection, and the group removes the member once the grace passes. The
+/// client here keeps its `Membership` reference alive, so only the server
+/// side of the close can release it.
+/// Disarm check: with the server leaking the export past the close (the
+/// `Membership` never dropped), the member count stays 2 and this fails.
+#[actix_web::test]
+async fn a_closed_connection_releases_its_membership() {
+    let rig = rig().await;
+    let (client, closed) = crate::revocation::connect(&rig.server).await;
+    let b_session = crate::revocation::signed_in(&client, &rig.fx.user_token).await;
+    let a_session = rig.session(&rig.fx.admin_token).await;
+    let (a_sink, mut a_seen) = sink();
+    let _a = create(&a_session, "dev-a", MOVIE, 5_000, a_sink)
+        .await
+        .unwrap();
+    let gid = only_group(&rig).await;
+    let (b_sink, _b_seen) = sink();
+    let _b = join(&b_session, "dev-b", &gid, b_sink).await.unwrap();
+    assert_eq!(member_count(&rig).await, 2);
+
+    rig.fx
+        .state
+        .stores
+        .revoke(&rig.fx.user_token)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("the revoked connection closes")
+        .expect("close frame");
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
     assert_eq!(member_count(&rig).await, 1, "removed once the grace passed");
     let _ = until(&mut a_seen, |s| matches!(s, Seen::Left(_)).then_some(())).await;
 }

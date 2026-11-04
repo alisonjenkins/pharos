@@ -123,6 +123,10 @@ pub struct ConnectionCtx {
     /// Woken when a logout leaves the connection with no session, so the
     /// socket re-arms its auth deadline.
     pub(crate) signed_out: tokio::sync::Notify,
+    /// Run once when the connection ends, whatever ended it. Capabilities
+    /// exported on a connection are not reliably dropped when it closes, so
+    /// whatever must happen on the close (a membership's seat) registers here.
+    on_close: RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
 impl ConnectionCtx {
@@ -144,7 +148,21 @@ impl ConnectionCtx {
             resumed: RefCell::new(Vec::new()),
             ended: RefCell::new(Vec::new()),
             signed_out: tokio::sync::Notify::new(),
+            on_close: RefCell::new(Vec::new()),
         }))
+    }
+
+    /// Runs `hook` when the connection closes.
+    pub(crate) fn on_close(&self, hook: impl FnOnce() + 'static) {
+        self.on_close.borrow_mut().push(Box::new(hook));
+    }
+
+    /// The connection has closed: runs the registered hooks, once.
+    pub(crate) fn closed(&self) {
+        let hooks = std::mem::take(&mut *self.on_close.borrow_mut());
+        for hook in hooks {
+            hook();
+        }
     }
 
     fn remember_token(&self, token: String, user: UserId) {
