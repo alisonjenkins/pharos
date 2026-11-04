@@ -21,6 +21,8 @@ pub enum Program {
     Horizon,
     /// An eight-fold mirrored pattern whose rings follow the spectrum.
     Kaleidoscope,
+    /// Stars flying towards the viewer, each twinkling with one band.
+    Starfield,
     /// Backdrop: slow curtains of the accent along the top of the page.
     Aurora,
     /// Backdrop: fine scanlines with a rolling band, like a CRT.
@@ -42,6 +44,10 @@ impl Program {
             Program::Orbit => include_str!("shaders/orbit.frag"),
             Program::Horizon => include_str!("shaders/horizon.frag"),
             Program::Kaleidoscope => include_str!("shaders/kaleidoscope.frag"),
+            Program::Starfield => concat!(
+                include_str!("shaders/noise.frag"),
+                include_str!("shaders/starfield.frag")
+            ),
             Program::Aurora => concat!(
                 include_str!("shaders/noise.frag"),
                 include_str!("shaders/aurora.frag")
@@ -87,7 +93,7 @@ pub fn fragment_source(program: Program) -> String {
 mod tests {
     use super::*;
 
-    const ALL: [Program; 11] = [
+    const ALL: [Program; 12] = [
         Program::Spectrum,
         Program::Scope,
         Program::Halo,
@@ -95,6 +101,7 @@ mod tests {
         Program::Orbit,
         Program::Horizon,
         Program::Kaleidoscope,
+        Program::Starfield,
         Program::Aurora,
         Program::Scanlines,
         Program::MatrixRain,
