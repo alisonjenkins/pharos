@@ -92,6 +92,12 @@ impl ClientError {
             }
         )
     }
+
+    /// Whether the call failed because its connection is gone, as a call on
+    /// a capability from a connection that has since dropped does.
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, ClientError::Rpc(e) if e.kind == capnp::ErrorKind::Disconnected)
+    }
 }
 
 /// A `Done` result: ok, or the server's `Error`.
@@ -189,5 +195,17 @@ mod tests {
         ] {
             assert!(!api(kind).needs_sign_in(), "{kind}");
         }
+    }
+
+    /// Only a lost connection is a disconnect: the server's own refusals and
+    /// other transport failures still warn.
+    #[test]
+    fn only_a_lost_connection_is_disconnected() {
+        assert!(
+            ClientError::from(capnp::Error::disconnected("Peer disconnected".into()))
+                .is_disconnected()
+        );
+        assert!(!ClientError::from(capnp::Error::failed("boom".into())).is_disconnected());
+        assert!(!api("unavailable").is_disconnected());
     }
 }
