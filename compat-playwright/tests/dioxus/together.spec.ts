@@ -1,4 +1,11 @@
-import { test, expect, Browser, Page } from "@playwright/test";
+import {
+  test,
+  expect,
+  APIRequestContext,
+  Browser,
+  BrowserContext,
+  Page,
+} from "@playwright/test";
 import {
   Probeable,
   VideoProbeLike,
@@ -51,6 +58,46 @@ class Member implements Probeable {
   }
 }
 
+/** The group ids `SyncPlay/List` shows the user. */
+async function listedGroups(
+  request: APIRequestContext,
+  api: Record<string, string>,
+): Promise<string[]> {
+  const res = await request.get(`${PHAROS_URL}/SyncPlay/List`, { headers: api });
+  const groups: { GroupId: string }[] = await res.json();
+  return groups.map((g) => g.GroupId);
+}
+
+/**
+ * Click A's `<video>` until A's own player reaches `paused`, then return.
+ * The click is a group command, so the player changes only when the server's
+ * answer comes back; a click that lands before the page has wired its player
+ * to the group is lost, so it is sent again rather than waited on forever.
+ * A click while A still shows the old state asks for the same new state, so
+ * a repeat never undoes one in flight.
+ */
+async function toggleUntil(member: Member, paused: boolean) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await member.page.locator("#pharos-video").click();
+    const took = await expect
+      .poll(() => member.probe().then((p) => p.paused), { timeout: 5_000 })
+      .toBe(paused)
+      .then(() => true)
+      .catch(() => false);
+    if (took) {
+      // A repeat is worth seeing: it means a click went unheard.
+      if (attempt > 0) {
+        test.info().annotations.push({
+          type: "lost-click",
+          description: `${member.label} paused=${paused} took ${attempt + 1} clicks`,
+        });
+      }
+      return;
+    }
+  }
+  throw new Error(`${member.label}'s player never became paused=${paused}`);
+}
+
 async function signIn(browser: Browser, label: string) {
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -66,6 +113,25 @@ async function signIn(browser: Browser, label: string) {
 }
 
 test.describe("pharos Dioxus UI watch together", () => {
+  // Each try's browsers, so afterEach leaves the group even when the test
+  // fails. A group left behind would show in the next try's list (retries
+  // run in the same server).
+  let open: { context: BrowserContext; page: Page }[] = [];
+
+  test.afterEach(async () => {
+    for (const { context, page } of open) {
+      // The overlay hides when the pointer rests; moving wakes it.
+      await page.mouse.move(20, 20).catch(() => {});
+      await page
+        .locator(".pharos-members")
+        .getByRole("button", { name: "Leave" })
+        .click({ timeout: 5_000 })
+        .catch(() => {});
+      await context.close();
+    }
+    open = [];
+  });
+
   test("two browsers play, pause and seek in step", async ({ browser, request }) => {
     test.setTimeout(150_000);
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
@@ -98,9 +164,14 @@ test.describe("pharos Dioxus UI watch together", () => {
     const nativeId = BigInt(`0x${movie.Id}`).toString();
 
     const a = await signIn(browser, "A");
+    open.push(a);
     const b = await signIn(browser, "B");
+    open.push(b);
     const logs = () => [...a.lines, ...b.lines].join("\n");
     try {
+      // Groups another test or an earlier try left are not A's.
+      const before = new Set(await listedGroups(request, api));
+
       // A starts a group on the title and lands on the watch page as its member.
       await a.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
       await a.page.getByRole("button", { name: "Watch together" }).click();
@@ -108,11 +179,17 @@ test.describe("pharos Dioxus UI watch together", () => {
       await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
 
       // B follows the invite link and joins.
-      const groups = await (
-        await request.get(`${PHAROS_URL}/SyncPlay/List`, { headers: api })
-      ).json();
-      expect(groups, "A's group is listed").toHaveLength(1);
-      const groupId: string = groups[0].GroupId;
+      let groupId = "";
+      await expect
+        .poll(
+          async () => {
+            const made = (await listedGroups(request, api)).filter((g) => !before.has(g));
+            groupId = made[0] ?? "";
+            return made.length;
+          },
+          { message: "A's group is listed", timeout: 10_000 },
+        )
+        .toBe(1);
       await b.page.goto(`${PHAROS_URL}/ui/together/${groupId.toLowerCase()}`);
       await b.page.getByRole("button", { name: "Join" }).click();
       await expect(b.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
@@ -125,18 +202,19 @@ test.describe("pharos Dioxus UI watch together", () => {
       }
 
       const people = [new Member("A", a.page), new Member("B", b.page)];
+      const [byA] = people;
 
       // The group starts by itself once both members are ready.
       await waitUntilInSync(people);
 
       // A pauses; B pauses.
-      await a.page.locator("#pharos-video").click();
+      await toggleUntil(byA, true);
       await assertPausedAll(people);
 
       // A plays again; the group resumes both together.
-      await a.page.locator("#pharos-video").click();
+      await toggleUntil(byA, false);
       await waitUntilInSync(people);
-      await a.page.locator("#pharos-video").click();
+      await toggleUntil(byA, true);
       await assertPausedAll(people);
 
       // A seeks with the bar; B converges on the same position.
@@ -157,9 +235,6 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw new Error(
         `${(e as Error).message}\n--- A page ---\n${await dom(a.page)}\n--- B page ---\n${await dom(b.page)}\n--- browser logs ---\n${logs()}`,
       );
-    } finally {
-      await a.context.close();
-      await b.context.close();
     }
   });
 });
