@@ -4251,7 +4251,15 @@ impl HlsSegmentCache {
                 audio_start_secs * 1000.0
             ));
         }
-        filters.push(Self::FILL_AUDIO_HOLES.to_string());
+        // B473 — a seek that lands inside a hole would otherwise start at the
+        // first packet after it, dropping the hole's tail and putting the audio
+        // early. `-ss` rebases the seek point to zero. A from-0 session must
+        // not anchor here: `adelay` above already pads a late track.
+        if start_seg == 0 {
+            filters.push(Self::FILL_AUDIO_HOLES.to_string());
+        } else {
+            filters.push(format!("{}:first_pts=0", Self::FILL_AUDIO_HOLES));
+        }
         args.push("-af".into());
         args.push(filters.join(","));
         args.extend(
@@ -9583,7 +9591,7 @@ mod tests {
     fn every_opus_audio_session_fills_source_holes() {
         for (start_seg, audio_start, want) in [
             (0, 0.0, "aresample=async=1:min_hard_comp=0.02"),
-            (30, 1.7, "aresample=async=1:min_hard_comp=0.02"),
+            (30, 1.7, "aresample=async=1:min_hard_comp=0.02:first_pts=0"),
             (
                 0,
                 1.7,
