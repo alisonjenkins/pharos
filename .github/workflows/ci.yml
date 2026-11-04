@@ -23,8 +23,13 @@ jobs:
   changes:
     name: classify changes
     runs-on: ubuntu-latest
+    # `actions: read` lets the runner-routing step count queued jobs.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      runner: ${{ steps.runner.outputs.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -51,11 +56,24 @@ jobs:
           done < <(git diff --name-only "$BASE_SHA"...HEAD)
           echo "code=$code" >> "$GITHUB_OUTPUT"
 
+      # GitHub cannot overflow a queued job between runner labels, so pick the
+      # label here. Off unless the repo variable BURST_ENABLED is `true`; any
+      # failure yields the home label, and an empty output falls back to it
+      # in each job's `runs-on`.
+      - name: Pick runner label
+        id: runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BURST_ENABLED: ${{ vars.BURST_ENABLED }}
+          BURST_QUEUE_THRESHOLD: ${{ vars.BURST_QUEUE_THRESHOLD || '12' }}
+          IS_FORK_PR: ${{ github.event.pull_request.head.repo.fork == true }}
+        run: echo "runner=$(scripts/ci-pick-runner.sh)" >> "$GITHUB_OUTPUT"
+
   test:
     name: build + test + lint
     # Self-hosted home nix builder (host daemon + warm store). Other jobs stay
     # on ubuntu-latest.
-    runs-on: pharos-nix-builder-amd64
+    runs-on: ${{ needs.changes.outputs.runner || 'pharos-nix-builder-amd64' }}
     timeout-minutes: 120
     # Never run fork-PR code on the self-hosted runner (the enforcer's fork-PR
     # approval gate is the primary control; this is a backstop).
@@ -112,7 +130,7 @@ jobs:
 
   oci:
     name: package + oci image
-    runs-on: pharos-nix-builder-amd64
+    runs-on: ${{ needs.changes.outputs.runner || 'pharos-nix-builder-amd64' }}
     timeout-minutes: 120
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -142,9 +160,9 @@ jobs:
 
   publish:
     name: publish images (ghcr)
-    runs-on: pharos-nix-builder-amd64
+    runs-on: ${{ needs.changes.outputs.runner || 'pharos-nix-builder-amd64' }}
     timeout-minutes: 120
-    needs: [test, oci]
+    needs: [changes, test, oci]
     # Only on a push that landed on main — PRs build the images (oci job)
     # but must not publish. Consumes the tarballs the `oci` job already built
     # (build-once): no second `nix build`, just download + push.
@@ -205,7 +223,7 @@ jobs:
 
   compat-playwright:
     name: jellyfin-web crawl
-    runs-on: pharos-nix-builder-amd64
+    runs-on: ${{ needs.changes.outputs.runner || 'pharos-nix-builder-amd64' }}
     timeout-minutes: 120
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -254,7 +272,7 @@ jobs:
   # suite. The `off` step runs even when `on` failed, so both results show.
   dioxus-ui:
     name: dioxus UI
-    runs-on: pharos-nix-builder-amd64
+    runs-on: ${{ needs.changes.outputs.runner || 'pharos-nix-builder-amd64' }}
     timeout-minutes: 120
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
