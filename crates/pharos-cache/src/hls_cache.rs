@@ -916,6 +916,16 @@ pub struct QuarantineReport {
     pub failed: usize,
 }
 
+/// What [`HlsSegmentCache::drop_item_audio`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AudioDropReport {
+    /// Sessions removed, as `<parent>/<session>`.
+    pub dropped: Vec<String>,
+    /// Sessions, or whole session directories, that could not be removed or
+    /// listed, each with its error. Anything here may still be served.
+    pub failed: Vec<String>,
+}
+
 /// Suffix of the provenance sidecar. Named once: the eviction walk, the
 /// quarantine and the sidecar writer all have to agree, and three string
 /// literals would drift apart silently.
@@ -2398,21 +2408,49 @@ impl HlsSegmentCache {
 
     /// Delete every cached audio encode of this item: its Opus rendition
     /// sessions and its continuous AAC sessions, all tracks, bitrates and
-    /// editions. Returns the directories removed.
+    /// editions. Reports the directories removed and every one that could not
+    /// be, with its error.
     ///
     /// An audio session spans the whole title, so there is no index range to
     /// aim at, and it is cheap to encode again. Without this a purge left the
     /// item's audio as it was, so a title whose audio was encoded wrong, or
     /// whose file was replaced at the same path, kept serving the old audio.
-    pub async fn drop_item_audio(&self, media_id: u64) -> Vec<String> {
+    /// A session that could not be removed may still be served, so a failure
+    /// is reported to the caller, never only logged.
+    pub async fn drop_item_audio(&self, media_id: u64) -> AudioDropReport {
         let prefix = format!("{media_id}-");
-        let mut removed = Vec::new();
+        let mut report = AudioDropReport::default();
         let mut dirs = Vec::new();
         for parent in ["_audiohls", "_contaudio"] {
-            let Ok(entries) = std::fs::read_dir(self.root.join(parent)) else {
-                continue;
+            let entries = match std::fs::read_dir(self.root.join(parent)) {
+                Ok(entries) => entries,
+                // No audio of any item was ever encoded here.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        media.id = media_id,
+                        dir = parent,
+                        error = %err,
+                        "could not list cached audio sessions to drop"
+                    );
+                    report.failed.push(format!("{parent}: {err}"));
+                    continue;
+                }
             };
-            for e in entries.flatten() {
+            for entry in entries {
+                let e = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::warn!(
+                            media.id = media_id,
+                            dir = parent,
+                            error = %err,
+                            "could not read a cached audio session entry"
+                        );
+                        report.failed.push(format!("{parent}: {err}"));
+                        continue;
+                    }
+                };
                 let name = e.file_name().to_string_lossy().into_owned();
                 if !name.starts_with(&prefix) {
                     continue;
@@ -2420,14 +2458,18 @@ impl HlsSegmentCache {
                 let path = e.path();
                 match tokio::fs::remove_dir_all(&path).await {
                     Ok(()) => {
-                        removed.push(format!("{parent}/{name}"));
+                        report.dropped.push(format!("{parent}/{name}"));
                         dirs.push(path);
                     }
-                    Err(err) => tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "could not drop a cached audio session"
-                    ),
+                    Err(err) => {
+                        tracing::warn!(
+                            media.id = media_id,
+                            path = %path.display(),
+                            error = %err,
+                            "could not drop a cached audio session"
+                        );
+                        report.failed.push(format!("{parent}/{name}: {err}"));
+                    }
                 }
             }
         }
@@ -2439,10 +2481,11 @@ impl HlsSegmentCache {
         }
         tracing::warn!(
             media.id = media_id,
-            dropped = removed.len(),
+            dropped = report.dropped.len(),
+            failed = report.failed.len(),
             "cached audio sessions dropped; the next play encodes them again"
         );
-        removed
+        report
     }
 
     /// Keep the quarantine bounded: the newest [`QUARANTINE_MAX`] files stay,
@@ -3398,7 +3441,9 @@ impl HlsSegmentCache {
                     // targets (see `probe_source_dimensions`). Fall back to
                     // the historical bounded error rather than guess a
                     // resolution that might not match this rendition's
-                    // sibling segments.
+                    // sibling segments. The kept short attempt has no use
+                    // now either.
+                    let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
                     record_segment_outcome(SegmentOutcome::Short, class);
                     return Err(HlsCacheError::Transcode(format!(
                         "transcode produced an incomplete segment even with a \
@@ -8592,7 +8637,9 @@ mod tests {
             std::fs::write(d.join("a0.m4s"), b"old").unwrap();
         }
 
-        let mut removed = cache.drop_item_audio(7).await;
+        let report = cache.drop_item_audio(7).await;
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let mut removed = report.dropped;
         removed.sort();
 
         assert_eq!(
