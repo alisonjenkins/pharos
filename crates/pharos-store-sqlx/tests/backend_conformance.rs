@@ -803,6 +803,36 @@ where
             .is_none(),
         "one user's pref is not another's"
     );
+    // One key across users in one read; a user without it is absent.
+    UserPrefStore::set_user_pref(&store, other_id, "binary", b"theirs")
+        .await
+        .unwrap();
+    let mut by_key = UserPrefStore::user_prefs_for_key(&store, "binary")
+        .await
+        .unwrap();
+    by_key.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        by_key,
+        vec![(uid, vec![0u8, 255, 1]), (other_id, b"theirs".to_vec())]
+    );
+    assert!(
+        UserPrefStore::user_prefs_for_key(&store, "diagnostics.opt_in")
+            .await
+            .unwrap()
+            .iter()
+            .all(|(u, _)| *u == uid)
+    );
+    // Deleted once: the second delete finds nothing.
+    assert!(UserPrefStore::delete_user_pref(&store, other_id, "binary")
+        .await
+        .unwrap());
+    assert!(!UserPrefStore::delete_user_pref(&store, other_id, "binary")
+        .await
+        .unwrap());
+    assert!(UserPrefStore::get_user_pref(&store, other_id, "binary")
+        .await
+        .unwrap()
+        .is_none());
 
     // -----------------------------------------------------------------
     // 7. GenreStore / TagStore / PersonStore / StudioStore
