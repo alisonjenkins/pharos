@@ -1,5 +1,7 @@
 [application]
 name = "pharos-ui"
+# 025 spike: TV entries (LEANBACK_LAUNCHER, banner, touchscreen optional).
+android_manifest = "android/AndroidManifest.xml"
 
 [web.app]
 # title lives in index.html (setting it here too double-renders it).
@@ -22,3 +24,8 @@ dev = []
 
 [bundle.web]
 out_dir = "target/dx/pharos-ui/release/web"
+
+# 025 slice 0 spike: the Android TV app.
+[bundle]
+identifier = "com.alisonjenkins.pharos.tv"
+publisher = "pharos"
