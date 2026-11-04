@@ -33,7 +33,7 @@ use super::playback::{
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
-use super::stage::{Stage, StageAction, StageBar, StageCtx, View, STAGE_ID};
+use super::stage::{Handoff, Stage, StageAction, StageBar, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
 use super::trail;
@@ -41,7 +41,7 @@ use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
 use super::watch_view::{
-    text_track_id, Control, Controls, WatchView, PLAYER_ID, SEEK_ID, VIDEO_ID,
+    text_track_id, Control, Controls, WatchView, OUTGOING_ID, PLAYER_ID, SEEK_ID, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -1034,6 +1034,41 @@ fn Screen(route: Route) -> Element {
     }
 }
 
+/// Where a player sits on the stage.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    /// The item playing. `play` is its [`Stage::play`]; `waiting` while the
+    /// song before it still shows, until this one's playback is negotiated.
+    Current { play: u32, waiting: bool },
+    /// The song handing over to it.
+    Outgoing(Handoff),
+}
+
+impl Slot {
+    fn class(self) -> &'static str {
+        match self {
+            Slot::Current { waiting: false, .. } => "pharos-stage-slot",
+            Slot::Current { waiting: true, .. } => "pharos-stage-slot is-waiting",
+            Slot::Outgoing(Handoff { ready: false, .. }) => "pharos-stage-slot is-outgoing",
+            Slot::Outgoing(Handoff { ready: true, .. }) => {
+                "pharos-stage-slot is-outgoing is-retired"
+            }
+        }
+    }
+
+    /// Out of sight, or shown but no longer the listener's to drive.
+    fn hidden(self) -> bool {
+        !matches!(self, Slot::Current { waiting: false, .. })
+    }
+
+    fn media_id(self) -> &'static str {
+        match self {
+            Slot::Current { .. } => VIDEO_ID,
+            Slot::Outgoing(_) => OUTGOING_ID,
+        }
+    }
+}
+
 /// The one player (spec 020): full on the watch route, else a floating
 /// window or a mini bar. It sits beside the routed screen, so a route change
 /// restyles it rather than unmounting it and its stream.
@@ -1041,9 +1076,23 @@ fn Screen(route: Route) -> Element {
 fn StageView() -> Element {
     let StageCtx(stage) = use_context::<StageCtx>();
     let s = stage.read();
-    let Some(id) = s.item else {
+    let (Some(id), Some(key)) = (s.item, s.key()) else {
         return rsx! {};
     };
+    // The playing item first, so a lookup by element id that both players
+    // share (the visualiser's canvas) finds its own.
+    let outgoing = s.outgoing();
+    let mut slots = vec![(
+        key,
+        id,
+        Slot::Current {
+            play: s.play,
+            waiting: outgoing.as_ref().is_some_and(|(h, _)| !h.ready),
+        },
+    )];
+    if let Some((handoff, key)) = outgoing {
+        slots.push((key, handoff.from, Slot::Outgoing(handoff)));
+    }
     let class = format!("pharos-stage is-{}", s.view.label());
     let style = format!(
         "--pharos-stage-x: {:.4}; --pharos-stage-y: {:.4};",
@@ -1052,8 +1101,15 @@ fn StageView() -> Element {
     rsx! {
         div { id: STAGE_ID, class, style,
             // Another item (the next episode) mounts a new playback rather
-            // than re-rendering this one's.
-            {remount_on(&id.to_string(), rsx! { WatchScreen { id } })}
+            // than re-rendering this one's; a song handing over keeps its own.
+            for (key, id, slot) in slots {
+                div {
+                    key: "{key}",
+                    class: slot.class(),
+                    "inert": slot.hidden().then_some("true"),
+                    WatchScreen { id, slot }
+                }
+            }
         }
     }
 }
@@ -1553,9 +1609,9 @@ impl PartialEq for PlayingRef {
 }
 
 #[component]
-fn WatchScreen(id: ItemRef) -> Element {
+fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
-    let StageCtx(ctx_stage) = use_context::<StageCtx>();
+    let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
@@ -1767,6 +1823,19 @@ fn WatchScreen(id: ItemRef) -> Element {
             }
         });
     });
+    // Once this playback is settled (or has failed), the song handing over
+    // to it can go: the screen shows this one from here on.
+    use_effect(move || {
+        if !playing.read().as_ref().is_some_and(Option::is_some) {
+            return;
+        }
+        let Slot::Current { play, .. } = slot else {
+            return;
+        };
+        if ctx_stage.peek().outgoing().is_some() {
+            ctx_stage.write().ready(play);
+        }
+    });
     let state = playing.read();
     loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
         remount_on(
@@ -1777,6 +1846,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                     last_ms: LastMs(Rc::clone(&last_ms)),
                     near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
                     on_renegotiate: move |next| picks.set(next),
+                    slot,
                 }
             },
         )
@@ -1838,9 +1908,13 @@ fn Player(
     last_ms: LastMs,
     near: Neighbours,
     on_renegotiate: EventHandler<TrackPicks>,
+    slot: Slot,
 ) -> Element {
     let ctx = use_context::<Ctx>();
     let p = playing.0;
+    // Handing over: the song is done with, so nothing it does is reported
+    // or acted on any more.
+    let retiring = use_hook(|| Rc::new(Cell::new(false)));
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let nav = use_context::<Nav>();
@@ -1883,6 +1957,12 @@ fn Player(
             platform::seek_ms(VIDEO_ID, 0);
             platform::play(VIDEO_ID);
         } else {
+            if queued {
+                // A copy, so `go` stays `Fn`. A cut: the song stops once the
+                // next is ready, and shows until then.
+                let mut stage = stage;
+                stage.write().hand_off(playing_id, 0);
+            }
             replace.0.call(Route::Watch(to));
         }
     };
@@ -1932,6 +2012,7 @@ fn Player(
         let stop = stop.clone();
         move || Rc::new(platform::on_page_hide(stop))
     });
+    let retire_stop = stop.clone();
     // The group drives this video while it is mounted.
     use_hook({
         let session = session.clone();
@@ -2007,7 +2088,11 @@ fn Player(
             Rc::clone(&switched),
         );
         let session = session.clone();
+        let retiring = Rc::clone(&retiring);
         move |event: MediaEvent| {
+            if retiring.get() {
+                return;
+            }
             if let Some(session) = &session {
                 session.on_media(event);
             }
@@ -2061,7 +2146,11 @@ fn Player(
     let on_control = {
         let p = Rc::clone(&p);
         let session = session.clone();
+        let retiring = Rc::clone(&retiring);
         move |control: Control| {
+            if retiring.get() {
+                return;
+            }
             // In a group the viewer's play, pause and seek are the group's.
             let seek = |ms: u64| {
                 if !session.as_ref().is_some_and(|s| s.seek(ms)) {
@@ -2197,6 +2286,17 @@ fn Player(
             }
         }
     };
+    // Handing over: report this song done and stop it. Once, as the slot
+    // changes.
+    if let Slot::Outgoing(_) = slot {
+        if !retiring.replace(true) {
+            let stop = retire_stop;
+            spawn(async move {
+                stop();
+                platform::pause(OUTGOING_ID);
+            });
+        }
+    }
     rsx! {
         if compact {
             StageBar {
@@ -2221,7 +2321,9 @@ fn Player(
         }
         if p.kind == ItemKind::Audio {
             ListenView {
-                compact,
+                // A retired song's screen is hidden; it draws no visualiser.
+                compact: compact || matches!(slot, Slot::Outgoing(Handoff { ready: true, .. })),
+                media_id: slot.media_id(),
                 title: p.title.clone(),
                 image: p.image.clone(),
                 year: p.detail.item.year,
