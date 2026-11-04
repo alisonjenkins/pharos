@@ -32,6 +32,8 @@ export default defineConfig({
     "**/syncplay-h264-nextitem.spec.ts",
     // Needs same-origin jellyfin-web: playwright.same-origin.config.ts.
     "**/item-file-auth.spec.ts",
+    // Needs pharos-ui and a /socket proxy: playwright.mixed.config.ts.
+    "**/mixed/**",
   ],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
