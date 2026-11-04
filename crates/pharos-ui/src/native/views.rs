@@ -43,6 +43,56 @@ pub fn Link(
     }
 }
 
+/// The Pharos "Beam P" mark (assets/brand/README.md), drawn inline in the
+/// theme's own colours: body and beam in the accent, the play button in
+/// the accent's foreground, a pair every theme keeps legible (the warm
+/// beacon of the standalone files would vanish on High Contrast's yellow).
+/// Decorative: the heading beside it carries the name.
+#[component]
+pub fn BrandMark() -> Element {
+    // Each mark owns its gradient: a shared id would resolve every beam to
+    // the first mark on the page, and lose it if that one unmounts.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let beam = use_hook(|| {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("pharos-mark-beam-{n}")
+    });
+    rsx! {
+        svg {
+            class: "pharos-mark",
+            view_box: "0 0 64 64",
+            "aria-hidden": "true",
+            defs {
+                linearGradient {
+                    id: "{beam}",
+                    x1: "44",
+                    x2: "64",
+                    y1: "0",
+                    y2: "0",
+                    "gradientUnits": "userSpaceOnUse",
+                    stop { class: "pharos-mark-glow", offset: "0", "stop-opacity": "0.9" }
+                    stop { class: "pharos-mark-glow", offset: "1", "stop-opacity": "0" }
+                }
+            }
+            path { d: BRAND_BEAM, fill: "url(#{beam})" }
+            path { class: "pharos-mark-body", "fill-rule": "evenodd", d: BRAND_BODY }
+            path { class: "pharos-mark-light", d: BRAND_PLAY }
+        }
+    }
+}
+
+const BRAND_BEAM: &str = "M44 22 64 12V36L44 30Z";
+const BRAND_BODY: &str = "M12 10a4 4 0 0 1 4-4H32a20 20 0 0 1 0 40H24V56a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4Z M26 16.5V35.5L42 26Z";
+const BRAND_PLAY: &str = "M26 16.5V35.5L42 26Z";
+
+/// The mark and the name, as the page heading.
+#[component]
+fn Brand() -> Element {
+    rsx! {
+        h1 { class: "pharos-lockup", BrandMark {} span { "pharos" } }
+    }
+}
+
 /// The frame around every signed-in screen: the bar, a button per library
 /// and the trail to the page shown (outermost first).
 #[component]
@@ -60,7 +110,7 @@ pub fn Shell(
         div { class: "pharos-app",
             header { class: "pharos-banner pharos-shell",
                 div { class: "pharos-shell-bar",
-                    Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
+                    Link { to: Route::Home, class: "pharos-brand", Brand {} }
                     nav { class: "pharos-shell-nav",
                         Link { to: Route::Find, "Find" }
                         Link { to: Route::Together, "Together" }
@@ -133,7 +183,7 @@ pub fn SignInView(
     let mut password = use_signal(String::new);
     rsx! {
         div { class: "pharos-app",
-            header { class: "pharos-banner", h1 { "pharos" } }
+            header { class: "pharos-banner", Brand {} }
             form {
                 class: "pharos-login",
                 id: "signin",
@@ -187,7 +237,7 @@ pub fn StatusView(
 ) -> Element {
     rsx! {
         div { class: "pharos-app",
-            header { class: "pharos-banner", h1 { "pharos" } }
+            header { class: "pharos-banner", Brand {} }
             section { class: "pharos-status", role: "status",
                 h2 { "{title}" }
                 p { "{detail}" }
@@ -634,6 +684,105 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// The heading on `html`, open tag to close tag.
+    fn heading(html: &str) -> &str {
+        let start = html
+            .find("<h1")
+            .unwrap_or_else(|| panic!("no heading in {html}"));
+        let end = html
+            .find("</h1>")
+            .unwrap_or_else(|| panic!("unclosed heading in {html}"));
+        html.get(start..end).unwrap_or_default()
+    }
+
+    #[test]
+    fn every_header_carries_the_brand_mark_and_name() {
+        let pages = [
+            (
+                "sign-in",
+                render(|| rsx! { SignInView { error: None, busy: false, on_submit: |_| {} } }),
+            ),
+            (
+                "status",
+                render(|| rsx! { StatusView { title: "Connecting", detail: "…", action: None } }),
+            ),
+            (
+                "shell",
+                render(
+                    || rsx! { Shell { account: rsx! {}, libraries: vec![], trail: vec![], p { "body" } } },
+                ),
+            ),
+        ];
+        for (page, html) in &pages {
+            let h1 = heading(html);
+            assert!(h1.contains(r#"class="pharos-mark""#), "{page}: {h1}");
+            assert!(h1.contains(r#"aria-hidden="true""#), "{page}: {h1}");
+            assert!(h1.contains("<span>pharos</span>"), "{page}: {h1}");
+            // Themed by class, so no colour is baked in.
+            assert!(h1.contains(r#"class="pharos-mark-body""#), "{page}: {h1}");
+            assert!(!h1.contains("fill=\"#"), "{page}: {h1}");
+        }
+    }
+
+    #[test]
+    fn two_marks_on_one_page_keep_their_own_beam() {
+        let html = render(|| rsx! { BrandMark {} BrandMark {} });
+        let ids: Vec<&str> = html
+            .match_indices(r#"id="pharos-mark-beam-"#)
+            .filter_map(|(at, _)| html.get(at + 4..).and_then(|r| r.split('"').next()))
+            .collect();
+        assert_eq!(ids.len(), 2, "{html}");
+        assert_ne!(ids.first(), ids.last(), "{html}");
+        for id in &ids {
+            assert!(
+                html.contains(&format!("url(#{id})")),
+                "{id} unused in {html}"
+            );
+        }
+    }
+
+    /// The inline mark and the shipped files are one drawing.
+    #[test]
+    fn the_inline_mark_matches_the_shipped_svgs() {
+        for (name, svg) in [
+            ("mark.svg", include_str!("../../assets/brand/mark.svg")),
+            (
+                "favicon.svg",
+                include_str!("../../assets/brand/favicon.svg"),
+            ),
+            ("logo.svg", include_str!("../../assets/brand/logo.svg")),
+            (
+                "logo-light.svg",
+                include_str!("../../assets/brand/logo-light.svg"),
+            ),
+        ] {
+            for d in [BRAND_BEAM, BRAND_BODY, BRAND_PLAY] {
+                assert!(svg.contains(d), "{name} lacks {d}");
+            }
+        }
+    }
+
+    /// Every icon index.html and the manifest name ships in assets/brand,
+    /// so the tab and home-screen icons never 404.
+    #[test]
+    fn every_linked_brand_file_exists() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/brand");
+        let index = include_str!("../../index.html");
+        let manifest = include_str!("../../assets/brand/manifest.webmanifest");
+        let mut seen = 0;
+        for text in [index, manifest] {
+            for (at, _) in text.match_indices("/ui/assets/brand/") {
+                let rest = text.get(at + "/ui/assets/brand/".len()..).unwrap_or("");
+                let file: String = rest.chars().take_while(|c| *c != '"').collect();
+                assert!(dir.join(&file).is_file(), "missing assets/brand/{file}");
+                // The server indexes the bundle by lowercase key.
+                assert_eq!(file, file.to_lowercase(), "{file}");
+                seen += 1;
+            }
+        }
+        assert!(seen >= 8, "only {seen} brand links found");
     }
 
     #[test]

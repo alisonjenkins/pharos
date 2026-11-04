@@ -710,6 +710,9 @@
               fi
             done
             install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
+            # Logos, favicons and the web manifest (crates/pharos-ui/assets/brand).
+            mkdir -p $out/assets/brand
+            cp crates/pharos-ui/assets/brand/*.{svg,png,ico,webmanifest} $out/assets/brand/
             # hls.js, vendored and pinned (ADR-0035); the watch page loads it
             # from 'self' only where the browser lacks native HLS.
             install -Dm644 crates/pharos-ui/assets/vendor/hls.min.js $out/assets/vendor/hls.min.js
@@ -746,6 +749,8 @@
               events { worker_connections 1024; }
               http {
                 include ${pkgs.angie}/conf/mime.types;
+                # The stock table has no entry for the UI's web manifest.
+                types { application/manifest+json webmanifest; }
                 default_type application/octet-stream;
                 ${angieAccessLog}
                 sendfile on;

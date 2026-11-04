@@ -141,9 +141,10 @@ input:focus-visible {
 
 .pharos-shell-bar {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
-  gap: 1rem;
+  gap: 0.5rem 1rem;
 }
 
 .pharos-brand {
@@ -151,8 +152,33 @@ input:focus-visible {
   text-decoration: none;
 }
 
+/* Brand lockup: the Beam P mark beside the lowercase name. */
+.pharos-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-family: var(--px-font-display);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.pharos-mark {
+  width: 1.35em;
+  height: 1.35em;
+  flex: none;
+}
+.pharos-mark-body {
+  fill: var(--px-color-accent);
+}
+.pharos-mark-light {
+  fill: var(--px-color-accent-fg);
+}
+.pharos-mark-glow {
+  stop-color: var(--px-color-accent);
+}
+
 .pharos-shell-nav {
   display: flex;
+  flex-wrap: wrap;
   gap: 1rem;
   align-items: center;
 }
