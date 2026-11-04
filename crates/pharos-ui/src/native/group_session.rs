@@ -233,7 +233,16 @@ impl GroupState {
             by: self.name_of(by.as_deref()),
             action,
         };
+        let catch_up =
+            |by: &Option<String>| by.as_deref() == Some(pharos_client::group::CATCH_UP_BY);
         match update {
+            GroupUpdate::Play { by, .. }
+            | GroupUpdate::Pause { by, .. }
+            | GroupUpdate::Seek { by, .. }
+                if catch_up(by) =>
+            {
+                Vec::new()
+            }
             GroupUpdate::Play { by, .. } => vec![by_member(by, activity::Action::Play)],
             GroupUpdate::Pause {
                 by, position_ms, ..
@@ -2221,6 +2230,28 @@ mod tests {
                 "The group skipped to 1:00"
             ]
         );
+    }
+
+    #[test]
+    fn a_catch_up_or_buffering_command_is_not_a_line() {
+        let rig = pair();
+        let by = Some(pharos_client::group::CATCH_UP_BY.to_owned());
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 0,
+            position_ms: 0,
+            by: by.clone(),
+        });
+        rig.session.deliver(GroupUpdate::Pause {
+            at_server_ms: 0,
+            position_ms: 724_000,
+            by: by.clone(),
+        });
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 0,
+            position_ms: 60_000,
+            by,
+        });
+        assert!(lines(&rig).is_empty());
     }
 
     #[test]
