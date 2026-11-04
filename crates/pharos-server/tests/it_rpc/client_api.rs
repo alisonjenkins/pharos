@@ -156,6 +156,144 @@ async fn play_negotiates_and_reports_progress() {
     assert_eq!(data.last_played_position_ticks, 200_000_000);
 }
 
+/// Each version carries what tells it apart (resolution, HDR, codecs, audio,
+/// size), and its path on disk only when an admin asks.
+#[actix_web::test]
+async fn versions_describe_their_files_and_show_paths_to_admins_only() {
+    use pharos_client::api::VersionAudio;
+    use pharos_core::{AlternateMediaSource, AudioTrack, MediaItem, MediaKind, MediaProbe};
+
+    const EPISODE: u64 = 311;
+    let (server, fx) = crate::revocation::start().await;
+    crate::library::seed_movies(&fx).await;
+    let copy = MediaProbe {
+        width: Some(3840),
+        height: Some(2160),
+        video_codec: Some("hevc".into()),
+        color_transfer: Some("smpte2084".into()),
+        container: Some("mkv".into()),
+        size_bytes: Some(9_000),
+        audio_tracks: vec![
+            AudioTrack {
+                codec: Some("eac3".into()),
+                channels: Some(6),
+                language: Some("eng".into()),
+                ..Default::default()
+            },
+            AudioTrack {
+                codec: Some("aac".into()),
+                channels: Some(2),
+                language: Some("jpn".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let primary = MediaProbe {
+        width: Some(1920),
+        height: Some(1080),
+        video_codec: Some("h264".into()),
+        audio_codec: Some("aac".into()),
+        audio_channels: Some(2),
+        container: Some("mkv".into()),
+        size_bytes: Some(4_000),
+        alternate_sources: vec![
+            AlternateMediaSource {
+                id: "season-1".into(),
+                path: "/libA/Show/Season 1/Show - S01E02.mkv".into(),
+                name: Some("Season 1".into()),
+                probe: Some(Box::new(copy)),
+                ..Default::default()
+            },
+            AlternateMediaSource {
+                id: "avi".into(),
+                path: "/libA/Show/Season 01/Show - S01E02.avi".into(),
+                name: Some("AVI".into()),
+                video_codec: Some("mpeg4".into()),
+                size_bytes: Some(700),
+                probe: None,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    pharos_core::MediaStore::put(
+        &fx.state.stores,
+        MediaItem {
+            id: EPISODE,
+            path: "/libA/Show/Season 01/Show - S01E02.mkv".into(),
+            title: "Episode".into(),
+            kind: MediaKind::Episode,
+            probe: primary,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
+        .await
+        .unwrap();
+    let detail_as = |token: String| {
+        let server = &server;
+        async move {
+            let (client, _closed) = crate::revocation::connect(server).await;
+            let session = crate::revocation::signed_in(&client, &token).await;
+            NativeApi::new(&session)
+                .detail(&CallInfo::default(), ItemRef::Real(EPISODE))
+                .await
+                .expect("detail")
+        }
+    };
+
+    let admin = detail_as(fx.admin_token.clone()).await;
+    let [primary, copy, avi] = admin.versions.as_slice() else {
+        panic!("three versions: {:?}", admin.versions);
+    };
+    assert_eq!(
+        (
+            primary.width,
+            primary.height,
+            primary.video_codec.as_str(),
+            primary.hdr.as_str()
+        ),
+        (1920, 1080, "h264", "")
+    );
+    assert_eq!(
+        primary.audio,
+        [VersionAudio {
+            codec: "aac".into(),
+            channels: 2,
+            ..Default::default()
+        }]
+    );
+    assert_eq!(primary.path, "/libA/Show/Season 01/Show - S01E02.mkv");
+    assert_eq!(
+        (
+            copy.name.as_str(),
+            copy.width,
+            copy.hdr.as_str(),
+            copy.size_bytes
+        ),
+        ("Season 1", 3840, "HDR10", 9_000)
+    );
+    let langs: Vec<_> = copy
+        .audio
+        .iter()
+        .map(|a| (a.language.as_str(), a.channels))
+        .collect();
+    assert_eq!(langs, [("eng", 6), ("jpn", 2)]);
+    assert_eq!(copy.path, "/libA/Show/Season 1/Show - S01E02.mkv");
+    assert_eq!((avi.video_codec.as_str(), avi.size_bytes), ("mpeg4", 700));
+
+    let viewer = detail_as(fx.user_token.clone()).await;
+    assert_eq!(viewer.versions.len(), 3);
+    assert!(
+        viewer.versions.iter().all(|v| v.path.is_empty()),
+        "paths reach admins only: {:?}",
+        viewer.versions
+    );
+}
+
 /// V291: a 2D film with a grouped half-SBS edition is badged 3D, lists both
 /// versions, is found by the 3D filter, and plays the edition's file when
 /// asked; a version it does not have, or cannot serve yet, is refused.

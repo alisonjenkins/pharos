@@ -2046,9 +2046,21 @@ impl MediaProbe {
     /// `smpte2084`; HLG broadcast uses `arib-std-b67`; Dolby Vision
     /// ffprobe also reports `smpte2084` for the base layer.
     pub fn video_range(&self) -> &'static str {
+        if self.hdr_format().is_empty() {
+            "SDR"
+        } else {
+            "HDR"
+        }
+    }
+
+    /// The HDR format a version picker names: `HDR10` (`smpte2084`, which
+    /// Dolby Vision's base layer reports too), `HLG` (`arib-std-b67`), or
+    /// empty for SDR.
+    pub fn hdr_format(&self) -> &'static str {
         match self.color_transfer.as_deref() {
-            Some("smpte2084") | Some("arib-std-b67") => "HDR",
-            _ => "SDR",
+            Some("smpte2084") => "HDR10",
+            Some("arib-std-b67") => "HLG",
+            _ => "",
         }
     }
 
@@ -3265,6 +3277,23 @@ pub trait MediaStore: Send + Sync {
         id: MediaId,
         new_path: &std::path::Path,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Copy each user's played, play count, favourite and resume state for
+    /// `from` onto `into`, keeping the furthest of the two: played or
+    /// favourite on either stays set, the higher play count wins, and resume
+    /// follows the later play. Stored audio and subtitle choices are not
+    /// copied: their stream indexes name the other file's streams. Used
+    /// when a file's row is folded into another item as one of its versions.
+    /// Idempotent; a no-op when `into` has no row. Stores without user data
+    /// keep the default.
+    fn merge_user_data(
+        &self,
+        from: MediaId,
+        into: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        let _ = (from, into);
+        async { Ok(()) }
+    }
 
     /// LIB-D4 — upsert one artwork row for `(item_id, role)`. `role` is an
     /// [`ArtworkRole::as_str`] token (`"Primary"` / `"Backdrop"` / …);

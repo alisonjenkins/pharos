@@ -3,7 +3,7 @@
 //! every reason a title has more than one file (a 3D edition, a cut, a
 //! second rip); a new fact about a version extends [`version_label`].
 
-use pharos_client::api::{ItemRef, Stereo, Version};
+use pharos_client::api::{ItemRef, Stereo, Version, VersionAudio};
 
 use super::stereo::packing_label;
 
@@ -12,18 +12,154 @@ pub fn version_key(title: ItemRef) -> String {
     format!("pharos.version.{title}")
 }
 
-/// A version as the picker lists it: "2D" or "3D (half side-by-side)", then
-/// its edition name when it has one that says more.
+/// A version as the picker lists it: its 3D packing when it has one, its
+/// edition name when that says more, then what tells its file apart
+/// (`1080p · HDR10 · HEVC · EAC3 5.1 +1 · 4.2 GB`). A 2D version is not
+/// marked 2D unless nothing else names it, so two copies of an episode read
+/// by their files rather than as "2D" twice.
 pub fn version_label(version: &Version) -> String {
-    let kind = match version.stereo {
-        None => "2D".to_owned(),
-        Some(s) => format!("3D ({})", packing_label(s)),
-    };
+    let mut parts = Vec::new();
+    if let Some(s) = version.stereo {
+        parts.push(format!("3D ({})", packing_label(s)));
+    }
     let name = version.name.trim();
-    if name.is_empty() || name.eq_ignore_ascii_case("3d") || name.eq_ignore_ascii_case("2d") {
-        kind
-    } else {
-        format!("{kind} · {name}")
+    if !name.is_empty() && !name.eq_ignore_ascii_case("3d") && !name.eq_ignore_ascii_case("2d") {
+        parts.push(name.to_owned());
+    }
+    parts.extend(resolution(version.width, version.height));
+    if !version.hdr.is_empty() {
+        parts.push(version.hdr.clone());
+    }
+    parts.extend(codec_name(&version.video_codec));
+    if let Some(first) = version.audio.first() {
+        let mut audio = audio_stream(first);
+        if version.audio.len() > 1 {
+            audio.push_str(&format!(" +{}", version.audio.len() - 1));
+        }
+        parts.push(audio);
+    }
+    parts.extend(file_size(version.size_bytes));
+    if parts.is_empty() {
+        return "2D".to_owned();
+    }
+    parts.join(" · ")
+}
+
+/// The rows a title page lists for the chosen version, as (label, value).
+/// The file row appears only when the server sent a path, which it does for
+/// admins alone.
+pub fn version_facts(version: &Version) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    let video: Vec<String> = [
+        resolution(version.width, version.height),
+        (!version.hdr.is_empty()).then(|| version.hdr.clone()),
+        codec_name(&version.video_codec),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !video.is_empty() {
+        rows.push(("Video", video.join(" · ")));
+    }
+    if !version.audio.is_empty() {
+        let tracks: Vec<String> = version
+            .audio
+            .iter()
+            .map(|a| match language_name(&a.language) {
+                Some(lang) => format!("{lang} {}", audio_stream(a)),
+                None => audio_stream(a),
+            })
+            .collect();
+        rows.push(("Audio", tracks.join(", ")));
+    }
+    let file: Vec<String> = [
+        (!version.container.is_empty()).then(|| version.container.to_ascii_uppercase()),
+        file_size(version.size_bytes),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !file.is_empty() {
+        rows.push(("File", file.join(" · ")));
+    }
+    if !version.path.is_empty() {
+        rows.push(("Path", version.path.clone()));
+    }
+    rows
+}
+
+/// `4K`, `1080p`, or the height in lines; `None` when unknown. A scope or
+/// cropped frame is named by its width, so a 1920×800 film still reads 1080p.
+fn resolution(width: u32, height: u32) -> Option<String> {
+    let label = match (width, height) {
+        (0, 0) => return None,
+        (w, h) if w >= 3200 || h >= 2000 => "4K".to_owned(),
+        (w, h) if w >= 1800 || h >= 1000 => "1080p".to_owned(),
+        (w, h) if w >= 1200 || h >= 700 => "720p".to_owned(),
+        (_, h) if h > 0 => format!("{h}p"),
+        _ => return None,
+    };
+    Some(label)
+}
+
+fn codec_name(codec: &str) -> Option<String> {
+    let name = match codec.to_ascii_lowercase().as_str() {
+        "" => return None,
+        "h264" | "avc" | "avc1" => "H.264",
+        "hevc" | "h265" | "hvc1" => "HEVC",
+        "av1" => "AV1",
+        "vp9" => "VP9",
+        "mpeg4" | "xvid" | "divx" => "MPEG-4",
+        "mpeg2video" => "MPEG-2",
+        "vc1" => "VC-1",
+        other => return Some(other.to_ascii_uppercase()),
+    };
+    Some(name.to_owned())
+}
+
+/// `EAC3 5.1`, `AAC 2.0`, `DTS`: the codec and its channel layout.
+fn audio_stream(audio: &VersionAudio) -> String {
+    let codec = audio.codec.to_ascii_uppercase();
+    let layout = match audio.channels {
+        0 => None,
+        1 => Some("1.0".to_owned()),
+        2 => Some("2.0".to_owned()),
+        n => Some(format!("{}.1", n - 1)),
+    };
+    match (codec.is_empty(), layout) {
+        (false, Some(l)) => format!("{codec} {l}"),
+        (false, None) => codec,
+        (true, Some(l)) => l,
+        (true, None) => "Audio".to_owned(),
+    }
+}
+
+/// An ISO 639 code as a reader knows it; an unknown code is shown as given,
+/// and `und` (undetermined) or empty as nothing.
+fn language_name(code: &str) -> Option<String> {
+    let name = match code.to_ascii_lowercase().as_str() {
+        "" | "und" => return None,
+        "en" | "eng" => "English",
+        "ja" | "jpn" => "Japanese",
+        "fr" | "fre" | "fra" => "French",
+        "de" | "ger" | "deu" => "German",
+        "es" | "spa" => "Spanish",
+        "it" | "ita" => "Italian",
+        "ko" | "kor" => "Korean",
+        "zh" | "chi" | "zho" => "Chinese",
+        other => return Some(other.to_owned()),
+    };
+    Some(name.to_owned())
+}
+
+/// `4.2 GB`, `700 MB`; `None` when unknown.
+fn file_size(bytes: u64) -> Option<String> {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    match bytes {
+        0 => None,
+        b if b >= GB => Some(format!("{:.1} GB", b as f64 / GB as f64)),
+        b => Some(format!("{} MB", b.div_ceil(MB))),
     }
 }
 
@@ -58,6 +194,7 @@ mod tests {
             name: name.into(),
             stereo,
             primary: id.is_empty(),
+            ..Default::default()
         }
     }
 
@@ -76,6 +213,76 @@ mod tests {
             version_label(&version("m", "", Some(Stereo::Mvc))),
             "3D (MVC, plays in 2D here)"
         );
+    }
+
+    fn copy() -> Version {
+        Version {
+            id: "season-1".into(),
+            name: "Season 1".into(),
+            width: 3840,
+            height: 2160,
+            video_codec: "hevc".into(),
+            hdr: "HDR10".into(),
+            audio: vec![
+                VersionAudio {
+                    language: "eng".into(),
+                    codec: "eac3".into(),
+                    channels: 6,
+                },
+                VersionAudio {
+                    language: "jpn".into(),
+                    codec: "aac".into(),
+                    channels: 2,
+                },
+            ],
+            size_bytes: 4_200_000_000,
+            container: "mkv".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_copy_is_labelled_by_its_file() {
+        assert_eq!(
+            version_label(&copy()),
+            "Season 1 · 4K · HDR10 · HEVC · EAC3 5.1 +1 · 4.2 GB"
+        );
+        let scope = Version {
+            width: 1920,
+            height: 800,
+            video_codec: "h264".into(),
+            ..Default::default()
+        };
+        assert_eq!(version_label(&scope), "1080p · H.264");
+        let small = Version {
+            size_bytes: 700_000_000,
+            ..Default::default()
+        };
+        assert_eq!(version_label(&small), "700 MB");
+    }
+
+    #[test]
+    fn facts_list_every_track_and_the_path_only_when_sent() {
+        assert_eq!(
+            version_facts(&copy()),
+            [
+                ("Video", "4K · HDR10 · HEVC".to_owned()),
+                ("Audio", "English EAC3 5.1, Japanese AAC 2.0".to_owned()),
+                ("File", "MKV · 4.2 GB".to_owned()),
+            ]
+        );
+        let admin = Version {
+            path: "/media/TV/Show/Season 1/Show - S01E02.mkv".into(),
+            ..copy()
+        };
+        assert_eq!(
+            version_facts(&admin).last(),
+            Some(&(
+                "Path",
+                "/media/TV/Show/Season 1/Show - S01E02.mkv".to_owned()
+            ))
+        );
+        assert!(version_facts(&Version::default()).is_empty());
     }
 
     #[test]

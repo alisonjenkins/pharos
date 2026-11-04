@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 7;
+const schemaVersion :UInt32 = 8;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -179,8 +179,20 @@ struct ItemDetail {
   versions @8 :List(Version);       # the primary first, then each grouped edition (022 FR-002)
 }
 # One playable file of an item. `id` is what Playback.negotiate takes as
-# `version`; the primary's is empty.
-struct Version { id @0 :Text; name @1 :Text; stereo @2 :Stereo3d; primary @3 :Bool; }
+# `version`; the primary's is empty. Copies of one episode are versions too,
+# named by what their file names add. Probe facts are 0 or empty when unknown.
+# `path` is the file on the server's disk, sent to admins only (else empty).
+struct Version {
+  id @0 :Text; name @1 :Text; stereo @2 :Stereo3d; primary @3 :Bool;
+  width @4 :UInt32; height @5 :UInt32;
+  videoCodec @6 :Text;
+  hdr @7 :Text;                     # HDR10 or HLG; empty is SDR
+  audio @8 :List(VersionAudio);
+  sizeBytes @9 :UInt64;
+  container @10 :Text;
+  path @11 :Text;
+}
+struct VersionAudio { language @0 :Text; codec @1 :Text; channels @2 :UInt32; }
 struct Chapter { name @0 :Text; startMs @1 :UInt64; }
 # An audio or subtitle stream. `index` is what Playback.negotiate takes.
 struct Track {
