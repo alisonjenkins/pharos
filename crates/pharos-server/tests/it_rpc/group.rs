@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use pharos_api::pharos_capnp::{
     clock_result, error, group_sink, group_update, groups_result, membership, membership_result,
-    session, EndReason,
+    seen_result, session, EndReason,
 };
 use pharos_api::{server, Connection};
 use pharos_core::{TokenStore as _, UserPolicy, UserStore as _};
-use pharos_jellyfin_api::dto::wire_item_id;
+use pharos_jellyfin_api::dto::{wire_item_id, WireId};
 use pharos_server::group_ops::SyncDeps;
 use pharos_sync::group::{GroupHandle, GroupMsg};
 use pharos_sync::messages::ServerMsg;
@@ -102,6 +102,7 @@ fn denial(e: error::Reader<'_>) -> String {
         error::kind::Unavailable(what) => format!("unavailable: {}", text(what)),
         error::kind::Invalid(i) => format!("invalid: {}", text(i.unwrap().get_field())),
         error::kind::Revoked(()) => "revoked".to_owned(),
+        error::kind::Limit(l) => format!("limit: {}", text(l.unwrap().get_name())),
         _ => "other".to_owned(),
     }
 }
@@ -1100,5 +1101,300 @@ async fn joining_from_a_device_in_another_group_moves_it() {
     assert_eq!(
         command!(pair.b, pause_request).unwrap_err(),
         "not found: membership"
+    );
+}
+
+// ---- US6: what each member has seen --------------------------------------
+
+/// One member's row of a `seen` answer.
+#[derive(Debug, PartialEq)]
+struct SeenRow {
+    name: String,
+    items: Vec<SeenItem>,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct SeenItem {
+    id: WireId,
+    played: bool,
+    pct: u8,
+    played_count: u32,
+    total_count: u32,
+}
+
+async fn seen(member: &membership::Client, ids: &[WireId]) -> Result<Vec<SeenRow>, String> {
+    let mut req = member.seen_request();
+    {
+        let mut p = req.get();
+        set_device(p.reborrow().init_ctx(), "dev");
+        let mut list = p.init_ids(u32::try_from(ids.len()).unwrap());
+        for (i, id) in (0u32..).zip(ids) {
+            match id {
+                WireId::Real(n) => list.reborrow().get(i).set_real(*n),
+                WireId::Synth(n) => list.reborrow().get(i).set_synth(*n),
+            }
+        }
+    }
+    let reply = req.send().promise.await.expect("seen");
+    let result = reply.get().unwrap().get_result().unwrap();
+    match result.which().unwrap() {
+        seen_result::Error(e) => Err(denial(e.unwrap())),
+        seen_result::Members(members) => Ok(members
+            .unwrap()
+            .iter()
+            .map(|m| SeenRow {
+                name: m
+                    .get_member()
+                    .unwrap()
+                    .get_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                items: m
+                    .get_items()
+                    .unwrap()
+                    .iter()
+                    .map(|i| SeenItem {
+                        id: match i.get_id().unwrap().which().unwrap() {
+                            pharos_api::pharos_capnp::item_id::Real(n) => WireId::Real(n),
+                            pharos_api::pharos_capnp::item_id::Synth(n) => WireId::Synth(n),
+                        },
+                        played: i.get_played(),
+                        pct: i.get_position_pct(),
+                        played_count: i.get_played_count(),
+                        total_count: i.get_total_count(),
+                    })
+                    .collect(),
+            })
+            .collect()),
+    }
+}
+
+const SHOW_S1: [u64; 3] = [801, 802, 803];
+const SHOW_S2: u64 = 804;
+const SHOW_DIR: &str = "/libA/Show";
+
+/// Four episodes of "Show" in `/libA` (three in season 1, one in season 2,
+/// each 100 s long), as A and B's library.
+async fn seed_show(rig: &Rig) {
+    use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore as _, SeriesInfo};
+    for (id, season, ep) in [(801, 1, 1), (802, 1, 2), (803, 1, 3), (SHOW_S2, 2, 1)] {
+        rig.fx
+            .state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("{SHOW_DIR}/Season {season:02}/e{ep}.mkv").into(),
+                title: format!("Show {season}x{ep}"),
+                kind: MediaKind::Episode,
+                probe: MediaProbe {
+                    duration_ms: Some(100_000),
+                    ..MediaProbe::default()
+                },
+                series: Some(SeriesInfo {
+                    series_name: "Show".into(),
+                    season_number: Some(season),
+                    episode_number: Some(ep),
+                    series_folder: Some(SHOW_DIR.into()),
+                    series_year: None,
+                }),
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+}
+
+fn synth(key: String) -> WireId {
+    let id = WireId::parse(&key).unwrap();
+    assert!(matches!(id, WireId::Synth(_)), "{key} is a synth id");
+    id
+}
+
+fn series_id() -> WireId {
+    synth(pharos_jellyfin_api::dto::series_id_for_key(
+        Some(SHOW_DIR),
+        "Show",
+    ))
+}
+
+fn season_id(n: u32) -> WireId {
+    synth(pharos_jellyfin_api::dto::season_id_for_key(
+        Some(SHOW_DIR),
+        "Show",
+        n,
+    ))
+}
+
+async fn a_plays(rig: &Rig, id: u64, data: pharos_core::UserItemData) {
+    use pharos_core::UserDataStore as _;
+    rig.fx
+        .state
+        .stores
+        .set_user_data(rig.fx.admin_id, id, data)
+        .await
+        .unwrap();
+}
+
+fn played() -> pharos_core::UserItemData {
+    pharos_core::UserItemData {
+        played: true,
+        play_count: 1,
+        ..pharos_core::UserItemData::default()
+    }
+}
+
+/// The row of the member named `name` (the fixture's users: "ali" is A, the
+/// admin, and "guest" is B).
+fn row<'a>(rows: &'a [SeenRow], name: &str) -> &'a SeenRow {
+    rows.iter().find(|r| r.name == name).unwrap()
+}
+
+/// B sees that A played one episode, is part-way through another and has not
+/// started a third, and that B has seen none of them.
+/// Disarm check: with `item_seen` reporting `played: false` for a `Target::Item`,
+/// A's first episode shows as unseen and this fails.
+#[actix_web::test]
+async fn a_member_sees_what_a_peer_has_played_of_an_episode() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    a_plays(&rig, 801, played()).await;
+    a_plays(
+        &rig,
+        802,
+        pharos_core::UserItemData {
+            last_played_position_ticks: 25_000 * 10_000,
+            ..pharos_core::UserItemData::default()
+        },
+    )
+    .await;
+    let pair = playing_pair(&rig).await;
+    let ids = SHOW_S1.map(WireId::Real);
+    let rows = seen(&pair.b, &ids).await.unwrap();
+    assert_eq!(rows.len(), 2, "both members are listed {rows:?}");
+    let item = |id: u64, played: bool, pct: u8| SeenItem {
+        id: WireId::Real(id),
+        played,
+        pct,
+        played_count: 0,
+        total_count: 0,
+    };
+    assert_eq!(
+        row(&rows, "ali").items,
+        vec![
+            item(801, true, 0),
+            item(802, false, 25),
+            item(803, false, 0)
+        ]
+    );
+    assert!(row(&rows, "guest")
+        .items
+        .iter()
+        .all(|i| !i.played && i.pct == 0));
+}
+
+/// A series and a season answer with the episodes a member has played of the
+/// ones the caller may see.
+/// Disarm check: with `resolve` filing an episode under its series only (not
+/// its season), the season rows are omitted and this fails.
+#[actix_web::test]
+async fn a_series_and_a_season_count_the_peers_played_episodes() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    a_plays(&rig, 801, played()).await;
+    a_plays(&rig, SHOW_S2, played()).await;
+    let pair = playing_pair(&rig).await;
+    let rows = seen(&pair.b, &[series_id(), season_id(1), season_id(2)])
+        .await
+        .unwrap();
+    let count = |id, played_count, total_count| SeenItem {
+        id,
+        played: played_count == total_count,
+        pct: 0,
+        played_count,
+        total_count,
+    };
+    assert_eq!(
+        row(&rows, "ali").items,
+        vec![
+            count(series_id(), 2, 4),
+            count(season_id(1), 1, 3),
+            count(season_id(2), 1, 1)
+        ]
+    );
+}
+
+/// What the caller may not see is in no member's answer, and its count never
+/// includes episodes the caller may not see.
+/// Disarm check: with `seen` skipping `retain_visible`, the hidden episode
+/// comes back with A's state and this fails.
+#[actix_web::test]
+async fn an_item_the_caller_may_not_see_is_omitted() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    a_plays(&rig, 801, played()).await;
+    let pair = playing_pair(&rig).await;
+    rig.fx
+        .state
+        .stores
+        .set_policy(
+            rig.fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![rig.fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let other = rig.fx.other_item_id;
+    let rows = seen(
+        &pair.b,
+        &[WireId::Real(801), series_id(), WireId::Real(other)],
+    )
+    .await
+    .unwrap();
+    for r in &rows {
+        assert_eq!(
+            r.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![WireId::Real(other)],
+            "{}: only the visible item",
+            r.name
+        );
+    }
+}
+
+/// A member with no recorded user is listed with no items; a caller who has
+/// left the group, or asks for too many ids, is refused.
+/// Disarm check: with the `in_group` check removed, the call after `leave`
+/// answers and this fails.
+#[actix_web::test]
+async fn seen_is_refused_outside_the_group_and_over_the_cap() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    let pair = playing_pair(&rig).await;
+    let groups = rig.deps.registry.list().await.unwrap();
+    let (reply, joined) = oneshot::channel();
+    groups[0]
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: pharos_sync::MemberId::new(),
+            name: "ghost".into(),
+            user: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    joined.await.unwrap();
+    let rows = seen(&pair.b, &[WireId::Real(801)]).await.unwrap();
+    let ghost = rows.iter().find(|r| r.name == "ghost").unwrap();
+    assert!(ghost.items.is_empty());
+    let many: Vec<WireId> = (0..201).map(WireId::Real).collect();
+    assert_eq!(seen(&pair.b, &many).await.unwrap_err(), "limit: seen_ids");
+    command!(pair.b, leave_request).unwrap();
+    assert_eq!(
+        seen(&pair.b, &[WireId::Real(801)]).await.unwrap_err(),
+        "not found: group"
     );
 }
