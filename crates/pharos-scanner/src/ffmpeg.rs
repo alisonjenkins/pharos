@@ -599,6 +599,8 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             // single file.
             alternate_sources: Vec::new(),
             video_3d_format,
+            // Written by the audio analysis sweep, never by the prober.
+            audio_analysis: None,
         },
     })
 }

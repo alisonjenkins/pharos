@@ -26,7 +26,9 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     original_language, art_version, \
     book_format, book_page_count, book_author, book_publisher, book_series, \
     book_series_index, book_isbn, alternate_sources_json, video_3d_format, \
-    imdb_rating, rt_tomatometer";
+    imdb_rating, rt_tomatometer, \
+    bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
+    audio_analysis_mtime, audio_analysis_size, file_mtime, file_size_seen";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -921,6 +923,37 @@ impl MediaStore for SqliteStore {
         Ok(crate::alternate_source_json::decode(
             row.and_then(|(json,)| json).as_deref(),
         ))
+    }
+
+    /// Spec 024 — one `UPDATE` of the analysis columns; `put` never writes
+    /// them (see the trait docs and V385).
+    #[tracing::instrument(skip(self, analysis), fields(media.id = %id))]
+    async fn put_audio_analysis(
+        &self,
+        id: MediaId,
+        analysis: pharos_core::AudioAnalysis,
+        signature: (i64, u64),
+    ) -> DomainResult<()> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let size_i64 = i64::try_from(signature.1)
+            .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
+        sqlx::query(
+            "UPDATE media_items SET bpm_mille = ?, tempo_source = ?, energy_mille = ?, \
+             audio_analysis_version = ?, audio_analysis_mtime = ?, audio_analysis_size = ? \
+             WHERE id = ?",
+        )
+        .bind(analysis.bpm_mille.map(i64::from))
+        .bind(analysis.tempo_source.map(pharos_core::TempoSource::label))
+        .bind(analysis.energy_mille.map(i64::from))
+        .bind(i64::from(analysis.version))
+        .bind(signature.0)
+        .bind(size_i64)
+        .bind(id_i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -3080,6 +3113,15 @@ struct MediaRow {
     match_confidence: Option<f32>,
     metadata_refreshed_at: Option<i64>,
     original_language: Option<String>,
+    // Spec 024 — audio analysis, and the scan signature it is checked against.
+    bpm_mille: Option<i64>,
+    tempo_source: Option<String>,
+    energy_mille: Option<i64>,
+    audio_analysis_version: Option<i64>,
+    audio_analysis_mtime: Option<i64>,
+    audio_analysis_size: Option<i64>,
+    file_mtime: Option<i64>,
+    file_size_seen: Option<i64>,
 }
 
 impl SeriesMetadataStore for SqliteStore {
@@ -3258,6 +3300,18 @@ impl MediaRow {
                 .video_3d_format
                 .as_deref()
                 .and_then(pharos_core::Video3DFormat::from_wire_name),
+            audio_analysis: crate::audio_analysis_row::decode(
+                crate::audio_analysis_row::AnalysisColumns {
+                    bpm_mille: self.bpm_mille,
+                    tempo_source: self.tempo_source.as_deref(),
+                    energy_mille: self.energy_mille,
+                    version: self.audio_analysis_version,
+                    analysed_mtime: self.audio_analysis_mtime,
+                    analysed_size: self.audio_analysis_size,
+                    file_mtime: self.file_mtime,
+                    file_size: self.file_size_seen,
+                },
+            ),
         };
         let series = self.series_name.map(|name| SeriesInfo {
             series_name: name,

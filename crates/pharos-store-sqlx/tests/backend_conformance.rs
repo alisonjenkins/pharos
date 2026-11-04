@@ -1640,6 +1640,111 @@ where
         !without_state.has_editions,
         "scan_state does not flag a row without editions"
     );
+
+    // -----------------------------------------------------------------
+    // Spec 024 / V385 — audio analysis: written by `put_audio_analysis` only,
+    // kept across a re-`put`, valid only while the file signature matches.
+    // -----------------------------------------------------------------
+    let song: MediaId = 7600;
+    let mut item = media_item(song, "song");
+    item.kind = MediaKind::Audio;
+    item.path = "/media/conformance/song.flac".into();
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
+        None,
+        "a new song is unanalysed"
+    );
+    let analysis = pharos_core::AudioAnalysis::from_readings(
+        Some((128.5, pharos_core::TempoSource::Tag)),
+        Some(0.72),
+        1,
+    );
+    MediaStore::put_audio_analysis(&store, song, analysis, (1_700_000_000, 4_096))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, song).await.unwrap().probe;
+    assert_eq!(got.audio_analysis, Some(analysis));
+    assert_eq!(got.bpm(), Some(128.5));
+    assert_eq!(got.tempo_source(), Some(pharos_core::TempoSource::Tag));
+    assert_eq!(got.energy(), Some(0.72));
+    // The list path decodes the same columns.
+    let listed = MediaStore::list(&store).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|i| i.id == song)
+            .unwrap()
+            .probe
+            .audio_analysis,
+        Some(analysis)
+    );
+
+    // A re-probe `put` carrying no analysis keeps the stored one.
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
+        Some(analysis),
+        "put never writes the analysis columns"
+    );
+
+    // The scan stamps the signature the analysis read: still valid.
+    let scan = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
+        .await
+        .unwrap();
+    MediaStore::mark_seen(&store, song, scan, 1_700_000_000, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
+        Some(analysis)
+    );
+    // The file changes: the analysis no longer applies.
+    MediaStore::mark_seen(&store, song, scan, 1_700_000_060, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
+        None,
+        "a changed file reads as unanalysed"
+    );
+
+    // "Found nothing" is stored, so the song is not decoded again.
+    let nothing = pharos_core::AudioAnalysis {
+        version: 1,
+        ..Default::default()
+    };
+    MediaStore::put_audio_analysis(&store, song, nothing, (1_700_000_060, 4_096))
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, song)
+            .await
+            .unwrap()
+            .probe
+            .audio_analysis,
+        Some(nothing)
+    );
+    // An absent row is a no-op.
+    MediaStore::put_audio_analysis(&store, 7601, analysis, (1, 1))
+        .await
+        .unwrap();
 }
 
 #[cfg(feature = "sqlite")]

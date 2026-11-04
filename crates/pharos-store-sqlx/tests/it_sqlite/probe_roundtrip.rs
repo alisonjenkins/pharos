@@ -154,6 +154,8 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 chapters: Vec::new(),
                 alternate_sources: Vec::new(),
                 video_3d_format,
+                // Not written by `put`; the sweep owns it (V385).
+                audio_analysis: None,
             },
         )
 }
