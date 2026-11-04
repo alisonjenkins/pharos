@@ -123,7 +123,13 @@ async fn play_negotiates_and_reports_progress() {
     assert_eq!(audio, [1]);
     assert!(detail.subtitle_tracks.is_empty() && detail.segments.is_empty());
     let (decision, grant) = api
-        .play(&call, ItemRef::Real(MOVIE), &caps, TrackPicks::default())
+        .play(
+            &call,
+            ItemRef::Real(MOVIE),
+            "",
+            &caps,
+            TrackPicks::default(),
+        )
         .await
         .expect("negotiate");
     assert_eq!(decision.method, "direct_play");
@@ -148,4 +154,166 @@ async fn play_negotiates_and_reports_progress() {
         .await
         .unwrap();
     assert_eq!(data.last_played_position_ticks, 200_000_000);
+}
+
+/// V291: a 2D film with a grouped half-SBS edition is badged 3D, lists both
+/// versions, is found by the 3D filter, and plays the edition's file when
+/// asked; a version it does not have, or cannot serve yet, is refused.
+#[actix_web::test]
+async fn a_3d_edition_is_badged_listed_filtered_and_played() {
+    use pharos_client::api::{Listing, Stereo};
+    use pharos_core::{AlternateMediaSource, MediaItem, MediaKind, MediaProbe, Video3DFormat};
+
+    const FILM: u64 = 310;
+    let (api, fx, _server) = api().await;
+    let probe = |format| MediaProbe {
+        duration_ms: Some(60_000),
+        width: Some(1920),
+        height: Some(1080),
+        container: Some("mp4".into()),
+        video_codec: Some("h264".into()),
+        audio_codec: Some("aac".into()),
+        video_3d_format: format,
+        ..Default::default()
+    };
+    let mut primary = probe(None);
+    primary.alternate_sources = vec![
+        AlternateMediaSource {
+            id: "3d-hsbs".into(),
+            path: "/libA/Film (2009) [3D.HSBS].mp4".into(),
+            name: Some("3D".into()),
+            video_3d_format: Some(Video3DFormat::HalfSideBySide),
+            probe: Some(Box::new(probe(Some(Video3DFormat::HalfSideBySide)))),
+            ..Default::default()
+        },
+        AlternateMediaSource {
+            id: "3d-htab".into(),
+            path: "/libA/Film (2009) [3D.HTAB].mp4".into(),
+            video_3d_format: Some(Video3DFormat::HalfTopAndBottom),
+            // Probed before schema v9 kept an edition's own probe.
+            probe: None,
+            ..Default::default()
+        },
+    ];
+    pharos_core::MediaStore::put(
+        &fx.state.stores,
+        MediaItem {
+            id: FILM,
+            path: "/libA/Film (2009).mp4".into(),
+            title: "Film".into(),
+            kind: MediaKind::Movie,
+            probe: primary,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
+        .await
+        .unwrap();
+    let call = CallInfo::default();
+
+    let detail = api
+        .detail(&call, ItemRef::Real(FILM))
+        .await
+        .expect("detail");
+    assert_eq!(detail.item.stereo, Some(Stereo::HalfSideBySide));
+    let versions: Vec<_> = detail
+        .versions
+        .iter()
+        .map(|v| (v.id.as_str(), v.stereo, v.primary))
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            ("", None, true),
+            ("3d-hsbs", Some(Stereo::HalfSideBySide), false),
+            ("3d-htab", Some(Stereo::HalfTopAndBottom), false),
+        ]
+    );
+
+    let library = api.home(&call).await.expect("home").rails[0].library.id;
+    let mut listing = Listing::of(library, None, "SortName");
+    listing.stereo = Some(true);
+    let only_3d = api.query(&call, &listing, 0, 50).await.expect("3D only");
+    let names: Vec<_> = only_3d.items.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["Film"]);
+    listing.stereo = Some(false);
+    let only_2d = api.query(&call, &listing, 0, 50).await.expect("2D only");
+    assert!(only_2d.items.iter().all(|i| i.name != "Film"));
+
+    let caps = Capabilities {
+        video_codecs: vec!["h264".into()],
+        audio_codecs: vec!["aac".into()],
+        containers: vec!["mp4".into()],
+        max_bitrate: 0,
+    };
+    let (decision, _grant) = api
+        .play(
+            &call,
+            ItemRef::Real(FILM),
+            "3d-hsbs",
+            &caps,
+            TrackPicks::default(),
+        )
+        .await
+        .expect("negotiate the edition");
+    assert!(
+        decision.stream_url.contains("MediaSourceId=") && decision.stream_url.contains("-3d-hsbs"),
+        "{}",
+        decision.stream_url
+    );
+    let (primary, _grant) = api
+        .play(&call, ItemRef::Real(FILM), "", &caps, TrackPicks::default())
+        .await
+        .expect("negotiate the primary");
+    assert!(
+        !primary.stream_url.contains("MediaSourceId"),
+        "{}",
+        primary.stream_url
+    );
+    let Err(err) = api
+        .play(
+            &call,
+            ItemRef::Real(FILM),
+            "nope",
+            &caps,
+            TrackPicks::default(),
+        )
+        .await
+    else {
+        panic!("negotiated a version the film does not have");
+    };
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "notFound",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let Err(err) = api
+        .play(
+            &call,
+            ItemRef::Real(FILM),
+            "3d-htab",
+            &caps,
+            TrackPicks::default(),
+        )
+        .await
+    else {
+        panic!("granted an edition it cannot serve");
+    };
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "unavailable",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
