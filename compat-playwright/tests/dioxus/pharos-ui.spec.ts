@@ -2618,13 +2618,16 @@ test.describe("pharos Dioxus UI previous and next track", () => {
     // song, so history has nothing before it (the step back to a different
     // song is covered in queue.rs); the album has no track before either, so
     // the song starts again, by the early branch rather than the restart one.
+    // Paused at 1 s, so only the press can bring the position to zero.
     await seekTo(1);
+    await audio.evaluate((a: HTMLMediaElement) => a.pause());
     await expect.poll(at).toBeLessThan(2.5);
+    expect(await at()).toBeGreaterThan(0.5);
     // Let a timeupdate carry the new position to the UI before pressing.
     await page.waitForTimeout(500);
     await previous.click();
     await expect.poll(() => previousReasons.at(-1)).toBe("nothing_before");
-    await expect.poll(at).toBeLessThan(5);
+    await expect.poll(at).toBeLessThan(0.5);
     expect(page.url()).toBe(song);
     await expect(page.locator("h2.pharos-listen-title")).toHaveText(track.Name);
   });
