@@ -15,6 +15,8 @@ pub mod dlna;
 pub mod group_ops;
 pub mod health;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod audio_analysis;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_memo;
