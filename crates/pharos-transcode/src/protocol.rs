@@ -245,6 +245,15 @@ pub enum TinyOp {
     /// than the server precisely because its input is expected to be
     /// malformed (V6).
     Integrity { input: PathBuf },
+    /// Tempo and energy of one song → `WorkerEvent::AudioFeaturesResult`
+    /// (spec 024, ADR-0050). Reads the BPM tag, then decodes only
+    /// `[start_ms, start_ms + dur_ms)` downmixed and downsampled. Bounded by
+    /// the window, so it keeps the tiny-op timeout.
+    AudioFeatures {
+        input: PathBuf,
+        start_ms: u64,
+        dur_ms: u64,
+    },
     /// Audio RMS waveform → `WorkerEvent::WaveformResult`.
     Waveform {
         input: PathBuf,
@@ -312,6 +321,11 @@ pub enum WorkerEvent {
     WaveformResult {
         job_id: JobId,
         bins: Vec<f32>,
+    },
+    /// Reply to `TinyOp::AudioFeatures`.
+    AudioFeaturesResult {
+        job_id: JobId,
+        features: crate::audio_features::AudioFeatures,
     },
     /// Reply to `TinyOp::SubtitleWindows` — merged `(start_ms, end_ms)`
     /// on-screen intervals, sorted.
