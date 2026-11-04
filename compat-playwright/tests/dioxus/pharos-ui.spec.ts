@@ -1788,6 +1788,7 @@ test.describe("pharos Dioxus UI lyrics", () => {
     );
     await page.goto("/ui/");
     await page.evaluate(() => localStorage.removeItem("pharos.listen.lyrics"));
+    await page.evaluate(() => localStorage.removeItem("pharos.listen.karaoke"));
     await page.locator("#signin-name").fill(TEST_USER);
     await page.locator("#signin-password").fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
@@ -1827,6 +1828,25 @@ test.describe("pharos Dioxus UI lyrics", () => {
         }),
       )
       .toBeLessThan(40);
+
+    // Karaoke (B483/V427): off to start; on, the sung line fills in as it
+    // is sung, and the choice is kept on the device.
+    await expect(panel).toHaveAttribute("data-karaoke", "false");
+    const karaoke = page.getByRole("button", { name: "Karaoke", exact: true });
+    await expect(karaoke).toHaveAttribute("aria-pressed", "false");
+    await karaoke.click();
+    await expect(panel).toHaveAttribute("data-karaoke", "true");
+    const words = panel.locator('[data-state="current"] .pharos-lyrics-words');
+    await expect(words).toHaveCount(1);
+    const wipe = () =>
+      words.evaluate((w) => parseFloat(getComputedStyle(w).getPropertyValue("--pharos-wipe")));
+    const first = await wipe();
+    await expect.poll(wipe, { timeout: 5_000 }).not.toBe(first);
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("pharos.listen.karaoke")))
+      .toBe("on");
+    await karaoke.click();
+    await expect(panel).toHaveAttribute("data-karaoke", "false");
 
     await page.getByRole("button", { name: "Lyrics", exact: true }).click();
     await expect(panel).toBeHidden();
