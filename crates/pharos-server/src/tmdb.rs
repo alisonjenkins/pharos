@@ -29,6 +29,9 @@ const IMAGE_BASE_W300: &str = "https://image.tmdb.org/t/p/w300";
 /// portrait thumbnail used for the inline 302 redirect above).
 const IMAGE_BASE_ORIGINAL: &str = "https://image.tmdb.org/t/p/original";
 
+/// TMDB image CDN base for a `w185` portrait thumbnail used in credit listings.
+const IMAGE_BASE_PROFILE: &str = "https://image.tmdb.org/t/p/w185";
+
 /// TMDB REST base.
 const API_BASE: &str = "https://api.themoviedb.org/3";
 
@@ -151,7 +154,10 @@ impl TmdbClient {
         let resp = self
             .http
             .get(format!("{API_BASE}/movie/{id}"))
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("append_to_response", "credits"),
+            ])
             .send()
             .await
             .ok()?;
@@ -170,7 +176,10 @@ impl TmdbClient {
         let resp = self
             .http
             .get(format!("{API_BASE}/tv/{id}"))
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("append_to_response", "credits"),
+            ])
             .send()
             .await
             .ok()?;
@@ -194,7 +203,10 @@ impl TmdbClient {
             .get(format!(
                 "{API_BASE}/tv/{series_id}/season/{season}/episode/{episode}"
             ))
-            .query(&[("api_key", self.api_key.as_str())])
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("append_to_response", "credits"),
+            ])
             .send()
             .await
             .ok()?;
@@ -472,6 +484,7 @@ pub(crate) fn parse_movie_detail(body: &str) -> Option<crate::online_enrich::Enr
                     .collect()
             })
             .unwrap_or_default(),
+        people: parse_tmdb_credits(&v),
         provider_id: v.get("id").and_then(|x| x.as_i64()).map(|i| i.to_string()),
         artwork: art,
         ..EnrichedMetadata::default()
@@ -531,6 +544,7 @@ pub(crate) fn parse_tv_detail(body: &str) -> Option<crate::online_enrich::Enrich
                     .collect()
             })
             .unwrap_or_default(),
+        people: parse_tmdb_credits(&v),
         provider_id: v.get("id").and_then(|x| x.as_i64()).map(|i| i.to_string()),
         artwork: art,
         ..EnrichedMetadata::default()
@@ -622,10 +636,140 @@ pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::E
             .get("vote_average")
             .and_then(|x| x.as_f64())
             .map(|f| f as f32),
+        people: parse_tmdb_credits(&v),
         provider_id: v.get("id").and_then(|x| x.as_i64()).map(|i| i.to_string()),
         artwork: art,
         ..EnrichedMetadata::default()
     })
+}
+
+/// Parse cast and crew credits from a TMDB movie, TV, or episode response.
+///
+/// Reads regular cast from `credits.cast`, episode guest stars from both
+/// top-level `guest_stars` and `credits.guest_stars`, and crew from both
+/// `crew` and `credits.crew`. Filters crew down to Directors and Writers.
+/// Normalises output order to actors, then guest stars, then directors, then
+/// writers, deduplicating by `(name, kind)` (preserving the earlier entry)
+/// and ensuring anyone appearing in both regular cast and guest stars stays only
+/// as an actor. Sort orders are finally renumbered sequentially 0..n.
+pub(crate) fn parse_tmdb_credits(v: &serde_json::Value) -> Vec<pharos_core::PersonRef> {
+    use pharos_core::{PersonKind, PersonRef};
+    use std::collections::HashSet;
+
+    const MAX_PER_KIND: usize = 30;
+
+    fn arrays<'a>(
+        v: &'a serde_json::Value,
+        key: &str,
+    ) -> impl Iterator<Item = &'a serde_json::Value> {
+        [v.get(key), v.get("credits").and_then(|c| c.get(key))]
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.as_array())
+            .flatten()
+    }
+
+    fn trimmed<'a>(entry: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        entry
+            .get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    fn person(entry: &serde_json::Value, kind: PersonKind) -> Option<PersonRef> {
+        let thumb = trimmed(entry, "profile_path")
+            .map(|p| format!("{IMAGE_BASE_PROFILE}/{}", p.trim_start_matches('/')));
+        let provider_ids = entry
+            .get("id")
+            .and_then(|i| {
+                i.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| i.as_str().map(str::to_string))
+            })
+            .map(|id| format!("tmdb:{id}"));
+        Some(PersonRef {
+            name: trimmed(entry, "name")?.to_string(),
+            role: None,
+            kind,
+            character: trimmed(entry, "character").map(str::to_string),
+            sort_order: None,
+            thumb,
+            provider_ids,
+        })
+    }
+
+    // Billing order ascending; entries without one go last, in input order.
+    fn billed<'a>(
+        entries: impl Iterator<Item = &'a serde_json::Value>,
+        kind: PersonKind,
+    ) -> Vec<PersonRef> {
+        let mut raw: Vec<(Option<u64>, PersonRef)> = entries
+            .filter_map(|e| Some((e.get("order").and_then(|o| o.as_u64()), person(e, kind)?)))
+            .collect();
+        raw.sort_by_key(|(order, _)| (order.is_none(), *order));
+        raw.into_iter().map(|(_, p)| p).collect()
+    }
+
+    let mut out: Vec<PersonRef> = Vec::new();
+
+    // Regular cast is only read from `credits.cast`; a top-level `cast` is
+    // not part of the TMDB detail response.
+    let cast = v
+        .get("credits")
+        .and_then(|c| c.get("cast"))
+        .and_then(|c| c.as_array());
+    let mut actor_names = HashSet::new();
+    for p in billed(cast.into_iter().flatten(), PersonKind::Actor) {
+        if actor_names.len() < MAX_PER_KIND && actor_names.insert(p.name.clone()) {
+            out.push(p);
+        }
+    }
+
+    let mut guest_names = HashSet::new();
+    for p in billed(arrays(v, "guest_stars"), PersonKind::GuestStar) {
+        if guest_names.len() < MAX_PER_KIND
+            && !actor_names.contains(&p.name)
+            && guest_names.insert(p.name.clone())
+        {
+            out.push(p);
+        }
+    }
+
+    let mut directors = Vec::new();
+    let mut writers = Vec::new();
+    for entry in arrays(v, "crew") {
+        let Some(job) = trimmed(entry, "job") else {
+            continue;
+        };
+        let kind = match job {
+            "Director" => PersonKind::Director,
+            "Writer" | "Screenplay" | "Teleplay" | "Story" | "Novel" => PersonKind::Writer,
+            _ => continue,
+        };
+        let Some(mut p) = person(entry, kind) else {
+            continue;
+        };
+        p.character = None;
+        p.role = Some(job.to_string());
+        if kind == PersonKind::Director {
+            directors.push(p);
+        } else {
+            writers.push(p);
+        }
+    }
+    let mut crew_seen = HashSet::new();
+    out.extend(
+        directors
+            .into_iter()
+            .chain(writers)
+            .filter(|p| crew_seen.insert((p.name.clone(), p.kind))),
+    );
+
+    for (idx, p) in out.iter_mut().enumerate() {
+        p.sort_order = Some(idx as u32);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -808,5 +952,146 @@ mod tests {
     #[test]
     fn tmdb_parse_episode_detail_none_on_malformed_body() {
         assert!(super::parse_episode_detail("not json").is_none());
+    }
+
+    #[test]
+    fn tmdb_credits_movie_cast_ordering_crew_filter_and_renumber() {
+        let body = r#"{
+          "id": 550,
+          "credits": {
+            "cast": [
+              {"id": 103, "name": "Charlie", "character": "Char C", "order": 2, "profile_path": "/charlie.jpg"},
+              {"id": 101, "name": "Alice", "character": "", "order": 0, "profile_path": null},
+              {"id": 102, "name": "Bob", "character": "Char B", "order": 1, "profile_path": "/bob.jpg"}
+            ],
+            "crew": [
+              {"id": 201, "name": "David", "job": "Director", "profile_path": "/david.jpg"},
+              {"id": 202, "name": "Eve", "job": "Producer", "profile_path": "/eve.jpg"},
+              {"id": 203, "name": "Frank", "job": "Screenplay", "profile_path": "/frank.jpg"}
+            ]
+          }
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let people = parse_tmdb_credits(&v);
+        // 3 actors (ordered 0, 1, 2) + 1 director + 1 writer = 5 (producer dropped)
+        assert_eq!(people.len(), 5);
+
+        // Alice (order 0)
+        assert_eq!(people[0].name, "Alice");
+        assert_eq!(people[0].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(people[0].character, None);
+        assert_eq!(people[0].thumb, None);
+        assert_eq!(people[0].provider_ids.as_deref(), Some("tmdb:101"));
+        assert_eq!(people[0].sort_order, Some(0));
+
+        // Bob (order 1)
+        assert_eq!(people[1].name, "Bob");
+        assert_eq!(people[1].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(people[1].character.as_deref(), Some("Char B"));
+        assert_eq!(
+            people[1].thumb.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/bob.jpg")
+        );
+        assert_eq!(people[1].provider_ids.as_deref(), Some("tmdb:102"));
+        assert_eq!(people[1].sort_order, Some(1));
+
+        // Charlie (order 2)
+        assert_eq!(people[2].name, "Charlie");
+        assert_eq!(people[2].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(people[2].character.as_deref(), Some("Char C"));
+        assert_eq!(
+            people[2].thumb.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/charlie.jpg")
+        );
+        assert_eq!(people[2].provider_ids.as_deref(), Some("tmdb:103"));
+        assert_eq!(people[2].sort_order, Some(2));
+
+        // Director (David)
+        assert_eq!(people[3].name, "David");
+        assert_eq!(people[3].kind, pharos_core::PersonKind::Director);
+        assert_eq!(people[3].role.as_deref(), Some("Director"));
+        assert_eq!(people[3].character, None);
+        assert_eq!(
+            people[3].thumb.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/david.jpg")
+        );
+        assert_eq!(people[3].provider_ids.as_deref(), Some("tmdb:201"));
+        assert_eq!(people[3].sort_order, Some(3));
+
+        // Writer (Frank)
+        assert_eq!(people[4].name, "Frank");
+        assert_eq!(people[4].kind, pharos_core::PersonKind::Writer);
+        assert_eq!(people[4].role.as_deref(), Some("Screenplay"));
+        assert_eq!(people[4].character, None);
+        assert_eq!(
+            people[4].thumb.as_deref(),
+            Some("https://image.tmdb.org/t/p/w185/frank.jpg")
+        );
+        assert_eq!(people[4].provider_ids.as_deref(), Some("tmdb:203"));
+        assert_eq!(people[4].sort_order, Some(4));
+
+        // Producer (Eve) was dropped
+        assert!(!people.iter().any(|p| p.name == "Eve"));
+    }
+
+    #[test]
+    fn tmdb_credits_episode_guest_stars_and_regular_actor_dedupe() {
+        let body = r#"{
+          "guest_stars": [
+            {"id": 301, "name": "Regular Actor", "character": "Cameo", "order": 1},
+            {"id": 302, "name": "Guest Actor", "character": "Villain", "order": 2}
+          ],
+          "crew": [
+            {"id": 401, "name": "Show Director", "job": "Director"}
+          ],
+          "credits": {
+            "cast": [
+              {"id": 301, "name": "Regular Actor", "character": "Hero", "order": 0}
+            ]
+          }
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let people = parse_tmdb_credits(&v);
+
+        // Regular Actor appears once as Actor
+        let regular: Vec<_> = people
+            .iter()
+            .filter(|p| p.name == "Regular Actor")
+            .collect();
+        assert_eq!(regular.len(), 1);
+        assert_eq!(regular[0].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(regular[0].character.as_deref(), Some("Hero"));
+
+        // Guest Actor appears as GuestStar
+        let guest = people.iter().find(|p| p.name == "Guest Actor").unwrap();
+        assert_eq!(guest.kind, pharos_core::PersonKind::GuestStar);
+        assert_eq!(guest.character.as_deref(), Some("Villain"));
+
+        // Director
+        assert!(people
+            .iter()
+            .any(|p| p.name == "Show Director" && p.kind == pharos_core::PersonKind::Director));
+    }
+
+    #[test]
+    fn tmdb_credits_empty_when_no_credits_key() {
+        let body = r#"{"id": 123, "title": "No Credits"}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        let people = parse_tmdb_credits(&v);
+        assert!(people.is_empty());
+    }
+
+    #[test]
+    fn tmdb_credits_caps_cast_at_30() {
+        let cast: Vec<_> = (0..35)
+            .map(|i| format!(r#"{{"id":{i},"name":"Actor {i}","order":{i}}}"#))
+            .collect();
+        let body = format!(r#"{{"credits":{{"cast":[{}]}}}}"#, cast.join(","));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let people = parse_tmdb_credits(&v);
+        assert_eq!(people.len(), 30);
+        assert_eq!(people[0].name, "Actor 0");
+        assert_eq!(people[29].name, "Actor 29");
+        assert_eq!(people[29].sort_order, Some(29));
     }
 }

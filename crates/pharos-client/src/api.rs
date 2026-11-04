@@ -9,8 +9,9 @@ use std::str::FromStr;
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, index_result, item_id, item_query,
     item_summary, items_result, library, negotiate_result, opt_u16, opt_u32, playback,
-    playback_grant, pref_result, prefs, session, stream_choice, telemetry, track, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
+    playback_grant, pref_result, prefs, session, stream_choice, telemetry, track,
+    CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 
@@ -198,6 +199,28 @@ pub struct Detail {
     /// server lists them.
     pub trickplay: Vec<Trickplay>,
     pub segments: Vec<Segment>,
+    /// Who appears in it, in billed order. A series or season lists its
+    /// regulars ranked across its episodes.
+    pub cast: Vec<Credit>,
+}
+
+/// Someone who appears in an item, and who they play.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Credit {
+    pub name: String,
+    /// Empty when the credit names no character.
+    pub character: String,
+    pub kind: CreditKind,
+    /// The person's photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreditKind {
+    #[default]
+    Actor,
+    /// Appears in this one episode only.
+    GuestStar,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -666,6 +689,21 @@ impl PharosApi for NativeApi {
                                 },
                                 start_ms: s.get_start_ms(),
                                 end_ms: s.get_end_ms(),
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                    cast: d
+                        .get_cast()?
+                        .iter()
+                        .map(|c| {
+                            Ok(Credit {
+                                name: text(c.get_name())?,
+                                character: text(c.get_character())?,
+                                kind: match c.get_kind()? {
+                                    WireCreditKind::Actor => CreditKind::Actor,
+                                    WireCreditKind::GuestStar => CreditKind::GuestStar,
+                                },
+                                image_url: Some(text(c.get_image_url())?).filter(|u| !u.is_empty()),
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,

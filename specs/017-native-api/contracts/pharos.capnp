@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 6;
+const schemaVersion :UInt32 = 9;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -168,7 +168,12 @@ struct ItemDetail {
   subtitleTracks @5 :List(Track);
   trickplay @6 :List(Trickplay);    # one per width the server renders; empty when off or unprobed
   segments @7 :List(Segment);
+  cast @8 :List(Credit);            # billed order; a series or season ranks its regulars across episodes
 }
+# Someone who appears in the item. `imageUrl` is the person's photo on this
+# server, empty when there is none.
+struct Credit { name @0 :Text; character @1 :Text; kind @2 :CreditKind; imageUrl @3 :Text; }
+enum CreditKind { actor @0; guestStar @1; }
 struct Chapter { name @0 :Text; startMs @1 :UInt64; }
 # An audio or subtitle stream. `index` is what Playback.negotiate takes.
 struct Track {

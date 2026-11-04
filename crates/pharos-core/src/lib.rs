@@ -2,6 +2,7 @@
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
 pub mod auth;
+pub mod ensemble;
 pub mod language;
 pub mod origin;
 pub mod parental_rank;
@@ -20,6 +21,7 @@ pub use auth::{
     TokenId, TokenRecord, TokenScope, TokenStore, User, UserId, UserPolicy, UserRecord, UserStore,
     API_KEY_DEVICE_PREFIX,
 };
+pub use ensemble::ensemble_cast;
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
@@ -979,6 +981,14 @@ pub trait PersonStore: Send + Sync {
         &self,
         limit: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
+
+    /// Every `Actor` credit on any of `items`, paired with the item that
+    /// carries it, so a show's or season's cast can be ranked across its
+    /// episodes with [`ensemble_cast`]. Guest stars and crew are left out.
+    fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network

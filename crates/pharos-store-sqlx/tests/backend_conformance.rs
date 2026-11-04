@@ -836,7 +836,18 @@ where
         kind: PersonKind::Actor,
         ..Default::default()
     };
-    PersonStore::link_item_people(&store, item_id, std::slice::from_ref(&person))
+    let guest = PersonRef {
+        name: "Conformance Guest".into(),
+        kind: PersonKind::GuestStar,
+        character: Some("Stranger".into()),
+        ..Default::default()
+    };
+    let person = PersonRef {
+        character: Some("Hero".into()),
+        sort_order: Some(0),
+        ..person
+    };
+    PersonStore::link_item_people(&store, item_id, &[person.clone(), guest])
         .await
         .unwrap();
     let person_counts = PersonStore::people_with_counts(&store).await.unwrap();
@@ -852,6 +863,18 @@ where
     assert!(people_for_item
         .iter()
         .any(|p| p.name == "Conformance Actor"));
+    // A show's cast is built from its episodes' actor credits only.
+    let credits = PersonStore::actor_credits_for_items(&store, &[item_id])
+        .await
+        .unwrap();
+    assert_eq!(credits.len(), 1, "{credits:?}");
+    assert_eq!(credits[0].0, item_id);
+    assert_eq!(credits[0].1.name, "Conformance Actor");
+    assert_eq!(credits[0].1.character.as_deref(), Some("Hero"));
+    assert!(PersonStore::actor_credits_for_items(&store, &[])
+        .await
+        .unwrap()
+        .is_empty());
 
     StudioStore::link_item_studios(&store, item_id, &["Conformance Studio".to_string()])
         .await

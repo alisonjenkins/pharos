@@ -1288,7 +1288,7 @@ async fn refused_item_calls_are_logged_and_counted() {
 
 /// Adds a TV library at /libTV with "Show" (two seasons, G) and "Mature"
 /// (one season, R), and returns its wire id.
-async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
+pub(crate) async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
     use pharos_core::{
         LibraryKind, LibraryStore as _, MediaItem, MediaKind, MediaMetadata, MediaStore as _,
         SeriesInfo,
