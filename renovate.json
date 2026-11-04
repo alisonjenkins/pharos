@@ -4,14 +4,15 @@
     "config:recommended"
   ],
   "automergeStrategy": "rebase",
+  "rebaseWhen": "conflicted",
   "packageRules": [
     {
-      "description": "Auto-merge patch and minor updates once CI is green (branch protection on main requires all 4 checks); major bumps still open a PR for manual review.",
+      "description": "Patch and minor updates are batched by the merge queue like any feature PR: a Renovate PR no longer runs the heavy CI jobs on its own, so automerging it on green would merge it untested. Major bumps still need manual review.",
       "matchUpdateTypes": [
         "patch",
         "minor"
       ],
-      "automerge": true
+      "automerge": false
     },
     {
       "description": "@playwright/test must equal nixpkgs playwright-driver.version (browsers come from the nix store, see compat-playwright/package.json). Bump by hand together with the flake nixpkgs pin.",
