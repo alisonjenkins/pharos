@@ -1716,7 +1716,10 @@ test.describe("pharos Dioxus UI now playing survives a reconnect", () => {
     await expect(page.getByText("Connection lost. Reconnecting…")).toHaveCount(0, {
       timeout: 15_000,
     });
-    await page.waitForTimeout(3_000);
+    // Renewal retries after 1, 2 and 4 s, so wait for its line.
+    await expect
+      .poll(() => lines.join("\n"), { timeout: 15_000 })
+      .toMatch(/pharos: playback grant renewed/);
 
     const kept = await page.evaluate(
       () =>
@@ -1725,21 +1728,21 @@ test.describe("pharos Dioxus UI now playing survives a reconnect", () => {
     );
     expect(kept, "the reconnect rebuilt the <audio>").toBe(1);
     await expect.poll(at).toBeGreaterThan(before + 0.5);
-    expect(lines.join("\n")).toMatch(/pharos: playback grant renewed/);
 
     // The stream is still served after the reconnect: a seek past what is
     // buffered plays on without an error.
-    await page.evaluate(() => {
+    const target = await page.evaluate(() => {
       const a = document.getElementById("pharos-video") as HTMLMediaElement;
       a.currentTime = Math.max(a.currentTime, a.duration - 5);
+      return a.currentTime;
     });
-    await expect
-      .poll(() =>
-        page.evaluate(
-          () => (document.getElementById("pharos-video") as HTMLMediaElement).error?.code ?? 0,
-        ),
-      )
-      .toBe(0);
+    // Only playback past the target shows the range was fetched and played.
+    await expect.poll(at, { timeout: 15_000 }).toBeGreaterThan(target + 1);
+    expect(
+      await page.evaluate(
+        () => (document.getElementById("pharos-video") as HTMLMediaElement).error?.code ?? 0,
+      ),
+    ).toBe(0);
   });
 });
 
