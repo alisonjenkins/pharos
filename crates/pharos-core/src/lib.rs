@@ -1924,7 +1924,9 @@ pub struct MediaProbe {
     /// been analysed, and again once its file changes (V385). Read it through
     /// [`MediaProbe::bpm`], [`MediaProbe::energy`] and
     /// [`MediaProbe::tempo_source`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // No `skip_serializing_if`: `MediaProbe` crosses the worker pipe as
+    // bincode, which cannot decode a skipped field.
+    #[serde(default)]
     pub audio_analysis: Option<AudioAnalysis>,
 }
 
