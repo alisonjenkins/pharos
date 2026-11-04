@@ -105,7 +105,12 @@ impl Song {
         Some(Self {
             // A stored item has no `probe.title`: the scanner folds the tag
             // into `item.title`, so that is the title once read back (B363).
-            title: tag(&probe.title).or_else(|| tag(&Some(item.title.clone())))?,
+            // An untagged song's `item.title` is its filename stem, which is
+            // the guess this rule refuses, so the stem is not a title.
+            title: tag(&probe.title).or_else(|| {
+                let stem = item.path.file_stem().and_then(|s| s.to_str());
+                tag(&Some(item.title.clone())).filter(|t| Some(t.as_str()) != stem)
+            })?,
             artist: tag(&probe.artist).or_else(|| tag(&probe.album_artist))?,
             album: tag(&probe.album),
             duration_ms: probe.duration_ms,
@@ -582,6 +587,9 @@ mod tests {
             ("Run On", "Band")
         );
         item.title = "  ".into();
+        assert_eq!(Song::of(&item), None);
+        // An untagged song's stored title is its filename stem: not a title.
+        item.title = "song".into();
         assert_eq!(Song::of(&item), None);
     }
 
