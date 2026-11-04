@@ -15,6 +15,13 @@ use pharos_sync::group::GroupMsg;
 use pharos_sync::messages::{GroupPlayState, ServerMsg};
 use tokio::time::Instant;
 
+fn unix_now_ms() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(since.as_millis()).unwrap()
+}
+
 /// Allowed gap between the TV and the group: the 750 ms dead-band plus one
 /// progress interval of measurement staleness.
 const TOLERANCE_MS: i64 = 1_800;
@@ -24,16 +31,25 @@ const SETTINGS: &str = "drift_threshold_ms = 750\n\
                         tv_token_lifetime_secs = 600";
 
 /// Where the group is, as its members were last told.
+///
+/// Anchored on the group's own clock: a command's `at_server_ms` plus the
+/// group's epoch is the wall-clock instant its position holds at. Anchoring
+/// on when the test happened to read the message instead made the model lag
+/// the group by however late the read was, which on a loaded runner passed
+/// the tolerance before the TV had drifted at all (B428).
 struct GroupClock {
+    /// The group's `server_ms` origin, in unix ms.
+    epoch_unix_ms: i64,
     position_ms: i64,
-    at: Instant,
+    /// Unix ms at which the group was at `position_ms`.
+    at_unix_ms: i64,
     playing: bool,
 }
 
 impl GroupClock {
     fn now(&self) -> i64 {
         if self.playing {
-            self.position_ms + i64::try_from(self.at.elapsed().as_millis()).unwrap()
+            self.position_ms + (unix_now_ms() - self.at_unix_ms)
         } else {
             self.position_ms
         }
@@ -41,17 +57,24 @@ impl GroupClock {
 
     fn observe(&mut self, rx: &mut tokio::sync::mpsc::Receiver<ServerMsg>) {
         for msg in drain(rx) {
-            let (position_ms, playing) = match msg {
-                ServerMsg::Play { position_ms, .. } => (position_ms, true),
-                ServerMsg::Pause { position_ms, .. } => (position_ms, false),
-                ServerMsg::Seek { position_ms, .. } => (position_ms, self.playing),
+            let (at_server_ms, position_ms, playing) = match msg {
+                ServerMsg::Play {
+                    at_server_ms,
+                    position_ms,
+                } => (at_server_ms, position_ms, true),
+                ServerMsg::Pause {
+                    at_server_ms,
+                    position_ms,
+                } => (at_server_ms, position_ms, false),
+                ServerMsg::Seek {
+                    at_server_ms,
+                    position_ms,
+                } => (at_server_ms, position_ms, self.playing),
                 _ => continue,
             };
-            *self = Self {
-                position_ms: i64::try_from(position_ms).unwrap(),
-                at: Instant::now(),
-                playing,
-            };
+            self.position_ms = i64::try_from(position_ms).unwrap();
+            self.at_unix_ms = self.epoch_unix_ms + i64::try_from(at_server_ms).unwrap();
+            self.playing = playing;
         }
     }
 }
@@ -72,12 +95,16 @@ fn tv_gap_ms(rig: &CastRig, clock: &GroupClock) -> i64 {
 }
 
 async fn casting() -> (CastRig, GroupClock) {
-    let rig = CastRig::with_mock_tv(SETTINGS).await;
-    let clock = GroupClock {
+    let mut rig = CastRig::with_mock_tv(SETTINGS).await;
+    let mut clock = GroupClock {
+        epoch_unix_ms: i64::try_from(rig.group.epoch_unix_ms).unwrap(),
         position_ms: i64::try_from(START_MS).unwrap(),
-        at: Instant::now(),
+        at_unix_ms: unix_now_ms(),
         playing: true,
     };
+    // Bob's join was caught up with the group's Play (at_server_ms and
+    // position), which anchors the clock on the group's own timeline.
+    clock.observe(&mut rig.bob.rx);
     let (status, body) = rig.play_on_tv(&rig.alice).await;
     assert_eq!(status, 204, "{body}");
     eventually_within("the mock TV playing", 10, || rig.receiver.state().playing).await;
