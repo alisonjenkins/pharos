@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 9;
+const schemaVersion :UInt32 = 10;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -118,6 +118,9 @@ interface Session {
   admin @7 (ctx :CallContext) -> (result :AdminResult);
   logout @8 (ctx :CallContext) -> (result :Done);
   group @9 (ctx :CallContext) -> (group :Group);
+  # The user's own password: `current` is checked through the login throttle,
+  # an empty `new` is refused, and the user's other sessions are signed out.
+  changePassword @10 (ctx :CallContext, current :Text $secret, new :Text $secret) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).

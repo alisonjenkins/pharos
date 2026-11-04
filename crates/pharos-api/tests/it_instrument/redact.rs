@@ -9,7 +9,7 @@ use std::rc::Rc;
 use capnp::introspect::{Introspect, TypeVariant};
 use capnp::schema::StructSchema;
 use pharos_api::pharos_capnp::{
-    bootstrap, playback_grant, telemetry, telemetry_event, EventKind, Level,
+    bootstrap, playback_grant, session, telemetry, telemetry_event, EventKind, Level,
 };
 use pharos_api::redact::{is_secret, REDACTED};
 use pharos_api::server::{self, SECRET_METHODS};
@@ -18,6 +18,7 @@ use pharos_api::Connection;
 use crate::support::{block_on, fill_ctx, observe, Observed};
 
 const PASSWORD: &str = "hunter2-password-secret";
+const NEW_PASSWORD: &str = "correct-horse-new-secret";
 const DEVICE_TOKEN: &str = "devtok-0123456789-secret";
 const QC_SECRET: &str = "qc-poll-secret-abcdef";
 const FIELD_SECRET: &str = "clientfield-secret-xyz";
@@ -31,6 +32,20 @@ struct TelemetryBoot;
 
 /// Answers `PlaybackGrant.decision` with an error, so the call completes.
 struct GrantBoot;
+
+/// Answers `Session.changePassword` ok, so the call's payload is logged.
+struct SessionBoot;
+
+impl server::session::Handler for SessionBoot {
+    fn change_password(
+        self: Rc<Self>,
+        _params: session::ChangePasswordParams,
+        results: &mut session::ChangePasswordResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        results.get().init_result().set_ok(());
+        std::future::ready(Ok(()))
+    }
+}
 
 impl server::telemetry::Handler for TelemetryBoot {
     fn submit(
@@ -169,6 +184,13 @@ fn call_all() -> Observed {
             let mut r = grant.decision_request();
             fill_ctx(r.get().init_ctx());
             r.send().promise.await.unwrap();
+
+            let sess: session::Client = server::session::client(SessionBoot, &Connection::new());
+            let mut r = sess.change_password_request();
+            fill_ctx(r.get().init_ctx());
+            r.get().set_current(PASSWORD);
+            r.get().set_new(NEW_PASSWORD);
+            r.send().promise.await.unwrap();
         });
     });
     o
@@ -176,7 +198,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 7] = [
+const COVERED: [(&str, &str); 8] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -184,6 +206,7 @@ const COVERED: [(&str, &str); 7] = [
     ("bootstrap", "submit_anonymous"),
     ("telemetry", "submit"),
     ("playback_grant", "decision"),
+    ("session", "change_password"),
 ];
 
 #[test]
@@ -196,7 +219,13 @@ fn every_secret_method_is_covered() {
 #[test]
 fn secrets_never_reach_logs_or_spans() {
     let o = call_all();
-    for secret in [PASSWORD, DEVICE_TOKEN, QC_SECRET, FIELD_SECRET] {
+    for secret in [
+        PASSWORD,
+        NEW_PASSWORD,
+        DEVICE_TOKEN,
+        QC_SECRET,
+        FIELD_SECRET,
+    ] {
         assert!(
             !o.logs.contains(secret),
             "{secret} leaked into:\n{}",
@@ -212,7 +241,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        14,
+        16,
         "a request and a response per call:\n{}",
         o.logs
     );
@@ -241,4 +270,12 @@ fn secret_annotation_is_read_from_the_schema() {
     let login = fields_of(<bootstrap::login_params::Owned as Introspect>::introspect());
     assert!(is_secret(login.get_field_by_name("password").unwrap()));
     assert!(!is_secret(login.get_field_by_name("name").unwrap()));
+}
+
+#[test]
+fn both_passwords_of_a_password_change_are_secret() {
+    let change = fields_of(<session::change_password_params::Owned as Introspect>::introspect());
+    assert!(is_secret(change.get_field_by_name("current").unwrap()));
+    assert!(is_secret(change.get_field_by_name("new").unwrap()));
+    assert!(!is_secret(change.get_field_by_name("ctx").unwrap()));
 }
