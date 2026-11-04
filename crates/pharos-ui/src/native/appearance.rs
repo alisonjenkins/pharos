@@ -133,7 +133,7 @@ pub fn AppearanceView(
                     }
                 }
                 p { id: "max-quality-help",
-                    "Auto sets no bitrate limit. Pick a lower limit on a slow connection; it applies to video from the next title you play."
+                    "Auto adapts to your connection: it lowers the video quality when playback keeps stalling and raises it again when the link allows. A limit you pick is a ceiling Auto never goes above."
                 }
             }
             fieldset { class: "pharos-diagnostics",
@@ -493,6 +493,21 @@ mod tests {
         for (_, label) in MAX_BITRATE_CHOICES {
             assert!(sel.contains(label), "{label} missing: {sel}");
         }
+    }
+
+    #[test]
+    fn max_quality_defaults_to_auto_and_says_auto_adapts() {
+        let html = page_full(Vec::new(), None, None, false, 0);
+        let start = html.find("id=\"max-quality\"").unwrap_or(usize::MAX);
+        assert!(start != usize::MAX, "select missing: {html}");
+        let sel = &html[start
+            ..html[start..]
+                .find("</select>")
+                .map_or(html.len(), |e| start + e)];
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(sel.contains("value=\"0\" selected") || sel.contains("selected=\"true\""));
+        assert!(html.contains("adapts to your connection"), "{html}");
+        assert!(html.contains("never goes above"), "{html}");
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {
