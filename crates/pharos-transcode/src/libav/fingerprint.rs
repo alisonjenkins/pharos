@@ -98,7 +98,9 @@ fn fingerprint_one(
     // let the pts gate below trim the lead-in.
     let start_us = (start_ms as i64) * 1000;
     if start_ms > 0 {
-        let _ = ictx.seek(start_us, ..start_us);
+        // `..=`: an exclusive end puts max below the target and libav refuses
+        // the seek (B446), which decoded every credits window from the top.
+        let _ = ictx.seek(start_us, ..=start_us);
         // Codec buffers may hold pre-seek frames.
         // (ffmpeg-the-third has no public flush_buffers; a fresh decoder isn't
         // worth it — the pts gate discards any stragglers.)
