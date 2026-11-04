@@ -20,6 +20,8 @@ mod platform;
 mod platform;
 pub mod playback;
 pub mod route;
+pub mod stereo;
+pub mod versions;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;
