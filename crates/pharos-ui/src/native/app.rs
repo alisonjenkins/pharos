@@ -33,6 +33,7 @@ use super::playback::{
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
+use super::seen::{self, MemberSeen};
 use super::stage::{Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
@@ -1460,9 +1461,55 @@ fn BrowseScreen(id: ItemRef) -> Element {
     loaded(
         state.as_ref().and_then(Option::as_ref),
         |browse: &browse::Browse| {
-            rsx! { browse::BrowseLayout { browse: browse.clone() } }
+            rsx! { SeenBrowse { browse: browse.clone() } }
         },
     )
+}
+
+/// What the members of the group we are in have seen of `ids`, fetched
+/// through the group session. It is fetched again when the group's roster
+/// changes (a member joined or left) and when `ids` do (another item). Empty
+/// outside a group, and when the answer fails: the screens simply show no
+/// marks.
+fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
+    let together = use_context::<Together>();
+    let view = (together.view)();
+    let roster: Vec<String> = view.members.iter().map(|m| m.id.clone()).collect();
+    let active = view.active;
+    let found = use_resource(use_reactive!(|(ids, roster, active)| {
+        let session = together.current();
+        async move {
+            let _ = roster;
+            let (true, Some(session), false) = (active, session, ids.is_empty()) else {
+                return Vec::new();
+            };
+            let ids: Vec<ItemRef> = ids.into_iter().take(seen::MAX_IDS).collect();
+            session.seen(ids).await.unwrap_or_else(|e| {
+                platform::warn(&format!("pharos: group seen failed: {}", e.0));
+                Vec::new()
+            })
+        }
+    }));
+    let seen = found.read().clone().unwrap_or_default();
+    seen
+}
+
+/// A show page with the group's marks on it.
+#[component]
+fn SeenBrowse(browse: browse::Browse) -> Element {
+    let ids = match &browse {
+        browse::Browse::Show(show) => browse::seen_ids(show),
+        _ => Vec::new(),
+    };
+    let seen = use_group_seen(ids);
+    rsx! { browse::BrowseLayout { browse, seen } }
+}
+
+/// A film or episode page with the group's marks on it.
+#[component]
+fn SeenTitle(detail: Detail, on_watch_together: EventHandler<ItemRef>) -> Element {
+    let seen = use_group_seen(vec![detail.item.id]);
+    rsx! { TitleView { detail, on_watch_together, seen } }
 }
 
 #[component]
@@ -1510,7 +1557,7 @@ fn TitleScreen(id: ItemRef) -> Element {
             state.as_ref().and_then(Option::as_ref),
             |detail: &Detail| {
                 rsx! {
-                    TitleView {
+                    SeenTitle {
                         detail: detail.clone(),
                         on_watch_together: on_watch_together.clone(),
                     }
@@ -1870,6 +1917,7 @@ fn Player(
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
     let group = (together.view)();
+    let watch_seen = use_group_seen(vec![p.detail.item.id]);
     let session = together.current();
     let mut failed = use_signal(|| None::<String>);
     let mut media = use_signal(MediaState::default);
@@ -2290,6 +2338,7 @@ fn Player(
                 on_control,
                 item_id: p.detail.item.id,
                 members: if group.active { group.members.clone() } else { Vec::new() },
+                seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
                 autoplay: !group.active,
             }
