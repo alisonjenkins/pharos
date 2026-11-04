@@ -521,16 +521,16 @@ input:focus-visible {
   z-index: 10;
   background: black; /* not themed: the letterbox around video is black in every theme */
 }
-body:has(.pharos-watch) {
+body:has(.pharos-watch, .pharos-listen) {
   overflow: hidden;
 }
 /* The shell under the player is out of sight, so out of the tab order and
    the accessibility tree too. */
-body:has(.pharos-watch) .pharos-shell-bar {
+body:has(.pharos-watch, .pharos-listen) .pharos-shell-bar {
   visibility: hidden;
 }
 /* A playback error stays readable over the picture. */
-body:has(.pharos-watch) .pharos-error {
+body:has(.pharos-watch, .pharos-listen) .pharos-error {
   position: fixed;
   top: 4rem;
   left: 50%;
@@ -717,24 +717,31 @@ body:has(.pharos-watch) .pharos-error {
   color: var(--px-color-accent-fg);
 }
 
-/* Now playing (013 US7): a song's art and controls over the visualiser.
-   Without the GPU layer the gradient is the whole look. */
+/* Now playing (013 US7): the visualiser fills the window like a video,
+   with the song's art and controls in a bar along the bottom so the middle
+   stays clear. Without the GPU layer the gradient is the whole look. */
 .pharos-listen {
   --pharos-glow: color-mix(in srgb, var(--px-color-accent) 45%, transparent);
-  position: relative;
+  position: fixed;
+  inset: 0;
+  z-index: 10;
   isolation: isolate;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 75vh;
-  padding: 2rem 1rem;
-  box-sizing: border-box;
-  border-radius: var(--px-radius);
   overflow: hidden;
   background:
     radial-gradient(ellipse at 30% 40%, color-mix(in srgb, var(--px-color-accent) 28%, transparent), transparent 60%),
     radial-gradient(ellipse at 80% 90%, color-mix(in srgb, var(--px-color-accent) 14%, transparent), transparent 55%),
     var(--px-color-bg);
+}
+.pharos-listen-top {
+  position: absolute;
+  inset: 0 0 auto 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.75rem 1rem 2.5rem;
+  background: linear-gradient(color-mix(in srgb, var(--px-color-bg) 65%, transparent), transparent);
 }
 .pharos-visualiser {
   position: absolute;
@@ -746,13 +753,16 @@ body:has(.pharos-watch) .pharos-error {
   pointer-events: none;
 }
 .pharos-listen-body {
+  position: absolute;
+  inset: auto 0 1rem;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 1.5rem 3.5rem;
-  width: min(56rem, 100%);
+  gap: 0 1.25rem;
+  width: min(64rem, calc(100% - 2rem));
+  margin: 0 auto;
   box-sizing: border-box;
-  padding: 2rem 2.5rem 1.5rem 2rem;
+  padding: 0.9rem 1.25rem 0.75rem 0.9rem;
   border: 1px solid color-mix(in srgb, var(--px-color-fg) 12%, transparent);
   border-radius: calc(var(--px-radius) * 2);
   background: color-mix(in srgb, var(--px-color-overlay) 55%, transparent);
@@ -766,9 +776,9 @@ body:has(.pharos-watch) .pharos-error {
    song plays. */
 .pharos-listen-cover {
   position: relative;
-  width: 15rem;
+  width: 5.5rem;
   aspect-ratio: 1;
-  margin-right: 4.5rem;
+  margin-right: 2.25rem;
 }
 .pharos-listen-disc {
   --pharos-vinyl: color-mix(in srgb, var(--px-color-fg) 10%, var(--px-color-overlay));
@@ -814,16 +824,24 @@ body:has(.pharos-watch) .pharos-error {
   display: block;
 }
 .pharos-listen-art .pharos-poster-placeholder {
-  font-size: 5rem;
+  font-size: 2.5rem;
   background: linear-gradient(135deg, color-mix(in srgb, var(--px-color-accent) 55%, var(--px-color-surface)), var(--px-color-surface));
 }
+/* Title over the seek bar, with the transport and volume to the right. */
 .pharos-listen-main {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "eyebrow transport volume"
+    "title transport volume"
+    "meta transport volume"
+    "seek seek seek";
+  align-items: center;
+  gap: 0.1rem 1.25rem;
   min-width: 0;
 }
 .pharos-listen-eyebrow {
+  grid-area: eyebrow;
   margin: 0;
   color: var(--px-color-accent);
   font-size: 0.75rem;
@@ -832,21 +850,27 @@ body:has(.pharos-watch) .pharos-error {
   text-transform: uppercase;
 }
 .pharos-listen-title {
+  grid-area: title;
   margin: 0;
   font-family: var(--px-font-display);
-  font-size: clamp(1.6rem, 3.5vw, 2.6rem);
-  line-height: 1.1;
-  overflow-wrap: anywhere;
+  font-size: 1.25rem;
+  line-height: 1.25;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .pharos-listen-meta {
+  grid-area: meta;
   margin: 0;
+  font-size: 0.85rem;
   color: var(--px-color-fg-muted);
 }
 .pharos-audio {
   display: none;
 }
 .pharos-listen-seek {
-  margin-top: 0.75rem;
+  grid-area: seek;
+  margin-top: 0.35rem;
 }
 .pharos-listen-times {
   display: flex;
@@ -920,10 +944,11 @@ body:has(.pharos-watch) .pharos-error {
   outline: none;
 }
 .pharos-listen-transport {
+  grid-area: transport;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 1.25rem;
+  gap: 0.5rem;
 }
 .pharos-icon {
   width: 1.5rem;
@@ -933,6 +958,7 @@ body:has(.pharos-watch) .pharos-error {
 .pharos-listen-skip,
 .pharos-listen-play {
   display: grid;
+  flex: none;
   place-items: center;
   padding: 0;
   border: none;
@@ -952,15 +978,15 @@ body:has(.pharos-watch) .pharos-error {
   background: color-mix(in srgb, var(--px-color-fg) 12%, transparent);
 }
 .pharos-listen-play {
-  width: 4rem;
-  height: 4rem;
+  width: 3.25rem;
+  height: 3.25rem;
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
   box-shadow: 0 10px 30px -6px var(--pharos-glow);
 }
 .pharos-listen-play .pharos-icon {
-  width: 2rem;
-  height: 2rem;
+  width: 1.75rem;
+  height: 1.75rem;
 }
 .pharos-listen-play:hover,
 .pharos-listen-play:focus-visible {
@@ -977,14 +1003,13 @@ body:has(.pharos-watch) .pharos-error {
   outline-offset: 2px;
 }
 .pharos-listen-volume {
+  grid-area: volume;
   display: flex;
   align-items: center;
   gap: 0.25rem;
-  align-self: flex-end;
-  width: min(11rem, 100%);
+  width: 10rem;
 }
 .pharos-listen-volume .pharos-listen-skip {
-  flex: none;
   width: 2.25rem;
   height: 2.25rem;
 }
@@ -992,42 +1017,58 @@ body:has(.pharos-watch) .pharos-error {
   width: 1.2rem;
   height: 1.2rem;
 }
-.pharos-listen-body > .pharos-visualiser-styles,
 .pharos-listen-note {
-  grid-column: 1 / -1;
-}
-.pharos-listen-note {
+  flex-basis: 100%;
   margin: 0;
-  text-align: center;
+  text-align: right;
 }
 @media (max-width: 40rem) {
-  .pharos-listen {
-    padding: 1rem 0.5rem;
+  .pharos-listen-top {
+    padding: 0.5rem 0.5rem 2rem;
   }
   .pharos-listen-body {
-    grid-template-columns: minmax(0, 1fr);
-    justify-items: center;
-    padding: 1.5rem 1.25rem 1.25rem;
-    text-align: center;
+    bottom: 0.5rem;
+    width: calc(100% - 1rem);
+    padding: 0.75rem;
   }
   .pharos-listen-cover {
-    width: min(12rem, 55vw);
-    margin-right: 4rem;
+    width: 3.5rem;
+    margin-right: 1.5rem;
+    align-self: start;
   }
+  /* Past what a narrow phone fits, the picker scrolls sideways. */
   .pharos-listen .pharos-visualiser-styles {
+    flex: 0 1 auto;
     flex-wrap: nowrap;
-    max-width: 100%;
+    min-width: 0;
     gap: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
   .pharos-listen .pharos-chip {
     padding: 0.35rem 0.5rem;
     font-size: 0.75rem;
   }
   .pharos-listen-main {
-    width: 100%;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 0.5rem;
+    grid-template-areas:
+      "eyebrow eyebrow"
+      "title title"
+      "meta meta"
+      "seek seek"
+      "transport volume";
   }
+  .pharos-listen-transport {
+    gap: 0.25rem;
+  }
+  /* A phone sets its volume with its own buttons; mute stays. */
   .pharos-listen-volume {
-    align-self: center;
+    justify-self: end;
+    width: auto;
+  }
+  .pharos-listen-volume .pharos-listen-range {
+    display: none;
   }
 }
 .pharos-visualiser-styles {
@@ -1055,7 +1096,6 @@ body:has(.pharos-watch) .pharos-error {
   outline-offset: 2px;
 }
 .pharos-listen .pharos-visualiser-styles {
-  justify-self: center;
   gap: 0.2rem;
   padding: 0.25rem;
   border: 1px solid color-mix(in srgb, var(--px-color-fg) 10%, transparent);

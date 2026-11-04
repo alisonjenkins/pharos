@@ -168,6 +168,29 @@ pub fn ListenView(
                     on_fallback: move |f| fallback.set(Some(f)),
                 }
             }
+            div { class: "pharos-listen-top",
+                button {
+                    class: "pharos-listen-skip",
+                    r#type: "button",
+                    aria_label: "Back",
+                    onclick: move |_| on_control.call(Control::Back),
+                    Icon { path: ICON_LEAVE }
+                }
+                div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
+                    for s in Style::ALL {
+                        button {
+                            class: "pharos-chip",
+                            r#type: "button",
+                            aria_pressed: if s == current { "true" } else { "false" },
+                            onclick: move |_| choose(s),
+                            "{s.name()}"
+                        }
+                    }
+                }
+                if let Some(note) = note {
+                    p { class: "pharos-muted pharos-listen-note", "{note}" }
+                }
+            }
             div { class: "pharos-listen-body",
                 div { class: "pharos-listen-cover",
                     div { class: "pharos-listen-disc", aria_hidden: "true" }
@@ -180,7 +203,7 @@ pub fn ListenView(
                 }
                 div { class: "pharos-listen-main",
                     p { class: "pharos-listen-eyebrow", "Now playing" }
-                    h2 { class: "pharos-listen-title", "{title}" }
+                    h2 { class: "pharos-listen-title", title: "{title}", "{title}" }
                     if let Some(meta) = meta {
                         p { class: "pharos-listen-meta", "{meta}" }
                     }
@@ -286,20 +309,6 @@ pub fn ListenView(
                         }
                     }
                 }
-                div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
-                    for s in Style::ALL {
-                        button {
-                            class: "pharos-chip",
-                            r#type: "button",
-                            aria_pressed: if s == current { "true" } else { "false" },
-                            onclick: move |_| choose(s),
-                            "{s.name()}"
-                        }
-                    }
-                }
-                if let Some(note) = note {
-                    p { class: "pharos-muted pharos-listen-note", "{note}" }
-                }
             }
         }
     }
@@ -320,6 +329,7 @@ const ICON_PLAY: &str =
 const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
 const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
+const ICON_LEAVE: &str = "M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20Z";
 const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
 const ICON_MUTED: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4L16.6 12Z";
 
@@ -503,6 +513,17 @@ mod tests {
             );
         }
         assert!(html.contains("1998 · Trip-hop"), "{html}");
+    }
+
+    #[test]
+    fn the_full_window_player_has_a_way_back_and_keeps_the_picker_up_top() {
+        let html = render("Teardrop", None);
+        let (top, bar) = html.split_once("pharos-listen-body").expect("a bottom bar");
+        assert!(top.contains(r#"aria-label="Back""#), "{top}");
+        assert!(top.contains(r#"aria-label="Visualiser""#), "{top}");
+        // A long title is cut to one line, so the whole of it is a tooltip.
+        assert!(bar.contains(r#"title="Teardrop""#), "{bar}");
+        assert!(!bar.contains(r#"aria-label="Visualiser""#), "{bar}");
     }
 
     #[test]
