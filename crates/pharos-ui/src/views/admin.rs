@@ -6,8 +6,8 @@
 //! render so the UI is in place when entries land.
 
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, LibraryFolder, LogEntry,
-    PluginEntry, ScheduledTask,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, FilmVersion,
+    LibraryFolder, LogEntry, PluginEntry, ScheduledTask,
 };
 use dioxus::prelude::*;
 
@@ -57,6 +57,7 @@ pub enum AdminTab {
     #[default]
     Users,
     Libraries,
+    Duplicates,
     Devices,
     Activity,
     ScheduledTasks,
@@ -71,6 +72,7 @@ impl AdminTab {
         match self {
             Self::Users => "Users",
             Self::Libraries => "Libraries",
+            Self::Duplicates => "Duplicates",
             Self::Devices => "Devices",
             Self::Activity => "Activity",
             Self::ScheduledTasks => "Tasks",
@@ -84,6 +86,7 @@ impl AdminTab {
         match self {
             Self::Users => "users",
             Self::Libraries => "libraries",
+            Self::Duplicates => "duplicates",
             Self::Devices => "devices",
             Self::Activity => "activity",
             Self::ScheduledTasks => "scheduledtasks",
@@ -93,10 +96,11 @@ impl AdminTab {
             Self::Branding => "branding",
         }
     }
-    fn all() -> [AdminTab; 9] {
+    fn all() -> [AdminTab; 10] {
         [
             Self::Users,
             Self::Libraries,
+            Self::Duplicates,
             Self::Devices,
             Self::Activity,
             Self::ScheduledTasks,
@@ -138,6 +142,10 @@ pub struct AdminViewProps {
     /// T65 — current branding snapshot for the Branding tab.
     #[props(default)]
     pub branding: BrandingConfig,
+    /// Films held more than once; `None` until the Duplicates tab's
+    /// listing has answered.
+    #[props(default)]
+    pub duplicates: Option<Result<Vec<DuplicateFilm>, String>>,
 }
 
 #[component]
@@ -375,6 +383,9 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                             }
                         }
                     }
+                },
+                AdminTab::Duplicates => rsx! {
+                    DuplicatesSection { films: props.duplicates.clone() }
                 },
                 AdminTab::Plugins => rsx! {
                     section {
@@ -695,6 +706,148 @@ fn AdminUserRow(props: AdminUserRowProps) -> Element {
     }
 }
 
+/// Read-only on purpose: the admin compares versions here and removes
+/// files outside pharos (V285).
+#[component]
+fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Element {
+    rsx! {
+        section {
+            class: "pharos-admin-section pharos-admin-section-duplicates",
+            h3 { "Duplicate films" }
+            match films {
+                None => rsx! { p { class: "pharos-loading", "Looking for duplicates…" } },
+                Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not list duplicates: {e}" } },
+                Some(Ok(films)) if films.is_empty() => rsx! {
+                    p { class: "pharos-empty", "No film is in the library more than once." }
+                },
+                Some(Ok(films)) => rsx! {
+                    p { class: "pharos-admin-duplicates-summary", "{duplicates_summary(&films)}" }
+                    for film in films.iter() {
+                        article {
+                            class: "pharos-admin-duplicate",
+                            key: "{film.versions.first().map(|v| v.id.as_str()).unwrap_or_default()}",
+                            h4 {
+                                "{film.title}"
+                                if let Some(year) = film.production_year {
+                                    span { class: "pharos-admin-duplicate-year", " ({year})" }
+                                }
+                            }
+                            p { class: "pharos-admin-duplicate-match", "{match_label(film)}" }
+                            table {
+                                class: "pharos-admin-duplicate-versions",
+                                thead {
+                                    tr {
+                                        th { "Path" }
+                                        th { "Size" }
+                                        th { "Resolution" }
+                                        th { "Codec" }
+                                        th { "Added" }
+                                    }
+                                }
+                                tbody {
+                                    for v in film.versions.iter() {
+                                        tr {
+                                            key: "{v.id}",
+                                            td {
+                                                class: "pharos-admin-duplicate-path",
+                                                "{v.path}"
+                                                if v.edition_count > 0 {
+                                                    span {
+                                                        class: "pharos-admin-duplicate-editions",
+                                                        " + {editions_label(v.edition_count)}"
+                                                    }
+                                                }
+                                            }
+                                            td { "{size_label(v)}" }
+                                            td { "{resolution_label(v)}" }
+                                            td { "{codec_label(v)}" }
+                                            td { "{added_label(v)}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+const UNKNOWN: &str = "—";
+
+fn duplicates_summary(films: &[DuplicateFilm]) -> String {
+    let files: usize = films.iter().map(|f| f.versions.len()).sum();
+    let noun = if films.len() == 1 { "film" } else { "films" };
+    format!("{} {noun} with {files} files between them.", films.len())
+}
+
+fn match_label(film: &DuplicateFilm) -> String {
+    match film.provider_id.as_deref() {
+        Some(id) => format!("Matched on {id}"),
+        None => "Matched on title and year".to_string(),
+    }
+}
+
+fn editions_label(n: usize) -> String {
+    if n == 1 {
+        "1 edition".to_string()
+    } else {
+        format!("{n} editions")
+    }
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+const MIB: f64 = 1024.0 * 1024.0;
+const KIB: f64 = 1024.0;
+
+fn size_label(v: &FilmVersion) -> String {
+    match v.size_bytes.map(|b| b as f64) {
+        None => UNKNOWN.to_string(),
+        Some(b) if b >= GIB => format!("{:.1} GiB", b / GIB),
+        Some(b) if b >= MIB => format!("{:.0} MiB", b / MIB),
+        Some(b) => format!("{:.0} KiB", b / KIB),
+    }
+}
+
+/// `1080p` for the common frame sizes, `1920×800` for anything else.
+fn resolution_label(v: &FilmVersion) -> String {
+    match (v.width, v.height) {
+        (Some(3840), Some(_)) => "2160p".to_string(),
+        (Some(1920 | 1440), Some(1080)) => "1080p".to_string(),
+        (Some(1280), Some(720)) => "720p".to_string(),
+        (Some(w), Some(h)) => format!("{w}×{h}"),
+        _ => UNKNOWN.to_string(),
+    }
+}
+
+fn codec_label(v: &FilmVersion) -> String {
+    v.video_codec.clone().unwrap_or_else(|| UNKNOWN.to_string())
+}
+
+/// The UTC calendar date of a Unix-seconds timestamp.
+fn added_label(v: &FilmVersion) -> String {
+    let Some(secs) = v.date_added else {
+        return UNKNOWN.to_string();
+    };
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Howard Hinnant's days-to-civil: days since 1970-01-01 to (year, month, day).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -746,6 +899,69 @@ mod tests {
         assert_eq!(AdminTab::ApiKeys.class_suffix(), "apikeys");
         assert_eq!(AdminTab::Branding.label(), "Branding");
         assert_eq!(AdminTab::Branding.class_suffix(), "branding");
-        assert_eq!(AdminTab::all().len(), 9);
+        assert_eq!(AdminTab::Duplicates.label(), "Duplicates");
+        assert_eq!(AdminTab::Duplicates.class_suffix(), "duplicates");
+        assert_eq!(AdminTab::all().len(), 10);
+    }
+
+    fn version(id: &str, width: u32, height: u32) -> FilmVersion {
+        FilmVersion {
+            id: id.into(),
+            path: format!("/m/{id}.mkv"),
+            size_bytes: Some(4_500_000_000),
+            width: Some(width),
+            height: Some(height),
+            video_codec: Some("hevc".into()),
+            date_added: Some(1_762_214_400),
+            edition_count: 0,
+        }
+    }
+
+    #[test]
+    fn the_duplicates_tab_lists_every_version_and_offers_no_delete() {
+        let films = vec![DuplicateFilm {
+            title: "The Six Million Dollar Man: Wine, Women and War".into(),
+            production_year: Some(1973),
+            provider_id: None,
+            versions: vec![version("1", 1920, 1080), version("2", 720, 480)],
+        }];
+        let html =
+            dioxus_ssr::render_element(rsx! { DuplicatesSection { films: Some(Ok(films)) } });
+        assert!(html.contains("Wine, Women and War"), "{html}");
+        assert!(html.contains("(1973)"), "{html}");
+        assert!(html.contains("Matched on title and year"), "{html}");
+        assert!(
+            html.contains("/m/1.mkv") && html.contains("/m/2.mkv"),
+            "{html}"
+        );
+        assert!(html.contains("1080p") && html.contains("720×480"), "{html}");
+        assert!(html.contains("4.2 GiB"), "{html}");
+        assert!(html.contains("2025-11-04"), "{html}");
+        assert!(!html.to_lowercase().contains("delete"), "{html}");
+    }
+
+    #[test]
+    fn the_duplicates_tab_says_when_there_are_none() {
+        let html =
+            dioxus_ssr::render_element(rsx! { DuplicatesSection { films: Some(Ok(vec![])) } });
+        assert!(html.contains("more than once"), "{html}");
+    }
+
+    #[test]
+    fn sizes_scale_to_the_file() {
+        let sized = |b| FilmVersion {
+            size_bytes: Some(b),
+            ..FilmVersion::default()
+        };
+        assert_eq!(size_label(&sized(700 * 1024)), "700 KiB");
+        assert_eq!(size_label(&sized(700 * 1024 * 1024)), "700 MiB");
+        assert_eq!(size_label(&FilmVersion::default()), "—");
+    }
+
+    #[test]
+    fn dates_are_utc_calendar_days() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
     }
 }
