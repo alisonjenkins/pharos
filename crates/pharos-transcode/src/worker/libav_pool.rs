@@ -48,6 +48,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::Trickplay { .. } => "trickplay",
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
+        TinyOp::AudioFeatures { .. } => "audio_features",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
         TinyOp::Integrity { .. } => "integrity",
         TinyOp::Fingerprint { .. } => "fingerprint",
@@ -327,6 +328,28 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Tempo and energy of one song from a window of its audio, plus its BPM
+    /// tag (spec 024). See `crate::audio_features` for the window and the
+    /// analysis.
+    pub async fn audio_features(
+        &self,
+        input: impl Into<PathBuf>,
+        start_ms: u64,
+        dur_ms: u64,
+    ) -> Result<crate::audio_features::AudioFeatures, PoolError> {
+        let ev = self
+            .run(TinyOp::AudioFeatures {
+                input: input.into(),
+                start_ms,
+                dur_ms,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::AudioFeaturesResult { features, .. } => Ok(features),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Subtitle event windows — merged `(start_ms, end_ms)` intervals of
     /// the `stream_rel_idx`-th subtitle stream. Demux-only whole-file scan.
     pub async fn subtitle_windows(
@@ -518,6 +541,7 @@ impl LibavWorkerPool {
             match &ev {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
+                | WorkerEvent::AudioFeaturesResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
