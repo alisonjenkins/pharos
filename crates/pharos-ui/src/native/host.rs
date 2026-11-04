@@ -55,6 +55,8 @@ pub fn on_a_control(_evt: &dioxus::prelude::MouseEvent) -> bool {
     false
 }
 
+pub fn swallow_next_context_menu() {}
+
 pub fn go_back() -> bool {
     false
 }

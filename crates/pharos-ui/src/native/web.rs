@@ -157,6 +157,53 @@ pub fn on_a_control(evt: &dioxus::prelude::MouseEvent) -> bool {
         .is_some()
 }
 
+thread_local! {
+    /// The next `contextmenu` opens no menu, unless a press comes first.
+    static SWALLOW_MENU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep the browser's menu off the `contextmenu` that follows this press. A
+/// Shift+right press that skips swaps the player before the browser asks for
+/// its menu, so the player's own `contextmenu` handler is gone by then
+/// (B405). The next press, key or touch drops the guard, so a browser that
+/// sends no `contextmenu` (Firefox with Shift held) leaves the next right
+/// click, Menu key or long press alone.
+pub fn swallow_next_context_menu() {
+    thread_local! {
+        static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !INSTALLED.replace(true) {
+        let Some(window) = web_sys::window() else {
+            INSTALLED.set(false);
+            return;
+        };
+        let on_menu = Closure::<dyn FnMut(web_sys::Event)>::new(|e: web_sys::Event| {
+            if SWALLOW_MENU.replace(false) {
+                e.prevent_default();
+            }
+        });
+        // In the capture phase, so it runs before the app root sees the
+        // press that may arm the guard again.
+        let on_input = Closure::<dyn FnMut(web_sys::Event)>::new(|_| SWALLOW_MENU.set(false));
+        for (kind, listener) in [
+            ("contextmenu", &on_menu),
+            ("mousedown", &on_input),
+            ("keydown", &on_input),
+            ("touchstart", &on_input),
+        ] {
+            let _ = window.add_event_listener_with_callback_and_bool(
+                kind,
+                listener.as_ref().unchecked_ref(),
+                true,
+            );
+        }
+        // For the page's life, like the app root's own listeners.
+        on_menu.forget();
+        on_input.forget();
+    }
+    SWALLOW_MENU.set(true);
+}
+
 /// `history.back()`, when the page before this one is the app's: an entry
 /// the app pushed. `history.length` would also count other sites' pages.
 pub fn go_back() -> bool {
