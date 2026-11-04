@@ -87,7 +87,7 @@ impl Settings {
              .quire-sheets{{display:none;}}\
              .quire-frame{{position:absolute;inset:0;padding:{m}px;box-sizing:border-box;overflow:hidden;}}\
              .quire-strip{{width:{width}px;height:100%;column-width:{width}px;column-gap:{gap}px;\
-             column-fill:auto;overflow:visible;will-change:transform;\
+             column-fill:auto;overflow:visible;will-change:transform;touch-action:pan-y;\
              font-size:{size}px !important;line-height:{lh} !important;color:{text} !important;\
              overflow-wrap:break-word;-webkit-user-select:text;user-select:text;}}\
              .quire-strip *{{color:inherit !important;background-color:transparent !important;\
