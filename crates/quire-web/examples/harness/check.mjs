@@ -30,7 +30,9 @@ const server = http.createServer((req, res) => {
     res.writeHead(err ? 404 : 200, { "content-type": type });
     res.end(err ? "" : body);
   });
-}).listen(0, "127.0.0.1");
+});
+// With a host, listen binds after a lookup: wait for it before reading the port.
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const url = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 let failed = 0;

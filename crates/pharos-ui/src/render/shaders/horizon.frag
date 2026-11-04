@@ -29,11 +29,13 @@ void main() {
     c += u_accent * edge * 0.8;
 
     // Floor: a perspective grid rolling towards the viewer.
+    // Derivatives need uniform control flow, so take them for every pixel;
+    // the clamp keeps the unused values finite above the horizon.
+    float depth = 0.09 / max(-above, 1e-4);
+    vec2 g = vec2((uv.x - 0.5) * aspect * depth * 1.4, depth + u_time * 0.6);
+    // Distance to the nearest line in pixels, so lines stay thin far off.
+    vec2 px = abs(fract(g + 0.5) - 0.5) / fwidth(g);
     if (above < 0.0) {
-        float depth = 0.09 / -above;
-        vec2 g = vec2((uv.x - 0.5) * aspect * depth * 1.4, depth + u_time * 0.6);
-        // Distance to the nearest line in pixels, so lines stay thin far off.
-        vec2 px = abs(fract(g + 0.5) - 0.5) / fwidth(g);
         float grid = (1.0 - min(min(px.x, px.y), 1.0)) * smoothstep(9.0, 1.0, depth);
         c = u_bg * 0.8 + u_accent * grid * (0.55 + 0.45 * u_level);
         c += u_accent * 0.3 * exp(above * 30.0);

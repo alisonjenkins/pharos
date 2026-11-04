@@ -137,7 +137,9 @@ pub fn LyricsPanel(
                         } else if karaoke && Some(i) == current {
                             span {
                                 class: "pharos-lyrics-words",
-                                style: "--pharos-wipe: {line_progress(&lyrics, i, position_ms):.1}%",
+                                // The same lead that picked the line, so it is full
+                                // just as the next line takes over.
+                                style: "--pharos-wipe: {line_progress(&lyrics, i, position_ms.saturating_add(LEAD_MS)):.1}%",
                                 "{line.text}"
                             }
                         } else {
@@ -278,10 +280,14 @@ mod tests {
     #[test]
     fn karaoke_fills_only_the_line_being_sung() {
         let l = synced(&[1_000, 3_000, 5_000]);
+        // 2 s in plus the 200 ms lead is 60% of the first line.
         let html = render_as(l.clone(), 2_000, true);
         assert!(html.contains(r#"data-karaoke="true""#), "{html}");
         assert_eq!(html.matches("pharos-lyrics-words").count(), 1, "{html}");
-        assert!(html.contains("--pharos-wipe: 50.0%"), "{html}");
+        assert!(html.contains("--pharos-wipe: 60.0%"), "{html}");
+        // The last frame before the next line takes over shows it full.
+        let edge = render_as(l.clone(), 3_000 - LEAD_MS - 1, true);
+        assert!(edge.contains("--pharos-wipe: 100.0%"), "{edge}");
         // Off, or on plain lyrics, nothing fills.
         let off = render_as(l.clone(), 2_000, false);
         assert!(!off.contains("pharos-lyrics-words"), "{off}");
