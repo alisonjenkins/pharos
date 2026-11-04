@@ -98,16 +98,16 @@ runs before each push (CLAUDE.md).
   watch page's member strip; unit and render tests.
 - [x] T035 [US6] Two-browser Playwright: A marks an episode played and B sees it
   under "In this group".
-- [ ] T036 [US7][US8] Contract: `TrackChoice`, `GroupTracks`, `GroupMember.ownTracks`,
+- [x] T036 [US7][US8] Contract: `TrackChoice`, `GroupTracks`, `GroupMember.ownTracks`,
   `GroupSummary.tracks`, `Membership.setTracks`/`followTracks`,
   `GroupUpdate.tracks`, `At.by`; one `schemaVersion` bump in both capnp files.
-- [ ] T037 [US8] Server: `ServerMsg::{Play, Pause, Seek}` carry the member that
+- [x] T037 [US8] Server: `ServerMsg::{Play, Pause, Seek}` carry the member that
   caused them; native `At.by` from it; V395. `it_rpc`: A pauses, B's sink sees
   `pause` by A; a ready-gate start has no `by`.
-- [ ] T038 [US7] Server: group tracks and own-tracks in the actor, `setTracks`,
+- [x] T038 [US7] Server: group tracks and own-tracks in the actor, `setTracks`,
   `followTracks`, `tracks` and member updates, reset on a queue change, late
   joiners get them in `joined`; `pharos_group_tracks_total{outcome}`; V396; ADR.
-- [ ] T039 [US7] `pharos-client` wrappers for `setTracks`, `followTracks` and
+- [x] T039 [US7] `pharos-client` wrappers for `setTracks`, `followTracks` and
   the new update fields.
 - [ ] T040 [US7] UI: a following member applies group tracks; the audio and
   subtitle menus send `setTracks`, or change only the local player under
