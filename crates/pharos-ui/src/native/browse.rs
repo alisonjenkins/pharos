@@ -5,6 +5,8 @@
 //! is a grid of albums; an album is its track list. Anything else, or a
 //! parent whose detail cannot be read, is the plain grid of its children.
 
+use std::collections::HashSet;
+
 use dioxus::prelude::*;
 use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
@@ -16,9 +18,11 @@ use pharos_client::{CallInfo, ClientError};
 
 use super::app::{call, remount_on, Ctx};
 use super::letters::{self, Wheel, LETTERS};
+use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
 use super::machine::Event;
 use super::paging::{Pager, Trigger};
 use super::platform;
+use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
 use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
 
@@ -877,7 +881,16 @@ fn PosterList(page: Page, square: Option<bool>, sentinel: Option<usize>) -> Elem
                 li {
                     key: "{item.id}",
                     id: if sentinel == Some(at) { SENTINEL_ID },
+                    class: if item.kind == ItemKind::Album { "pharos-album-tile" },
                     PosterTile { item: item.clone() }
+                    if item.kind == ItemKind::Album {
+                        QueueButtons {
+                            name: item.name.clone(),
+                            tracks: Vec::new(),
+                            album: item.id,
+                            kind: QueueTarget::AlbumCard,
+                        }
+                    }
                 }
             }
         }
@@ -1101,9 +1114,23 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     .collect();
     let discs = discs(&tracks.items);
     let multi = discs.len() > 1;
+    let complete = tracks.items.len() >= tracks.total as usize;
+    // Read once here, not per row, so a queue change redraws the list once.
+    let queued: HashSet<ItemRef> = try_use_context::<QueueCtx>()
+        .map(|q| q.0.read().upcoming().iter().map(|e| e.id).collect())
+        .unwrap_or_default();
     rsx! {
         section { class: "pharos-album",
             Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
+            if !tracks.items.is_empty() {
+                QueueButtons {
+                    name: detail.item.name.clone(),
+                    // A long album lists past one page; fetch it whole.
+                    tracks: if complete { tracks.items.clone() } else { Vec::new() },
+                    album: detail.item.id,
+                    kind: QueueTarget::AlbumPage,
+                }
+            }
             if tracks.items.is_empty() {
                 p { class: "pharos-empty", "No tracks yet." }
             }
@@ -1114,7 +1141,9 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                     }
                     ol { class: "pharos-tracks",
                         for track in rows {
-                            li { key: "{track.id}", TrackRow { track } }
+                            li { key: "{track.id}",
+                                TrackRow { queued: queued.contains(&track.id), track }
+                            }
                         }
                     }
                 }
@@ -1145,16 +1174,184 @@ pub fn track_length(ms: u64) -> Option<String> {
 }
 
 #[component]
-fn TrackRow(track: Item) -> Element {
+fn TrackRow(track: Item, queued: bool) -> Element {
     let length = track_length(track.runtime_ms);
+    rsx! {
+        div { class: "pharos-track-item",
+            TrackLink { track: track.clone(), length, queued }
+            QueueButtons { name: track.name.clone(), tracks: vec![track], kind: QueueTarget::Song }
+        }
+    }
+}
+
+#[component]
+fn TrackLink(track: Item, length: Option<String>, queued: bool) -> Element {
     rsx! {
         Link { to: Route::Watch(track.id), class: "pharos-track",
             span { class: "pharos-track-number",
                 if let Some(n) = track.episode { "{n}" }
             }
-            span { class: "pharos-track-name", "{track.name}" }
+            span { class: "pharos-track-name",
+                "{track.name}"
+                if queued {
+                    span { class: "pharos-track-queued pharos-muted", "In queue" }
+                }
+            }
             span { class: "pharos-track-length pharos-muted",
                 if let Some(l) = length { "{l}" }
+            }
+        }
+    }
+}
+
+/// Where queued songs go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// "Play next": the front of the queue.
+    Next,
+    /// "Add to queue": the end.
+    End,
+}
+
+impl Place {
+    pub fn label(self) -> &'static str {
+        match self {
+            Place::Next => "next",
+            Place::End => "end",
+        }
+    }
+}
+
+/// What a pair of queue buttons queues, and so how they look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueTarget {
+    /// One song, on its row: icons only.
+    Song,
+    /// An album's songs, on its library card: icons over the cover.
+    AlbumCard,
+    /// An album's songs, on its own page: labelled buttons.
+    AlbumPage,
+}
+
+impl QueueTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            QueueTarget::Song => "song",
+            QueueTarget::AlbumCard => "album_card",
+            QueueTarget::AlbumPage => "album_page",
+        }
+    }
+}
+
+/// How long the "Added" note stays.
+const QUEUED_NOTE_MS: u32 = 2_500;
+
+/// "Play next" and "Add to queue" (B436/V376). `tracks` are queued as
+/// given; when there are none, `album`'s songs are fetched first. Without
+/// the app's queue (a page rendered on its own) they draw nothing.
+#[component]
+pub fn QueueButtons(
+    name: String,
+    tracks: Vec<Item>,
+    album: Option<ItemRef>,
+    kind: QueueTarget,
+) -> Element {
+    let mut note = use_signal(|| None::<String>);
+    // Counts notes, so a note's timer clears only its own note.
+    let mut shown = use_signal(|| 0u64);
+    let (next_label, end_label) = (
+        format!("Play {name} next"),
+        format!("Add {name} to the queue"),
+    );
+    let queue = try_use_context::<QueueCtx>();
+    let ctx = try_use_context::<Ctx>();
+    let Some(QueueCtx(mut queue)) = queue else {
+        return rsx! {};
+    };
+    let put = move |place: Place| {
+        let (tracks, name) = (tracks.clone(), name.clone());
+        spawn(async move {
+            let found = match (
+                tracks.is_empty(),
+                album,
+                ctx.and_then(|c| c.api.peek().clone()),
+            ) {
+                (false, _, _) | (true, None, _) => Ok(tracks),
+                (true, Some(album), Some(api)) => {
+                    list_all(&api, &call("queue", "album"), album, None, INDEX_ORDER)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                (true, Some(_), None) => Err("not signed in".to_owned()),
+            };
+            let target = kind.label();
+            let place_label = place.label();
+            match found {
+                Ok(items) => {
+                    let songs: Vec<Track> = items
+                        .iter()
+                        .filter(|i| i.kind == ItemKind::Audio)
+                        .map(Track::from)
+                        .collect();
+                    let count = songs.len();
+                    platform::info(&added_line(place_label, target, count));
+                    match place {
+                        Place::Next => queue.write().play_next(songs),
+                        Place::End => queue.write().add(songs),
+                    }
+                    note.set(Some(match (place, count) {
+                        (_, 0) => format!("{name} has no songs to queue."),
+                        (Place::Next, _) => format!("{name} plays next."),
+                        (Place::End, _) => format!("{name} added to the queue."),
+                    }));
+                }
+                Err(e) => {
+                    platform::warn(&format!(
+                        "pharos: queue add failed place={place_label} target={target} album={album:?} error={e}"
+                    ));
+                    note.set(Some(format!("Could not queue {name}.")));
+                }
+            }
+            let mine = *shown.peek() + 1;
+            shown.set(mine);
+            platform::sleep_ms(QUEUED_NOTE_MS).await;
+            if *shown.peek() == mine {
+                note.set(None);
+            }
+        });
+    };
+    let put_end = put.clone();
+    let labelled = kind == QueueTarget::AlbumPage;
+    rsx! {
+        div { class: "pharos-queue-buttons", "data-target": kind.label(),
+            button {
+                class: "pharos-queue-button",
+                r#type: "button",
+                title: "{next_label}",
+                aria_label: "{next_label}",
+                onclick: move |evt: MouseEvent| {
+                    evt.stop_propagation();
+                    evt.prevent_default();
+                    put(Place::Next);
+                },
+                Icon { path: ICON_QUEUE_NEXT }
+                if labelled { span { "Play next" } }
+            }
+            button {
+                class: "pharos-queue-button",
+                r#type: "button",
+                title: "{end_label}",
+                aria_label: "{end_label}",
+                onclick: move |evt: MouseEvent| {
+                    evt.stop_propagation();
+                    evt.prevent_default();
+                    put_end(Place::End);
+                },
+                Icon { path: ICON_QUEUE_ADD }
+                if labelled { span { "Add to queue" } }
+            }
+            span { class: "pharos-queue-note", role: "status",
+                if let Some(text) = note() { "{text}" }
             }
         }
     }
@@ -1178,8 +1375,18 @@ pub async fn neighbours<A: PharosApi>(
     info: &CallInfo,
     episode: &Item,
 ) -> Result<Neighbours, ClientError> {
+    Ok(neighbours_and_rest(api, info, episode).await?.0)
+}
+
+/// [`neighbours`], and the items after `episode` in its season or on its
+/// album, which seed the play queue (B435/V375).
+pub async fn neighbours_and_rest<A: PharosApi>(
+    api: &A,
+    info: &CallInfo,
+    episode: &Item,
+) -> Result<(Neighbours, Vec<Item>), ClientError> {
     let Some(season) = episode.parent else {
-        return Ok(Neighbours::default());
+        return Ok((Neighbours::default(), Vec::new()));
     };
     let episodes = |season| list_all(api, info, season, None, INDEX_ORDER);
     // The season's series is needed only at a season's edge, but asking for
@@ -1187,26 +1394,27 @@ pub async fn neighbours<A: PharosApi>(
     let (here, season_detail) = join(episodes(season), api.detail(info, season)).await;
     let here = here?;
     let Some(at) = here.iter().position(|e| e.id == episode.id) else {
-        return Ok(Neighbours::default());
+        return Ok((Neighbours::default(), Vec::new()));
     };
     let mut near = Neighbours {
         previous: at.checked_sub(1).and_then(|i| here.get(i)).map(|e| e.id),
         next: here.get(at + 1).map(|e| e.id),
     };
+    let rest = here.get(at + 1..).map(<[Item]>::to_vec).unwrap_or_default();
     if near.previous.is_some() && near.next.is_some() {
-        return Ok(near);
+        return Ok((near, rest));
     }
     let Some(series) = season_detail?.item.parent else {
-        return Ok(near);
+        return Ok((near, rest));
     };
     let mut seasons = list_all(api, info, series, Some(ItemKind::Season), "").await?;
     seasons.sort_by_key(|s| s.episode.unwrap_or(u32::MAX));
     let Some(s) = seasons.iter().position(|x| x.id == season) else {
-        return Ok(near);
+        return Ok((near, rest));
     };
     let regular = |x: &&Item| x.episode != Some(0);
     if seasons.get(s).is_some_and(|x| !regular(&x)) {
-        return Ok(near);
+        return Ok((near, rest));
     }
     let before = near
         .previous
@@ -1234,7 +1442,7 @@ pub async fn neighbours<A: PharosApi>(
     if let Some(after) = after {
         near.next = after.first().map(|e| e.id);
     }
-    Ok(near)
+    Ok((near, rest))
 }
 
 /// Every child of `parent`, page after page: a season can run past one page.
@@ -1884,6 +2092,121 @@ mod tests {
                 next: None,
             }
         );
+    }
+
+    #[test]
+    fn a_track_brings_the_rest_of_its_album_for_the_queue() {
+        let mut fake = Fake::default();
+        let album = ItemRef::Synth(31);
+        fake.details
+            .insert(album, detail(item(album, ItemKind::Album, "Album")));
+        let track = |n| {
+            let mut t = item(ItemRef::Real(n), ItemKind::Audio, "Track");
+            t.parent = Some(album);
+            t
+        };
+        fake.lists
+            .insert((album, None), vec![track(40), track(41), track(42)]);
+        let rest = |n| {
+            run(neighbours_and_rest(&fake, &CallInfo::default(), &track(n)))
+                .unwrap()
+                .1
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rest(40), [ItemRef::Real(41), ItemRef::Real(42)]);
+        assert_eq!(rest(42), []);
+    }
+
+    fn with_queue(body: impl Fn() -> Element + 'static) -> String {
+        render(move || {
+            let queue = use_signal(crate::native::queue::Queue::default);
+            use_context_provider(|| QueueCtx(queue));
+            body()
+        })
+    }
+
+    #[test]
+    fn songs_and_albums_get_play_next_and_add_to_queue() {
+        let mut song = item(ItemRef::Real(1), ItemKind::Audio, "Opener");
+        song.episode = Some(1);
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let tracks = page(vec![song]);
+        let html = with_queue({
+            let (album, tracks) = (album.clone(), tracks.clone());
+            move || rsx! { AlbumView { detail: album.clone(), tracks: tracks.clone() } }
+        });
+        for label in [
+            "Play Opener next",
+            "Add Opener to the queue",
+            "Play Record next",
+            "Add Record to the queue",
+        ] {
+            assert!(
+                html.contains(&format!(r#"aria-label="{label}""#)),
+                "{label}: {html}"
+            );
+        }
+        // The album's page labels its buttons; a song's row has icons only.
+        assert!(html.contains(r#"data-target="album_page""#), "{html}");
+        assert!(html.contains(r#"data-target="song""#), "{html}");
+        assert!(html.contains("<span>Play next</span>"), "{html}");
+        // Buttons are not inside the row's link.
+        let link = html
+            .split_once(r#"class="pharos-track""#)
+            .and_then(|(_, rest)| rest.split_once("</a>"))
+            .map(|(inner, _)| inner)
+            .expect("a track link");
+        assert!(!link.contains("<button"), "{link}");
+
+        let cards = page(vec![
+            item(ItemRef::Synth(5), ItemKind::Album, "Record"),
+            item(ItemRef::Synth(6), ItemKind::Artist, "Band"),
+        ]);
+        let grid = with_queue(move || rsx! { PosterGrid { page: cards.clone(), square: true } });
+        assert!(grid.contains(r#"data-target="album_card""#), "{grid}");
+        assert!(grid.contains(r#"aria-label="Play Record next""#), "{grid}");
+        assert!(!grid.contains("Play Band next"), "{grid}");
+    }
+
+    #[test]
+    fn without_the_apps_queue_there_are_no_queue_buttons() {
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let tracks = page(vec![item(ItemRef::Real(1), ItemKind::Audio, "Opener")]);
+        let html =
+            render(move || rsx! { AlbumView { detail: album.clone(), tracks: tracks.clone() } });
+        assert!(!html.contains("pharos-queue-button"), "{html}");
+    }
+
+    #[test]
+    fn a_queued_song_says_so_on_its_row() {
+        let song = item(ItemRef::Real(1), ItemKind::Audio, "Opener");
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let tracks = page(vec![song.clone()]);
+        let html = render(move || {
+            let queue = use_signal(|| {
+                let mut q = crate::native::queue::Queue::default();
+                q.add(vec![Track::from(&song)]);
+                q
+            });
+            use_context_provider(|| QueueCtx(queue));
+            rsx! { AlbumView { detail: album.clone(), tracks: tracks.clone() } }
+        });
+        assert!(html.contains("In queue"), "{html}");
+    }
+
+    #[test]
+    fn queue_labels_are_distinct() {
+        assert_ne!(Place::Next.label(), Place::End.label());
+        let targets = [
+            QueueTarget::Song.label(),
+            QueueTarget::AlbumCard.label(),
+            QueueTarget::AlbumPage.label(),
+        ];
+        for (i, a) in targets.iter().enumerate() {
+            assert!(!targets[i + 1..].contains(a), "{a}");
+        }
     }
 
     #[test]
