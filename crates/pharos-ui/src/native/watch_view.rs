@@ -6,18 +6,18 @@
 use dioxus::html::geometry::WheelDelta;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
-use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
+use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
     clock, left_to_watch, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent,
-    MediaState,
+    MediaState, UP_NEXT_COUNTDOWN_MS,
 };
 use super::seen::SeenRow;
 use super::together::Member;
 use super::together_view::{ActivityToast, MemberStrip};
-use super::views::{ends_at, use_ends_at_refresh};
+use super::views::{ends_at, episode_label, use_ends_at_refresh};
 
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
@@ -68,6 +68,36 @@ pub struct Controls {
     /// The episodes before and after this one, when it is an episode.
     pub previous: Option<ItemRef>,
     pub next: Option<ItemRef>,
+    /// The "Up next" card, while it counts down.
+    pub up_next: Option<UpNextCard>,
+}
+
+/// The next episode, as the "Up next" card shows it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UpNextCard {
+    pub name: String,
+    /// Its season and number, such as "S2 · E1".
+    pub number: Option<String>,
+    pub image: Option<String>,
+    /// Whole seconds until it plays, rounded up.
+    pub seconds: u64,
+    /// How much of the countdown has run, 0 to 100.
+    pub elapsed_pct: f64,
+}
+
+impl UpNextCard {
+    /// The card for `next`, or a plain one while it is unknown, with
+    /// `left_ms` of the countdown to run.
+    pub fn of(next: Option<&Item>, left_ms: u64) -> Self {
+        let run = UP_NEXT_COUNTDOWN_MS.saturating_sub(left_ms.min(UP_NEXT_COUNTDOWN_MS));
+        Self {
+            name: next.map_or_else(|| "Next episode".to_owned(), |n| n.name.clone()),
+            number: next.and_then(episode_label),
+            image: next.and_then(|n| n.image.clone()),
+            seconds: left_ms.div_ceil(1_000),
+            elapsed_pct: percent(run, UP_NEXT_COUNTDOWN_MS),
+        }
+    }
 }
 
 impl Controls {
@@ -132,6 +162,10 @@ pub enum Control {
     Play(ItemRef),
     /// The previous song, or this one from the start (B464/V406).
     Previous,
+    /// Play the next episode now, as finishing this one ("Up next").
+    PlayNext,
+    /// Hide "Up next" and stay on this episode to its end.
+    CancelNext,
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -333,7 +367,9 @@ pub fn WatchView(
                     }
                 }
                 ActivityToast { line: toast }
-                if let Some(seg) = skip {
+                if let Some(card) = c.up_next.clone() {
+                    UpNext { card, on_control }
+                } else if let Some(seg) = skip {
                     button {
                         class: "pharos-skip",
                         r#type: "button",
@@ -423,6 +459,47 @@ pub fn WatchView(
 /// The `<track id>` of the subtitle stream `index`.
 pub fn text_track_id(index: u32) -> String {
     format!("pharos-sub-{index}")
+}
+
+/// The next episode and a countdown to it, over the end of this one.
+#[component]
+fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
+    let s = card.seconds;
+    rsx! {
+        aside { class: "pharos-up-next", aria_label: "Up next",
+            if let Some(src) = card.image.clone() {
+                img { class: "pharos-up-next-art", src, alt: "" }
+            }
+            div { class: "pharos-up-next-text",
+                p { class: "pharos-up-next-eyebrow", "Up next" }
+                p { class: "pharos-up-next-name", "{card.name}" }
+                if let Some(number) = card.number.clone() {
+                    p { class: "pharos-up-next-number", "{number}" }
+                }
+                p { class: "pharos-up-next-count", role: "timer",
+                    if s == 1 { "Playing in 1 second" } else { "Playing in {s} seconds" }
+                }
+                div {
+                    class: "pharos-up-next-bar",
+                    style: "--pharos-fill: {card.elapsed_pct:.1}%",
+                }
+                div { class: "pharos-up-next-actions",
+                    button {
+                        class: "pharos-up-next-play",
+                        r#type: "button",
+                        onclick: move |_| on_control.call(Control::PlayNext),
+                        "Play now"
+                    }
+                    button {
+                        class: "pharos-up-next-cancel",
+                        r#type: "button",
+                        onclick: move |_| on_control.call(Control::CancelNext),
+                        "Cancel"
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Played and buffered progress, chapter ticks, skippable spans and the
@@ -1194,6 +1271,45 @@ mod tests {
             wheel_control(-3, true, MediaState::default()),
             Some(Control::Seek(0))
         );
+    }
+
+    #[test]
+    fn up_next_shows_the_next_episode_and_its_countdown_in_place_of_skip() {
+        let next = Item {
+            id: ItemRef::Real(8),
+            kind: pharos_client::api::ItemKind::Episode,
+            name: "The Return".into(),
+            year: None,
+            runtime_ms: 0,
+            image: Some("/Items/8/Images/Primary".into()),
+            played: false,
+            favorite: false,
+            position_ms: 0,
+            series_name: None,
+            season: Some(2),
+            episode: Some(1),
+            parent: None,
+            library_kind: None,
+            imdb_rating: None,
+            critic_rating: None,
+        };
+        let mut c = controls();
+        c.up_next = Some(UpNextCard::of(Some(&next), 7_200));
+        let html = render(c);
+        assert!(html.contains("Up next"), "{html}");
+        assert!(html.contains("The Return"), "{html}");
+        assert!(html.contains("S2 · E1"), "{html}");
+        assert!(html.contains("Playing in 8 seconds"), "{html}");
+        assert!(
+            html.contains("Play now") && html.contains("Cancel"),
+            "{html}"
+        );
+        assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
+        assert!(!html.contains("Skip intro"), "{html}");
+
+        let plain = UpNextCard::of(None, 1_000);
+        assert_eq!((plain.name.as_str(), plain.seconds), ("Next episode", 1));
+        assert_eq!(plain.image, None);
     }
 
     #[test]
