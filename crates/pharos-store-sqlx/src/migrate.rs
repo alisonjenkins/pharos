@@ -489,7 +489,9 @@ const MEDIA_MIGRATE_COLUMNS: &str = "id, path, title, kind, \
     community_rating, critic_rating, official_rating, production_year, premiere_date, \
     overview, tagline, provider_ids, series_folder, series_year, library_id, \
     title_fold, attachments_json, probe_schema_version, video_3d_format, \
-    alternate_sources_json, has_3d";
+    alternate_sources_json, has_3d, \
+    bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
+    audio_analysis_mtime, audio_analysis_size";
 
 #[derive(sqlx::FromRow)]
 struct MediaItemRow {
@@ -547,13 +549,20 @@ struct MediaItemRow {
     video_3d_format: Option<String>,
     alternate_sources_json: Option<String>,
     has_3d: i64,
+    // Spec 024 — carried so a migrated library is not decoded again (V385).
+    bpm_mille: Option<i64>,
+    tempo_source: Option<String>,
+    energy_mille: Option<i64>,
+    audio_analysis_version: Option<i64>,
+    audio_analysis_mtime: Option<i64>,
+    audio_analysis_size: Option<i64>,
     sort_name: Option<String>,
 }
 
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 55-placeholder statement while still batching the
+/// manageable fixed 61-placeholder statement while still batching the
 /// whole copy as a single round of prepared-statement reuse.
 async fn copy_media_items(
     sp: &SqlitePool,
@@ -573,7 +582,7 @@ async fn copy_media_items(
         "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
          $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55)"
+         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61)"
     );
     for row in rows {
         let sort_name = row
@@ -634,6 +643,12 @@ async fn copy_media_items(
             .bind(row.video_3d_format)
             .bind(row.alternate_sources_json)
             .bind(row.has_3d)
+            .bind(row.bpm_mille)
+            .bind(row.tempo_source)
+            .bind(row.energy_mille)
+            .bind(row.audio_analysis_version)
+            .bind(row.audio_analysis_mtime)
+            .bind(row.audio_analysis_size)
             .bind(sort_name)
             .execute(&mut **tx)
             .await
