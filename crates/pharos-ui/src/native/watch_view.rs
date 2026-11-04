@@ -241,7 +241,6 @@ pub fn WatchView(
                     },
                     oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
                     onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
-                    onmouseup: move |evt: MouseEvent| shortcuts.mouse_up(&evt),
                     onplaying: move |_| on_media.call(MediaEvent::Playing),
                     onpause: move |_| on_media.call(MediaEvent::Pause),
                     onseeked: move |_| on_media.call(MediaEvent::Seeked),
@@ -529,22 +528,25 @@ pub enum Skip {
 }
 
 /// The skip a mouse button asks for with Shift held: the main button is the
-/// previous episode or track, the secondary the next. A click that started on
-/// a control is that control's own, so it skips nothing.
+/// previous episode or track, the middle or secondary the next. Firefox
+/// keeps Shift+right click for its own menu (B405), so the middle button is
+/// the one every browser leaves to the page. A click that started on a
+/// control is that control's own, so it skips nothing.
 pub fn shift_skip(shift: bool, button: Option<MouseButton>, on_a_control: bool) -> Option<Skip> {
     if !shift || on_a_control {
         return None;
     }
     match button {
         Some(MouseButton::Primary) => Some(Skip::Previous),
-        Some(MouseButton::Secondary) => Some(Skip::Next),
+        Some(MouseButton::Auxiliary | MouseButton::Secondary) => Some(Skip::Next),
         _ => None,
     }
 }
 
 /// The mouse shortcuts both players share: the wheel changes the volume, or
-/// seeks with Shift, and Shift+click / Shift+right click play the previous /
-/// next item. Hand each handler the matching event of the player's surface.
+/// seeks with Shift, and Shift+click / Shift+middle or right click play the
+/// previous / next item. Hand each handler the matching event of the
+/// player's surface.
 #[derive(Clone, Copy)]
 pub struct Shortcuts {
     media: MediaState,
@@ -553,8 +555,6 @@ pub struct Shortcuts {
     on_control: EventHandler<Control>,
     /// Wheel travel short of a whole notch, kept for the next event.
     carry: Signal<f64>,
-    /// A Shift+right press began on the surface, so its release may skip.
-    armed: Signal<bool>,
 }
 
 pub fn use_shortcuts(
@@ -569,7 +569,6 @@ pub fn use_shortcuts(
         next,
         on_control,
         carry: use_signal(|| 0.0),
-        armed: use_signal(|| false),
     }
 }
 
@@ -597,28 +596,29 @@ impl Shortcuts {
         true
     }
 
-    pub fn mouse_down(mut self, evt: &MouseEvent) {
+    /// A Shift+middle or Shift+right press plays the next item. It acts on
+    /// the press: Firefox on Linux opens its menu there, and the menu takes
+    /// the release.
+    pub fn mouse_down(self, evt: &MouseEvent) {
         let skip = shift_skip(
             evt.modifiers().shift(),
             evt.trigger_button(),
             platform::on_a_control(evt),
         );
-        self.armed.set(skip == Some(Skip::Next));
-    }
-
-    pub fn mouse_up(mut self, evt: &MouseEvent) {
-        if evt.trigger_button() != Some(MouseButton::Secondary) || !*self.armed.peek() {
+        if skip != Some(Skip::Next) || self.next.is_none() {
             return;
         }
-        self.armed.set(false);
-        if evt.modifiers().shift() {
-            self.play(self.next);
+        // No autoscroll or paste from the middle button.
+        evt.prevent_default();
+        if evt.trigger_button() == Some(MouseButton::Secondary) {
+            platform::swallow_next_context_menu();
         }
+        self.play(self.next);
     }
 
-    /// Shift+right click is next, so it opens no menu. Firefox shows its
-    /// menu on Shift+right click whatever the page says, but the skip still
-    /// happens.
+    /// Shift+right click is next, so it opens no menu where the browser lets
+    /// the page say so. Firefox shows its menu on Shift+right click and never
+    /// tells the page, but the skip still happens on the press.
     pub fn context_menu(self, evt: &MouseEvent) {
         if evt.modifiers().shift() && !platform::on_a_control(evt) {
             evt.prevent_default();
@@ -935,7 +935,12 @@ mod tests {
             None,
             "a control's own click"
         );
-        assert_eq!(shift_skip(true, Some(MouseButton::Auxiliary), false), None);
+        assert_eq!(
+            shift_skip(true, Some(MouseButton::Auxiliary), false),
+            Some(Skip::Next),
+            "the middle button, which no browser keeps for itself"
+        );
+        assert_eq!(shift_skip(true, Some(MouseButton::Fourth), false), None);
     }
 
     #[test]

@@ -177,7 +177,6 @@ pub fn ListenView(
             },
             oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
             onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
-            onmouseup: move |evt: MouseEvent| shortcuts.mouse_up(&evt),
             "data-playing": if media.paused { "false" } else { "true" },
             if let (Some(program), None) = (current.program(), fallback()) {
                 Visualiser {
