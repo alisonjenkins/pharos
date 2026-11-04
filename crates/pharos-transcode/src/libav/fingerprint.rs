@@ -112,7 +112,9 @@ fn fingerprint_one(
                 "fingerprint: seek refused, reopening to read the window from the top"
             );
             *ictx = format::input(src)
-                .map_err(|e| FrameError::BadInput(format!("reopen after seek: {e}")))?;
+                // An I/O fault on reopen says nothing about the file: `Other`
+                // keeps it retryable.
+                .map_err(|e| FrameError::Other(format!("reopen after seek: {e}")))?;
         }
         // Codec buffers may hold pre-seek frames.
         // (ffmpeg-the-third has no public flush_buffers; a fresh decoder isn't
