@@ -145,12 +145,13 @@ pub struct LyricsFinder {
 }
 
 /// An online answer held in memory: what was asked, so a retagged song is
-/// asked again, and when, so a miss can lapse.
+/// asked again, and for a miss when it lapses.
 #[derive(Clone)]
 struct Remembered {
     key: String,
     found: Option<Lyrics>,
-    at: Instant,
+    /// `None` for found words, which stand.
+    lapses_at: Option<Instant>,
 }
 
 impl LyricsFinder {
@@ -209,8 +210,8 @@ impl LyricsFinder {
         if let Some(known) = self.remembered(item.id, &key) {
             return known;
         }
-        if let Some(known) = self.read_disk(item.id, online.name(), &song).await {
-            self.remember(item.id, key, known.clone());
+        if let Some((known, age)) = self.read_disk(item.id, online.name(), &song).await {
+            self.remember_aged(item.id, key, known.clone(), age);
             return known;
         }
         if self.cooling_down() {
@@ -262,10 +263,23 @@ impl LyricsFinder {
             return None;
         }
         // A miss lapses as it does on disk; a long-running server asks again.
-        (r.found.is_some() || r.at.elapsed() < cache::MISS_TTL).then_some(r.found)
+        r.lapses_at
+            .map_or(true, |at| Instant::now() < at)
+            .then_some(r.found)
     }
 
     fn remember(&self, id: u64, key: String, found: Option<Lyrics>) {
+        self.remember_aged(id, key, found, Duration::ZERO);
+    }
+
+    /// Remember an answer given `age` ago, so a miss read back from disk
+    /// lapses when it would have on disk, not a whole `MISS_TTL` later.
+    fn remember_aged(&self, id: u64, key: String, found: Option<Lyrics>, age: Duration) {
+        // A deadline ahead rather than a start behind: `Instant` cannot reach
+        // back past the host's boot, and CI hosts are often a day old.
+        let lapses_at = found
+            .is_none()
+            .then(|| Instant::now() + cache::MISS_TTL.saturating_sub(age));
         if let Ok(mut memo) = self.memo.lock() {
             if memo.len() >= ONLINE_MEMO_MAX {
                 memo.clear();
@@ -275,19 +289,20 @@ impl LyricsFinder {
                 Remembered {
                     key,
                     found,
-                    at: Instant::now(),
+                    lapses_at,
                 },
             );
         }
     }
 
-    /// A standing answer from the disk cache, `None` when there is none.
+    /// A standing answer from the disk cache and how old it is, `None` when
+    /// there is none.
     async fn read_disk(
         &self,
         id: u64,
         provider: &'static str,
         song: &Song,
-    ) -> Option<Option<Lyrics>> {
+    ) -> Option<(Option<Lyrics>, Duration)> {
         let disk = Arc::clone(self.disk.as_ref()?);
         let song = song.clone();
         let cached = tokio::task::spawn_blocking(move || disk.get(id, provider, &song))
@@ -300,8 +315,8 @@ impl LyricsFinder {
             "lyrics: online answer from the disk cache"
         );
         Some(match cached {
-            cache::Cached::Found(l) => Some(l),
-            cache::Cached::Missing => None,
+            cache::Cached::Found(l) => (Some(l), Duration::ZERO),
+            cache::Cached::Missing { age } => (None, age),
         })
     }
 
@@ -491,6 +506,50 @@ mod tests {
         let finder = LyricsFinder::with_online(miss.clone()).with_cache(cache);
         assert_eq!(finder.find(&other).await, None);
         assert_eq!(miss.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_miss_read_from_disk_lapses_in_memory_when_it_would_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("lyrics");
+        let item = song_item(dir.path());
+        let song = Song::of(&item).unwrap();
+        let six_days = 6 * 24 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        cache::DiskCache::new(cache_dir.clone()).put_at(
+            item.id,
+            "fixed",
+            &song,
+            None,
+            now - six_days,
+        );
+
+        let online = Arc::new(Fixed(Ok(None), Default::default()));
+        let finder = LyricsFinder::with_online(online.clone()).with_cache(cache_dir);
+        assert_eq!(finder.find(&item).await, None);
+        assert_eq!(online.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The memo keeps it for the day it has left, not seven more.
+        let left = finder.memo.lock().unwrap()[&item.id]
+            .lapses_at
+            .unwrap()
+            .saturating_duration_since(Instant::now());
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert!(
+            left <= day && left > day - Duration::from_secs(60),
+            "{left:?}"
+        );
+        finder
+            .memo
+            .lock()
+            .unwrap()
+            .get_mut(&item.id)
+            .unwrap()
+            .lapses_at = Some(Instant::now());
+        let key = cache::key("fixed", &song);
+        assert_eq!(finder.remembered(item.id, &key), None);
     }
 
     #[tokio::test]

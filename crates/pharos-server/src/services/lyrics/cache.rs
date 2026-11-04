@@ -18,7 +18,10 @@ pub const MISS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cached {
     Found(Lyrics),
-    Missing,
+    /// The provider had none, `age` ago.
+    Missing {
+        age: Duration,
+    },
 }
 
 pub struct DiskCache {
@@ -86,7 +89,9 @@ impl DiskCache {
             .map(Cached::Found),
             None => {
                 let age = now_secs().saturating_sub(record.fetched_at);
-                (age < MISS_TTL.as_secs()).then_some(Cached::Missing)
+                (age < MISS_TTL.as_secs()).then_some(Cached::Missing {
+                    age: Duration::from_secs(age),
+                })
             }
         }
     }
@@ -97,7 +102,14 @@ impl DiskCache {
         self.put_at(id, provider, song, found, now_secs());
     }
 
-    fn put_at(&self, id: u64, provider: &str, song: &Song, found: Option<&Lyrics>, at: u64) {
+    pub(super) fn put_at(
+        &self,
+        id: u64,
+        provider: &str,
+        song: &Song,
+        found: Option<&Lyrics>,
+        at: u64,
+    ) {
         let record = Record {
             key: key(provider, song),
             fetched_at: at,
@@ -196,7 +208,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::new(dir.path().to_path_buf());
         cache.put(7, "lrclib", &song(), None);
-        assert_eq!(cache.get(7, "lrclib", &song()), Some(Cached::Missing));
+        assert!(matches!(
+            cache.get(7, "lrclib", &song()),
+            Some(Cached::Missing { age }) if age < Duration::from_secs(5)
+        ));
         let old = now_secs() - MISS_TTL.as_secs();
         cache.put_at(7, "lrclib", &song(), None, old);
         assert_eq!(cache.get(7, "lrclib", &song()), None);
