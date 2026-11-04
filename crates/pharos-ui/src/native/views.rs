@@ -769,6 +769,7 @@ mod tests {
             name: String::new(),
             stereo,
             primary: id.is_empty(),
+            ..Default::default()
         };
         let detail = Detail {
             item: movie,

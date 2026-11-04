@@ -104,14 +104,33 @@ pub enum Stereo {
     Mvc,
 }
 
-/// One playable file of an item: its primary, or a grouped edition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One playable file of an item: its primary, a grouped edition, or another
+/// copy of the same episode. Probe facts are 0 or empty when unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Version {
     /// What [`PharosApi::play`] takes; empty for the primary.
     pub id: String,
     pub name: String,
     pub stereo: Option<Stereo>,
     pub primary: bool,
+    pub width: u32,
+    pub height: u32,
+    pub video_codec: String,
+    /// `HDR10` or `HLG`; empty is SDR.
+    pub hdr: String,
+    pub audio: Vec<VersionAudio>,
+    pub size_bytes: u64,
+    pub container: String,
+    /// The file on the server's disk; the server sends it to admins only.
+    pub path: String,
+}
+
+/// One audio stream of a [`Version`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionAudio {
+    pub language: String,
+    pub codec: String,
+    pub channels: u32,
 }
 
 /// One item as a list or rail shows it.
@@ -710,6 +729,24 @@ impl PharosApi for NativeApi {
                                 name: text(v.get_name())?,
                                 stereo: read_stereo(v.get_stereo()),
                                 primary: v.get_primary(),
+                                width: v.get_width(),
+                                height: v.get_height(),
+                                video_codec: text(v.get_video_codec())?,
+                                hdr: text(v.get_hdr())?,
+                                audio: v
+                                    .get_audio()?
+                                    .iter()
+                                    .map(|a| {
+                                        Ok(VersionAudio {
+                                            language: text(a.get_language())?,
+                                            codec: text(a.get_codec())?,
+                                            channels: a.get_channels(),
+                                        })
+                                    })
+                                    .collect::<Result<_, capnp::Error>>()?,
+                                size_bytes: v.get_size_bytes(),
+                                container: text(v.get_container())?,
+                                path: text(v.get_path())?,
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,
