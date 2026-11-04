@@ -421,6 +421,87 @@ pub async fn revoke_other_tokens(
     Ok(revoked)
 }
 
+/// Why [`change_own_password`] stored no new password, or did but could
+/// not sign the user's other sessions out.
+#[derive(Debug)]
+pub enum ChangePasswordError {
+    /// The new password is empty: no account may hold one (V211).
+    EmptyNew,
+    /// The current password was refused: wrong (or empty), throttled, or
+    /// the user store could not check it.
+    Refused(crate::auth::LoginRefusal),
+    /// Hashing or storing the new password failed; the old one stands.
+    Store(AuthError),
+    /// The new password is stored, but the other sessions were not revoked.
+    Revoke(AuthError),
+}
+
+/// A signed-in user changing their own password: the current one is
+/// checked through the login throttle (V174), so a stolen session cannot
+/// buy unthrottled guesses with it, the new one is stored in one update,
+/// and every other session token the user holds is revoked (B235);
+/// `keep_token`, the caller's own, survives. Returns how many went.
+pub async fn change_own_password(
+    state: &AppState,
+    user: &User,
+    current: &pharos_core::SecretString,
+    new: &pharos_core::SecretString,
+    client_ip: std::net::IpAddr,
+    keep_token: &str,
+) -> Result<u64, ChangePasswordError> {
+    let result = async {
+        // Both checked before the throttle, so a malformed request spends
+        // no attempt; an empty current password is refused as a wrong one.
+        if new.expose().is_empty() {
+            return Err(ChangePasswordError::EmptyNew);
+        }
+        if current.expose().is_empty() {
+            return Err(ChangePasswordError::Refused(
+                crate::auth::LoginRefusal::Invalid,
+            ));
+        }
+        state
+            .login_throttle
+            .verify(&state.auth, &user.name, current, client_ip)
+            .await
+            .map_err(ChangePasswordError::Refused)?;
+        let hash = state
+            .auth
+            .hash_password_off_worker(new)
+            .await
+            .map_err(ChangePasswordError::Store)?;
+        state
+            .stores
+            .set_password(user.id, hash)
+            .await
+            .map_err(ChangePasswordError::Store)?;
+        revoke_other_tokens(
+            state,
+            user.id,
+            Some(keep_token),
+            RevokeCause::PasswordChanged,
+        )
+        .await
+        .map_err(ChangePasswordError::Revoke)
+    }
+    .await;
+    match &result {
+        Ok(revoked) => tracing::info!(
+            user = %user.name,
+            client_ip = %client_ip,
+            revoked,
+            "password changed"
+        ),
+        Err(e) => tracing::warn!(
+            user = %user.name,
+            client_ip = %client_ip,
+            error = ?e,
+            "password change refused"
+        ),
+    }
+    result
+}
+
 /// Why [`quick_connect_login`] issued no token.
 #[derive(Debug)]
 pub enum QuickConnectLoginError {

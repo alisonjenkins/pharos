@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
-use pharos_core::{AuthError, DomainResult, User, UserId, UserPrefStore};
+use pharos_core::{AuthError, DomainResult, SecretString, User, UserId, UserPrefStore};
 
 use super::bootstrap::token_denial;
 use super::group::Group;
@@ -18,7 +18,11 @@ use super::socket::MessageBucket;
 use super::telemetry::{Telemetry, TELEMETRY_BATCHES_PER_SECOND, TELEMETRY_BATCH_BURST};
 use super::user_data::UserData;
 use super::ConnectionCtx;
-use crate::services::auth::{revoke_token, user_for_token, RevokeCause, TokenRefusal};
+use crate::auth::LoginRefusal;
+use crate::services::auth::{
+    change_own_password, revoke_token, user_for_token, ChangePasswordError, RevokeCause,
+    TokenRefusal,
+};
 use crate::state::AppState;
 
 /// How long a session trusts the diagnostics opt-in it last read. A batch
@@ -252,4 +256,86 @@ impl server::session::Handler for Session {
         }
         Ok(())
     }
+
+    /// The user's own password (V361): see [`change_own_password`]. This
+    /// session's token is kept, so the caller stays signed in here; the
+    /// user's other sessions close.
+    async fn change_password(
+        self: Rc<Self>,
+        params: wire::ChangePasswordParams,
+        results: &mut wire::ChangePasswordResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let params = params.get()?;
+        // Not UTF-8: it cannot be the current password, nor one to store.
+        let (Ok(current), Ok(new)) = (
+            params.get_current()?.to_string(),
+            params.get_new()?.to_string(),
+        ) else {
+            Denial::NotPermitted {
+                what: "current password is wrong",
+            }
+            .write(results.get().init_result().init_error());
+            return Ok(());
+        };
+        let changed = change_own_password(
+            &self.state,
+            &user,
+            &SecretString::new(current),
+            &SecretString::new(new),
+            self.ctx.client_ip,
+            &self.token,
+        )
+        .await;
+        let mut done = results.get().init_result();
+        match changed {
+            Ok(_) => done.set_ok(()),
+            Err(e) => write_change_password_error(&e, done.init_error()),
+        }
+        Ok(())
+    }
+}
+
+/// A refused `changePassword` as the client sees it; backend error text
+/// stays in the log.
+fn write_change_password_error(
+    error: &ChangePasswordError,
+    mut out: pharos_api::pharos_capnp::error::Builder<'_>,
+) {
+    let denial = match error {
+        ChangePasswordError::EmptyNew => {
+            out.set_reason("a new password is required");
+            let mut invalid = out.get_kind().init_invalid();
+            invalid.set_field("new");
+            invalid.set_value("");
+            return;
+        }
+        // Stored already: say so, so the client does not retry with the
+        // old password. A retry with the new one revokes again.
+        ChangePasswordError::Revoke(_) => {
+            out.set_reason(pharos_api::PASSWORD_CHANGED_REVOKE_FAILED);
+            out.get_kind().set_unavailable("token store");
+            return;
+        }
+        ChangePasswordError::Refused(LoginRefusal::Invalid) => Denial::NotPermitted {
+            what: "current password is wrong",
+        },
+        // V174: the wait is machine-readable, in seconds.
+        ChangePasswordError::Refused(LoginRefusal::Throttled(retry)) => Denial::Throttled {
+            name: "login_retry_after_secs",
+            retry_after_secs: retry.secs,
+        },
+        ChangePasswordError::Refused(LoginRefusal::Backend(_)) | ChangePasswordError::Store(_) => {
+            Denial::Unavailable {
+                dependency: "user store",
+            }
+        }
+    };
+    denial.write(out);
 }

@@ -19,6 +19,7 @@ mod limits;
 mod login;
 mod lyrics;
 mod mix;
+mod password;
 mod playback;
 mod prefs;
 mod quick_connect;
