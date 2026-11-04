@@ -26,6 +26,7 @@ use super::playback::{
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
+use super::trail;
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
@@ -697,10 +698,22 @@ fn NativeApp(route: Route) -> Element {
             }
         });
     });
-    let current = match route {
-        Route::Browse(id) => Some(id),
+    // The player hides the shell, so a watch page needs no trail.
+    let shown = match route {
+        Route::Browse(id) | Route::Title(id) => Some(id),
         _ => None,
     };
+    let trail = use_resource(use_reactive!(|(shown,)| {
+        let api = api.read().clone();
+        async move {
+            let (Some(api), Some(id)) = (api, shown) else {
+                return Vec::new();
+            };
+            trail::load(&api, &call("shell", "trail"), id)
+                .await
+                .unwrap_or_default()
+        }
+    }));
 
     use_effect(move || {
         let (phase, epoch, delay) = {
@@ -761,7 +774,7 @@ fn NativeApp(route: Route) -> Element {
         return rsx! {
             Shell {
                 libraries: libraries(),
-                current,
+                trail: trail.read().clone().unwrap_or_default(),
                 account: rsx! {
                     AccountMenu {
                         me,

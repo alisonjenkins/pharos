@@ -188,6 +188,30 @@ input:focus-visible {
   color: var(--px-color-accent-fg);
 }
 
+.pharos-crumbs ol {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--px-color-fg-muted);
+  font-size: 0.9rem;
+}
+.pharos-crumbs li + li::before {
+  content: "›";
+  margin-right: 0.4rem;
+}
+.pharos-crumbs a {
+  color: inherit;
+}
+.pharos-crumbs a:hover {
+  color: var(--px-color-fg);
+}
+.pharos-crumbs [aria-current="page"] {
+  color: var(--px-color-fg);
+}
+
 .pharos-account {
   position: relative;
 }
