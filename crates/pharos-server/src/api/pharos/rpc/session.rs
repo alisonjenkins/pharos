@@ -75,6 +75,12 @@ impl Session {
         })
     }
 
+    /// The user this session was signed in as, whether or not its token is
+    /// still live.
+    pub(super) fn owner(&self) -> UserId {
+        self.user.id
+    }
+
     pub(super) fn conn(&self) -> Rc<Connection> {
         Rc::clone(&self.conn)
     }
