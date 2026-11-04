@@ -630,6 +630,14 @@ body:has(.pharos-watch) .pharos-error {
   font-variant-numeric: tabular-nums;
   font-size: 0.9rem;
 }
+.pharos-ends-at {
+  opacity: 0.75;
+}
+@media (max-width: 40rem) {
+  .pharos-ends-at {
+    display: none;
+  }
+}
 .pharos-volume {
   width: 6rem;
   accent-color: var(--px-color-accent);

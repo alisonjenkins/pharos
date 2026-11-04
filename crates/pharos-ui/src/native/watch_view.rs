@@ -10,8 +10,10 @@ use pharos_client::api::{Chapter, ItemRef, Segment, Track, Trickplay};
 
 use super::platform;
 use super::playback::{
-    clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
+    clock, left_to_watch, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent,
+    MediaState,
 };
+use super::views::{ends_at, use_ends_at_refresh};
 
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
@@ -127,6 +129,7 @@ pub fn WatchView(
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
 ) -> Element {
+    use_ends_at_refresh();
     let c = &controls;
     let total = c.total_ms();
     let media = c.media;
@@ -183,6 +186,7 @@ pub fn WatchView(
         on_control.call(control);
     };
     let skip = segment_at(&c.segments, media.position_ms);
+    let ends = ends_at(left_to_watch(&c.segments, media.position_ms, total));
     let text_tracks: Vec<(String, Track)> = c
         .subtitles
         .iter()
@@ -288,6 +292,9 @@ pub fn WatchView(
                         }
                         span { class: "pharos-time",
                             "{clock(media.position_ms)} / {clock(total)}"
+                        }
+                        if let Some(ends) = &ends {
+                            span { class: "pharos-time pharos-ends-at", "{ends}" }
                         }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
@@ -730,6 +737,25 @@ mod tests {
             subtitle_pick: Some(3),
             ..Controls::default()
         }
+    }
+
+    #[test]
+    fn the_player_says_when_the_video_ends_before_the_credits() {
+        let mut c = controls();
+        assert!(render(c.clone()).contains(">Ends at "));
+        c.segments.push(Segment {
+            kind: SegmentKind::Outro,
+            start_ms: 1_100_000,
+            end_ms: 1_200_000,
+        });
+        let html = render(c.clone());
+        assert!(html.contains(" (before credits)<"), "{html}");
+        c.media.position_ms = 1_150_000;
+        let html = render(c);
+        assert!(
+            html.contains(">Ends at ") && !html.contains("before credits"),
+            "{html}"
+        );
     }
 
     #[test]
