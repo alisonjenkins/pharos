@@ -3038,6 +3038,7 @@ impl GroupHandle {
                             metrics::counter!(
                                 "pharos_syncplay_member_pruned_total",
                                 "connected" => "true",
+                                "cause" => "silence_ttl",
                             )
                             .increment(1);
                             remove_member(&mut state, id);
