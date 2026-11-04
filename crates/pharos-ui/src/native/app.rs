@@ -28,6 +28,7 @@ use super::playback::{
     choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
+use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
@@ -703,6 +704,9 @@ fn NativeApp(route: Route) -> Element {
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
     use_context_provider(|| Ctx { api, machine });
+    // The play queue lives as long as the app, across pages and songs.
+    let queue = use_signal(Queue::default);
+    use_context_provider(|| QueueCtx(queue));
     let nav = use_context::<Nav>();
     // The library buttons, read again for each signed-in API; a reconnect
     // keeps the last list until the new one arrives.
@@ -1328,18 +1332,61 @@ fn WatchScreen(id: ItemRef) -> Element {
             let result = async {
                 let episode = api.detail(&info, id).await?.item;
                 // An episode's neighbours are in its series, a track's on its album.
-                if !matches!(episode.kind, ItemKind::Episode | ItemKind::Audio) {
-                    return Ok(Neighbours::default());
+                match episode.kind {
+                    ItemKind::Episode => {
+                        Ok((browse::neighbours(&api, &info, &episode).await?, None))
+                    }
+                    ItemKind::Audio => {
+                        let (near, rest) =
+                            browse::neighbours_and_rest(&api, &info, &episode).await?;
+                        Ok((near, Some(rest)))
+                    }
+                    _ => Ok((Neighbours::default(), None)),
                 }
-                browse::neighbours(&api, &info, &episode).await
             }
             .await;
             result
-                .map_err(|e| {
+                .map_err(|e: ClientError| {
                     platform::warn(&format!("pharos: episode neighbours unavailable: {e}"))
                 })
                 .ok()
         }
+    });
+    // A song that starts takes itself out of the queue, or seeds it with the
+    // rest of its album (B435/V375); once per song, as the screen remounts
+    // per item.
+    let queue = try_use_context::<QueueCtx>();
+    let mut seeded = use_signal(|| false);
+    use_effect(move || {
+        let read = near.read();
+        // Still loading.
+        let Some(looked_up) = read.as_ref() else {
+            return;
+        };
+        if *seeded.peek() {
+            return;
+        }
+        seeded.set(true);
+        let Some(QueueCtx(mut queue)) = queue else {
+            return;
+        };
+        let rest = match looked_up {
+            Some((_, Some(rest))) => Some(rest.as_slice()),
+            // Not a song.
+            Some((_, None)) => return,
+            // The album could not be read; a song played from the queue
+            // still leaves it.
+            None if queue.peek().next() == Some(id) => None,
+            None => return,
+        };
+        queue.write().started(id, rest, seed());
+        let q = queue.peek();
+        platform::info(&format!(
+            "pharos: queue started item={id} album_rest={} upcoming={} shuffled={}",
+            rest.map_or_else(|| "unread".to_owned(), |r| r.len().to_string()),
+            q.upcoming().len(),
+            q.shuffled()
+        ));
     });
     let playing = use_resource(move || {
         let api = ctx.api.read().clone();
@@ -1406,7 +1453,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                 Player {
                     playing: p.clone(),
                     last_ms: LastMs(Rc::clone(&last_ms)),
-                    near: near.read().flatten().unwrap_or_default(),
+                    near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
                     on_renegotiate: move |next| picks.set(next),
                 }
             },
@@ -1433,6 +1480,11 @@ impl PartialEq for LastMs {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
+}
+
+/// A shuffle seed: a play order needs no more randomness than the clock.
+fn seed() -> u64 {
+    platform::now_ms().to_bits()
 }
 
 fn choice(index: Option<u32>) -> TrackChoice {
@@ -1467,6 +1519,32 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    let own_queue = use_signal(Queue::default);
+    let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
+    let audio = p.kind == ItemKind::Audio;
+    let playing_id = p.detail.item.id;
+    // A song's next comes from the queue, unless a group decides what plays.
+    let queued = audio && session.is_none();
+    let next = if queued {
+        queue.read().next_after(playing_id, near.next)
+    } else {
+        near.next
+    };
+    // Play `to` after this song. The same song again (queued twice) is the
+    // same route, which mounts nothing new, so it plays again in place.
+    let go = move |to: ItemRef| {
+        if queued && to == playing_id {
+            // A copy, so `go` is `Fn` and every handler can hold it.
+            let mut queue = queue;
+            queue.write().started(to, None, seed());
+            platform::info(&format!("pharos: queue replay item={to}"));
+            platform::seek_ms(VIDEO_ID, 0);
+            platform::play(VIDEO_ID);
+        } else {
+            replace.0.call(Route::Watch(to));
+        }
+    };
+
     let lyrics = use_resource({
         let (id, kind) = (p.detail.item.id, p.kind);
         move || {
@@ -1589,6 +1667,15 @@ fn Player(
             if let Some(session) = &session {
                 session.on_media(event);
             }
+            // A song that ends plays what is next; in a group the group
+            // decides what plays.
+            if event == MediaEvent::Ended && queued {
+                let (to, line) = queue.peek().advance(playing_id, near.next);
+                platform::info(&line);
+                if let Some(to) = to {
+                    go(to);
+                }
+            }
             media.set(platform::media_state(VIDEO_ID));
             if event == MediaEvent::Changed && !burned {
                 // Text tracks load with the metadata; show the picked one.
@@ -1664,7 +1751,7 @@ fn Player(
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
                 // In place of this episode, so Back leaves the show rather than
                 // replaying every episode watched.
-                Control::Play(id) => replace.0.call(Route::Watch(id)),
+                Control::Play(id) => go(id),
                 Control::Back => {
                     if !platform::go_back() {
                         nav.0.call(Route::Home);
@@ -1708,7 +1795,7 @@ fn Player(
         audio_pick: p.audio,
         subtitle_pick: subtitle(),
         previous: near.previous,
-        next: near.next,
+        next,
     };
     let on_leave = {
         let session = session.clone();
@@ -1734,8 +1821,32 @@ fn Player(
                 runtime_ms: p.detail.item.runtime_ms,
                 media: media(),
                 previous: near.previous,
-                next: near.next,
+                next,
                 lyrics: lyrics.read().clone().flatten(),
+                queue: queue.read().upcoming().to_vec(),
+                shuffled: queue.read().shuffled(),
+                on_queue: move |action: QueueAction| {
+                    // In a group the group picks the song.
+                    if matches!(action, QueueAction::Play(_)) && !queued {
+                        platform::info("pharos: queue action=play refused reason=group");
+                        return;
+                    }
+                    let play = match action {
+                        QueueAction::Play(key) => {
+                            queue.peek().upcoming().iter().find(|e| e.key == key).map(|e| e.id)
+                        }
+                        _ => None,
+                    };
+                    queue.write().apply(action, seed());
+                    platform::info(&format!(
+                        "pharos: queue action={} upcoming={}",
+                        action.label(),
+                        queue.peek().upcoming().len()
+                    ));
+                    if let Some(id) = play {
+                        go(id);
+                    }
+                },
                 on_media,
                 on_control,
             }
