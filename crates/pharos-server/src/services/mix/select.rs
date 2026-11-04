@@ -55,6 +55,10 @@ pub struct Song {
     /// Unix seconds it was last played; 0 is never.
     pub last_played_at: i64,
     pub favorite: bool,
+    /// Beats per minute: the file's tag, else the scanner's analysis.
+    pub bpm: Option<f32>,
+    /// How intense it sounds, 0 (calm) to 1, from the scanner's analysis.
+    pub energy: Option<f32>,
 }
 
 impl Song {
@@ -125,9 +129,20 @@ pub enum Test {
         min_s: u32,
         max_s: u32,
     },
-    /// Like the seed: same artist, or close in genre and era. A `Prefer`
-    /// weights by how alike, not just whether.
+    /// Like the seed: same artist, or close in genre, era, tempo and
+    /// energy. A `Prefer` weights by how alike, not just whether.
     LikeSeed,
+    /// `min..=max` beats per minute; a song with no tempo never matches.
+    Tempo {
+        min: u16,
+        max: u16,
+    },
+    /// Energy `min..=max` in percent (0 calm, 100 intense); a song not yet
+    /// analysed never matches.
+    Energy {
+        min: u8,
+        max: u8,
+    },
 }
 
 impl Test {
@@ -146,6 +161,8 @@ impl Test {
             Test::AddedWithin { .. } => "added_within",
             Test::Length { .. } => "length",
             Test::LikeSeed => "like_seed",
+            Test::Tempo { .. } => "tempo",
+            Test::Energy { .. } => "energy",
         }
     }
 
@@ -165,6 +182,8 @@ impl Test {
             Test::PlayedWithin { days } => format!("Played in the last {days} days"),
             Test::AddedWithin { days } => format!("Added in the last {days} days"),
             Test::Length { min_s, max_s } => format!("{}–{} long", mmss(*min_s), mmss(*max_s)),
+            Test::Tempo { min, max } => format!("{min}–{max} BPM"),
+            Test::Energy { min, max } => format!("Energy {min}–{max}%"),
             Test::LikeSeed => match seed.and_then(Song::by) {
                 Some(by) => format!("Like {by}"),
                 None => "Like the seed".to_owned(),
@@ -287,6 +306,12 @@ impl Spec {
                 Test::Length { min_s, max_s } if max_s < min_s => {
                     return Err(SpecError::BackwardsRange { rule, test });
                 }
+                Test::Tempo { min, max } if max < min => {
+                    return Err(SpecError::BackwardsRange { rule, test });
+                }
+                Test::Energy { min, max } if max < min || *max > 100 => {
+                    return Err(SpecError::BackwardsRange { rule, test });
+                }
                 Test::LikeSeed if self.seed.is_none() => return Err(SpecError::NoSeed { rule }),
                 _ => {}
             }
@@ -369,8 +394,24 @@ fn opt_eq(a: Option<&str>, b: &str) -> bool {
     a.is_some_and(|a| eq_ci(a, b))
 }
 
-/// How alike `s` is to `seed`, from 0 to 1: the same artist is 1; else
-/// shared genres (Jaccard) count 0.7 and closeness in year 0.3.
+/// How close two tempos are, 0 to 1, counting half and double time as the
+/// same beat: 1 at the same tempo, 0 a quarter apart or more.
+pub fn tempo_closeness(a: f32, b: f32) -> f64 {
+    let (a, b) = (f64::from(a), f64::from(b));
+    if a <= 0.0 || b <= 0.0 {
+        return 0.0;
+    }
+    [b, b * 2.0, b / 2.0]
+        .iter()
+        .map(|b| (1.0 - ((a - b).abs() / a.max(*b)) / 0.25).max(0.0))
+        .fold(0.0, f64::max)
+}
+
+/// How alike `s` is to `seed`, from 0 to 1: the same artist is 1; else a
+/// weighted mean of shared genres (Jaccard, 0.5), closeness in year (0.2),
+/// in tempo (0.15) and in energy (0.15). Tempo and energy count only when
+/// the seed has them (a song without scores halfway), so an unanalysed
+/// library scores as genre 0.7 / era 0.3.
 pub fn likeness(seed: &Song, s: &Song) -> f64 {
     if let (Some(a), Some(b)) = (seed.by(), s.by()) {
         if eq_ci(a, b) {
@@ -393,7 +434,21 @@ pub fn likeness(seed: &Song, s: &Song) -> f64 {
         (Some(a), Some(b)) => (1.0 - f64::from(a.abs_diff(b)) / 20.0).max(0.0),
         _ => 0.0,
     };
-    0.7 * genre + 0.3 * era
+    let mut sum = 0.5 * genre + 0.2 * era;
+    let mut weight = 0.7;
+    // A part counts when the seed has it; a song the scanner has not yet
+    // analysed scores halfway on it, neither like nor unlike.
+    if let Some(a) = seed.bpm {
+        sum += 0.15 * s.bpm.map_or(0.5, |b| tempo_closeness(a, b));
+        weight += 0.15;
+    }
+    if let Some(a) = seed.energy {
+        sum += 0.15
+            * s.energy
+                .map_or(0.5, |b| (1.0 - f64::from((a - b).abs())).clamp(0.0, 1.0));
+        weight += 0.15;
+    }
+    sum / weight
 }
 
 /// How strongly `test` holds for `s`, from 0 to 1. Every test but
@@ -423,6 +478,12 @@ fn degree(test: &Test, s: &Song, seed: Option<&Song>, now: i64) -> f64 {
             yes(s.duration_s.is_some_and(|d| (*min_s..=*max_s).contains(&d)))
         }
         Test::LikeSeed => seed.map_or(0.0, |seed| likeness(seed, s)),
+        Test::Tempo { min, max } => yes(s
+            .bpm
+            .is_some_and(|b| (f32::from(*min)..=f32::from(*max)).contains(&b))),
+        Test::Energy { min, max } => yes(s
+            .energy
+            .is_some_and(|e| (f32::from(*min) / 100.0..=f32::from(*max) / 100.0).contains(&e))),
     }
 }
 
@@ -838,6 +899,43 @@ mod tests {
     }
 
     #[test]
+    fn tempo_and_energy_rules_read_the_analysis_and_skip_songs_without_it() {
+        let mut s = song(1, "A", "House", 2000);
+        let tempo = Test::Tempo { min: 120, max: 130 };
+        let calm = Test::Energy { min: 0, max: 30 };
+        assert!(!matches(&tempo, &s, None, NOW), "no tempo, no match");
+        assert!(!matches(&calm, &s, None, NOW), "not analysed, no match");
+        s.bpm = Some(124.0);
+        s.energy = Some(0.2);
+        assert!(matches(&tempo, &s, None, NOW));
+        assert!(matches(&calm, &s, None, NOW));
+        s.energy = Some(0.31);
+        assert!(!matches(&calm, &s, None, NOW));
+        assert_eq!(tempo.describe(None), "120–130 BPM");
+    }
+
+    #[test]
+    fn like_seed_hears_tempo_and_energy_when_the_seed_has_them() {
+        let mut seed = song(1, "A", "House", 2000);
+        seed.bpm = Some(124.0);
+        seed.energy = Some(0.8);
+        let mut near = song(2, "B", "House", 2000);
+        near.bpm = Some(62.0); // half time: the same beat
+        near.energy = Some(0.75);
+        let mut far = song(3, "C", "House", 2000);
+        far.bpm = Some(90.0);
+        far.energy = Some(0.1);
+        let unknown = song(4, "D", "House", 2000);
+        assert!(likeness(&seed, &near) > likeness(&seed, &unknown));
+        assert!(likeness(&seed, &unknown) > likeness(&seed, &far));
+        assert!((tempo_closeness(124.0, 62.0) - 1.0).abs() < 1e-9);
+        assert_eq!(tempo_closeness(124.0, 0.0), 0.0);
+        // No analysis on either side scores as before: genre 0.7, era 0.3.
+        let a = song(5, "E", "House", 2000);
+        assert!((likeness(&a, &unknown) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn play_history_rules_read_the_clock() {
         let mut s = song(1, "A", "Rock", 2000);
         assert!(matches(&Test::NeverPlayed, &s, None, NOW));
@@ -930,6 +1028,8 @@ mod tests {
             Test::AddedWithin { days: 0 },
             Test::Length { min_s: 0, max_s: 0 },
             Test::LikeSeed,
+            Test::Tempo { min: 0, max: 0 },
+            Test::Energy { min: 0, max: 0 },
         ];
         let labels: HashSet<&str> = tests.iter().map(Test::label).collect();
         assert_eq!(labels.len(), tests.len());

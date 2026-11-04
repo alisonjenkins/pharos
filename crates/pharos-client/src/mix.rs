@@ -46,15 +46,34 @@ pub enum Test {
     Genre(String),
     Artist(String),
     Album(String),
-    Years { from: u16, to: u16 },
+    Years {
+        from: u16,
+        to: u16,
+    },
     Favorite,
     NeverPlayed,
-    PlayCount { min: u32, max: u32 },
+    PlayCount {
+        min: u32,
+        max: u32,
+    },
     NotPlayedForDays(u32),
     PlayedWithinDays(u32),
     AddedWithinDays(u32),
-    LengthSecs { min: u32, max: u32 },
+    LengthSecs {
+        min: u32,
+        max: u32,
+    },
     LikeSeed,
+    /// Beats per minute.
+    Tempo {
+        min: u16,
+        max: u16,
+    },
+    /// Percent, 0 calm to 100 intense.
+    Energy {
+        min: u8,
+        max: u8,
+    },
 }
 
 impl Test {
@@ -73,6 +92,8 @@ impl Test {
             Test::AddedWithinDays(_) => "Added in the last",
             Test::LengthSecs { .. } => "Length",
             Test::LikeSeed => "Like the seed",
+            Test::Tempo { .. } => "Tempo",
+            Test::Energy { .. } => "Energy",
         }
     }
 
@@ -94,6 +115,8 @@ impl Test {
             Test::AddedWithinDays(30),
             Test::LengthSecs { min: 120, max: 360 },
             Test::LikeSeed,
+            Test::Tempo { min: 110, max: 130 },
+            Test::Energy { min: 60, max: 100 },
         ]
     }
 }
@@ -274,6 +297,16 @@ fn write_rule(mut out: mix_rule::Builder<'_>, r: &Rule) {
             m.set_to(*max);
         }
         Test::LikeSeed => t.set_like_seed(()),
+        Test::Tempo { min, max } => {
+            let mut m = t.init_tempo_bpm();
+            m.set_from(u32::from(*min));
+            m.set_to(u32::from(*max));
+        }
+        Test::Energy { min, max } => {
+            let mut m = t.init_energy();
+            m.set_from(u32::from(*min));
+            m.set_to(u32::from(*max));
+        }
     }
 }
 
@@ -336,6 +369,21 @@ fn read_rule(r: mix_rule::Reader<'_>) -> Result<Option<Rule>, capnp::Error> {
             }
         }
         Ok(T::LikeSeed(())) => Test::LikeSeed,
+        Ok(T::TempoBpm(m)) => {
+            let m = m?;
+            Test::Tempo {
+                min: u16_of(m.get_from()),
+                max: u16_of(m.get_to()),
+            }
+        }
+        Ok(T::Energy(m)) => {
+            let m = m?;
+            let pct = |v: u32| u8::try_from(v).unwrap_or(u8::MAX);
+            Test::Energy {
+                min: pct(m.get_from()),
+                max: pct(m.get_to()),
+            }
+        }
         // A test from a newer schema: this client cannot show or keep it.
         Err(_) => return Ok(None),
     };

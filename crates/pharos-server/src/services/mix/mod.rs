@@ -141,6 +141,11 @@ fn song(item: &MediaItem, ud: UserItemData) -> select::Song {
         play_count: ud.play_count,
         last_played_at: ud.last_played_at,
         favorite: ud.is_favorite,
+        // Filled from `probe.bpm` / `probe.energy` once the scanner reads
+        // tempo tags and analyses energy (B445); until then the tempo and
+        // energy rules match nothing and likeness ignores them.
+        bpm: None,
+        energy: None,
     }
 }
 
