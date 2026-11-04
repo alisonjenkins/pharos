@@ -28,6 +28,7 @@ pub mod syncplay;
 pub mod system;
 pub mod trickplay;
 pub mod user_data;
+pub mod user_images;
 pub mod user_prefs;
 pub mod users;
 pub mod waveform;
@@ -59,6 +60,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     search::register(cfg);
     user_data::register(cfg);
     images::register(cfg);
+    user_images::register(cfg);
     stream::register(cfg);
     hls::register(cfg);
     trickplay::register(cfg);
