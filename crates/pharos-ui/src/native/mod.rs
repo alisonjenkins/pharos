@@ -6,6 +6,7 @@ pub mod account_settings;
 pub mod activity;
 pub mod app;
 pub mod appearance;
+pub mod approve_device;
 pub mod backdrop;
 pub mod browse;
 pub mod depth;

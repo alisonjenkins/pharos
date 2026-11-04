@@ -322,6 +322,67 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
     });
 
+    test("a user approves a Quick Connect code from the account menu", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      // A user of its own, so the seeded user's password never changes.
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-qc-auth-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token } = await auth.json();
+      const name = `pw-qc-${Date.now()}`;
+      const created = await request.post(`${PHAROS_URL}/Users/New`, {
+        headers: { "X-Emby-Token": token, "Content-Type": "application/json" },
+        data: { Name: name, Password: "test-pass" },
+      });
+      expect(created.ok()).toBeTruthy();
+
+      const rand = Math.floor(Math.random() * 1_000_000);
+      const initiated = await request.post(`${PHAROS_URL}/QuickConnect/Initiate`, {
+        headers: {
+          Authorization: `MediaBrowser Client="pw", Device="tv", DeviceId="pw-qc-${rand}", Version="1"`,
+        },
+      });
+      expect(initiated.ok()).toBeTruthy();
+      const { Code, Secret } = await initiated.json();
+
+      const signIn = async (password: string) => {
+        await page.locator("#signin-name").fill(name);
+        await page.locator("#signin-password").fill(password);
+        await page.getByRole("button", { name: "Sign in" }).click();
+      };
+      await page.goto("/ui/");
+      await signIn("test-pass");
+      const account = page.getByRole("button", { name: /^Account/ });
+      await account.click();
+      await page.getByRole("menuitem", { name: "Approve a device" }).click();
+      await expect(page).toHaveURL(/\/ui\/settings\/approve-device$/);
+
+      const form = page.locator("form#approve-device");
+      await form.locator("input").fill("000000");
+      await form.getByRole("button", { name: "Approve" }).click();
+      await expect(form.getByRole("alert")).toContainText("not right");
+
+      await form.locator("input").fill(Code);
+      await form.getByRole("button", { name: "Approve" }).click();
+      await expect(form.getByRole("status")).toContainText("Device approved");
+
+      const connect = await request.get(`${PHAROS_URL}/QuickConnect/Connect?secret=${Secret}`);
+      expect(connect.ok()).toBeTruthy();
+      const connectJson = await connect.json();
+      expect(connectJson.Authenticated).toBe(true);
+    });
+
     test("a user sets and removes their avatar from the Account page", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },

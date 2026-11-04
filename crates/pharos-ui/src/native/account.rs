@@ -93,6 +93,7 @@ pub fn AccountMenuView(
                         p { class: "pharos-account-name", "{name}" }
                     }
                     MenuLink { to: Route::Account, "Account" }
+                    MenuLink { to: Route::ApproveDevice, "Approve a device" }
                     MenuLink { to: Route::Appearance, "Appearance" }
                     if is_admin {
                         MenuLink { to: Route::Manage, "Manage" }
@@ -218,7 +219,13 @@ mod tests {
     fn an_admin_sees_manage() {
         let html = render(me("ali", true), true);
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
-        for item in ["Account", "Appearance", "Manage", "Sign out"] {
+        for item in [
+            "Account",
+            "Approve a device",
+            "Appearance",
+            "Manage",
+            "Sign out",
+        ] {
             assert!(html.contains(item), "{item}: {html}");
         }
     }
@@ -226,6 +233,7 @@ mod tests {
     #[test]
     fn a_user_who_is_not_an_admin_does_not_see_manage() {
         let html = render(me("guest", false), true);
+        assert!(html.contains("Approve a device"), "{html}");
         assert!(html.contains("Appearance"), "{html}");
         assert!(html.contains("Sign out"), "{html}");
         assert!(!html.contains("Manage"), "{html}");
