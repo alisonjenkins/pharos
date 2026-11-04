@@ -1,0 +1,6 @@
+<!-- Pharos brand mark "Beam P". Original artwork; see README.md. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<style>.a{fill:#0b63c5}.l{fill:#f0a020}.s{stop-color:#f0a020}
+@media (prefers-color-scheme:dark){.a{fill:#4cb4ff}.l{fill:#ffd27a}.s{stop-color:#ffd27a}}</style>
+<linearGradient id="beam" x1="44" x2="64" y1="0" y2="0" gradientUnits="userSpaceOnUse"><stop class="s" offset="0" stop-opacity=".9"/><stop class="s" offset="1" stop-opacity="0"/></linearGradient>
+<path d="M44 22 64 12V36L44 30Z" fill="url(#beam)"/><path class="a" fill-rule="evenodd" d="M12 10a4 4 0 0 1 4-4H32a20 20 0 0 1 0 40H24V56a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4Z M26 16.5V35.5L42 26Z"/><path class="l" d="M26 16.5V35.5L42 26Z"/></svg>
