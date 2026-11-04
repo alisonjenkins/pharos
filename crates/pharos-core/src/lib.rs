@@ -3725,6 +3725,13 @@ pub trait UserPrefStore: Send + Sync {
         user: UserId,
         key: &str,
     ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
+    /// Every user's value under `key`, in one read, for a listing that
+    /// needs it per user. Users with no value are absent.
+    fn user_prefs_for_key(
+        &self,
+        key: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(UserId, Vec<u8>)>>> + Send;
 }
 
 /// Persisted transcode negotiation for a PlaySessionId (Phase B1 —

@@ -3919,6 +3919,23 @@ impl pharos_core::UserPrefStore for PostgresStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(done.rows_affected() > 0)
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn user_prefs_for_key(&self, key: &str) -> DomainResult<Vec<(UserId, Vec<u8>)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("SELECT user_id, value FROM user_prefs WHERE key = $1")
+                .bind(key)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id, value)| {
+                uuid::Uuid::from_slice(&id)
+                    .map(|id| (UserId(id), value))
+                    .map_err(|e| DomainError::Backend(format!("bad uuid: {e}")))
+            })
+            .collect()
+    }
 }
 
 type SessionRow = crate::TranscodeSessionRow;

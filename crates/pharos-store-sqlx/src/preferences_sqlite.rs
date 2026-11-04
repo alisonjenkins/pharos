@@ -131,6 +131,23 @@ impl UserPrefStore for SqliteStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(done.rows_affected() > 0)
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn user_prefs_for_key(&self, key: &str) -> DomainResult<Vec<(UserId, Vec<u8>)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("SELECT user_id, value FROM user_prefs WHERE key = ?")
+                .bind(key)
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id, value)| {
+                uuid::Uuid::from_slice(&id)
+                    .map(|id| (UserId(id), value))
+                    .map_err(|e| DomainError::Backend(format!("bad uuid: {e}")))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -144,7 +161,7 @@ mod tests {
         let uid = UserId::new();
         s.create(UserRecord {
             id: uid,
-            name: "u".into(),
+            name: format!("u-{}", uid.0.simple()),
             password_hash: SecretString::new("h"),
             policy: UserPolicy::default(),
         })
@@ -166,6 +183,22 @@ mod tests {
             s.get_user_pref(uid, "other").await.unwrap().as_deref(),
             Some(&b"w"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn every_users_value_for_a_key_is_read_at_once() {
+        let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        let (a, b, none) = (
+            seed_user(&s).await,
+            seed_user(&s).await,
+            seed_user(&s).await,
+        );
+        s.set_user_pref(a, "k", b"1").await.unwrap();
+        s.set_user_pref(b, "k", b"2").await.unwrap();
+        s.set_user_pref(none, "other", b"3").await.unwrap();
+        let mut found = s.user_prefs_for_key("k").await.unwrap();
+        found.sort_by(|x, y| x.1.cmp(&y.1));
+        assert_eq!(found, vec![(a, b"1".to_vec()), (b, b"2".to_vec())]);
     }
 
     #[tokio::test]
