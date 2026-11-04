@@ -1605,6 +1605,27 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
     await expect(page.locator(".pharos-stage")).toHaveCount(0);
     await play();
     await expect.poll(volume).toBeCloseTo(0.3, 2);
+
+    // V393: a volume localStorage refuses still reaches the next player,
+    // from this page load's memory rather than the stored 0.300.
+    await page.evaluate(() => {
+      const write = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (key: string, value: string) {
+        if (key === "pharos.volume") throw new DOMException("full", "QuotaExceededError");
+        return write.call(this, key, value);
+      };
+    });
+    await page.getByLabel("Volume").fill("0.5");
+    await expect.poll(volume).toBeCloseTo(0.5, 2);
+    await expect
+      .poll(() => lines.join("\n"))
+      .toMatch(/pharos: volume storage write failed/);
+    await page.getByRole("button", { name: "Back", exact: true }).click();
+    await page.locator(".pharos-stage").getByRole("button", { name: "Close" }).click();
+    await expect(page.locator(".pharos-stage")).toHaveCount(0);
+    await play();
+    await expect.poll(volume).toBeCloseTo(0.5, 2);
+    expect(lines.join("\n")).toMatch(/pharos: volume restored volume=0\.500 muted=false from=page/);
     expect(lines.join("\n")).toMatch(/pharos: volume restored volume=0\.300 muted=false/);
 
     // The rest needs a GPU context; headless CI may have none.
@@ -1637,7 +1658,7 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
       .toMatch(/pharos: webgl context restored program=\w+/);
     await expect(page.locator("canvas.pharos-visualiser")).toBeVisible();
     expect(lines.join("\n")).not.toMatch(/reason=context_lost/);
-    await expect.poll(volume).toBeCloseTo(0.3, 2);
+    await expect.poll(volume).toBeCloseTo(0.5, 2);
   });
 });
 
