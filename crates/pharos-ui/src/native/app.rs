@@ -2492,14 +2492,20 @@ fn Player(
     use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+        let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
         move || {
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
             let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+            let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
             spawn(async move {
                 let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
                 let on_fragment: OnFragment = {
                     let (watch, assess) = (watch.clone(), Rc::clone(&assess));
                     Rc::new(move |load| {
+                        // Handing over, or already decided: no more downloads count.
+                        if retiring.get() || decided.get() {
+                            return;
+                        }
                         watch
                             .0
                             .borrow_mut()
