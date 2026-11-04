@@ -62,6 +62,16 @@ item: play, add to group queue. Hidden for users without the permission or when
 Cards show a "watching together now" badge when a group is on that item;
 detail page offers "Join group"; mini-player shows group state.
 
+### US6 — who has seen what (P2)
+
+In a group, a film, episode, season or series page shows an "In this group"
+row: each member with seen, part-way with a percent, or not seen, and for a
+series or season "6/10 episodes". Each episode row of a season shows who has
+seen it. Hovering a member on the watch page's strip shows whether they have
+seen the item playing. It answers "who needs catching up?" and "who has seen
+this film?". A member's state is shown only to others in the same group, and
+only for items the viewer may see (ADR-0054, V365).
+
 ## Functional Requirements
 
 - **FR-001** Group-sync client implementing `docs/group-sync-protocol.md` over

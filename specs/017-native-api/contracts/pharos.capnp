@@ -388,7 +388,7 @@ interface Membership {
   # the ghost prune (T83).
   ping      @6 (ctx :CallContext) -> (result :Done);
   clockReport @7 (ctx :CallContext, t1 :UInt64, t2 :UInt64, t3 :UInt64, t4 :UInt64) -> (result :Done);
-  # What each member of THIS group has watched of `ids` (US6, ADR-0046). At most
+  # What each member of THIS group has watched of `ids` (US6, ADR-0054). At most
   # 200 ids, else `limit`. An id the caller may not see is left out of every
   # member's `items`; a member with no recorded user is listed with no items.
   seen      @8 (ctx :CallContext, ids :List(ItemId)) -> (result :SeenResult);
