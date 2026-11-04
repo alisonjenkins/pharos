@@ -372,6 +372,15 @@ pub trait PharosApi {
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
     async fn lyrics(&self, call: &CallInfo, id: ItemRef) -> Result<Lyrics, ClientError>;
+    /// The next `count` songs for `spec`, given what was heard or queued
+    /// (`recent`, oldest first). Short with `exhausted` when it runs out.
+    async fn mix(
+        &self,
+        call: &CallInfo,
+        spec: &crate::mix::MixSpec,
+        recent: &[ItemRef],
+        count: u32,
+    ) -> Result<crate::mix::MixBatch, ClientError>;
     /// Negotiate playback of `id` with the tracks in `picks`.
     async fn play(
         &self,
@@ -773,6 +782,39 @@ impl PharosApi for NativeApi {
         }
     }
 
+    async fn mix(
+        &self,
+        call: &CallInfo,
+        spec: &crate::mix::MixSpec,
+        recent: &[ItemRef],
+        count: u32,
+    ) -> Result<crate::mix::MixBatch, ClientError> {
+        use pharos_api::pharos_capnp::mix_result;
+        let mut req = self.library.mix_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            crate::mix::write_spec(p.reborrow().init_spec(), spec);
+            let mut ids = p
+                .reborrow()
+                .init_recent(u32::try_from(recent.len()).unwrap_or(u32::MAX));
+            for (i, id) in (0..ids.len()).zip(recent) {
+                set_item_ref(ids.reborrow().get(i), *id);
+            }
+            p.set_count(count);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            mix_result::Batch(b) => Ok(crate::mix::read_batch(b?)?),
+            mix_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
     async fn play(
         &self,
         call: &CallInfo,
@@ -1045,7 +1087,7 @@ fn read_items(
     list.iter().map(read_item).collect()
 }
 
-fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
+pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
     let year = read_opt_u16(item.get_year()?)?;
     let image = item
         .get_images()?
