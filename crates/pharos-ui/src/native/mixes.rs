@@ -251,7 +251,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
     let mut open = use_signal(|| false);
     let mut editing = use_signal(|| None::<SavedMix>);
     let mut saved = use_signal(|| None::<Vec<SavedMix>>);
-    let mut load = move || {
+    let load = move || {
         if saved.peek().is_some() {
             return;
         }
@@ -279,7 +279,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             playing.is_none(),
         );
     };
-    let on_save = move |m: SavedMix| {
+    let mut on_save = move |m: SavedMix| {
         let Some(api) = ctx.and_then(|c| c.api.peek().clone()) else {
             return;
         };
@@ -302,7 +302,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             }
         });
     };
-    let on_delete = move |name: String| {
+    let mut on_delete = move |name: String| {
         let Some(api) = ctx.and_then(|c| c.api.peek().clone()) else {
             return;
         };
