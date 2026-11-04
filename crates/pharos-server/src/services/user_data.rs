@@ -164,6 +164,22 @@ pub async fn folder_items(
     Ok(items)
 }
 
+/// Whether `user` has played every item under synthesised series or season
+/// `id` that they may see; false when they may see none.
+pub async fn folder_played(state: &AppState, user: &User, id: &str) -> Result<bool, DetailError> {
+    let items = folder_items(state, user, id).await?;
+    if items.is_empty() {
+        return Ok(false);
+    }
+    let ids: Vec<_> = items.iter().map(|i| i.id).collect();
+    let data = state
+        .stores
+        .user_data_bulk(user.id, &ids)
+        .await
+        .map_err(DetailError::Store)?;
+    Ok(data.iter().all(|d| d.played))
+}
+
 /// Applies `change` to `user`'s state on every item under synthesised
 /// series or season `id` they may see, and announces every new state plus
 /// a folder entry keyed on `id`, so a series or season page updates by its
