@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 10;
+const schemaVersion :UInt32 = 11;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -104,7 +104,10 @@ struct LoginOk { session @0 :Session; deviceToken @1 :Text $secret; }
 struct QuickConnectResult { union { pending @0 :QuickConnectPending; error @1 :Error; } }
 struct QuickConnectPending { code @0 :Text; secret @1 :Text $secret; }
 
-struct Me { id @0 :UserId; name @1 :Text; isAdmin @2 :Bool; }
+struct Me {
+  id @0 :UserId; name @1 :Text; isAdmin @2 :Bool;
+  avatarTag @3 :Text;          # empty: no avatar; else GET /UserImage?userId=&tag=
+}
 struct MeResult { union { me @0 :Me; error @1 :Error; } }
 
 interface Session {
@@ -121,11 +124,16 @@ interface Session {
   # The user's own password: `current` is checked through the login throttle,
   # an empty `new` is refused, and the user's other sessions are signed out.
   changePassword @10 (ctx :CallContext, current :Text $secret, new :Text $secret) -> (result :Done);
+  # The user's own avatar: any PNG, JPEG, WebP or GIF up to 768 KiB, stored
+  # cropped square and re-encoded by the server; answers the new tag.
+  setAvatar @11 (ctx :CallContext, image :Data) -> (result :AvatarResult);
+  removeAvatar @12 (ctx :CallContext) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
 }
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
+struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
 
 # ---- library --------------------------------------------------------------
 # `kinds` naming exactly one kind pharos only synthesises (series, season,
