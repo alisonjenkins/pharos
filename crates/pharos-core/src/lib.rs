@@ -981,6 +981,14 @@ pub trait PersonStore: Send + Sync {
         &self,
         limit: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
+
+    /// Every `Actor` credit on any of `items`, paired with the item that
+    /// carries it, so a show's or season's cast can be ranked across its
+    /// episodes with [`ensemble_cast`]. Guest stars and crew are left out.
+    fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network
