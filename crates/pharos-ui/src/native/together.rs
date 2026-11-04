@@ -2,12 +2,13 @@
 //! need the server. Pure functions and models here; the screens and the
 //! network seam come in later commits.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use pharos_client::api::{ItemKind, ItemRef, NativeApi};
 
 use super::seen::MemberSeen;
+use super::track_follow::{GroupTracksView, TrackChoice};
 
 /// How many clock samples the estimator keeps; older ones fall off.
 pub const CLOCK_WINDOW: usize = 9;
@@ -207,6 +208,8 @@ pub struct Member {
     pub id: String,
     pub name: String,
     pub buffering: bool,
+    /// On their own audio and subtitles, not the group's.
+    pub own_tracks: bool,
 }
 
 /// A group as the Together page lists it.
@@ -217,6 +220,8 @@ pub struct GroupSummary {
     /// What the group is watching; `None` before it has an item.
     pub item: Option<ItemRef>,
     pub members: Vec<Member>,
+    /// What a late joiner starts on.
+    pub tracks: GroupTracksView,
 }
 
 /// A refused or failed group call, in words for the viewer.
@@ -251,14 +256,18 @@ pub enum GroupUpdate {
     Play {
         at_server_ms: i64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Pause {
         at_server_ms: i64,
         position_ms: u64,
+        by: Option<String>,
     },
     Seek {
         at_server_ms: i64,
         position_ms: u64,
+        by: Option<String>,
     },
     /// A member joined, or its buffering changed.
     Member(Member),
@@ -270,6 +279,11 @@ pub enum GroupUpdate {
         playlist_item_id: String,
         position_ms: u64,
         playing: bool,
+    },
+    /// The group's audio or subtitle changed, set by `by`.
+    Tracks {
+        tracks: GroupTracksView,
+        by: Option<String>,
     },
     /// The group is over for this member, for whatever reason.
     Ended,
@@ -313,6 +327,17 @@ pub trait GroupClient {
         playing: bool,
     ) -> Result<(), GroupError>;
     async fn leave(&self) -> Result<(), GroupError>;
+    /// Change the group's audio and subtitle; an unset half stays as it is.
+    /// `playlist_item_id` is the queue entry the pick was made on: the group
+    /// drops it if it has moved on.
+    async fn set_tracks(
+        &self,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError>;
+    /// `false` puts this member on their own tracks ("Just me").
+    async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError>;
     /// What each member has seen of `ids` (at most 200).
     async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError>;
 }
@@ -336,9 +361,15 @@ pub struct FakeGroups {
     sinks: Rc<RefCell<Vec<GroupSink>>>,
     joined: Rc<RefCell<Option<GroupId>>>,
     seen: Rc<RefCell<Vec<MemberSeen>>>,
+    refuse_follow: Rc<Cell<bool>>,
 }
 
 impl FakeGroups {
+    /// Makes every `follow_tracks` fail, as a dropped connection would.
+    pub fn refuse_follow(&self) {
+        self.refuse_follow.set(true);
+    }
+
     /// What `seen` answers.
     pub fn with_seen(seen: Vec<MemberSeen>) -> Self {
         Self {
@@ -380,7 +411,15 @@ impl FakeGroups {
             id: "me".into(),
             name: "You".into(),
             buffering: false,
+            own_tracks: false,
         }
+    }
+
+    /// The group this member is in, mutably.
+    fn with_joined<R>(&self, f: impl FnOnce(&mut GroupSummary) -> R) -> Option<R> {
+        let id = self.joined.borrow().clone()?;
+        let mut groups = self.groups.borrow_mut();
+        groups.iter_mut().find(|g| g.id == id).map(f)
     }
 }
 
@@ -403,6 +442,7 @@ impl GroupClient for FakeGroups {
             name: "Watch together".into(),
             item: Some(item),
             members: vec![Self::me()],
+            tracks: GroupTracksView::default(),
         };
         groups.push(group.clone());
         self.sinks.borrow_mut().push(sink);
@@ -481,6 +521,53 @@ impl GroupClient for FakeGroups {
     async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError> {
         self.log(format!("seen({})", ids.len()));
         Ok(self.seen.borrow().clone())
+    }
+
+    async fn set_tracks(
+        &self,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError> {
+        self.log(format!(
+            "set_tracks({audio:?},{subtitle:?},{playlist_item_id})"
+        ));
+        let Some(tracks) = self.with_joined(|g| {
+            if audio != TrackChoice::Unset {
+                g.tracks.audio = audio;
+            }
+            if subtitle != TrackChoice::Unset {
+                g.tracks.subtitle = subtitle;
+            }
+            g.tracks
+        }) else {
+            return Err(GroupError("Not in a group".into()));
+        };
+        self.push(&GroupUpdate::Tracks {
+            tracks,
+            by: Some(Self::me().id),
+        });
+        Ok(())
+    }
+
+    async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError> {
+        self.log(format!("follow_tracks({follow})"));
+        if self.refuse_follow.get() {
+            return Err(GroupError("Refused".into()));
+        }
+        let me = Member {
+            own_tracks: !follow,
+            ..Self::me()
+        };
+        let Some(()) = self.with_joined(|g| {
+            if let Some(m) = g.members.iter_mut().find(|m| m.id == me.id) {
+                m.own_tracks = me.own_tracks;
+            }
+        }) else {
+            return Err(GroupError("Not in a group".into()));
+        };
+        self.push(&GroupUpdate::Member(me));
+        Ok(())
     }
 
     async fn leave(&self) -> Result<(), GroupError> {
@@ -742,6 +829,7 @@ mod tests {
             name: "Friday".into(),
             item: None,
             members: vec![],
+            tracks: GroupTracksView::default(),
         }]);
         let seen = Rc::new(RefCell::new(vec![]));
         let sink: GroupSink = {
@@ -751,5 +839,62 @@ mod tests {
         assert!(matches!(now(api.join("g1", sink)), Some(Ok(_))));
         api.push(&GroupUpdate::Ended);
         assert_eq!(*seen.borrow(), [GroupUpdate::Ended]);
+    }
+
+    fn joined_fake() -> (FakeGroups, Rc<RefCell<Vec<GroupUpdate>>>) {
+        let api = FakeGroups::with_groups(vec![GroupSummary {
+            id: "g1".into(),
+            name: "Friday".into(),
+            item: None,
+            members: vec![],
+            tracks: GroupTracksView::default(),
+        }]);
+        let seen = Rc::new(RefCell::new(vec![]));
+        let sink: GroupSink = {
+            let seen = Rc::clone(&seen);
+            Rc::new(move |u| seen.borrow_mut().push(u))
+        };
+        assert!(matches!(now(api.join("g1", sink)), Some(Ok(_))));
+        (api, seen)
+    }
+
+    #[test]
+    fn set_tracks_broadcasts_and_keeps_the_unset_half() {
+        let (api, seen) = joined_fake();
+        let _ = now(api.set_tracks(TrackChoice::Index(2), TrackChoice::Unset, "p1".into()));
+        let _ = now(api.set_tracks(TrackChoice::Unset, TrackChoice::Off, "p1".into()));
+        let both = GroupTracksView {
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Off,
+        };
+        let last = seen.borrow().last().cloned();
+        assert_eq!(
+            last,
+            Some(GroupUpdate::Tracks {
+                tracks: both,
+                by: Some("me".into())
+            })
+        );
+        assert_eq!(seen.borrow().len(), 2);
+        let listed = now(api.list()).and_then(Result::ok).unwrap_or_default();
+        assert_eq!(listed.first().map(|g| g.tracks), Some(both));
+    }
+
+    #[test]
+    fn follow_tracks_marks_the_member_and_broadcasts_it() {
+        let (api, seen) = joined_fake();
+        let _ = now(api.follow_tracks(false));
+        let own = Member {
+            own_tracks: true,
+            ..FakeGroups::me()
+        };
+        assert_eq!(*seen.borrow(), [GroupUpdate::Member(own)]);
+        let _ = now(api.follow_tracks(true));
+        let listed = now(api.list()).and_then(Result::ok).unwrap_or_default();
+        let marks: Vec<bool> = listed
+            .first()
+            .map(|g| g.members.iter().map(|m| m.own_tracks).collect())
+            .unwrap_or_default();
+        assert_eq!(marks, [false]);
     }
 }
