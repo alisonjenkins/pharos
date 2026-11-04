@@ -130,6 +130,12 @@ pub enum MediaEvent {
     /// Volume, duration or metadata changed: the controls redraw, nothing
     /// is reported.
     Changed,
+    /// Playback ran out of data to show (`waiting`, `stalled`). Not a
+    /// progress report; a group member tells the others it is buffering.
+    Waiting,
+    /// Enough data to play from the current position (`canplay`). Not a
+    /// progress report; a group member tells the others it is ready.
+    CanPlay,
 }
 
 /// What to send the server.
@@ -186,7 +192,7 @@ impl ReportClock {
                 Outgoing::Report { paused: false }
             }
             MediaEvent::Ended => return self.stop().then_some(Outgoing::Stop),
-            MediaEvent::Changed => return None,
+            MediaEvent::Changed | MediaEvent::Waiting | MediaEvent::CanPlay => return None,
         };
         self.last_report_ms = Some(now_ms);
         Some(send)
@@ -400,6 +406,25 @@ pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Buffering and readiness are for a watch-together group, not the
+    /// server's progress report: they send nothing and do not disturb the
+    /// cadence.
+    #[test]
+    fn waiting_and_can_play_report_nothing() {
+        let mut clock = ReportClock::new();
+        assert_eq!(
+            clock.on(0.0, MediaEvent::Playing),
+            Some(Outgoing::Report { paused: false })
+        );
+        assert_eq!(clock.on(1.0, MediaEvent::Waiting), None);
+        assert_eq!(clock.on(2.0, MediaEvent::CanPlay), None);
+        assert_eq!(clock.on(3.0, MediaEvent::TimeUpdate), None);
+        assert_eq!(
+            clock.on(REPORT_INTERVAL_MS, MediaEvent::TimeUpdate),
+            Some(Outgoing::Report { paused: false })
+        );
+    }
 
     fn sprites() -> Trickplay {
         Trickplay {
