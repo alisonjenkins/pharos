@@ -253,12 +253,16 @@ async fn a_seek_sessions_fragment_reports_the_session_it_came_from() {
 /// Where the source's audio packets stop and resume, in seconds: a zeroed
 /// stretch of the file, as in Buffy S02E11 (B468).
 const HOLE: (f64, f64) = (8.0, 12.5);
+/// A hole shorter than ffmpeg's default 100 ms `min_hard_comp`, inside a3.
+const SHORT_HOLE: (f64, f64) = (20.0, 20.05);
 
-/// An audio-only source whose packet timestamps jump over `HOLE`: `aselect`
-/// without `asetpts` drops the frames but keeps the survivors' timestamps.
-fn make_holed_audio_source(dir: &Path) -> PathBuf {
+/// An audio-only source whose packet timestamps jump over `hole`, silent but
+/// for a half-second beep at `beep_at`: `aselect` without `asetpts` drops the
+/// frames but keeps the survivors' timestamps.
+fn make_holed_audio_source(dir: &Path, hole: (f64, f64), beep_at: f64) -> PathBuf {
     let src = dir.join("holed.mka");
-    let (from, to) = HOLE;
+    let (from, to) = hole;
+    let beep_to = beep_at + 0.5;
     ffmpeg(
         &[
             "-v",
@@ -269,6 +273,7 @@ fn make_holed_audio_source(dir: &Path) -> PathBuf {
             "-i",
             &format!(
                 "sine=frequency=1000:sample_rate=48000:duration=40:samples_per_frame=480,\
+                 volume=enable=1-between(t\\,{beep_at}\\,{beep_to}):volume=0,\
                  aselect=not(between(t\\,{from}\\,{to}))"
             ),
             "-c:a",
@@ -313,7 +318,7 @@ fn decoded_secs(fragment: &Path) -> f64 {
 #[tokio::test]
 async fn a_hole_in_the_source_audio_is_filled_with_silence() {
     let td = tempfile::tempdir().expect("tempdir");
-    let src = make_holed_audio_source(td.path());
+    let src = make_holed_audio_source(td.path(), HOLE, 7.0);
     let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
     let dir = cache
         .ensure_audio_hls_covering(&src, None, 44, None, Some(128_000), 0)
@@ -330,6 +335,33 @@ async fn a_hole_in_the_source_audio_is_filled_with_silence() {
          but decoded to {got:.3}s — the hole at {:.1}–{:.1}s was not filled",
         HOLE.0,
         HOLE.1,
+    );
+}
+
+/// B472 — a hole shorter than 100 ms is filled too.
+///
+/// `aresample=async=1` alone pads only past its 100 ms `min_hard_comp`; a
+/// shorter hole was closed up, leaving everything after it that much early.
+#[tokio::test]
+async fn a_hole_shorter_than_100ms_is_filled_with_silence() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let beep_at = 21.0;
+    let src = make_holed_audio_source(td.path(), SHORT_HOLE, beep_at);
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+    let dir = cache
+        .ensure_audio_hls_covering(&src, None, 45, None, Some(128_000), 0)
+        .await
+        .expect("audio session");
+    // a3 spans [18, 24) and holds the whole 50 ms hole, then the beep.
+    let frag = td.path().join("short_hole.mp4");
+    fragment_file(&cache, &dir, &frag, 3).await;
+    let want = beep_at - 18.0;
+    let got = beep_offset_in(&frag);
+    assert!(
+        (got - want).abs() < 0.02,
+        "the beep after a {:.0} ms hole should sit {want:.3}s into a3 but sits {got:.3}s \
+         in — the hole was closed up instead of filled",
+        (SHORT_HOLE.1 - SHORT_HOLE.0) * 1000.0,
     );
 }
 
