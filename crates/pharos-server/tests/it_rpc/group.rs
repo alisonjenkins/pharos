@@ -242,6 +242,7 @@ enum Seen {
         item: Option<u64>,
         members: Vec<String>,
         member_ids: Vec<String>,
+        buffering: Vec<String>,
     },
     Play {
         at: u64,
@@ -294,6 +295,12 @@ impl server::group_sink::Handler for TestSink {
                         .map(|m| text(m.get_name()))
                         .collect(),
                     member_ids: g.get_members()?.iter().map(|m| text(m.get_id())).collect(),
+                    buffering: g
+                        .get_members()?
+                        .iter()
+                        .filter(|m| m.get_buffering())
+                        .map(|m| text(m.get_name()))
+                        .collect(),
                 }
             }
             group_update::Play(a) => {
@@ -371,6 +378,30 @@ async fn until<T>(rx: &mut mpsc::UnboundedReceiver<Seen>, want: impl Fn(&Seen) -
             return t;
         }
     }
+}
+
+/// Lets the updates still in flight from setting a group up arrive and drops
+/// them, so the next one is a reaction to what the test does next.
+async fn settle(rx: &mut mpsc::UnboundedReceiver<Seen>) {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while rx.try_recv().is_ok() {}
+}
+
+/// Like [`until`], for an update that waits on the pump's poll.
+async fn until_polled<T>(
+    rx: &mut mpsc::UnboundedReceiver<Seen>,
+    want: impl Fn(&Seen) -> Option<T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let seen = rx.recv().await.expect("sink open");
+            if let Some(t) = want(&seen) {
+                return t;
+            }
+        }
+    })
+    .await
+    .expect("an update within 3 s")
 }
 
 fn set_device(session_ctx: pharos_api::pharos_capnp::call_context::Builder<'_>, device: &str) {
@@ -799,4 +830,167 @@ async fn a_rejoin_inside_the_grace_keeps_the_member() {
     let _again = join(&b_session, "dev-b", &gid, sink).await.unwrap();
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(member_count(&rig).await, 2);
+}
+
+/// US2: when a member buffers, the group's other members are told which one,
+/// and told again when it recovers.
+/// Disarm check: with `changes_buffering` returning false, no `member` update
+/// arrives and this times out.
+#[actix_web::test]
+async fn a_members_buffering_reaches_the_others_as_a_member_update() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.a, unpause_request).unwrap();
+    let _ = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Play { .. }).then_some(())
+    })
+    .await;
+    command!(
+        pair.b,
+        buffering_request,
+        set_position_ms(6_000),
+        set_buffering(true)
+    )
+    .unwrap();
+    // Skip the join announcement still queued ahead of it.
+    let stalled = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: true,
+        } => Some((name.clone(), true)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(stalled, ("guest".to_owned(), true));
+    command!(
+        pair.b,
+        ready_request,
+        set_position_ms(6_000),
+        set_playing(true)
+    )
+    .unwrap();
+    let recovered = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: false,
+        } => Some((name.clone(), false)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(recovered, ("guest".to_owned(), false));
+}
+
+/// The liveness beacon and the clock report are accepted from a member, and
+/// refused once it has left.
+#[actix_web::test]
+async fn ping_and_clock_report_are_accepted_until_the_member_leaves() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    command!(pair.a, ping_request).unwrap();
+    command!(
+        pair.a,
+        clock_report_request,
+        set_t1(1),
+        set_t2(2),
+        set_t3(3),
+        set_t4(4)
+    )
+    .unwrap();
+    command!(pair.a, leave_request).unwrap();
+    assert_eq!(
+        command!(pair.a, ping_request).unwrap_err(),
+        "not found: group"
+    );
+}
+
+/// While the group is paused the actor sends nothing on a buffering change, so
+/// the others learn of it (and of its end) from the pump's poll.
+/// Disarm check: with the poll tick doing nothing, no `member` update arrives
+/// and this times out.
+#[actix_web::test]
+async fn a_pauses_buffering_reaches_the_others_by_the_poll() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.a, unpause_request).unwrap();
+    command!(pair.a, pause_request).unwrap();
+    settle(&mut pair.b_seen).await;
+    command!(
+        pair.a,
+        buffering_request,
+        set_position_ms(5_000),
+        set_buffering(true)
+    )
+    .unwrap();
+    let stalled = until_polled(&mut pair.b_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: true,
+        } => Some(name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(stalled, "ali");
+    command!(
+        pair.a,
+        buffering_request,
+        set_position_ms(5_000),
+        set_buffering(false)
+    )
+    .unwrap();
+    let recovered = until_polled(&mut pair.b_seen, |s| match s {
+        Seen::Member {
+            name,
+            buffering: false,
+        } => Some(name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(recovered, "ali");
+}
+
+/// A member joining while another buffers is told so in the roster it joins.
+/// Disarm check: with the `joined` roster sending `buffering: false` for
+/// everyone, the buffering list is empty and this fails.
+#[actix_web::test]
+async fn a_joiner_sees_who_is_already_buffering() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.a, unpause_request).unwrap();
+    command!(pair.a, pause_request).unwrap();
+    settle(&mut pair.b_seen).await;
+    command!(
+        pair.a,
+        buffering_request,
+        set_position_ms(5_000),
+        set_buffering(true)
+    )
+    .unwrap();
+    let _ = until_polled(&mut pair.b_seen, |s| {
+        matches!(
+            s,
+            Seen::Member {
+                buffering: true,
+                ..
+            }
+        )
+        .then_some(())
+    })
+    .await;
+    let gid = only_group(&rig).await;
+    let c_session = rig.session(&rig.fx.user_token).await;
+    let (c_sink, mut c_seen) = sink();
+    let _c = join(&c_session, "dev-c", &gid, c_sink).await.unwrap();
+    let Seen::Joined { buffering, .. } = until(&mut c_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(buffering, ["ali"]);
+    // The poll does not announce what the roster already said.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    while let Ok(seen) = c_seen.try_recv() {
+        assert!(!matches!(seen, Seen::Member { .. }), "{seen:?}");
+    }
 }

@@ -5,6 +5,7 @@
 //! Jellyfin member can share a group.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -341,33 +342,114 @@ fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
     }
 }
 
+/// How often the pump re-reads who is buffering. The actor announces no
+/// buffering change itself, and while the group is paused none of the commands
+/// the pump watches follows one, so a stall or recovery is picked up here.
+const BUFFERING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Delivers a member's group messages to its `GroupSink` in order, until the
 /// member's channel closes or the sink goes away.
+///
+/// The actor announces no member's buffering to the others, so the pump reads
+/// it from the group's snapshot: after each message that follows a change in
+/// it (a freeze or resume, a gate opening or closing) and every
+/// [`BUFFERING_POLL`], and sends a `member` update for each member whose flag
+/// moved.
 async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group: GroupHandle) {
-    while let Some(msg) = rx.recv().await {
-        let Some(mut update) = translate(&msg, group.group_id, group.epoch_unix_ms) else {
-            continue;
+    let mut roster: HashMap<String, String> = HashMap::new();
+    let mut buffering: HashSet<String> = HashSet::new();
+    let mut poll =
+        tokio::time::interval_at(tokio::time::Instant::now() + BUFFERING_POLL, BUFFERING_POLL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let mut updates = Vec::new();
+        let msg = tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { return };
+                Some(msg)
+            }
+            _ = poll.tick() => None,
         };
-        if let Update::Joined(summary) = &mut update {
-            // `Joined` carries the roster only; the name and the item playing
-            // are the group's own.
-            if let Some(snap) = group.snapshot().await {
-                summary.name = snap.group_name;
-                summary.item = real_item(
-                    snap.current_item_id
-                        .as_deref()
-                        .or_else(|| snap.queue_item_ids.first().map(String::as_str)),
-                );
+        if let Some(msg) = &msg {
+            if let Some(mut update) = translate(msg, group.group_id, group.epoch_unix_ms) {
+                match &mut update {
+                    Update::Joined(summary) => {
+                        // `Joined` carries the roster only; the name, the
+                        // item playing and who is buffering are the group's own.
+                        if let Some(snap) = group.snapshot().await {
+                            summary.name = snap.group_name;
+                            summary.item = real_item(
+                                snap.current_item_id
+                                    .as_deref()
+                                    .or_else(|| snap.queue_item_ids.first().map(String::as_str)),
+                            );
+                            buffering = snap
+                                .buffering_members
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect();
+                            for m in &mut summary.members {
+                                m.buffering = buffering.contains(&m.id);
+                            }
+                        }
+                        roster = summary
+                            .members
+                            .iter()
+                            .map(|m| (m.id.clone(), m.name.clone()))
+                            .collect();
+                    }
+                    Update::Member(m) => {
+                        roster.insert(m.id.clone(), m.name.clone());
+                    }
+                    Update::Left(id) => {
+                        roster.remove(id);
+                        buffering.remove(id);
+                    }
+                    _ => {}
+                }
+                updates.push(update);
             }
         }
-        let mut req = sink.update_request();
-        req.get().init_ctx();
-        write_update(req.get().init_update(), &update);
-        if let Err(e) = req.send().promise.await {
-            tracing::info!(group = %group.group_id, error = %e, "syncplay: native sink gone — stopping its updates");
-            break;
+        if msg.as_ref().map_or(true, changes_buffering) {
+            if let Some(snap) = group.snapshot().await {
+                let now: HashSet<String> = snap
+                    .buffering_members
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                for id in now.symmetric_difference(&buffering) {
+                    updates.push(Update::Member(Member {
+                        id: id.clone(),
+                        name: roster.get(id).cloned().unwrap_or_default(),
+                        buffering: now.contains(id),
+                    }));
+                }
+                buffering = now;
+            }
+        }
+        for update in updates {
+            let mut req = sink.update_request();
+            req.get().init_ctx();
+            write_update(req.get().init_update(), &update);
+            if let Err(e) = req.send().promise.await {
+                tracing::info!(group = %group.group_id, error = %e, "syncplay: native sink gone — stopping its updates");
+                return;
+            }
         }
     }
+}
+
+/// Whether `msg` follows a change in who is buffering: the group froze or
+/// resumed, or a gate opened or closed.
+fn changes_buffering(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::Play { .. }
+            | ServerMsg::Pause { .. }
+            | ServerMsg::Seek { .. }
+            | ServerMsg::StateUpdate { .. }
+            | ServerMsg::PlayQueue { .. }
+    )
 }
 
 /// Answers `create`/`join`: the membership, or a refused one whose every call
