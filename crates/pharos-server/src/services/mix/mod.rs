@@ -145,11 +145,11 @@ fn song(item: &MediaItem, ud: UserItemData) -> select::Song {
         play_count: ud.play_count,
         last_played_at: ud.last_played_at,
         favorite: ud.is_favorite,
-        // Filled from `probe.bpm()` / `probe.energy()` once the scanner reads
-        // tempo tags and analyses energy (B445); until then the tempo and
-        // energy rules match nothing and likeness ignores them.
-        bpm: None,
-        energy: None,
+        // The file's BPM tag or the scanner's analysis, and the analysed
+        // energy (0 to 1). None until a song is analysed: the tempo and
+        // energy rules then skip it and likeness scores it halfway.
+        bpm: item.probe.bpm(),
+        energy: item.probe.energy(),
     }
 }
 
@@ -378,5 +378,16 @@ mod tests {
         assert_eq!(s.duration_s, Some(241));
         assert_eq!((s.play_count, s.last_played_at, s.favorite), (3, 77, true));
         assert_eq!(s.added_at, Some(5));
+        assert_eq!((s.bpm, s.energy), (None, None), "not analysed yet");
+
+        item.probe.audio_analysis = Some(pharos_core::AudioAnalysis {
+            bpm_mille: Some(92_500),
+            tempo_source: Some(pharos_core::TempoSource::Analysis),
+            energy_mille: Some(350),
+            version: 1,
+        });
+        let s = song(&item, UserItemData::default());
+        assert_eq!(s.bpm, Some(92.5));
+        assert_eq!(s.energy, Some(0.35));
     }
 }
