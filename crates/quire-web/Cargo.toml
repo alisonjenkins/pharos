@@ -1,0 +1,72 @@
+[package]
+name = "quire-web"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Draw quire books in a browser: shadow-root mounting, CSS-column pages, reader settings and layout-independent positions"
+readme = "README.md"
+keywords = ["epub", "ebook", "reader", "wasm", "web"]
+categories = ["wasm", "web-programming"]
+
+# Standalone like quire (spec 023 FR-001): no `pharos-*` dependency and no
+# `workspace = true` keys. quire is the one path dependency; the two crates
+# move together.
+[dependencies]
+js-sys = "0.3"
+quire = { path = "../quire" }
+thiserror = "2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "AddEventListenerOptions",
+    "Blob",
+    "BlobPropertyBag",
+    "CssStyleDeclaration",
+    "Document",
+    "DomRect",
+    "DomRectList",
+    "Element",
+    "Event",
+    "EventTarget",
+    "HtmlElement",
+    "HtmlImageElement",
+    "HtmlStyleElement",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "PointerEvent",
+    "Range",
+    "ResizeObserver",
+    "Selection",
+    "ShadowRoot",
+    "ShadowRootInit",
+    "ShadowRootMode",
+    "Text",
+    "Url",
+    "Window",
+] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+unwrap_in_result = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+get_unwrap = "deny"
+
+# A browser check of the DOM half of V352 (`just quire-web-check`): built for
+# wasm32 and driven by Playwright, because no chromedriver is packaged for
+# wasm-bindgen-test here.
+[[example]]
+name = "harness"
+path = "examples/harness/main.rs"
+crate-type = ["cdylib"]
+
+[dev-dependencies]
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

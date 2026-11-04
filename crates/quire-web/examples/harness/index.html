@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>quire-web harness</title>
+<style>html,body{margin:0;height:100%}#host{width:100vw;height:100vh}</style>
+<div id="host"></div>
+<script type="module">
+  import init, * as q from "./pkg/harness.js";
+  await init();
+  window.q = q;
+  document.body.dataset.ready = "1";
+</script>
