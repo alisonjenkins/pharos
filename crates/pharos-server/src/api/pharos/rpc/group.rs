@@ -1233,8 +1233,11 @@ impl server::membership::Handler for Membership {
         results: &mut member_wire::SeenResults,
     ) -> Result<(), capnp::Error> {
         let wire_ids = params.get()?.get_ids()?;
-        let mut ids = Vec::with_capacity(wire_ids.len() as usize);
-        for id in wire_ids.iter() {
+        // One past the cap is enough for `seen_for` to refuse the call, so an
+        // oversized list is never decoded whole.
+        let keep = group_seen::MAX_IDS + 1;
+        let mut ids = Vec::with_capacity((wire_ids.len() as usize).min(keep));
+        for id in wire_ids.iter().take(keep) {
             ids.push(read_item_id(id)?);
         }
         match self.seen_for(&ids).await {
