@@ -565,6 +565,8 @@ fn rule_value(test: &Test) -> (String, String) {
         Test::NotPlayedForDays(d) | Test::PlayedWithinDays(d) | Test::AddedWithinDays(d) => {
             (d.to_string(), String::new())
         }
+        Test::Tempo { min, max } => (min.to_string(), max.to_string()),
+        Test::Energy { min, max } => (min.to_string(), max.to_string()),
         Test::Favorite | Test::NeverPlayed | Test::LikeSeed => (String::new(), String::new()),
     }
 }
@@ -596,6 +598,14 @@ pub fn with_value(test: &Test, a: &str, b: &str) -> Test {
         Test::NotPlayedForDays(d) => Test::NotPlayedForDays(num(a, *d)),
         Test::PlayedWithinDays(d) => Test::PlayedWithinDays(num(a, *d)),
         Test::AddedWithinDays(d) => Test::AddedWithinDays(num(a, *d)),
+        Test::Tempo { min, max } => Test::Tempo {
+            min: a.trim().parse().unwrap_or(*min),
+            max: b.trim().parse().unwrap_or(*max),
+        },
+        Test::Energy { min, max } => Test::Energy {
+            min: a.trim().parse::<u8>().map_or(*min, |v| v.min(100)),
+            max: b.trim().parse::<u8>().map_or(*max, |v| v.min(100)),
+        },
         Test::Favorite | Test::NeverPlayed | Test::LikeSeed => test.clone(),
     }
 }
@@ -606,6 +616,8 @@ fn units(test: &Test) -> (&'static str, &'static str) {
         Test::Years { .. } => ("from", "to"),
         Test::PlayCount { .. } => ("from", "to (blank: any)"),
         Test::LengthSecs { .. } => ("from (min)", "to (min)"),
+        Test::Tempo { .. } => ("from (BPM)", "to (BPM)"),
+        Test::Energy { .. } => ("from (%, calm)", "to (%, intense)"),
         Test::NotPlayedForDays(_) | Test::PlayedWithinDays(_) | Test::AddedWithinDays(_) => {
             ("days", "")
         }
@@ -616,7 +628,11 @@ fn units(test: &Test) -> (&'static str, &'static str) {
 fn takes_two(test: &Test) -> bool {
     matches!(
         test,
-        Test::Years { .. } | Test::PlayCount { .. } | Test::LengthSecs { .. }
+        Test::Years { .. }
+            | Test::PlayCount { .. }
+            | Test::LengthSecs { .. }
+            | Test::Tempo { .. }
+            | Test::Energy { .. }
     )
 }
 
@@ -644,6 +660,12 @@ pub fn draft_problem(draft: &SavedMix) -> Option<String> {
             }
             Test::PlayCount { min, max } | Test::LengthSecs { min, max } if max < min => {
                 return Some(format!("Rule {n}: the range ends before it starts."));
+            }
+            Test::Tempo { min, max } if max < min => {
+                return Some(format!("Rule {n}: the tempo range ends before it starts."));
+            }
+            Test::Energy { min, max } if max < min => {
+                return Some(format!("Rule {n}: the energy range ends before it starts."));
             }
             Test::LikeSeed if draft.spec.seed == Seed::None => {
                 return Some(format!("Rule {n}: pick what the mix should be like."));
@@ -1082,6 +1104,16 @@ mod tests {
                 min: 2,
                 max: u32::MAX
             }
+        );
+        let energy = Test::Energy { min: 10, max: 50 };
+        assert_eq!(
+            with_value(&energy, "20", "300"),
+            Test::Energy { min: 20, max: 50 },
+            "300 is no u8 percent"
+        );
+        assert_eq!(
+            with_value(&energy, "20", "180"),
+            Test::Energy { min: 20, max: 100 }
         );
         let length = Test::LengthSecs { min: 120, max: 360 };
         assert_eq!(
