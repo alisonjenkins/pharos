@@ -44,6 +44,11 @@ pub(super) struct Session {
 }
 
 impl Session {
+    /// Runs `hook` when this session's connection closes.
+    pub(super) fn on_connection_close(&self, hook: impl FnOnce() + 'static) {
+        self.ctx.on_close(hook);
+    }
+
     pub(super) fn new(
         state: web::Data<AppState>,
         ctx: Rc<ConnectionCtx>,
