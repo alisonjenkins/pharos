@@ -994,3 +994,73 @@ async fn a_joiner_sees_who_is_already_buffering() {
         assert!(!matches!(seen, Seen::Member { .. }), "{seen:?}");
     }
 }
+
+/// A device is in one group at a time: creating a group from a device that is
+/// in another takes it out of the old roster, the old membership's sink is
+/// told `ended(left)`, and the old membership's commands are refused without
+/// reaching the group.
+/// Disarm check: with `leave_previous` doing nothing, the old group still
+/// counts two members and the old sink hears nothing.
+#[actix_web::test]
+async fn creating_from_a_device_in_another_group_moves_it() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    let old = rig.deps.registry.list().await.unwrap().remove(0);
+    let b_session = rig.session(&rig.fx.user_token).await;
+    let (new_sink, _new_seen) = sink();
+    let _moved = create(&b_session, "dev-b", MOVIE, 0, new_sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        until(&mut pair.b_seen, |s| {
+            matches!(s, Seen::Ended(_)).then(|| s.clone())
+        })
+        .await,
+        Seen::Ended("left")
+    );
+    let _ = until(&mut pair.a_seen, |s| {
+        matches!(s, Seen::Left(_)).then_some(())
+    })
+    .await;
+    assert_eq!(old.snapshot().await.unwrap().member_count, 1);
+    // The stale membership neither commands the old group nor the new one.
+    command!(pair.a, unpause_request).unwrap();
+    assert_eq!(
+        command!(pair.b, pause_request).unwrap_err(),
+        "not found: membership"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    while let Ok(seen) = pair.a_seen.try_recv() {
+        assert!(!matches!(seen, Seen::Pause { .. }), "{seen:?}");
+    }
+}
+
+/// Joining another group does the same.
+#[actix_web::test]
+async fn joining_from_a_device_in_another_group_moves_it() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    let old = rig.deps.registry.list().await.unwrap().remove(0);
+    let (other, _other_rx) = rig.jellyfin_group("Other").await;
+    let b_session = rig.session(&rig.fx.user_token).await;
+    let (new_sink, mut new_seen) = sink();
+    let _moved = join(&b_session, "dev-b", &other.group_id.to_string(), new_sink)
+        .await
+        .unwrap();
+    let _ = until(&mut new_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then_some(())
+    })
+    .await;
+    assert_eq!(
+        until(&mut pair.b_seen, |s| {
+            matches!(s, Seen::Ended(_)).then(|| s.clone())
+        })
+        .await,
+        Seen::Ended("left")
+    );
+    assert_eq!(old.snapshot().await.unwrap().member_count, 1);
+    assert_eq!(
+        command!(pair.b, pause_request).unwrap_err(),
+        "not found: membership"
+    );
+}

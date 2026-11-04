@@ -98,10 +98,40 @@ impl Group {
             .map_err(|_| unavailable())
     }
 
+    /// Takes the call's device out of the group it is still in, when that is
+    /// not `keep`: out of the roster, its old membership's sink told
+    /// `ended(left)`. A device is in one group at a time.
+    async fn leave_previous(
+        &self,
+        deps: &SyncDeps,
+        user: &pharos_core::User,
+        device: &str,
+        keep: Option<GroupId>,
+    ) {
+        let key = member_key(user, device);
+        let Some(sess) = deps.hub.resolve(&key) else {
+            return;
+        };
+        let Some(old) = sess.group.clone() else {
+            return;
+        };
+        if Some(old.group_id) == keep {
+            return;
+        }
+        end_owned_cast(&self.session.state, user.id, sess.member_id).await;
+        deps.hub.detach_group(&key);
+        let _ = old
+            .tx
+            .send(GroupMsg::RemoveMember {
+                member_id: sess.member_id,
+            })
+            .await;
+        let _ = sess.sink.send(ServerMsg::GroupLeft).await;
+        tracing::info!(device_id = %key, from = %old.group_id, "syncplay: native device left its previous group");
+    }
+
     /// Registers the call's device in the hub as a member bound to `sink`,
-    /// ready for `add_caller_to_group`. The member's identity is the user
-    /// folded into `ctx.device` (as `AuthSession::sync_key`), so a device's
-    /// member id is stable across reconnects (V25).
+    /// ready for `add_caller_to_group`.
     fn register(
         &self,
         deps: &SyncDeps,
@@ -110,7 +140,7 @@ impl Group {
         sink: group_sink::Client,
         group: &GroupHandle,
     ) -> Membership {
-        let key = format!("{}:{device}", user.id.0.simple());
+        let key = member_key(user, device);
         let (tx, rx) = mpsc::channel(SINK_QUEUE);
         let reg = deps
             .hub
@@ -128,6 +158,13 @@ impl Group {
             pump: pump.abort_handle(),
         }
     }
+}
+
+/// A device's key in the hub: the user folded into `ctx.device` (as
+/// `AuthSession::sync_key`), so a device's member id is stable across
+/// reconnects (V25).
+fn member_key(user: &pharos_core::User, device: &str) -> String {
+    format!("{}:{device}", user.id.0.simple())
 }
 
 /// Server wall-clock, unix ms: the base `atServerMs` is expressed in.
@@ -534,6 +571,7 @@ impl server::group::Handler for Group {
                     dependency: "syncplay",
                 }
             })?;
+            self.leave_previous(&deps, &user, &device, None).await;
             let member = self.register(&deps, &user, &device, sink, &handle);
             add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle.clone())
                 .await;
@@ -608,8 +646,10 @@ impl server::group::Handler for Group {
             if !may_join(&self.session.state, &user, &handle, GroupHiddenRoute::RpcJoin).await {
                 return Err(Denial::NotPermitted { what: "group" });
             }
-            // Only now is the device registered: a refused join leaves the
+            // Only now does the device move: a refused join leaves the
             // device's existing membership, if any, as it was.
+            self.leave_previous(&deps, &user, &device, Some(handle.group_id))
+                .await;
             let member = self.register(&deps, &user, &device, sink, &handle);
             tracing::info!(device_id = %member.key, group = %handle.group_id, "syncplay: native join");
             add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle).await;
@@ -736,6 +776,16 @@ impl Membership {
             return Err(Denial::NotFound { what: "group" });
         }
         self.session.current_user().await?;
+        // The hub entry is the device's, not this membership's: a later
+        // create or join on the device moved it to another group.
+        if let Some(sess) = self.deps.hub.resolve(&self.key) {
+            if sess
+                .group
+                .is_some_and(|g| g.group_id != self.group.group_id)
+            {
+                return Err(Denial::NotFound { what: "membership" });
+            }
+        }
         let outcome = route_command(
             &self.deps.hub,
             &self.deps.registry,
