@@ -99,14 +99,18 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         if tb_den == 0 {
             return 0;
         }
-        (ts - stream_start) * 1000 * tb_num / tb_den
+        // i128: a 1/1e9 time base times 1000 overflows i64 past ~2.5 hours.
+        let ms = (i128::from(ts) - i128::from(stream_start)) * 1000 * i128::from(tb_num)
+            / i128::from(tb_den);
+        i64::try_from(ms).unwrap_or(if ms < 0 { i64::MIN } else { i64::MAX })
     };
     // The seek target is in AV_TIME_BASE (µs) on the same timeline, so it is
     // offset by the stream's origin too.
     let origin_us = if tb_den == 0 {
         0
     } else {
-        stream_start * 1_000_000 * tb_num / tb_den
+        let us = i128::from(stream_start) * 1_000_000 * i128::from(tb_num) / i128::from(tb_den);
+        i64::try_from(us).unwrap_or(if us < 0 { i64::MIN } else { i64::MAX })
     };
     // Land at or before the window; the pts gate trims the lead-in. A
     // container that cannot seek is read from the top instead, so the gate
