@@ -2212,6 +2212,37 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(await clipped(), "mini bar at 320px").toEqual([]);
   });
 
+  test("the floating player keeps its controls in view on a short viewport", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    await signIn(page);
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("Playwright");
+    await page.locator(".pharos-poster").first().click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await page.setViewportSize({ width: 320, height: 180 });
+    // Every visible button of the bar lies inside the viewport's height.
+    const below = await page.evaluate(() =>
+      [...document.querySelectorAll<HTMLElement>(".pharos-stage-bar button")]
+        .filter((b) => b.offsetParent !== null)
+        .filter((b) => b.getBoundingClientRect().bottom > document.documentElement.clientHeight + 0.5)
+        .map((b) => b.getAttribute("aria-label")),
+    );
+    expect(below, "floating at 320x180").toEqual([]);
+    await expect(
+      page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }),
+    ).toBeInViewport();
+  });
+
   test("picture in picture hands the film to the browser and back", async ({ page, request }) => {
     test.setTimeout(120_000);
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {

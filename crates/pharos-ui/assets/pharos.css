@@ -2457,7 +2457,9 @@ body::before {
 }
 .pharos-stage.is-floating {
   --pharos-stage-w: min(20rem, 60vw);
-  --pharos-stage-h: calc(var(--pharos-stage-w) * 9 / 16 + 3.25rem + 3px);
+  /* Never taller than the viewport: on a short one the video gives way
+     (it is contained) and the strip stays in view. */
+  --pharos-stage-h: min(calc(var(--pharos-stage-w) * 9 / 16 + 3.25rem + 3px), 100%);
   position: fixed;
   z-index: 20;
   width: var(--pharos-stage-w);
