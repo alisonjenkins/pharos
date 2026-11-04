@@ -1,9 +1,12 @@
 //! A user's avatar: an uploaded picture checked, cropped square and
 //! re-encoded before it is stored, so what the server keeps and serves is
 //! always an image it wrote itself (V362). Stored as the user's
-//! [`AVATAR_PREF_KEY`] pref, which the native `Prefs` API does not offer, so
-//! only these functions write it.
+//! [`AVATAR_PREF_KEY`] pref, with its tag beside it under
+//! [`AVATAR_TAG_PREF_KEY`] so a user listing need not read every picture.
+//! The native `Prefs` API offers neither key, so only these functions write
+//! them.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -19,6 +22,10 @@ use crate::state::Stores;
 
 /// The user pref an avatar is stored under.
 pub const AVATAR_PREF_KEY: &str = "avatar";
+
+/// The user pref an avatar's [`tag_of`] is stored under, written after the
+/// picture so a tag never names bytes that were not stored.
+pub const AVATAR_TAG_PREF_KEY: &str = "avatar_tag";
 
 /// Largest upload accepted, before any decode. A phone photo is well under
 /// this; anything bigger is refused unread.
@@ -172,13 +179,28 @@ pub async fn load(stores: &Stores, user: UserId) -> Result<Option<Avatar>, Domai
 }
 
 /// The tag of `user`'s avatar, for `UserDto.PrimaryImageTag`. A store
-/// failure is logged and read as no avatar, so a user listing still answers.
+/// failure is logged and read as no avatar, so the reply still answers.
 pub async fn tag(stores: &Stores, user: UserId) -> Option<String> {
-    match load(stores, user).await {
-        Ok(avatar) => avatar.map(|a| a.tag),
+    match stores.get_user_pref(user, AVATAR_TAG_PREF_KEY).await {
+        Ok(stored) => stored.and_then(|t| String::from_utf8(t).ok()),
         Err(e) => {
             tracing::warn!(user.id = %user.0.simple(), error = %e, "avatar: tag lookup failed");
             None
+        }
+    }
+}
+
+/// Every user's avatar tag in one read, for a user listing. A store failure
+/// is logged and read as no avatars.
+pub async fn tags(stores: &Stores) -> HashMap<UserId, String> {
+    match stores.user_prefs_for_key(AVATAR_TAG_PREF_KEY).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|(user, t)| Some((user, String::from_utf8(t).ok()?)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "avatar: tag listing failed");
+            HashMap::new()
         }
     }
 }
@@ -190,7 +212,11 @@ pub async fn set(stores: &Stores, user: UserId, upload: Vec<u8>) -> Result<Strin
     let result = async {
         let bytes = normalise_off_worker(upload).await?;
         stores.set_user_pref(user, AVATAR_PREF_KEY, &bytes).await?;
-        Ok::<_, AvatarError>((tag_of(&bytes), bytes.len()))
+        let tag = tag_of(&bytes);
+        stores
+            .set_user_pref(user, AVATAR_TAG_PREF_KEY, tag.as_bytes())
+            .await?;
+        Ok::<_, AvatarError>((tag, bytes.len()))
     }
     .await;
     match &result {
@@ -209,6 +235,8 @@ pub async fn set(stores: &Stores, user: UserId, upload: Vec<u8>) -> Result<Strin
 
 /// Removes `user`'s avatar; `true` when there was one.
 pub async fn remove(stores: &Stores, user: UserId) -> Result<bool, DomainError> {
+    // The tag first, so a listing never names a picture that is gone.
+    stores.delete_user_pref(user, AVATAR_TAG_PREF_KEY).await?;
     let removed = stores.delete_user_pref(user, AVATAR_PREF_KEY).await?;
     tracing::info!(user.id = %user.0.simple(), removed, "avatar removed");
     Ok(removed)
