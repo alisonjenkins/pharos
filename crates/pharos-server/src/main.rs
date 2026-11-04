@@ -1448,10 +1448,27 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state.parental_ratings =
         pharos_server::parental::ParentalRatingMap::from_config(&cfg.parental.ratings);
     if cfg.lyrics.online {
-        tracing::info!(provider = "lrclib", "lyrics: online lookup on");
-        state = state.with_lyrics(pharos_server::services::lyrics::LyricsFinder::with_online(
+        // Same "explicit dir, else a sibling of an existing cache dir" rule
+        // the subtitle and book caches use (B361).
+        let cache_dir = cfg.lyrics.cache_dir.clone().or_else(|| {
+            cfg.server
+                .transcode_cache_dir
+                .as_ref()
+                .or(cfg.server.image_cache_dir.as_ref())
+                .and_then(|d| d.parent().map(|p| p.join("lyrics")))
+        });
+        tracing::info!(
+            provider = "lrclib",
+            cache_dir = cache_dir.as_ref().map(|d| d.display().to_string()),
+            "lyrics: online lookup on"
+        );
+        let mut finder = pharos_server::services::lyrics::LyricsFinder::with_online(
             std::sync::Arc::new(pharos_server::services::lyrics::lrclib::LrcLib::new()),
-        ));
+        );
+        if let Some(dir) = cache_dir {
+            finder = finder.with_cache(dir);
+        }
+        state = state.with_lyrics(finder);
     }
     // P48 — one resident libav worker pool shared by the image + trickplay
     // caches (and the scanner prober) in the `ffmpeg-lib` build. Tiny ops
