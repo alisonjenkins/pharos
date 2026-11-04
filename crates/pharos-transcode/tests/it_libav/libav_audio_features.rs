@@ -95,3 +95,45 @@ fn a_file_with_no_audio_is_bad_input() {
         "{err:?}"
     );
 }
+
+/// Manual tuning aid, not a gate: print what the analyser makes of real songs.
+/// `PHAROS_AUDIO_SAMPLES=~/Music cargo nextest run -p pharos-transcode
+/// --run-ignored only -E 'test(real_songs)' --no-capture`
+#[test]
+#[ignore = "reads a local music folder; run by hand to tune"]
+fn real_songs() {
+    let Ok(dir) = std::env::var("PHAROS_AUDIO_SAMPLES") else {
+        eprintln!("set PHAROS_AUDIO_SAMPLES to a folder of songs");
+        return;
+    };
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    let mut n = 0;
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !["mp3", "flac", "m4a", "ogg", "opus", "wav"].contains(&ext) || n >= 40 {
+                continue;
+            }
+            n += 1;
+            let t = std::time::Instant::now();
+            match audio_features(&p, 60_000, 30_000) {
+                Ok(f) => eprintln!(
+                    "{:>6.1} ms  tag {:>6?}  est {:>6?}  conf {:.2}  energy {:?}  {}",
+                    t.elapsed().as_secs_f64() * 1000.0,
+                    f.tag_bpm,
+                    f.analysed_bpm,
+                    f.tempo_confidence,
+                    f.energy,
+                    p.display()
+                ),
+                Err(e) => eprintln!("ERR {e:?} {}", p.display()),
+            }
+        }
+    }
+}
