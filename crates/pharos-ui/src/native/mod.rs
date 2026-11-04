@@ -1,6 +1,7 @@
 //! The native web UI (009): screens over `pharos-client`'s `PharosApi`,
 //! served at `/`. The older REST panes stay reachable at `/manage`.
 
+pub mod account;
 pub mod app;
 pub mod appearance;
 pub mod backdrop;

@@ -12,6 +12,7 @@ use pharos_client::api::{
 };
 use pharos_client::{CallInfo, ClientError};
 
+use super::account::AccountMenu;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
@@ -712,6 +713,22 @@ fn NativeApp(route: Route) -> Element {
         }
     });
 
+    // Who is signed in, for the account menu; asked again on each resume.
+    // A failed ask leaves the menu without a name rather than blocking it.
+    let me = use_resource(move || {
+        let api = api.read().clone();
+        async move {
+            let api = api?;
+            match api.me(&call("shell", "me")).await {
+                Ok(me) => Some(me),
+                Err(e) => {
+                    platform::warn(&format!("account: me failed: {e}"));
+                    None
+                }
+            }
+        }
+    });
+
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
     if machine.read().shows_screens() {
@@ -723,17 +740,23 @@ fn NativeApp(route: Route) -> Element {
                 m.notice().map(str::to_owned)
             }
         };
+        let me = me.read().clone().flatten();
         return rsx! {
             Shell {
-                on_sign_out: move |_| {
-                    if machine.peek().signing_out() {
-                        return;
+                account: rsx! {
+                    AccountMenu {
+                        me,
+                        on_sign_out: move |_| {
+                            if machine.peek().signing_out() {
+                                return;
+                            }
+                            machine.write().apply(Event::SignOutSubmitted);
+                            spawn(async move {
+                                let reply = platform::sign_out().await;
+                                machine.write().apply(Event::SignOutAnswered(reply));
+                            });
+                        },
                     }
-                    machine.write().apply(Event::SignOutSubmitted);
-                    spawn(async move {
-                        let reply = platform::sign_out().await;
-                        machine.write().apply(Event::SignOutAnswered(reply));
-                    });
                 },
                 if let Some(message) = notice {
                     ErrorNote { message }

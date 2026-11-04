@@ -161,14 +161,78 @@ input:focus-visible {
   text-decoration: none;
 }
 
-.pharos-link-button {
-  background: none;
-  border: 0;
+.pharos-account {
+  position: relative;
+}
+.pharos-account-button {
+  display: grid;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
   padding: 0;
-  color: inherit;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 50%;
+  background: var(--px-color-surface-raised);
+  color: var(--px-color-fg);
   font: inherit;
   cursor: pointer;
+  overflow: hidden;
+}
+.pharos-account-button:hover,
+.pharos-account-button[aria-expanded="true"] {
+  border-color: var(--px-color-accent);
+}
+.pharos-account-button:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: 2px;
+}
+.pharos-avatar {
+  font-size: var(--px-type-step--1);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+.pharos-account-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+}
+.pharos-account-menu {
+  position: absolute;
+  top: calc(100% + var(--px-space-unit));
+  right: 0;
+  z-index: 21;
+  display: flex;
+  flex-direction: column;
+  min-width: 12rem;
+  padding: var(--px-space-unit) 0;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface-raised);
+}
+.pharos-account-name {
+  margin: 0;
+  padding: 0.25rem 1rem 0.5rem;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+  border-bottom: var(--px-border) solid var(--px-color-border);
+  margin-bottom: 0.25rem;
+}
+.pharos-account-item {
+  display: block;
+  padding: 0.5rem 1rem;
+  border: 0;
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  text-align: left;
   text-decoration: none;
+  cursor: pointer;
+}
+.pharos-account-item:hover,
+.pharos-account-item:focus-visible {
+  background: var(--px-color-surface);
+  outline: none;
 }
 
 .pharos-status {

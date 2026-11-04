@@ -37,20 +37,14 @@ pub fn Link(to: Route, class: Option<String>, children: Element) -> Element {
 
 /// The frame around every signed-in screen.
 #[component]
-pub fn Shell(on_sign_out: EventHandler<()>, children: Element) -> Element {
+pub fn Shell(account: Element, children: Element) -> Element {
     rsx! {
         div { class: "pharos-app",
             header { class: "pharos-banner pharos-shell-bar",
                 Link { to: Route::Home, class: "pharos-brand", h1 { "pharos" } }
                 nav { class: "pharos-shell-nav",
                     Link { to: Route::Find, "Find" }
-                    Link { to: Route::Appearance, "Appearance" }
-                    Link { to: Route::Manage, "Manage" }
-                    button {
-                        class: "pharos-link-button",
-                        onclick: move |_| on_sign_out.call(()),
-                        "Sign out"
-                    }
+                    {account}
                 }
             }
             main { class: "pharos-main", {children} }
