@@ -18,6 +18,7 @@ use pharos_client::mix::{
 
 use super::app::{call, remount_on, Ctx};
 use super::group_app::Together;
+use super::listen::Icon;
 use super::platform;
 use super::queue::{Queue, QueueAction, QueueCtx, Source, Track};
 use super::route::Route;
@@ -28,9 +29,8 @@ pub const LOW_WATER: usize = 5;
 /// How many songs one ask brings.
 pub const BATCH: u32 = 10;
 
-/// "Mix from this song": a sound wave.
-pub const ICON_MIX: &str =
-    "M7 18h2V6H7v12Zm4 4h2V2h-2v20Zm-8-8h2v-4H3v4Zm12 4h2V6h-2v12Zm4-8v4h2v-4h-2Z";
+/// A mix: a die showing five, as the auto playlist's dice in Amarok.
+pub const ICON_MIX: &str = "M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3Zm0 2a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1H6Zm1 3.5a1.5 1.5 0 1 0 3 0 1.5 1.5 0 1 0-3 0Zm7 0a1.5 1.5 0 1 0 3 0 1.5 1.5 0 1 0-3 0ZM10.5 12a1.5 1.5 0 1 0 3 0 1.5 1.5 0 1 0-3 0ZM7 15.5a1.5 1.5 0 1 0 3 0 1.5 1.5 0 1 0-3 0Zm7 0a1.5 1.5 0 1 0 3 0 1.5 1.5 0 1 0-3 0Z";
 
 /// The mix that is on.
 #[derive(Debug, Clone, PartialEq)]
@@ -479,6 +479,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                             load();
                         }
                     },
+                    Icon { path: ICON_MIX }
                     "Mix"
                 }
             }
@@ -1246,6 +1247,10 @@ mod tests {
         assert!(
             html.contains("pharos-mix-toggle") && html.contains(">Mix<"),
             "{html}"
+        );
+        assert!(
+            html.contains(ICON_MIX),
+            "the Mix button shows the die: {html}"
         );
     }
 
