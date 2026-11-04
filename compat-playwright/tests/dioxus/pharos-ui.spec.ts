@@ -1598,7 +1598,11 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
       .poll(() => page.evaluate(() => localStorage.getItem("pharos.volume")))
       .toBe("0.300");
 
+    // Back only shrinks the player now (spec 020); Close ends it, so the
+    // next Play mounts a fresh one.
     await page.getByRole("button", { name: "Back", exact: true }).click();
+    await page.locator(".pharos-stage").getByRole("button", { name: "Close" }).click();
+    await expect(page.locator(".pharos-stage")).toHaveCount(0);
     await play();
     await expect.poll(volume).toBeCloseTo(0.3, 2);
     expect(lines.join("\n")).toMatch(/pharos: volume restored volume=0\.300 muted=false/);
