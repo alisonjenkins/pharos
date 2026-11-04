@@ -26,7 +26,7 @@ use super::playback::{
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
-use super::together::{group_api, GroupClient as _, GroupSink, GroupSummary};
+use super::together::{group_api, GroupClient as _, GroupError, GroupSink, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
@@ -910,14 +910,24 @@ fn FindScreen() -> Element {
     rsx! { FindView { text: text(), hits: hits(), on_input } }
 }
 
-/// Join `id` and go to what the group is watching. The group client is the
-/// in-memory seam of [`group_api`] until the network adapter lands.
-fn join_group(
-    api: super::together::FakeGroups,
-    nav: Nav,
-    mut error: Signal<Option<String>>,
-    id: String,
-) {
+/// The group client for the signed-in session, `None` while signed out.
+fn group_client(ctx: Ctx) -> Option<Groups> {
+    ctx.api.peek().as_ref().map(group_api)
+}
+
+/// The groups running now, or why they cannot be listed.
+async fn list_groups(api: Option<Groups>) -> Result<Vec<GroupSummary>, GroupError> {
+    match api {
+        Some(api) => api.list().await,
+        None => Err(GroupError("Sign in to watch together".into())),
+    }
+}
+
+/// Join `id` and go to what the group is watching.
+fn join_group(api: Option<Groups>, nav: Nav, mut error: Signal<Option<String>>, id: String) {
+    let Some(api) = api else {
+        return;
+    };
     spawn(async move {
         let sink: GroupSink = Rc::new(|_| {});
         match api.join(&id, sink).await {
@@ -935,14 +945,12 @@ fn join_group(
 #[component]
 fn TogetherScreen() -> Element {
     let nav = use_context::<Nav>();
-    let api = use_hook(group_api);
+    let ctx = use_context::<Ctx>();
+    let api = use_hook(move || group_client(ctx));
     let error = use_signal(|| None::<String>);
     let groups = use_resource({
         let api = api.clone();
-        move || {
-            let api = api.clone();
-            async move { api.list().await }
-        }
+        move || list_groups(api.clone())
     });
     let state = groups.read();
     match state.as_ref() {
@@ -964,14 +972,12 @@ fn TogetherScreen() -> Element {
 #[component]
 fn InviteScreen(id: String) -> Element {
     let nav = use_context::<Nav>();
-    let api = use_hook(group_api);
+    let ctx = use_context::<Ctx>();
+    let api = use_hook(move || group_client(ctx));
     let error = use_signal(|| None::<String>);
     let groups = use_resource({
         let api = api.clone();
-        move || {
-            let api = api.clone();
-            async move { api.list().await }
-        }
+        move || list_groups(api.clone())
     });
     let state = groups.read();
     match state.as_ref() {

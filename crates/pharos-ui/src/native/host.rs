@@ -225,3 +225,10 @@ pub fn audio_tap(_media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>
 pub fn media_playing(_id: &str) -> bool {
     false
 }
+
+/// The host has no server: the in-memory groups.
+pub type Groups = super::together::FakeGroups;
+
+pub fn groups(_api: &NativeApi) -> Groups {
+    Groups::default()
+}
