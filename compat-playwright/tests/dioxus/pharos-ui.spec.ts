@@ -892,12 +892,10 @@ test.describe("pharos Dioxus UI", () => {
       const tracks = await json(
         `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
       );
-      const track = tracks.Items?.find(
-        (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
-      );
+      const track = tracks.Items?.find((t: Song) => t.Album && songBy(t));
       test.skip(!track, "the seed has no track tagged with an album and artist");
       const artists = await json(`/Artists`);
-      const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
+      const artist = artists.Items?.find((a: { Name: string }) => a.Name === songBy(track));
       expect(artist, "the track's album artist is listed").toBeTruthy();
 
       await page.goto("/ui/");
@@ -2095,7 +2093,11 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     // The whole album again behind the first song, so something follows it.
-    await page.getByRole("button", { name: `Add ${track.Album} to the queue` }).click();
+    // Twice: starting a queued song takes its copy off the queue, and the
+    // seed's album may hold only that one song.
+    const add = page.getByRole("button", { name: `Add ${track.Album} to the queue` });
+    await add.click();
+    await add.click();
     await page.locator("ol.pharos-tracks li").first().locator("a").click();
     await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
       timeout: 15_000,
