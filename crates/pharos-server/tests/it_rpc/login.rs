@@ -13,7 +13,7 @@ use pharos_server::api::pharos::rpc;
 use crate::bootstrap::LOCAL;
 use crate::common::{seed_rich, Fixture};
 
-fn client(fx: &Fixture, max_per_user: u32) -> bootstrap::Client {
+pub(crate) fn client(fx: &Fixture, max_per_user: u32) -> bootstrap::Client {
     let ctx = rpc::ConnectionCtx::admit(
         None,
         LOCAL,
@@ -27,13 +27,13 @@ fn client(fx: &Fixture, max_per_user: u32) -> bootstrap::Client {
 
 /// The kind of a login error, without its payload.
 #[derive(Debug, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     NotPermitted,
     Limit { name: String, value: u64 },
     Other,
 }
 
-async fn login(
+pub(crate) async fn login(
     client: &bootstrap::Client,
     name: &str,
     password: &str,
@@ -70,7 +70,7 @@ async fn login(
     }
 }
 
-async fn me_name(session: &session::Client) -> Option<String> {
+pub(crate) async fn me_name(session: &session::Client) -> Option<String> {
     let mut me = session.me_request();
     me.get().init_ctx();
     let reply = me.send().promise.await.ok()?;
