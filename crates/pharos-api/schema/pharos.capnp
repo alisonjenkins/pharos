@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 11;
+const schemaVersion :UInt32 = 12;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -388,7 +388,17 @@ interface Membership {
   # the ghost prune (T83).
   ping      @6 (ctx :CallContext) -> (result :Done);
   clockReport @7 (ctx :CallContext, t1 :UInt64, t2 :UInt64, t3 :UInt64, t4 :UInt64) -> (result :Done);
+  # What each member of THIS group has watched of `ids` (US6, ADR-0046). At most
+  # 200 ids, else `limit`. An id the caller may not see is left out of every
+  # member's `items`; a member with no recorded user is listed with no items.
+  seen      @8 (ctx :CallContext, ids :List(ItemId)) -> (result :SeenResult);
 }
+# For a film or episode `played` and `positionPct` (0-100, the resume point)
+# apply. For a series or season `playedCount` of `totalCount` episodes (the ones
+# the caller may see) have been played; `played` is true when all are.
+struct ItemSeen { id @0 :ItemId; played @1 :Bool; positionPct @2 :UInt8; playedCount @3 :UInt32; totalCount @4 :UInt32; }
+struct MemberSeen { member @0 :GroupMember; items @1 :List(ItemSeen); }
+struct SeenResult { union { members @0 :List(MemberSeen); error @1 :Error; } }
 enum EndReason { left @0; notInGroup @1; }
 struct GroupUpdate {
   union {

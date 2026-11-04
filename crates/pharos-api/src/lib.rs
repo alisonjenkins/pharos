@@ -11,6 +11,10 @@ pub mod instrument;
 pub mod labels;
 pub mod redact;
 
+/// Ids one `Membership.seen` call may ask about; more is `limit`. The server
+/// enforces it and the client sizes its calls by it.
+pub const MAX_SEEN_IDS: usize = 200;
+
 pub use instrument::{register_metrics, set_trace_parent_hook, Connection, Denial};
 
 /// `Session.changePassword`'s `unavailable` reason when the new password is

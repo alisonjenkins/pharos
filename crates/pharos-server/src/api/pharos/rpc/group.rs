@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pharos_api::pharos_capnp::{
     done, group as wire, group_sink, group_summary, group_update, membership as member_wire,
-    membership_result, EndReason,
+    membership_result, seen_result, EndReason,
 };
 use pharos_api::{server, Connection, Denial};
 use pharos_jellyfin_api::dto::{wire_item_id, WireId};
@@ -27,6 +27,7 @@ use crate::api::jellyfin::syncplay::{
     resolve_runtimes_ms, sync_play_allows, GroupHiddenRoute, ListedGroup, QueueVia, SyncPlayNeed,
 };
 use crate::group_ops::{route_command, CommandOutcome, SyncDeps};
+use crate::services::group_seen::{self, MemberSeen, Outcome};
 
 /// Updates queued for a member's `GroupSink` before the actor's delivery to
 /// it backs up; the Jellyfin `/socket` queues the same.
@@ -250,6 +251,30 @@ fn write_summary(mut out: group_summary::Builder<'_>, group: &Summary) {
     let mut members = out.init_members(u32::try_from(group.members.len()).unwrap_or(u32::MAX));
     for (i, m) in (0u32..).zip(&group.members) {
         write_member(members.reborrow().get(i), m);
+    }
+}
+
+fn write_seen(out: seen_result::Builder<'_>, members: &[MemberSeen]) {
+    let mut out = out.init_members(u32::try_from(members.len()).unwrap_or(u32::MAX));
+    for (i, m) in (0u32..).zip(members) {
+        let mut entry = out.reborrow().get(i);
+        write_member(
+            entry.reborrow().init_member(),
+            &Member {
+                id: m.member_id.clone(),
+                name: m.name.clone(),
+                buffering: m.buffering,
+            },
+        );
+        let mut items = entry.init_items(u32::try_from(m.items.len()).unwrap_or(u32::MAX));
+        for (j, item) in (0u32..).zip(&m.items) {
+            let mut out = items.reborrow().get(j);
+            set_item_id(out.reborrow().init_id(), item.id);
+            out.set_played(item.played);
+            out.set_position_pct(item.position_pct);
+            out.set_played_count(item.played_count);
+            out.set_total_count(item.total_count);
+        }
     }
 }
 
@@ -850,6 +875,57 @@ impl Membership {
         }
     }
 
+    /// Each member's state on `ids` (US6), for the group this membership is
+    /// in and only while the caller is still in it.
+    async fn seen_for(&self, ids: &[WireId]) -> Result<Vec<MemberSeen>, Denial> {
+        let user = self.session.current_user().await?;
+        let group = self.group.group_id.to_string();
+        let record = |outcome: Outcome, answered: usize, members: usize| {
+            group_seen::record(outcome, &user, &group, ids.len(), answered, members);
+        };
+        let in_group = !self.left.get()
+            && self.deps.hub.resolve(&self.key).map_or(true, |s| {
+                s.group
+                    .as_ref()
+                    .map_or(true, |g| g.group_id == self.group.group_id)
+            });
+        if !in_group {
+            record(Outcome::NotInGroup, 0, 0);
+            return Err(Denial::NotFound { what: "group" });
+        }
+        if ids.len() > group_seen::MAX_IDS {
+            record(Outcome::OverLimit, 0, 0);
+            return Err(Denial::Limit {
+                name: "seen_ids",
+                value: u64::try_from(ids.len()).unwrap_or(u64::MAX),
+                max: group_seen::MAX_IDS as u64,
+            });
+        }
+        let Some(snapshot) = self.group.snapshot().await else {
+            record(Outcome::Unavailable, 0, 0);
+            return Err(Denial::Unavailable {
+                dependency: "syncplay",
+            });
+        };
+        if !snapshot.participant_ids.contains(&self.member_id) {
+            record(Outcome::NotInGroup, 0, 0);
+            return Err(Denial::NotFound { what: "group" });
+        }
+        match group_seen::seen(&self.session.state, &user, &snapshot, ids).await {
+            Ok(members) => {
+                let answered = members.iter().map(|m| m.items.len()).max().unwrap_or(0);
+                record(Outcome::Answered, answered, members.len());
+                Ok(members)
+            }
+            Err(group_seen::SeenError::Unavailable) => {
+                record(Outcome::Unavailable, 0, 0);
+                Err(Denial::Unavailable {
+                    dependency: "media store",
+                })
+            }
+        }
+    }
+
     /// `leave_group`'s work: out of the roster, the leaver told `GroupLeft`
     /// whether or not the server still had it in a group (B25), then out of
     /// the hub. Idempotent.
@@ -991,6 +1067,23 @@ impl server::membership::Handler for Membership {
             .command("ping", |member_id| GroupMsg::MemberPing { member_id })
             .await;
         write_done(results.get().init_result(), done);
+        Ok(())
+    }
+
+    async fn seen(
+        self: Rc<Self>,
+        params: member_wire::SeenParams,
+        results: &mut member_wire::SeenResults,
+    ) -> Result<(), capnp::Error> {
+        let wire_ids = params.get()?.get_ids()?;
+        let mut ids = Vec::with_capacity(wire_ids.len() as usize);
+        for id in wire_ids.iter() {
+            ids.push(read_item_id(id)?);
+        }
+        match self.seen_for(&ids).await {
+            Ok(members) => write_seen(results.get().init_result(), &members),
+            Err(denial) => denial.write(results.get().init_result().init_error()),
+        }
         Ok(())
     }
 
