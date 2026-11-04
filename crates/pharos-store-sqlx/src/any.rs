@@ -763,6 +763,16 @@ impl PersonStore for AnyStore {
             AnyStore::Postgres(p) => p.people_for_item(item).await,
         }
     }
+
+    async fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.actor_credits_for_items(items).await,
+            AnyStore::Postgres(p) => p.actor_credits_for_items(items).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

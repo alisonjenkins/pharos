@@ -3551,6 +3551,12 @@ mod tests {
             out.truncate(limit.max(0) as usize);
             Ok(out)
         }
+        async fn actor_credits_for_items(
+            &self,
+            _items: &[MediaId],
+        ) -> DomainResult<Vec<(MediaId, pharos_core::ItemPerson)>> {
+            Ok(vec![])
+        }
         async fn people_for_item(
             &self,
             item: MediaId,
