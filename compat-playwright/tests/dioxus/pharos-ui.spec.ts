@@ -973,6 +973,35 @@ test.describe("pharos Dioxus UI", () => {
       await picker.selectOption("off");
       await expect.poll(async () => (await media()).showing).toEqual([]);
 
+      // The chrome fades soon after the last activity while playing, even
+      // with a track just picked or a control focused by a key press (B430).
+      const chromeOpacity = () =>
+        page.evaluate(
+          () => getComputedStyle(document.querySelector(".pharos-controls")!).opacity,
+        );
+      if ((await media()).paused) {
+        await page.locator(".pharos-control-row .pharos-control").first().click();
+      }
+      await expect.poll(async () => (await media()).paused).toBe(false);
+      await page.mouse.move(20, 20);
+      await expect.poll(chromeOpacity, { message: "a pointer move shows the chrome" }).toBe("1");
+      await picker.selectOption(option!);
+      await expect.poll(chromeOpacity, { timeout: 4_000 }).toBe("0");
+      await picker.selectOption("off");
+      // Tab moves focus by keyboard, so the control it lands on is
+      // :focus-visible; a modifier alone would not make it so.
+      await page.getByRole("button", { name: "Mute" }).focus();
+      await page.keyboard.press("Tab");
+      await expect
+        .poll(() =>
+          page.evaluate(() => document.activeElement?.matches(".pharos-controls :focus-visible")),
+        )
+        .toBe(true);
+      await expect.poll(chromeOpacity, { message: "a key press shows the chrome" }).toBe("1");
+      await expect.poll(chromeOpacity, { timeout: 4_000 }).toBe("0");
+      await page.mouse.move(40, 40);
+      await expect.poll(chromeOpacity).toBe("1");
+
       // Volume and mute.
       await page.locator(".pharos-volume").fill("0.5");
       await expect.poll(async () => (await media()).volume).toBeCloseTo(0.5, 2);
