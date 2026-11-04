@@ -1813,6 +1813,7 @@ const FFT_SIZE: u32 = 2048;
 struct WebAudioTap {
     context: web_sys::AudioContext,
     analyser: web_sys::AnalyserNode,
+    media: web_sys::HtmlMediaElement,
     samples: Vec<f32>,
 }
 
@@ -1832,6 +1833,14 @@ impl super::visualiser::AudioTap for WebAudioTap {
 
     fn sample_rate(&self) -> f32 {
         self.context.sample_rate()
+    }
+
+    fn volume(&self) -> f32 {
+        if self.media.muted() {
+            0.0
+        } else {
+            self.media.volume() as f32
+        }
     }
 }
 
@@ -1880,6 +1889,7 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     Ok(Box::new(WebAudioTap {
         context,
         analyser,
+        media,
         samples: vec![0.0; FFT_SIZE as usize],
     }))
 }
