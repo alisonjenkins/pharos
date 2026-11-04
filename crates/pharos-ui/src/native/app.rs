@@ -2795,6 +2795,7 @@ fn Player(
                 previous: near.previous,
                 next,
                 lyrics: lyrics.read().clone().flatten(),
+                lyrics_loading: lyrics.read().is_none(),
                 playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),

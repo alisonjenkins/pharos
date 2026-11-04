@@ -1915,7 +1915,7 @@ test.describe("pharos Dioxus UI play queue", () => {
     const toggle = page.locator(".pharos-queue-toggle");
     await expect(toggle).toBeVisible({ timeout: 15_000 });
     await expect(toggle).toHaveAttribute("aria-pressed", "false");
-    await expect(page.getByRole("button", { name: "Lyrics", exact: true })).toBeVisible();
+    await expect(page.locator(".pharos-lyrics-toggle")).toBeVisible();
     const panel = page.getByRole("complementary", { name: "Queue" });
     await expect(panel).toBeHidden();
     await toggle.click();
