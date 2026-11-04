@@ -11,7 +11,8 @@
 use super::clock::ClockOffset;
 use super::delivery::Delivery;
 use super::messages::{
-    ErrorCode, GroupId, GroupPlayState, MemberId, MemberSummary, QueueItemInfo, ServerMsg,
+    ErrorCode, GroupId, GroupPlayState, GroupTracks, MemberId, MemberSummary, QueueItemInfo,
+    ServerMsg, TrackChoice,
 };
 use super::persistence::GroupPersistence;
 use pharos_core::UserId;
@@ -389,6 +390,23 @@ pub enum GroupMsg {
     SetGroupName {
         name: String,
     },
+    /// Change the group's audio and/or subtitle choice (US7). A `Unset` choice
+    /// leaves that one as it is. Advisory: the server records and announces it,
+    /// each following client applies it to its own player (ADR-0055).
+    SetTracks {
+        sender: MemberId,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        /// The queue entry the pick was made on; `None` skips the stale check.
+        playlist_item_id: Option<String>,
+    },
+    /// `follow` false puts the member on its own tracks ("Just me"): group
+    /// track changes are announced as before but are not meant for it. `true`
+    /// puts it back on the group's.
+    FollowTracks {
+        member_id: MemberId,
+        follow: bool,
+    },
     /// Jellyfin HTTP `/SyncPlay/SetIgnoreWait` — the client asks to be
     /// excluded from (or re-included in) group waits. jellyfin-web posts
     /// `true` when it halts its own playback (player never started within its
@@ -580,6 +598,18 @@ pub enum RemoteCommand {
     SetGroupName {
         name: String,
     },
+    SetTracks {
+        sender: MemberId,
+        audio: TrackChoice,
+        subtitle: TrackChoice,
+        /// The queue entry the pick was made on; `None` skips the stale check.
+        #[serde(default)]
+        playlist_item_id: Option<String>,
+    },
+    FollowTracks {
+        member_id: MemberId,
+        follow: bool,
+    },
     SetIgnoreWait {
         member_id: MemberId,
         ignore: bool,
@@ -757,6 +787,20 @@ impl RemoteCommand {
                 GroupMsg::SetShuffleMode { sender, mode }
             }
             RemoteCommand::SetGroupName { name } => GroupMsg::SetGroupName { name },
+            RemoteCommand::SetTracks {
+                sender,
+                audio,
+                subtitle,
+                playlist_item_id,
+            } => GroupMsg::SetTracks {
+                sender,
+                audio,
+                subtitle,
+                playlist_item_id,
+            },
+            RemoteCommand::FollowTracks { member_id, follow } => {
+                GroupMsg::FollowTracks { member_id, follow }
+            }
             RemoteCommand::SetIgnoreWait { member_id, ignore } => {
                 GroupMsg::SetIgnoreWait { member_id, ignore }
             }
@@ -807,6 +851,10 @@ pub struct GroupSnapshot {
     pub queue_item_ids: Vec<String>,
     /// Every cast seat in the roster, with the Controller it is paired with.
     pub cast_seats: Vec<CastSeatInfo>,
+    /// The group's audio and subtitle choice: what a late joiner starts on.
+    pub tracks: GroupTracks,
+    /// The members on their own tracks, not following the group's.
+    pub own_tracks_members: Vec<MemberId>,
 }
 
 /// One cast seat as the roster holds it.
@@ -847,6 +895,10 @@ struct MemberRec {
     cast: Option<CastBinding>,
     offset: ClockOffset,
     buffering: bool,
+    /// On their own audio and subtitles ("Just me"), not the group's (US7).
+    /// Not persisted: a member that comes back after a takeover follows the
+    /// group again.
+    own_tracks: bool,
     /// Jellyfin `/SyncPlay/SetIgnoreWait` — the client halted its own playback
     /// (e.g. its player never started) and asked to be left out of group
     /// waits. Excluded from every readiness-gate pending set until it posts
@@ -1283,6 +1335,38 @@ fn record_next_item_outcome(outcome: NextItemOutcome) {
     .increment(1);
 }
 
+/// What became of a group-tracks command (US7). The label set is the dashboard
+/// contract for `pharos_group_tracks_total`, asserted in
+/// `tracks_outcome_labels_are_distinct_and_stable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TracksOutcome {
+    /// The group's choice, or the member's following, changed and was announced.
+    Applied,
+    /// The sender is not in the group's roster; nothing changed.
+    NotInGroup,
+    /// Nothing to change: the group already had that choice, or the member
+    /// already followed (or did not follow) as asked.
+    Unchanged,
+    /// The pick was made on a queue entry the group has since moved on from;
+    /// stream indexes belong to one item, so it is dropped (B37).
+    Stale,
+}
+
+impl TracksOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            TracksOutcome::Applied => "applied",
+            TracksOutcome::NotInGroup => "not_in_group",
+            TracksOutcome::Unchanged => "unchanged",
+            TracksOutcome::Stale => "stale",
+        }
+    }
+}
+
+fn record_tracks_outcome(outcome: TracksOutcome) {
+    metrics::counter!("pharos_group_tracks_total", "outcome" => outcome.label()).increment(1);
+}
+
 /// The playback state a member was hydrated with when it joined, reconnected,
 /// or acked late. Bounded label set — asserted distinct in
 /// `hydrate_states_have_distinct_labels`.
@@ -1471,6 +1555,12 @@ struct GroupState {
     /// it has necessarily broadcast already, and a spurious promote would
     /// reload every member's player after a deploy.
     queue_broadcast: bool,
+    /// The group's audio and subtitle choice (US7). Not persisted: a takeover
+    /// starts the group with no choice, and the next change sets it.
+    tracks: GroupTracks,
+    /// The queue entry `tracks` was chosen for; a different playing entry
+    /// clears them (the new item's streams differ).
+    tracks_pli: Option<String>,
     /// `Some` while the readiness gate is open (group is `Waiting`).
     waiting: Option<WaitingGate>,
     /// Display name shown in the join dialog (set from `/SyncPlay/New`).
@@ -1507,6 +1597,8 @@ impl GroupState {
             queue: PlayQueue::default(),
             // A fresh group has no queue at all; the first real broadcast sets this.
             queue_broadcast: true,
+            tracks: GroupTracks::default(),
+            tracks_pli: None,
             waiting: None,
             group_name: "Watch Party".to_string(),
             delivery,
@@ -1819,6 +1911,22 @@ impl GroupState {
             repeat_mode: self.queue.repeat_mode.clone(),
             shuffle_mode: self.queue.shuffle_mode.clone(),
             last_update_unix_ms: self.queue.updated_unix_ms,
+        });
+        self.clear_tracks_if_item_changed();
+    }
+
+    /// The group's tracks were chosen for one queue entry; once another plays
+    /// they are meaningless, so clear them and tell the members.
+    fn clear_tracks_if_item_changed(&mut self) {
+        if self.tracks == GroupTracks::default()
+            || self.tracks_pli.as_deref() == self.current_playlist_item_id()
+        {
+            return;
+        }
+        self.tracks = GroupTracks::default();
+        self.tracks_pli = None;
+        self.broadcast(ServerMsg::Tracks {
+            tracks: GroupTracks::default(),
         });
     }
 
@@ -2601,6 +2709,7 @@ impl GroupState {
                 (
                     m.id,
                     MemberRec {
+                        own_tracks: false,
                         name: m.name,
                         user: m.user,
                         offset: ClockOffset::default(),
@@ -3245,11 +3354,13 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::BufferingEnd { member_id }
         | GroupMsg::ObserveClock { member_id, .. }
         | GroupMsg::SetIgnoreWait { member_id, .. }
+        | GroupMsg::FollowTracks { member_id, .. }
         | GroupMsg::SetMemberKind {
             member: member_id, ..
         }
         | GroupMsg::ResyncMember { member_id, .. } => Some(*member_id),
         GroupMsg::LeaderPlay { sender, .. }
+        | GroupMsg::SetTracks { sender, .. }
         | GroupMsg::LeaderPause { sender }
         | GroupMsg::LeaderSeek { sender, .. }
         | GroupMsg::Unpause { sender }
@@ -3354,6 +3465,7 @@ fn add_member(
             user,
             offset: ClockOffset::default(),
             buffering: false,
+            own_tracks: false,
             ignore_wait: false,
             kind,
             cast,
@@ -4104,6 +4216,74 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             }
             yield_leadership_to_player(state);
         }
+        GroupMsg::SetTracks {
+            sender,
+            audio,
+            subtitle,
+            playlist_item_id,
+        } => {
+            if !state.members.contains_key(&sender) {
+                tracing::info!(group = %state.id, member = %sender, "syncplay: tracks from a non-member ignored");
+                record_tracks_outcome(TracksOutcome::NotInGroup);
+                return;
+            }
+            // A pick made on the previous entry would land on the one the group
+            // has moved to: its stream indexes mean nothing there.
+            if state.pli_is_stale(&playlist_item_id) {
+                tracing::info!(
+                    group = %state.id, member = %sender,
+                    sent = playlist_item_id.as_deref().unwrap_or(""),
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    "syncplay: stale-item tracks change ignored"
+                );
+                record_tracks_outcome(TracksOutcome::Stale);
+                return;
+            }
+            let mut next = state.tracks.clone();
+            if audio != TrackChoice::Unset {
+                next.audio = audio;
+            }
+            if subtitle != TrackChoice::Unset {
+                next.subtitle = subtitle;
+            }
+            if next.audio == state.tracks.audio && next.subtitle == state.tracks.subtitle {
+                tracing::info!(
+                    group = %state.id, member = %sender, ?audio, ?subtitle,
+                    "syncplay: tracks change matches the group's — nothing to announce"
+                );
+                record_tracks_outcome(TracksOutcome::Unchanged);
+                return;
+            }
+            next.by = Some(sender);
+            tracing::info!(
+                group = %state.id, member = %sender, audio = ?next.audio, subtitle = ?next.subtitle,
+                "syncplay: group tracks changed"
+            );
+            state.tracks = next;
+            state.tracks_pli = state.current_playlist_item_id().map(str::to_string);
+            record_tracks_outcome(TracksOutcome::Applied);
+            state.broadcast(ServerMsg::Tracks {
+                tracks: state.tracks.clone(),
+            });
+        }
+        GroupMsg::FollowTracks { member_id, follow } => {
+            let Some(rec) = state.members.get_mut(&member_id) else {
+                tracing::info!(group = %state.id, member = %member_id, "syncplay: follow-tracks from a non-member ignored");
+                record_tracks_outcome(TracksOutcome::NotInGroup);
+                return;
+            };
+            if rec.own_tracks == !follow {
+                record_tracks_outcome(TracksOutcome::Unchanged);
+                return;
+            }
+            rec.own_tracks = !follow;
+            tracing::info!(group = %state.id, member = %member_id, follow, "syncplay: member's track following changed");
+            record_tracks_outcome(TracksOutcome::Applied);
+            state.broadcast(ServerMsg::MemberTracks {
+                member_id,
+                own_tracks: !follow,
+            });
+        }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             if let Some(rec) = state.members.get_mut(&member_id) {
                 rec.ignore_wait = ignore;
@@ -4542,6 +4722,13 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                     .map(|e| e.item_id.clone())
                     .collect(),
                 cast_seats: state.cast_seats(),
+                tracks: state.tracks.clone(),
+                own_tracks_members: state
+                    .members
+                    .iter()
+                    .filter(|(_, m)| m.own_tracks)
+                    .map(|(id, _)| *id)
+                    .collect(),
             };
             let _ = reply.send(snap);
         }
@@ -5826,6 +6013,264 @@ mod tests {
             }
         }
         assert_eq!(started, Some(None), "the gate's start is the group's own");
+    }
+
+    #[test]
+    fn tracks_outcome_labels_are_distinct_and_stable() {
+        let all = [
+            (TracksOutcome::Applied, "applied"),
+            (TracksOutcome::NotInGroup, "not_in_group"),
+            (TracksOutcome::Unchanged, "unchanged"),
+            (TracksOutcome::Stale, "stale"),
+        ];
+        let mut seen = HashSet::new();
+        for (outcome, label) in all {
+            assert_eq!(outcome.label(), label);
+            assert!(seen.insert(label), "{label} repeated");
+        }
+    }
+
+    async fn tracks_of(h: &GroupHandle) -> GroupTracks {
+        snapshot_of(h).await.tracks
+    }
+
+    async fn queue_two(h: &GroupHandle, leader: MemberId, first: &str) {
+        h.tx.send(GroupMsg::SetNewQueue {
+            sender: leader,
+            item_ids: vec![first.into(), "99".into()],
+            item_runtimes_ms: Vec::new(),
+            playing_index: 0,
+            start_position_ms: 0,
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn next_tracks(rx: &mut mpsc::Receiver<ServerMsg>) -> GroupTracks {
+        let m = recv_matching(rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::Tracks { .. })
+        })
+        .await
+        .expect("a tracks message within 2 s");
+        let ServerMsg::Tracks { tracks } = m else {
+            unreachable!()
+        };
+        tracks
+    }
+
+    /// V396: a member's audio or subtitle change reaches every member, names
+    /// who made it, and a choice left `Unset` is left as it was.
+    #[tokio::test]
+    async fn a_tracks_change_reaches_every_member_and_keeps_the_unset_half() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Off,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let want = GroupTracks {
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Off,
+            by: Some(m1),
+        };
+        assert_eq!(next_tracks(&mut rx1).await, want);
+        assert_eq!(next_tracks(&mut rx2).await, want);
+
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m2,
+            audio: TrackChoice::Unset,
+            subtitle: TrackChoice::Index(5),
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let want = GroupTracks {
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Index(5),
+            by: Some(m2),
+        };
+        assert_eq!(next_tracks(&mut rx1).await, want);
+        assert_eq!(tracks_of(&h).await, want);
+    }
+
+    /// V396: a late joiner starts on the group's tracks (the snapshot the
+    /// native `joined` is built from).
+    #[tokio::test]
+    async fn a_late_joiner_finds_the_groups_tracks_in_the_snapshot() {
+        let (h, sinks, _rx1, m1) = fresh().await;
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(1),
+            subtitle: TrackChoice::Unset,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let (_m2, _rx2) = add_member(&h, &sinks, "late").await;
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.tracks.audio, TrackChoice::Index(1));
+        assert_eq!(snap.tracks.subtitle, TrackChoice::Unset);
+        assert_eq!(snap.tracks.by, Some(m1));
+    }
+
+    /// V396: "Just me" and "Follow group" are announced and show in the
+    /// snapshot; a track change does not touch an own-tracks member's flag.
+    #[tokio::test]
+    async fn a_member_can_leave_and_rejoin_the_groups_tracks() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::FollowTracks {
+            member_id: m2,
+            follow: false,
+        })
+        .await
+        .unwrap();
+        let m = recv_matching(&mut rx1, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::MemberTracks { .. })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            m,
+            ServerMsg::MemberTracks { member_id, own_tracks: true } if member_id == m2
+        ));
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(3),
+            subtitle: TrackChoice::Unset,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(snap.own_tracks_members, vec![m2]);
+        assert_eq!(snap.tracks.audio, TrackChoice::Index(3));
+
+        h.tx.send(GroupMsg::FollowTracks {
+            member_id: m2,
+            follow: true,
+        })
+        .await
+        .unwrap();
+        assert!(snapshot_of(&h).await.own_tracks_members.is_empty());
+    }
+
+    /// V396: moving the group to another item clears its tracks and says so;
+    /// adding to the queue without changing what plays does not.
+    #[tokio::test]
+    async fn a_queue_change_clears_the_tracks_but_an_enqueue_does_not() {
+        let (h, _sinks, mut rx1, m1) = fresh().await;
+        queue_two(&h, m1, "10").await;
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Index(4),
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(next_tracks(&mut rx1).await.audio, TrackChoice::Index(2));
+
+        h.tx.send(GroupMsg::Queue {
+            sender: m1,
+            item_ids: vec!["50".into()],
+            item_runtimes_ms: Vec::new(),
+            mode: QueueMode::Queue,
+        })
+        .await
+        .unwrap();
+        assert_eq!(tracks_of(&h).await.audio, TrackChoice::Index(2));
+
+        queue_two(&h, m1, "20").await;
+        assert_eq!(next_tracks(&mut rx1).await, GroupTracks::default());
+        assert_eq!(tracks_of(&h).await, GroupTracks::default());
+    }
+
+    /// V396: a pick made on the entry the group has since left is dropped, not
+    /// applied to the entry it moved to.
+    #[tokio::test]
+    async fn a_tracks_pick_from_the_previous_item_is_dropped() {
+        let (h, _sinks, mut rx1, m1) = fresh().await;
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        h.tx.send(GroupMsg::NextItem {
+            sender: m1,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(3),
+            subtitle: TrackChoice::Unset,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(tracks_of(&h).await, GroupTracks::default());
+
+        h.tx.send(GroupMsg::SetTracks {
+            sender: m1,
+            audio: TrackChoice::Index(3),
+            subtitle: TrackChoice::Unset,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(tracks_of(&h).await.audio, TrackChoice::Index(3));
+    }
+
+    /// V396, ODD: every outcome of a tracks command is counted under its own
+    /// label. Disarmed once, with `record_tracks_outcome` not incrementing:
+    /// this went red.
+    #[tokio::test]
+    async fn every_tracks_outcome_is_counted_under_its_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, _sinks, mut rx1, m1) = fresh().await;
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        let send_tracks = async |sender: MemberId, audio: TrackChoice, pli: &str| {
+            h.tx.send(GroupMsg::SetTracks {
+                sender,
+                audio,
+                subtitle: TrackChoice::Unset,
+                playlist_item_id: Some(pli.to_string()),
+            })
+            .await
+            .unwrap();
+        };
+        send_tracks(m1, TrackChoice::Index(1), &plis[0]).await; // applied
+        send_tracks(m1, TrackChoice::Index(1), &plis[0]).await; // unchanged
+        send_tracks(m1, TrackChoice::Index(2), &plis[1]).await; // stale
+        send_tracks(MemberId::new(), TrackChoice::Index(2), &plis[0]).await; // not in group
+        let _ = snapshot_of(&h).await;
+
+        let snap = snapshotter.snapshot().into_vec();
+        let count = |outcome: &str| -> u64 {
+            snap.iter()
+                .filter(|(ck, _, _, _)| ck.key().name() == "pharos_group_tracks_total")
+                .filter(|(ck, _, _, _)| {
+                    ck.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == outcome)
+                })
+                .map(|(_, _, _, v)| match v {
+                    DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(count("applied"), 1, "{snap:?}");
+        assert_eq!(count("unchanged"), 1, "{snap:?}");
+        assert_eq!(count("stale"), 1, "{snap:?}");
+        assert_eq!(count("not_in_group"), 1, "{snap:?}");
     }
 
     #[tokio::test]
@@ -8492,6 +8937,7 @@ mod tests {
             MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let live = MemberId(uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
         let mk = |last_seen| MemberRec {
+            own_tracks: false,
             user: None,
             socket_gone_since: None,
             name: "m".into(),

@@ -189,6 +189,20 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::SetRepeatMode { sender, mode } => RemoteCommand::SetRepeatMode { sender, mode },
         GroupMsg::SetShuffleMode { sender, mode } => RemoteCommand::SetShuffleMode { sender, mode },
         GroupMsg::SetGroupName { name } => RemoteCommand::SetGroupName { name },
+        GroupMsg::SetTracks {
+            sender,
+            audio,
+            subtitle,
+            playlist_item_id,
+        } => RemoteCommand::SetTracks {
+            sender,
+            audio,
+            subtitle,
+            playlist_item_id,
+        },
+        GroupMsg::FollowTracks { member_id, follow } => {
+            RemoteCommand::FollowTracks { member_id, follow }
+        }
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             RemoteCommand::SetIgnoreWait { member_id, ignore }
         }
@@ -346,5 +360,39 @@ mod tests {
             playlist_item_id: "a".into(),
             new_index: -3,
         });
+    }
+
+    #[test]
+    fn tracks_commands_round_trip_over_the_bus() {
+        use crate::messages::TrackChoice;
+        let sender = MemberId::new();
+        survives_the_bus(|| GroupMsg::SetTracks {
+            sender,
+            audio: TrackChoice::Index(2),
+            subtitle: TrackChoice::Off,
+            playlist_item_id: Some("pli-1".into()),
+        });
+        survives_the_bus(|| GroupMsg::FollowTracks {
+            member_id: sender,
+            follow: false,
+        });
+    }
+
+    /// A replica from before the item id was added forwards `SetTracks`
+    /// without it; the owner takes that as "no stale check".
+    #[test]
+    fn a_tracks_command_without_an_item_id_still_decodes() {
+        let wire = format!(
+            r#"{{"SetTracks":{{"sender":"{}","audio":{{"index":2}},"subtitle":"unset"}}}}"#,
+            MemberId::new()
+        );
+        let cmd: RemoteCommand = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            cmd.into_group_msg(),
+            GroupMsg::SetTracks {
+                playlist_item_id: None,
+                ..
+            }
+        ));
     }
 }

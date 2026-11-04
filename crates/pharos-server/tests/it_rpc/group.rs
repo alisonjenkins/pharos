@@ -244,6 +244,10 @@ enum Seen {
         members: Vec<String>,
         member_ids: Vec<String>,
         buffering: Vec<String>,
+        /// Names of the members on their own tracks.
+        own_tracks: Vec<String>,
+        /// The group's audio, subtitle and who set them.
+        tracks: (String, String, String),
     },
     Play {
         at: u64,
@@ -263,6 +267,7 @@ enum Seen {
     Member {
         name: String,
         buffering: bool,
+        own_tracks: bool,
     },
     Left(String),
     Item {
@@ -319,6 +324,20 @@ impl server::group_sink::Handler for TestSink {
                         .filter(|m| m.get_buffering())
                         .map(|m| text(m.get_name()))
                         .collect(),
+                    own_tracks: g
+                        .get_members()?
+                        .iter()
+                        .filter(|m| m.get_own_tracks())
+                        .map(|m| text(m.get_name()))
+                        .collect(),
+                    tracks: {
+                        let t = g.get_tracks()?;
+                        (
+                            choice(t.get_audio()?),
+                            choice(t.get_subtitle()?),
+                            text(t.get_by()),
+                        )
+                    },
                 }
             }
             group_update::Play(a) => {
@@ -350,6 +369,7 @@ impl server::group_sink::Handler for TestSink {
                 Seen::Member {
                     name: text(m.get_name()),
                     buffering: m.get_buffering(),
+                    own_tracks: m.get_own_tracks(),
                 }
             }
             group_update::Left(id) => Seen::Left(text(id)),
@@ -734,6 +754,178 @@ async fn a_group_play_pause_and_seek_name_the_member_who_caused_them() {
     assert_eq!(by, a_id, "seek");
 }
 
+/// `Membership.setTracks` with an audio and a subtitle choice, each one of
+/// "unset", "off" or a stream index.
+async fn set_tracks(
+    member: &membership::Client,
+    audio: &str,
+    subtitle: &str,
+) -> Result<(), String> {
+    set_tracks_on(member, audio, subtitle, "").await
+}
+
+/// [`set_tracks`] made on the queue entry `playlist_item_id` (empty: any).
+async fn set_tracks_on(
+    member: &membership::Client,
+    audio: &str,
+    subtitle: &str,
+    playlist_item_id: &str,
+) -> Result<(), String> {
+    fn fill(mut out: pharos_api::pharos_capnp::track_choice::Builder<'_>, choice: &str) {
+        match choice {
+            "unset" => {}
+            "off" => {
+                out.set_set(true);
+                out.set_off(true);
+            }
+            index => {
+                out.set_set(true);
+                out.set_index(index.parse().unwrap());
+            }
+        }
+    }
+    let mut req = member.set_tracks_request();
+    {
+        let mut p = req.get();
+        set_device(p.reborrow().init_ctx(), "dev");
+        fill(p.reborrow().init_audio(), audio);
+        fill(p.reborrow().init_subtitle(), subtitle);
+        p.set_playlist_item_id(playlist_item_id);
+    }
+    let reply = req.send().promise.await.expect("call");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        pharos_api::pharos_capnp::done::Ok(()) => Ok(()),
+        pharos_api::pharos_capnp::done::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+/// V396: one member's audio and subtitle pick reaches the others naming who
+/// made it, and a late joiner starts on it in its `joined`.
+/// Disarm check: with `translate` dropping `ServerMsg::Tracks`, B's sink never
+/// sees it and this times out.
+#[actix_web::test]
+async fn a_tracks_pick_reaches_the_group_and_a_late_joiner() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    let a_id =
+        pharos_sync::hub::member_id_for_device(&format!("{}:dev-a", rig.fx.admin_id.0.simple()))
+            .to_string();
+    set_tracks(&pair.a, "2", "off").await.unwrap();
+    let tracks = until(&mut pair.b_seen, |s| match s {
+        Seen::Tracks {
+            audio,
+            subtitle,
+            by,
+        } => Some((audio.clone(), subtitle.clone(), by.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(tracks, ("2".into(), "off".into(), a_id.clone()));
+
+    // The other half is left as it was.
+    set_tracks(&pair.a, "unset", "5").await.unwrap();
+    let tracks = until(&mut pair.b_seen, |s| match s {
+        Seen::Tracks {
+            audio,
+            subtitle,
+            by,
+        } => Some((audio.clone(), subtitle.clone(), by.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(tracks, ("2".into(), "5".into(), a_id.clone()));
+
+    let gid = only_group(&rig).await;
+    let c_session = rig.session(&rig.fx.user_token).await;
+    let (c_sink, mut c_seen) = sink();
+    let _c = join(&c_session, "dev-c", &gid, c_sink).await.unwrap();
+    let Seen::Joined { tracks, .. } = until(&mut c_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(tracks, ("2".into(), "5".into(), a_id));
+}
+
+/// V396: a pick made on a queue entry the group has left is answered ok and
+/// dropped, so the next valid pick is the first the group hears.
+/// Disarm check: with the stale check removed, B hears the stale pick first.
+#[actix_web::test]
+async fn a_tracks_pick_from_another_queue_entry_is_dropped() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    set_tracks_on(&pair.a, "9", "unset", "not-the-playing-entry")
+        .await
+        .unwrap();
+    set_tracks(&pair.a, "3", "unset").await.unwrap();
+    let audio = until(&mut pair.b_seen, |s| match s {
+        Seen::Tracks { audio, .. } => Some(audio.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(audio, "3");
+}
+
+/// V396: "Just me" is announced to the group as a member update, shows in the
+/// roster a later joiner gets, and "Follow group" clears it.
+/// Disarm check: with `followTracks` answering ok without sending the
+/// `FollowTracks` message, A never sees the update and this times out.
+#[actix_web::test]
+async fn a_member_on_their_own_tracks_is_marked_in_the_roster() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    command!(pair.b, follow_tracks_request, set_follow(false)).unwrap();
+    let marked = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            own_tracks: true,
+            ..
+        } => Some(name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(marked, "guest");
+
+    let gid = only_group(&rig).await;
+    let c_session = rig.session(&rig.fx.user_token).await;
+    let (c_sink, mut c_seen) = sink();
+    let _c = join(&c_session, "dev-c", &gid, c_sink).await.unwrap();
+    let Seen::Joined { own_tracks, .. } = until(&mut c_seen, |s| {
+        matches!(s, Seen::Joined { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(own_tracks, ["guest"]);
+
+    command!(pair.b, follow_tracks_request, set_follow(true)).unwrap();
+    let cleared = until(&mut pair.a_seen, |s| match s {
+        Seen::Member {
+            name,
+            own_tracks: false,
+            ..
+        } if name == "guest" => Some(()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(cleared, ());
+}
+
+/// A member that has left cannot change the group's tracks.
+#[actix_web::test]
+async fn a_member_who_left_cannot_set_tracks() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    command!(pair.a, leave_request).unwrap();
+    assert_eq!(
+        set_tracks(&pair.a, "1", "unset").await.unwrap_err(),
+        "not found: group"
+    );
+}
+
 async fn next_pause(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {
     until(rx, |s| matches!(s, Seen::Pause { .. }).then(|| s.clone())).await
 }
@@ -963,6 +1155,7 @@ async fn a_members_buffering_reaches_the_others_as_a_member_update() {
         Seen::Member {
             name,
             buffering: true,
+            ..
         } => Some((name.clone(), true)),
         _ => None,
     })
@@ -979,6 +1172,7 @@ async fn a_members_buffering_reaches_the_others_as_a_member_update() {
         Seen::Member {
             name,
             buffering: false,
+            ..
         } => Some((name.clone(), false)),
         _ => None,
     })
@@ -1031,6 +1225,7 @@ async fn a_pauses_buffering_reaches_the_others_by_the_poll() {
         Seen::Member {
             name,
             buffering: true,
+            ..
         } => Some(name.clone()),
         _ => None,
     })
@@ -1047,6 +1242,7 @@ async fn a_pauses_buffering_reaches_the_others_by_the_poll() {
         Seen::Member {
             name,
             buffering: false,
+            ..
         } => Some(name.clone()),
         _ => None,
     })
