@@ -1512,13 +1512,15 @@ test.describe("pharos Dioxus UI play queue", () => {
     const tracks = await json(
       `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
     );
-    const track = tracks.Items?.find(
-      (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
-    );
+    // The seeded song (05-carefree.mp3) has an album and a track artist but
+    // no album artist tag, so the artist stands in for it.
+    type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
+    const by = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
+    const track = tracks.Items?.find((t: Song) => t.Album && by(t));
     test.skip(!track, "the seed has no track tagged with an album and artist");
     const artists = await json(`/Artists`);
-    const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
-    expect(artist, "the track's album artist is listed").toBeTruthy();
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === by(track));
+    expect(artist, "the track's artist is listed").toBeTruthy();
 
     await page.goto("/ui/");
     await page.evaluate(() => localStorage.removeItem("pharos.listen.queue"));
