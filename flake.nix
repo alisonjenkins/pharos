@@ -39,18 +39,18 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # `dx build` requires wasm-bindgen-cli to EXACTLY match the
-        # wasm-bindgen crate the project locks (0.2.128 in Cargo.lock),
+        # wasm-bindgen crate the project locks (0.2.130 in Cargo.lock),
         # but the pinned nixpkgs ships 0.2.121. Build the matching version
         # from crates.io. (Bump version + both hashes together when dioxus
         # bumps its wasm-bindgen pin.)
         wasmBindgenCli = pkgs.rustPlatform.buildRustPackage rec {
           pname = "wasm-bindgen-cli";
-          version = "0.2.128";
+          version = "0.2.130";
           src = pkgs.fetchCrate {
             inherit pname version;
-            hash = "sha256-a7lcXJnnZkYReja+iUO7NqqrWyv3toxnUgQb8s4IS5s=";
+            hash = "sha256-9Og1O/6/VC3sc5hBjoIWBErmLW2UHGMsTQO+6+m/dng=";
           };
-          cargoHash = "sha256-R1Tas33Ursy8kqsxguAkG0ZhNed2n5uFTAhw1l2qlLY=";
+          cargoHash = "sha256-j81sUf1m5yXU4FJfGj7GV+hdqVCV8mRmNb0QIsMCjqw=";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl ]
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.curl ];
