@@ -78,7 +78,7 @@ pub fn AccountMenuView(
                 aria_expanded: "{open}",
                 aria_controls: MENU_ID,
                 onclick: move |_| on_toggle.call(()),
-                span { class: "pharos-avatar", "aria-hidden": "true", {initials(&name)} }
+                Avatar { me: me.clone() }
             }
             if open {
                 // Catches a click anywhere else on the page and closes the menu.
@@ -111,6 +111,21 @@ pub fn AccountMenuView(
 }
 
 const MENU_ID: &str = "account-menu";
+
+/// The user's picture when they have one, else their initials. Decorative:
+/// whatever holds it names the account.
+#[component]
+pub fn Avatar(me: Option<Me>) -> Element {
+    let name = me.as_ref().map(|me| me.name.as_str()).unwrap_or_default();
+    match me.as_ref().and_then(|me| me.avatar_url.as_deref()) {
+        Some(url) => rsx! {
+            img { class: "pharos-avatar pharos-avatar-picture", src: "{url}", alt: "", "aria-hidden": "true" }
+        },
+        None => rsx! {
+            span { class: "pharos-avatar", "aria-hidden": "true", {initials(name)} }
+        },
+    }
+}
 
 /// A menu item that navigates in place, as [`super::views::Link`] does.
 #[component]
@@ -159,8 +174,10 @@ mod tests {
 
     fn me(name: &str, is_admin: bool) -> Option<Me> {
         Some(Me {
+            id: "0123".into(),
             name: name.into(),
             is_admin,
+            avatar_url: None,
         })
     }
 
@@ -181,6 +198,20 @@ mod tests {
         assert!(html.contains("aria-expanded=\"false\""), "{html}");
         assert!(!html.contains("Sign out"), "{html}");
         assert!(!html.contains("Appearance"), "{html}");
+    }
+
+    #[test]
+    fn a_user_with_an_avatar_sees_it_on_the_button() {
+        let mut with = me("alison jenkins", false);
+        if let Some(me) = &mut with {
+            me.avatar_url = Some("/UserImage?userId=0123&tag=ab".into());
+        }
+        let html = render(with, false);
+        assert!(
+            html.contains("src=\"/UserImage?userId=0123&#38;tag=ab\""),
+            "{html}"
+        );
+        assert!(!html.contains(">AJ<"), "{html}");
     }
 
     #[test]

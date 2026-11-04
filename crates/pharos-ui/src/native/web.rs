@@ -1458,6 +1458,126 @@ pub async fn pick_file(
         .ok_or_else(|| storage_error("the file is not text".into()))
 }
 
+/// Ask the user for a picture and return it ready to send as an avatar: at
+/// most `max_bytes`, scaled down in the browser first when it is bigger, so a
+/// phone photo fits one WebSocket message. `Ok(None)` when nothing was
+/// chosen. The server checks and re-encodes whatever arrives.
+pub async fn pick_picture(max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let input = document
+        .create_element("input")
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into::<web_sys::HtmlInputElement>()
+        .map_err(|_| "not an input element")?;
+    input.set_type("file");
+    input.set_accept("image/png,image/jpeg,image/webp,image/gif");
+    let body = document.body();
+    if let Some(body) = &body {
+        body.append_child(&input).map_err(|e| format!("{e:?}"))?;
+    }
+    let settled = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = input.add_event_listener_with_callback("change", &resolve);
+        let _ = input.add_event_listener_with_callback("cancel", &resolve);
+    });
+    input.click();
+    let _ = wasm_bindgen_futures::JsFuture::from(settled).await;
+    if let Some(body) = &body {
+        let _ = body.remove_child(&input);
+    }
+    let Some(file) = input.files().and_then(|files| files.get(0)) else {
+        return Ok(None);
+    };
+    if file.size() <= max_bytes as f64 {
+        return blob_bytes(&file).await.map(Some);
+    }
+    shrink_picture(&file, max_bytes).await.map(Some)
+}
+
+/// Longest the shorter side of a picture is sent at; the server keeps 512.
+const PICTURE_SHORT_SIDE: f64 = 1024.0;
+/// Longest the longer side is sent at, for a very wide or tall picture.
+const PICTURE_LONG_SIDE: f64 = 2048.0;
+
+/// Draws `file` onto a canvas no bigger than the sides above and encodes it,
+/// WebP where the browser can, else PNG, both keeping transparency; JPEG
+/// only when neither fits.
+async fn shrink_picture(file: &web_sys::File, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let decoded = window
+        .create_image_bitmap_with_blob(file)
+        .map_err(|e| format!("{e:?}"))?;
+    let bitmap: web_sys::ImageBitmap = wasm_bindgen_futures::JsFuture::from(decoded)
+        .await
+        .map_err(|_| "the browser could not read that picture".to_owned())?
+        .dyn_into()
+        .map_err(|_| "not an image bitmap")?;
+    let (w, h) = (f64::from(bitmap.width()), f64::from(bitmap.height()));
+    let scale = (PICTURE_SHORT_SIDE / w.min(h))
+        .min(PICTURE_LONG_SIDE / w.max(h))
+        .min(1.0);
+    let (cw, ch) = ((w * scale).round().max(1.0), (h * scale).round().max(1.0));
+    let canvas = window
+        .document()
+        .ok_or("no document")?
+        .create_element("canvas")
+        .map_err(|e| format!("{e:?}"))?
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .map_err(|_| "not a canvas")?;
+    canvas.set_width(cw as u32);
+    canvas.set_height(ch as u32);
+    let ctx = canvas
+        .get_context("2d")
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("no 2d context")?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| "not a 2d context")?;
+    ctx.draw_image_with_image_bitmap_and_dw_and_dh(&bitmap, 0.0, 0.0, cw, ch)
+        .map_err(|e| format!("{e:?}"))?;
+    bitmap.close();
+    for mime in ["image/webp", "image/png", "image/jpeg"] {
+        let Some(blob) = canvas_blob(&canvas, mime).await else {
+            continue;
+        };
+        // A browser that cannot write WebP gives PNG instead: try the next.
+        if blob.type_() != mime {
+            continue;
+        }
+        let bytes = blob_bytes(&blob).await?;
+        if bytes.len() <= max_bytes {
+            return Ok(bytes);
+        }
+    }
+    Err("that picture is too large even scaled down".to_owned())
+}
+
+async fn canvas_blob(canvas: &web_sys::HtmlCanvasElement, mime: &str) -> Option<web_sys::Blob> {
+    const QUALITY: f64 = 0.9;
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let done = Closure::once_into_js(move |blob: JsValue| {
+            let _ = resolve.call1(&JsValue::NULL, &blob);
+        });
+        let _ = canvas.to_blob_with_type_and_encoder_options(
+            done.unchecked_ref(),
+            mime,
+            &JsValue::from_f64(QUALITY),
+        );
+    });
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .ok()?
+        .dyn_into()
+        .ok()
+}
+
+async fn blob_bytes(blob: &web_sys::Blob) -> Result<Vec<u8>, String> {
+    let buffer = wasm_bindgen_futures::JsFuture::from(blob.array_buffer())
+        .await
+        .map_err(|_| "could not read the picture".to_owned())?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+}
+
 /// Resolves on the next animation frame with its timestamp. Browsers stop
 /// animation frames in a hidden tab, so a loop over this idles there.
 pub async fn animation_frame() -> f64 {
