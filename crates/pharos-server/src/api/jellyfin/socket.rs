@@ -1072,6 +1072,9 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // side, so don't emit it: keep the election internal and the client
         // console clean.
         ServerMsg::LeaderChange { .. } => None,
+        // Group tracks are native-only (V396): Jellyfin's SyncPlay has no
+        // track sync, so jellyfin-web members are never told.
+        ServerMsg::Tracks { .. } | ServerMsg::MemberTracks { .. } => None,
         // B24 — the session sent a group command but the server has no
         // membership for it (unrecoverable: no persisted snapshot names it).
         // jellyfin-web handles NotInGroup by disabling SyncPlay locally — a
@@ -1458,6 +1461,48 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
         assert_eq!(v["Data"]["Command"], "Pause");
         assert_eq!(v["Data"]["PositionTicks"], 654_321u64 * 10_000);
+    }
+
+    /// V396, V395: a Jellyfin member is told nothing about group tracks, and a
+    /// pause that names a member translates exactly as one that names none.
+    #[test]
+    fn jellyfin_hears_nothing_of_tracks_and_ignores_who_paused() {
+        use pharos_sync::messages::{GroupTracks, MemberId, TrackChoice};
+        let ctx = TranslateCtx {
+            group_id: None,
+            epoch_unix_ms: 0,
+            current_pli: Some("pli-1"),
+        };
+        let tracks = GroupTracks {
+            audio: TrackChoice::Index(1),
+            subtitle: TrackChoice::Off,
+            by: Some(MemberId::new()),
+        };
+        assert!(translate_outbound(ServerMsg::Tracks { tracks }, &ctx).is_none());
+        assert!(translate_outbound(
+            ServerMsg::MemberTracks {
+                member_id: MemberId::new(),
+                own_tracks: true,
+            },
+            &ctx
+        )
+        .is_none());
+        let pause = |by| {
+            let out = translate_outbound(
+                ServerMsg::Pause {
+                    by,
+                    at_server_ms: 1_000,
+                    position_ms: 5,
+                },
+                &ctx,
+            )
+            .unwrap();
+            // The id and the emit time are per message.
+            let mut data = serde_json::to_value(&out).unwrap()["Data"].take();
+            data.as_object_mut().unwrap().remove("EmittedAt");
+            data
+        };
+        assert_eq!(pause(Some(MemberId::new())), pause(None));
     }
 
     #[test]

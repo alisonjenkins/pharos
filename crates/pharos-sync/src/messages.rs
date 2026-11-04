@@ -61,6 +61,30 @@ pub struct MemberSummary {
     pub device: Option<String>,
 }
 
+/// One of the group's track choices: a stream index of the playing item.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackChoice {
+    /// The group has made no choice; each member keeps the player's default.
+    #[default]
+    Unset,
+    /// The stream with this index.
+    Index(u32),
+    /// Subtitles off.
+    Off,
+}
+
+/// The group's audio and subtitle choice and who made it last. Advisory:
+/// each following client applies it to its own player (ADR-0055).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupTracks {
+    pub audio: TrackChoice,
+    pub subtitle: TrackChoice,
+    /// `None` before any change, and when a queue change cleared the choice.
+    #[serde(default)]
+    pub by: Option<MemberId>,
+}
+
 /// Coarse group playback state, mirrored to Jellyfin's `GroupStateType`
 /// (`Idle`/`Waiting`/`Playing`/`Paused`). Emitted in [`ServerMsg::StateUpdate`]
 /// so a client can drive its SyncPlay UI (spinner while `Waiting`, etc.).
@@ -177,6 +201,16 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<MemberId>,
     },
+    /// The group's audio or subtitle choice changed, or a queue change cleared
+    /// it. Native only: the Jellyfin translation drops it.
+    Tracks {
+        tracks: GroupTracks,
+    },
+    /// A member went onto, or came back from, its own tracks. Native only.
+    MemberTracks {
+        member_id: MemberId,
+        own_tracks: bool,
+    },
     LeaderChange {
         leader: MemberId,
     },
@@ -248,6 +282,8 @@ impl ServerMsg {
             ServerMsg::Play { .. } => "play",
             ServerMsg::Pause { .. } => "pause",
             ServerMsg::Seek { .. } => "seek",
+            ServerMsg::Tracks { .. } => "tracks",
+            ServerMsg::MemberTracks { .. } => "member_tracks",
             ServerMsg::LeaderChange { .. } => "leader_change",
             ServerMsg::MemberJoined { .. } => "member_joined",
             ServerMsg::MemberLeft { .. } => "member_left",

@@ -180,6 +180,8 @@ pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
         | ServerMsg::LeaderChange { .. }
         | ServerMsg::MemberJoined { .. }
         | ServerMsg::MemberLeft { .. }
+        | ServerMsg::Tracks { .. }
+        | ServerMsg::MemberTracks { .. }
         | ServerMsg::StateUpdate { .. }
         | ServerMsg::Error { .. }
         | ServerMsg::NotInGroup
