@@ -346,7 +346,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                         load();
                         let m = mix.peek().clone();
                         if let Some(m) = m {
-                            editing.set(Some(SavedMix { name: m.name, spec: m.spec }));
+                            editing.set(Some(SavedMix::new(m.name, m.spec)));
                         }
                     },
                     "Edit"
@@ -400,9 +400,14 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                 }
                 for mine in saved().unwrap_or_default() {
                     li { key: "saved-{mine.name}", class: "pharos-mix-saved",
+                        // A newer app's mix holds rules this one cannot
+                        // read: playing it would skip them, editing would
+                        // drop them. It can still be deleted.
                         button {
                             class: "pharos-mix-choice",
                             r#type: "button",
+                            disabled: mine.newer.is_some(),
+                            title: if mine.newer.is_some() { "Made with a newer Pharos app" } else { "" },
                             onclick: {
                                 let mine = mine.clone();
                                 move |_| begin(mine.name.clone(), mine.spec.clone())
@@ -412,6 +417,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                         button {
                             class: "pharos-queue-icon",
                             r#type: "button",
+                            disabled: mine.newer.is_some(),
                             aria_label: "Edit {mine.name}",
                             title: "Edit",
                             onclick: {
@@ -438,10 +444,10 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                         class: "pharos-mix-choice pharos-mix-new",
                         r#type: "button",
                         onclick: move |_| {
-                            editing.set(Some(SavedMix {
-                                name: "My mix".to_owned(),
-                                spec: MixSpec { artist_gap: 3, album_gap: 5, ..MixSpec::default() },
-                            }))
+                            editing.set(Some(SavedMix::new(
+                                "My mix",
+                                MixSpec { artist_gap: 3, album_gap: 5, ..MixSpec::default() },
+                            )))
                         },
                         "New mix…"
                     }
@@ -993,10 +999,7 @@ mod tests {
 
     #[test]
     fn a_draft_names_its_first_problem() {
-        let mut d = SavedMix {
-            name: " ".into(),
-            spec: MixSpec::default(),
-        };
+        let mut d = SavedMix::new(" ", MixSpec::default());
         assert_eq!(draft_problem(&d).as_deref(), Some("Give the mix a name."));
         d.name = "Mine".into();
         assert_eq!(draft_problem(&d), None);
