@@ -53,10 +53,6 @@ impl Env for AppEnv {
     fn warn(&self, message: &str) {
         platform::warn(message);
     }
-
-    fn info(&self, message: &str) {
-        platform::info(message);
-    }
 }
 
 /// The page's `<video>` as the group drives it.
