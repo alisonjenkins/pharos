@@ -83,14 +83,18 @@ impl GroupPlayer for VideoPlayer {
 pub struct Together {
     /// The group as the viewer sees it; reading it subscribes the caller.
     pub view: Signal<GroupView>,
+    /// Why the last create or join failed. It lives with the app, not a
+    /// screen: the attempt outlasts the screen that started it.
+    pub error: Signal<Option<String>>,
     ui: Coroutine<Ui>,
     current: Rc<RefCell<Option<Rc<AppSession>>>>,
 }
 
 impl Together {
-    pub fn new(view: Signal<GroupView>, ui: Coroutine<Ui>) -> Self {
+    pub fn new(view: Signal<GroupView>, error: Signal<Option<String>>, ui: Coroutine<Ui>) -> Self {
         Self {
             view,
+            error,
             ui,
             current: Rc::default(),
         }
