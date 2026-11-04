@@ -317,6 +317,81 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
     });
 
+    test("a user sets and removes their avatar from the Account page", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-avatar-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token } = await auth.json();
+      const name = `pw-avatar-${Date.now()}`;
+      const created = await request.post(`${PHAROS_URL}/Users/New`, {
+        headers: { "X-Emby-Token": token, "Content-Type": "application/json" },
+        data: { Name: name, Password: "avatar-pass" },
+      });
+      expect(created.ok()).toBeTruthy();
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(name);
+      await page.locator("#signin-password").fill("avatar-pass");
+      await page.getByRole("button", { name: "Sign in" }).click();
+      const account = page.getByRole("button", { name: "Account", exact: true });
+      await expect(account.locator("img")).toHaveCount(0);
+      await account.click();
+      await page.getByRole("menuitem", { name: "Account" }).click();
+
+      // A noisy picture well over the 768 KiB a message may carry, so the
+      // browser has to scale it down before it sends it.
+      const big = await page.evaluate(async () => {
+        const c = document.createElement("canvas");
+        c.width = c.height = 900;
+        const ctx = c.getContext("2d")!;
+        const data = ctx.createImageData(900, 900);
+        for (let i = 0; i < data.data.length; i += 65536) {
+          crypto.getRandomValues(data.data.subarray(i, i + 65536));
+        }
+        for (let i = 3; i < data.data.length; i += 4) data.data[i] = 255;
+        ctx.putImageData(data, 0, 0);
+        const blob: Blob = await new Promise((r) => c.toBlob((b) => r(b!), "image/png"));
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 8192) {
+          bin += String.fromCharCode(...bytes.subarray(i, i + 8192));
+        }
+        return btoa(bin);
+      });
+      expect(Buffer.from(big, "base64").length).toBeGreaterThan(768 * 1024);
+      const chooser = page.waitForEvent("filechooser");
+      await page.locator("#avatar-choose").click();
+      await (await chooser).setFiles({
+        name: "noise.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(big, "base64"),
+      });
+
+      // The menu button and the page now show the server's picture.
+      const picture = account.locator("img");
+      await expect(picture).toHaveAttribute("src", /^\/UserImage\?userId=[0-9a-f]{32}&tag=[0-9a-f]{16}$/);
+      await expect
+        .poll(() => picture.evaluate((img: HTMLImageElement) => img.naturalWidth))
+        .toBe(512);
+      await expect(page.locator("#avatar-remove")).toBeVisible();
+
+      await page.locator("#avatar-remove").click();
+      await expect(account.locator("img")).toHaveCount(0);
+      await expect(page.locator("#avatar-remove")).toHaveCount(0);
+    });
+
     test("a wrong password says so", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },

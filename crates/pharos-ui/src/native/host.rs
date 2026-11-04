@@ -223,6 +223,10 @@ pub async fn pick_file(
     Ok(None)
 }
 
+pub async fn pick_picture(_max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+    Ok(None)
+}
+
 /// No frames on the host: a render loop here waits forever.
 pub async fn animation_frame() -> f64 {
     std::future::pending().await

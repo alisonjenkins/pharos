@@ -7,10 +7,11 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    decision_result, detail_result, done, home_result, index_result, item_id, item_query,
-    item_summary, items_result, library, lyrics_result, me_result, negotiate_result, opt_u16,
-    opt_u32, playback, playback_grant, pref_result, prefs, session, stream_choice, telemetry,
-    track, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
+    avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
+    item_query, item_summary, items_result, library, lyrics_result, me_result, negotiate_result,
+    opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session, stream_choice,
+    telemetry, track, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind,
+    SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -421,8 +422,13 @@ pub struct NativeApi {
 /// The signed-in user, as `Session.me` reports them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Me {
+    /// The user's id in the simple hex form Jellyfin's routes take.
+    pub id: String,
     pub name: String,
     pub is_admin: bool,
+    /// Where the user's avatar is, when they have one; the URL carries its
+    /// tag, so it changes when the picture does.
+    pub avatar_url: Option<String>,
 }
 
 /// One client event for `Telemetry.submit`, in plain Rust types.
@@ -460,9 +466,20 @@ impl NativeApi {
         {
             me_result::Me(me) => {
                 let me = me?;
+                let id: String = me
+                    .get_id()?
+                    .get_uuid()?
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let tag = text(me.get_avatar_tag())?;
+                let avatar_url =
+                    (!tag.is_empty()).then(|| format!("/UserImage?userId={id}&tag={tag}"));
                 Ok(Me {
+                    id,
                     name: text(me.get_name())?,
                     is_admin: me.get_is_admin(),
+                    avatar_url,
                 })
             }
             me_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -489,6 +506,43 @@ impl NativeApi {
             p.set_current(current);
             p.set_new(new);
         }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Sets the signed-in user's avatar from a picture's bytes; answers the
+    /// new tag.
+    pub async fn set_avatar(&self, call: &CallInfo, image: &[u8]) -> Result<String, ClientError> {
+        let mut req = self.session.set_avatar_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_image(image);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            avatar_result::Tag(tag) => Ok(text(tag)?),
+            avatar_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Removes the signed-in user's avatar.
+    pub async fn remove_avatar(&self, call: &CallInfo) -> Result<(), ClientError> {
+        let mut req = self.session.remove_avatar_request();
+        call.write(req.get().init_ctx());
         let reply = req.send().promise.await?;
         match reply
             .get()?
