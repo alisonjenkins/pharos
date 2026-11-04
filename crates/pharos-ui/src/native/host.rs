@@ -137,6 +137,12 @@ pub fn session_set(_key: &str, _value: &str) -> Result<(), String> {
 
 pub fn toggle_fullscreen(_id: &str) {}
 
+pub fn pip_supported() -> bool {
+    false
+}
+
+pub fn toggle_pip(_id: &str) {}
+
 pub fn focus_by_id(_id: &str) {}
 
 pub fn now_ms() -> f64 {

@@ -1836,6 +1836,7 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
                 // In place of this episode, so Back leaves the show rather than
                 // replaying every episode watched.
                 Control::Play(id) => go(id),
