@@ -116,7 +116,11 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
     // container that cannot seek is read from the top instead, so the gate
     // never waits for a start it will not reach.
     let start_ms = if start_ms > 0 {
-        let start_us = origin_us + (start_ms as i64) * 1000;
+        let start_us = origin_us.saturating_add(
+            i64::try_from(start_ms)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1000),
+        );
         if ictx.seek(start_us, ..start_us).is_ok() {
             start_ms
         } else {
