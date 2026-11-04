@@ -129,6 +129,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 base64 = "0.23"
+# Avatar uploads: decoded and re-encoded in memory-safe Rust, not ffmpeg.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 sonic-rs = "0.5"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "2"
