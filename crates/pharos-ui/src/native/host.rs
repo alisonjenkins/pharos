@@ -155,6 +155,19 @@ pub fn now_ms() -> f64 {
     0.0
 }
 
+pub fn wall_clock_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_millis() as f64)
+}
+
+/// The hour and minute of `epoch_ms`, in UTC. Only tests render on the
+/// host, and they have no locale to follow.
+pub fn local_time(epoch_ms: f64) -> Option<String> {
+    let minutes = (epoch_ms / 60_000.0) as u64;
+    Some(format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60))
+}
+
 pub fn spawn_detached(_fut: impl std::future::Future<Output = ()> + 'static) {}
 
 /// The host has no DOM to observe.

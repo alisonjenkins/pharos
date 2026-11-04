@@ -7,6 +7,7 @@ use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, Librar
 
 use super::depth;
 use super::platform;
+use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
@@ -444,6 +445,7 @@ pub fn TitleView(
     #[props(default)]
     seen: Vec<MemberSeen>,
 ) -> Element {
+    use_ends_at_refresh();
     let item = &detail.item;
     let in_group = if seen.is_empty() {
         Vec::new()
@@ -454,6 +456,7 @@ pub fn TitleView(
         item.year.map(|y| y.to_string()),
         runtime(item.runtime_ms),
         episode_label(item),
+        title_ends_at(&detail),
     ]
     .into_iter()
     .flatten()
@@ -658,6 +661,45 @@ fn sub_lines(item: &Item) -> Vec<String> {
             .collect(),
         _ => item.year.map(|y| y.to_string()).into_iter().collect(),
     }
+}
+
+/// When a film or episode would end if played now, from where Play starts.
+fn title_ends_at(detail: &Detail) -> Option<String> {
+    let item = &detail.item;
+    if !matches!(item.kind, ItemKind::Movie | ItemKind::Episode) {
+        return None;
+    }
+    let from = start_ms(item.position_ms, item.played);
+    ends_at(left_to_watch(&detail.segments, from, item.runtime_ms))
+}
+
+/// How often an "Ends at" estimate is worked out again when nothing else
+/// redraws it, as on a title page or in a paused player.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+const ENDS_AT_REFRESH_MS: u32 = 30_000;
+
+/// Redraws the calling component every [`ENDS_AT_REFRESH_MS`], so an
+/// "Ends at" it shows keeps up with the clock.
+pub fn use_ends_at_refresh() {
+    let tick = use_signal(|| 0u32);
+    // The host's sleep returns at once, so this would spin there.
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    use_future(move || async move {
+        let mut tick = tick;
+        loop {
+            platform::sleep_ms(ENDS_AT_REFRESH_MS).await;
+            let next = tick.peek().wrapping_add(1);
+            tick.set(next);
+        }
+    });
+    tick();
+}
+
+/// "Ends at 10:42 PM": the local time `left` runs out if watched from now.
+pub fn ends_at(left: Option<Left>) -> Option<String> {
+    let left = left?;
+    let time = platform::local_time(platform::wall_clock_ms() + left.ms as f64)?;
+    Some(ends_at_label(&time, left.before_credits))
 }
 
 /// How far into an unfinished item the user is, 1–99.
@@ -1113,6 +1155,44 @@ mod tests {
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
         }
+    }
+
+    #[test]
+    fn a_title_says_when_it_ends_and_whether_that_is_before_the_credits() {
+        use pharos_client::api::{Segment, SegmentKind};
+        let detail = |kind, segments| {
+            let mut i = item(kind);
+            i.runtime_ms = 42 * 60_000;
+            Detail {
+                item: i,
+                overview: String::new(),
+                genres: vec![],
+                chapters: vec![],
+                audio_tracks: vec![],
+                subtitle_tracks: vec![],
+                trickplay: vec![],
+                segments,
+            }
+        };
+        let outro = Segment {
+            kind: SegmentKind::Outro,
+            start_ms: 40 * 60_000,
+            end_ms: 42 * 60_000,
+        };
+        let shown = |d: Detail| render(move || rsx! { TitleView { detail: d.clone() } });
+
+        let html = shown(detail(ItemKind::Episode, vec![outro]));
+        assert!(
+            html.contains("· Ends at ") && html.contains(" (before credits)"),
+            "{html}"
+        );
+        let html = shown(detail(ItemKind::Movie, vec![]));
+        assert!(
+            html.contains("· Ends at ") && !html.contains("credits"),
+            "{html}"
+        );
+        let html = shown(detail(ItemKind::Audio, vec![]));
+        assert!(!html.contains("Ends at"), "{html}");
     }
 
     #[test]
