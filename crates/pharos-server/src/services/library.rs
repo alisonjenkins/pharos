@@ -787,15 +787,38 @@ pub(crate) async fn grouped(
 }
 
 /// What the library filter bar needs beside a listing (B312/V252): where
-/// each first letter starts in it, and the genres there are to pick from.
+/// each section of it starts, and the genres there are to pick from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListIndex {
-    /// Each letter the listing holds and the offset of its first item, in
-    /// listing order. `#` is any name not starting A to Z.
-    pub letters: Vec<(char, u32)>,
+    /// Each section the listing holds and the offset of its first item, in
+    /// listing order: first letters in name order (`#` is any name not
+    /// starting A to Z), years in a date order (B317/V256; `#` is no date).
+    pub letters: Vec<(String, u32)>,
     /// The genres under the parent and kind, by name; the query's own genre
     /// and filters do not narrow it.
     pub genres: Vec<String>,
+}
+
+/// What a listing's sections are, by the first key it is sorted on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sections {
+    /// The first letter of the sort name.
+    Letters,
+    /// The year of release: the premiere date's, else the production year.
+    Released,
+    /// The year the item was added.
+    Added,
+}
+
+impl Sections {
+    /// The sections a listing sorted by `sort_by` falls into.
+    pub fn of(sort_by: Option<&str>) -> Self {
+        match sort_by.and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty())) {
+            Some("PremiereDate" | "ProductionYear") => Self::Released,
+            Some("DateCreated" | "DateAdded") => Self::Added,
+            _ => Self::Letters,
+        }
+    }
 }
 
 /// The letter a sort key files under: its first character upper-cased when
@@ -807,19 +830,58 @@ pub fn letter_of(key: &str) -> char {
     }
 }
 
-/// Where each letter first appears among `names` taken in listing order,
-/// filed by [`pharos_core::sort_name`] (the key `SortName` orders by, which
-/// drops a leading article). Walking the real order keeps every start an
-/// item of that letter whatever collation the store sorted with.
-pub fn letter_starts<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(char, u32)> {
-    let mut starts: Vec<(char, u32)> = Vec::new();
-    for (at, name) in (0u32..).zip(names) {
-        let letter = letter_of(&pharos_core::sort_name(name));
-        if !starts.iter().any(|&(seen, _)| seen == letter) {
-            starts.push((letter, at));
+/// The year in a unix-seconds date, as the rail labels it.
+fn year_of(unix_secs: i64) -> String {
+    let iso = crate::api::jellyfin::dto::format_iso8601(unix_secs);
+    iso.get(..4).unwrap_or("#").to_owned()
+}
+
+/// Where each section first appears among `labels` taken in listing order.
+/// Walking the real order keeps every start an item of that section
+/// whatever collation or null placement the store sorted with.
+pub fn section_starts(labels: impl IntoIterator<Item = String>) -> Vec<(String, u32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut starts: Vec<(String, u32)> = Vec::new();
+    for (at, label) in (0u32..).zip(labels) {
+        if seen.insert(label.clone()) {
+            starts.push((label, at));
         }
     }
     starts
+}
+
+/// The section a stored item is in.
+fn item_section(sections: Sections, item: &MediaItem) -> String {
+    let year = match sections {
+        Sections::Letters => return letter_of(&pharos_core::sort_name(&item.title)).to_string(),
+        Sections::Released => item
+            .metadata
+            .premiere_date
+            .map(year_of)
+            .or_else(|| item.metadata.production_year.map(|y| y.to_string())),
+        Sections::Added => item.created_at.map(year_of),
+    };
+    year.unwrap_or_else(|| "#".to_owned())
+}
+
+/// The section a synthesised group's DTO is in.
+fn dto_section(sections: Sections, dto: &serde_json::Value) -> String {
+    let iso_year = |field: &str| {
+        dto[field]
+            .as_str()
+            .and_then(|d| d.get(..4))
+            .map(str::to_owned)
+    };
+    let year = match sections {
+        Sections::Letters => {
+            let name = dto["Name"].as_str().unwrap_or_default();
+            return letter_of(&pharos_core::sort_name(name)).to_string();
+        }
+        Sections::Released => iso_year("PremiereDate")
+            .or_else(|| dto["ProductionYear"].as_u64().map(|y| y.to_string())),
+        Sections::Added => iso_year("DateCreated"),
+    };
+    year.unwrap_or_else(|| "#".to_owned())
 }
 
 /// The [`ListIndex`] of the listing `q` asks for under `parent_id`: the same
@@ -844,11 +906,11 @@ pub async fn index(
         filters: None,
         ..unpaged.clone()
     };
-    let dto_name = |dto: &serde_json::Value| dto["Name"].as_str().unwrap_or_default().to_owned();
+    let sections = Sections::of(q.sort_by.as_deref());
     if let Some(grouping) = grouping {
         let group = |q| grouped(state, user, parent_id, grouping, q);
         let listed = group(&unpaged).await?;
-        let names: Vec<String> = listed.items.iter().map(dto_name).collect();
+        let letters = section_starts(listed.items.iter().map(|dto| dto_section(sections, dto)));
         // Unnarrowed, the listing already is every group there is to pick
         // genres from; folding the episodes again would only repeat it.
         let pool = if q.genre.is_none() && q.filters.is_none() {
@@ -867,10 +929,7 @@ pub async fn index(
             }
         }
         genres.sort_by_key(|g| g.to_lowercase());
-        return Ok(ListIndex {
-            letters: letter_starts(names.iter().map(String::as_str)),
-            genres,
-        });
+        return Ok(ListIndex { letters, genres });
     }
     let store = |e: DomainError| GroupError::Store(e.to_string());
     let listed = query(state, user, parent_id, &unpaged)
@@ -907,7 +966,7 @@ pub async fn index(
         genres
     };
     Ok(ListIndex {
-        letters: letter_starts(listed.items.iter().map(|i| i.title.as_str())),
+        letters: section_starts(listed.items.iter().map(|i| item_section(sections, i))),
         genres,
     })
 }
@@ -1293,13 +1352,50 @@ mod tests {
             "Zulu",
         ];
         assert_eq!(
-            super::letter_starts(names),
-            [('#', 0), ('A', 2), ('B', 3), ('Z', 6)]
+            letter_starts(names),
+            starts(&[("#", 0), ("A", 2), ("B", 3), ("Z", 6)])
         );
     }
 
     #[test]
     fn a_leading_article_files_under_the_next_word() {
-        assert_eq!(super::letter_starts(["The Matrix"]), [('M', 0)]);
+        assert_eq!(letter_starts(["The Matrix"]), starts(&[("M", 0)]));
+    }
+
+    #[test]
+    fn date_sections_are_years_in_listing_order() {
+        let years = ["2024", "2024", "2019", "#", "#"].map(String::from);
+        assert_eq!(
+            super::section_starts(years),
+            starts(&[("2024", 0), ("2019", 2), ("#", 3)])
+        );
+    }
+
+    #[test]
+    fn the_first_sort_key_picks_the_sections() {
+        use super::Sections;
+        assert!(matches!(Sections::of(None), Sections::Letters));
+        assert!(matches!(Sections::of(Some("SortName")), Sections::Letters));
+        assert!(matches!(
+            Sections::of(Some("PremiereDate,ProductionYear,SortName")),
+            Sections::Released
+        ));
+        assert!(matches!(
+            Sections::of(Some("DateCreated,SortName")),
+            Sections::Added
+        ));
+    }
+
+    /// Sections in name order, labelled as `item_section` labels a title.
+    fn letter_starts<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<(String, u32)> {
+        super::section_starts(
+            names
+                .into_iter()
+                .map(|name| super::letter_of(&pharos_core::sort_name(name)).to_string()),
+        )
+    }
+
+    fn starts(want: &[(&str, u32)]) -> Vec<(String, u32)> {
+        want.iter().map(|&(l, i)| (l.to_owned(), i)).collect()
     }
 }
