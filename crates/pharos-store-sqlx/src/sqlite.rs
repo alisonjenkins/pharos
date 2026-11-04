@@ -1968,6 +1968,61 @@ impl PersonStore for SqliteStore {
             )
             .collect())
     }
+
+    #[tracing::instrument(skip(self, items), fields(items = items.len()))]
+    async fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One JSON-array bind instead of a placeholder per id: a long-running
+        // show has more episodes than is comfortable to spell out as `?`s.
+        let ids = serde_json::to_string(items)
+            .map_err(|e| DomainError::Backend(format!("encode item ids: {e}")))?;
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+            ),
+        >(
+            "SELECT ip.item_id, p.name, p.wire_id, ip.role, ip.character, ip.sort_order, \
+                 p.thumb_url \
+             FROM item_people ip JOIN people p ON p.id = ip.person_id \
+             WHERE ip.item_id IN (SELECT value FROM json_each(?)) \
+               AND ip.person_kind = 'Actor'",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(item, name, wire_id, role, character, sort_order, thumb_url)| {
+                    (
+                        item.max(0) as MediaId,
+                        ItemPerson {
+                            name,
+                            wire_id,
+                            role: Some(role).filter(|r| !r.is_empty()),
+                            character,
+                            kind: PersonKind::Actor,
+                            sort_order: sort_order.map(|n| n.max(0) as u32),
+                            thumb_url,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
 }
 
 impl StudioStore for SqliteStore {
