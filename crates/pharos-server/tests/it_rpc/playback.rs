@@ -426,6 +426,19 @@ async fn a_released_grant_ends_its_playback_at_the_last_report() {
             .unwrap()
             .last_played_position_ticks
     };
+    // The stop on release runs after the grant goes, so wait for its write.
+    let settles_at = |ticks: u64| {
+        let position = &position;
+        async move {
+            for _ in 0..100 {
+                if position().await == ticks {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    };
     let closed = |url: String| {
         let app = &app;
         async move {
@@ -450,7 +463,7 @@ async fn a_released_grant_ends_its_playback_at_the_last_report() {
         closed(decided.url).await,
         "the released grant's stream closes"
     );
-    assert_eq!(position().await, 300_000_000);
+    assert!(settles_at(300_000_000).await, "the last report is saved");
 
     let (grant, decided) = play().await.unwrap();
     drop(grant);
