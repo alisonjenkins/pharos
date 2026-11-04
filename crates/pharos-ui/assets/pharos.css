@@ -1431,6 +1431,37 @@ button.pharos-lyrics-line:focus-visible {
 .pharos-lyrics-break {
   height: 1rem;
 }
+/* Karaoke (B483/V427): the sung line is large and fills in from left to
+   right. The fill is a gradient clipped to the text; on an inline span a
+   wrapped line's pieces share one gradient, so the fill runs row by row.
+   The player reports its position about four times a second, and the
+   registered property lets the fill glide between reports. */
+@property --pharos-wipe {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 0%;
+}
+.pharos-lyrics[data-karaoke="true"] button.pharos-lyrics-line {
+  opacity: 0.4;
+}
+.pharos-lyrics[data-karaoke="true"] button.pharos-lyrics-line[data-state="current"] {
+  opacity: 1;
+  scale: 1;
+  font-size: clamp(1.6rem, 4.5vw, 2.6rem);
+  line-height: 1.2;
+  text-shadow: none;
+  padding-block: 0.6rem;
+}
+.pharos-lyrics-words {
+  background-image: linear-gradient(90deg, var(--px-color-accent) var(--pharos-wipe), var(--px-color-fg) var(--pharos-wipe));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-box-decoration-break: slice;
+  box-decoration-break: slice;
+  transition: --pharos-wipe 300ms linear;
+  filter: drop-shadow(0 0 14px var(--pharos-glow));
+}
 .pharos-listen-note {
   grid-column: 1 / -1;
   margin: 0;
@@ -1531,6 +1562,7 @@ button.pharos-lyrics-line:focus-visible {
   .pharos-listen-play,
   .pharos-listen .pharos-chip,
   button.pharos-lyrics-line,
+  .pharos-lyrics-words,
   .pharos-listen-range::-webkit-slider-thumb,
   .pharos-listen-range::-moz-range-thumb {
     transition: none;
