@@ -2,6 +2,7 @@
 //! served at `/`. The older REST panes stay reachable at `/manage`.
 
 pub mod account;
+pub mod account_settings;
 pub mod app;
 pub mod appearance;
 pub mod backdrop;
