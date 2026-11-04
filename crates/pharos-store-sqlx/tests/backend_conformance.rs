@@ -1645,10 +1645,13 @@ where
     // Spec 024 / V385 — audio analysis: written by `put_audio_analysis` only,
     // kept across a re-`put`, valid only while the file signature matches.
     // -----------------------------------------------------------------
-    let song: MediaId = 7600;
+    // A fresh id per run (as section 10b does with its tag), so a second run
+    // against a persistent postgres does not find last run's analysis. The
+    // shift keeps it, and `song + 1`, inside i64.
+    let song: MediaId = (UserId::new().0.as_u128() as u64) >> 2;
     let mut item = media_item(song, "song");
     item.kind = MediaKind::Audio;
-    item.path = "/media/conformance/song.flac".into();
+    item.path = format!("/media/conformance/song-{song}.flac").into();
     MediaStore::put(&store, item.clone()).await.unwrap();
     assert_eq!(
         MediaStore::get(&store, song)
@@ -1742,7 +1745,7 @@ where
         Some(nothing)
     );
     // An absent row is a no-op.
-    MediaStore::put_audio_analysis(&store, 7601, analysis, (1, 1))
+    MediaStore::put_audio_analysis(&store, song + 1, analysis, (1, 1))
         .await
         .unwrap();
 }
