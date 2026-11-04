@@ -119,6 +119,30 @@ impl Default for MediaState {
     }
 }
 
+/// Where the viewer's volume and mute are kept, so the next player (each
+/// track and each renegotiated stream mounts a new media element) starts
+/// where they left it rather than at full volume.
+pub const VOLUME_KEY: &str = "pharos.volume";
+
+/// `volume` and `muted` as stored under [`VOLUME_KEY`].
+pub fn volume_setting(volume: f64, muted: bool) -> String {
+    let muted = if muted { " muted" } else { "" };
+    format!("{:.3}{muted}", volume.clamp(0.0, 1.0))
+}
+
+/// The volume and mute a [`volume_setting`] holds; `None` for anything else.
+pub fn parse_volume_setting(stored: &str) -> Option<(f64, bool)> {
+    let (level, muted) = match stored.strip_suffix(" muted") {
+        Some(level) => (level, true),
+        None => (stored, false),
+    };
+    let volume = level
+        .parse::<f64>()
+        .ok()
+        .filter(|v| (0.0..=1.0).contains(v))?;
+    Some((volume, muted))
+}
+
 /// A `<video>` event the report clock cares about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaEvent {
@@ -406,6 +430,24 @@ pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_volume_reads_back_as_it_was_set() {
+        for (volume, muted) in [(0.35, false), (0.0, true), (1.0, false), (0.5, true)] {
+            assert_eq!(
+                parse_volume_setting(&volume_setting(volume, muted)),
+                Some((volume, muted))
+            );
+        }
+        assert_eq!(volume_setting(1.7, false), "1.000");
+    }
+
+    #[test]
+    fn a_stored_volume_out_of_range_or_garbled_is_ignored() {
+        for stored in ["", "loud", "1.5", "-0.1", "NaN", "0.5 quiet", " muted"] {
+            assert_eq!(parse_volume_setting(stored), None, "{stored:?}");
+        }
+    }
 
     /// Buffering and readiness are for a watch-together group, not the
     /// server's progress report: they send nothing and do not disturb the

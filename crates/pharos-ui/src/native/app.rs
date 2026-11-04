@@ -25,8 +25,9 @@ use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
-    MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
+    choose_engine, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
+    volume_setting, Engine, MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock,
+    SubtitleSwitch, VOLUME_KEY,
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
@@ -280,6 +281,37 @@ fn log_lines(lines: &[device::Line]) {
 fn store_setting(key: &str, value: &str) {
     if let Err(e) = platform::store_theme(key, value) {
         platform::warn(&signal::storage_failed(key, &e));
+    }
+}
+
+/// Set the new media element to the viewer's last volume, if one is stored.
+fn restore_volume() {
+    let stored = match platform::stored_theme(VOLUME_KEY) {
+        Ok(stored) => stored,
+        Err(e) => {
+            platform::warn(&format!("pharos: volume storage read failed error={e}"));
+            return;
+        }
+    };
+    let Some(stored) = stored else {
+        return;
+    };
+    match parse_volume_setting(&stored) {
+        Some((volume, muted)) => {
+            platform::set_volume(VIDEO_ID, volume, muted);
+            platform::info(&format!(
+                "pharos: volume restored volume={volume:.3} muted={muted}"
+            ));
+        }
+        None => platform::warn(&format!(
+            "pharos: volume not restored reason=unreadable stored={stored:?}"
+        )),
+    }
+}
+
+fn remember_volume(volume: f64, muted: bool) {
+    if let Err(e) = platform::store_theme(VOLUME_KEY, &volume_setting(volume, muted)) {
+        platform::warn(&format!("pharos: volume storage write failed error={e}"));
     }
 }
 
@@ -1630,6 +1662,8 @@ fn Player(
             }
         }
     });
+    // Before the stream attaches, so autoplay never starts at full volume.
+    use_effect(restore_volume);
     use_effect({
         let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
         move || {
@@ -1747,6 +1781,7 @@ fn Player(
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
                 Control::Volume { volume, muted } => {
                     platform::set_volume(VIDEO_ID, volume, muted);
+                    remember_volume(volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
                 // In place of this episode, so Back leaves the show rather than
