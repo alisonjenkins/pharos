@@ -51,6 +51,8 @@ pub trait Env {
     fn report(&self, event: ClientEvent);
     fn ui(&self, ui: Ui);
     fn warn(&self, message: &str);
+    /// A decision the group took, for the console and the field logs.
+    fn info(&self, message: &str);
 }
 
 /// The `<video>` the group drives.
@@ -326,6 +328,11 @@ impl Inner {
         let grace = i64::try_from(SELF_SEEK_GRACE_MS).unwrap_or(i64::MAX);
         self.self_seek_ms
             .is_some_and(|seek| now.saturating_sub(seek) < grace)
+    }
+
+    /// Milliseconds since this session's last own seek, 0 when there was none.
+    fn since_self_seek(&self, now: i64) -> i64 {
+        self.self_seek_ms.map_or(0, |seek| now.saturating_sub(seek))
     }
 }
 
@@ -819,7 +826,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// buffering now, once.
     fn report_held_stall(&self) {
         let now = self.env.now_ms();
-        let (playlist, position, buffering) = {
+        let (playlist, position, buffering, line) = {
             let mut inner = self.inner.borrow_mut();
             if !inner.active
                 || !inner.held_waiting
@@ -831,14 +838,21 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let Some(player) = inner.player.clone() else {
                 return;
             };
+            let line = format!(
+                "pharos: group wait reported reason=grace_expired held_ms={} position_ms={}",
+                inner.since_self_seek(now),
+                player.position_ms()
+            );
             inner.held_waiting = false;
             inner.buffering_sent = true;
             (
                 inner.state.playlist_item_id.clone(),
                 player.position_ms(),
                 true,
+                line,
             )
         };
+        self.env.info(&line);
         self.report_buffering(playlist, position, buffering);
     }
 
@@ -851,7 +865,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// runs dry, ready when it can play a new item or a new position.
     pub fn on_media(&self, event: MediaEvent) {
         let now = self.env.now_ms();
-        let (playlist, position, playing, send_buffering, send_ready) = {
+        let (playlist, position, playing, send_buffering, send_ready, line) = {
             let mut inner = self.inner.borrow_mut();
             if !inner.active {
                 return;
@@ -861,9 +875,15 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             };
             let owes = inner.state.owes_ready;
             let (mut buffering, mut ready) = (None, false);
+            let mut line = None;
             match event {
                 MediaEvent::Waiting if !owes && !inner.buffering_sent => {
                     if inner.within_self_seek_grace(now) {
+                        line = Some(format!(
+                            "pharos: group wait held reason=self_seek since_seek_ms={} position_ms={}",
+                            inner.since_self_seek(now),
+                            player.position_ms()
+                        ));
                         inner.held_waiting = true;
                     } else {
                         inner.buffering_sent = true;
@@ -872,6 +892,18 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 }
                 MediaEvent::CanPlay | MediaEvent::Seeked | MediaEvent::Playing => {
                     if matches!(event, MediaEvent::CanPlay | MediaEvent::Playing) {
+                        if inner.held_waiting {
+                            let reason = if matches!(event, MediaEvent::CanPlay) {
+                                "canplay"
+                            } else {
+                                "playing"
+                            };
+                            line = Some(format!(
+                                "pharos: group wait released reason={reason} held_ms={} position_ms={}",
+                                inner.since_self_seek(now),
+                                player.position_ms()
+                            ));
+                        }
                         inner.held_waiting = false;
                         inner.self_seek_ms = None;
                     }
@@ -893,8 +925,12 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 !player.paused(),
                 buffering,
                 ready,
+                line,
             )
         };
+        if let Some(line) = line {
+            self.env.info(&line);
+        }
         if let Some(buffering) = send_buffering {
             self.report_buffering(playlist.clone(), position, buffering);
         }
@@ -920,6 +956,7 @@ mod tests {
         reports: Rc<RefCell<Vec<ClientEvent>>>,
         ui: Rc<RefCell<Vec<Ui>>>,
         tasks: Rc<RefCell<Vec<LocalBoxFuture<'static, ()>>>>,
+        logs: Rc<RefCell<Vec<String>>>,
     }
 
     impl Env for TestEnv {
@@ -945,6 +982,9 @@ mod tests {
             self.ui.borrow_mut().push(ui);
         }
         fn warn(&self, _message: &str) {}
+        fn info(&self, message: &str) {
+            self.logs.borrow_mut().push(message.to_owned());
+        }
     }
 
     impl TestEnv {
@@ -964,6 +1004,16 @@ mod tests {
 
         fn kinds(&self) -> Vec<ClientEventKind> {
             self.reports.borrow().iter().map(|e| e.kind).collect()
+        }
+
+        /// The logged lines that start with `prefix`.
+        fn logged(&self, prefix: &str) -> Vec<String> {
+            self.logs
+                .borrow()
+                .iter()
+                .filter(|l| l.starts_with(prefix))
+                .cloned()
+                .collect()
         }
     }
 
@@ -1303,6 +1353,14 @@ mod tests {
         rig.session.on_media(MediaEvent::Waiting);
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
+        assert_eq!(
+            rig.env
+                .logged(
+                    "pharos: group wait held reason=self_seek since_seek_ms=0 position_ms=20000"
+                )
+                .len(),
+            1
+        );
     }
 
     /// A wait that outlives the self-seek grace with no `canplay` is a real
@@ -1332,6 +1390,14 @@ mod tests {
         let sent = calls_with(&rig, "buffering");
         assert_eq!(sent.len(), 1);
         assert!(sent[0].ends_with(",true)"), "got {sent:?}");
+        assert_eq!(
+            rig.env
+                .logged(
+                    "pharos: group wait reported reason=grace_expired held_ms=5000 position_ms="
+                )
+                .len(),
+            1
+        );
     }
 
     /// A playing player stuck after a hard drift seek is not sought again
@@ -1385,10 +1451,17 @@ mod tests {
         rig.session.on_media(MediaEvent::Waiting);
         rig.session.on_media(MediaEvent::CanPlay);
         rig.env.settle();
+        assert_eq!(
+            rig.env
+                .logged("pharos: group wait released reason=canplay held_ms=0 ")
+                .len(),
+            1
+        );
         rig.env.now.set(105_000);
         assert!(rig.session.tick(1).now_or_never().is_some());
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
+        assert!(rig.env.logged("pharos: group wait reported").is_empty());
     }
 
     /// Playing group at 10 s of server time 100_000; our clock offset is 0.
