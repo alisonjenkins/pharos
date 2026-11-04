@@ -12,6 +12,31 @@
 /// always one the server has seen.
 pub const RUNGS: [u64; 4] = [8_000_000, 4_000_000, 2_000_000, 1_000_000];
 
+/// Where the last cap auto quality settled on is kept, in bits per second;
+/// absent or `0` is none. It is where the next video starts.
+pub const AUTO_RUNG_KEY: &str = "pharos.player.auto_rung";
+
+/// The cap a stored [`AUTO_RUNG_KEY`] value holds; anything that is not
+/// one of the [`RUNGS`] is none.
+pub fn parse_rung(stored: &str) -> u64 {
+    stored
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|bps| RUNGS.contains(bps))
+        .unwrap_or(0)
+}
+
+/// The cap to negotiate with: the lower of the viewer's manual maximum and
+/// the automatic one, where 0 is no limit.
+pub fn effective_cap(manual: u64, auto: u64) -> u64 {
+    match (manual, auto) {
+        (0, auto) => auto,
+        (manual, 0) => manual,
+        (manual, auto) => manual.min(auto),
+    }
+}
+
 /// A stall older than this no longer counts.
 const STALL_WINDOW_MS: u64 = 30_000;
 /// Stalls inside the window that step the quality down.
@@ -690,6 +715,25 @@ mod tests {
         w.stalled(46 * MS);
         w.stalled(50 * MS);
         assert!(w.evaluate(51 * MS).is_some());
+    }
+
+    #[test]
+    fn the_manual_maximum_and_the_automatic_cap_combine_to_the_lower() {
+        assert_eq!(effective_cap(0, 0), 0);
+        assert_eq!(effective_cap(4_000_000, 0), 4_000_000);
+        assert_eq!(effective_cap(0, 2_000_000), 2_000_000);
+        assert_eq!(effective_cap(2_000_000, 4_000_000), 2_000_000);
+        assert_eq!(effective_cap(4_000_000, 1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn a_stored_rung_is_read_only_when_it_is_one() {
+        assert_eq!(parse_rung("2000000"), 2_000_000);
+        assert_eq!(parse_rung(" 1000000 "), 1_000_000);
+        assert_eq!(parse_rung("0"), 0);
+        assert_eq!(parse_rung("3000000"), 0);
+        assert_eq!(parse_rung("fast"), 0);
+        assert_eq!(parse_rung(""), 0);
     }
 
     #[test]
