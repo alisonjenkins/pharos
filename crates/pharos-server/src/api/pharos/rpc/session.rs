@@ -329,7 +329,14 @@ impl server::session::Handler for Session {
             limit.set_max(NATIVE_MAX_AVATAR_BYTES as u64);
             return Ok(());
         }
-        match crate::avatar::set(&self.state.stores, user.id, image.to_vec()).await {
+        match crate::avatar::set(
+            &self.state.stores,
+            user.id,
+            image.to_vec(),
+            crate::avatar::raw,
+        )
+        .await
+        {
             Ok(tag) => result.set_tag(tag.as_str()),
             Err(e) => write_avatar_error(&e, result.init_error()),
         }
