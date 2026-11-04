@@ -242,11 +242,18 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator(".pharos-shell-bar")).toBeVisible({
         timeout: 15_000,
       });
-      await expect(
-        page.locator(".pharos-shell-nav").getByRole("link", { name: "Manage" }),
-      ).toBeVisible();
+      // The seeded user is an admin, so the account menu offers Manage.
+      const account = page.getByRole("button", { name: "Account", exact: true });
+      await expect(account).toHaveText(new RegExp(`^${TEST_USER.charAt(0).toUpperCase()}`));
+      await expect(account).toHaveAttribute("aria-expanded", "false");
+      await account.click();
+      await expect(account).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByRole("menuitem", { name: "Manage" })).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("menu")).toHaveCount(0);
 
-      await page.getByRole("button", { name: "Sign out" }).click();
+      await account.click();
+      await page.getByRole("menuitem", { name: "Sign out" }).click();
       await expect(page.locator("form#signin")).toBeVisible();
     });
 
@@ -1156,7 +1163,9 @@ test.describe("pharos Dioxus UI", () => {
       await page.locator("#signin-name").fill(TEST_USER);
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
-      await page.locator(".pharos-shell-nav").getByRole("link", { name: "Appearance" }).click();
+      await page.getByRole("button", { name: "Account", exact: true }).click();
+      await page.getByRole("menuitem", { name: "Appearance" }).click();
+      await expect(page.getByRole("menu")).toHaveCount(0);
       await expect(page).toHaveURL(/\/ui\/settings\/appearance$/);
       await expect(page.locator("li.pharos-theme-card")).toHaveCount(7);
 
