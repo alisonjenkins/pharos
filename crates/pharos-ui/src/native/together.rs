@@ -96,6 +96,10 @@ pub const RATE_BEHIND: f64 = 1.05;
 /// After a server command (play, pause, seek, item) the client leaves the
 /// player alone this long: the command owns the position until it settles.
 pub const SETTLE_AFTER_COMMAND_MS: u64 = 3_000;
+/// After this session seeks the player, the video's `waiting` is held for
+/// this long before it counts as the group buffering: a seek makes the video
+/// wait, and reporting that wait freezes the group, which seeks again.
+pub const SELF_SEEK_GRACE_MS: u64 = 5_000;
 
 /// What to do about the gap between where the player is and where the group
 /// says it should be.
