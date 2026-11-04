@@ -714,6 +714,13 @@ pub struct SeriesFolderDto {
     /// T9-series — community rating (0–10) from the matched provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub community_rating: Option<f32>,
+    /// B341 — the show's Rotten Tomatoes Tomatometer (0–100), from OMDb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critic_rating: Option<f32>,
+    /// B341 — the show's IMDb score (0–10), from OMDb. Not a Jellyfin field
+    /// (Jellyfin clients ignore it); the native API reads it from here.
+    #[serde(rename = "PharosImdbRating", skip_serializing_if = "Option::is_none")]
+    pub imdb_rating: Option<f32>,
     /// T9-series — parental rating string, e.g. "TV-14".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub official_rating: Option<String>,
@@ -2000,7 +2007,13 @@ impl BaseItemDto {
             overview: item.metadata.overview.clone(),
             taglines: item.metadata.tagline.iter().cloned().collect(),
             community_rating: item.metadata.community_rating,
-            critic_rating: item.metadata.critic_rating,
+            // B341 — an OMDb Tomatometer outranks an NFO <criticrating>.
+            critic_rating: item
+                .metadata
+                .ratings
+                .tomatometer
+                .map(f32::from)
+                .or(item.metadata.critic_rating),
             official_rating: item.metadata.official_rating.clone(),
             // LIB-C11 — fall back to the series folder's parsed year so
             // same-name shows (Cosmos 1980 vs 2014) are distinguishable
