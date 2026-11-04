@@ -38,6 +38,11 @@ const SEEK_GIVE_UP_MS: u32 = 5_000;
 const LYRICS_KEY: &str = "pharos.listen.lyrics";
 const LYRICS_HIDDEN: &str = "hidden";
 
+/// Device-local: whether the listener turned karaoke mode on (B483/V427).
+/// It starts off.
+const KARAOKE_KEY: &str = "pharos.listen.karaoke";
+const KARAOKE_ON: &str = "on";
+
 /// Device-local: whether the listener opened the queue. It starts closed,
 /// so the visualiser keeps the screen (B435/V375).
 const QUEUE_KEY: &str = "pharos.listen.queue";
@@ -162,6 +167,24 @@ pub fn ListenView(
         }
     };
     let lyrics = lyrics.filter(|l| !l.lines.is_empty());
+    let mut karaoke = use_signal(|| {
+        platform::stored_theme(KARAOKE_KEY)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(KARAOKE_ON)
+    });
+    let mut toggle_karaoke = move || {
+        let on = !karaoke();
+        karaoke.set(on);
+        platform::info(&format!("pharos: karaoke on={on}"));
+        if let Err(e) = platform::store_theme(KARAOKE_KEY, if on { KARAOKE_ON } else { "off" }) {
+            platform::warn(&format!("pharos: karaoke choice not stored error={e}"));
+        }
+    };
+    // Karaoke follows the words, so it is offered only for synced lyrics
+    // that are on screen.
+    let can_karaoke = show_lyrics() && lyrics.as_ref().is_some_and(|l| l.synced);
     let mut show_queue = use_signal(|| {
         platform::stored_theme(QUEUE_KEY).ok().flatten().as_deref() == Some(QUEUE_SHOWN)
     });
@@ -267,6 +290,16 @@ pub fn ListenView(
                         onclick: move |_| toggle_lyrics(),
                         {lyrics_label(lyrics.is_some(), lyrics_loading, lyrics_failed)}
                     }
+                    if can_karaoke {
+                        button {
+                            class: "pharos-chip pharos-karaoke-toggle",
+                            r#type: "button",
+                            title: "Fill in each line as it is sung",
+                            aria_pressed: if karaoke() { "true" } else { "false" },
+                            onclick: move |_| toggle_karaoke(),
+                            "Karaoke"
+                        }
+                    }
                     button {
                         class: "pharos-chip pharos-queue-toggle",
                         r#type: "button",
@@ -290,6 +323,7 @@ pub fn ListenView(
                     lyrics,
                     position_ms: media.position_ms,
                     on_seek: move |ms| on_control.call(Control::Seek(ms)),
+                    karaoke: karaoke(),
                 }
             }
             if show_queue() {
@@ -1122,6 +1156,20 @@ mod tests {
         assert!(html.contains(r#"aria-controls="pharos-lyrics""#), "{html}");
         assert!(!lyrics_toggle(&html).contains("disabled"), "{html}");
         assert!(html.contains(">Lyrics</button>"), "{html}");
+        // B483/V427: synced lyrics on screen offer karaoke, off to start.
+        assert!(html.contains("pharos-karaoke-toggle"), "{html}");
+        assert!(html.contains(r#"data-karaoke="false""#), "{html}");
+        let plain = Lyrics {
+            synced: false,
+            lines: vec![LyricLine {
+                start_ms: 0,
+                text: "Words".to_owned(),
+            }],
+        };
+        let html = render_full("Teardrop", None, MediaState::default(), Some(plain));
+        assert!(!html.contains("pharos-karaoke-toggle"), "{html}");
+        let none = render_full("Teardrop", None, MediaState::default(), None);
+        assert!(!none.contains("pharos-karaoke-toggle"), "{none}");
     }
 
     /// The opening tag of the lyrics toggle.
