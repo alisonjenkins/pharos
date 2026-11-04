@@ -1408,7 +1408,7 @@ fn WatchScreen(id: ItemRef) -> Element {
             Some((_, None)) => return,
             // The album could not be read; a song played from the queue
             // still leaves it.
-            None if queue.peek().next() == Some(id) => None,
+            None if queue.peek().expects(id) => None,
             None => return,
         };
         queue.write().started(id, rest, seed());

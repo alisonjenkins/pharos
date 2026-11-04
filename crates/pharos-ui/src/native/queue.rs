@@ -103,6 +103,13 @@ pub struct Queue {
     unshuffled: Vec<u64>,
     /// The songs started, newest first, at most `RECENT`.
     recent: VecDeque<ItemRef>,
+    /// The songs Previous walks back through, newest (the playing song)
+    /// first, each with how it got into the queue. Unlike `recent`, a step
+    /// back takes songs off it.
+    behind: VecDeque<(ItemRef, Source)>,
+    /// The song a step back went to, which starts without reseeding the
+    /// album part of the queue.
+    returning: Option<(ItemRef, Source)>,
     /// The song the queue was last told started: once it knows the playing
     /// song, the queue alone says what is next.
     current: Option<ItemRef>,
@@ -111,6 +118,10 @@ pub struct Queue {
 
 /// How many started songs the queue remembers.
 const RECENT: usize = 50;
+
+/// How far into a song Previous starts it again rather than going back: the
+/// usual music player rule, long enough for a quick double press to go back.
+pub const RESTART_AFTER_MS: u64 = 3_000;
 
 /// The app-wide queue, provided by the app's root.
 #[derive(Clone, Copy)]
@@ -144,6 +155,18 @@ impl Queue {
     /// The songs started lately, newest first.
     pub fn recent(&self) -> impl Iterator<Item = ItemRef> + '_ {
         self.recent.iter().copied()
+    }
+
+    /// Whether `id` starting comes from the queue: its first song, or the
+    /// song a step back went to.
+    pub fn expects(&self, id: ItemRef) -> bool {
+        self.next() == Some(id) || self.returning.is_some_and(|(r, _)| r == id)
+    }
+
+    /// Whether a step back is on its way: the song it went to has not
+    /// started yet.
+    pub fn stepping_back(&self) -> bool {
+        self.returning.is_some()
     }
 
     pub fn contains(&self, id: ItemRef) -> bool {
@@ -209,11 +232,19 @@ impl Queue {
             self.recent.truncate(RECENT);
         }
         self.current = Some(id);
+        let returning = self.returning.take().filter(|(r, _)| *r == id);
         if self.next() == Some(id) {
-            self.upcoming.remove(0);
+            let source = self.upcoming.remove(0).source;
+            self.behind_push(id, source);
             self.forget_gone();
             return;
         }
+        if let Some((_, source)) = returning {
+            self.behind_push(id, source);
+            return;
+        }
+        // A song started outside the queue heads the album part after it.
+        self.behind_push(id, Source::Album);
         let Some(album_after) = album_after else {
             return;
         };
@@ -271,6 +302,36 @@ impl Queue {
             }
         }
         self.forget_gone();
+    }
+
+    /// Step back from `playing` (B464/V406): the song before it plays
+    /// next, without reseeding the album part, and `playing` goes back to
+    /// the front of the queue so Next returns to it. `None` when nothing
+    /// played before it, or the queue has not heard `playing` start yet.
+    pub fn back(&mut self, playing: Track) -> Option<ItemRef> {
+        if self.current != Some(playing.id) {
+            return None;
+        }
+        let (front, source) = *self.behind.front()?;
+        if front != playing.id {
+            return None;
+        }
+        let previous = *self.behind.get(1)?;
+        self.behind.drain(..2);
+        let again = self.entry(playing, source);
+        if self.shuffled {
+            self.unshuffled.insert(0, again.key);
+        }
+        self.upcoming.insert(0, again);
+        self.returning = Some(previous);
+        Some(previous.0)
+    }
+
+    fn behind_push(&mut self, id: ItemRef, source: Source) {
+        if self.behind.front().map(|(b, _)| *b) != Some(id) {
+            self.behind.push_front((id, source));
+            self.behind.truncate(RECENT);
+        }
     }
 
     fn position(&self, key: u64) -> Option<usize> {
@@ -565,6 +626,68 @@ mod tests {
         assert_eq!(recent.len(), RECENT);
         assert_eq!(recent[0], ItemRef::Real(RECENT as u64 + 4));
         assert_eq!(recent[1], ItemRef::Real(RECENT as u64 + 3));
+    }
+
+    #[test]
+    fn back_then_next_plays_the_same_song_again() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
+        q.started(ItemRef::Real(2), Some(&album(&[3])), 0);
+        assert_eq!(q.back(track(2)), Some(ItemRef::Real(1)));
+        assert!(q.expects(ItemRef::Real(1)));
+        assert!(q.stepping_back());
+        // The song stepped back to starts without reseeding the album.
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
+        assert_eq!(ids(&q), [2, 3]);
+        assert_eq!(q.next(), Some(ItemRef::Real(2)));
+        assert!(!q.stepping_back());
+    }
+
+    #[test]
+    fn two_steps_back_walk_what_played() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&[]), 0);
+        q.play_next(vec![track(5)]);
+        q.started(ItemRef::Real(5), Some(&[]), 0);
+        q.append(vec![track(30)], Source::Mix);
+        q.started(ItemRef::Real(30), Some(&[]), 0);
+        assert_eq!(q.back(track(30)), Some(ItemRef::Real(5)));
+        q.started(ItemRef::Real(5), None, 0);
+        assert_eq!(q.back(track(5)), Some(ItemRef::Real(1)));
+        q.started(ItemRef::Real(1), None, 0);
+        assert_eq!(ids(&q), [5, 30]);
+        // Each keeps how it got into the queue.
+        assert_eq!(q.upcoming()[0].source, Source::Added);
+        assert_eq!(q.upcoming()[1].source, Source::Mix);
+        assert_eq!(q.back(track(1)), None);
+    }
+
+    #[test]
+    fn back_needs_a_song_before_and_the_playing_song_heard() {
+        let mut q = Queue::default();
+        assert_eq!(q.back(track(1)), None);
+        q.started(ItemRef::Real(1), Some(&album(&[2])), 0);
+        assert_eq!(q.back(track(1)), None);
+        // A song the queue has not heard start yet.
+        assert_eq!(q.back(track(2)), None);
+        assert_eq!(ids(&q), [2]);
+    }
+
+    #[test]
+    fn back_while_shuffled_keeps_the_song_when_shuffle_goes_off() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3, 4])), 0);
+        q.apply(QueueAction::Shuffle(true), 7);
+        let first = q.next().unwrap();
+        q.started(first, None, 0);
+        let ItemRef::Real(n) = first else {
+            panic!("{first:?}")
+        };
+        assert_eq!(q.back(track(n)), Some(ItemRef::Real(1)));
+        q.started(ItemRef::Real(1), None, 0);
+        q.apply(QueueAction::Shuffle(false), 0);
+        assert_eq!(q.next(), Some(first));
+        assert_eq!(q.upcoming().len(), 3);
     }
 
     #[test]
