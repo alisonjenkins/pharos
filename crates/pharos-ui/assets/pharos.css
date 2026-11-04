@@ -795,6 +795,32 @@ body:has(.pharos-stage.is-full) .pharos-error {
 .pharos-member-buffering {
   color: var(--px-color-warning);
 }
+.pharos-member-own-tracks {
+  color: var(--px-color-fg-muted);
+}
+.pharos-activity-log {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--px-type-step--1);
+  color: var(--px-color-fg-muted);
+}
+/* A sibling of the chrome, not inside it: the .is-idle rule below fades
+   .pharos-watch-top and .pharos-controls, and this stays up. */
+.pharos-activity-toast {
+  position: absolute;
+  left: 50%;
+  top: 4.5rem;
+  transform: translateX(-50%);
+  max-width: 90%;
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.65); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  pointer-events: none;
+}
 /* Watch together, US6: what each member has seen. On the member strip the
    mark shows on hover or focus; on a detail page it is a plain list; on an
    episode row it is a dot per member. Colours are the accent for seen, a
