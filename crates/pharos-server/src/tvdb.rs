@@ -20,10 +20,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::online_enrich::{EnrichedMetadata, RemoteArt};
-use pharos_core::{ArtworkRole, MediaKind, SearchCandidate};
+use pharos_core::{ArtworkRole, MediaKind, PersonKind, PersonRef, SearchCandidate};
 
 /// TVDB v4 REST base.
 const API_BASE: &str = "https://api4.thetvdb.com/v4";
+
+/// TVDB artwork host, for an image a record gives as a bare path.
+const ARTWORK_BASE: &str = "https://artworks.thetvdb.com";
 
 /// Abstraction over the HTTP transport TVDB calls ride on. Exists solely so
 /// [`TvdbClient`]'s auth state-machine (cache the JWT, re-login once on a
@@ -204,7 +207,28 @@ impl<T: TvdbTransport> TvdbClient<T> {
         let body = self
             .authed_get(&format!("/series/{series_id}/episodes/default"))
             .await?;
-        parse_episode_detail(&body, season, episode)
+        let mut meta = parse_episode_detail(&body, season, episode)?;
+        if let Some(ref eid) = meta.provider_id {
+            meta.people = self.get_episode_people(eid).await;
+        }
+        Some(meta)
+    }
+
+    /// Fetch cast and crew credits for an episode via `/episodes/{id}/extended`.
+    /// Best-effort; returns an empty `Vec` on auth/transport/decode failure,
+    /// and the episode is retried when the refresh TTL re-admits it.
+    pub async fn get_episode_people(&self, episode_id: &str) -> Vec<pharos_core::PersonRef> {
+        let Some(body) = self
+            .authed_get(&format!("/episodes/{episode_id}/extended"))
+            .await
+        else {
+            tracing::info!(
+                tvdb.episode_id = episode_id,
+                "tvdb: episode credits unavailable; enriching without cast, retried at TTL"
+            );
+            return vec![];
+        };
+        parse_tvdb_characters(&body)
     }
 
     /// Download the raw bytes of a TVDB artwork/image CDN URL. `None` on
@@ -487,6 +511,181 @@ pub(crate) fn parse_episode_detail(
         artwork: art,
         ..EnrichedMetadata::default()
     })
+}
+
+/// Parse cast and crew credits from a TVDB `/episodes/{id}/extended` response body.
+///
+/// Reads characters from `data.characters`. Maps `peopleType` `"Actor"` and
+/// `"Guest Star"` to [`PersonKind::Actor`] and [`PersonKind::GuestStar`]
+/// (character name from `name`), and `"Director"` and `"Writer"` to their
+/// kinds. Entries with other types or missing/blank `personName` are dropped.
+///
+/// Thumb uses `personImgURL` if it is a non-empty `http(s)` URL, falling back
+/// to `image` if non-empty `http(s)`. `provider_ids` maps from `peopleId`.
+/// Sorts by kind group (Actor, GuestStar, Director, Writer) then `sort` ascending,
+/// caps Actor and GuestStar at 30 each, deduplicates `(name, kind)` keeping the
+/// first occurrence, and renumbers `sort_order` sequentially 0..n.
+/// Returns an empty `Vec` on malformed JSON or missing `data.characters`.
+pub(crate) fn parse_tvdb_characters(body: &str) -> Vec<pharos_core::PersonRef> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let Some(characters) = v
+        .get("data")
+        .and_then(|d| d.get("characters"))
+        .and_then(|c| c.as_array())
+    else {
+        return vec![];
+    };
+
+    /// A TVDB image reference as an absolute URL: kept when it already is
+    /// one, joined to the artwork host when it is a bare `/banners/...` path.
+    fn image_url(s: &str) -> Option<String> {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Some(t.to_string())
+        } else if t.starts_with('/') {
+            Some(format!("{ARTWORK_BASE}{t}"))
+        } else {
+            None
+        }
+    }
+
+    struct ParsedChar {
+        person: PersonRef,
+        raw_sort: Option<i64>,
+    }
+
+    let mut parsed: Vec<ParsedChar> = Vec::new();
+    for item in characters {
+        let Some(raw_person_name) = item.get("personName").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let person_name = raw_person_name.trim();
+        if person_name.is_empty() {
+            continue;
+        }
+
+        // `peopleType` names the role; `type` is its numeric id, used when the
+        // name is missing (TVDB people types: 1 Director, 2 Writer, 3 Actor,
+        // 4 Guest Star).
+        let people_type = match item.get("peopleType").and_then(|t| t.as_str()) {
+            Some(t) => t.trim(),
+            None => match item.get("type").and_then(|t| t.as_i64()) {
+                Some(1) => "Director",
+                Some(2) => "Writer",
+                Some(3) => "Actor",
+                Some(4) => "Guest Star",
+                _ => continue,
+            },
+        };
+        let character = || {
+            item.get("name")
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (kind, character) = match people_type {
+            "Actor" => (PersonKind::Actor, character()),
+            "Guest Star" => (PersonKind::GuestStar, character()),
+            "Director" => (PersonKind::Director, None),
+            "Writer" => (PersonKind::Writer, None),
+            _ => continue,
+        };
+
+        let thumb = ["personImgURL", "image"]
+            .into_iter()
+            .find_map(|key| item.get(key).and_then(|u| u.as_str()).and_then(image_url));
+
+        let provider_ids = item
+            .get("peopleId")
+            .and_then(|i| {
+                i.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| i.as_str().map(str::to_string))
+            })
+            .map(|id| format!("tvdb:{id}"));
+
+        let raw_sort = item.get("sort").and_then(|s| {
+            s.as_i64()
+                .or_else(|| s.as_str().and_then(|str_val| str_val.parse::<i64>().ok()))
+        });
+
+        parsed.push(ParsedChar {
+            person: PersonRef {
+                name: person_name.to_string(),
+                // Crew carry their job as the role, as TMDB crew do, so a
+                // person both acting and directing keeps both credits.
+                role: matches!(kind, PersonKind::Director | PersonKind::Writer)
+                    .then(|| people_type.to_string()),
+                kind,
+                character,
+                sort_order: None,
+                thumb,
+                provider_ids,
+            },
+            raw_sort,
+        });
+    }
+
+    /// Numerical rank for kind grouping: Actor < GuestStar < Director < Writer.
+    fn kind_rank(k: PersonKind) -> usize {
+        match k {
+            PersonKind::Actor => 0,
+            PersonKind::GuestStar => 1,
+            PersonKind::Director => 2,
+            PersonKind::Writer => 3,
+            _ => 4,
+        }
+    }
+
+    parsed.sort_by(|a, b| {
+        let ra = kind_rank(a.person.kind);
+        let rb = kind_rank(b.person.kind);
+        match ra.cmp(&rb) {
+            std::cmp::Ordering::Equal => match (a.raw_sort, b.raw_sort) {
+                (Some(s1), Some(s2)) => s1.cmp(&s2),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+            ord => ord,
+        }
+    });
+
+    let mut out: Vec<pharos_core::PersonRef> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut actor_count = 0;
+    let mut guest_star_count = 0;
+
+    for item in parsed {
+        if !seen.insert((item.person.name.clone(), item.person.kind)) {
+            continue;
+        }
+        match item.person.kind {
+            PersonKind::Actor => {
+                if actor_count >= 30 {
+                    continue;
+                }
+                actor_count += 1;
+            }
+            PersonKind::GuestStar => {
+                if guest_star_count >= 30 {
+                    continue;
+                }
+                guest_star_count += 1;
+            }
+            _ => {}
+        }
+        out.push(item.person);
+    }
+
+    for (idx, p) in out.iter_mut().enumerate() {
+        p.sort_order = Some(idx as u32);
+    }
+
+    out
 }
 
 /// [`crate::online_enrich::OnlineEnricher`] impl backed by [`TvdbClient`].
@@ -838,5 +1037,106 @@ mod tests {
             "Game%20of%20Thrones"
         );
         assert_eq!(super::encode_query("abc-123_.~"), "abc-123_.~");
+    }
+
+    #[test]
+    fn tvdb_parse_characters_maps_types_and_fallbacks() {
+        let body = r#"{"data":{"id":100,"characters":[
+            {"peopleType":"Actor","personName":"Actor One","name":"Hero","sort":1,"peopleId":10,"personImgURL":"https://tvdb/p1.jpg","image":"https://tvdb/i1.jpg"},
+            {"peopleType":"Guest Star","personName":"Guest One","name":"Guest Hero","sort":2,"peopleId":20,"personImgURL":null,"image":"https://tvdb/fallback.jpg"},
+            {"peopleType":"Director","personName":"Director One","name":null,"sort":1,"peopleId":30,"personImgURL":"https://tvdb/d1.jpg"},
+            {"peopleType":"Crew","personName":"Crew One","sort":1,"peopleId":40},
+            {"peopleType":"Actor","personName":"   ","name":"Ghost","sort":0}
+        ]}}"#;
+        let people = parse_tvdb_characters(body);
+        assert_eq!(people.len(), 3);
+
+        // Actor One
+        assert_eq!(people[0].name, "Actor One");
+        assert_eq!(people[0].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(people[0].character.as_deref(), Some("Hero"));
+        assert_eq!(people[0].thumb.as_deref(), Some("https://tvdb/p1.jpg"));
+        assert_eq!(people[0].provider_ids.as_deref(), Some("tvdb:10"));
+        assert_eq!(people[0].sort_order, Some(0));
+
+        // Guest One (fallback to image when personImgURL is null)
+        assert_eq!(people[1].name, "Guest One");
+        assert_eq!(people[1].kind, pharos_core::PersonKind::GuestStar);
+        assert_eq!(people[1].character.as_deref(), Some("Guest Hero"));
+        assert_eq!(
+            people[1].thumb.as_deref(),
+            Some("https://tvdb/fallback.jpg")
+        );
+        assert_eq!(people[1].provider_ids.as_deref(), Some("tvdb:20"));
+        assert_eq!(people[1].sort_order, Some(1));
+
+        // Director One
+        assert_eq!(people[2].name, "Director One");
+        assert_eq!(people[2].kind, pharos_core::PersonKind::Director);
+        assert_eq!(people[2].character, None);
+        assert_eq!(people[2].role.as_deref(), Some("Director"));
+        assert_eq!(people[2].thumb.as_deref(), Some("https://tvdb/d1.jpg"));
+        assert_eq!(people[2].provider_ids.as_deref(), Some("tvdb:30"));
+        assert_eq!(people[2].sort_order, Some(2));
+    }
+
+    #[test]
+    fn tvdb_parse_characters_reads_the_type_id_and_bare_image_paths() {
+        let body = r#"{"data":{"characters":[
+            {"type":4,"personName":"Guest Two","name":"Visitor","sort":1,"image":"/banners/person/2/a.jpg"},
+            {"type":3,"personName":"Actor Two","name":"Lead","sort":1,"personImgURL":"","image":null},
+            {"type":5,"personName":"Crew Two","sort":1}
+        ]}}"#;
+        let people = parse_tvdb_characters(body);
+        let got: Vec<_> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.kind, p.thumb.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Actor Two", pharos_core::PersonKind::Actor, None),
+                (
+                    "Guest Two",
+                    pharos_core::PersonKind::GuestStar,
+                    Some("https://artworks.thetvdb.com/banners/person/2/a.jpg")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tvdb_parse_characters_empty_on_malformed() {
+        assert!(parse_tvdb_characters("not json").is_empty());
+        assert!(parse_tvdb_characters("{}").is_empty());
+        assert!(parse_tvdb_characters(r#"{"data":{}}"#).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tvdb_get_episode_fetches_credits_when_present() {
+        let ep_list =
+            r#"{"data":{"episodes":[{"id":42,"seasonNumber":1,"number":1,"name":"Pilot"}]}}"#;
+        let ext = r#"{"data":{"id":42,"characters":[{"peopleType":"Actor","personName":"Lead Actor","name":"Main","sort":1,"peopleId":501}]}}"#;
+        let t = FakeTransport::new()
+            .push_login("jwt-1")
+            .push_ok(ep_list)
+            .push_ok(ext);
+        let c = TvdbClient::with_transport("key".into(), t);
+        let ep = c.get_episode("10", 1, 1).await.expect("found episode");
+        assert_eq!(ep.people.len(), 1);
+        assert_eq!(ep.people[0].name, "Lead Actor");
+        assert_eq!(ep.people[0].character.as_deref(), Some("Main"));
+        assert_eq!(ep.people[0].provider_ids.as_deref(), Some("tvdb:501"));
+        assert_eq!(ep.people[0].sort_order, Some(0));
+    }
+
+    #[tokio::test]
+    async fn tvdb_get_episode_missing_extended_yields_empty_people() {
+        let ep_list =
+            r#"{"data":{"episodes":[{"id":42,"seasonNumber":1,"number":1,"name":"Pilot"}]}}"#;
+        let t = FakeTransport::new().push_login("jwt-1").push_ok(ep_list);
+        let c = TvdbClient::with_transport("key".into(), t);
+        let ep = c.get_episode("10", 1, 1).await.expect("found episode");
+        assert!(ep.people.is_empty());
     }
 }
