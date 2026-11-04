@@ -503,6 +503,8 @@ fn TrackPicker(
             onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
             onchange: move |evt: FormEvent| {
                 on_pick.call(evt.value().parse::<u32>().ok());
+                // A focused picker holds the chrome up; once picked, it is done.
+                platform::focus_by_id(PLAYER_ID);
             },
             if offer_off {
                 option { value: "off", selected: pick.is_none(), "{label} off" }
