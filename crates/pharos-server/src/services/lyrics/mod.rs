@@ -103,7 +103,9 @@ impl Song {
         };
         let probe = &item.probe;
         Some(Self {
-            title: tag(&probe.title)?,
+            // A stored item has no `probe.title`: the scanner folds the tag
+            // into `item.title`, so that is the title once read back (B363).
+            title: tag(&probe.title).or_else(|| tag(&Some(item.title.clone())))?,
             artist: tag(&probe.artist).or_else(|| tag(&probe.album_artist))?,
             album: tag(&probe.album),
             duration_ms: probe.duration_ms,
@@ -565,6 +567,22 @@ mod tests {
         item.probe.title = Some("Another Song".into());
         finder.find(&item).await.unwrap();
         assert_eq!(online.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_song_read_back_from_the_store_is_looked_up_by_its_title() {
+        let dir = tempfile::tempdir().unwrap();
+        // As the store returns it: the tag's title is the item's own.
+        let mut item = song_item(dir.path());
+        item.probe.title = None;
+        item.title = "Run On".into();
+        let song = Song::of(&item).unwrap();
+        assert_eq!(
+            (song.title.as_str(), song.artist.as_str()),
+            ("Run On", "Band")
+        );
+        item.title = "  ".into();
+        assert_eq!(Song::of(&item), None);
     }
 
     #[tokio::test]
