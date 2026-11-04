@@ -101,28 +101,13 @@ jobs:
         run: |
           find /nix/var/nix/gcroots/gha -maxdepth 1 -name 'pharos-run-*' -mmin +240 -delete || true
           nix build .#pharos --out-link "/nix/var/nix/gcroots/gha/pharos-run-${GITHUB_RUN_ID}" || echo "::warning::could not pin the release build"
-
-  audit:
-    name: supply-chain
-    # Self-hosted home nix builder (host daemon + warm store), same as the
-    # other jobs — no Azure-hosted runner + no DeterminateSystems installer /
-    # magic-nix-cache round-trip.
-    runs-on: pharos-nix-builder-amd64
-    timeout-minutes: 120
-    continue-on-error: false
-    # Never run fork-PR code on the self-hosted runner (backstop to the
-    # enforcer's fork-PR approval gate; matches the `test` job).
-    needs: [changes]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && github.event.pull_request.head.repo.fork != true }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: alisonjenkins/setup-host-nix@v1.0.1
-        with:
-          max-jobs: 2
-          cores: 16
+      # Supply-chain checks ride along here rather than in a job of their own:
+      # they take ~30 s, and a separate job was another wait for a home runner.
       - name: cargo-audit (RustSec)
+        if: ${{ !cancelled() }}
         run: nix develop --command cargo audit
       - name: cargo-deny (licenses + bans)
+        if: ${{ !cancelled() }}
         run: nix develop --command cargo deny check
 
   oci:
