@@ -71,7 +71,7 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["compre
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
-simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+simd-adler32 = { version = "0.3" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
