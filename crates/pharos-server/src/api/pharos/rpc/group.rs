@@ -148,7 +148,7 @@ impl Group {
             .hub
             .register(key.clone(), user.name.clone(), tx.clone());
         deps.sinks.insert(reg.member_id, reg.gen, tx);
-        let pump = actix_web::rt::spawn(pump(rx, sink, group.clone()));
+        let pump = actix_web::rt::spawn(pump(rx, sink, group.clone(), reg.member_id));
         // The capability is not always dropped when its connection closes
         // (observed live: the seat outlived the socket until the silence
         // TTL), so the close itself starts the same loss.
@@ -202,6 +202,8 @@ struct Summary {
     members: Vec<Member>,
     /// What a late joiner starts on.
     tracks: GroupTracks,
+    /// The receiving member's own id; set only in `joined`.
+    you: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -231,6 +233,7 @@ impl From<&ListedGroup> for Summary {
                 })
                 .collect(),
             tracks: GroupTracks::default(),
+            you: String::new(),
         }
     }
 }
@@ -287,6 +290,7 @@ fn write_summary(mut out: group_summary::Builder<'_>, group: &Summary) {
         set_item_id(out.reborrow().init_item(), WireId::Real(id));
     }
     write_tracks(out.reborrow().init_tracks(), &group.tracks);
+    out.reborrow().set_you(group.you.as_str());
     let mut members = out.init_members(u32::try_from(group.members.len()).unwrap_or(u32::MAX));
     for (i, m) in (0u32..).zip(&group.members) {
         write_member(members.reborrow().get(i), m);
@@ -512,7 +516,12 @@ const BUFFERING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// it (a freeze or resume, a gate opening or closing) and every
 /// [`BUFFERING_POLL`], and sends a `member` update for each member whose flag
 /// moved.
-async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group: GroupHandle) {
+async fn pump(
+    mut rx: mpsc::Receiver<ServerMsg>,
+    sink: group_sink::Client,
+    group: GroupHandle,
+    me: MemberId,
+) {
     let mut roster: HashMap<String, String> = HashMap::new();
     let mut buffering: HashSet<String> = HashSet::new();
     let mut own_tracks: HashSet<String> = HashSet::new();
@@ -533,6 +542,7 @@ async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group
                 let mut member_update = None;
                 match &mut update {
                     Update::Joined(summary) => {
+                        summary.you = me.to_string();
                         // `Joined` carries the roster only; the name, the
                         // item playing, who is buffering and the group's
                         // tracks (what a late joiner starts on) are the

@@ -246,6 +246,8 @@ enum Seen {
         buffering: Vec<String>,
         /// Names of the members on their own tracks.
         own_tracks: Vec<String>,
+        /// The receiving member's own id.
+        you: String,
         /// The group's audio, subtitle and who set them.
         tracks: (String, String, String),
     },
@@ -318,6 +320,7 @@ impl server::group_sink::Handler for TestSink {
                         .map(|m| text(m.get_name()))
                         .collect(),
                     member_ids: g.get_members()?.iter().map(|m| text(m.get_id())).collect(),
+                    you: text(g.get_you()),
                     buffering: g
                         .get_members()?
                         .iter()
@@ -592,6 +595,37 @@ async fn listed_member_ids_are_the_ids_updates_use() {
     assert_eq!(listed.len(), 2);
     assert!(listed.iter().all(|id| !id.is_empty()));
     assert_eq!(listed, member_ids);
+}
+
+/// `joined` names the receiving member, so a client can tell which roster
+/// entry is itself.
+#[actix_web::test]
+async fn joined_names_the_member_it_is_sent_to() {
+    let rig = rig().await;
+    let a = rig.session(&rig.fx.admin_token).await;
+    let b = rig.session(&rig.fx.user_token).await;
+    let (a_sink, mut a_seen) = sink();
+    let _a_member = create(&a, "dev-a", MOVIE, 0, a_sink).await.unwrap();
+    let gid = only_group(&rig).await;
+    let (b_sink, mut b_seen) = sink();
+    let _b_member = join(&b, "dev-b", &gid, b_sink).await.unwrap();
+    let mut you = Vec::new();
+    for seen in [&mut a_seen, &mut b_seen] {
+        let Seen::Joined {
+            you: me,
+            member_ids,
+            ..
+        } = until(seen, |s| {
+            matches!(s, Seen::Joined { .. }).then(|| s.clone())
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(member_ids.contains(&me), "{me} is in {member_ids:?}");
+        you.push(me);
+    }
+    assert_ne!(you[0], you[1]);
 }
 
 /// Joining a group that does not exist answers notFound and creates nothing
