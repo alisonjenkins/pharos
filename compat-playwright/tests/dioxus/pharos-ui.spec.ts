@@ -381,6 +381,24 @@ test.describe("pharos Dioxus UI", () => {
       expect(connect.ok()).toBeTruthy();
       const connectJson = await connect.json();
       expect(connectJson.Authenticated).toBe(true);
+
+      // The device's own last step: the secret buys a token for the approver.
+      const finish = await request.post(`${PHAROS_URL}/Users/AuthenticateWithQuickConnect`, {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `MediaBrowser Client="pw", Device="tv", DeviceId="pw-qc-${rand}", Version="1"`,
+        },
+        data: { Secret },
+      });
+      expect(finish.ok()).toBeTruthy();
+      const finished = await finish.json();
+      expect(finished.User.Name).toBe(name);
+      expect(typeof finished.AccessToken).toBe("string");
+      const me = await request.get(`${PHAROS_URL}/Users/Me`, {
+        headers: { "X-Emby-Token": finished.AccessToken },
+      });
+      expect(me.ok()).toBeTruthy();
+      expect((await me.json()).Name).toBe(name);
     });
 
     test("a user sets and removes their avatar from the Account page", async ({ page, request }) => {
