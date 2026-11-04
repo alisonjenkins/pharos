@@ -399,6 +399,7 @@ async fn metadata_roundtrips_through_store() {
         },
         production_locations: vec!["USA".into(), "Australia".into()],
         trailers: vec!["https://youtu.be/m8e-FF8MsqU".into()],
+        ratings: Default::default(),
     };
     s.put(it.clone()).await.unwrap();
     let got = s.get(7).await.unwrap();
@@ -1475,6 +1476,7 @@ async fn series_metadata_upsert_then_by_keys_roundtrips() {
         },
         poster_locator: Some("cache/poster.jpg".into()),
         backdrop_locator: Some("cache/back.jpg".into()),
+        ratings: Default::default(),
     };
     s.upsert_series_metadata(meta.clone()).await.unwrap();
 

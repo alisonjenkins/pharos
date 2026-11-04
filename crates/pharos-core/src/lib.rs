@@ -163,6 +163,20 @@ pub struct MediaMetadata {
     /// way to want Japanese for anime and English for everything else from a
     /// single setting.
     pub original_language: Option<String>,
+    /// IMDb and Rotten Tomatoes scores from a ratings source. Written only
+    /// by [`RatingsStore::set_ratings`], never by a put, so a rescan keeps them.
+    #[serde(default)]
+    pub ratings: ExternalRatings,
+}
+
+/// A title's scores from a ratings source (OMDb), each with a known source,
+/// unlike the mixed-source `community_rating`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExternalRatings {
+    /// IMDb user score, 0–10.
+    pub imdb: Option<f32>,
+    /// Rotten Tomatoes Tomatometer, a percentage.
+    pub tomatometer: Option<u16>,
 }
 
 /// LIB-C9 — external metadata-provider identifiers. Persisted as a JSON
@@ -1257,6 +1271,9 @@ pub struct SeriesMetadata {
     pub poster_locator: Option<String>,
     /// Locator for the cached backdrop (Backdrop), same fallback semantics.
     pub backdrop_locator: Option<String>,
+    /// The show's IMDb and Rotten Tomatoes scores. Written only by
+    /// [`RatingsStore::set_ratings`]; an upsert leaves them alone.
+    pub ratings: ExternalRatings,
 }
 
 /// T9-series — one distinct show that needs (or is due for re-)enrichment,
@@ -1301,6 +1318,47 @@ pub trait SeriesMetadataStore: Send + Sync {
     ) -> impl std::future::Future<
         Output = DomainResult<std::collections::HashMap<String, SeriesMetadata>>,
     > + Send;
+}
+
+/// What a ratings lookup is for: a stored film, or a show by its
+/// [`SeriesMetadata::series_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RatingsTarget {
+    Item(MediaId),
+    Series(String),
+}
+
+/// A film or show due a ratings lookup: its IMDb id when one is stored,
+/// else its title and year to search by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatingsSubject {
+    pub target: RatingsTarget,
+    pub imdb_id: Option<String>,
+    pub title: String,
+    pub year: Option<u32>,
+}
+
+/// Scores from a ratings source, kept apart from the rows a scan writes.
+/// Split from [`MediaStore`] like [`SeriesMetadataStore`] so in-memory test
+/// stores don't have to implement it.
+pub trait RatingsStore: Send + Sync {
+    /// Films, then shows with a [`SeriesMetadata`] row, never looked up or
+    /// last looked up before `ttl_cutoff` (unix seconds), never-looked-up
+    /// first. At most `limit`.
+    fn needing_ratings(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<RatingsSubject>>> + Send;
+
+    /// Record a lookup's scores (both `None` when it found nothing) and when
+    /// it ran. A target with no row is a no-op.
+    fn set_ratings(
+        &self,
+        target: &RatingsTarget,
+        ratings: ExternalRatings,
+        fetched_at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
 /// T70 — playlists as first-class, user-owned, ordered item containers.
