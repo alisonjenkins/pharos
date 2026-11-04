@@ -8,6 +8,8 @@
 //! or an admin. The upload body is the picture base64-encoded, as Jellyfin
 //! reads it; raw picture bytes are accepted too.
 
+use std::borrow::Cow;
+
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use base64::Engine as _;
 use pharos_core::{UserId, UserStore};
@@ -154,10 +156,11 @@ async fn get_image(
 }
 
 /// The picture in an upload body: base64 as Jellyfin sends it (with or
-/// without a `data:` URL prefix), or the picture's own bytes.
-fn upload_bytes(body: &[u8]) -> Result<Vec<u8>, AvatarError> {
+/// without a `data:` URL prefix), or the picture's own bytes. Runs in the
+/// decode slot ([`avatar::Unwrap`]), not on the actix worker.
+fn upload_bytes(body: &[u8]) -> Result<Cow<'_, [u8]>, AvatarError> {
     if image::guess_format(body).is_ok() {
-        return Ok(body.to_vec());
+        return Ok(Cow::Borrowed(body));
     }
     let text: Vec<u8> = body
         .iter()
@@ -172,6 +175,7 @@ fn upload_bytes(body: &[u8]) -> Result<Vec<u8>, AvatarError> {
     };
     base64::engine::general_purpose::STANDARD
         .decode(encoded)
+        .map(Cow::Owned)
         .map_err(|_| AvatarError::Unsupported)
 }
 
@@ -196,8 +200,7 @@ async fn post_image(
     body: web::Bytes,
 ) -> Result<HttpResponse, actix_web::Error> {
     let target = writable_target(&state, &req, &q.0, &caller).await?;
-    let upload = upload_bytes(&body).map_err(|e| refusal(&e))?;
-    avatar::set(&state.stores, target, upload)
+    avatar::set(&state.stores, target, body, upload_bytes)
         .await
         .map_err(|e| refusal(&e))?;
     Ok(HttpResponse::NoContent().finish())
