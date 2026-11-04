@@ -117,7 +117,7 @@ lopdf = { version = "0.47", default-features = false }
 # GPL-3.0-or-later — combined with pharos's AGPL-3.0-or-later under GPLv3
 # §13, which exists for precisely this pairing. See the scoped exception in
 # deny.toml; it is NOT a workspace-wide allow.
-boko = { version = "0.5", default-features = false }
+boko = { version = "0.6", default-features = false }
 # 009 CASTV2 transport. `ring` matches the provider already in Cargo.lock
 # (reqwest/sqlx); `default-features = false` keeps aws-lc-rs (C build) out.
 prost = "0.14"
