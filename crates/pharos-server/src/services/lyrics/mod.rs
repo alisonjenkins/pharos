@@ -144,9 +144,11 @@ pub struct LyricsFinder {
     disk: Option<Arc<cache::DiskCache>>,
 }
 
-/// An online answer held in memory: when it was given, so a miss can lapse.
+/// An online answer held in memory: what was asked, so a retagged song is
+/// asked again, and when, so a miss can lapse.
 #[derive(Clone)]
 struct Remembered {
+    key: String,
     found: Option<Lyrics>,
     at: Instant,
 }
@@ -203,11 +205,12 @@ impl LyricsFinder {
             );
             return None;
         };
-        if let Some(known) = self.remembered(item.id) {
+        let key = cache::key(online.name(), &song);
+        if let Some(known) = self.remembered(item.id, &key) {
             return known;
         }
         if let Some(known) = self.read_disk(item.id, online.name(), &song).await {
-            self.remember(item.id, known.clone());
+            self.remember(item.id, key, known.clone());
             return known;
         }
         if self.cooling_down() {
@@ -220,7 +223,7 @@ impl LyricsFinder {
         }
         match online.find(&song).await {
             Ok(found) => {
-                self.remember(item.id, found.clone());
+                self.remember(item.id, key, found.clone());
                 self.write_disk(item.id, online.name(), song, found.clone())
                     .await;
                 found
@@ -253,13 +256,16 @@ impl LyricsFinder {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    fn remembered(&self, id: u64) -> Option<Option<Lyrics>> {
+    fn remembered(&self, id: u64, key: &str) -> Option<Option<Lyrics>> {
         let r = self.memo.lock().ok()?.get(&id).cloned()?;
+        if r.key != key {
+            return None;
+        }
         // A miss lapses as it does on disk; a long-running server asks again.
         (r.found.is_some() || r.at.elapsed() < cache::MISS_TTL).then_some(r.found)
     }
 
-    fn remember(&self, id: u64, found: Option<Lyrics>) {
+    fn remember(&self, id: u64, key: String, found: Option<Lyrics>) {
         if let Ok(mut memo) = self.memo.lock() {
             if memo.len() >= ONLINE_MEMO_MAX {
                 memo.clear();
@@ -267,6 +273,7 @@ impl LyricsFinder {
             memo.insert(
                 id,
                 Remembered {
+                    key,
                     found,
                     at: Instant::now(),
                 },
@@ -484,6 +491,21 @@ mod tests {
         let finder = LyricsFinder::with_online(miss.clone()).with_cache(cache);
         assert_eq!(finder.find(&other).await, None);
         assert_eq!(miss.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retagged_song_is_asked_again_rather_than_served_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut item = song_item(dir.path());
+        let words = Lyrics::from_lines(vec![line(Some(0), "remote")], Origin::Online);
+        let online = Arc::new(Fixed(Ok(words), Default::default()));
+        let finder = LyricsFinder::with_online(online.clone());
+        finder.find(&item).await.unwrap();
+        finder.find(&item).await.unwrap();
+        assert_eq!(online.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+        item.probe.title = Some("Another Song".into());
+        finder.find(&item).await.unwrap();
+        assert_eq!(online.1.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
