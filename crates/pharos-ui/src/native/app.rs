@@ -33,7 +33,7 @@ use super::playback::{
 };
 use super::queue::{Queue, QueueAction, QueueCtx};
 use super::route::Route;
-use super::stage::{Stage, StageAction, StageBar, StageCtx, View, STAGE_ID};
+use super::stage::{Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
 use super::trail;
@@ -1780,7 +1780,11 @@ fn WatchScreen(id: ItemRef) -> Element {
         });
     });
     let state = playing.read();
-    loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+    // The stage bar, and its Close, comes with a loaded player; a compact
+    // window still loading or failed needs a way out of its own.
+    let stranded = ctx_stage.read().view != View::Full
+        && !matches!(state.as_ref().and_then(Option::as_ref), Some(Ok(_)));
+    let body = loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
         remount_on(
             &p.0.session,
             rsx! {
@@ -1792,7 +1796,13 @@ fn WatchScreen(id: ItemRef) -> Element {
                 }
             },
         )
-    })
+    });
+    rsx! {
+        {body}
+        if stranded {
+            StageClose { item: id }
+        }
+    }
 }
 
 /// Mounts `body` afresh whenever `key` changes, dropping its hooks. Dioxus

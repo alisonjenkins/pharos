@@ -2590,6 +2590,13 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   flex: none;
   align-items: center;
 }
+/* Close on a compact window that is still loading or failed to. */
+.pharos-stage-close {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  z-index: 1;
+}
 .pharos-stage-button {
   display: inline-grid;
   place-items: center;
