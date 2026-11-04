@@ -6137,7 +6137,18 @@ pub(crate) async fn virtual_shows_page(
         // Stable: ties keep the name-then-folder order the map produced.
         rows.sort_by(|a, b| compare_by_chain(&a.0, &b.0, &chain, ShowSortKeys::value));
     }
-    let items: Vec<serde_json::Value> = rows.into_iter().map(|(_, dto)| dto).collect();
+    let items: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(keys, mut dto)| {
+            // A series was added when its latest episode was: what the date
+            // added order sorts it by, so the tile says so too (B317).
+            if let (Some(at), true) = (keys.created_at, dto["DateCreated"].is_null()) {
+                dto["DateCreated"] =
+                    serde_json::Value::String(crate::api::jellyfin::dto::format_iso8601(at));
+            }
+            dto
+        })
+        .collect();
     Ok(synth_page(items, q.start_index, q.limit))
 }
 
