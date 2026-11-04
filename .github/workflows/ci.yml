@@ -13,13 +13,18 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # Decides whether this run needs the heavy jobs. A PR that touches only
-  # Markdown builds nothing and tests nothing, yet every job below used to
-  # take a home runner slot for it. Runs on a hosted runner so the decision
-  # itself never waits for a home slot. Every job below is gated with
-  # `needs.changes.outputs.code != 'false'`: a job skipped by its `if:`
-  # reports success, so required checks still pass, and if this job fails
-  # the output is empty and the heavy jobs run anyway (fail open).
+  # Decides whether this run needs the heavy jobs. Only three kinds of run
+  # do: a push to main, a `batch/` PR (the merge queue stacks feature PRs
+  # onto one and merges that), and a release-please PR. A feature or
+  # Renovate PR is reviewed on its own but tested only inside a batch:
+  # every push to one used to take four home runner slots, and pushes and
+  # re-cuts of feature PRs were most of the runner time on 2026-11-04.
+  # Within those three, a change touching only Markdown still skips them.
+  # Runs on a hosted runner so the decision never waits for a home slot.
+  # Every heavy job is gated with `needs.changes.outputs.code != 'false'`:
+  # a job skipped by its `if:` reports success, so `merge via batch` below
+  # is what stops a feature PR merging on skipped checks. If this job fails
+  # its output is empty and the heavy jobs run anyway (fail open).
   changes:
     name: classify changes
     runs-on: ubuntu-latest
@@ -33,12 +38,21 @@ jobs:
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          case "$HEAD_REF" in
+            batch/*|release-please--*) ;;
+            *)
+              echo "$HEAD_REF is not a batch: heavy jobs run when the merge queue batches it"
+              echo "code=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
           code=false
           while IFS= read -r path; do
             case "$path" in
@@ -50,6 +64,38 @@ jobs:
             echo "$path -> code=$code"
           done < <(git diff --name-only "$BASE_SHA"...HEAD)
           echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  # Feature PRs skip the heavy jobs, and a skipped job reports success, so
+  # without this a feature PR would show every required check green and
+  # could merge untested. Fails on any PR that is not a batch or a release.
+  merge-via-batch:
+    name: merge via batch
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Require a batch or release-please head
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          case "$HEAD_REF" in
+            batch/*|release-please--*) echo "$HEAD_REF may merge" ;;
+            *)
+              echo "::error::$HEAD_REF is a feature PR: it merges inside a batch/ PR from the merge queue, not on its own"
+              exit 1
+              ;;
+          esac
+
+  # The one check a feature PR gets, on a hosted runner: formatting, so a
+  # batch is not cut only to fail on fmt. Clippy and tests run in the batch.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.code == 'false'
+    steps:
+      - uses: actions/checkout@v7
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
 
   test:
     name: build + test + lint
