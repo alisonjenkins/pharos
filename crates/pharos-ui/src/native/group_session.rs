@@ -364,6 +364,12 @@ impl GroupState {
                 position_ms,
                 playing,
             } => {
+                // The previous item's picks name its streams, not this
+                // one's; the server's cleared `Tracks` follows. A joiner's
+                // first item (no previous one) keeps what `Joined` brought.
+                if !self.playlist_item_id.is_empty() && self.playlist_item_id != playlist_item_id {
+                    self.tracks = GroupTracksView::default();
+                }
                 self.playlist_item_id = playlist_item_id;
                 self.owes_ready = true;
                 self.last_command_ms = Some(now_ms);
@@ -1924,6 +1930,30 @@ mod tests {
             env,
             player,
         }
+    }
+
+    #[test]
+    fn a_new_item_clears_the_previous_items_picks_but_a_first_item_keeps_a_joiners() {
+        let mut state = GroupState::default();
+        let joined = GroupSummary {
+            tracks: groups_tracks(),
+            ..summary()
+        };
+        let _ = state.apply(GroupUpdate::Joined(joined), 0);
+        let _ = state.apply(item_update(0, true), 0);
+        assert_eq!(state.tracks, groups_tracks(), "first item");
+        let _ = state.apply(item_update(0, true), 0);
+        assert_eq!(state.tracks, groups_tracks(), "same item");
+        let _ = state.apply(
+            GroupUpdate::Item {
+                item: ItemRef::Real(8),
+                playlist_item_id: "p2".into(),
+                position_ms: 0,
+                playing: true,
+            },
+            0,
+        );
+        assert_eq!(state.tracks, GroupTracksView::default());
     }
 
     #[test]
