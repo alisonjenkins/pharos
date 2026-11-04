@@ -1,4 +1,6 @@
 pub mod api;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod audio_analysis;
 pub mod auth;
 pub mod bg_io;
 pub mod book_convert;
