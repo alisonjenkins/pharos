@@ -61,6 +61,12 @@ pub fn go_back() -> bool {
     false
 }
 
+pub struct EscapeWatch;
+
+pub fn on_escape(_on_escape: impl FnMut() + 'static) -> EscapeWatch {
+    EscapeWatch
+}
+
 pub struct PopState;
 
 pub fn on_pop_state(_on_path: impl FnMut(String) + 'static) -> PopState {
