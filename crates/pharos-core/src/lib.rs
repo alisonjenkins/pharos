@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod client_ids;
+pub mod ensemble;
 pub mod fuzzy;
 pub mod language;
 pub mod origin;
@@ -24,6 +25,7 @@ pub use auth::{
     UserRecord, UserStore, API_KEY_DEVICE_PREFIX,
 };
 pub use client_ids::{ClientDeviceId, PlaySessionId};
+pub use ensemble::ensemble_cast;
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
