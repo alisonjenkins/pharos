@@ -17,6 +17,7 @@
 //! - [`subtitle_cache`] — extracted / converted subtitle blob cache.
 //!   Embedded streams via ffmpeg `-map`, sidecar SRT → WebVTT.
 
+pub mod fmp4;
 pub mod hls_cache;
 pub mod image_cache;
 pub mod single_flight;
