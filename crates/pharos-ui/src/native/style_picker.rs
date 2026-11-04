@@ -208,7 +208,9 @@ mod tests {
             .expect("a panel");
         assert!(trigger.contains(r#"aria-expanded="false""#), "{trigger}");
         assert!(trigger.contains("Halo"), "{trigger}");
-        assert!(panel.contains("hidden"), "{panel}");
+        // Only the panel's own tag: the thumbnails below carry aria-hidden.
+        let tag = panel.split_once('>').map_or(panel, |(tag, _)| tag);
+        assert!(tag.contains(" hidden"), "{tag}");
         assert!(!html.contains("pharos-style-scrim"), "{html}");
     }
 
