@@ -89,6 +89,16 @@ pub fn seek_ms(_video_id: &str, _ms: u64) {}
 
 pub fn toggle_play(_video_id: &str) {}
 
+pub fn play(_video_id: &str) {}
+
+pub fn pause(_video_id: &str) {}
+
+pub fn set_rate(_video_id: &str, _rate: f64) {}
+
+pub fn unix_ms() -> i64 {
+    0
+}
+
 pub fn set_volume(_video_id: &str, _volume: f64, _muted: bool) {}
 
 pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}

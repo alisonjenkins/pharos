@@ -290,6 +290,35 @@ pub fn toggle_play(video_id: &str) {
     }
 }
 
+/// Start the `<video>`. A refused `play()` (autoplay policy) leaves it paused.
+pub fn play(video_id: &str) {
+    if let Some(v) = video_element(video_id) {
+        if let Err(e) = v.play() {
+            warn(&format!("pharos: play() refused: {e:?}"));
+        }
+    }
+}
+
+pub fn pause(video_id: &str) {
+    if let Some(v) = video_element(video_id) {
+        if let Err(e) = v.pause() {
+            warn(&format!("pharos: pause() refused: {e:?}"));
+        }
+    }
+}
+
+/// `playbackRate`: 1.0 is normal speed.
+pub fn set_rate(video_id: &str, rate: f64) {
+    if let Some(v) = video_element(video_id) {
+        v.set_playback_rate(rate);
+    }
+}
+
+/// Wall-clock unix milliseconds: the base the server's group clock speaks.
+pub fn unix_ms() -> i64 {
+    js_sys::Date::now() as i64
+}
+
 pub fn set_volume(video_id: &str, volume: f64, muted: bool) {
     if let Some(v) = video_element(video_id) {
         v.set_volume(volume.clamp(0.0, 1.0));
