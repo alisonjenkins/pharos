@@ -98,6 +98,12 @@ impl ClientError {
     pub fn is_disconnected(&self) -> bool {
         matches!(self, ClientError::Rpc(e) if e.kind == capnp::ErrorKind::Disconnected)
     }
+
+    /// Whether the server does not know the method called, as a server
+    /// older than the client's schema answers a method added since.
+    pub fn is_unimplemented(&self) -> bool {
+        matches!(self, ClientError::Rpc(e) if e.kind == capnp::ErrorKind::Unimplemented)
+    }
 }
 
 /// A `Done` result: ok, or the server's `Error`.
@@ -207,5 +213,17 @@ mod tests {
         );
         assert!(!ClientError::from(capnp::Error::failed("boom".into())).is_disconnected());
         assert!(!api("unavailable").is_disconnected());
+    }
+
+    /// Only a method the server does not know is unimplemented, so a UI
+    /// newer than its server can say so instead of showing a raw error.
+    #[test]
+    fn only_an_unknown_method_is_unimplemented() {
+        assert!(ClientError::from(capnp::Error::unimplemented(
+            "Method not implemented.".into()
+        ))
+        .is_unimplemented());
+        assert!(!ClientError::from(capnp::Error::failed("boom".into())).is_unimplemented());
+        assert!(!api("unavailable").is_unimplemented());
     }
 }

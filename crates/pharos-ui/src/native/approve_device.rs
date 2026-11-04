@@ -23,6 +23,9 @@ pub fn refusal_message(error: &ClientError) -> String {
             kind: "unavailable",
             ..
         } => "The server could not approve the device just now. Try again.".to_owned(),
+        e if e.is_unimplemented() => {
+            "This server cannot approve devices yet. Update the server, then try again.".to_owned()
+        }
         other => format!("Could not approve the device: {other}"),
     }
 }
@@ -38,6 +41,10 @@ pub fn normalise_code(raw: &str) -> Option<String> {
     }
 }
 
+/// The code form: checks the code is 6 digits before calling `on_approve`,
+/// shows `outcome` (the server's answer to the last approval), and clears
+/// the code once a device is approved. `busy` disables the button while a
+/// call is in flight.
 #[component]
 pub fn ApproveDeviceView(
     busy: bool,
@@ -81,7 +88,6 @@ pub fn ApproveDeviceView(
                         r#type: "text",
                         inputmode: "numeric",
                         autocomplete: "one-time-code",
-                        maxlength: "12",
                         placeholder: "000000",
                         value: "{code}",
                         oninput: move |e| {
@@ -176,7 +182,8 @@ mod tests {
         assert!(html.contains("id=\"quick-connect-code\""), "{html}");
         assert!(html.contains("inputmode=\"numeric\""), "{html}");
         assert!(html.contains("autocomplete=\"one-time-code\""), "{html}");
-        assert!(html.contains("maxlength=\"12\""), "{html}");
+        // No raw length cap: spaces are allowed around and between the digits.
+        assert!(!html.contains("maxlength"), "{html}");
         assert!(html.contains("placeholder=\"000000\""), "{html}");
         assert!(html.contains(">Approve<"), "{html}");
         assert!(!html.contains("role=\"alert\""), "{html}");

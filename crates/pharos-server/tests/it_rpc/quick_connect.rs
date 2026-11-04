@@ -66,6 +66,7 @@ enum AuthorizeAnswer {
     Other(String),
 }
 
+/// Calls `quickConnectAuthorize` on `session` with `code` and sorts the answer.
 async fn authorize_session(session: &session::Client, code: &str) -> AuthorizeAnswer {
     let mut req = session.quick_connect_authorize_request();
     req.get().init_ctx();
@@ -262,6 +263,8 @@ async fn racing_polls_sign_in_once_and_leave_no_slot_behind() {
     assert_eq!(limits.unauthenticated(), 1);
 }
 
+/// V428: a signed-in session approves a code, and the device then signs in
+/// once, as that user.
 #[actix_web::test]
 async fn a_signed_in_user_approves_a_code_over_the_session() {
     let fx = seed_rich().await;
@@ -290,6 +293,8 @@ async fn a_signed_in_user_approves_a_code_over_the_session() {
     );
 }
 
+/// A session that has signed out is refused as revoked, and the code stays
+/// pending.
 #[actix_web::test]
 async fn a_signed_out_session_cannot_approve_a_code() {
     let fx = seed_rich().await;
@@ -320,6 +325,7 @@ async fn a_signed_out_session_cannot_approve_a_code() {
     );
 }
 
+/// A code no device is showing answers notFound.
 #[actix_web::test]
 async fn an_unknown_code_is_not_found() {
     let fx = seed_rich().await;
@@ -333,6 +339,7 @@ async fn an_unknown_code_is_not_found() {
     );
 }
 
+/// A blank code is refused as invalid, naming the `code` field.
 #[actix_web::test]
 async fn a_blank_code_is_invalid() {
     let fx = seed_rich().await;
@@ -348,6 +355,8 @@ async fn a_blank_code_is_invalid() {
     );
 }
 
+/// After MAX_AUTHORIZE_FAILURES wrong codes the session is throttled, so
+/// codes cannot be guessed.
 #[actix_web::test]
 async fn wrong_codes_are_throttled() {
     let fx = seed_rich().await;
