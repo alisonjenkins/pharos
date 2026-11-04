@@ -18,6 +18,9 @@ use super::together_view::MemberStrip;
 
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
+/// The `<audio>` of a song handing over to the next, which takes
+/// [`VIDEO_ID`].
+pub const OUTGOING_ID: &str = "pharos-video-out";
 /// The element that goes fullscreen: the video with its controls.
 pub const PLAYER_ID: &str = "pharos-player";
 /// The seek bar, whose width turns a pointer offset into a position.
