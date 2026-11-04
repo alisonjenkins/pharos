@@ -334,8 +334,10 @@ mod tests {
 
     #[test]
     fn a_stored_song_carries_its_tags_and_play_state_into_the_engine() {
-        let mut item = MediaItem::default();
-        item.id = 9;
+        let mut item = MediaItem {
+            id: 9,
+            ..MediaItem::default()
+        };
         item.probe.artist = Some(" Portishead ".into());
         item.probe.album = Some("Dummy".into());
         item.probe.genre = Some("Trip-hop, Electronic".into());
