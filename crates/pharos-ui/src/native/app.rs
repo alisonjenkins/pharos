@@ -1947,6 +1947,7 @@ fn Player(
                 image: p.image.clone(),
                 media: media(),
                 runtime_ms: p.detail.item.runtime_ms,
+                pip: p.kind != ItemKind::Audio && platform::pip_supported(),
                 previous: near.previous,
                 next,
                 error: failed().or_else(|| group.ended.clone()),
