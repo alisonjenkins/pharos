@@ -974,9 +974,9 @@ mod tests {
         );
         let energy = Test::Energy { min: 10, max: 50 };
         assert_eq!(
-            with_value(&energy, "20", "250"),
+            with_value(&energy, "20", "300"),
             Test::Energy { min: 20, max: 50 },
-            "250 is no u8 percent"
+            "300 is no u8 percent"
         );
         assert_eq!(
             with_value(&energy, "20", "180"),
