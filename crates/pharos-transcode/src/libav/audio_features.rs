@@ -130,8 +130,13 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
                     target: "libav",
                     start_us,
                     error = %e,
-                    "audio features: seek refused, reading the window from the top"
+                    "audio features: seek refused, reopening to read the window from the top"
                 );
+                // A failed seek may already have read packets, leaving the
+                // input anywhere (even at EOF, which would store an empty
+                // analysis). Reopen so the read really starts at the top.
+                ictx = format::input(src)
+                    .map_err(|e| FrameError::Other(format!("reopen after seek: {e}")))?;
                 0
             }
         }
