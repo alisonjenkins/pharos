@@ -30,7 +30,7 @@ pub use archive::{Archive, ArchiveError, ZipArchive, MAX_ENTRY_BYTES};
 pub use css::Css;
 pub use epub::{Metadata, OpenError, SpineItem, TocEntry};
 pub use locator::{char_index, utf16_offset, Locator, ParseLocatorError};
-pub use section::{Attr, Content, El, Namespace, Section, Target, Value};
+pub use section::{Attr, Content, El, Namespace, ParseTargetError, Section, Target, Value};
 
 use epub::ManifestItem;
 use xml::XmlError;
