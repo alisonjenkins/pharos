@@ -1055,20 +1055,69 @@ test.describe("pharos Dioxus UI", () => {
       await bar.press("Escape");
       await expect(options).toHaveCount(0);
 
-      // Enter with no match picked opens the find screen on the same term.
+      // Enter with no match picked opens the palette on the same term,
+      // with every match under Titles.
       await bar.press("Enter");
-      await expect(page).toHaveURL(/\/ui\/find$/);
-      const box = page.getByLabel("Search");
+      const palette = page.getByRole("dialog", { name: "Go to or search" });
+      await expect(palette).toBeVisible();
+      const box = palette.getByRole("combobox");
       await expect(box).toHaveValue("Playwright");
       await expect(box).toBeFocused();
-      await expect(page.locator(".pharos-poster").first()).toBeVisible({
+      await expect(palette.getByRole("group", { name: "Titles" })).toBeVisible({
         timeout: 15_000,
       });
 
       await box.fill("zzqx-no-such-title");
-      await expect(page.getByText("No matches")).toBeVisible({
+      await expect(palette.getByText("No matches")).toBeVisible({
         timeout: 15_000,
       });
+      await box.press("Escape");
+      await expect(palette).toHaveCount(0);
+    });
+
+    test("palette: Ctrl+K goes to a page by name, and an old /find link opens it", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      const palette = page.getByRole("dialog", { name: "Go to or search" });
+      await page.keyboard.press("Control+k");
+      await expect(palette).toBeVisible();
+      // Before anything is typed it lists the libraries to go to.
+      await expect(palette.getByRole("option", { name: /^TV/ })).toBeVisible({
+        timeout: 15_000,
+      });
+      const box = palette.getByRole("combobox");
+      await expect(box).toBeFocused();
+      await box.fill("appear");
+      await box.press("Enter");
+      await expect(page).toHaveURL(/\/ui\/settings\/appearance$/);
+      await expect(palette).toHaveCount(0);
+
+      // Cmd+K, as on macOS, toggles it too.
+      await page.keyboard.press("Meta+k");
+      await expect(palette).toBeVisible();
+      await page.keyboard.press("Meta+k");
+      await expect(palette).toHaveCount(0);
+
+      await page.goto("/ui/find");
+      await expect(page).toHaveURL(/\/ui\/$/, { timeout: 15_000 });
+      await expect(palette).toBeVisible();
     });
 
     // The page is told it has neither WebM nor native HLS, as Firefox on a

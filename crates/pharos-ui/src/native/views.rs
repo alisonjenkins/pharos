@@ -7,6 +7,7 @@ use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, Librar
 
 use super::depth;
 use super::find::SUGGEST_LIMIT;
+use super::palette::Row;
 use super::platform;
 use super::route::Route;
 use super::seen::{self, MemberSeen};
@@ -345,7 +346,7 @@ pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
     }
 }
 
-/// What the find screen shows under its box.
+/// Where the shared search stands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Hits {
     /// Nothing asked yet: the box is blank.
@@ -355,69 +356,35 @@ pub enum Hits {
     Failed(String),
 }
 
-pub const FIND_INPUT: &str = "find-input";
-
-/// The search box and the matches under it. Typing reports each new text
-/// through `on_input`; the grid is the same poster tiles a library shows.
-#[component]
-pub fn FindView(text: String, hits: Hits, on_input: EventHandler<String>) -> Element {
-    rsx! {
-        section { class: "pharos-find",
-            h2 { "Find" }
-            div { class: "pharos-find-field",
-                label { r#for: FIND_INPUT, "Search" }
-                input {
-                    id: FIND_INPUT,
-                    r#type: "search",
-                    autocomplete: "off",
-                    value: "{text}",
-                    oninput: move |evt: FormEvent| on_input.call(evt.value()),
-                }
-            }
-            match hits {
-                Hits::Idle => rsx! {},
-                Hits::Failed(message) => rsx! { ErrorNote { message } },
-                Hits::Found(page) if page.items.is_empty() => rsx! {
-                    p { class: "pharos-empty", role: "status", "No matches" }
-                },
-                Hits::Found(page) => rsx! {
-                    p { class: "pharos-muted", role: "status", "{page.total} found" }
-                    ul { class: "pharos-grid",
-                        for item in page.items.iter() {
-                            li { key: "{item.id}", PosterTile { item: item.clone() } }
-                        }
-                    }
-                },
-            }
-        }
-    }
-}
-
 const SEARCH_INPUT: &str = "search-input";
 const SEARCH_LIST: &str = "search-list";
 
 /// The top bar's search box: matches from every library listed under it as
 /// you type. `open` hides the list (Escape, a pick, focus gone) without
-/// clearing the text; `active` is the match the arrow keys are on.
+/// clearing the text; `active` is the match the arrow keys are on, and
+/// `on_all` asks for every match, in the palette.
 #[component]
 pub fn SearchBox(
     text: String,
     hits: Hits,
     open: bool,
     active: Option<usize>,
+    /// The placeholder, naming the palette's shortcut.
+    hint: String,
     on_input: EventHandler<String>,
     on_key: EventHandler<KeyboardEvent>,
     on_open: EventHandler<()>,
     on_close: EventHandler<()>,
+    on_all: EventHandler<()>,
 ) -> Element {
     let shown = open && !text.trim().is_empty() && hits != Hits::Idle;
-    let active_id = active.filter(|_| shown).map(option_id);
+    let active_id = active.filter(|_| shown).map(|at| option_id("search", at));
     rsx! {
         div { class: "pharos-search", role: "search",
             input {
                 id: SEARCH_INPUT,
                 r#type: "search",
-                placeholder: "Search",
+                placeholder: "{hint}",
                 autocomplete: "off",
                 role: "combobox",
                 "aria-label": "Search all libraries",
@@ -449,18 +416,18 @@ pub fn SearchBox(
                                 for (at, item) in page.items.iter().take(SUGGEST_LIMIT).enumerate() {
                                     li {
                                         key: "{item.id}",
-                                        id: option_id(at),
+                                        id: option_id("search", at),
                                         role: "option",
                                         "aria-selected": if active == Some(at) { "true" } else { "false" },
                                         SearchHit { item: item.clone() }
                                     }
                                 }
                             }
-                            Link { to: Route::Find, class: "pharos-search-all",
-                                if page.total as usize > SUGGEST_LIMIT {
+                            if page.total as usize > SUGGEST_LIMIT {
+                                button {
+                                    class: "pharos-search-all",
+                                    onclick: move |_| on_all.call(()),
                                     "See all {page.total} matches"
-                                } else {
-                                    "Open the find page"
                                 }
                             }
                         },
@@ -471,11 +438,107 @@ pub fn SearchBox(
     }
 }
 
-fn option_id(at: usize) -> String {
-    format!("search-option-{at}")
+fn option_id(list: &str, at: usize) -> String {
+    format!("{list}-option-{at}")
 }
 
-/// One match in the search list: a thumbnail, the name, and what it is.
+pub const PALETTE_INPUT: &str = "palette-input";
+const PALETTE_LIST: &str = "palette-list";
+
+/// The Ctrl+K / Cmd+K palette: a box over the page that goes anywhere,
+/// listing `rows` under their group headings. `active` is the row Enter
+/// opens; `failed` is a search that did not answer.
+#[component]
+pub fn PaletteView(
+    text: String,
+    rows: Vec<Row>,
+    active: Option<usize>,
+    failed: Option<String>,
+    on_input: EventHandler<String>,
+    on_key: EventHandler<KeyboardEvent>,
+    on_close: EventHandler<()>,
+) -> Element {
+    let active_id = active.map(|at| option_id("palette", at));
+    rsx! {
+        div { class: "pharos-palette",
+            div { class: "pharos-palette-backdrop", onclick: move |_| on_close.call(()) }
+            div {
+                class: "pharos-palette-box",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-label": "Go to or search",
+                input {
+                    id: PALETTE_INPUT,
+                    r#type: "search",
+                    placeholder: "Go to a page, or search every library",
+                    autocomplete: "off",
+                    role: "combobox",
+                    "aria-label": "Go to or search",
+                    "aria-autocomplete": "list",
+                    "aria-controls": PALETTE_LIST,
+                    "aria-expanded": "true",
+                    "aria-activedescendant": active_id,
+                    value: "{text}",
+                    oninput: move |evt: FormEvent| on_input.call(evt.value()),
+                    onkeydown: move |evt| on_key.call(evt),
+                }
+                div {
+                    id: PALETTE_LIST,
+                    class: "pharos-palette-list",
+                    role: "listbox",
+                    "aria-label": "Places and matches",
+                    onclick: move |_| on_close.call(()),
+                    for (group, members) in groups(&rows) {
+                        ul { key: "{group}", role: "group", "aria-label": group,
+                            li { class: "pharos-palette-group", role: "presentation", "{group}" }
+                            for (at, row) in members {
+                                li {
+                                    key: "{at}",
+                                    id: option_id("palette", at),
+                                    role: "option",
+                                    "aria-selected": if active == Some(at) { "true" } else { "false" },
+                                    match row {
+                                        Row::Place(place) => rsx! {
+                                            Link { to: place.route.clone(), class: "pharos-search-hit",
+                                                span { class: "pharos-search-text",
+                                                    span { class: "pharos-search-name", "{place.label}" }
+                                                    span { class: "pharos-muted", "{place.detail}" }
+                                                }
+                                            }
+                                        },
+                                        Row::Recent(item) | Row::Title(item) => rsx! { SearchHit { item: item.clone() } },
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(message) = failed {
+                    ErrorNote { message }
+                } else if rows.is_empty() {
+                    p { class: "pharos-empty", role: "status", "No matches" }
+                }
+                p { class: "pharos-palette-keys pharos-muted",
+                    "↑↓ to move · Enter to open · Esc to close"
+                }
+            }
+        }
+    }
+}
+
+/// `rows` cut into runs of one group, each row with its place in `rows`.
+fn groups(rows: &[Row]) -> Vec<(&'static str, Vec<(usize, Row)>)> {
+    let mut groups: Vec<(&'static str, Vec<(usize, Row)>)> = Vec::new();
+    for (at, row) in rows.iter().enumerate() {
+        match groups.last_mut() {
+            Some((group, members)) if *group == row.group() => members.push((at, row.clone())),
+            _ => groups.push((row.group(), vec![(at, row.clone())])),
+        }
+    }
+    groups
+}
+
+/// One match in a search list: a thumbnail, the name, and what it is.
 #[component]
 fn SearchHit(item: Item) -> Element {
     let detail = std::iter::once(kind_name(item.kind).to_owned())
@@ -979,10 +1042,12 @@ mod tests {
                     hits: hits.clone(),
                     open,
                     active,
+                    hint: "Search (Ctrl+K)".to_owned(),
                     on_input: |_| {},
                     on_key: |_| {},
                     on_open: |_| {},
                     on_close: |_| {},
+                    on_all: |_| {},
                 }
             }
         })
@@ -1016,10 +1081,12 @@ mod tests {
                         hits: Hits::Idle,
                         open: false,
                         active: None,
+                        hint: String::new(),
                         on_input: |_| {},
                         on_key: |_| {},
                         on_open: |_| {},
                         on_close: |_| {},
+                        on_all: |_| {},
                     } },
                     p { "screen" }
                 }
@@ -1067,6 +1134,72 @@ mod tests {
             assert!(html.contains(r#"aria-expanded="false""#), "{html}");
             assert!(!html.contains("aria-activedescendant"), "{html}");
         }
+    }
+
+    #[test]
+    fn the_search_list_offers_the_rest_only_when_there_are_more() {
+        let html = search_box("match", found(3), true, None);
+        assert!(!html.contains("See all"), "{html}");
+        assert!(html.contains(r#"placeholder="Search (Ctrl+K)""#), "{html}");
+    }
+
+    #[test]
+    fn the_palette_heads_each_group_and_marks_the_active_row() {
+        use super::super::palette::{places, Row};
+        let film = Item {
+            name: "Alpha".into(),
+            ..item(ItemKind::Movie)
+        };
+        let mut rows: Vec<Row> = places(&[]).into_iter().map(Row::Place).collect();
+        rows.push(Row::Title(film));
+        let html = render(move || {
+            rsx! {
+                PaletteView {
+                    text: "a".to_owned(),
+                    rows: rows.clone(),
+                    active: Some(1),
+                    failed: None,
+                    on_input: |_| {},
+                    on_key: |_| {},
+                    on_close: |_| {},
+                }
+            }
+        });
+        assert!(html.contains(r#"role="dialog""#), "{html}");
+        assert_eq!(html.matches("pharos-palette-group").count(), 2, "{html}");
+        assert!(
+            html.contains(">Go to<") && html.contains(">Titles<"),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="/ui/settings/appearance""#), "{html}");
+        assert!(html.contains(r#"href="/ui/title/1""#), "{html}");
+        assert!(
+            html.contains(r#"aria-activedescendant="palette-option-1""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_palette_shows_a_failed_search_as_an_alert_and_says_when_nothing_matched() {
+        let palette = |failed: Option<String>| {
+            render(move || {
+                rsx! {
+                    PaletteView {
+                        text: "zzz".to_owned(),
+                        rows: Vec::new(),
+                        active: None,
+                        failed: failed.clone(),
+                        on_input: |_| {},
+                        on_key: |_| {},
+                        on_close: |_| {},
+                    }
+                }
+            })
+        };
+        let html = palette(Some("the server is busy".into()));
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("the server is busy"), "{html}");
+        assert!(palette(None).contains("No matches"));
     }
 
     #[test]

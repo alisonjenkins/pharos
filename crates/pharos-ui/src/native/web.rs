@@ -1010,6 +1010,47 @@ pub fn rail_gestures() -> RailGestures {
     RailGestures(held)
 }
 
+/// A page-wide `keydown` listener; removed on drop.
+pub struct KeyListener(Closure<dyn FnMut(web_sys::KeyboardEvent)>);
+
+impl Drop for KeyListener {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("keydown", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Call `on_key` with every key pressed anywhere in the page (its key, and
+/// whether Ctrl and the meta key are held); when it answers true the press
+/// is taken, so the browser does not act on it too.
+pub fn on_key(mut on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> KeyListener {
+    let listener =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            if !e.repeat() && on_key(&e.key(), e.ctrl_key(), e.meta_key()) {
+                e.prevent_default();
+            }
+        });
+    if let Some(window) = web_sys::window() {
+        let _ =
+            window.add_event_listener_with_callback("keydown", listener.as_ref().unchecked_ref());
+    }
+    KeyListener(listener)
+}
+
+/// How the palette's shortcut is written on this device: Cmd on Apple's.
+pub fn palette_keys() -> &'static str {
+    let apple = web_sys::window()
+        .and_then(|w| w.navigator().user_agent().ok())
+        .is_some_and(|agent| ["Mac", "iPhone", "iPad"].iter().any(|a| agent.contains(a)));
+    if apple {
+        "⌘K"
+    } else {
+        "Ctrl+K"
+    }
+}
+
 /// The tiles of the browse grid, in order.
 fn grid_tiles() -> Option<web_sys::HtmlCollection> {
     let grid = web_sys::window()?
