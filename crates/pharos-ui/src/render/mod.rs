@@ -5,7 +5,7 @@
 
 pub mod catalogue;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-mod glow;
+mod webgl;
 
 pub use catalogue::Program;
 
@@ -128,7 +128,7 @@ pub fn open(
     }
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
     {
-        glow::open(canvas_id, program)
+        webgl::open(canvas_id, program)
     }
     #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
     {

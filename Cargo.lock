@@ -2116,18 +2116,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glow"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "263218b0ba2b0715c3370fb04674f5f8aa331594b521c94ff0a8e4a8472d1386"
-dependencies = [
- "js-sys",
- "slotmap",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3679,7 +3667,6 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "gloo-net",
- "glow",
  "js-sys",
  "pharos-client",
  "serde",
