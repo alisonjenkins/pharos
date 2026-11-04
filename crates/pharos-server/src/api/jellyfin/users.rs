@@ -558,7 +558,7 @@ async fn user_by_id(
 
 /// A `UserDto` with the user's avatar tag, for replies that do not carry
 /// their configuration.
-pub(super) async fn user_dto_with_avatar(state: &AppState, user: &pharos_core::User) -> UserDto {
+async fn user_dto_with_avatar(state: &AppState, user: &pharos_core::User) -> UserDto {
     let mut dto = UserDto::from_domain(user, &state.server_id);
     dto.primary_image_tag = crate::avatar::tag(&state.stores, user.id).await;
     dto
