@@ -112,15 +112,24 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
         let us = i128::from(stream_start) * 1_000_000 * i128::from(tb_num) / i128::from(tb_den);
         i64::try_from(us).unwrap_or(if us < 0 { i64::MIN } else { i64::MAX })
     };
-    // Land at or before the window; the pts gate trims the lead-in. A
-    // container that cannot seek is read from the top instead, so the gate
-    // never waits for a start it will not reach.
+    // Land at or before the window; the pts gate trims the lead-in. The
+    // range must include the target itself: `..start_us` makes libav's max
+    // `start_us - 1`, below the target, and avformat_seek_file refuses every
+    // such seek with EPERM (B446). A container that cannot seek is read from
+    // the top instead, so the gate never waits for a start it will not reach.
     let start_ms = if start_ms > 0 {
-        let start_us = origin_us + (start_ms as i64) * 1000;
-        if ictx.seek(start_us, ..start_us).is_ok() {
-            start_ms
-        } else {
-            0
+        let start_us = origin_us.saturating_add((start_ms as i64).saturating_mul(1000));
+        match ictx.seek(start_us, ..=start_us) {
+            Ok(()) => start_ms,
+            Err(e) => {
+                tracing::debug!(
+                    target: "libav",
+                    start_us,
+                    error = %e,
+                    "audio features: seek refused, reading the window from the top"
+                );
+                0
+            }
         }
     } else {
         0
