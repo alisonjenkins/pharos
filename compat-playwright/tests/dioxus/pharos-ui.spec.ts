@@ -257,6 +257,66 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("form#signin")).toBeVisible();
     });
 
+    test("a user changes their own password from the account menu", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      // A user of its own, so the seeded user's password never changes.
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-passwd-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token } = await auth.json();
+      const name = `pw-passwd-${Date.now()}`;
+      const created = await request.post(`${PHAROS_URL}/Users/New`, {
+        headers: { "X-Emby-Token": token, "Content-Type": "application/json" },
+        data: { Name: name, Password: "first-pass" },
+      });
+      expect(created.ok()).toBeTruthy();
+
+      const signIn = async (password: string) => {
+        await page.locator("#signin-name").fill(name);
+        await page.locator("#signin-password").fill(password);
+        await page.getByRole("button", { name: "Sign in" }).click();
+      };
+      await page.goto("/ui/");
+      await signIn("first-pass");
+      const account = page.getByRole("button", { name: /^Account/ });
+      await account.click();
+      // Not an admin: no Manage.
+      await expect(page.getByRole("menuitem", { name: "Manage" })).toHaveCount(0);
+      await page.getByRole("menuitem", { name: "Account" }).click();
+      await expect(page).toHaveURL(/\/ui\/settings\/account$/);
+
+      const form = page.locator("form#change-password");
+      await form.locator("#password-current").fill("wrong");
+      await form.locator("#password-new").fill("second-pass");
+      await form.locator("#password-confirm").fill("second-pass");
+      await form.getByRole("button", { name: "Change password" }).click();
+      await expect(form.getByRole("alert")).toContainText("current password is not right");
+
+      await form.locator("#password-current").fill("first-pass");
+      await form.locator("#password-new").fill("second-pass");
+      await form.locator("#password-confirm").fill("second-pass");
+      await form.getByRole("button", { name: "Change password" }).click();
+      await expect(form.getByRole("status")).toContainText("Password changed");
+
+      await account.click();
+      await page.getByRole("menuitem", { name: "Sign out" }).click();
+      await signIn("first-pass");
+      await expect(page.locator(".pharos-error")).toBeVisible();
+      await signIn("second-pass");
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    });
+
     test("a wrong password says so", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },

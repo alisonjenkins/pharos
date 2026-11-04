@@ -14,6 +14,7 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::account::AccountMenu;
+use super::account_settings;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
@@ -918,6 +919,7 @@ fn Screen(route: Route) -> Element {
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
         Route::Appearance => rsx! { AppearanceScreen {} },
+        Route::Account => rsx! { AccountScreen {} },
         Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
@@ -1073,6 +1075,50 @@ fn Redirect(to: Route) -> Element {
     let replace = use_context::<Replace>();
     use_effect(move || replace.0.call(to.clone()));
     rsx! { Loading {} }
+}
+
+/// The Account page: the change-password form over the native session.
+#[component]
+fn AccountScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut busy = use_signal(|| false);
+    let mut outcome = use_signal(|| None::<account_settings::Outcome>);
+    let me = use_resource(move || {
+        let api = ctx.api.read().clone();
+        async move { api?.me(&call("account", "me")).await.ok() }
+    });
+    let name = me.read().clone().flatten().map(|me| me.name);
+    rsx! {
+        account_settings::AccountView {
+            name,
+            busy: busy(),
+            outcome: outcome(),
+            on_change_password: move |(current, new): (String, String)| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                outcome.set(None);
+                spawn(async move {
+                    let result = api
+                        .change_password(&call("account", "change_password"), &current, &new)
+                        .await;
+                    if let Err(e) = &result {
+                        if e.needs_sign_in() {
+                            let mut machine = ctx.machine;
+                            machine.write().apply(Event::NeedsSignIn);
+                        }
+                        platform::warn(&format!("account: change password failed: {e}"));
+                    }
+                    outcome.set(Some(result.map_err(|e| account_settings::refusal_message(&e))));
+                    busy.set(false);
+                });
+            },
+        }
+    }
 }
 
 /// The Appearance page: the theme gallery, imports, and the editor, mapped
