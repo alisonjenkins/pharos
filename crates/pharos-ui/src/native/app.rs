@@ -30,8 +30,8 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
-    volume_setting, Engine, MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock,
-    SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
+    volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
+    ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
 };
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
@@ -2416,8 +2416,11 @@ fn Player(
             let (p, engine) = (Rc::clone(&p), Rc::clone(&engine));
             spawn(async move {
                 let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
+                let on_fragment: OnFragment = Rc::new(|_| {});
                 let attached = match platform::engine(p.engine).await {
-                    Ok(mut e) => e.attach(VIDEO_ID, &p.url, p.start_ms, on_fatal).map(|()| e),
+                    Ok(mut e) => e
+                        .attach(VIDEO_ID, &p.url, p.start_ms, on_fatal, on_fragment)
+                        .map(|()| e),
                     Err(e) => Err(e),
                 };
                 match attached {
