@@ -1246,6 +1246,54 @@
           '';
         };
 
+        # 025 slice 0 spike: `dx bundle --platform android` for the TV app.
+        # Its own nixpkgs import: the Android SDK is unfree and needs its
+        # licence accepted, which the main `pkgs` does not allow.
+        devShells.android =
+          let
+            apkgs = import nixpkgs {
+              inherit system;
+              overlays = [ (import rust-overlay) ];
+              config = {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              };
+            };
+            sdk = apkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "31" "34" "35" "36" ];
+              buildToolsVersions = [ "34.0.0" "35.0.0" ];
+              includeNDK = true;
+              includeEmulator = false;
+              includeSystemImages = false;
+            };
+            androidToolchain = rustToolchain.override {
+              targets = [
+                "armv7-linux-androideabi"
+                "aarch64-linux-android"
+              ];
+            };
+            androidHome = "${sdk.androidsdk}/libexec/android-sdk";
+          in
+          apkgs.mkShell {
+            packages = [
+              androidToolchain
+              pkgs.dioxus-cli
+              pkgs.capnproto
+              pkgs.pkg-config
+              apkgs.jdk17
+              sdk.platform-tools
+            ];
+            shellHook = ''
+              unset LD_LIBRARY_PATH
+              export ANDROID_HOME=${androidHome}
+              export ANDROID_SDK_ROOT=${androidHome}
+              export ANDROID_NDK_HOME=$(ls -d ${androidHome}/ndk/* | head -1)
+              export JAVA_HOME=${apkgs.jdk17.home}
+              # AGP's own aapt2 from maven is a generic-linux binary; use the SDK's.
+              export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/35.0.0/aapt2"
+            '';
+          };
+
         # `nix flake check` gates the shipped artifact on the whole suite +
         # lints + doctests + a release build — same source + toolchain as
         # `.#pharos`. These are independent derivations sharing only the
