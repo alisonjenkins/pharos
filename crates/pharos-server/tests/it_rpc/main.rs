@@ -10,6 +10,7 @@ mod common;
 mod bootstrap;
 mod client;
 mod client_api;
+mod client_group;
 mod connect;
 mod gate;
 mod group;
