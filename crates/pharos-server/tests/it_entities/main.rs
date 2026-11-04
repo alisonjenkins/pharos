@@ -6,6 +6,7 @@ mod jellyfin_add_library;
 mod jellyfin_channels;
 mod jellyfin_chapter_image_route;
 mod jellyfin_collections_entity;
+mod jellyfin_episode_images;
 mod jellyfin_genres_entity;
 mod jellyfin_grouping_options;
 mod jellyfin_item_ancestors;
