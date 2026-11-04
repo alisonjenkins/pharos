@@ -20,6 +20,8 @@ pub enum Route {
     Appearance,
     /// The signed-in user's own settings (password), under `/settings`.
     Account,
+    /// Approving a Quick Connect code shown on another device, under `/settings`.
+    ApproveDevice,
     /// The search screen, `/find`: matches from `Library.search` as you type.
     Find,
     /// Watch together (014): the groups to join, `/together`.
@@ -57,6 +59,7 @@ impl Route {
             ["together"] => Route::Together,
             ["together", g] if is_group_id(g) => Route::TogetherGroup((*g).to_owned()),
             ["settings", "account"] => Route::Account,
+            ["settings", "approve-device"] => Route::ApproveDevice,
             _ => not_found(path),
         }
     }
@@ -72,6 +75,7 @@ impl Route {
             Route::Manage => format!("{MOUNT}/manage"),
             Route::Appearance => format!("{MOUNT}/settings/appearance"),
             Route::Account => format!("{MOUNT}/settings/account"),
+            Route::ApproveDevice => format!("{MOUNT}/settings/approve-device"),
             Route::Find => format!("{MOUNT}/find"),
             Route::Together => format!("{MOUNT}/together"),
             Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
@@ -90,6 +94,7 @@ impl Route {
             Route::Manage => "manage",
             Route::Appearance => "appearance",
             Route::Account => "account",
+            Route::ApproveDevice => "approve_device",
             Route::Find => "find",
             Route::Together => "together",
             Route::TogetherGroup(_) => "together_group",
@@ -125,6 +130,7 @@ mod tests {
             Route::Manage,
             Route::Appearance,
             Route::Account,
+            Route::ApproveDevice,
             Route::Find,
             Route::Together,
             Route::TogetherGroup("0a1b-2c_3d".into()),
