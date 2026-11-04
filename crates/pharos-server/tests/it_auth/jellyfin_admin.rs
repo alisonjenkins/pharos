@@ -1116,3 +1116,98 @@ async fn a_non_admin_cannot_read_the_quarantine() {
     .await;
     assert_eq!(resp.status().as_u16(), 403);
 }
+
+#[actix_web::test]
+async fn a_non_admin_cannot_list_duplicate_films() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Admin/Media/Duplicates")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+/// V285 — two files of one film are listed together with what tells them
+/// apart; an episode with the same title is not a film and stays out.
+#[actix_web::test]
+async fn an_admin_sees_each_duplicated_film_with_its_versions() {
+    use pharos_core::{MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaStore, ProviderIds};
+
+    let (state, token, _uid) = seed(true).await;
+    let item = |id: u64, path: &str, kind: MediaKind, tmdb: Option<&str>, height: u32| MediaItem {
+        id,
+        path: path.into(),
+        title: "The Six Million Dollar Man: Wine, Women and War".into(),
+        kind,
+        probe: MediaProbe {
+            size_bytes: Some(u64::from(height) * 1_000_000),
+            width: Some(height * 16 / 9),
+            height: Some(height),
+            video_codec: Some("h264".into()),
+            ..Default::default()
+        },
+        metadata: MediaMetadata {
+            production_year: Some(1973),
+            provider_ids: ProviderIds {
+                tmdb: tmdb.map(Into::into),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        created_at: Some(1_700_000_000),
+        ..Default::default()
+    };
+    for m in [
+        item(
+            11,
+            "/m/Wine Women and War (1973).mkv",
+            MediaKind::Movie,
+            Some("5157"),
+            1080,
+        ),
+        item(
+            12,
+            "/m/Six Million Dollar Man - Wine Women and War.avi",
+            MediaKind::Movie,
+            None,
+            480,
+        ),
+        item(
+            13,
+            "/tv/Six Million Dollar Man/S01E01.mkv",
+            MediaKind::Episode,
+            None,
+            480,
+        ),
+    ] {
+        MediaStore::put(&state.stores, m).await.unwrap();
+    }
+    let app = test::init_service(build_app(state)).await;
+
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/Admin/Media/Duplicates")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let groups = v.as_array().expect("array response");
+    assert_eq!(groups.len(), 1, "{v}");
+    let group = &groups[0];
+    assert_eq!(group["ProductionYear"], 1973, "{v}");
+    assert_eq!(group["ProviderId"], "tmdb:5157", "{v}");
+    let versions = group["Versions"].as_array().unwrap();
+    let ids: Vec<&str> = versions.iter().map(|e| e["Id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["11", "12"], "{v}");
+    assert_eq!(versions[1]["Height"], 480, "{v}");
+    assert_eq!(versions[1]["VideoCodec"], "h264", "{v}");
+    assert_eq!(versions[1]["SizeBytes"], 480_000_000, "{v}");
+    assert_eq!(versions[1]["DateAdded"], 1_700_000_000, "{v}");
+}
