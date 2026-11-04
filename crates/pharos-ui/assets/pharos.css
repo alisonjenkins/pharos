@@ -320,6 +320,14 @@ input:focus-visible {
   opacity: 0.45;
   cursor: default;
 }
+/* Years are four figures: a wider rail, and no wider a page gutter. */
+.pharos-browse:has(.pharos-years) {
+  padding-right: 3rem;
+}
+.pharos-years .pharos-letter {
+  width: 2.5rem;
+  font-size: clamp(0.55rem, 2.2vh, 0.72rem);
+}
 
 .pharos-poster {
   display: block;

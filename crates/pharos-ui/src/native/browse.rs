@@ -88,6 +88,15 @@ impl Order {
     }
 }
 
+/// What a library grid's rail jumps between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rail {
+    /// First letters, `#` then A to Z, in name order (V252).
+    Letters,
+    /// Years, in the listing's own order, in a date order (B317/V256).
+    Years,
+}
+
 /// How a library's filter bar narrows and orders its grid. The default is
 /// the listing as the library opens: everything, by name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -134,10 +143,12 @@ impl Narrow {
         }
     }
 
-    /// Whether the grid is in name order, so jumping by letter means
-    /// something.
-    pub fn by_letter(&self) -> bool {
-        self.order == Order::Name
+    /// What the grid's rail jumps between in this order.
+    pub fn rail(&self) -> Rail {
+        match self.order {
+            Order::Name => Rail::Letters,
+            Order::Released | Order::Added => Rail::Years,
+        }
     }
 }
 
@@ -470,7 +481,7 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
                 Some(base) if library => rsx! { LibraryGrid { first: page, base } },
                 Some(source) => remount_on(
                     &source.parent.to_string(),
-                    rsx! { PagedGrid { first: page, source, by_letter: false } },
+                    rsx! { PagedGrid { first: page, source, rail: None } },
                 ),
                 None => rsx! { PosterGrid { page } },
             }
@@ -515,7 +526,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
             .map_err(|e| e.to_string())
         }
     });
-    let by_letter = narrow.read().by_letter();
+    let rail = narrow.read().rail();
     rsx! {
         FilterBar { narrow, genres }
         match &*listed.read() {
@@ -527,7 +538,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
                     PagedGrid {
                         first: page.clone(),
                         source: listing.clone(),
-                        by_letter,
+                        rail: Some(rail),
                         genres,
                     }
                 },
@@ -642,14 +653,15 @@ enum Ask {
 /// (V237): an observer on a tile `SENTINEL_LEAD` before the last, and on
 /// the end of the list, asks for the next page, and a button does the same by
 /// hand and retries a failure (V237; B294 was the dead end this replaces).
-/// In name order it also jumps by letter (V252): the rail on the right goes
-/// straight to one, and Shift+wheel steps to the next or previous, reading
-/// ahead through the pages in between.
+/// A library's grid also jumps by section, letters in name order (V252) and
+/// years in a date order (B317/V256): the rail on the right goes straight to
+/// one, and Shift+wheel steps to the next or previous, reading ahead through
+/// the pages in between.
 #[component]
 fn PagedGrid(
     first: Page,
     source: Listing,
-    by_letter: bool,
+    rail: Option<Rail>,
     genres: Option<Signal<Vec<String>>>,
 ) -> Element {
     let ctx = use_context::<Ctx>();
@@ -716,7 +728,7 @@ fn PagedGrid(
         });
     });
 
-    // Where each letter starts, and the genres for the filter bar.
+    // Where each section starts, and the genres for the filter bar.
     let indexed = source.clone();
     let index = use_resource(move || {
         let listing = indexed.clone();
@@ -771,7 +783,7 @@ fn PagedGrid(
     };
     let mut wheel = use_signal(Wheel::default);
     use_hook(move || {
-        by_letter.then(|| {
+        rail.is_some().then(|| {
             std::rc::Rc::new(platform::on_shift_wheel(move |turn| {
                 let steps = wheel.write().feed(turn);
                 if steps == 0 {
@@ -811,28 +823,59 @@ fn PagedGrid(
         "Show more"
     };
     let starts = starts.read().clone();
-    let current = cursor().and_then(|at| letters::letter_at(&starts, at));
+    let current = cursor()
+        .and_then(|at| letters::letter_at(&starts, at))
+        .map(str::to_owned);
+    // Every letter, the ones the listing lacks greyed out; or the years the
+    // listing holds, every few when there are many.
+    let buttons: Vec<(String, Option<u32>)> = match rail {
+        _ if starts.is_empty() => Vec::new(),
+        None => Vec::new(),
+        Some(Rail::Letters) => LETTERS
+            .iter()
+            .map(|l| {
+                let label = l.to_string();
+                let start = letters::start_of(&starts, &label);
+                (label, start)
+            })
+            .collect(),
+        Some(Rail::Years) => letters::shown(&starts)
+            .into_iter()
+            .map(|(label, start)| (label, Some(start)))
+            .collect(),
+    };
+    // A thinned rail of years marks the shown year at or before the one in
+    // view.
+    let marked = current.as_deref().and_then(|c| {
+        let at = letters::start_of(&starts, c)?;
+        buttons
+            .iter()
+            .filter(|(_, s)| s.is_some_and(|s| s <= at))
+            .max_by_key(|(_, s)| *s)
+            .map(|(l, _)| l.clone())
+    });
+    let years = rail == Some(Rail::Years);
     rsx! {
-        if by_letter && !starts.is_empty() {
-            nav { class: "pharos-letters", aria_label: "Jump to letter",
-                for letter in LETTERS {
-                    {
-                        let start = letters::start_of(&starts, letter);
-                        rsx! {
-                            button {
-                                class: "pharos-letter",
-                                r#type: "button",
-                                disabled: start.is_none(),
-                                "aria-current": if current == Some(letter) { "true" },
-                                aria_label: if letter == '#' { "Numbers and symbols" },
-                                onclick: move |_| {
-                                    if let Some(start) = start {
-                                        go(start);
-                                    }
-                                },
-                                "{letter}"
+        if !buttons.is_empty() {
+            nav {
+                class: if years { "pharos-letters pharos-years" } else { "pharos-letters" },
+                aria_label: if years { "Jump to year" } else { "Jump to letter" },
+                for (label, start) in buttons {
+                    button {
+                        key: "{label}",
+                        class: "pharos-letter",
+                        r#type: "button",
+                        disabled: start.is_none(),
+                        "aria-current": if marked.as_deref() == Some(label.as_str()) { "true" },
+                        aria_label: if label == "#" {
+                            if years { "No date" } else { "Numbers and symbols" }
+                        },
+                        onclick: move |_| {
+                            if let Some(start) = start {
+                                go(start);
                             }
-                        }
+                        },
+                        "{label}"
                     }
                 }
             }
@@ -1702,14 +1745,14 @@ mod tests {
         assert_eq!(listing.genre.as_deref(), Some("Drama"));
         assert_eq!(listing.played, Some(false));
         let by_name = released.ordered(Order::Name);
-        assert!(by_name.by_letter() && !by_name.descending);
+        assert!(by_name.rail() == Rail::Letters && !by_name.descending);
         assert_eq!(by_name.apply(&base).sort_by, "SortName");
         assert_eq!(
             by_name.genre.as_deref(),
             Some("Drama"),
             "a new order keeps the filters"
         );
-        assert!(!newest.by_letter());
+        assert_eq!(newest.rail(), Rail::Years);
     }
 
     #[test]

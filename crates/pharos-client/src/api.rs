@@ -176,13 +176,14 @@ impl Listing {
     }
 }
 
-/// Where each first letter starts in a listing, and the genres it can be
-/// narrowed to.
+/// Where each section of a listing starts, and the genres it can be narrowed
+/// to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListIndex {
-    /// Each letter the listing holds (`#` for anything not A to Z) and the
-    /// offset of its first item, in listing order.
-    pub letters: Vec<(char, u32)>,
+    /// Each section the listing holds and the offset of its first item, in
+    /// listing order: in name order a first letter (`#` for anything not A to
+    /// Z), in a date order a year (`#` for no date).
+    pub letters: Vec<(String, u32)>,
     pub genres: Vec<String>,
 }
 
@@ -573,10 +574,8 @@ impl PharosApi for NativeApi {
                 let letters = index
                     .get_letters()?
                     .iter()
-                    .filter_map(|l| {
-                        let letter = text(l.get_letter()).map(|t| t.chars().next());
-                        letter.map(|c| c.map(|c| (c, l.get_start()))).transpose()
-                    })
+                    .map(|l| Ok((text(l.get_letter())?, l.get_start())))
+                    .filter(|l| !matches!(l, Ok((label, _)) if label.is_empty()))
                     .collect::<Result<_, capnp::Error>>()?;
                 let genres = index
                     .get_genres()?
