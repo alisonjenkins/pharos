@@ -1,4 +1,4 @@
-# ADR-0049: User avatars are re-encoded by the `image` crate and kept as a user pref
+# ADR-0051: User avatars are re-encoded by the `image` crate and kept as a user pref
 
 - **Status:** Accepted
 - **Date:** 2026-11-04T00:00:00Z
