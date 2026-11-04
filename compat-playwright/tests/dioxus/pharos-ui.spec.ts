@@ -1714,6 +1714,14 @@ test.describe("pharos Dioxus UI previous and next track", () => {
         t.AlbumId && (t.RunTimeTicks ?? 0) > 200_000_000,
     );
     test.skip(!track, "the seed has no track of over 20 s on an album");
+    // Two copies of a one-song album queue the same song, so Next is known.
+    const siblings = await json(
+      `/Users/${user.Id}/Items?ParentId=${track.AlbumId}&IncludeItemTypes=Audio`,
+    );
+    test.skip(
+      (siblings.Items?.length ?? 0) !== 1,
+      "the queue steps in this test assume a one-song album",
+    );
 
     await page.goto("/ui/");
     await page.locator("#signin-name").fill(TEST_USER);
@@ -1754,10 +1762,12 @@ test.describe("pharos Dioxus UI previous and next track", () => {
       .poll(() => audio.evaluate((a: HTMLMediaElement) => a.readyState), { timeout: 15_000 })
       .toBeGreaterThan(0);
 
-    // Next plays the queue's first song from its start.
+    // Next plays the queue's first song, the second copy, from its start.
     await seekTo(12);
     await next.click();
     await expect.poll(at).toBeLessThan(5);
+    await expect(page.locator("h2.pharos-listen-title")).toHaveText(track.Name);
+    await expect(next).toBeDisabled();
 
     // Past the opening seconds, Previous starts the same song again.
     await expect
