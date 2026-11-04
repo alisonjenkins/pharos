@@ -10,13 +10,14 @@ use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pharos_api::pharos_capnp::{
-    done, group as wire, group_sink, group_summary, group_update, membership as member_wire,
-    membership_result, seen_result, EndReason,
+    done, group as wire, group_sink, group_summary, group_tracks, group_update,
+    membership as member_wire, membership_result, seen_result, track_choice, EndReason,
 };
+use pharos_api::track_choice::{self as codec, TrackChoice as WireChoice};
 use pharos_api::{server, Connection, Denial};
 use pharos_jellyfin_api::dto::{wire_item_id, WireId};
 use pharos_sync::group::{GroupHandle, GroupMsg};
-use pharos_sync::messages::{GroupId, ServerMsg};
+use pharos_sync::messages::{GroupId, GroupTracks, ServerMsg, TrackChoice};
 use pharos_sync::MemberId;
 use tokio::sync::mpsc;
 
@@ -182,6 +183,8 @@ struct Summary {
     name: String,
     item: Option<u64>,
     members: Vec<Member>,
+    /// What a late joiner starts on.
+    tracks: GroupTracks,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -189,6 +192,7 @@ struct Member {
     id: String,
     name: String,
     buffering: bool,
+    own_tracks: bool,
 }
 
 impl From<&ListedGroup> for Summary {
@@ -206,8 +210,10 @@ impl From<&ListedGroup> for Summary {
                     id: id.clone(),
                     name: name.clone(),
                     buffering: false,
+                    own_tracks: false,
                 })
                 .collect(),
+            tracks: GroupTracks::default(),
         }
     }
 }
@@ -223,6 +229,38 @@ fn write_member(mut out: pharos_api::pharos_capnp::group_member::Builder<'_>, m:
     out.set_id(m.id.as_str());
     out.set_name(m.name.as_str());
     out.set_buffering(m.buffering);
+    out.set_own_tracks(m.own_tracks);
+}
+
+fn write_choice(out: track_choice::Builder<'_>, choice: TrackChoice) {
+    codec::write(
+        out,
+        match choice {
+            TrackChoice::Unset => WireChoice::Unset,
+            TrackChoice::Index(index) => WireChoice::Index(index),
+            TrackChoice::Off => WireChoice::Off,
+        },
+    );
+}
+
+fn read_choice(choice: track_choice::Reader<'_>) -> TrackChoice {
+    match codec::read(choice) {
+        WireChoice::Unset => TrackChoice::Unset,
+        WireChoice::Index(index) => TrackChoice::Index(index),
+        WireChoice::Off => TrackChoice::Off,
+    }
+}
+
+fn write_tracks(mut out: group_tracks::Builder<'_>, tracks: &GroupTracks) {
+    write_choice(out.reborrow().init_audio(), tracks.audio);
+    write_choice(out.reborrow().init_subtitle(), tracks.subtitle);
+    out.set_by(
+        tracks
+            .by
+            .map(|m| m.to_string())
+            .unwrap_or_default()
+            .as_str(),
+    );
 }
 
 fn write_summary(mut out: group_summary::Builder<'_>, group: &Summary) {
@@ -231,6 +269,7 @@ fn write_summary(mut out: group_summary::Builder<'_>, group: &Summary) {
     if let Some(id) = group.item {
         set_item_id(out.reborrow().init_item(), WireId::Real(id));
     }
+    write_tracks(out.reborrow().init_tracks(), &group.tracks);
     let mut members = out.init_members(u32::try_from(group.members.len()).unwrap_or(u32::MAX));
     for (i, m) in (0u32..).zip(&group.members) {
         write_member(members.reborrow().get(i), m);
@@ -247,6 +286,7 @@ fn write_seen(out: seen_result::Builder<'_>, members: &[MemberSeen]) {
                 id: m.member_id.clone(),
                 name: m.name.clone(),
                 buffering: m.buffering,
+                own_tracks: false,
             },
         );
         let mut items = entry.init_items(u32::try_from(m.items.len()).unwrap_or(u32::MAX));
@@ -284,6 +324,13 @@ enum Update {
         by: Option<String>,
     },
     Member(Member),
+    /// A member went onto, or came back from, its own tracks; the pump turns
+    /// it into a `Member` with the name and buffering it already knows.
+    MemberTracks {
+        id: String,
+        own_tracks: bool,
+    },
+    Tracks(GroupTracks),
     Left(String),
     Item {
         item: u64,
@@ -309,6 +356,7 @@ fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Upda
                     id: m.member_id.to_string(),
                     name: m.name.clone(),
                     buffering: false,
+                    own_tracks: false,
                 })
                 .collect(),
             ..Summary::default()
@@ -344,7 +392,16 @@ fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Upda
             id: member.member_id.to_string(),
             name: member.name.clone(),
             buffering: false,
+            own_tracks: false,
         }),
+        ServerMsg::Tracks { tracks } => Update::Tracks(tracks.clone()),
+        ServerMsg::MemberTracks {
+            member_id,
+            own_tracks,
+        } => Update::MemberTracks {
+            id: member_id.to_string(),
+            own_tracks: *own_tracks,
+        },
         ServerMsg::MemberLeft { member_id, .. } => Update::Left(member_id.to_string()),
         ServerMsg::PlayQueue {
             items,
@@ -405,6 +462,9 @@ fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
             at.set_by(by.as_deref().unwrap_or_default());
         }
         Update::Member(member) => write_member(out.init_member(), member),
+        Update::Tracks(tracks) => write_tracks(out.init_tracks(), tracks),
+        // The pump turns it into a `Member` before anything is written.
+        Update::MemberTracks { .. } => {}
         Update::Left(id) => out.set_left(id.as_str()),
         Update::Item {
             item,
@@ -438,6 +498,7 @@ const BUFFERING_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group: GroupHandle) {
     let mut roster: HashMap<String, String> = HashMap::new();
     let mut buffering: HashSet<String> = HashSet::new();
+    let mut own_tracks: HashSet<String> = HashSet::new();
     let mut poll =
         tokio::time::interval_at(tokio::time::Instant::now() + BUFFERING_POLL, BUFFERING_POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -452,12 +513,21 @@ async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group
         };
         if let Some(msg) = &msg {
             if let Some(mut update) = translate(msg, group.group_id, group.epoch_unix_ms) {
+                let mut member_update = None;
                 match &mut update {
                     Update::Joined(summary) => {
                         // `Joined` carries the roster only; the name, the
-                        // item playing and who is buffering are the group's own.
+                        // item playing, who is buffering and the group's
+                        // tracks (what a late joiner starts on) are the
+                        // group's own.
                         if let Some(snap) = group.snapshot().await {
                             summary.name = snap.group_name;
+                            summary.tracks = snap.tracks;
+                            own_tracks = snap
+                                .own_tracks_members
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect();
                             summary.item = real_item(
                                 snap.current_item_id
                                     .as_deref()
@@ -470,6 +540,7 @@ async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group
                                 .collect();
                             for m in &mut summary.members {
                                 m.buffering = buffering.contains(&m.id);
+                                m.own_tracks = own_tracks.contains(&m.id);
                             }
                         }
                         roster = summary
@@ -484,8 +555,28 @@ async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group
                     Update::Left(id) => {
                         roster.remove(id);
                         buffering.remove(id);
+                        own_tracks.remove(id);
+                    }
+                    Update::MemberTracks {
+                        id,
+                        own_tracks: own,
+                    } => {
+                        if *own {
+                            own_tracks.insert(id.clone());
+                        } else {
+                            own_tracks.remove(id);
+                        }
+                        member_update = Some(Update::Member(Member {
+                            id: id.clone(),
+                            name: roster.get(id).cloned().unwrap_or_default(),
+                            buffering: buffering.contains(id),
+                            own_tracks: *own,
+                        }));
                     }
                     _ => {}
+                }
+                if let Some(member) = member_update {
+                    update = member;
                 }
                 updates.push(update);
             }
@@ -502,6 +593,7 @@ async fn pump(mut rx: mpsc::Receiver<ServerMsg>, sink: group_sink::Client, group
                         id: id.clone(),
                         name: roster.get(id).cloned().unwrap_or_default(),
                         buffering: now.contains(id),
+                        own_tracks: own_tracks.contains(id),
                     }));
                 }
                 buffering = now;
@@ -1044,6 +1136,43 @@ impl server::membership::Handler for Membership {
     ) -> Result<(), capnp::Error> {
         let done = self
             .command("ping", |member_id| GroupMsg::MemberPing { member_id })
+            .await;
+        write_done(results.get().init_result(), done);
+        Ok(())
+    }
+
+    async fn set_tracks(
+        self: Rc<Self>,
+        params: member_wire::SetTracksParams,
+        results: &mut member_wire::SetTracksResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let audio = read_choice(params.get_audio()?);
+        let subtitle = read_choice(params.get_subtitle()?);
+        let playlist_item_id = playlist_item_id(params.get_playlist_item_id()?.to_string()?);
+        let done = self
+            .command("set_tracks", |sender| GroupMsg::SetTracks {
+                sender,
+                audio,
+                subtitle,
+                playlist_item_id,
+            })
+            .await;
+        write_done(results.get().init_result(), done);
+        Ok(())
+    }
+
+    async fn follow_tracks(
+        self: Rc<Self>,
+        params: member_wire::FollowTracksParams,
+        results: &mut member_wire::FollowTracksResults,
+    ) -> Result<(), capnp::Error> {
+        let follow = params.get()?.get_follow();
+        let done = self
+            .command("follow_tracks", |member_id| GroupMsg::FollowTracks {
+                member_id,
+                follow,
+            })
             .await;
         write_done(results.get().init_result(), done);
         Ok(())
