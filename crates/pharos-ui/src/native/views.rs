@@ -420,6 +420,9 @@ pub fn PosterTile(item: Item) -> Element {
                 if item.played {
                     span { class: "pharos-badge", "Watched" }
                 }
+                if item.stereo.is_some() {
+                    span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
+                }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
