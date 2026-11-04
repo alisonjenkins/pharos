@@ -18,6 +18,7 @@ use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
     GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS,
 };
+use super::track_follow::GroupTracksView;
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
@@ -112,6 +113,8 @@ pub enum Action {
 pub struct GroupState {
     pub id: Option<GroupId>,
     pub members: Vec<Member>,
+    /// The group's audio and subtitle choice.
+    pub tracks: GroupTracksView,
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
     pub ended: Option<String>,
@@ -197,6 +200,7 @@ impl GroupState {
             GroupUpdate::Joined(g) => {
                 self.id = Some(g.id);
                 self.members = g.members;
+                self.tracks = g.tracks;
                 Vec::new()
             }
             GroupUpdate::Member(m) => {
@@ -235,6 +239,7 @@ impl GroupState {
             GroupUpdate::Play {
                 at_server_ms,
                 position_ms,
+                ..
             } => {
                 let (delay_ms, late) = self.due(at_server_ms, now_ms);
                 self.settle(position_ms, at_server_ms, true, now_ms);
@@ -246,6 +251,7 @@ impl GroupState {
             GroupUpdate::Pause {
                 at_server_ms,
                 position_ms,
+                ..
             } => {
                 let (delay_ms, _) = self.due(at_server_ms, now_ms);
                 self.settle(position_ms, at_server_ms, false, now_ms);
@@ -257,6 +263,7 @@ impl GroupState {
             GroupUpdate::Seek {
                 at_server_ms,
                 position_ms,
+                ..
             } => {
                 let playing = self.anchor.map(|a| a.playing);
                 let (delay_ms, late) = self.due(at_server_ms, now_ms);
@@ -275,6 +282,10 @@ impl GroupState {
                         position_ms
                     },
                 }]
+            }
+            GroupUpdate::Tracks { tracks, .. } => {
+                self.tracks = tracks;
+                Vec::new()
             }
             GroupUpdate::Ended => {
                 self.ended = Some("This group has ended".to_owned());
@@ -968,6 +979,7 @@ mod tests {
             id: id.into(),
             name: id.to_uppercase(),
             buffering,
+            own_tracks: false,
         }
     }
 
@@ -977,6 +989,7 @@ mod tests {
             name: "Friday".into(),
             item: None,
             members: vec![member("me", false)],
+            tracks: GroupTracksView::default(),
         }
     }
 
@@ -1117,7 +1130,8 @@ mod tests {
             state.apply(
                 GroupUpdate::Play {
                     at_server_ms: 11_500,
-                    position_ms: 5_000
+                    position_ms: 5_000,
+                    by: None
                 },
                 10_000
             ),
@@ -1131,7 +1145,8 @@ mod tests {
             state.apply(
                 GroupUpdate::Seek {
                     at_server_ms: 11_000,
-                    position_ms: 20_000
+                    position_ms: 20_000,
+                    by: None
                 },
                 10_300
             ),
@@ -1144,7 +1159,8 @@ mod tests {
             state.apply(
                 GroupUpdate::Pause {
                     at_server_ms: 12_000,
-                    position_ms: 21_000
+                    position_ms: 21_000,
+                    by: None
                 },
                 11_000
             ),
@@ -1163,12 +1179,14 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 100_000,
             position_ms: 5_000,
+            by: None,
         });
         rig.env.settle();
         assert_eq!(*rig.player.log.borrow(), ["seek(5000)", "play"]);
         rig.session.deliver(GroupUpdate::Pause {
             at_server_ms: 100_000,
             position_ms: 9_000,
+            by: None,
         });
         rig.env.settle();
         assert_eq!(
@@ -1266,6 +1284,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 100_000,
             position_ms: 10_000,
+            by: None,
         });
         rig.env.settle();
         rig.player.log.borrow_mut().clear();
@@ -1322,6 +1341,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 102_500,
             position_ms: 0,
+            by: None,
         });
         rig.env.settle();
         {
@@ -1427,6 +1447,7 @@ mod tests {
             GroupUpdate::Seek {
                 at_server_ms: 0,
                 position_ms: 3_000,
+                by: None,
             },
             100_000,
         );
@@ -1448,6 +1469,7 @@ mod tests {
             GroupUpdate::Seek {
                 at_server_ms: 100_500,
                 position_ms: 20_000,
+                by: None,
             },
             100_500,
         );
@@ -1460,6 +1482,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Pause {
             at_server_ms: 100_000,
             position_ms: 42_000,
+            by: None,
         });
         let late = Rc::new(TestPlayer::default());
         rig.session.set_player(Some(late.clone()));

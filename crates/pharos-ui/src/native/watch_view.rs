@@ -960,6 +960,7 @@ mod tests {
                         id: "a".into(),
                         name: "Ada".into(),
                         buffering: false,
+                        own_tracks: false,
                     }]
                 } else {
                     vec![]

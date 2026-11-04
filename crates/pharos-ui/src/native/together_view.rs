@@ -234,6 +234,7 @@ mod tests {
             id: id.into(),
             name: name.into(),
             buffering,
+            own_tracks: false,
         }
     }
 
@@ -243,6 +244,7 @@ mod tests {
             name: "Friday film".into(),
             item: None,
             members: vec![member("a", "Ada", false), member("b", "Bo", true)],
+            tracks: crate::native::track_follow::GroupTracksView::default(),
         }
     }
 
