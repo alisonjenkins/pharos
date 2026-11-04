@@ -139,6 +139,12 @@ pub struct Stage {
     /// The view to use when the player leaves full: floating or mini.
     pub compact: View,
     pub spot: Spot,
+    /// Counts the items played, so each one mounts its own player even when
+    /// an item comes round again.
+    pub play: u32,
+    /// The song handing over to the next one, kept mounted until the next
+    /// is ready and, with a crossfade, until it has faded out.
+    pub handoff: Option<Handoff>,
 }
 
 impl Default for Stage {
@@ -148,8 +154,25 @@ impl Default for Stage {
             view: View::Full,
             compact: View::Floating,
             spot: Spot::default(),
+            play: 0,
+            handoff: None,
         }
     }
+}
+
+/// A song handing the stage over to the next: its player stays mounted
+/// beside the next one's, so the screen never drops to a loading state
+/// between songs and the two can overlap for a crossfade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handoff {
+    pub from: ItemRef,
+    /// The [`Stage::play`] the song was mounted as.
+    pub from_play: u32,
+    /// How long the two overlap; 0 is a cut once the next is ready.
+    pub fade_ms: u64,
+    /// The next song's playback is negotiated: its screen shows, the
+    /// handing-over one is hidden.
+    pub ready: bool,
 }
 
 impl Stage {
@@ -182,7 +205,7 @@ impl Stage {
         let before = (self.item, self.view);
         match route {
             Route::Watch(id) => {
-                self.item = Some(*id);
+                self.set_item(*id);
                 self.view = View::Full;
             }
             // Manage is another app: the player ends there (FR-009).
@@ -203,8 +226,76 @@ impl Stage {
         if !self.compact_shown() {
             return false;
         }
-        self.item = Some(*id);
+        self.set_item(*id);
         true
+    }
+
+    /// Play `id`. Another item is a new play; a handoff only survives as the
+    /// item it was made for leaves.
+    fn set_item(&mut self, id: ItemRef) {
+        if self.item == Some(id) {
+            // Nothing leaves, so nothing hands over.
+            if self.handoff.is_some_and(|h| h.from_play == self.play) {
+                self.handoff = None;
+            }
+            return;
+        }
+        if self.handoff.is_some_and(|h| h.from_play != self.play) {
+            // An older handoff gives way to this one.
+            self.handoff = None;
+        }
+        self.item = Some(id);
+        self.play = self.play.wrapping_add(1);
+    }
+
+    /// The key the playing item's player mounts under: one per play.
+    pub fn key(&self) -> Option<String> {
+        self.item.map(|id| format!("{id}:{}", self.play))
+    }
+
+    /// Mark the playing song (`from`) as handing over to whatever plays next,
+    /// overlapping it by `fade_ms`. Ignored unless `from` is playing.
+    pub fn hand_off(&mut self, from: ItemRef, fade_ms: u64) {
+        if self.item != Some(from) {
+            return;
+        }
+        self.handoff = Some(Handoff {
+            from,
+            from_play: self.play,
+            fade_ms,
+            ready: false,
+        });
+    }
+
+    /// The song handing over, once the next one plays; with its key.
+    pub fn outgoing(&self) -> Option<(Handoff, String)> {
+        self.handoff
+            .filter(|h| h.from_play != self.play)
+            .map(|h| (h, format!("{}:{}", h.from, h.from_play)))
+    }
+
+    /// The next song's playback is negotiated (`play` is its play): show it.
+    /// Without a fade the handing-over song goes at once.
+    pub fn ready(&mut self, play: u32) {
+        if play != self.play {
+            return;
+        }
+        match self.outgoing() {
+            Some((h, _)) if h.fade_ms == 0 => self.handoff = None,
+            Some(_) => {
+                if let Some(h) = self.handoff.as_mut() {
+                    h.ready = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The handing-over song mounted as `from_play` has faded out.
+    pub fn faded(&mut self, from_play: u32) {
+        if self.handoff.is_some_and(|h| h.from_play == from_play) {
+            self.handoff = None;
+        }
     }
 
     /// Show the player as `view`. A compact view is remembered for next time.
@@ -231,6 +322,7 @@ impl Stage {
     pub fn close(&mut self) {
         self.item = None;
         self.view = View::Full;
+        self.handoff = None;
     }
 }
 
@@ -575,5 +667,67 @@ mod tests {
         stage.close();
         assert!(!stage.takes(&Route::Watch(ItemRef::Real(8))));
         assert_eq!(stage.item, None);
+    }
+
+    #[test]
+    fn a_song_handing_over_stays_until_the_next_is_ready() {
+        let mut stage = playing_full(7);
+        let first = stage.key();
+        stage.hand_off(ItemRef::Real(7), 0);
+        assert_eq!(stage.outgoing(), None, "nothing has taken over yet");
+        stage.follow(&Route::Watch(ItemRef::Real(8)));
+        assert_eq!(
+            stage.outgoing().map(|(h, key)| (h.from, key)),
+            first.map(|key| (ItemRef::Real(7), key)),
+            "7 hands over"
+        );
+        assert_ne!(stage.key(), stage.outgoing().map(|(_, k)| k));
+        stage.ready(stage.play);
+        assert_eq!(stage.handoff, None, "a cut drops it once 8 is ready");
+    }
+
+    #[test]
+    fn a_crossfading_song_stays_until_it_has_faded() {
+        let mut stage = playing_full(7);
+        stage.hand_off(ItemRef::Real(7), 4000);
+        stage.follow(&Route::Watch(ItemRef::Real(8)));
+        let Some(from_play) = stage.outgoing().map(|(h, _)| h.from_play) else {
+            panic!("7 hands over to 8");
+        };
+        stage.ready(stage.play.wrapping_sub(1));
+        assert!(
+            !stage.handoff.is_some_and(|h| h.ready),
+            "an older play is not ready"
+        );
+        stage.ready(stage.play);
+        assert!(stage.outgoing().is_some_and(|(h, _)| h.ready));
+        stage.faded(from_play);
+        assert_eq!(stage.handoff, None);
+    }
+
+    #[test]
+    fn a_handoff_to_the_same_item_or_a_close_is_dropped() {
+        let mut stage = playing_full(7);
+        stage.hand_off(ItemRef::Real(7), 0);
+        stage.follow(&Route::Watch(ItemRef::Real(7)));
+        assert_eq!(stage.handoff, None);
+        stage.hand_off(ItemRef::Real(9), 0);
+        assert_eq!(stage.handoff, None, "9 is not playing");
+        stage.hand_off(ItemRef::Real(7), 0);
+        stage.follow(&Route::Watch(ItemRef::Real(8)));
+        stage.close();
+        assert_eq!(stage.outgoing(), None);
+    }
+
+    #[test]
+    fn an_item_that_comes_round_again_is_a_new_play() {
+        let mut stage = playing_full(7);
+        let first = stage.key();
+        stage.follow(&Route::Watch(ItemRef::Real(8)));
+        stage.follow(&Route::Watch(ItemRef::Real(7)));
+        assert_ne!(stage.key(), first);
+        let again = stage.key();
+        stage.follow(&Route::Watch(ItemRef::Real(7)));
+        assert_eq!(stage.key(), again, "the same route mounts nothing new");
     }
 }

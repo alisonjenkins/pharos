@@ -132,6 +132,10 @@ pub fn ListenView(
     /// screen is out of sight, so it draws no visualiser.
     #[props(default)]
     compact: bool,
+    /// The `<audio>` element's id: [`VIDEO_ID`], or another while this song
+    /// hands over to the next.
+    #[props(default = VIDEO_ID)]
+    media_id: &'static str,
 ) -> Element {
     let tap = use_hook(Tap::default);
     let shortcuts = use_shortcuts(media, previous, next, on_control);
@@ -307,7 +311,7 @@ pub fn ListenView(
                         p { class: "pharos-listen-meta", "{meta}" }
                     }
                     audio {
-                        id: VIDEO_ID,
+                        id: media_id,
                         class: "pharos-audio",
                         autoplay: true,
                         onplaying: move |_| on_media.call(MediaEvent::Playing),
