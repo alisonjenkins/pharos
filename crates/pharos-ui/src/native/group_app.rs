@@ -1,15 +1,14 @@
 //! The watch-together store as the app runs it: the browser's clock, timers
 //! and `<video>` behind [`Session`]'s traits, and the handle the screens share.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
 use futures_util::future::LocalBoxFuture;
 use futures_util::FutureExt as _;
-use pharos_client::api::{ClientEvent, NativeApi};
+use pharos_client::api::{ClientEvent, ItemRef, NativeApi};
 
-use super::group_session::{Env, GroupPlayer, GroupView, Session, Ui};
+use super::group_session::{Env, GroupPlayer, GroupView, Seat, Session, Ui};
 use super::platform;
 use super::together::{group_api, Groups};
 
@@ -87,7 +86,7 @@ pub struct Together {
     /// screen: the attempt outlasts the screen that started it.
     pub error: Signal<Option<String>>,
     ui: Coroutine<Ui>,
-    current: Rc<RefCell<Option<Rc<AppSession>>>>,
+    seat: Rc<Seat<Groups, AppEnv>>,
 }
 
 impl Together {
@@ -96,29 +95,31 @@ impl Together {
             view,
             error,
             ui,
-            current: Rc::default(),
+            seat: Rc::new(Seat::new(platform::info)),
         }
     }
 
     /// The session to create or join a group with. One in a group is kept;
     /// otherwise a new one is made over the current connection, so a
-    /// reconnect never leaves a session on a dead socket. It takes over the
-    /// old one's player and watched item, which the watch page set once.
+    /// reconnect never leaves a session on a dead socket. It drives the
+    /// stage's video, if one plays.
     pub fn session(&self, api: &NativeApi) -> Rc<AppSession> {
-        let mut current = self.current.borrow_mut();
-        if let Some(session) = current.as_ref().filter(|s| s.active()) {
-            return Rc::clone(session);
-        }
-        let session = Session::new(group_api(api), AppEnv { ui: self.ui });
-        if let Some(old) = current.as_ref() {
-            session.adopt(old);
-        }
-        *current = Some(Rc::clone(&session));
-        session
+        self.seat
+            .session(|| Session::new(group_api(api), AppEnv { ui: self.ui }))
+    }
+
+    /// A video is on the stage: the group drives it, whatever route shows.
+    pub fn attach(&self, item: ItemRef, player: Rc<dyn GroupPlayer>) {
+        self.seat.attach(item, player);
+    }
+
+    /// The video is gone from the stage.
+    pub fn detach(&self, player: &Rc<dyn GroupPlayer>) {
+        self.seat.detach(player);
     }
 
     /// The session the watch page drives, if there is one.
     pub fn current(&self) -> Option<Rc<AppSession>> {
-        self.current.borrow().clone()
+        self.seat.current()
     }
 }

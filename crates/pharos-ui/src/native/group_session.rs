@@ -424,17 +424,6 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         epoch
     }
 
-    /// Take the player and the watched item of a session this one replaces.
-    pub fn adopt(&self, old: &Self) {
-        let (player, watching) = {
-            let inner = old.inner.borrow();
-            (inner.player.clone(), inner.state.watching)
-        };
-        let mut inner = self.inner.borrow_mut();
-        inner.player = player;
-        inner.state.watching = watching;
-    }
-
     fn began(&self, made: Result<GroupSummary, GroupError>) -> Result<GroupSummary, GroupError> {
         let summary = made?;
         let epoch = {
@@ -902,6 +891,103 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let client = self.client.clone();
             self.command(async move { client.ready(playlist, position, playing).await });
         }
+    }
+}
+
+/// The `<video>` the stage plays and the item it shows.
+struct Video {
+    item: ItemRef,
+    player: Rc<dyn GroupPlayer>,
+}
+
+/// Holds the stage's video apart from any session, so a session made after
+/// the video mounted (a join from another page) still drives it, and one
+/// replaced on a reconnect keeps it.
+pub struct Seat<C, E> {
+    session: RefCell<Option<Rc<Session<C, E>>>>,
+    video: RefCell<Option<Video>>,
+    log: Box<dyn Fn(&str)>,
+}
+
+impl<C: GroupClient + Clone + 'static, E: Env + 'static> Seat<C, E> {
+    pub fn new(log: impl Fn(&str) + 'static) -> Self {
+        Self {
+            session: RefCell::default(),
+            video: RefCell::default(),
+            log: Box::new(log),
+        }
+    }
+
+    /// The session the stage's video is driven by, if one was made.
+    pub fn current(&self) -> Option<Rc<Session<C, E>>> {
+        self.session.borrow().clone()
+    }
+
+    /// A video mounted on the stage showing `item`; the session, if any,
+    /// drives it from here.
+    pub fn attach(&self, item: ItemRef, player: Rc<dyn GroupPlayer>) {
+        let session = self.current();
+        *self.video.borrow_mut() = Some(Video {
+            item,
+            player: Rc::clone(&player),
+        });
+        if let Some(session) = &session {
+            session.set_watching(Some(item));
+            session.set_player(Some(player));
+        }
+        (self.log)(&format!(
+            "pharos: group player attached reason=stage_mounted item={item} session={}",
+            session
+                .as_ref()
+                .map_or("none", |s| if s.active() { "in_group" } else { "idle" })
+        ));
+    }
+
+    /// The video `player` went from the stage. A newer video that already
+    /// took its place stays.
+    pub fn detach(&self, player: &Rc<dyn GroupPlayer>) {
+        let gone = {
+            let mut video = self.video.borrow_mut();
+            match video.as_ref() {
+                Some(v) if std::ptr::addr_eq(Rc::as_ptr(&v.player), Rc::as_ptr(player)) => {
+                    video.take()
+                }
+                _ => None,
+            }
+        };
+        let Some(gone) = gone else {
+            (self.log)("pharos: group player detach skipped reason=superseded");
+            return;
+        };
+        if let Some(session) = self.current() {
+            session.set_player(None);
+            session.set_watching(None);
+        }
+        (self.log)(&format!(
+            "pharos: group player detached reason=video_gone item={}",
+            gone.item
+        ));
+    }
+
+    /// The session to create or join a group with: the one in a group, else
+    /// a new one from `make`.
+    pub fn session(&self, make: impl FnOnce() -> Rc<Session<C, E>>) -> Rc<Session<C, E>> {
+        let mut current = self.session.borrow_mut();
+        if let Some(session) = current.as_ref().filter(|s| s.active()) {
+            return Rc::clone(session);
+        }
+        let session = make();
+        *current = Some(Rc::clone(&session));
+        drop(current);
+        if let Some(video) = self.video.borrow().as_ref() {
+            session.set_watching(Some(video.item));
+            session.set_player(Some(Rc::clone(&video.player)));
+            (self.log)(&format!(
+                "pharos: group player attached reason=session_created item={}",
+                video.item
+            ));
+        }
+        session
     }
 }
 
@@ -1615,16 +1701,115 @@ mod tests {
         assert!(rig.session.view().members.contains(&member("bo", false)));
     }
 
+    type TestSeat = Seat<FakeGroups, TestEnv>;
+
+    fn seat() -> (TestSeat, Rc<RefCell<Vec<String>>>) {
+        let logged = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&logged);
+        (
+            Seat::new(move |m: &str| sink.borrow_mut().push(m.to_owned())),
+            logged,
+        )
+    }
+
+    fn new_session(env: &TestEnv) -> Rc<Session<FakeGroups, TestEnv>> {
+        Session::new(FakeGroups::with_groups(vec![summary()]), env.clone())
+    }
+
+    fn logged_with(logged: &Rc<RefCell<Vec<String>>>, prefix: &str) -> bool {
+        logged.borrow().iter().any(|m| m.starts_with(prefix))
+    }
+
     #[test]
-    fn a_replacement_session_keeps_the_player_and_the_watched_item() {
-        let rig = rig();
-        rig.session.set_watching(Some(ItemRef::Real(7)));
-        let next = Session::new(FakeGroups::with_groups(vec![summary()]), rig.env.clone());
-        next.adopt(&rig.session);
-        assert!(next.inner.borrow().player.is_some());
-        assert_eq!(next.inner.borrow().state.watching, Some(ItemRef::Real(7)));
-        assert!(matches!(next.join("g1").now_or_never(), Some(Ok(_))));
-        assert_eq!(next.inner.borrow().state.watching, Some(ItemRef::Real(7)));
-        assert!(next.inner.borrow().player.is_some());
+    fn a_video_on_the_stage_before_the_join_is_driven_once_the_group_is_joined() {
+        let (seat, logged) = seat();
+        let env = TestEnv::default();
+        env.now.set(100_000);
+        let video = Rc::new(TestPlayer::default());
+        seat.attach(ItemRef::Real(7), video.clone());
+        let session = seat.session(|| new_session(&env));
+        assert!(matches!(session.join("g1").now_or_never(), Some(Ok(_))));
+        env.settle();
+        session.deliver(GroupUpdate::Pause {
+            at_server_ms: 100_000,
+            position_ms: 42_000,
+        });
+        env.settle();
+        assert!(video.log.borrow().contains(&"seek(42000)".to_owned()));
+        assert_eq!(
+            session.inner.borrow().state.watching,
+            Some(ItemRef::Real(7))
+        );
+        assert!(logged_with(
+            &logged,
+            "pharos: group player attached reason=session_created"
+        ));
+    }
+
+    #[test]
+    fn a_video_arriving_after_the_session_is_attached_and_caught_up() {
+        let (seat, logged) = seat();
+        let env = TestEnv::default();
+        env.now.set(100_000);
+        let session = seat.session(|| new_session(&env));
+        assert!(matches!(session.join("g1").now_or_never(), Some(Ok(_))));
+        env.settle();
+        session.deliver(GroupUpdate::Pause {
+            at_server_ms: 100_000,
+            position_ms: 42_000,
+        });
+        let video = Rc::new(TestPlayer::default());
+        seat.attach(ItemRef::Real(7), video.clone());
+        assert_eq!(*video.log.borrow(), ["seek(42000)"]);
+        assert!(logged_with(
+            &logged,
+            "pharos: group player attached reason=stage_mounted"
+        ));
+    }
+
+    #[test]
+    fn a_session_replacing_an_ended_one_keeps_the_video() {
+        let (seat, _) = seat();
+        let env = TestEnv::default();
+        let video = Rc::new(TestPlayer::default());
+        seat.attach(ItemRef::Real(7), video);
+        let first = seat.session(|| new_session(&env));
+        let second = seat.session(|| new_session(&env));
+        assert!(!Rc::ptr_eq(&first, &second));
+        assert!(second.inner.borrow().player.is_some());
+        assert_eq!(second.inner.borrow().state.watching, Some(ItemRef::Real(7)));
+    }
+
+    #[test]
+    fn the_video_going_detaches_the_group_and_says_why() {
+        let (seat, logged) = seat();
+        let env = TestEnv::default();
+        let video: Rc<dyn GroupPlayer> = Rc::new(TestPlayer::default());
+        seat.attach(ItemRef::Real(7), video.clone());
+        let session = seat.session(|| new_session(&env));
+        seat.detach(&video);
+        assert!(session.inner.borrow().player.is_none());
+        assert_eq!(session.inner.borrow().state.watching, None);
+        assert!(logged_with(
+            &logged,
+            "pharos: group player detached reason=video_gone"
+        ));
+    }
+
+    #[test]
+    fn an_older_video_going_leaves_the_newer_one_attached() {
+        let (seat, _) = seat();
+        let env = TestEnv::default();
+        let old: Rc<dyn GroupPlayer> = Rc::new(TestPlayer::default());
+        let new: Rc<dyn GroupPlayer> = Rc::new(TestPlayer::default());
+        let session = seat.session(|| new_session(&env));
+        seat.attach(ItemRef::Real(7), old.clone());
+        seat.attach(ItemRef::Real(8), new);
+        seat.detach(&old);
+        assert!(session.inner.borrow().player.is_some());
+        assert_eq!(
+            session.inner.borrow().state.watching,
+            Some(ItemRef::Real(8))
+        );
     }
 }
