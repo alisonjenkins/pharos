@@ -1339,6 +1339,24 @@ mod tests {
         );
     }
 
+    /// V395: the catch-up marker reaches the client as the id it skips.
+    #[test]
+    fn the_catch_up_marker_reaches_the_client_as_the_id_it_skips() {
+        let update = translate(
+            &ServerMsg::Pause {
+                by: Some(MemberId::CATCH_UP),
+                at_server_ms: 1,
+                position_ms: 2,
+            },
+            gid(),
+            0,
+        );
+        let Some(Update::Pause { by, .. }) = update else {
+            panic!("not a pause: {update:?}")
+        };
+        assert_eq!(by.as_deref(), Some(pharos_client::group::CATCH_UP_BY));
+    }
+
     #[test]
     fn the_playing_queue_entry_becomes_the_item_update() {
         let msg = ServerMsg::PlayQueue {
