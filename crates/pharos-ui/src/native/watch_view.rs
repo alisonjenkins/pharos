@@ -521,8 +521,6 @@ pub(super) fn Volume(
     }
 }
 
-/// A `<select>` of tracks; nothing at all for an item with one audio track
-/// or no subtitles.
 /// "Follow group" or "Just me" for the track menus. Only in a group.
 #[component]
 fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) -> Element {
@@ -545,6 +543,8 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
     }
 }
 
+/// A `<select>` of tracks; nothing at all for an item with one audio track
+/// or no subtitles.
 #[component]
 fn TrackPicker(
     label: &'static str,
