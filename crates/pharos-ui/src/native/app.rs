@@ -1643,10 +1643,14 @@ fn WatchScreen(id: ItemRef) -> Element {
         api_count.set(api_count.get().wrapping_add(1));
         api_count.get()
     });
-    let playing = use_resource(move || {
+    // The API generation the latest negotiation started on.
+    let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
+    let negotiated_at = Rc::clone(&negotiated_gen);
+    let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
         let grant_gen = *api_gen.peek();
+        negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
         let asked = picks();
         async move {
@@ -1709,8 +1713,18 @@ fn WatchScreen(id: ItemRef) -> Element {
     // negotiated again.
     use_effect(move || {
         let gen = api_gen();
-        let Some(Some(Ok(p))) = playing.read().clone() else {
-            return;
+        let current = playing.read().clone();
+        let p = match current {
+            Some(Some(Ok(p))) => p,
+            // A first negotiation that failed, perhaps on the socket that
+            // dropped, is tried again once on each newer one.
+            Some(Some(Err(_))) => {
+                if negotiated_gen.get() != gen {
+                    playing.restart();
+                }
+                return;
+            }
+            _ => return,
         };
         if p.0.grant_gen.replace(gen) == gen {
             return;
