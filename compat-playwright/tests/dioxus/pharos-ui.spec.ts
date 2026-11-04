@@ -731,7 +731,7 @@ test.describe("pharos Dioxus UI", () => {
     // straight to one, reading ahead past the first page; Shift+wheel steps
     // between letters; a date order hides the rail. The seed's "Bulk" names
     // run AA, BB, ... ZZ, so Z starts past the first 100 tiles.
-    test("browse jumps a library by letter and sorts it by date added", async ({
+    test("browse jumps a library by letter, and by year in a date order", async ({
       page,
       request,
     }) => {
@@ -829,10 +829,29 @@ test.describe("pharos Dioxus UI", () => {
       });
       await page.getByLabel("Genre", { exact: true }).selectOption({ index: 0 });
 
-      // Date added, newest first: no letters to jump by.
-      await page.getByLabel("Sort", { exact: true }).selectOption("added");
+      // A date order jumps by year instead (V256). The Dramas span 40 years,
+      // more than the rail shows at once, so it shows every few.
+      await page.getByLabel("Sort", { exact: true }).selectOption("released");
+      const years = page.getByRole("navigation", { name: "Jump to year" });
+      await expect(years).toBeVisible({ timeout: 15_000 });
       await expect(rail).toHaveCount(0);
+      await expect(years.getByRole("button")).toHaveCount(27);
+      await expect(years.getByRole("button").first()).toHaveText("2019");
+      // The last is the undated odd titles, after the 60 dated ones.
+      const undated = years.getByRole("button", { name: "No date" });
+      await expect(years.getByRole("button").last()).toHaveText("#");
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await undated.click();
+      await expect(undated).toHaveAttribute("aria-current", "true");
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
+
+      // Date added, newest first: everything arrived this year.
+      await page.getByLabel("Sort", { exact: true }).selectOption("added");
       await expect(page.getByRole("button", { name: /Sort direction: Newest first/ })).toBeVisible();
+      await expect(years.getByRole("button")).toHaveCount(1, { timeout: 15_000 });
+      await expect(years.getByRole("button").first()).toHaveText(
+        String(new Date().getUTCFullYear()),
+      );
       await expect(tiles.first()).toBeVisible();
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
       await page.evaluate(() => window.scrollTo(0, 0));
