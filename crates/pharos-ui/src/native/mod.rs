@@ -19,7 +19,9 @@ mod platform;
 #[path = "web.rs"]
 mod platform;
 pub mod playback;
+pub mod preplay;
 pub mod route;
+pub mod show_tracks;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;

@@ -635,12 +635,24 @@ body:has(.pharos-watch) .pharos-error {
   accent-color: var(--px-color-accent);
 }
 .pharos-track-picker {
-  max-width: 12rem;
+  max-width: 16rem;
   padding: 0.25rem 0.5rem;
   border: 1px solid rgb(255 255 255 / 0.3); /* not themed: controls sit on the video, whose colours no theme sets */
   border-radius: 6px;
   background: rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
   color: inherit;
+}
+.pharos-title-tracks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: -0.75rem 0 1.5rem;
+}
+.pharos-title-tracks .pharos-track-picker {
+  max-width: 20rem;
+  border-color: var(--px-color-border);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
 }
 .pharos-seek {
   position: relative;

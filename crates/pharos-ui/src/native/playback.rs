@@ -361,15 +361,48 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
-/// How a track is named in a picker: its title, else its language, else its
-/// position, with the forced and SDH flags the title does not already say.
+/// Where the players keep their volume between plays.
+pub const VOLUME_KEY: &str = "pharos.player.volume";
+
+/// The volume a player starts at from what [`VOLUME_KEY`] holds: an audible
+/// level up to 1, else nothing and the browser's own.
+pub fn remembered_volume(stored: Option<&str>) -> Option<f64> {
+    stored?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+}
+
+/// How a track is named in a picker: its language, an audio track's codec
+/// and channels, then its title when that says something more (a file's
+/// "Surround" on a 5.1 track does not), and the forced and SDH flags the
+/// title does not already say. A track with none of these is its position.
 pub fn track_label(track: &Track, position: usize) -> String {
-    let mut label = [&track.title, &track.language]
+    let mut parts: Vec<String> = Vec::new();
+    if !track.language.is_empty() {
+        parts.push(language_name(&track.language));
+    }
+    let sound = [codec_name(&track.codec), channel_name(track.channels)]
         .into_iter()
-        .find(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("Track {}", position.saturating_add(1)));
-    let lower = label.to_lowercase();
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !sound.is_empty() {
+        parts.push(sound);
+    }
+    let said = parts.join(" ").to_lowercase();
+    let adds = track.title.split_whitespace().any(|word| {
+        let word = word.to_lowercase();
+        !said.contains(&word) && !GENERIC_TITLE_WORDS.contains(&word.as_str())
+    });
+    if adds {
+        parts.push(track.title.clone());
+    }
+    let mut label = match parts.is_empty() {
+        true => format!("Track {}", position.saturating_add(1)),
+        false => parts.join(" · "),
+    };
+    let lower = track.title.to_lowercase();
     if track.is_forced && !lower.contains("forced") {
         label.push_str(" (forced)");
     }
@@ -377,6 +410,144 @@ pub fn track_label(track: &Track, position: usize) -> String {
         label.push_str(" [SDH]");
     }
     label
+}
+
+/// Title words that only restate a track's channels or that it is audio.
+const GENERIC_TITLE_WORDS: &[&str] = &[
+    "surround", "stereo", "mono", "audio", "sound", "track", "-", "ch", "channel", "channels",
+];
+
+/// A language's English name for an ISO 639-1 or 639-2 (bibliographic or
+/// terminology) code, else the code in capitals. A region or script tag
+/// after it (`pt-BR`, `zh-Hant`) is dropped; the track title says which.
+pub fn language_name(code: &str) -> String {
+    let lower = code.trim().to_ascii_lowercase();
+    let base = lower.split(['-', '_']).next().unwrap_or_default();
+    match base {
+        "aa" | "aar" => "Afar",
+        "af" | "afr" => "Afrikaans",
+        "sq" | "alb" | "sqi" => "Albanian",
+        "am" | "amh" => "Amharic",
+        "ar" | "ara" => "Arabic",
+        "hy" | "arm" | "hye" => "Armenian",
+        "az" | "aze" => "Azerbaijani",
+        "eu" | "baq" | "eus" => "Basque",
+        "be" | "bel" => "Belarusian",
+        "bn" | "ben" => "Bengali",
+        "bs" | "bos" => "Bosnian",
+        "bg" | "bul" => "Bulgarian",
+        "my" | "bur" | "mya" => "Burmese",
+        "ca" | "cat" => "Catalan",
+        "zh" | "chi" | "zho" => "Chinese",
+        "hr" | "hrv" | "scr" => "Croatian",
+        "cs" | "cze" | "ces" => "Czech",
+        "da" | "dan" => "Danish",
+        "nl" | "dut" | "nld" => "Dutch",
+        "en" | "eng" => "English",
+        "eo" | "epo" => "Esperanto",
+        "et" | "est" => "Estonian",
+        "fo" | "fao" => "Faroese",
+        "fil" => "Filipino",
+        "fi" | "fin" => "Finnish",
+        "fr" | "fre" | "fra" => "French",
+        "gl" | "glg" => "Galician",
+        "ka" | "geo" | "kat" => "Georgian",
+        "de" | "ger" | "deu" => "German",
+        "el" | "gre" | "ell" => "Greek",
+        "gu" | "guj" => "Gujarati",
+        "he" | "heb" => "Hebrew",
+        "hi" | "hin" => "Hindi",
+        "hu" | "hun" => "Hungarian",
+        "is" | "ice" | "isl" => "Icelandic",
+        "id" | "ind" => "Indonesian",
+        "ga" | "gle" => "Irish",
+        "it" | "ita" => "Italian",
+        "ja" | "jpn" => "Japanese",
+        "kn" | "kan" => "Kannada",
+        "kk" | "kaz" => "Kazakh",
+        "km" | "khm" => "Khmer",
+        "ko" | "kor" => "Korean",
+        "ku" | "kur" => "Kurdish",
+        "lo" | "lao" => "Lao",
+        "la" | "lat" => "Latin",
+        "lv" | "lav" => "Latvian",
+        "lt" | "lit" => "Lithuanian",
+        "lb" | "ltz" => "Luxembourgish",
+        "mk" | "mac" | "mkd" => "Macedonian",
+        "ms" | "may" | "msa" => "Malay",
+        "ml" | "mal" => "Malayalam",
+        "mt" | "mlt" => "Maltese",
+        "mi" | "mao" | "mri" => "Maori",
+        "mr" | "mar" => "Marathi",
+        "mn" | "mon" => "Mongolian",
+        "ne" | "nep" => "Nepali",
+        "no" | "nor" => "Norwegian",
+        "nb" | "nob" => "Norwegian Bokmål",
+        "nn" | "nno" => "Norwegian Nynorsk",
+        "fa" | "per" | "fas" => "Persian",
+        "pl" | "pol" => "Polish",
+        "pt" | "por" => "Portuguese",
+        "pa" | "pan" => "Punjabi",
+        "ro" | "rum" | "ron" => "Romanian",
+        "ru" | "rus" => "Russian",
+        "sr" | "srp" | "scc" => "Serbian",
+        "si" | "sin" => "Sinhala",
+        "sk" | "slo" | "slk" => "Slovak",
+        "sl" | "slv" => "Slovenian",
+        "so" | "som" => "Somali",
+        "es" | "spa" => "Spanish",
+        "sw" | "swa" => "Swahili",
+        "sv" | "swe" => "Swedish",
+        "tl" | "tgl" => "Tagalog",
+        "ta" | "tam" => "Tamil",
+        "te" | "tel" => "Telugu",
+        "th" | "tha" => "Thai",
+        "bo" | "tib" | "bod" => "Tibetan",
+        "tr" | "tur" => "Turkish",
+        "uk" | "ukr" => "Ukrainian",
+        "ur" | "urd" => "Urdu",
+        "uz" | "uzb" => "Uzbek",
+        "vi" | "vie" => "Vietnamese",
+        "cy" | "wel" | "cym" => "Welsh",
+        "xh" | "xho" => "Xhosa",
+        "yi" | "yid" => "Yiddish",
+        "zu" | "zul" => "Zulu",
+        "und" | "mis" | "zxx" | "mul" => "Unknown language",
+        _ => return code.trim().to_ascii_uppercase(),
+    }
+    .to_owned()
+}
+
+/// How an audio codec is usually written; nothing for a subtitle's.
+fn codec_name(codec: &str) -> Option<String> {
+    let name = match codec.to_ascii_lowercase().as_str() {
+        "aac" => "AAC",
+        "ac3" => "AC3",
+        "eac3" => "E-AC3",
+        "dts" => "DTS",
+        "truehd" => "TrueHD",
+        "flac" => "FLAC",
+        "opus" => "Opus",
+        "vorbis" => "Vorbis",
+        "mp3" => "MP3",
+        "mp2" => "MP2",
+        "alac" => "ALAC",
+        c if c.starts_with("pcm") => "PCM",
+        _ => return None,
+    };
+    Some(name.to_owned())
+}
+
+/// "Stereo", "5.1": a layout by its usual name, nothing when unknown.
+fn channel_name(channels: u16) -> Option<String> {
+    Some(match channels {
+        0 => return None,
+        1 => "Mono".to_owned(),
+        2 => "Stereo".to_owned(),
+        6 => "5.1".to_owned(),
+        8 => "7.1".to_owned(),
+        n => format!("{n} ch"),
+    })
 }
 
 /// How the player moves from the subtitle it shows to another.
@@ -486,17 +657,69 @@ mod tests {
     }
 
     #[test]
-    fn tracks_are_named_by_title_then_language_then_position() {
+    fn tracks_are_named_by_language_sound_and_a_title_that_adds_something() {
         let mut t = Track {
             language: "eng".into(),
+            title: "Surround".into(),
+            codec: "aac".into(),
+            channels: 6,
             ..Track::default()
         };
-        assert_eq!(track_label(&t, 0), "eng");
+        assert_eq!(track_label(&t, 0), "English · AAC 5.1");
         t.title = "Commentary".into();
-        assert_eq!(track_label(&t, 0), "Commentary");
+        assert_eq!(track_label(&t, 0), "English · AAC 5.1 · Commentary");
         t.is_forced = true;
-        assert_eq!(track_label(&t, 0), "Commentary (forced)");
+        assert_eq!(
+            track_label(&t, 0),
+            "English · AAC 5.1 · Commentary (forced)"
+        );
+        let subtitle = Track {
+            language: "jpn".into(),
+            title: "Signs".into(),
+            codec: "subrip".into(),
+            ..Track::default()
+        };
+        assert_eq!(track_label(&subtitle, 0), "Japanese · Signs");
+        let untagged = Track {
+            title: "Commentary".into(),
+            ..Track::default()
+        };
+        assert_eq!(track_label(&untagged, 0), "Commentary");
         assert_eq!(track_label(&Track::default(), 2), "Track 3");
+    }
+
+    #[test]
+    fn every_kind_of_language_code_reads_as_its_name() {
+        let named = |language: &str, title: &str, forced: bool, sdh: bool| {
+            let t = Track {
+                language: language.into(),
+                title: title.into(),
+                codec: "subrip".into(),
+                is_forced: forced,
+                is_hearing_impaired: sdh,
+                ..Track::default()
+            };
+            track_label(&t, 0)
+        };
+        assert_eq!(named("gre", "", false, false), "Greek");
+        assert_eq!(named("ell", "", false, false), "Greek");
+        assert_eq!(named("rum", "", false, false), "Romanian");
+        assert_eq!(named("heb", "", false, false), "Hebrew");
+        assert_eq!(named("ind", "", false, false), "Indonesian");
+        assert_eq!(named("tha", "", false, false), "Thai");
+        assert_eq!(named("pt-BR", "", false, false), "Portuguese");
+        assert_eq!(
+            named("por", "Brazilian", false, false),
+            "Portuguese · Brazilian"
+        );
+        assert_eq!(
+            named("chi", "Simplified", false, false),
+            "Chinese · Simplified"
+        );
+        assert_eq!(named("eng", "SDH", false, true), "English · SDH");
+        assert_eq!(named("eng", "Forced", true, false), "English · Forced");
+        assert_eq!(named("eng", "", true, false), "English (forced)");
+        assert_eq!(named("qaa", "", false, false), "QAA");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _, PlaybackGrant as _,
-    TrackChoice, TrackPicks,
+    StartTracks, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -21,10 +21,13 @@ use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, position_at, preview_set, start_ms, subtitle_switch, Engine, MediaEvent,
-    MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
+    choose_engine, position_at, preview_set, remembered_volume, start_ms, subtitle_switch, Engine,
+    MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
+    VOLUME_KEY,
 };
+use super::preplay::{self, PlayPicks, TrackChoices};
 use super::route::Route;
+use super::show_tracks;
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
@@ -682,6 +685,8 @@ fn NativeApp(route: Route) -> Element {
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
     use_context_provider(|| Ctx { api, machine });
+    let play_picks = use_signal(|| None);
+    use_context_provider(|| PlayPicks(play_picks));
     let nav = use_context::<Nav>();
 
     use_effect(move || {
@@ -1047,11 +1052,57 @@ fn TitleScreen(id: ItemRef) -> Element {
             ))
         }
     });
+    // The tracks playback would start on, for the pickers to show, asked
+    // only once the title has a choice to offer (a book or a one-track song
+    // has none). Without them the pickers start on each list's first entry
+    // and still ask the server only for what the viewer changes.
+    let start = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let choice = detail.read().as_ref().and_then(Option::as_ref).map(|d| {
+            d.as_ref().is_ok_and(|d| {
+                d.item.kind.playable()
+                    && (d.audio_tracks.len() > 1 || !d.subtitle_tracks.is_empty())
+            })
+        });
+        async move {
+            let api = api?;
+            if !choice? {
+                return None;
+            }
+            let asked = api
+                .start_tracks(&call("title", "tracks"), id, &platform::capabilities())
+                .await;
+            Some(asked.unwrap_or_else(|e| {
+                platform::warn(&format!("pharos: start tracks unavailable: {e}"));
+                StartTracks::default()
+            }))
+        }
+    });
+    // Picks made on an earlier visit are not this visit's.
+    let mut pending = use_context::<PlayPicks>().0;
+    use_effect(move || pending.set(None));
     let state = detail.read();
+    let start = start.read().flatten();
     loaded(
         state.as_ref().and_then(Option::as_ref),
         |detail: &Detail| {
-            rsx! { TitleView { detail: detail.clone() } }
+            let series = show_tracks::show_of(detail);
+            let tracks = start.map(|start| {
+                // A choice made on another episode of the show applies here.
+                let start = series.map_or(start, |s| {
+                    show_tracks::shown(&show_tracks::load(s), detail, start)
+                });
+                rsx! {
+                    TrackChoices {
+                        id,
+                        audio: detail.audio_tracks.clone(),
+                        subtitles: detail.subtitle_tracks.clone(),
+                        start,
+                        series: series.map(str::to_owned),
+                    }
+                }
+            });
+            rsx! { TitleView { detail: detail.clone(), tracks } }
         },
     )
 }
@@ -1071,6 +1122,8 @@ struct Playing {
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// The tracks the viewer asked for; `Default` left the pick to the server.
+    asked: TrackPicks,
 }
 
 impl Playing {
@@ -1102,8 +1155,11 @@ fn WatchScreen(id: ItemRef) -> Element {
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
-    // The tracks asked for; changing them negotiates a new playback.
-    let mut picks = use_signal(TrackPicks::default);
+    // The tracks asked for, first on the title page; changing them
+    // negotiates a new playback.
+    let mut pending = use_context::<PlayPicks>().0;
+    let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
+    use_effect(move || pending.set(None));
     let resume_from = Rc::clone(&last_ms);
     // The episodes either side follow the item, not the playback, so a track
     // change that renegotiates does not look them up again.
@@ -1137,14 +1193,19 @@ fn WatchScreen(id: ItemRef) -> Element {
             let info = call("watch", "play");
             let result = async {
                 let detail = api.detail(&info, id).await?;
+                // What the viewer left to the server takes the show's choice
+                // from its other episodes, when this one has a track like it.
+                let asked = show_tracks::show_of(&detail).map_or(asked, |s| {
+                    show_tracks::apply(&show_tracks::load(s), &detail, asked)
+                });
                 let (decision, grant) = api
                     .play(&info, id, &platform::capabilities(), asked)
                     .await?;
-                Ok::<_, ClientError>((detail, decision, grant))
+                Ok::<_, ClientError>((detail, decision, grant, asked))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
+                settle(ctx.machine, result).and_then(|(detail, decision, grant, asked)| {
                     let engine = choose_engine(
                         decision.is_hls(),
                         platform::plays_hls(),
@@ -1180,6 +1241,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                         detail,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
+                        asked,
                     })))
                 }),
             )
@@ -1302,7 +1364,15 @@ fn Player(
                     Err(e) => Err(e),
                 };
                 match attached {
-                    Ok(e) => *engine.borrow_mut() = Some(e),
+                    Ok(e) => {
+                        // Every playback, a track switch's too, starts at the
+                        // volume last set.
+                        let stored = platform::stored_theme(VOLUME_KEY).ok().flatten();
+                        if let Some(volume) = remembered_volume(stored.as_deref()) {
+                            platform::set_volume(VIDEO_ID, volume, false);
+                        }
+                        *engine.borrow_mut() = Some(e);
+                    }
                     Err(e) => failed.set(Some(format!("Could not start playback: {e}"))),
                 }
             });
@@ -1347,9 +1417,17 @@ fn Player(
             };
             let grant = p.grant.clone();
             let at = last_ms.get();
+            // A track the viewer chose is reported so the next playback
+            // starts on it; one the server chose is left to its rules.
             let tracks = TrackPicks {
-                audio: TrackChoice::Default,
-                subtitle: switched.get().unwrap_or_default(),
+                audio: match p.asked.audio {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.audio),
+                },
+                subtitle: switched.get().unwrap_or(match p.asked.subtitle {
+                    TrackChoice::Default => TrackChoice::Default,
+                    _ => choice(p.subtitle),
+                }),
             };
             spawn(async move {
                 let result = grant
@@ -1384,6 +1462,12 @@ fn Player(
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
                 Control::Volume { volume, muted } => {
                     platform::set_volume(VIDEO_ID, volume, muted);
+                    // Silence is a mute, not a level to come back to.
+                    if volume > 0.0 {
+                        if let Err(e) = platform::store_theme(VOLUME_KEY, &volume.to_string()) {
+                            platform::warn(&format!("pharos: volume not remembered: {e}"));
+                        }
+                    }
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
                 // In place of this episode, so Back leaves the show rather than
@@ -1395,6 +1479,10 @@ fn Player(
                     }
                 }
                 Control::Audio(index) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.audio_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_audio(s, tracks, index));
+                    }
                     if p.audio != Some(index) {
                         on_renegotiate.call(TrackPicks {
                             audio: TrackChoice::Index(index),
@@ -1403,6 +1491,10 @@ fn Player(
                     }
                 }
                 Control::Subtitle(to) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.subtitle_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, tracks, to));
+                    }
                     let track =
                         to.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
                     match subtitle_switch(p.burned(), track) {

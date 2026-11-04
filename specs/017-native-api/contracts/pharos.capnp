@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 6;
+const schemaVersion :UInt32 = 7;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -176,6 +176,7 @@ struct Track {
   isDefault @4 :Bool; isForced @5 :Bool; isHearingImpaired @6 :Bool;
   delivery @7 :SubtitleDelivery;    # subtitles only
   url @8 :Text;                     # WebVTT for an `external` subtitle (HTTP, 017 §Scope), else empty
+  channels @9 :UInt16;              # audio only; 0 = unknown
 }
 # `external`: the player renders the WebVTT at Track.url itself. `burn`: an
 # image subtitle the server draws into the video, so choosing it renegotiates.
@@ -217,8 +218,14 @@ interface PlaybackGrant {
   stop @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
+# The tracks a negotiate naming `default` for both would start on: the user's
+# remembered pick for the item, else their language rules; none = off.
+struct StartTracks { audio @0 :OptU32; subtitle @1 :OptU32; }
+struct StartTracksResult { union { tracks @0 :StartTracks; error @1 :Error; } }
 interface Playback {
   negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice) -> (result :NegotiateResult);
+  # What a title page shows in its track pickers before playback; opens no session.
+  startTracks @1 (ctx :CallContext, id :ItemId, caps :Capabilities) -> (result :StartTracksResult);
 }
 
 # ---- push -----------------------------------------------------------------
