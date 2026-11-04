@@ -15,7 +15,7 @@ use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 use super::playback::MediaEvent;
 use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
-    GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS,
+    GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SELF_SEEK_GRACE_MS,
 };
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
@@ -314,6 +314,19 @@ struct Inner {
     last_drift_ms: Option<i64>,
     /// This member left; what the server still sends is not for the screens.
     leaving: bool,
+    /// When this session last moved the player itself.
+    self_seek_ms: Option<i64>,
+    /// The video waited within the grace of our own seek; it is reported as
+    /// buffering only if it outlasts the grace.
+    held_waiting: bool,
+}
+
+impl Inner {
+    fn within_self_seek_grace(&self, now: i64) -> bool {
+        let grace = i64::try_from(SELF_SEEK_GRACE_MS).unwrap_or(i64::MAX);
+        self.self_seek_ms
+            .is_some_and(|seek| now.saturating_sub(seek) < grace)
+    }
 }
 
 /// The one active membership and everything that runs for it.
@@ -495,6 +508,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             )
         };
         if let (Some(player), Some((position_ms, playing))) = (player, expected) {
+            self.inner.borrow_mut().self_seek_ms = Some(self.env.now_ms());
             player.seek_ms(position_ms);
             if playing {
                 player.play();
@@ -592,6 +606,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 return;
             };
             if player.position_ms().abs_diff(position_ms) > HOLD_BELOW_MS {
+                me.inner.borrow_mut().self_seek_ms = Some(me.env.now_ms());
                 player.seek_ms(position_ms);
             }
             then(&*player);
@@ -642,6 +657,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// second, the drift sample and clock sync every 10 s, the ping every 30 s.
     pub async fn tick(&self, n: u64) {
         self.check_drift();
+        self.report_held_stall();
         if n % SAMPLE_EVERY_S == 0 {
             self.report_drift();
             self.sync_clock().await;
@@ -714,6 +730,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             Correction::Rate(rate) => self.set_rate(&player, rate),
             Correction::Seek(to) => {
                 self.set_rate(&player, 1.0);
+                self.inner.borrow_mut().self_seek_ms = Some(now);
                 player.seek_ms(to);
                 self.emit(
                     ClientEventKind::GroupHardSeek,
@@ -796,6 +813,38 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         }));
     }
 
+    /// A wait held past the self-seek grace is a real stall: report it as
+    /// buffering now, once.
+    fn report_held_stall(&self) {
+        let now = self.env.now_ms();
+        let (playlist, position, buffering) = {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.active
+                || !inner.held_waiting
+                || inner.buffering_sent
+                || inner.within_self_seek_grace(now)
+            {
+                return;
+            }
+            let Some(player) = inner.player.clone() else {
+                return;
+            };
+            inner.held_waiting = false;
+            inner.buffering_sent = true;
+            (
+                inner.state.playlist_item_id.clone(),
+                player.position_ms(),
+                true,
+            )
+        };
+        self.report_buffering(playlist, position, buffering);
+    }
+
+    fn report_buffering(&self, playlist: String, position_ms: u64, buffering: bool) {
+        let client = self.client.clone();
+        self.command(async move { client.buffering(playlist, position_ms, buffering).await });
+    }
+
     /// The local video's events, as the group needs them: buffering when it
     /// runs dry, ready when it can play a new item or a new position.
     pub fn on_media(&self, event: MediaEvent) {
@@ -812,10 +861,18 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let (mut buffering, mut ready) = (None, false);
             match event {
                 MediaEvent::Waiting if !owes && !inner.buffering_sent => {
-                    inner.buffering_sent = true;
-                    buffering = Some(true);
+                    if inner.within_self_seek_grace(now) {
+                        inner.held_waiting = true;
+                    } else {
+                        inner.buffering_sent = true;
+                        buffering = Some(true);
+                    }
                 }
                 MediaEvent::CanPlay | MediaEvent::Seeked | MediaEvent::Playing => {
+                    if matches!(event, MediaEvent::CanPlay | MediaEvent::Playing) {
+                        inner.held_waiting = false;
+                        inner.self_seek_ms = None;
+                    }
                     if inner.buffering_sent {
                         inner.buffering_sent = false;
                         buffering = Some(false);
@@ -837,9 +894,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             )
         };
         if let Some(buffering) = send_buffering {
-            let client = self.client.clone();
-            let id = playlist.clone();
-            self.command(async move { client.buffering(id, position, buffering).await });
+            self.report_buffering(playlist.clone(), position, buffering);
         }
         if send_ready {
             let client = self.client.clone();
@@ -1215,6 +1270,92 @@ mod tests {
             calls_with(&rig, "buffering"),
             ["buffering(pl-7,3000,true)", "buffering(pl-7,3000,false)"]
         );
+    }
+
+    /// The session's own seek makes the video wait; that wait is not the group
+    /// buffering, or the group freezes and seeks again.
+    #[test]
+    fn a_wait_right_after_the_sessions_own_play_seek_is_not_buffering() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 100_000,
+            position_ms: 10_000,
+        });
+        rig.env.settle();
+        assert!(rig.player.log.borrow().contains(&"seek(10000)".to_owned()));
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        assert!(calls_with(&rig, "buffering").is_empty());
+    }
+
+    #[test]
+    fn a_wait_right_after_a_hard_drift_seek_is_not_buffering() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.position.set(15_000);
+        rig.session.check_drift();
+        assert_eq!(
+            rig.player.log.borrow().last().map(String::as_str),
+            Some("seek(20000)")
+        );
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        assert!(calls_with(&rig, "buffering").is_empty());
+    }
+
+    /// A wait that outlives the self-seek grace with no `canplay` is a real
+    /// stall. The player is paused here so the drift check does not seek
+    /// again and restart the grace.
+    #[test]
+    fn a_held_wait_becomes_buffering_once_the_grace_runs_out() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 100_000,
+            position_ms: 10_000,
+        });
+        rig.env.settle();
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        assert!(calls_with(&rig, "buffering").is_empty());
+
+        rig.player.paused.set(true);
+        rig.env.now.set(104_999);
+        assert!(rig.session.tick(1).now_or_never().is_some());
+        rig.env.settle();
+        assert!(calls_with(&rig, "buffering").is_empty());
+
+        rig.env.now.set(105_000);
+        assert!(rig.session.tick(2).now_or_never().is_some());
+        rig.env.settle();
+        let sent = calls_with(&rig, "buffering");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].ends_with(",true)"), "got {sent:?}");
+    }
+
+    #[test]
+    fn a_wait_with_no_recent_seek_is_buffering_at_once() {
+        let rig = playing_rig();
+        rig.env.now.set(200_000);
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "buffering").len(), 1);
+    }
+
+    #[test]
+    fn a_held_wait_that_recovers_sends_nothing() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 100_000,
+            position_ms: 10_000,
+        });
+        rig.env.settle();
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.session.on_media(MediaEvent::CanPlay);
+        rig.env.settle();
+        rig.env.now.set(105_000);
+        assert!(rig.session.tick(1).now_or_never().is_some());
+        rig.env.settle();
+        assert!(calls_with(&rig, "buffering").is_empty());
     }
 
     /// Playing group at 10 s of server time 100_000; our clock offset is 0.
