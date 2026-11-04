@@ -352,6 +352,21 @@ pub fn element_width(id: &str) -> f64 {
         .map_or(0.0, |e| e.get_bounding_client_rect().width())
 }
 
+/// Moves keyboard focus to the element `id`, when it is there and focusable.
+pub fn focus_by_id(id: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    if let Err(e) = el.focus() {
+        warn(&format!("pharos: focus {id} refused: {e:?}"));
+    }
+}
+
 /// Enters fullscreen on the element `id`, or leaves it.
 pub fn toggle_fullscreen(id: &str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
