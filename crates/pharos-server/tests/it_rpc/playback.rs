@@ -396,6 +396,75 @@ async fn reports_and_stop_move_the_resume_point_and_end_the_stream() {
     assert_eq!(closed, actix_web::http::StatusCode::UNAUTHORIZED);
 }
 
+/// B465: a grant released without a stop, as a reload or a dropped
+/// connection releases it, ends its playback: the stream capability closes
+/// and the last reported position is saved. A grant never reported on closes
+/// its stream but leaves the stored position alone.
+/// Disarm check: with `Grant`'s `Drop` returning early, the stream stays open.
+#[actix_web::test]
+async fn a_released_grant_ends_its_playback_at_the_last_report() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let play = || {
+        negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            &direct,
+            Choice::Default,
+            Choice::Default,
+        )
+    };
+    let position = || async {
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks
+    };
+    let closed = |url: String| {
+        let app = &app;
+        async move {
+            for _ in 0..100 {
+                let status =
+                    test::call_service(app, test::TestRequest::get().uri(&url).to_request())
+                        .await
+                        .status();
+                if status == actix_web::http::StatusCode::UNAUTHORIZED {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        }
+    };
+
+    let (grant, decided) = play().await.unwrap();
+    report(&grant, 30_000, false).await.unwrap();
+    drop(grant);
+    assert!(
+        closed(decided.url).await,
+        "the released grant's stream closes"
+    );
+    assert_eq!(position().await, 300_000_000);
+
+    let (grant, decided) = play().await.unwrap();
+    drop(grant);
+    assert!(
+        closed(decided.url).await,
+        "an unreported grant's stream closes"
+    );
+    assert_eq!(
+        position().await,
+        300_000_000,
+        "no report, no position written"
+    );
+}
+
 /// T037: what a native player may not negotiate answers the way a detail
 /// call does, so an id says nothing about what exists; a book is refused.
 /// Disarm check: with the access check removed from `services::library::
