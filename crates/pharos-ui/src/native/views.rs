@@ -1,5 +1,6 @@
 //! The native UI's screens as pure components: data in through props,
-//! navigation out through the [`Nav`] context. No IO here, so every screen
+//! navigation out through the [`Nav`] context and marks through
+//! [`MarkPlayed`]. No IO here, so every screen
 //! renders under `dioxus-ssr` in tests (009 FR-014).
 
 use dioxus::prelude::*;
@@ -17,6 +18,31 @@ use super::together_view::InThisGroup;
 /// instead of reloading the page.
 #[derive(Clone, Copy)]
 pub struct Nav(pub EventHandler<Route>);
+
+/// Marks an item watched (`true`) or unwatched, provided by the app root:
+/// it stores the mark and reloads the screen.
+#[derive(Clone, Copy)]
+pub struct MarkPlayed(pub EventHandler<(ItemRef, bool)>);
+
+/// A button that marks `id` watched, or unwatched when `played`. `what`
+/// names a whole group it marks, such as "season".
+#[component]
+pub fn WatchedToggle(id: ItemRef, played: bool, what: Option<String>) -> Element {
+    let mark = use_context::<MarkPlayed>();
+    let state = if played { "unwatched" } else { "watched" };
+    let text = match what {
+        Some(what) => format!("Mark {what} {state}"),
+        None => format!("Mark {state}"),
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            class: "pharos-button pharos-button-secondary",
+            onclick: move |_| mark.0.call((id, !played)),
+            "{text}"
+        }
+    }
+}
 
 /// An `<a>` to a route. A plain click navigates in place; a modified click
 /// (new tab, new window) is left to the browser. `current` marks the link to
@@ -501,6 +527,9 @@ pub fn TitleView(
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
+                    if item.kind.playable() {
+                        WatchedToggle { id: item.id, played: item.played }
+                    }
                 }
                 InThisGroup { rows: in_group }
                 if !detail.overview.is_empty() {
@@ -824,6 +853,7 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |body: std::rc::Rc<dyn Fn() -> Element>| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+                use_context_provider(|| MarkPlayed(EventHandler::new(|_: (ItemRef, bool)| {})));
                 body()
             },
             body,
@@ -1095,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_title_offers_play_or_resume() {
+    fn a_title_offers_play_or_resume_and_a_watched_mark() {
         let mut movie = item(ItemKind::Movie);
         movie.runtime_ms = 102 * 60_000;
         let detail = Detail {
@@ -1113,6 +1143,7 @@ mod tests {
             html.contains(r#"href="/ui/watch/1""#) && html.contains(">Play<"),
             "{html}"
         );
+        assert!(html.contains(">Mark watched<"), "{html}");
         assert!(
             html.contains("2001 · 1h 42m") && html.contains("A heist.") && html.contains("Crime"),
             "{html}"
@@ -1131,6 +1162,21 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
+
+        let mut watched = item(ItemKind::Episode);
+        watched.played = true;
+        let detail = Detail {
+            item: watched,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(html.contains(">Mark unwatched<"), "{html}");
     }
 
     #[test]
@@ -1208,7 +1254,10 @@ mod tests {
             segments: vec![],
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
-        assert!(!html.contains("/watch/"), "{html}");
+        assert!(
+            !html.contains("/watch/") && !html.contains("Mark "),
+            "{html}"
+        );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
     }
 
