@@ -12,6 +12,7 @@
 mod bootstrap;
 mod group;
 mod library;
+mod mix;
 pub mod limits;
 pub mod origin;
 mod playback;

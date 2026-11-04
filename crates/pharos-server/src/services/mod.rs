@@ -6,6 +6,7 @@ pub mod access;
 pub mod auth;
 pub mod library;
 pub mod lyrics;
+pub mod mix;
 pub mod play_state;
 pub mod playback;
 pub mod segments;
