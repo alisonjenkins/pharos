@@ -220,6 +220,18 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn put_audio_analysis(
+        &self,
+        id: MediaId,
+        analysis: pharos_core::AudioAnalysis,
+        signature: (i64, u64),
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_audio_analysis(id, analysis, signature).await,
+            AnyStore::Postgres(p) => p.put_audio_analysis(id, analysis, signature).await,
+        }
+    }
+
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         match self {
             AnyStore::Sqlite(s) => s.begin_scan(root).await,

@@ -1919,6 +1919,109 @@ pub struct MediaProbe {
     /// `3D.<tag>` flag). `None` for ordinary 2D video.
     #[serde(default)]
     pub video_3d_format: Option<Video3DFormat>,
+    /// Spec 024 — a song's tempo and energy, written by the background audio
+    /// analysis sweep (never by the prober or `put`). `None` until the song has
+    /// been analysed, and again once its file changes (V385). Read it through
+    /// [`MediaProbe::bpm`], [`MediaProbe::energy`] and
+    /// [`MediaProbe::tempo_source`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_analysis: Option<AudioAnalysis>,
+}
+
+impl MediaProbe {
+    /// Beats per minute: the file's BPM tag when it has one, else the
+    /// analysed tempo. `None` when neither is known.
+    pub fn bpm(&self) -> Option<f32> {
+        self.audio_analysis?.bpm()
+    }
+
+    /// 0.0 (calm) to 1.0 (intense), from audio analysis.
+    pub fn energy(&self) -> Option<f32> {
+        self.audio_analysis?.energy()
+    }
+
+    /// Where [`bpm`](Self::bpm) came from.
+    pub fn tempo_source(&self) -> Option<TempoSource> {
+        self.audio_analysis?.tempo_source
+    }
+}
+
+/// Spec 024 — where a song's tempo came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TempoSource {
+    /// The file's own BPM tag (ID3 `TBPM`, Vorbis `BPM`, MP4 `tmpo`).
+    Tag,
+    /// Estimated from the audio.
+    Analysis,
+}
+
+impl TempoSource {
+    /// Stable string for the store column, logs and metric labels.
+    pub fn label(self) -> &'static str {
+        match self {
+            TempoSource::Tag => "tag",
+            TempoSource::Analysis => "analysis",
+        }
+    }
+
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "tag" => Some(TempoSource::Tag),
+            "analysis" => Some(TempoSource::Analysis),
+            _ => None,
+        }
+    }
+}
+
+/// Spec 024 — one analysis result. Integers in thousandths keep
+/// [`MediaProbe`] `Eq` (the `frame_rate_mille` convention).
+///
+/// A row with a `version` and nothing else is an analysis that found nothing
+/// (silence, no beat, too short): it is kept, so the song is not decoded
+/// again on every pass (V385, the V134 shape).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AudioAnalysis {
+    /// Beats per minute × 1000.
+    pub bpm_mille: Option<u32>,
+    pub tempo_source: Option<TempoSource>,
+    /// Energy × 1000, 0 to 1000.
+    pub energy_mille: Option<u16>,
+    /// The analyser version that produced this; an older one is redone.
+    pub version: u32,
+}
+
+impl AudioAnalysis {
+    pub fn bpm(&self) -> Option<f32> {
+        self.bpm_mille.map(|m| m as f32 / 1000.0)
+    }
+
+    pub fn energy(&self) -> Option<f32> {
+        self.energy_mille.map(|m| f32::from(m) / 1000.0)
+    }
+
+    /// Build from float readings, rounding to thousandths and clamping energy
+    /// into 0..=1. A non-finite or non-positive tempo is dropped.
+    pub fn from_readings(
+        bpm: Option<(f32, TempoSource)>,
+        energy: Option<f32>,
+        version: u32,
+    ) -> Self {
+        let (bpm_mille, tempo_source) = match bpm {
+            Some((b, src)) if b.is_finite() && b > 0.0 => {
+                (Some((b * 1000.0).round() as u32), Some(src))
+            }
+            _ => (None, None),
+        };
+        let energy_mille = energy
+            .filter(|e| e.is_finite())
+            .map(|e| (e.clamp(0.0, 1.0) * 1000.0).round() as u16);
+        Self {
+            bpm_mille,
+            tempo_source,
+            energy_mille,
+            version,
+        }
+    }
 }
 
 /// P34 — minimal MediaSource shape carried alongside the primary
@@ -3159,6 +3262,35 @@ pub trait MediaStore: Send + Sync {
             match self.get(id).await {
                 Ok(item) => Ok(item.probe.alternate_sources),
                 Err(DomainError::NotFound(_)) => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Spec 024 — store one song's tempo and energy, against the file
+    /// signature `(mtime, size)` the analysis read. A read returns it in
+    /// [`MediaProbe::audio_analysis`] only while the row's scan signature still
+    /// matches, so a replaced file reads as unanalysed without any write on the
+    /// scan path (V385). `put` never writes these columns, so a re-probe keeps
+    /// them. No-op when the row is gone.
+    ///
+    /// The default reads the item and `put`s it back, which suits in-memory
+    /// stores; the SQL stores override it with a single `UPDATE`, because their
+    /// `put` does not carry these columns.
+    fn put_audio_analysis(
+        &self,
+        id: MediaId,
+        analysis: AudioAnalysis,
+        signature: (i64, u64),
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        async move {
+            let _ = signature;
+            match self.get(id).await {
+                Ok(mut item) => {
+                    item.probe.audio_analysis = Some(analysis);
+                    self.put(item).await
+                }
+                Err(DomainError::NotFound(_)) => Ok(()),
                 Err(e) => Err(e),
             }
         }

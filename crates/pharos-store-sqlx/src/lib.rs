@@ -14,6 +14,10 @@ mod postgres_put;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod put_batch;
 
+// Spec 024 — the audio analysis columns and when a stored result still holds.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod audio_analysis_row;
+
 #[cfg(feature = "sqlite")]
 mod auth_sqlite;
 
