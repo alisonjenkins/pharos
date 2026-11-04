@@ -165,6 +165,42 @@ pub fn parse_crossfade(stored: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Where the viewer's maximum video bitrate is kept, in bits per second;
+/// absent or `0` is Auto (no limit), the default.
+pub const MAX_BITRATE_KEY: &str = "pharos.player.max_bitrate";
+
+/// The maximum qualities offered, as (bits per second, label); `0` is Auto.
+pub const MAX_BITRATE_CHOICES: [(u64, &str); 5] = [
+    (0, "Auto"),
+    (8_000_000, "8 Mbps"),
+    (4_000_000, "4 Mbps"),
+    (2_000_000, "2 Mbps"),
+    (1_000_000, "1 Mbps"),
+];
+
+/// The limit a stored [`MAX_BITRATE_KEY`] value holds; anything that is not
+/// one of [`MAX_BITRATE_CHOICES`] is Auto.
+pub fn parse_max_bitrate(stored: &str) -> u64 {
+    let stored = stored.trim();
+    if !stored.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    stored
+        .parse::<u64>()
+        .ok()
+        .filter(|bps| MAX_BITRATE_CHOICES.iter().any(|(c, _)| c == bps))
+        .unwrap_or(0)
+}
+
+/// The `playback max_bitrate=` log line's value.
+pub fn max_bitrate_label(bps: u64) -> String {
+    if bps == 0 {
+        "auto".to_owned()
+    } else {
+        bps.to_string()
+    }
+}
+
 /// The fade between this song and the next, in ms, for a crossfade of
 /// `seconds` on a song `duration_ms` long: never more than a third of the
 /// song, so a short song is still mostly heard on its own. `None` when off
@@ -470,6 +506,19 @@ pub fn subtitle_switch(burned: bool, to: Option<&Track>) -> SubtitleSwitch {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_bitrate_reads_only_the_offered_choices() {
+        assert_eq!(parse_max_bitrate("4000000"), 4_000_000);
+        assert_eq!(parse_max_bitrate(" 1000000 "), 1_000_000);
+        assert_eq!(parse_max_bitrate("0"), 0);
+        assert_eq!(parse_max_bitrate("3000000"), 0);
+        assert_eq!(parse_max_bitrate("+4000000"), 0);
+        assert_eq!(parse_max_bitrate("fast"), 0);
+        assert_eq!(parse_max_bitrate(""), 0);
+        assert_eq!(max_bitrate_label(0), "auto");
+        assert_eq!(max_bitrate_label(2_000_000), "2000000");
+    }
+
     use super::*;
 
     #[test]
