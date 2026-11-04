@@ -2163,4 +2163,93 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page).toHaveURL(/\/ui\/watch\//);
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
+
+  test("picture in picture hands the film to the browser and back", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    await signIn(page);
+    const pipId = () =>
+      page.evaluate(
+        () =>
+          (document as Document & { pictureInPictureElement: Element | null })
+            .pictureInPictureElement?.id ?? null,
+      );
+    const supported = await page.evaluate(
+      () =>
+        (document as Document & { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled ===
+        true,
+    );
+    test.skip(!supported, "this browser has no picture-in-picture");
+
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("Playwright");
+    await page.locator(".pharos-poster").first().click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.2);
+    const watchPip = page.locator(".pharos-controls").getByRole("button", {
+      name: "Picture in picture",
+    });
+    const stagePip = page.locator(".pharos-stage-bar").getByRole("button", {
+      name: "Picture in picture",
+    });
+
+    // From the watch page: out to the browser's window and back.
+    await page.mouse.move(20, 20);
+    await watchPip.click();
+    await expect.poll(pipId).toBe("pharos-video");
+    await page.mouse.move(40, 40);
+    await watchPip.click();
+    await expect.poll(pipId).toBeNull();
+
+    // From the floating window, which keeps playing behind it.
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await stagePip.click();
+    await expect.poll(pipId).toBe("pharos-video");
+    const from = await at(page);
+    await expect.poll(() => at(page), { timeout: 10_000 }).toBeGreaterThan(from);
+    await stagePip.click();
+    await expect.poll(pipId).toBeNull();
+    expect(plays(lines), "the browser's window keeps the stream").toBe(1);
+    expect(lines.filter((l) => /pharos: pip action=open id=pharos-video/.test(l))).toHaveLength(2);
+    expect(lines.filter((l) => /pharos: pip action=close id=pharos-video/.test(l))).toHaveLength(2);
+    expect(lines.filter((l) => /pharos: pip .*refused/.test(l))).toEqual([]);
+  });
+
+  test("picture in picture is absent where the browser has none", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    // Firefox has no `pictureInPictureEnabled`; stand in for it here.
+    await page.addInitScript(() =>
+      Object.defineProperty(Document.prototype, "pictureInPictureEnabled", {
+        get: () => false,
+      }),
+    );
+    await signIn(page);
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("Playwright");
+    await page.locator(".pharos-poster").first().click();
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(page.getByRole("button", { name: "Fullscreen" })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
+  });
 });
