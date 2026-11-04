@@ -476,7 +476,13 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
         section { class: "pharos-browse",
             h2 { "{title}" }
             match more {
-                Some(base) if library => rsx! { LibraryGrid { first: page, base } },
+                // The top bar swaps libraries without leaving this view, and
+                // the grid's filters and listing belong to the one it opened
+                // on, so a new library mounts a new grid (B490).
+                Some(base) if library => remount_on(
+                    &base.parent.to_string(),
+                    rsx! { LibraryGrid { first: page, base } },
+                ),
                 Some(source) => remount_on(
                     &source.parent.to_string(),
                     rsx! { PagedGrid { first: page, source, by_letter: false } },
@@ -1583,6 +1589,67 @@ mod tests {
             items,
             start: 0,
         }
+    }
+
+    /// B490: switching libraries from the top bar keeps the same `GridView`
+    /// mounted with new props, so the grid must start afresh for the new
+    /// library rather than keep showing the one it opened on.
+    #[test]
+    fn a_switch_to_another_library_shows_that_library() {
+        use futures_util::FutureExt as _;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct Props(Rc<RefCell<(u64, &'static str)>>);
+        impl PartialEq for Props {
+            fn eq(&self, _: &Self) -> bool {
+                false
+            }
+        }
+        #[component]
+        fn Harness(shown: Props) -> Element {
+            use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+            let api = use_signal(|| None::<pharos_client::api::NativeApi>);
+            let machine = use_signal(super::super::machine::Machine::new);
+            use_context_provider(|| Ctx { api, machine });
+            let (id, name) = *shown.0.borrow();
+            let kind = ItemKind::Movie;
+            rsx! {
+                GridView {
+                    title: name.to_owned(),
+                    page: page(vec![item(ItemRef::Real(id * 10), kind, name)]),
+                    more: Some(Listing::of(ItemRef::Real(id), None, "SortName")),
+                    library: true,
+                }
+            }
+        }
+        let settle = |dom: &mut VirtualDom| {
+            for _ in 0..8 {
+                if dom.wait_for_work().now_or_never().is_none() {
+                    break;
+                }
+                dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+            }
+        };
+        let shown = Props(Rc::new(RefCell::new((1, "Films"))));
+        let mut dom = VirtualDom::new_with_props(
+            Harness,
+            HarnessProps {
+                shown: shown.clone(),
+            },
+        );
+        dom.rebuild_in_place();
+        settle(&mut dom);
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains(r#"href="/ui/title/10""#), "{html}");
+
+        *shown.0.borrow_mut() = (2, "Shows");
+        dom.mark_dirty(ScopeId::APP);
+        dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+        settle(&mut dom);
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains(r#"href="/ui/title/20""#), "{html}");
+        assert!(!html.contains(r#"href="/ui/title/10""#), "{html}");
     }
 
     struct NoGrant;
