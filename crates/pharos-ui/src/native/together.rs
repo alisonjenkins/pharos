@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 use pharos_client::api::{ItemKind, ItemRef, NativeApi};
 
+use super::seen::MemberSeen;
+
 /// How many clock samples the estimator keeps; older ones fall off.
 pub const CLOCK_WINDOW: usize = 9;
 
@@ -311,6 +313,8 @@ pub trait GroupClient {
         playing: bool,
     ) -> Result<(), GroupError>;
     async fn leave(&self) -> Result<(), GroupError>;
+    /// What each member has seen of `ids` (at most 200).
+    async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError>;
 }
 
 /// The seam's one place of construction: the screens ask for the client
@@ -331,9 +335,18 @@ pub struct FakeGroups {
     calls: Rc<RefCell<Vec<String>>>,
     sinks: Rc<RefCell<Vec<GroupSink>>>,
     joined: Rc<RefCell<Option<GroupId>>>,
+    seen: Rc<RefCell<Vec<MemberSeen>>>,
 }
 
 impl FakeGroups {
+    /// What `seen` answers.
+    pub fn with_seen(seen: Vec<MemberSeen>) -> Self {
+        Self {
+            seen: Rc::new(RefCell::new(seen)),
+            ..Self::default()
+        }
+    }
+
     pub fn with_groups(groups: Vec<GroupSummary>) -> Self {
         Self {
             groups: Rc::new(RefCell::new(groups)),
@@ -463,6 +476,11 @@ impl GroupClient for FakeGroups {
     ) -> Result<(), GroupError> {
         self.log(format!("ready({playlist_item_id},{position_ms},{playing})"));
         Ok(())
+    }
+
+    async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError> {
+        self.log(format!("seen({})", ids.len()));
+        Ok(self.seen.borrow().clone())
     }
 
     async fn leave(&self) -> Result<(), GroupError> {
