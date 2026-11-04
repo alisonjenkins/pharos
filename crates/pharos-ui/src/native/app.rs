@@ -284,8 +284,22 @@ fn store_setting(key: &str, value: &str) {
     }
 }
 
-/// Set the new media element to the viewer's last volume, if one is stored.
+thread_local! {
+    /// The viewer's last volume and mute this page load, so a player keeps it
+    /// even where `localStorage` cannot be written.
+    static LAST_VOLUME: Cell<Option<(f64, bool)>> = const { Cell::new(None) };
+}
+
+/// Set the new media element to the viewer's last volume: this page load's,
+/// else the stored one.
 fn restore_volume() {
+    if let Some((volume, muted)) = LAST_VOLUME.get() {
+        platform::set_volume(VIDEO_ID, volume, muted);
+        platform::info(&format!(
+            "pharos: volume restored volume={volume:.3} muted={muted} from=page"
+        ));
+        return;
+    }
     let stored = match platform::stored_theme(VOLUME_KEY) {
         Ok(stored) => stored,
         Err(e) => {
@@ -300,7 +314,7 @@ fn restore_volume() {
         Some((volume, muted)) => {
             platform::set_volume(VIDEO_ID, volume, muted);
             platform::info(&format!(
-                "pharos: volume restored volume={volume:.3} muted={muted}"
+                "pharos: volume restored volume={volume:.3} muted={muted} from=storage"
             ));
         }
         None => platform::warn(&format!(
@@ -310,6 +324,7 @@ fn restore_volume() {
 }
 
 fn remember_volume(volume: f64, muted: bool) {
+    LAST_VOLUME.set(Some((volume, muted)));
     if let Err(e) = platform::store_theme(VOLUME_KEY, &volume_setting(volume, muted)) {
         platform::warn(&format!("pharos: volume storage write failed error={e}"));
     }
