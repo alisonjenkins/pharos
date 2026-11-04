@@ -1939,6 +1939,9 @@ body::before {
   position: absolute;
   top: 4.5rem;
   right: 1rem;
+  /* Above the now-playing card, so the mix editor it opens is too. */
+  z-index: 1;
+  isolation: isolate;
   /* As tall as its songs, short of the bottom bar. */
   max-height: calc(100% - 14.5rem);
   display: flex;
@@ -1947,9 +1950,21 @@ body::before {
   box-sizing: border-box;
   padding: 0.75rem;
   border-radius: calc(var(--px-radius) * 2);
+}
+/* The frosted glass sits on a layer behind the panel, not on the panel:
+   a backdrop-filter on the panel would make it the containing block of
+   the fixed mix editor inside it, which would then centre on the panel
+   and could be cut off the screen. */
+.pharos-queue::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
   background: color-mix(in srgb, var(--px-color-overlay) 55%, transparent);
   backdrop-filter: blur(14px) saturate(1.2);
   -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  pointer-events: none;
 }
 .pharos-queue-head {
   display: flex;
@@ -2182,4 +2197,115 @@ body::before {
   .pharos-queue-buttons[data-target="album_card"] {
     opacity: 1;
   }
+}
+
+/* Dynamic mixes (spec 024, B441): the mix line in the queue panel, its
+   picker, the rule editor, and why a mix picked a song. */
+.pharos-mix-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.25rem 0 0.5rem;
+}
+.pharos-mix-on {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pharos-mix-name {
+  color: var(--px-color-accent);
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.pharos-mix-status {
+  font-size: 0.8rem;
+}
+.pharos-mix-menu {
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0.25rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: var(--px-radius);
+}
+.pharos-mix-menu li {
+  display: flex;
+  align-items: center;
+}
+.pharos-mix-choice {
+  flex: 1 1 auto;
+  padding: 0.4rem 0.5rem;
+  border: 0;
+  border-radius: var(--px-radius);
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+}
+.pharos-mix-choice:hover,
+.pharos-mix-choice:focus-visible {
+  background: color-mix(in srgb, var(--px-color-fg) 10%, transparent);
+}
+.pharos-mix-new {
+  color: var(--px-color-accent);
+}
+.pharos-queue-why {
+  display: block;
+  overflow: hidden;
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+}
+.pharos-mix-editor {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  width: min(36rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 4rem);
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 1rem;
+  transform: translate(-50%, -50%);
+  border-radius: calc(var(--px-radius) * 2);
+  background: color-mix(in srgb, var(--px-color-overlay) 92%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--px-color-fg);
+}
+.pharos-mix-field,
+.pharos-mix-rule,
+.pharos-mix-share,
+.pharos-mix-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.pharos-mix-rules {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+  padding-left: 1.25rem;
+}
+.pharos-mix-editor input,
+.pharos-mix-editor select {
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  font: inherit;
+}
+.pharos-mix-editor input[type="number"] {
+  width: 5rem;
+}
+.pharos-mix-problem {
+  margin: 0;
+  color: var(--px-color-danger);
 }
