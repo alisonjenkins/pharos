@@ -85,6 +85,13 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # RUSTSEC-2024-0436 — `paste` is "no longer maintained", not vulnerable.
+    # It comes only from `lofty` (song tags, for lyrics: ADR 0046), which
+    # needs it unconditionally up to its latest release, 0.25.5. `paste` is
+    # a proc-macro: it runs at compile time to join identifiers and puts no
+    # code of its own into the shipped binary, so there is nothing reachable
+    # at run time. Drop the entry when a lofty release no longer pulls it in.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
