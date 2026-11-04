@@ -1550,7 +1550,8 @@ test.describe("pharos Dioxus UI now playing", () => {
 });
 
 // B450 / V390: a volume turned down stays down on the next player, which
-// mounts a new <audio> element. B451 / V391: a lost WebGL context comes back
+// mounts a new <audio> element, and B478 / V421 its slider shows it from the
+// first frame. B451 / V391: a lost WebGL context comes back
 // without the screen dropping its visualiser, and attribute 0 is an array.
 test.describe("pharos Dioxus UI now playing survives remounts", () => {
   test("the volume carries to the next player and a lost context is restored", async ({
@@ -1606,8 +1607,27 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
     await page.getByRole("button", { name: "Back", exact: true }).click();
     await page.locator(".pharos-stage").getByRole("button", { name: "Close" }).click();
     await expect(page.locator(".pharos-stage")).toHaveCount(0);
+    // B478 / V421: the new player's slider never draws full volume first.
+    await page.evaluate(() => {
+      const w = window as unknown as { seenVolumes: string[]; stopSampling: boolean };
+      w.seenVolumes = [];
+      w.stopSampling = false;
+      const sample = () => {
+        const slider = document.querySelector<HTMLInputElement>(".pharos-listen-volume input");
+        if (slider) w.seenVolumes.push(slider.value);
+        if (!w.stopSampling) requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+    });
     await play();
     await expect.poll(volume).toBeCloseTo(0.3, 2);
+    const seen = await page.evaluate(() => {
+      const w = window as unknown as { seenVolumes: string[]; stopSampling: boolean };
+      w.stopSampling = true;
+      return w.seenVolumes;
+    });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.filter((v) => Math.abs(Number(v) - 0.3) > 0.01)).toEqual([]);
 
     // V393: a volume localStorage refuses still reaches the next player,
     // from this page load's memory rather than the stored 0.300.
