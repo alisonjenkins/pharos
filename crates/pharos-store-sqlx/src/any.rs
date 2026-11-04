@@ -1049,6 +1049,13 @@ impl pharos_core::UserPrefStore for AnyStore {
             }
         }
     }
+
+    async fn user_prefs_for_key(&self, key: &str) -> DomainResult<Vec<(UserId, Vec<u8>)>> {
+        match self {
+            AnyStore::Sqlite(s) => pharos_core::UserPrefStore::user_prefs_for_key(s, key).await,
+            AnyStore::Postgres(p) => pharos_core::UserPrefStore::user_prefs_for_key(p, key).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
