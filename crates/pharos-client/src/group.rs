@@ -7,8 +7,8 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    clock_result, group, group_member, group_sink, group_summary, group_update, groups_result,
-    member_seen, membership, membership_result, seen_result, session,
+    clock_result, group, group_member, group_sink, group_summary, group_tracks, group_update,
+    groups_result, member_seen, membership, membership_result, seen_result, session,
 };
 use pharos_api::{server, Connection};
 
@@ -21,6 +21,19 @@ pub struct GroupMember {
     pub id: String,
     pub name: String,
     pub buffering: bool,
+    /// On their own audio and subtitles, not the group's (US7).
+    pub own_tracks: bool,
+}
+
+pub use pharos_api::track_choice::TrackChoice;
+
+/// The group's audio and subtitle choice, and the member who made it last.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupTracks {
+    pub audio: TrackChoice,
+    pub subtitle: TrackChoice,
+    /// Member id of the last change; empty before any.
+    pub by: String,
 }
 
 /// A group as the server lists it.
@@ -31,6 +44,8 @@ pub struct GroupSummary {
     /// What the group is watching; `None` before it has an item.
     pub item: Option<ItemRef>,
     pub members: Vec<GroupMember>,
+    /// What a late joiner starts on.
+    pub tracks: GroupTracks,
 }
 
 /// The server's half of one clock round trip: it received the client's
@@ -72,14 +87,20 @@ pub enum GroupUpdate {
     Play {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Pause {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     Seek {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member who caused it; `None` when the group did.
+        by: Option<String>,
     },
     /// A member joined, or its buffering changed.
     Member(GroupMember),
@@ -92,6 +113,8 @@ pub enum GroupUpdate {
         position_ms: u64,
         playing: bool,
     },
+    /// The group's audio or subtitle changed.
+    Tracks(GroupTracks),
     /// The group is over for this member, whatever the reason.
     Ended,
 }
@@ -344,6 +367,7 @@ fn read_member(m: group_member::Reader<'_>) -> Result<GroupMember, capnp::Error>
         id: text(m.get_id())?,
         name: text(m.get_name())?,
         buffering: m.get_buffering(),
+        own_tracks: m.get_own_tracks(),
     })
 }
 
@@ -360,7 +384,21 @@ fn read_summary(g: group_summary::Reader<'_>) -> Result<GroupSummary, capnp::Err
             .iter()
             .map(read_member)
             .collect::<Result<_, _>>()?,
+        tracks: read_tracks(g.get_tracks()?)?,
     })
+}
+
+fn read_tracks(t: group_tracks::Reader<'_>) -> Result<GroupTracks, capnp::Error> {
+    Ok(GroupTracks {
+        audio: pharos_api::track_choice::read(t.get_audio()?),
+        subtitle: pharos_api::track_choice::read(t.get_subtitle()?),
+        by: text(t.get_by())?,
+    })
+}
+
+fn by(a: &group_update::at::Reader<'_>) -> Result<Option<String>, capnp::Error> {
+    let by = text(a.get_by())?;
+    Ok((!by.is_empty()).then_some(by))
 }
 
 fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::Error> {
@@ -371,6 +409,7 @@ fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::E
             GroupUpdate::Play {
                 at_server_ms: a.get_at_server_ms(),
                 position_ms: a.get_position_ms(),
+                by: by(&a)?,
             }
         }
         group_update::Pause(a) => {
@@ -378,6 +417,7 @@ fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::E
             GroupUpdate::Pause {
                 at_server_ms: a.get_at_server_ms(),
                 position_ms: a.get_position_ms(),
+                by: by(&a)?,
             }
         }
         group_update::Seek(a) => {
@@ -385,6 +425,7 @@ fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::E
             GroupUpdate::Seek {
                 at_server_ms: a.get_at_server_ms(),
                 position_ms: a.get_position_ms(),
+                by: by(&a)?,
             }
         }
         group_update::Member(m) => GroupUpdate::Member(read_member(m?)?),
@@ -398,6 +439,7 @@ fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::E
                 playing: i.get_playing(),
             }
         }
+        group_update::Tracks(t) => GroupUpdate::Tracks(read_tracks(t?)?),
         group_update::Ended(_) => GroupUpdate::Ended,
     })
 }

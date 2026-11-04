@@ -1914,6 +1914,7 @@ mod tests {
                 id: id.into(),
                 name: name.into(),
                 buffering: false,
+                own_tracks: false,
             },
             items,
         }
