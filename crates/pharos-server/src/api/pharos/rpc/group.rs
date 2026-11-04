@@ -996,12 +996,15 @@ impl Membership {
     }
 
     /// Each member's state on `ids` (US6), for the group this membership is
-    /// in and only while the caller is still in it.
-    async fn seen_for(&self, ids: &[WireId]) -> Result<Vec<MemberSeen>, Denial> {
+    /// in and only while the caller is still in it. `asked` is how many ids
+    /// the caller sent, which can exceed `ids.len()`: the handler decodes at
+    /// most one past the cap, and the log and the refusal report the real
+    /// count.
+    async fn seen_for(&self, ids: &[WireId], asked: usize) -> Result<Vec<MemberSeen>, Denial> {
         let user = self.session.current_user().await?;
         let group = self.group.group_id.to_string();
         let record = |outcome: Outcome, answered: usize, members: usize| {
-            group_seen::record(outcome, &user.name, &group, ids.len(), answered, members);
+            group_seen::record(outcome, &user.name, &group, asked, answered, members);
         };
         let in_group = !self.left.get()
             && self.deps.hub.resolve(&self.key).map_or(true, |s| {
@@ -1013,11 +1016,11 @@ impl Membership {
             record(Outcome::NotInGroup, 0, 0);
             return Err(Denial::NotFound { what: "group" });
         }
-        if ids.len() > group_seen::MAX_IDS {
+        if asked > group_seen::MAX_IDS || ids.len() > group_seen::MAX_IDS {
             record(Outcome::OverLimit, 0, 0);
             return Err(Denial::Limit {
                 name: "seen_ids",
-                value: u64::try_from(ids.len()).unwrap_or(u64::MAX),
+                value: u64::try_from(asked.max(ids.len())).unwrap_or(u64::MAX),
                 max: group_seen::MAX_IDS as u64,
             });
         }
@@ -1240,7 +1243,7 @@ impl server::membership::Handler for Membership {
         for id in wire_ids.iter().take(keep) {
             ids.push(read_item_id(id)?);
         }
-        match self.seen_for(&ids).await {
+        match self.seen_for(&ids, wire_ids.len() as usize).await {
             Ok(members) => write_seen(results.get().init_result(), &members),
             Err(denial) => denial.write(results.get().init_result().init_error()),
         }
