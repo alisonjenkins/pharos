@@ -201,9 +201,12 @@ async fn a_hidden_item_cannot_be_marked() {
 }
 
 /// Marking a season or a series marks every episode in it: played sets
-/// each one and counts the play, unplayed clears each one.
+/// each unwatched one and counts the play, leaving one already watched as it
+/// was, and unplayed clears each one. Their detail
+/// says watched once every episode in them is.
 /// Disarm check: with the native `setPlayed` refusing synthesised ids again,
-/// marking the season answers notFound.
+/// marking the season answers notFound; with `synth_played` answering
+/// false, the season's detail says unwatched.
 #[actix_web::test]
 async fn a_season_or_series_marks_every_episode_in_it() {
     use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
@@ -230,12 +233,48 @@ async fn a_season_or_series_marks_every_episode_in_it() {
     assert_eq!(played(604).await, (false, 0), "another show");
 
     let show = WireId::parse(&series_id_for_key(Some("/libTV/Show"), "Show")).unwrap();
+    let watched = |id: WireId| {
+        let session = &session;
+        async move { detail_played(session, id).await }
+    };
+    assert!(watched(season).await);
+    assert!(!watched(show).await, "season 2 is unwatched");
+
+    assert!(wire_set(&session, show, Set::Played(true)).await.is_ok());
+    assert!(watched(show).await);
+    assert_eq!(
+        played(601).await,
+        (true, 1),
+        "already watched: not counted again"
+    );
+    assert_eq!(played(603).await, (true, 1));
     assert_eq!(
         wire_set(&session, show, Set::Played(false)).await,
         Ok((false, false, 0, 0))
     );
     for id in [601, 602, 603] {
         assert!(!played(id).await.0, "episode {id}");
+    }
+    assert!(!watched(show).await);
+}
+
+/// Whether `Library.detail` says `id` is watched.
+async fn detail_played(session: &session::Client, id: WireId) -> bool {
+    use pharos_api::pharos_capnp::detail_result;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    match id {
+        WireId::Real(n) => req.get().init_id().set_real(n),
+        WireId::Synth(n) => req.get().init_id().set_synth(n),
+    }
+    let reply = req.send().promise.await.expect("detail");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        detail_result::Detail(d) => {
+            let summary = d.unwrap().get_summary().unwrap();
+            summary.has_user_state() && summary.get_user_state().unwrap().get_played()
+        }
+        detail_result::Error(_) => panic!("detail {id}"),
     }
 }
 

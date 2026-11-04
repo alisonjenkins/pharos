@@ -40,8 +40,11 @@ impl server::user_data::Handler for UserData {
             }
             // A series or season: every episode in it the user may see.
             (Ok(user), synth @ WireId::Synth(_)) => {
+                // An episode already watched keeps its play count and date.
                 user_data::update_folder(&self.session.state, &user, &synth.to_string(), |d| {
-                    user_data::apply_played(d, played)
+                    if !(played && d.played) {
+                        user_data::apply_played(d, played);
+                    }
                 })
                 .await
                 .map_err(|e| wire_denial(synth, &e, "set_played"))
