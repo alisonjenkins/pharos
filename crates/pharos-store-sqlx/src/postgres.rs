@@ -19,14 +19,15 @@
 use crate::StoreError;
 use pharos_core::{
     AuthError, AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainError,
-    DomainResult, EntityCounts, Fingerprint, Genre, GenreCount, GenreStore, IssuedToken,
-    ItemPerson, Library, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata,
-    MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, Person,
-    PersonCount, PersonKind, PersonRef, PersonStore, PlaybackProgress, Playlist, PlaylistEntry,
-    PlaylistStore, PreferenceStore, ResolvedToken, ScanState, SecretString, SeriesInfo,
-    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, Studio, StudioCount, StudioStore,
-    SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope, TokenStore,
-    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    DomainResult, EntityCounts, ExternalRatings, Fingerprint, Genre, GenreCount, GenreStore,
+    IssuedToken, ItemPerson, Library, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
+    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup,
+    PersistedTranscodeSession, Person, PersonCount, PersonKind, PersonRef, PersonStore,
+    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
+    ScanState, SecretString, SeriesInfo, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
+    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope,
+    TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord,
+    UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -41,7 +42,8 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     original_language, art_version, \
     book_format, book_page_count, book_author, book_publisher, book_series, \
-    book_series_index, book_isbn, alternate_sources_json, video_3d_format";
+    book_series_index, book_isbn, alternate_sources_json, video_3d_format, \
+    imdb_rating, rt_tomatometer";
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -3494,6 +3496,8 @@ struct MediaRow {
     book_isbn: Option<String>,
     alternate_sources_json: Option<String>,
     video_3d_format: Option<String>,
+    imdb_rating: Option<f32>,
+    rt_tomatometer: Option<i64>,
     match_provider: Option<String>,
     match_external_id: Option<String>,
     match_source: Option<String>,
@@ -3698,6 +3702,10 @@ impl MediaRow {
             ),
             trailers: crate::string_list_json::decode(self.trailers_json.as_deref()),
             original_language: self.original_language.clone(),
+            ratings: ExternalRatings {
+                imdb: self.imdb_rating,
+                tomatometer: self.rt_tomatometer.and_then(|v| u16::try_from(v).ok()),
+            },
         };
         Ok(MediaItem {
             id,
