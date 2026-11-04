@@ -314,6 +314,7 @@ impl server::library::Handler for Library {
             }
         };
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
+        let cover = album_cover(state, &item).await;
         let mut out = results.get().init_result().init_detail();
         write_item(
             out.reborrow().init_summary(),
@@ -321,6 +322,12 @@ impl server::library::Handler for Library {
             user_data,
             &state.server_id,
         );
+        if let Some((tag, url)) = cover {
+            let mut image = out.reborrow().get_summary()?.init_images(1).get(0);
+            image.set_kind("Primary");
+            image.set_tag(tag.as_str());
+            image.set_url(url.as_str());
+        }
         out.set_overview(dto.overview.as_deref().unwrap_or_default());
         let count = u32::try_from(dto.genres.len()).unwrap_or(u32::MAX);
         let mut genres = out.reborrow().init_genres(count);
@@ -1094,6 +1101,20 @@ fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    // B320: a track's page names who made it and where it comes from. The
+    // album artist reads truer for a compilation; the track artist covers a
+    // file tagged with only that.
+    if let Some(album) = &dto.album {
+        out.set_album(album.as_str());
+    }
+    let artist = dto
+        .album_artists
+        .first()
+        .map(|a| a.name.as_str())
+        .or_else(|| dto.artists.first().map(String::as_str));
+    if let Some(artist) = artist {
+        out.set_artist(artist);
+    }
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.init_critic_rating().set_some(score);
     }
@@ -1111,6 +1132,21 @@ fn tomatometer(rating: f32) -> Option<u16> {
         return None;
     }
     Some(rounded as u16)
+}
+
+/// B320: a track with no cover of its own shows its album's, which any other
+/// track on the album may carry, as the tag and URL to name. Only a cover the
+/// image route can serve is named (B149).
+async fn album_cover(state: &AppState, item: &MediaItem) -> Option<(String, String)> {
+    if item.kind != MediaKind::Audio || item.has_primary_art {
+        return None;
+    }
+    let album = pharos_jellyfin_api::dto::album_id_for(item.probe.album.as_deref()?);
+    let tag = crate::api::jellyfin::images::synth_primary_tag(state, &album)
+        .await?
+        .remove("Primary")?;
+    let url = format!("/Items/{album}/Images/Primary?tag={tag}");
+    Some((tag, url))
 }
 
 fn write_view(mut item: item_summary::Builder<'_>, id: WireId, view: &LibraryView) {

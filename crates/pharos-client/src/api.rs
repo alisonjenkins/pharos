@@ -119,6 +119,9 @@ pub struct Item {
     pub imdb_rating: Option<u16>,
     /// Rotten Tomatoes Tomatometer, a percentage.
     pub critic_rating: Option<u16>,
+    /// A track's album and artist, from its tags (B320).
+    pub album: Option<String>,
+    pub artist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -981,6 +984,8 @@ fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::Error> {
             .then(|| read_library_kind(item.get_library_kind())),
         imdb_rating: read_opt_u16(item.get_imdb_rating()?)?,
         critic_rating: read_opt_u16(item.get_critic_rating()?)?,
+        album: Some(text(item.get_album())?).filter(|s| !s.is_empty()),
+        artist: Some(text(item.get_artist())?).filter(|s| !s.is_empty()),
     })
 }
 

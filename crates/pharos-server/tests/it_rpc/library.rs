@@ -2643,3 +2643,86 @@ async fn letters_start_where_the_listing_pages_them() {
     assert_eq!(letters, [("M".to_owned(), 0), ("S".to_owned(), 1)]);
     assert_eq!(genres, ["Comedy"]);
 }
+
+/// B320: a track's detail names its album and artist, and a track with no
+/// cover of its own shows its album's cover, carried by another track. A
+/// track whose album has no cover names no image (B149).
+/// Disarm check: with `write_item` leaving out the album, or `detail`
+/// skipping `album_cover`, the assertions fail.
+#[actix_web::test]
+async fn a_track_names_its_album_and_artist_and_borrows_the_album_cover() {
+    use pharos_api::pharos_capnp::detail_result;
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _};
+    use pharos_jellyfin_api::dto::album_id_for;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let track = |id: u64, title: &str, album: &str| {
+        let mut item = MediaItem {
+            id,
+            path: format!("/libA/{title}.flac").into(),
+            title: title.into(),
+            kind: MediaKind::Audio,
+            ..MediaItem::default()
+        };
+        item.probe.album = Some(album.into());
+        item.probe.artist = Some("Track Artist".into());
+        item.probe.album_artist = Some("Owl City".into());
+        item
+    };
+    for item in [
+        track(401, "Enchanted", "Covered"),
+        track(402, "Cover Carrier", "Covered"),
+        track(403, "Bare", "Uncovered"),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state
+        .stores
+        .set_artwork(402, "Primary", "musicbrainz", "/cache/covered.jpg")
+        .await
+        .unwrap();
+
+    let summary_of = |id: u64| {
+        let library = session.library_request().send().pipeline.get_library();
+        let mut req = library.detail_request();
+        req.get().init_ctx();
+        req.get().init_id().set_real(id);
+        req.send().promise
+    };
+    let reply = summary_of(401).await.unwrap();
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail of 401 failed");
+    };
+    let summary = d.unwrap().get_summary().unwrap();
+    assert_eq!(summary.get_album().unwrap().to_str().unwrap(), "Covered");
+    assert_eq!(summary.get_artist().unwrap().to_str().unwrap(), "Owl City");
+    let images = summary.get_images().unwrap();
+    assert_eq!(
+        images.len(),
+        1,
+        "the album's cover stands in for the track's"
+    );
+    let album = album_id_for("Covered");
+    assert!(
+        images
+            .get(0)
+            .get_url()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(&format!("/Items/{album}/Images/Primary?tag=")),
+        "{:?}",
+        images.get(0).get_url().unwrap().to_str()
+    );
+
+    let reply = summary_of(403).await.unwrap();
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail of 403 failed");
+    };
+    let images = d.unwrap().get_summary().unwrap().get_images().unwrap();
+    assert!(images.is_empty(), "an album with no cover lends none");
+}
