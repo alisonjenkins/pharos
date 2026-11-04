@@ -1,5 +1,6 @@
 //! The account button at the right of the top bar and the menu it opens:
-//! the user's initials, then Appearance, Manage (admins only) and Sign out.
+//! the user's initials, then Account, Appearance, Manage (admins only) and
+//! Sign out.
 
 use dioxus::prelude::*;
 use pharos_client::api::Me;
@@ -91,6 +92,7 @@ pub fn AccountMenuView(
                     if !name.is_empty() {
                         p { class: "pharos-account-name", "{name}" }
                     }
+                    MenuLink { to: Route::Account, "Account" }
                     MenuLink { to: Route::Appearance, "Appearance" }
                     if is_admin {
                         MenuLink { to: Route::Manage, "Manage" }
@@ -185,7 +187,7 @@ mod tests {
     fn an_admin_sees_manage() {
         let html = render(me("ali", true), true);
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
-        for item in ["Appearance", "Manage", "Sign out"] {
+        for item in ["Account", "Appearance", "Manage", "Sign out"] {
             assert!(html.contains(item), "{item}: {html}");
         }
     }

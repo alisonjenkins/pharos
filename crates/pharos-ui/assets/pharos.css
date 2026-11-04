@@ -1417,6 +1417,49 @@ button.pharos-lyrics-line:focus-visible {
 
 /* Appearance (010) */
 
+.pharos-account-settings {
+  display: grid;
+  gap: 1rem;
+  max-width: 24rem;
+}
+.pharos-account-signed-in {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
+.pharos-password-form {
+  display: grid;
+  gap: 0.75rem;
+}
+.pharos-password-form h3 {
+  margin: 0;
+}
+.pharos-password-form label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-password-form input {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  border: var(--px-border) solid var(--px-color-border);
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
+}
+.pharos-password-form button {
+  justify-self: start;
+  padding: 0.6rem 1rem;
+  border: 0;
+  border-radius: 4px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-weight: 600;
+  cursor: pointer;
+}
+.pharos-password-form button:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
 .pharos-appearance {
   display: grid;
   gap: 1.5rem;
