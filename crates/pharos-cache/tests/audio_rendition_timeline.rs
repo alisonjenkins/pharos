@@ -365,6 +365,31 @@ async fn a_hole_shorter_than_100ms_is_filled_with_silence() {
     );
 }
 
+/// B473 — a seek session that starts inside a hole fills the hole's tail at
+/// its start, so what follows the hole stays at its true time.
+#[tokio::test]
+async fn a_seek_session_starting_inside_a_hole_fills_its_start_with_silence() {
+    let td = tempfile::tempdir().expect("tempdir");
+    let beep_at = 13.0;
+    let src = make_holed_audio_source(td.path(), HOLE, beep_at);
+    let cache = HlsSegmentCache::new(td.path().join("cache"), 1 << 30);
+    // a2 spans [12, 18); the hole runs to 12.5, so the session's first packet
+    // arrives 0.5 s after the point it seeked to.
+    let dir = cache
+        .ensure_audio_hls_covering(&src, None, 46, None, Some(128_000), 2)
+        .await
+        .expect("seek session");
+    let frag = td.path().join("seek_in_hole.mp4");
+    fragment_file(&cache, &dir, &frag, 2).await;
+    let want = beep_at - 12.0;
+    let got = beep_offset_in(&frag);
+    assert!(
+        (got - want).abs() < 0.02,
+        "a2's beep should sit {want:.3}s in, after {:.1}s of silence, but sits {got:.3}s in",
+        HOLE.1 - 12.0,
+    );
+}
+
 /// `baseMediaDecodeTime` of the first `tfdt` in a fragment, in timescale ticks.
 /// A deliberately minimal box walk — the fragment is `moof(traf(tfdt))`+`mdat`.
 fn first_tfdt(data: &[u8]) -> Option<u64> {
