@@ -526,6 +526,34 @@ impl GenreStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// RatingsStore
+// ---------------------------------------------------------------------
+impl pharos_core::RatingsStore for AnyStore {
+    async fn needing_ratings(
+        &self,
+        limit: i64,
+        ttl_cutoff: i64,
+    ) -> DomainResult<Vec<pharos_core::RatingsSubject>> {
+        match self {
+            AnyStore::Sqlite(s) => s.needing_ratings(limit, ttl_cutoff).await,
+            AnyStore::Postgres(p) => p.needing_ratings(limit, ttl_cutoff).await,
+        }
+    }
+
+    async fn set_ratings(
+        &self,
+        target: &pharos_core::RatingsTarget,
+        ratings: pharos_core::ExternalRatings,
+        fetched_at: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_ratings(target, ratings, fetched_at).await,
+            AnyStore::Postgres(p) => p.set_ratings(target, ratings, fetched_at).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // SeriesMetadataStore
 // ---------------------------------------------------------------------
 impl SeriesMetadataStore for AnyStore {
