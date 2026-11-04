@@ -15,6 +15,9 @@ import { test, expect, type APIRequestContext, type Locator, type Page } from "@
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
 const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
+// A synthesised wire id is the same 63-bit hash in both halves; the native
+// route spells it `s` and that number in decimal.
+const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
 
 // Signs in on a small window and answers a home rail that overflows
 // sideways, skipping when the server has no native API or seeded user.
@@ -295,9 +298,6 @@ test.describe("pharos Dioxus UI", () => {
       const api = { "X-Emby-Token": token };
       const json = async (path: string) =>
         (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
-      // A synthesised wire id is the same 63-bit hash in both halves; the
-      // native route spells it `s` and that number in decimal.
-      const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
       // The seed registers a three-episode show (the startup rescan names it
       // from the file); its episodes carry the synthesised series and season
       // ids.
@@ -646,6 +646,136 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("p.pharos-error")).toHaveCount(0);
     });
 
+    // B380: an episode row's tick, the season and the show each mark
+    // watched and unwatched, and a part-watched episode can play from the
+    // start instead of resuming.
+    test("an episode, its season and its show mark watched, and play from start", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(90_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-mark-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const episodes = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode&Fields=SeriesId`,
+          { headers: api },
+        )
+      ).json();
+      const episode = (episodes.Items ?? []).find(
+        (i: { SeriesName?: string }) => i.SeriesName === "Another Show",
+      );
+      test.skip(!episode, "pharos has no seeded Another Show episode");
+      const played = async () =>
+        (
+          await (
+            await request.get(`${PHAROS_URL}/Users/${user.Id}/Items/${episode.Id}`, {
+              headers: api,
+            })
+          ).json()
+        ).UserData?.Played;
+      await request.delete(`${PHAROS_URL}/Users/${user.Id}/PlayedItems/${episode.Id}`, {
+        headers: api,
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
+      const show = page.locator("section.pharos-show");
+      await expect(show.locator("h2")).toHaveText("Another Show", { timeout: 15_000 });
+      const tick = show.locator("button.pharos-episode-mark").first();
+      const season = show.locator(".pharos-season-bar button");
+      const whole = show.getByRole("button", { name: /^Mark show (un)?watched$/ });
+      await expect(season).toHaveText("Mark season watched");
+      await expect(whole).toHaveText("Mark show watched");
+
+      // The row's tick marks the one episode, so its season and show are
+      // watched too.
+      await tick.click();
+      await expect(tick).toHaveClass(/is-watched/);
+      await expect(season).toHaveText("Mark season unwatched");
+      await expect(whole).toHaveText("Mark show unwatched");
+      expect(await played()).toBe(true);
+
+      await whole.click();
+      await expect(tick).not.toHaveClass(/is-watched/);
+      await expect(season).toHaveText("Mark season watched");
+      expect(await played()).toBe(false);
+
+      await season.click();
+      await expect(tick).toHaveClass(/is-watched/);
+      await season.click();
+      await expect(tick).not.toHaveClass(/is-watched/);
+      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+
+      // Part way through: the title offers Resume and Play from start, and
+      // the latter starts at zero.
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: episode.Id,
+          PlaySessionId: `pw-start-${episode.Id}`,
+          PositionTicks: 25_000_000,
+          IsPaused: true,
+        },
+      });
+      const nativeId = BigInt(`0x${episode.Id}`).toString();
+      await page.goto(`/ui/title/${nativeId}`);
+      await expect(page.getByRole("link", { name: "Resume" })).toBeVisible({ timeout: 15_000 });
+      await page.getByRole("button", { name: "Mark watched" }).click();
+      await expect(page.getByRole("button", { name: "Mark unwatched" })).toBeVisible();
+      await expect(page.getByRole("link", { name: "Play from start" })).toHaveCount(0);
+      await page.getByRole("button", { name: "Mark unwatched" }).click();
+      await expect(page.getByRole("link", { name: /^Play$/ })).toBeVisible();
+
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: episode.Id,
+          PlaySessionId: `pw-start2-${episode.Id}`,
+          PositionTicks: 25_000_000,
+          IsPaused: true,
+        },
+      });
+      await page.reload();
+      await page.getByRole("link", { name: "Play from start" }).click({ timeout: 15_000 });
+      await expect(page).toHaveURL(new RegExp(`/ui/watch/${nativeId}/start$`));
+      const start = await page.evaluate(
+        () =>
+          new Promise<number>((resolve) => {
+            const look = () => {
+              const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+              if (v && v.readyState >= 1) resolve(v.currentTime);
+              else setTimeout(look, 50);
+            };
+            look();
+          }),
+      );
+      expect(start).toBeLessThan(1.5);
+      await request.delete(`${PHAROS_URL}/Users/${user.Id}/PlayedItems/${episode.Id}`, {
+        headers: api,
+      });
+    });
+
     // 012 US5: artist, then album, then track list.
     test("browse walks an artist to an album and its tracks", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
@@ -667,7 +797,6 @@ test.describe("pharos Dioxus UI", () => {
       const api = { "X-Emby-Token": token };
       const json = async (path: string) =>
         (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
-      const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
       // An artist with an album: the first tagged track names both.
       const tracks = await json(
         `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
