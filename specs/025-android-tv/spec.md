@@ -4,7 +4,7 @@
 - **Date:** 2026-11-04
 - **Asked by:** Alison, "I want to go the Rust route with Dioxus, it keeps it
   more like the Web version + means we don't have the heavy weight Java BS".
-- **Ids:** B/V allocated when slices land. ADR-0056 (renumber at merge if
+- **Ids:** B/V allocated when slices land. ADR-0057 (renumber at merge if
   taken).
 - **Depends on:** 009 (shell), 011 (D-pad focus, US1/US8), 013 (playback),
   017 (native API: `deviceToken`, `quickConnect*`, `Capabilities`).

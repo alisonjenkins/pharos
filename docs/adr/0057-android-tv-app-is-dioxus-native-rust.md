@@ -1,4 +1,4 @@
-# ADR-0056: The Android TV app is the Dioxus UI built for Android, in Rust only
+# ADR-0057: The Android TV app is the Dioxus UI built for Android, in Rust only
 
 - **Status:** Proposed
 - **Date:** 2026-11-04T22:20:00Z
