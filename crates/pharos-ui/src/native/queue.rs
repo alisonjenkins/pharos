@@ -244,15 +244,16 @@ impl Queue {
         if self.from_start != Some(id) {
             self.from_start = None;
         }
-        let returning = self.returning.take().filter(|(r, _)| *r == id);
+        // The song stepped back to comes first: a queued copy of it that
+        // reached the front meanwhile is a separate entry and stays queued.
+        if let Some((_, source)) = self.returning.take().filter(|(r, _)| *r == id) {
+            self.behind_push(id, source);
+            return;
+        }
         if self.next() == Some(id) {
             let source = self.upcoming.remove(0).source;
             self.behind_push(id, source);
             self.forget_gone();
-            return;
-        }
-        if let Some((_, source)) = returning {
-            self.behind_push(id, source);
             return;
         }
         // A song started outside the queue heads the album part after it.
@@ -659,6 +660,19 @@ mod tests {
         assert!(q.plays_from_start(ItemRef::Real(1)));
         q.started(ItemRef::Real(2), None, 0);
         assert!(!q.plays_from_start(ItemRef::Real(1)));
+    }
+
+    #[test]
+    fn a_queued_copy_of_the_song_stepped_back_to_stays_queued() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&[]), 0);
+        q.started(ItemRef::Real(2), Some(&[]), 0);
+        assert_eq!(q.back(track(2)), Some(ItemRef::Real(1)));
+        // While the step back loads, the listener queues song 1 again.
+        q.play_next(vec![track(1)]);
+        q.started(ItemRef::Real(1), None, 0);
+        assert!(!q.stepping_back());
+        assert_eq!(ids(&q)[0], 1, "the queued copy is still first");
     }
 
     #[test]
