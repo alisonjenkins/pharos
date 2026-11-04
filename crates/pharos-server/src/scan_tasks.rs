@@ -16,9 +16,14 @@
 //! internal schedules and stay `Idle` here until wired to drive the registry.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A root a coalesced re-run scans, and whether any request for it asked for
+/// a forced re-probe.
+pub type QueuedRoot = (PathBuf, bool);
 
 /// Task id for the media-library scan. Jellyfin advertises this task under
 /// `Key == "RefreshLibrary"`; jellyfin-web's "Scan All Libraries" button looks
@@ -108,9 +113,11 @@ struct Runtime {
     /// running job re-runs exactly once more on completion; further requests
     /// during the run coalesce into this single pending flag.
     pending: bool,
-    /// OR of the `force` flags of every request coalesced into `pending`, so a
-    /// forced refresh arriving mid-scan still forces the queued re-run.
-    pending_force: bool,
+    /// The roots every request coalesced into `pending` asked for, each with the
+    /// OR of its requests' `force`. The re-run scans exactly these, so a forced
+    /// one-folder item refresh queued behind another scan re-probes that folder
+    /// and nothing else, rather than growing into a forced whole-library pass.
+    pending_roots: Vec<QueuedRoot>,
 }
 
 impl Default for Runtime {
@@ -122,7 +129,7 @@ impl Default for Runtime {
             started_ms: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             pending: false,
-            pending_force: false,
+            pending_roots: Vec::new(),
         }
     }
 }
@@ -174,13 +181,19 @@ impl ScanTasks {
     /// B100 — start the task if it is `Idle`, otherwise fold this request into a
     /// single pending re-run and return `None`. This is the scan entry point:
     /// many concurrent `/Library/Refresh`s collapse to **one** running scan plus
-    /// **at most one** queued re-run (`force` OR'd across them), instead of
+    /// **at most one** queued re-run (over the union of their roots, `force`
+    /// OR'd per root), instead of
     /// spawning N concurrent catalog walks — the stacked-scan NFS I/O storm that
     /// starved the node and stalled the control plane during the B98 recovery.
     /// A `Some(cancel)` return means the caller owns the run and must eventually
     /// call [`finish_or_rerun`](Self::finish_or_rerun); `None` means "already
     /// running, re-run queued — nothing to spawn".
-    pub fn start_or_mark_pending(&self, id: &str, force: bool) -> Option<Arc<AtomicBool>> {
+    pub fn start_or_mark_pending(
+        &self,
+        id: &str,
+        roots: &[PathBuf],
+        force: bool,
+    ) -> Option<Arc<AtomicBool>> {
         let mut map = self.inner.lock().ok()?;
         let rt = map.get_mut(id)?;
         if rt.state == RunState::Idle {
@@ -190,18 +203,23 @@ impl ScanTasks {
             rt.started_ms = now_ms();
             rt.cancel = cancel.clone();
             rt.pending = false;
-            rt.pending_force = false;
+            rt.pending_roots.clear();
             Some(cancel)
         } else {
             rt.pending = true;
-            rt.pending_force |= force;
+            for root in roots {
+                match rt.pending_roots.iter_mut().find(|(r, _)| r == root) {
+                    Some((_, f)) => *f |= force,
+                    None => rt.pending_roots.push((root.clone(), force)),
+                }
+            }
             None
         }
     }
 
     /// B100 — end one scan pass. If a re-run was coalesced during the pass (and
     /// it was not cancelled), keep the task `Running` for another pass and return
-    /// the fresh `(cancel, force)` to drive it; otherwise finish to `Idle`,
+    /// the fresh cancel flag and the queued `(root, force)` pairs to drive it; otherwise finish to `Idle`,
     /// recording the result, and return `None`. Holding the slot `Running` across
     /// the re-run leaves no `Idle` window in which a concurrent request could
     /// slip in and start a second scan. A cancelled pass never re-runs (an
@@ -210,19 +228,18 @@ impl ScanTasks {
         &self,
         id: &str,
         status: CompletionStatus,
-    ) -> Option<(Arc<AtomicBool>, bool)> {
+    ) -> Option<(Arc<AtomicBool>, Vec<QueuedRoot>)> {
         let mut map = self.inner.lock().ok()?;
         let rt = map.get_mut(id)?;
         if rt.pending && status != CompletionStatus::Cancelled {
-            let force = rt.pending_force;
+            let roots = std::mem::take(&mut rt.pending_roots);
             rt.pending = false;
-            rt.pending_force = false;
             let cancel = Arc::new(AtomicBool::new(false));
             rt.state = RunState::Running;
             rt.progress = Some(0.0);
             rt.started_ms = now_ms();
             rt.cancel = cancel.clone();
-            Some((cancel, force))
+            Some((cancel, roots))
         } else {
             rt.last = Some(LastRun {
                 start_ms: rt.started_ms,
@@ -232,7 +249,7 @@ impl ScanTasks {
             rt.state = RunState::Idle;
             rt.progress = None;
             rt.pending = false;
-            rt.pending_force = false;
+            rt.pending_roots.clear();
             None
         }
     }
@@ -418,17 +435,22 @@ mod tests {
     fn concurrent_starts_coalesce_into_one_pending_rerun() {
         let t = ScanTasks::new();
         let id = TASK_REFRESH_LIBRARY;
+        let lib = [PathBuf::from("/media/tv")];
         // First request wins the slot and runs.
-        assert!(t.start_or_mark_pending(id, false).is_some());
+        assert!(t.start_or_mark_pending(id, &lib, false).is_some());
         assert_eq!(t.snapshot_one(id).unwrap().state, RunState::Running);
         // Concurrent requests do NOT start a second scan — they coalesce.
-        assert!(t.start_or_mark_pending(id, false).is_none());
-        assert!(t.start_or_mark_pending(id, true).is_none()); // force OR'd in
-                                                              // Pass ends → exactly one re-run is queued, carrying the OR'd force.
-        let (_c2, force) = t
+        assert!(t.start_or_mark_pending(id, &lib, false).is_none());
+        assert!(t.start_or_mark_pending(id, &lib, true).is_none()); // force OR'd in
+                                                                    // Pass ends → exactly one re-run is queued, carrying the OR'd force.
+        let (_c2, roots) = t
             .finish_or_rerun(id, CompletionStatus::Completed)
             .expect("a coalesced re-run must be pending");
-        assert!(force, "pending_force must OR the coalesced requests' force");
+        assert_eq!(
+            roots,
+            vec![(PathBuf::from("/media/tv"), true)],
+            "one entry per root, force OR'd across the coalesced requests"
+        );
         assert_eq!(
             t.snapshot_one(id).unwrap().state,
             RunState::Running,
@@ -440,10 +462,34 @@ mod tests {
     }
 
     #[test]
+    fn a_coalesced_item_refresh_reruns_only_its_own_folder() {
+        let t = ScanTasks::new();
+        let id = TASK_REFRESH_LIBRARY;
+        let first = [PathBuf::from("/media/tv/Show.A.S01E03-GRP")];
+        let second = [PathBuf::from("/media/tv/Show.B.S04E21-GRP")];
+        let library = [PathBuf::from("/media/movies")];
+        assert!(t.start_or_mark_pending(id, &first, true).is_some());
+        assert!(t.start_or_mark_pending(id, &second, true).is_none());
+        assert!(t.start_or_mark_pending(id, &library, false).is_none());
+        let (_c, roots) = t
+            .finish_or_rerun(id, CompletionStatus::Completed)
+            .expect("re-run queued");
+        // The forced folder stays forced; the incremental library scan queued
+        // beside it stays incremental and nothing else is added.
+        assert_eq!(
+            roots,
+            vec![
+                (PathBuf::from("/media/tv/Show.B.S04E21-GRP"), true),
+                (PathBuf::from("/media/movies"), false),
+            ]
+        );
+    }
+
+    #[test]
     fn a_lone_run_with_no_pending_finishes_to_idle() {
         let t = ScanTasks::new();
         let id = TASK_REFRESH_LIBRARY;
-        t.start_or_mark_pending(id, false).unwrap();
+        t.start_or_mark_pending(id, &[], false).unwrap();
         assert!(t.finish_or_rerun(id, CompletionStatus::Completed).is_none());
         let s = t.snapshot_one(id).unwrap();
         assert_eq!(s.state, RunState::Idle);
@@ -454,9 +500,9 @@ mod tests {
     fn a_cancelled_pass_does_not_rerun_even_with_pending() {
         let t = ScanTasks::new();
         let id = TASK_REFRESH_LIBRARY;
-        t.start_or_mark_pending(id, false).unwrap();
-        t.start_or_mark_pending(id, false); // queue a re-run
-                                            // An operator cancel must actually stop — no coalesced re-run fires.
+        t.start_or_mark_pending(id, &[], false).unwrap();
+        t.start_or_mark_pending(id, &[], false); // queue a re-run
+                                                 // An operator cancel must actually stop — no coalesced re-run fires.
         assert!(t.finish_or_rerun(id, CompletionStatus::Cancelled).is_none());
         let s = t.snapshot_one(id).unwrap();
         assert_eq!(s.state, RunState::Idle);
