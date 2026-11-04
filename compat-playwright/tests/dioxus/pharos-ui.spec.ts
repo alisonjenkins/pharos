@@ -1338,6 +1338,97 @@ test.describe("pharos Dioxus UI now playing", () => {
   });
 });
 
+// B450 / V390: a volume turned down stays down on the next player, which
+// mounts a new <audio> element. B451 / V391: a lost WebGL context comes back
+// without the screen dropping its visualiser, and attribute 0 is an array.
+test.describe("pharos Dioxus UI now playing survives remounts", () => {
+  test("the volume carries to the next player and a lost context is restored", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+    const volume = () =>
+      page.evaluate(
+        () =>
+          (document.getElementById("pharos-video") as HTMLMediaElement | null)
+            ?.volume ?? -1,
+      );
+    const play = async () => {
+      await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+      await expect(page.locator(".pharos-listen")).toBeVisible({
+        timeout: 15_000,
+      });
+    };
+
+    await page.goto("/ui/");
+    await page.evaluate(() => localStorage.removeItem("pharos.volume"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByRole("link", { name: "Find" }).click();
+    await page.getByLabel("Search").fill("carefree");
+    const tile = page.locator(".pharos-poster").first();
+    await expect(tile).toBeVisible({ timeout: 15_000 });
+    await tile.click();
+    await play();
+
+    await page.getByLabel("Volume").fill("0.3");
+    await expect.poll(volume).toBeCloseTo(0.3, 2);
+    await expect
+      .poll(() => page.evaluate(() => localStorage.getItem("pharos.volume")))
+      .toBe("0.300");
+
+    await page.getByRole("button", { name: "Back", exact: true }).click();
+    await play();
+    await expect.poll(volume).toBeCloseTo(0.3, 2);
+    expect(lines.join("\n")).toMatch(/pharos: volume restored volume=0\.300 muted=false/);
+
+    // The rest needs a GPU context; headless CI may have none.
+    await expect
+      .poll(() => [...lines].reverse().find((l) => /pharos: renderer mode=/.test(l)) ?? "", {
+        timeout: 15_000,
+      })
+      .toMatch(/mode=(webgl2|fallback)/);
+    const mode = [...lines].reverse().find((l) => /pharos: renderer mode=/.test(l)) ?? "";
+    test.skip(!/mode=webgl2/.test(mode), `no WebGL2 here: ${mode}`);
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const canvas = document.querySelector("canvas.pharos-visualiser");
+          const gl = (canvas as HTMLCanvasElement | null)?.getContext("webgl2");
+          return gl ? gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_ENABLED) : null;
+        }),
+      )
+      .toBe(true);
+
+    await page.evaluate(() => {
+      const canvas = document.querySelector("canvas.pharos-visualiser") as HTMLCanvasElement;
+      const ext = canvas.getContext("webgl2")?.getExtension("WEBGL_lose_context");
+      ext?.loseContext();
+      setTimeout(() => ext?.restoreContext(), 300);
+    });
+    await expect
+      .poll(() => lines.join("\n"), { timeout: 10_000 })
+      .toMatch(/pharos: webgl context restored program=\w+/);
+    await expect(page.locator("canvas.pharos-visualiser")).toBeVisible();
+    expect(lines.join("\n")).not.toMatch(/reason=context_lost/);
+    await expect.poll(volume).toBeCloseTo(0.3, 2);
+  });
+});
+
 // V300: the seeded song has a synced .lrc sidecar (a line every 2 s, written
 // by `just compat-dioxus-full`). Its lines light up in time, a line seeks
 // when clicked, and the Lyrics chip hides the panel.
