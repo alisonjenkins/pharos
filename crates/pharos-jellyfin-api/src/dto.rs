@@ -2120,7 +2120,11 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
     if has_primary {
         m.insert(
             "Primary".into(),
-            serde_json::Value::String(image_tag_for(item.id, item.art_version, "primary")),
+            serde_json::Value::String(image_tag_for(
+                item.id,
+                item.art_version,
+                primary_tag_role(item.kind),
+            )),
         );
     }
     if has_video_frames(item.kind) {
@@ -2134,6 +2138,16 @@ pub fn image_tags_for(item: &pharos_core::MediaItem) -> serde_json::Map<String, 
         );
     }
     m
+}
+
+/// The role key an item's Primary tag hashes. An episode's Primary changed
+/// from the series poster to its own still; a new key retires the week-long
+/// browser cache of the poster bytes under the old tag.
+fn primary_tag_role(kind: pharos_core::MediaKind) -> &'static str {
+    match kind {
+        pharos_core::MediaKind::Episode => "primary:episode-still",
+        _ => "primary",
+    }
 }
 
 /// One entry of `GET /Items/{id}/Images` — the ImageInfo shape jellyfin-web's
@@ -2182,7 +2196,11 @@ pub fn image_infos_for(item: &pharos_core::MediaItem, local_roles: &[String]) ->
             } else {
                 None
             },
-            image_tag: image_tag_for(item.id, item.art_version, &role.to_ascii_lowercase()),
+            image_tag: if role == "Primary" {
+                image_tag_for(item.id, item.art_version, primary_tag_role(item.kind))
+            } else {
+                image_tag_for(item.id, item.art_version, &role.to_ascii_lowercase())
+            },
             image_type: role,
         })
         .collect()
@@ -3777,6 +3795,24 @@ mod trickplay_helper_tests {
         assert_eq!(by_type["Backdrop"].image_index, Some(0));
         assert_eq!(by_type["Primary"].image_index, None);
         assert_eq!(by_type["Logo"].image_index, None);
+    }
+
+    #[test]
+    fn episode_primary_tag_is_retired_and_matches_its_image_info() {
+        use pharos_core::{MediaItem, MediaKind};
+        let item = MediaItem {
+            id: 5,
+            path: "/m/s01e01.mkv".into(),
+            title: "E".into(),
+            kind: MediaKind::Episode,
+            ..Default::default()
+        };
+        let tag = super::image_tags_for(&item)["Primary"].clone();
+        assert_ne!(tag, super::image_tag_for(5, 0, "primary"));
+        let infos = super::image_infos_for(&item, &["Primary".into()]);
+        let primary: Vec<_> = infos.iter().filter(|i| i.image_type == "Primary").collect();
+        assert_eq!(primary.len(), 1);
+        assert_eq!(serde_json::Value::String(primary[0].image_tag.clone()), tag);
     }
 
     #[test]
