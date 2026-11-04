@@ -74,6 +74,19 @@ pub fn audio_pick_here(
     Some(index)
 }
 
+/// The group's audio pick `pick` when this playback must be negotiated again
+/// to carry it: not what the server chose to play (`playing`), and not what
+/// this playback was already asked for (`asked`). Without the second test a
+/// server that answers another stream, or none, is asked again by every
+/// remount, forever.
+pub fn audio_to_renegotiate(
+    pick: Option<u32>,
+    playing: Option<u32>,
+    asked: Option<u32>,
+) -> Option<u32> {
+    pick.filter(|a| playing != Some(*a) && asked != Some(*a))
+}
+
 /// Whether this player switches itself to the subtitle `to` (`None` is off) for
 /// a menu pick, `shown` being what it shows now. False when the group took the
 /// pick, as for [`audio_pick_here`].
@@ -104,6 +117,17 @@ mod tests {
         };
         assert!(!subtitle_pick_here(None, Some(3), take));
         assert_eq!(*sent.borrow(), [Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn an_audio_pick_the_server_did_not_play_is_asked_for_once() {
+        assert_eq!(audio_to_renegotiate(Some(2), Some(1), None), Some(2));
+        // Asked for 2 and the server played 1, or nothing: the remount that
+        // follows must not ask again.
+        assert_eq!(audio_to_renegotiate(Some(2), Some(1), Some(2)), None);
+        assert_eq!(audio_to_renegotiate(Some(2), None, Some(2)), None);
+        assert_eq!(audio_to_renegotiate(Some(2), Some(2), None), None);
+        assert_eq!(audio_to_renegotiate(None, Some(1), None), None);
     }
 
     #[test]

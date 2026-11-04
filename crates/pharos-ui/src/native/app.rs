@@ -1602,6 +1602,9 @@ struct Playing {
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// The audio stream this playback was asked for. The server may play
+    /// another, so `audio` alone cannot tell a request was already made.
+    asked_audio: Option<u32>,
 }
 
 impl Playing {
@@ -1778,6 +1781,10 @@ fn WatchScreen(id: ItemRef) -> Element {
                         detail,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
+                        asked_audio: match asked.audio {
+                            TrackChoice::Index(i) => Some(i),
+                            _ => None,
+                        },
                     })))
                 }),
             )
@@ -2045,7 +2052,8 @@ fn Player(
             let (p, switched) = (Rc::clone(&p), Rc::clone(&switched));
             async move {
                 while let Some(picks) = rx.next().await {
-                    let audio = picks.audio.filter(|a| p.audio != Some(*a));
+                    let audio =
+                        track_follow::audio_to_renegotiate(picks.audio, p.audio, p.asked_audio);
                     let to = picks.subtitle.filter(|s| *subtitle.peek() != *s);
                     let burn = to.is_some_and(|to| {
                         let track =
