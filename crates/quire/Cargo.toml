@@ -1,0 +1,36 @@
+[package]
+name = "quire"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Open EPUB books from bytes: metadata, contents, reading order, sanitised sections and reading positions"
+readme = "README.md"
+keywords = ["epub", "ebook", "reader", "wasm"]
+categories = ["parser-implementations", "wasm"]
+
+# Deliberately standalone: no `pharos-*` dependency and no `workspace = true`
+# keys, so the crate can leave this repository unchanged (spec 023 FR-001).
+[dependencies]
+quick-xml = { version = "0.42", features = ["escape-html"] }
+thiserror = "2"
+# Inflate only: zip's `deflate` feature also pulls zopfli, a compressor
+# nothing here uses, into every wasm build.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+proptest = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+unwrap_in_result = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+get_unwrap = "deny"
