@@ -16,6 +16,10 @@ pub trait AudioTap {
     /// Frequency bins the analyser produces.
     fn bins(&self) -> usize;
     fn sample_rate(&self) -> f32;
+    /// The gain the player applied before the analyser: the media element's
+    /// volume, 0 when muted. Chromium and Firefox both scale the analysed
+    /// sound by it.
+    fn volume(&self) -> f32;
 }
 
 /// A visualiser look, or none.
@@ -86,11 +90,15 @@ const HIGH_HZ: f32 = 16_000.0;
 const ATTACK: f32 = 0.6;
 const DECAY: f32 = 0.12;
 
-/// Browsers analyse the sound after the media element's volume, so a quiet
-/// slider would dim the picture. The analysis follows the music's own
-/// recent peak instead (an automatic gain): it jumps up to a louder peak and
-/// relaxes over a few seconds, so the volume, or a quietly mastered track,
-/// changes how loud it sounds but not how it looks.
+/// Browsers analyse the sound after the media element's volume, so each
+/// frame is first divided by that volume: the slider changes how loud the
+/// song sounds, never how it looks, from the very next frame (B478).
+/// Under this volume the element is near silent and nothing is undone.
+const MIN_VOLUME: f32 = 1e-3;
+
+/// A quietly mastered track would still look dim, so the analysis also
+/// follows the music's own recent peak (an automatic gain): it jumps up to a
+/// louder peak and relaxes over a few seconds.
 ///
 /// Decibels shown below the reference peak.
 const RANGE_DB: f32 = 70.0;
@@ -174,6 +182,12 @@ impl Analysis {
     /// Read one frame from `tap` into the texture.
     pub fn read(&mut self, tap: &mut dyn AudioTap) {
         tap.read(&mut self.bins, &mut self.wave);
+        let volume = tap.volume();
+        if volume >= MIN_VOLUME {
+            let db = 20.0 * volume.log10();
+            self.bins.iter_mut().for_each(|b| *b -= db);
+            self.wave.iter_mut().for_each(|s| *s /= volume);
+        }
         self.update();
     }
 
@@ -249,9 +263,14 @@ mod tests {
     /// No sound in a bin.
     const NONE: f32 = f32::NEG_INFINITY;
 
+    /// Analyser bins in every test, and the samples per frame.
+    const BINS: usize = 1024;
+    const SAMPLES: usize = DATA_WIDTH;
+
     struct Fixed {
         bins: Vec<f32>,
         wave: Vec<f32>,
+        volume: f32,
     }
 
     impl AudioTap for Fixed {
@@ -265,10 +284,17 @@ mod tests {
         fn sample_rate(&self) -> f32 {
             48_000.0
         }
+        fn volume(&self) -> f32 {
+            self.volume
+        }
     }
 
     fn tap(bins: Vec<f32>, wave: Vec<f32>) -> (Analysis, Fixed) {
-        let tap = Fixed { bins, wave };
+        let tap = Fixed {
+            bins,
+            wave,
+            volume: 1.0,
+        };
         (Analysis::new(tap.bins(), tap.sample_rate()), tap)
     }
 
@@ -278,20 +304,27 @@ mod tests {
         }
     }
 
-    /// A song-like frame: a falling spectrum and a two-tone wave, scaled to
-    /// `volume` (the media element's slider, applied before the analyser).
-    fn song(volume: f32) -> (Vec<f32>, Vec<f32>) {
-        let db = 20.0 * volume.log10();
-        let bins = (0..1024)
-            .map(|i| -20.0 - 40.0 * (i as f32 / 1024.0) + db)
+    /// A song-like frame: a falling spectrum and a two-tone wave, scaled by
+    /// `gain` (a quiet master, or the media element's slider).
+    fn song(gain: f32) -> (Vec<f32>, Vec<f32>) {
+        let db = 20.0 * gain.log10();
+        let bins = (0..BINS)
+            .map(|i| -20.0 - 40.0 * (i as f32 / BINS as f32) + db)
             .collect();
-        let wave = (0..DATA_WIDTH)
+        let wave = (0..SAMPLES)
             .map(|i| {
-                let x = i as f32 / DATA_WIDTH as f32 * std::f32::consts::TAU;
-                (0.6 * (3.0 * x).sin() + 0.3 * (17.0 * x).sin()) * volume
+                let x = i as f32 / SAMPLES as f32 * std::f32::consts::TAU;
+                (0.6 * (3.0 * x).sin() + 0.3 * (17.0 * x).sin()) * gain
             })
             .collect();
         (bins, wave)
+    }
+
+    /// A sine of `period` samples starting at `phase` samples in.
+    fn sine(amp: f32, period: f32, phase: f32) -> Vec<f32> {
+        (0..SAMPLES)
+            .map(|i| amp * ((i as f32 + phase) / period * std::f32::consts::TAU).sin())
+            .collect()
     }
 
     #[test]
@@ -306,7 +339,7 @@ mod tests {
 
     #[test]
     fn silence_is_an_empty_spectrum_and_a_flat_wave() {
-        let (mut a, mut t) = tap(vec![NONE; 1024], vec![0.0; DATA_WIDTH]);
+        let (mut a, mut t) = tap(vec![NONE; BINS], vec![0.0; SAMPLES]);
         settle(&mut a, &mut t, 600);
         let data = a.data();
         assert!(data[..DATA_WIDTH].iter().all(|&b| b == 0));
@@ -315,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn a_low_volume_looks_like_full_volume_once_the_gain_settles() {
+    fn a_quiet_master_looks_like_a_loud_one_once_the_gain_settles() {
         let (bins, wave) = song(1.0);
         let (mut loud, mut lt) = tap(bins, wave);
         let (bins, wave) = song(0.05);
@@ -331,7 +364,7 @@ mod tests {
 
     #[test]
     fn noise_far_below_any_music_is_not_boosted_into_view() {
-        let (mut a, mut t) = tap(vec![-120.0; 1024], vec![0.001; DATA_WIDTH]);
+        let (mut a, mut t) = tap(vec![-120.0; BINS], vec![0.001; SAMPLES]);
         settle(&mut a, &mut t, 2000);
         assert!(a.data()[..DATA_WIDTH].iter().all(|&b| b == 0));
         assert!(a.data()[DATA_WIDTH..].iter().all(|&b| b.abs_diff(128) <= 6));
@@ -340,21 +373,16 @@ mod tests {
     #[test]
     fn a_near_silent_element_between_the_floor_and_true_silence_shows_nothing() {
         // A slider near 0.1%: quieter than the boost reaches, louder than -inf.
-        let (mut a, mut t) = tap(vec![-95.0; 1024], vec![0.0; DATA_WIDTH]);
+        let (mut a, mut t) = tap(vec![-95.0; BINS], vec![0.0; SAMPLES]);
         settle(&mut a, &mut t, 2000);
         assert!(a.data()[..DATA_WIDTH].iter().all(|&b| b == 0));
     }
 
     #[test]
     fn a_sudden_loud_wave_after_quiet_is_not_clipped() {
-        let quiet = |amp: f32| -> Vec<f32> {
-            (0..DATA_WIDTH)
-                .map(|i| amp * (i as f32 / DATA_WIDTH as f32 * std::f32::consts::TAU).sin())
-                .collect()
-        };
-        let (mut a, mut t) = tap(vec![NONE; 1024], quiet(0.1));
+        let (mut a, mut t) = tap(vec![NONE; BINS], sine(0.1, SAMPLES as f32 / 2.0, 0.0));
         settle(&mut a, &mut t, 2000);
-        t.wave = quiet(0.9);
+        t.wave = sine(0.9, SAMPLES as f32 / 2.0, 0.0);
         a.read(&mut t);
         let row = &a.data()[DATA_WIDTH..];
         let top = row.iter().filter(|&&b| b == 255).count();
@@ -364,9 +392,9 @@ mod tests {
     #[test]
     fn a_bass_tone_lights_the_left_of_the_spectrum_only() {
         // 1024 bins at 48 kHz: 23.4 Hz each, so bins 2..=4 hold ~50–100 Hz.
-        let mut bins = vec![NONE; 1024];
+        let mut bins = vec![NONE; BINS];
         bins[2..=4].fill(-20.0);
-        let (mut a, mut t) = tap(bins, vec![0.0; DATA_WIDTH]);
+        let (mut a, mut t) = tap(bins, vec![0.0; SAMPLES]);
         settle(&mut a, &mut t, 10);
         let (low, high) = a.data()[..DATA_WIDTH].split_at(DATA_WIDTH / 4);
         assert!(low.iter().any(|&b| b > 200), "{low:?}");
@@ -375,7 +403,7 @@ mod tests {
 
     #[test]
     fn bars_rise_faster_than_they_fall() {
-        let (mut a, mut t) = tap(vec![-20.0; 1024], vec![0.0; DATA_WIDTH]);
+        let (mut a, mut t) = tap(vec![-20.0; BINS], vec![0.0; SAMPLES]);
         a.read(&mut t);
         let up = a.data()[DATA_WIDTH / 2];
         t.bins.fill(NONE);
@@ -387,13 +415,43 @@ mod tests {
 
     #[test]
     fn a_loud_wave_raises_the_level_and_keeps_its_shape() {
-        let wave: Vec<f32> = (0..DATA_WIDTH)
+        let wave: Vec<f32> = (0..SAMPLES)
             .map(|i| if i % 2 == 0 { -0.9 } else { 0.9 })
             .collect();
-        let (mut a, mut t) = tap(vec![NONE; 1024], wave);
+        let (mut a, mut t) = tap(vec![NONE; BINS], wave);
         settle(&mut a, &mut t, 10);
         assert!(a.level() > 0.9, "{}", a.level());
         let row = &a.data()[DATA_WIDTH..];
         assert!(row[0] < 20 && row[1] > 235, "{:?}", &row[..2]);
+    }
+
+    #[test]
+    fn the_volume_slider_changes_nothing_from_the_next_frame() {
+        let (bins, wave) = song(1.0);
+        let (mut steady, mut st) = tap(bins.clone(), wave.clone());
+        let (mut turned, mut tt) = tap(bins, wave);
+        settle(&mut steady, &mut st, 300);
+        settle(&mut turned, &mut tt, 300);
+        for volume in [0.05, 1.0, 0.3] {
+            let (bins, wave) = song(volume);
+            tt.bins = bins;
+            tt.wave = wave;
+            tt.volume = volume;
+            steady.read(&mut st);
+            turned.read(&mut tt);
+            for (i, (s, t)) in steady.data().iter().zip(turned.data()).enumerate() {
+                assert!(s.abs_diff(*t) <= 1, "volume {volume} texel {i}: {s} vs {t}");
+            }
+            assert!((steady.level() - turned.level()).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn a_muted_element_shows_nothing() {
+        let (mut a, mut t) = tap(vec![NONE; BINS], vec![0.0; SAMPLES]);
+        t.volume = 0.0;
+        settle(&mut a, &mut t, 100);
+        assert!(a.data()[..DATA_WIDTH].iter().all(|&b| b == 0));
+        assert!(a.data()[DATA_WIDTH..].iter().all(|&b| b == 128));
     }
 }
