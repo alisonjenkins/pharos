@@ -193,6 +193,16 @@ impl Stage {
         (before != (self.item, self.view)).then_some(self.view)
     }
 
+    /// Signed in again: sign-in closed the player, so a watch route that
+    /// never changed puts its item back. A player already on stage, or any
+    /// other route, is left alone.
+    pub fn resume(&mut self, route: &Route) -> Option<View> {
+        if self.item.is_some() || !matches!(route, Route::Watch(_)) {
+            return None;
+        }
+        self.follow(route)
+    }
+
     /// Whether a navigation to `to` is a play the stage takes in place: a
     /// watch route while the player is compact (FR-001). The route stays
     /// where it is and the stage plays `to`'s item in its current view.
@@ -556,6 +566,25 @@ mod tests {
         let mut stage = Stage::default();
         assert_eq!(stage.follow(&Route::Home), None);
         assert_eq!(stage, Stage::default());
+    }
+
+    #[test]
+    fn signing_in_again_on_the_watch_route_puts_its_item_back() {
+        let mut stage = playing_full(7);
+        stage.close();
+        assert_eq!(
+            stage.resume(&Route::Watch(ItemRef::Real(7))),
+            Some(View::Full)
+        );
+        assert_eq!(stage.item, Some(ItemRef::Real(7)));
+        assert_eq!(
+            stage.resume(&Route::Watch(ItemRef::Real(8))),
+            None,
+            "one on stage stays"
+        );
+        stage.close();
+        assert_eq!(stage.resume(&Route::Home), None);
+        assert_eq!(stage.item, None);
     }
 
     #[test]
