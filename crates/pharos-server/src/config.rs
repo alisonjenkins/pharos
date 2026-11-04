@@ -715,6 +715,13 @@ pub struct NativeApiConfig {
     /// within this many seconds (cause `revoked`).
     #[serde(default = "default_native_revalidate_secs")]
     pub revalidate_secs: NonZeroU32,
+    /// How long an unauthenticated connection may stay open without a session.
+    #[serde(default = "default_native_auth_deadline_secs")]
+    pub auth_deadline_secs: NonZeroU32,
+    /// How long a connection may stay open without a session however many
+    /// pending QuickConnect polls extend `auth_deadline_secs`.
+    #[serde(default = "default_native_max_unauthenticated_secs")]
+    pub max_unauthenticated_secs: NonZeroU32,
 }
 
 impl Default for NativeApiConfig {
@@ -724,8 +731,31 @@ impl Default for NativeApiConfig {
             allowed_origins: Vec::new(),
             max_connections_per_user: default_native_max_connections_per_user(),
             revalidate_secs: default_native_revalidate_secs(),
+            auth_deadline_secs: default_native_auth_deadline_secs(),
+            max_unauthenticated_secs: default_native_max_unauthenticated_secs(),
         }
     }
+}
+
+fn default_native_max_unauthenticated_secs() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(
+        crate::api::pharos::rpc::limits::MAX_UNAUTHENTICATED_FOR.as_secs() as u32,
+    ) {
+        Some(n) => n,
+        None => panic!("the default unauthenticated lifetime must not be zero"),
+    };
+    DEFAULT
+}
+
+fn default_native_auth_deadline_secs() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 =
+        match NonZeroU32::new(crate::api::pharos::rpc::limits::AUTH_DEADLINE.as_secs() as u32) {
+            Some(n) => n,
+            None => panic!("the default auth deadline must not be zero"),
+        };
+    DEFAULT
 }
 
 fn default_native_revalidate_secs() -> NonZeroU32 {
@@ -1534,6 +1564,20 @@ mod tests {
         assert!(toml::from_str::<NativeApiConfig>("max_connections_per_user = 0").is_err());
         let cfg: NativeApiConfig = toml::from_str("max_connections_per_user = 2").expect("parses");
         assert_eq!(cfg.max_connections_per_user.get(), 2);
+    }
+
+    /// B541: the auth deadline defaults to 30 s and a zero is refused.
+    #[test]
+    fn a_zero_auth_deadline_is_rejected() {
+        assert_eq!(NativeApiConfig::default().auth_deadline_secs.get(), 30);
+        assert!(toml::from_str::<NativeApiConfig>("auth_deadline_secs = 0").is_err());
+        let cfg: NativeApiConfig = toml::from_str("auth_deadline_secs = 2").expect("parses");
+        assert_eq!(cfg.auth_deadline_secs.get(), 2);
+        assert_eq!(
+            NativeApiConfig::default().max_unauthenticated_secs.get(),
+            300
+        );
+        assert!(toml::from_str::<NativeApiConfig>("max_unauthenticated_secs = 0").is_err());
     }
 
     /// V174: a zero in `[server.login_throttle]` would quietly switch the

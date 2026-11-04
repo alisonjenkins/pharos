@@ -37,7 +37,11 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::config::NativeApiConfig;
 use crate::state::AppState;
 
-pub use socket::{record_closed, record_refused, CloseCause, Recheck, Refused, SESSION_COOKIE};
+pub use socket::{
+    record_auth_deadline_extended, record_auth_deadline_extension_refused, record_closed,
+    record_refused, AuthDeadlineExtension, AuthDeadlineRefusal, CloseCause, Recheck, Refused,
+    SESSION_COOKIE,
+};
 
 /// Routes of the native API (`/pharos/rpc`, `/pharos/session`), or none at
 /// all while `[server.native_api].enabled` is false: every push to main deploys
@@ -72,11 +76,23 @@ pub fn record_state(cfg: &NativeApiConfig) {
     if cfg.enabled {
         pharos_api::register_metrics();
         pharos_api::set_trace_parent_hook(crate::obs::rpc_trace_parent);
+        metrics::counter!(
+            "pharos_rpc_auth_deadline_extended_total",
+            "reason" => AuthDeadlineExtension::QuickConnectPending.label()
+        )
+        .absolute(0);
+        metrics::counter!(
+            "pharos_rpc_auth_deadline_extension_refused_total",
+            "reason" => AuthDeadlineRefusal::MaxUnauthenticated.label()
+        )
+        .absolute(0);
     }
     tracing::info!(
         enabled = cfg.enabled,
         allowed_origins = ?cfg.allowed_origins,
         max_connections_per_user = cfg.max_connections_per_user.get(),
+        auth_deadline_secs = cfg.auth_deadline_secs.get(),
+        max_unauthenticated_secs = cfg.max_unauthenticated_secs.get(),
         "native api (/pharos/rpc)"
     );
     for origin in origin::insecure(&cfg.allowed_origins) {
@@ -123,6 +139,9 @@ pub struct ConnectionCtx {
     /// Woken when a logout leaves the connection with no session, so the
     /// socket re-arms its auth deadline.
     pub(crate) signed_out: tokio::sync::Notify,
+    /// Woken when an unauthenticated client requests an auth deadline
+    /// extension (B541, V436).
+    pub(crate) extend_auth: tokio::sync::Notify,
     /// Run once when the connection ends, whatever ended it. Capabilities
     /// exported on a connection are not reliably dropped when it closes, so
     /// whatever must happen on the close (a membership's seat) registers here.
@@ -148,8 +167,17 @@ impl ConnectionCtx {
             resumed: RefCell::new(Vec::new()),
             ended: RefCell::new(Vec::new()),
             signed_out: tokio::sync::Notify::new(),
+            extend_auth: tokio::sync::Notify::new(),
             on_close: RefCell::new(Vec::new()),
         }))
+    }
+
+    /// Requests an extension of the auth deadline if the connection is not
+    /// signed in (B541, V436).
+    pub(crate) fn extend_auth_deadline(&self) {
+        if !self.is_signed_in() {
+            self.extend_auth.notify_one();
+        }
     }
 
     /// Runs `hook` when the connection closes.
