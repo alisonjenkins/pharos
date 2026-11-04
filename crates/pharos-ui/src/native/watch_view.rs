@@ -26,9 +26,11 @@ pub const SEEK_ID: &str = "pharos-seek";
 pub(super) const SEEK_STEP_MS: u64 = 10_000;
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
-/// How often a playing picture checks for a still pointer; the chrome fades
-/// one to two ticks after the last movement.
-const IDLE_TICK_MS: u32 = 1_500;
+/// How often a playing picture checks for a still pointer.
+const IDLE_TICK_MS: u32 = 500;
+/// Still ticks before the chrome fades: 2 to 2.5 s after the last movement,
+/// about what modern players wait, so the picture has the screen.
+const IDLE_TICKS: u32 = 4;
 /// How far one wheel notch moves the volume, or seeks with Shift held.
 const WHEEL_VOLUME_STEP: f64 = 0.05;
 const WHEEL_SEEK_MS: u64 = 5_000;
@@ -164,12 +166,15 @@ pub fn WatchView(
         }
         ticking.set(true);
         spawn(async move {
-            loop {
+            let mut still = 0;
+            while still < IDLE_TICKS {
                 platform::sleep_ms(IDLE_TICK_MS).await;
-                if !*stirred.peek() {
-                    break;
+                if *stirred.peek() {
+                    stirred.set(false);
+                    still = 0;
+                } else {
+                    still += 1;
                 }
-                stirred.set(false);
             }
             ticking.set(false);
             idle.set(true);
