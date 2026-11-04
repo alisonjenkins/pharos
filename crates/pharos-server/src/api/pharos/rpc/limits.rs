@@ -2,8 +2,10 @@
 //!
 //! Three bounds, shared by every actix worker:
 //! - connections not yet signed in, server-wide ([`MAX_UNAUTHENTICATED`]),
-//!   each given [`AUTH_DEADLINE`] to `resume` before it is closed. This bounds
-//!   what an anonymous client can hold open;
+//!   each given `auth_deadline_secs` (default [`AUTH_DEADLINE`]) to sign in
+//!   before it is closed. A pending QuickConnect poll re-arms that deadline,
+//!   up to `max_unauthenticated_secs` (default [`MAX_UNAUTHENTICATED_FOR`])
+//!   in all (B541). This bounds what an anonymous client can hold open;
 //! - the same connections per client address ([`MAX_UNAUTHENTICATED_PER_IP`]),
 //!   so one host cannot take the server-wide bound alone. Enforced only when
 //!   the server knows its proxies ([`ConnectionLimits::with_per_ip`]);
@@ -28,6 +30,9 @@ pub const MAX_UNAUTHENTICATED: u32 = 64;
 pub const MAX_UNAUTHENTICATED_PER_IP: u32 = 8;
 /// How long a connection may stay open without a session.
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(30);
+/// How long a connection may stay open without a session however many
+/// pending QuickConnect polls extend its deadline: one code's lifetime.
+pub const MAX_UNAUTHENTICATED_FOR: Duration = crate::quick_connect::PENDING_TTL;
 
 #[derive(Default)]
 struct Counts {
