@@ -12,6 +12,7 @@ use std::rc::{Rc, Weak};
 use futures_util::future::LocalBoxFuture;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
+use super::activity::{self, ActivityLog, Event, TrackKind};
 use super::playback::MediaEvent;
 use super::seen::{self, MemberSeen};
 use super::together::{
@@ -35,6 +36,8 @@ pub struct GroupView {
     pub members: Vec<Member>,
     /// This member is on their own tracks ("Just me").
     pub own_tracks: bool,
+    /// Who did what lately, newest last.
+    pub log: ActivityLog,
     /// Why the group is over, once it is.
     pub ended: Option<String>,
     /// Counts the group's updates, so a screen can fetch what an update may
@@ -72,6 +75,8 @@ pub trait GroupPlayer {
     fn pause(&self);
     fn seek_ms(&self, ms: u64);
     fn set_rate(&self, rate: f64);
+    /// What the viewer calls the stream `index` of this kind, for the activity lines.
+    fn track_label(&self, kind: TrackKind, index: u32) -> Option<String>;
     /// The audio and subtitle stream indexes of the item playing.
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>);
     /// Switch the player's audio and subtitle, as its own menus do.
@@ -127,6 +132,8 @@ pub struct GroupState {
     pub tracks: GroupTracksView,
     /// This member is on their own tracks ("Just me"), not the group's.
     pub own_tracks: bool,
+    /// Who did what, as the updates came.
+    pub log: ActivityLog,
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
     pub ended: Option<String>,
@@ -205,8 +212,124 @@ impl GroupState {
             .map_or(u64::MAX, |t| u64::try_from(now_ms - t).unwrap_or(0))
     }
 
+    /// A member's display name, or `None` for the group (no id, or one the
+    /// roster does not know).
+    fn name_of(&self, id: Option<&str>) -> Option<String> {
+        let id = id.filter(|id| !id.is_empty())?;
+        self.members
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.name.clone())
+    }
+
+    /// The activity events an update stands for, read against the group as it
+    /// is before the update lands.
+    fn events(
+        &self,
+        update: &GroupUpdate,
+        label: &dyn Fn(TrackKind, u32) -> Option<String>,
+    ) -> Vec<Event> {
+        let by_member = |by: &Option<String>, action| Event {
+            by: self.name_of(by.as_deref()),
+            action,
+        };
+        match update {
+            GroupUpdate::Play { by, .. } => vec![by_member(by, activity::Action::Play)],
+            GroupUpdate::Pause {
+                by, position_ms, ..
+            } => vec![by_member(
+                by,
+                activity::Action::Pause {
+                    position_ms: *position_ms,
+                },
+            )],
+            GroupUpdate::Seek {
+                by, position_ms, ..
+            } => vec![by_member(
+                by,
+                activity::Action::Seek {
+                    position_ms: *position_ms,
+                },
+            )],
+            GroupUpdate::Member(m) => match self.members.iter().find(|x| x.id == m.id) {
+                None => vec![Event {
+                    by: Some(m.name.clone()),
+                    action: activity::Action::Joined,
+                }],
+                Some(before) => {
+                    let mut events = Vec::new();
+                    if m.own_tracks != before.own_tracks {
+                        events.push(Event {
+                            by: Some(m.name.clone()),
+                            action: activity::Action::OwnTracks { on: m.own_tracks },
+                        });
+                    }
+                    if m.buffering && !before.buffering {
+                        let names = self
+                            .members
+                            .iter()
+                            .filter(|x| if x.id == m.id { true } else { x.buffering })
+                            .map(|x| x.name.clone())
+                            .collect();
+                        events.push(Event {
+                            by: None,
+                            action: activity::Action::Waiting { names },
+                        });
+                    }
+                    events
+                }
+            },
+            GroupUpdate::Left(id) => self
+                .name_of(Some(id))
+                .map(|name| Event {
+                    by: Some(name),
+                    action: activity::Action::Left,
+                })
+                .into_iter()
+                .collect(),
+            GroupUpdate::Tracks { tracks, by } => {
+                let who = self.name_of(by.as_deref());
+                let mut events = Vec::new();
+                let mut push = |kind, now: TrackChoice, before: TrackChoice| {
+                    if now == before {
+                        return;
+                    }
+                    let label = match now {
+                        TrackChoice::Unset => return,
+                        TrackChoice::Off => None,
+                        TrackChoice::Index(i) => {
+                            Some(label(kind, i).unwrap_or_else(|| format!("track {i}")))
+                        }
+                    };
+                    events.push(Event {
+                        by: who.clone(),
+                        action: activity::Action::Tracks { kind, label },
+                    });
+                };
+                push(TrackKind::Audio, tracks.audio, self.tracks.audio);
+                push(TrackKind::Subtitles, tracks.subtitle, self.tracks.subtitle);
+                events
+            }
+            GroupUpdate::Joined(_) | GroupUpdate::Item { .. } | GroupUpdate::Ended => Vec::new(),
+        }
+    }
+
     /// Take an update; the actions for the player and screens.
     pub fn apply(&mut self, update: GroupUpdate, now_ms: i64) -> Vec<Action> {
+        self.apply_labelled(update, now_ms, &|_, _| None)
+    }
+
+    /// [`Self::apply`], naming the tracks in the activity lines with `label`.
+    pub fn apply_labelled(
+        &mut self,
+        update: GroupUpdate,
+        now_ms: i64,
+        label: &dyn Fn(TrackKind, u32) -> Option<String>,
+    ) -> Vec<Action> {
+        let at = u64::try_from(now_ms).unwrap_or(0);
+        for event in self.events(&update, label) {
+            self.log.push(&event, at);
+        }
         self.activity = self.activity.wrapping_add(1);
         match update {
             GroupUpdate::Joined(g) => {
@@ -323,6 +446,7 @@ impl GroupState {
             active,
             members: self.members.clone(),
             own_tracks: self.own_tracks,
+            log: self.log.clone(),
             ended: self.ended.clone(),
             activity: self.activity,
         }
@@ -689,7 +813,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if inner.leaving || inner.epoch != epoch {
                 return;
             }
-            let actions = inner.state.apply(update, now);
+            let player = inner.player.clone();
+            let label = |kind, index| player.as_ref().and_then(|p| p.track_label(kind, index));
+            let actions = inner.state.apply_labelled(update, now, &label);
             let wait = if is_play {
                 inner.ready_sent_ms.take().map(|t| now - t)
             } else {
@@ -1197,6 +1323,9 @@ mod tests {
         }
         fn set_rate(&self, rate: f64) {
             self.log.borrow_mut().push(format!("rate({rate})"));
+        }
+        fn track_label(&self, kind: TrackKind, index: u32) -> Option<String> {
+            Some(format!("{kind:?} {index}"))
         }
         fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
             self.streams.borrow().clone()
@@ -2041,5 +2170,115 @@ mod tests {
                 subtitle: Some(Some(3))
             }]
         );
+    }
+
+    fn named(id: &str, name: &str) -> Member {
+        Member {
+            id: id.into(),
+            name: name.into(),
+            buffering: false,
+            own_tracks: false,
+        }
+    }
+
+    /// A group of Ada and Bo, seen from Ada's session.
+    fn pair() -> Rig {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Joined(GroupSummary {
+            members: vec![named("ada", "Ada"), named("bo", "Bo")],
+            ..summary()
+        }));
+        rig
+    }
+
+    fn lines(rig: &Rig) -> Vec<String> {
+        rig.session.view().log.lines()
+    }
+
+    #[test]
+    fn a_pause_names_the_member_who_caused_it_and_a_gate_names_no_one() {
+        let rig = pair();
+        rig.session.deliver(GroupUpdate::Pause {
+            at_server_ms: 0,
+            position_ms: 724_000,
+            by: Some("bo".into()),
+        });
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 0,
+            position_ms: 724_000,
+            by: Some(String::new()),
+        });
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 0,
+            position_ms: 60_000,
+            by: Some("nobody".into()),
+        });
+        assert_eq!(
+            lines(&rig),
+            [
+                "Bo paused at 12:04",
+                "Everyone's ready, playing",
+                "The group skipped to 1:00"
+            ]
+        );
+    }
+
+    #[test]
+    fn roster_changes_buffering_and_own_tracks_become_lines() {
+        let rig = pair();
+        rig.session.deliver(GroupUpdate::Member(named("cy", "Cy")));
+        rig.session.deliver(GroupUpdate::Member(Member {
+            buffering: true,
+            ..named("bo", "Bo")
+        }));
+        rig.session.deliver(GroupUpdate::Member(Member {
+            own_tracks: true,
+            buffering: true,
+            ..named("bo", "Bo")
+        }));
+        rig.session.deliver(GroupUpdate::Left("cy".into()));
+        assert_eq!(
+            lines(&rig),
+            ["Waiting for Bo", "Bo is on their own tracks", "Cy left"]
+        );
+    }
+
+    #[test]
+    fn a_tracks_change_names_who_and_what_changed() {
+        let rig = pair();
+        rig.session.deliver(GroupUpdate::Tracks {
+            tracks: GroupTracksView {
+                audio: TrackChoice::Index(2),
+                subtitle: TrackChoice::Off,
+            },
+            by: Some("bo".into()),
+        });
+        assert_eq!(
+            lines(&rig),
+            ["Bo switched audio to Audio 2", "Bo turned subtitles off"]
+        );
+        // The same state again says nothing.
+        rig.session.deliver(GroupUpdate::Tracks {
+            tracks: GroupTracksView {
+                audio: TrackChoice::Index(2),
+                subtitle: TrackChoice::Off,
+            },
+            by: Some("bo".into()),
+        });
+        assert_eq!(lines(&rig).len(), 2);
+    }
+
+    #[test]
+    fn the_toast_lasts_four_seconds_from_the_clock() {
+        let rig = pair();
+        rig.env.now.set(200_000);
+        rig.session.deliver(GroupUpdate::Pause {
+            at_server_ms: 0,
+            position_ms: 0,
+            by: Some("ada".into()),
+        });
+        let log = rig.session.view().log;
+        assert_eq!(log.toast(203_999), Some("Ada paused at 0:00"));
+        assert_eq!(log.toast(204_000), None);
     }
 }
