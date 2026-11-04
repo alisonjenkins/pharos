@@ -53,6 +53,16 @@ tmdb:
     secretName: ""      # e.g. "pharos-tmdb"
     secretKey: "api-key"
 
+# ── IMDb and Rotten Tomatoes scores (OMDb, B341). When apiKey.secretName is
+#    set, the key is injected as PHAROS_OMDB_API_KEY from that Secret and a
+#    background sweep looks up films and shows, up to [omdb].daily_limit
+#    lookups a day (default 900; the free key allows 1000). Leave secretName
+#    empty to keep the feature off.
+omdb:
+  apiKey:
+    secretName: ""      # e.g. "pharos-omdb"
+    secretKey: "api-key"
+
 # ── MusicBrainz + Cover Art Archive album artwork. Most music files carry no
 #    embedded picture and no cover.jpg, so album/artist tiles render a flat
 #    icon; MusicBrainz fills that gap with no API key. What it does require is
