@@ -22,7 +22,7 @@ use super::browse::{self, Neighbours};
 use super::diagnostics;
 use super::find::{Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
-use super::group_session::{GroupView, Ui};
+use super::group_session::{GroupPlayer, GroupView, Ui};
 use super::listen::ListenView;
 use super::machine::{Event, Machine, Phase};
 use super::mixes::{self, ActiveMix, MixCtx};
@@ -2122,7 +2122,11 @@ fn Player(
     let together = use_context::<Together>();
     let group = (together.view)();
     let watch_seen = use_group_seen(vec![p.detail.item.id]);
-    let session = together.current();
+    // The session is read when used: a join can make it after this mounted.
+    let session = {
+        let together = together.clone();
+        move || together.current()
+    };
     // Bumped when the toast's time is up, so the page draws without it.
     let toast_expired = use_signal(|| 0u32);
     let _ = toast_expired();
@@ -2277,34 +2281,28 @@ fn Player(
             }
         }
     });
-    // The group drives this video while it is mounted.
-    use_hook({
-        let session = session.clone();
+    // The group drives this video while it is on the stage.
+    let group_video: Rc<dyn GroupPlayer> = use_hook({
+        let together = together.clone();
         let item = p.detail.item.id;
         let (audio, subtitles) = (
             p.detail.audio_tracks.clone(),
             p.detail.subtitle_tracks.clone(),
         );
         move || {
-            if let Some(session) = &session {
-                session.set_watching(Some(item));
-                session.set_player(Some(Rc::new(VideoPlayer {
-                    id: VIDEO_ID,
-                    audio,
-                    subtitles,
-                    tracks: group_tracks,
-                })));
-            }
+            let video: Rc<dyn GroupPlayer> = Rc::new(VideoPlayer {
+                id: VIDEO_ID,
+                audio,
+                subtitles,
+                tracks: group_tracks,
+            });
+            together.attach(item, Rc::clone(&video));
+            video
         }
     });
     use_drop({
-        let session = session.clone();
-        move || {
-            if let Some(session) = &session {
-                session.set_player(None);
-                session.set_watching(None);
-            }
-        }
+        let together = together.clone();
+        move || together.detach(&group_video)
     });
     use_drop({
         let (engine, stop) = (Rc::clone(&engine), stop.clone());
@@ -2381,7 +2379,7 @@ fn Player(
             if retiring.get() {
                 return;
             }
-            if let Some(session) = &session {
+            if let Some(session) = session() {
                 session.on_media(event);
             }
             // Near the end, with a crossfade chosen, the next song starts
@@ -2479,7 +2477,7 @@ fn Player(
             }
             // In a group the viewer's play, pause and seek are the group's.
             let seek = |ms: u64| {
-                if !session.as_ref().is_some_and(|s| s.seek(ms)) {
+                if !session().is_some_and(|s| s.seek(ms)) {
                     platform::seek_ms(VIDEO_ID, ms);
                 }
             };
@@ -2490,7 +2488,7 @@ fn Player(
             };
             match control {
                 Control::TogglePlay => {
-                    if !session.as_ref().is_some_and(|s| s.toggle_play()) {
+                    if !session().is_some_and(|s| s.toggle_play()) {
                         platform::toggle_play(VIDEO_ID);
                     }
                 }
@@ -2568,7 +2566,7 @@ fn Player(
                 }
                 Control::Audio(index) => {
                     let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
-                        session.as_ref().is_some_and(|s| s.pick_audio(index))
+                        session().is_some_and(|s| s.pick_audio(index))
                     }) else {
                         return;
                     };
@@ -2579,7 +2577,7 @@ fn Player(
                 }
                 Control::Subtitle(to) => {
                     let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
-                        session.as_ref().is_some_and(|s| s.pick_subtitle(to))
+                        session().is_some_and(|s| s.pick_subtitle(to))
                     });
                     if !here {
                         return;
@@ -2618,7 +2616,7 @@ fn Player(
     let on_leave = {
         let session = session.clone();
         move |()| {
-            if let Some(session) = session.clone() {
+            if let Some(session) = session() {
                 spawn(async move { session.leave().await });
             }
         }
@@ -2626,7 +2624,7 @@ fn Player(
     let on_own_tracks = {
         let session = session.clone();
         move |own: bool| {
-            if let Some(session) = &session {
+            if let Some(session) = session() {
                 session.follow_tracks(!own);
             }
         }
