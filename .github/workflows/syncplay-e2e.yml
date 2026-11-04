@@ -55,9 +55,10 @@ jobs:
   syncplay:
     name: syncplay group-watch E2E
     runs-on: pharos-nix-builder-amd64
-    # Like ci.yml's heavy jobs: feature PRs are tested inside a batch/ PR.
+    # Like ci.yml's heavy jobs: feature PRs are tested inside a batch/ PR;
+    # release PRs run it too.
     # Never for a fork: its code would run on the home runner.
-    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'batch/'))
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (startsWith(github.head_ref, 'batch/') || startsWith(github.head_ref, 'release-please--')))
     steps:
       - uses: actions/checkout@v7
       - uses: alisonjenkins/setup-host-nix@v1.0.1
