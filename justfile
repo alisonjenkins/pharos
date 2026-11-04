@@ -236,9 +236,10 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     for n in $(seq -w 1 120); do
       l=${letters:$((10#$n % 26)):1}
       ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Bulk/$l$l Bulk $n.webm"
-      # Every other title is a Drama, so the genre filter has something to keep.
+      # Every other title is a Drama, so the genre filter has something to keep,
+      # from one of 40 years, more than the year rail shows at once (V256).
       if (( 10#$n % 2 == 0 )); then
-        printf '<movie><title>%s</title><genre>Drama</genre></movie>\n' "$l$l Bulk $n" > "$TMP/media/Bulk/$l$l Bulk $n.nfo"
+        printf '<movie><title>%s</title><genre>Drama</genre><year>%d</year></movie>\n' "$l$l Bulk $n" $((1980 + (10#$n / 2) % 40)) > "$TMP/media/Bulk/$l$l Bulk $n.nfo"
       fi
     done
     # Synced lyrics for the seeded song, a line every 2 s, for the lyrics
