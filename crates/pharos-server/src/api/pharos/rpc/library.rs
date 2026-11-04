@@ -372,7 +372,16 @@ impl server::library::Handler for Library {
             synth @ WireId::Synth(_) => {
                 match synth_detail(state, &user, synth).await {
                     Ok(dto) => {
-                        write_synth_detail(results.get().init_result().init_detail(), synth, &dto)
+                        let played = synth_played(state, &user, synth, &dto).await;
+                        let mut out = results.get().init_result().init_detail();
+                        write_synth_detail(out.reborrow(), synth, &dto);
+                        if played {
+                            let data = UserItemData {
+                                played,
+                                ..UserItemData::default()
+                            };
+                            write_user_state(out.get_summary()?.init_user_state(), data);
+                        }
                     }
                     Err(denial) => denial.write(results.get().init_result().init_error()),
                 }
@@ -1048,6 +1057,26 @@ async fn synth_detail(
             Err(item_not_found)
         }
     }
+}
+
+/// Whether `user` has watched all of synthesised series or season `id`;
+/// false for any other kind. A store that cannot say leaves it unwatched:
+/// the page still opens, and marking it is still offered.
+async fn synth_played(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: WireId,
+    dto: &serde_json::Value,
+) -> bool {
+    if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
+        return false;
+    }
+    crate::services::user_data::folder_played(state, user, &id.to_string())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(item.id = %id, error = ?e, "detail: watched state unavailable");
+            false
+        })
 }
 
 /// The text field `key` of a Jellyfin DTO, empty when absent.
