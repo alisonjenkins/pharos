@@ -377,16 +377,28 @@ fn remember_volume(volume: f64, muted: bool) {
     }
 }
 
-/// The capabilities to negotiate with: what the browser decodes, and the
-/// maximum bitrate the viewer chose (0, Auto, unless they set one).
-fn negotiation_capabilities() -> pharos_client::api::Capabilities {
+/// The capabilities to negotiate `kind` with: what the browser decodes, and
+/// for video the maximum bitrate the viewer chose (0, Auto, unless they set
+/// one). The choice limits video only: a song above it still plays as stored.
+fn negotiation_capabilities(kind: ItemKind) -> pharos_client::api::Capabilities {
     let mut caps = platform::capabilities();
-    caps.max_bitrate = stored_max_bitrate();
+    let chosen = stored_max_bitrate();
+    caps.max_bitrate = video_max_bitrate(kind, chosen);
     platform::info(&format!(
-        "pharos: playback max_bitrate={}",
-        max_bitrate_label(caps.max_bitrate)
+        "pharos: playback max_bitrate={} chosen={} kind={kind:?}",
+        max_bitrate_label(caps.max_bitrate),
+        max_bitrate_label(chosen)
     ));
     caps
+}
+
+/// The viewer's maximum-quality choice applies to video, never to audio.
+fn video_max_bitrate(kind: ItemKind, chosen: u64) -> u64 {
+    if kind == ItemKind::Audio {
+        0
+    } else {
+        chosen
+    }
 }
 
 fn stored_max_bitrate() -> u64 {
@@ -1909,9 +1921,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
                 let detail = api.detail(&info, id).await?;
-                let (decision, grant) = api
-                    .play(&info, id, &negotiation_capabilities(), asked)
-                    .await?;
+                let caps = negotiation_capabilities(detail.item.kind);
+                let (decision, grant) = api.play(&info, id, &caps, asked).await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
             .await;
@@ -1995,6 +2006,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             return;
         };
         let asked = *picks.peek();
+        let kind = p.0.kind;
         spawn(async move {
             let info = call("watch", "renew");
             let mut wait_ms = RENEW_FIRST_WAIT_MS;
@@ -2003,7 +2015,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &negotiation_capabilities(), asked).await {
+                match api.play(&info, id, &negotiation_capabilities(kind), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).
@@ -2832,6 +2844,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The maximum-quality choice caps video and leaves a song as stored
+    /// (B477/V420).
+    #[test]
+    fn the_maximum_quality_choice_limits_video_only() {
+        assert_eq!(video_max_bitrate(ItemKind::Movie, 2_000_000), 2_000_000);
+        assert_eq!(video_max_bitrate(ItemKind::Episode, 1_000_000), 1_000_000);
+        assert_eq!(video_max_bitrate(ItemKind::Audio, 2_000_000), 0);
+        assert_eq!(video_max_bitrate(ItemKind::Movie, 0), 0);
+    }
 
     /// Counts the mounts of `remount_on`'s body as the key changes.
     fn mounts_across(keys: &[&str]) -> u32 {

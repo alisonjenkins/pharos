@@ -133,7 +133,7 @@ pub fn AppearanceView(
                     }
                 }
                 p { id: "max-quality-help",
-                    "Auto sends the video as stored. Pick a lower limit on a slow connection; it applies from the next title you play."
+                    "Auto sets no bitrate limit. Pick a lower limit on a slow connection; it applies to video from the next title you play."
                 }
             }
             fieldset { class: "pharos-diagnostics",
