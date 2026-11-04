@@ -97,6 +97,8 @@ pub struct Narrow {
     pub genre: Option<String>,
     /// Only watched (`Some(true)`) or unwatched (`Some(false)`) items.
     pub played: Option<bool>,
+    /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
+    pub stereo: Option<bool>,
 }
 
 impl Default for Narrow {
@@ -106,6 +108,7 @@ impl Default for Narrow {
             descending: false,
             genre: None,
             played: None,
+            stereo: None,
         }
     }
 }
@@ -121,6 +124,7 @@ impl Narrow {
             descending: self.descending,
             genre: self.genre.clone(),
             played: self.played,
+            stereo: self.stereo,
             ..base.clone()
         }
     }
@@ -546,6 +550,11 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
         Some(false) => "unwatched",
         Some(true) => "watched",
     };
+    let stereo = match now.stereo {
+        None => ANY,
+        Some(true) => "3d",
+        Some(false) => "2d",
+    };
     let direction = match (now.order, now.descending) {
         (Order::Name, false) => "A to Z",
         (Order::Name, true) => "Z to A",
@@ -615,6 +624,26 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                     option { value: ANY, selected: played == ANY, "All" }
                     option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
                     option { value: "watched", selected: played == "watched", "Watched" }
+                }
+            }
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "3D" }
+                select {
+                    aria_label: "3D",
+                    value: stereo,
+                    onchange: move |e| {
+                        let value = e.value();
+                        narrow.with_mut(|n| {
+                            n.stereo = match value.as_str() {
+                                "3d" => Some(true),
+                                "2d" => Some(false),
+                                _ => None,
+                            }
+                        });
+                    },
+                    option { value: ANY, selected: stereo == ANY, "2D and 3D" }
+                    option { value: "3d", selected: stereo == "3d", "3D only" }
+                    option { value: "2d", selected: stereo == "2d", "2D only" }
                 }
             }
         }
@@ -1704,6 +1733,11 @@ mod tests {
         assert_eq!(listing.sort_by, "PremiereDate,ProductionYear,SortName");
         assert_eq!(listing.genre.as_deref(), Some("Drama"));
         assert_eq!(listing.played, Some(false));
+        let three_d = Narrow {
+            stereo: Some(true),
+            ..Narrow::default()
+        };
+        assert_eq!(three_d.apply(&base).stereo, Some(true));
         let by_name = released.ordered(Order::Name);
         assert!(by_name.by_letter() && !by_name.descending);
         assert_eq!(by_name.apply(&base).sort_by, "SortName");

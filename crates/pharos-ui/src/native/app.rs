@@ -25,6 +25,7 @@ use super::playback::{
     MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock, SubtitleSwitch,
 };
 use super::route::Route;
+use super::versions;
 use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
@@ -832,7 +833,8 @@ fn Screen(route: Route) -> Element {
     match route {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
-        Route::Title(id) => rsx! { TitleScreen { id } },
+        // Remounted per title so the version pick is read for each one.
+        Route::Title(id) => remount_on(&id.to_string(), rsx! { TitleScreen { id } }),
         // Another item (the next episode) mounts a new playback rather than
         // re-rendering this one's.
         Route::Watch(id) => remount_on(&id.to_string(), rsx! { WatchScreen { id } }),
@@ -1047,13 +1049,33 @@ fn TitleScreen(id: ItemRef) -> Element {
             ))
         }
     });
+    let mut picked = use_signal(|| stored_version(id));
     let state = detail.read();
     loaded(
         state.as_ref().and_then(Option::as_ref),
         |detail: &Detail| {
-            rsx! { TitleView { detail: detail.clone() } }
+            let version =
+                versions::chosen_version(&detail.versions, picked().as_deref(), false).to_owned();
+            rsx! {
+                TitleView {
+                    detail: detail.clone(),
+                    version,
+                    on_version: move |v: String| {
+                        store_setting(&versions::version_key(id), &v);
+                        picked.set(Some(v));
+                    },
+                }
+            }
         },
     )
+}
+
+/// The version last picked for `title` on this device, if any.
+fn stored_version(title: ItemRef) -> Option<String> {
+    platform::stored_theme(&versions::version_key(title))
+        .map_err(|e| platform::warn(&format!("pharos: version choice unreadable: {e}")))
+        .ok()
+        .flatten()
 }
 
 /// A negotiated playback, ready for the player.
@@ -1137,8 +1159,16 @@ fn WatchScreen(id: ItemRef) -> Element {
             let info = call("watch", "play");
             let result = async {
                 let detail = api.detail(&info, id).await?;
+                let stored = stored_version(id);
+                let version = versions::chosen_version(&detail.versions, stored.as_deref(), false);
+                if detail.versions.len() > 1 {
+                    platform::info(&format!(
+                        "pharos: version chosen={version:?} stored={stored:?} of {}",
+                        detail.versions.len()
+                    ));
+                }
                 let (decision, grant) = api
-                    .play(&info, id, "", &platform::capabilities(), asked)
+                    .play(&info, id, version, &platform::capabilities(), asked)
                     .await?;
                 Ok::<_, ClientError>((detail, decision, grant))
             }
