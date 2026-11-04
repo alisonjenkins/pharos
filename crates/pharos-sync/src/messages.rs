@@ -151,6 +151,10 @@ pub enum ServerMsg {
     Play {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member whose command caused this; `None` when the group did
+        /// (everyone ready) or an older peer sent none (V395).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<MemberId>,
     },
     Pause {
         at_server_ms: u64,
@@ -160,10 +164,18 @@ pub enum ServerMsg {
         /// the client seek to 0:00 and desync permanently (drift correction
         /// is off by default in 10.11.8).
         position_ms: u64,
+        /// The member whose command caused this; `None` when the group did
+        /// (everyone ready) or an older peer sent none (V395).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<MemberId>,
     },
     Seek {
         at_server_ms: u64,
         position_ms: u64,
+        /// The member whose command caused this; `None` when the group did
+        /// (everyone ready) or an older peer sent none (V395).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<MemberId>,
     },
     LeaderChange {
         leader: MemberId,
@@ -281,6 +293,7 @@ mod tests {
     #[test]
     fn server_play_serializes_snake_case() {
         let m = ServerMsg::Play {
+            by: None,
             at_server_ms: 12345,
             position_ms: 100,
         };

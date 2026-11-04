@@ -248,14 +248,17 @@ enum Seen {
     Play {
         at: u64,
         position_ms: u64,
+        by: String,
     },
     Pause {
         at: u64,
         position_ms: u64,
+        by: String,
     },
     Seek {
         at: u64,
         position_ms: u64,
+        by: String,
     },
     Member {
         name: String,
@@ -323,6 +326,7 @@ impl server::group_sink::Handler for TestSink {
                 Seen::Play {
                     at: a.get_at_server_ms(),
                     position_ms: a.get_position_ms(),
+                    by: text(a.get_by()),
                 }
             }
             group_update::Pause(a) => {
@@ -330,6 +334,7 @@ impl server::group_sink::Handler for TestSink {
                 Seen::Pause {
                     at: a.get_at_server_ms(),
                     position_ms: a.get_position_ms(),
+                    by: text(a.get_by()),
                 }
             }
             group_update::Seek(a) => {
@@ -337,6 +342,7 @@ impl server::group_sink::Handler for TestSink {
                 Seen::Seek {
                     at: a.get_at_server_ms(),
                     position_ms: a.get_position_ms(),
+                    by: text(a.get_by()),
                 }
             }
             group_update::Member(m) => {
@@ -687,6 +693,45 @@ async fn a_pause_by_one_native_member_reaches_the_other() {
         next_pause(&mut pair.a_seen).await,
         Seen::Pause { .. }
     ));
+}
+
+/// V395: a group play, pause and seek name the member whose command caused
+/// them, as the id the roster lists.
+/// Disarm check: with `translate` writing no `by`, the ids come back empty.
+#[actix_web::test]
+async fn a_group_play_pause_and_seek_name_the_member_who_caused_them() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    let a_id =
+        pharos_sync::hub::member_id_for_device(&format!("{}:dev-a", rig.fx.admin_id.0.simple()))
+            .to_string();
+    let next_play = async |seen: &mut mpsc::UnboundedReceiver<Seen>| {
+        let Seen::Play { by, .. } =
+            until(seen, |s| matches!(s, Seen::Play { .. }).then(|| s.clone())).await
+        else {
+            unreachable!()
+        };
+        by
+    };
+    // The start the readiness gate made once both had acked is the group's.
+    command!(pair.a, unpause_request).unwrap();
+    assert_eq!(next_play(&mut pair.b_seen).await, "", "gate start");
+    command!(pair.a, pause_request).unwrap();
+    let Seen::Pause { by, .. } = next_pause(&mut pair.b_seen).await else {
+        unreachable!()
+    };
+    assert_eq!(by, a_id, "pause");
+    command!(pair.a, unpause_request).unwrap();
+    assert_eq!(next_play(&mut pair.b_seen).await, a_id, "play");
+    command!(pair.a, seek_request, set_position_ms(9_000)).unwrap();
+    let Seen::Seek { by, .. } = until(&mut pair.b_seen, |s| {
+        matches!(s, Seen::Seek { .. }).then(|| s.clone())
+    })
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(by, a_id, "seek");
 }
 
 async fn next_pause(rx: &mut mpsc::UnboundedReceiver<Seen>) -> Seen {

@@ -190,6 +190,7 @@ mod tests {
         let mid = MemberId::new();
         sinks.insert(mid, 1, tx);
         let pause = ServerMsg::Pause {
+            by: None,
             at_server_ms: 1,
             position_ms: 0,
         };
@@ -229,6 +230,7 @@ mod tests {
         d.deliver(
             mid,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 5,
                 position_ms: 0,
             },
@@ -244,6 +246,7 @@ mod tests {
         d.deliver(
             MemberId::new(),
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 5,
                 position_ms: 0,
             },
@@ -261,6 +264,7 @@ mod tests {
         d.deliver(
             mid,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },
@@ -281,6 +285,7 @@ mod tests {
         d.deliver(
             mid,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },
@@ -306,6 +311,7 @@ mod tests {
         d.deliver(
             mid,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },
@@ -333,6 +339,7 @@ mod tests {
         d.deliver(
             mid,
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1,
                 position_ms: 0,
             },

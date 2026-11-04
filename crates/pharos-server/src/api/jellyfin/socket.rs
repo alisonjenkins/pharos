@@ -967,6 +967,7 @@ fn group_update(
 fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
     match msg {
         ServerMsg::Play {
+            by: _,
             at_server_ms,
             position_ms,
         } => command(ctx, "Unpause", at_server_ms, Some(position_ms)),
@@ -974,10 +975,12 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // to the command's position after pausing, so a missing value seeks
         // the client to 0:00.
         ServerMsg::Pause {
+            by: _,
             at_server_ms,
             position_ms,
         } => command(ctx, "Pause", at_server_ms, Some(position_ms)),
         ServerMsg::Seek {
+            by: _,
             at_server_ms,
             position_ms,
         } => command(ctx, "Seek", at_server_ms, Some(position_ms)),
@@ -1443,6 +1446,7 @@ mod tests {
         };
         let out = translate_outbound(
             ServerMsg::Pause {
+                by: None,
                 at_server_ms: 1_000,
                 position_ms: 654_321,
             },
