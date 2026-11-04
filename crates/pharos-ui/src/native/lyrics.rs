@@ -23,6 +23,11 @@ pub const PANEL_ID: &str = "pharos-lyrics";
 /// lands it on the word more often than not.
 const LEAD_MS: u64 = 200;
 
+/// The player reports its position about every 250 ms and the CSS eases the
+/// fill over the same time, so the fill aims one report ahead and arrives as
+/// the next report lands.
+const REPORT_MS: u64 = 250;
+
 /// How long the panel leaves the listener's own scrolling alone before it
 /// follows the song again.
 const HOLD_MS: f64 = 4_000.0;
@@ -224,9 +229,9 @@ pub fn LyricsPanel(
                         } else if karaoke && Some(i) == current {
                             span {
                                 class: "pharos-lyrics-words",
-                                // The same lead that picked the line, so it is full
-                                // just as the next line takes over.
-                                style: "--pharos-wipe: {line_progress(&lyrics, i, position_ms.saturating_add(LEAD_MS)):.1}%",
+                                // Aim one report ahead so the CSS transition lands as
+                                // the next position report arrives.
+                                style: "--pharos-wipe: {line_progress(&lyrics, i, position_ms.saturating_add(REPORT_MS)):.1}%",
                                 "{line.text}"
                             }
                         } else {
@@ -430,12 +435,12 @@ mod tests {
     #[test]
     fn karaoke_fills_only_the_line_being_sung() {
         let l = synced(&[1_000, 3_000, 5_000]);
-        // 1800 ms + 200 ms lead = 1000 ms into "line 0" (sung = 1400 ms):
-        // w = 10/7 syllables -> 3/7 through "0", char 5.43 of 6 = 90.5%.
+        // 1800 ms + 250 ms report lead = 1050 ms into "line 0" (sung = 1400 ms):
+        // w = 1.5 syllables -> halfway through "0" at char 5.5 of 6 = 91.7%.
         let html = render_as(l.clone(), 1_800, true);
         assert!(html.contains(r#"data-karaoke="true""#), "{html}");
         assert_eq!(html.matches("pharos-lyrics-words").count(), 1, "{html}");
-        assert!(html.contains("--pharos-wipe: 90.5%"), "{html}");
+        assert!(html.contains("--pharos-wipe: 91.7%"), "{html}");
         // The last frame before the next line takes over shows it full.
         let edge = render_as(l.clone(), 3_000 - LEAD_MS - 1, true);
         assert!(edge.contains("--pharos-wipe: 100.0%"), "{edge}");

@@ -1459,7 +1459,8 @@ button.pharos-lyrics-line:focus-visible {
   color: transparent;
   -webkit-box-decoration-break: slice;
   box-decoration-break: slice;
-  transition: --pharos-wipe 300ms linear;
+  /* One position report: REPORT_MS in native/lyrics.rs. */
+  transition: --pharos-wipe 250ms linear;
   filter: drop-shadow(0 0 14px var(--pharos-glow));
 }
 .pharos-listen-note {
