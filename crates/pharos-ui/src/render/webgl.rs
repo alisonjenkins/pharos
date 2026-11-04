@@ -10,8 +10,8 @@ use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 use web_sys::{
-    WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlTexture, WebGlUniformLocation,
-    WebGlVertexArrayObject,
+    WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlShader, WebGlTexture,
+    WebGlUniformLocation, WebGlVertexArrayObject,
 };
 
 use super::catalogue::{fragment_source, Program, VERTEX};
@@ -100,7 +100,16 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
         .flatten()
         .map(|e| e.unchecked_into::<web_sys::WebglLoseContext>());
 
-    let resources = build(&gl, program)?;
+    let resources = match build(&gl, program) {
+        Ok(resources) => resources,
+        Err(f) => {
+            // Release now rather than at garbage collection, as `Drop` does.
+            if let Some(lose) = &lose {
+                lose.lose_context();
+            }
+            return Err(f);
+        }
+    };
 
     let context = Rc::new(Cell::new(Context::Live));
     let on_lost = {
@@ -202,39 +211,52 @@ fn link(gl: &Gl, fragment: &str) -> Result<WebGlProgram, Fallback> {
         .create_program()
         .ok_or_else(|| Fallback::Shader("create program".to_owned()))?;
     let mut shaders = Vec::with_capacity(2);
+    let linked = compile_and_link(gl, &program, fragment, &mut shaders);
+    for shader in &shaders {
+        gl.detach_shader(&program, shader);
+        gl.delete_shader(Some(shader));
+    }
+    if linked.is_err() {
+        gl.delete_program(Some(&program));
+    }
+    linked.map(|()| program)
+}
+
+/// Compile both stages into `program` and link it; every shader made is
+/// left in `shaders` for the caller to delete, whatever the outcome.
+fn compile_and_link(
+    gl: &Gl,
+    program: &WebGlProgram,
+    fragment: &str,
+    shaders: &mut Vec<WebGlShader>,
+) -> Result<(), Fallback> {
     for (kind, source) in [(Gl::VERTEX_SHADER, VERTEX), (Gl::FRAGMENT_SHADER, fragment)] {
         let shader = gl
             .create_shader(kind)
             .ok_or_else(|| Fallback::Shader("create shader".to_owned()))?;
         gl.shader_source(&shader, source);
         gl.compile_shader(&shader);
+        gl.attach_shader(program, &shader);
         let compiled = gl
             .get_shader_parameter(&shader, Gl::COMPILE_STATUS)
             .as_bool()
             .unwrap_or(false);
-        if !compiled {
-            let log = gl.get_shader_info_log(&shader).unwrap_or_default();
-            gl.delete_shader(Some(&shader));
+        let log = (!compiled).then(|| gl.get_shader_info_log(&shader).unwrap_or_default());
+        shaders.push(shader);
+        if let Some(log) = log {
             return Err(Fallback::Shader(format!("compile: {log}")));
         }
-        gl.attach_shader(&program, &shader);
-        shaders.push(shader);
     }
-    gl.link_program(&program);
-    for shader in &shaders {
-        gl.detach_shader(&program, shader);
-        gl.delete_shader(Some(shader));
-    }
+    gl.link_program(program);
     let linked = gl
-        .get_program_parameter(&program, Gl::LINK_STATUS)
+        .get_program_parameter(program, Gl::LINK_STATUS)
         .as_bool()
         .unwrap_or(false);
     if !linked {
-        let log = gl.get_program_info_log(&program).unwrap_or_default();
-        gl.delete_program(Some(&program));
+        let log = gl.get_program_info_log(program).unwrap_or_default();
         return Err(Fallback::Shader(format!("link: {log}")));
     }
-    Ok(program)
+    Ok(())
 }
 
 impl WebglSurface {
