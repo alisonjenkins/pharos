@@ -150,10 +150,12 @@ struct ItemQuery {
   genre @8 :Text;              # one genre's name; empty means every genre
 }
 
-# Where each first letter starts in a listing, in the listing's own order: a
-# letter's `start` is the offset of its first item, so a client can page
-# straight to it. `#` gathers names that do not start with a letter A to Z.
-# Only letters the listing holds appear. `genres` are the genres found under
+# Where each section starts in a listing, in the listing's own order: a
+# section's `start` is the offset of its first item, so a client can page
+# straight to it. In name order a section is a first letter, `#` gathering
+# names that do not start with a letter A to Z; in a date order (the first
+# `sortBy` key a date) it is a four-figure year, `#` gathering items with no
+# such date. Only sections the listing holds appear. `genres` are the genres found under
 # the query's parent and kind, ignoring its own genre and filters.
 struct LetterStart { letter @0 :Text; start @1 :UInt32; }
 struct ListIndex { letters @0 :List(LetterStart); genres @1 :List(Text); }
