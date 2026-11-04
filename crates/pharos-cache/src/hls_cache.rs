@@ -2302,6 +2302,55 @@ impl HlsSegmentCache {
         Ok(report)
     }
 
+    /// Delete every cached audio encode of this item: its Opus rendition
+    /// sessions and its continuous AAC sessions, all tracks, bitrates and
+    /// editions. Returns the directories removed.
+    ///
+    /// An audio session spans the whole title, so there is no index range to
+    /// aim at, and it is cheap to encode again. Without this a purge left the
+    /// item's audio as it was, so a title whose audio was encoded wrong, or
+    /// whose file was replaced at the same path, kept serving the old audio.
+    pub async fn drop_item_audio(&self, media_id: u64) -> Vec<String> {
+        let prefix = format!("{media_id}-");
+        let mut removed = Vec::new();
+        let mut dirs = Vec::new();
+        for parent in ["_audiohls", "_contaudio"] {
+            let Ok(entries) = std::fs::read_dir(self.root.join(parent)) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if !name.starts_with(&prefix) {
+                    continue;
+                }
+                let path = e.path();
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(()) => {
+                        removed.push(format!("{parent}/{name}"));
+                        dirs.push(path);
+                    }
+                    Err(err) => tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "could not drop a cached audio session"
+                    ),
+                }
+            }
+        }
+        {
+            let mut state = self.state.lock().await;
+            let gone = |p: &PathBuf| dirs.iter().any(|d| p.starts_with(d));
+            state.audio_session_starts.retain(|p, _| !gone(p));
+            state.audio_session_failures.retain(|p, _| !gone(p));
+        }
+        tracing::warn!(
+            media.id = media_id,
+            dropped = removed.len(),
+            "cached audio sessions dropped; the next play encodes them again"
+        );
+        removed
+    }
+
     /// Keep the quarantine bounded: the newest [`QUARANTINE_MAX`] files stay,
     /// everything older goes. A diagnostic that grows without limit inside the
     /// cache would eventually be the outage.
@@ -8166,6 +8215,45 @@ mod tests {
             left.iter().all(|n| !n.starts_with("1-")),
             "the requested index must be the one removed: {left:?}"
         );
+    }
+
+    /// A purge drops every cached audio session of the item, and only of that
+    /// item: `7-` must not take `71-` with it.
+    #[tokio::test]
+    async fn dropping_an_items_audio_takes_only_that_items_sessions() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let made = [
+            "_audiohls/7-a0-b128",
+            "_audiohls/7-a1-b128",
+            "_audiohls/71-a0-b128",
+            "_contaudio/7-a0-b128",
+            "_contaudio/70-a0-b128",
+        ];
+        for d in made {
+            let d = cache.root().join(d);
+            std::fs::create_dir_all(d.join("s5")).unwrap();
+            std::fs::write(d.join("a0.m4s"), b"old").unwrap();
+        }
+
+        let mut removed = cache.drop_item_audio(7).await;
+        removed.sort();
+
+        assert_eq!(
+            removed,
+            [
+                "_audiohls/7-a0-b128",
+                "_audiohls/7-a1-b128",
+                "_contaudio/7-a0-b128"
+            ]
+        );
+        for d in made {
+            assert_eq!(
+                cache.root().join(d).exists(),
+                !d.contains("/7-"),
+                "{d} after dropping item 7's audio"
+            );
+        }
     }
 
     /// The quarantine is evidence for the incident in progress, not an
