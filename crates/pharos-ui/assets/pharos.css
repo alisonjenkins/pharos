@@ -2927,4 +2927,13 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   .pharos-stage.is-floating .pharos-stage-transport [aria-label="Previous"] {
     display: none;
   }
+/* Admin > Duplicates: paths wrap, the short facts beside them do not. */
+.pharos-admin-duplicate-versions th {
+  text-align: start;
+}
+.pharos-admin-duplicate-versions td:not(.pharos-admin-duplicate-path) {
+  white-space: nowrap;
+}
+.pharos-admin-duplicate-versions td.pharos-admin-duplicate-path {
+  overflow-wrap: anywhere;
 }
