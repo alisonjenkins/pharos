@@ -13,9 +13,9 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, ItemChapter, ItemDetail,
-    LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry,
-    QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, ItemChapter,
+    ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry,
+    PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -620,6 +620,25 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             async move { fetch_scheduled_tasks(&base, &token).await }
         })
     };
+    // Grouping walks every film, so it runs only while its tab is open.
+    let duplicates_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::Duplicates;
+            let base = base.clone();
+            let token = token.clone();
+            async move {
+                if open {
+                    Some(fetch_duplicate_films(&base, &token).await)
+                } else {
+                    None
+                }
+            }
+        })
+    };
     let plugins_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
@@ -772,6 +791,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             Some(Ok(v)) => v.clone(),
             _ => Vec::new(),
         };
+    let duplicates = duplicates_resource.read_unchecked().clone().flatten();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -808,6 +828,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             api_keys: api_keys,
             new_api_key_secret: new_secret_now,
             branding: branding,
+            duplicates: duplicates,
         }
     }
 }
@@ -2007,6 +2028,18 @@ async fn fetch_scheduled_tasks(base: &str, token: &str) -> Result<Vec<ScheduledT
 #[cfg(not(feature = "web"))]
 async fn fetch_scheduled_tasks(_base: &str, _token: &str) -> Result<Vec<ScheduledTask>, String> {
     Err("list_scheduled_tasks is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_duplicate_films(base: &str, token: &str) -> Result<Vec<DuplicateFilm>, String> {
+    crate::client::web::list_duplicate_films(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_duplicate_films(_base: &str, _token: &str) -> Result<Vec<DuplicateFilm>, String> {
+    Err("list_duplicate_films is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
