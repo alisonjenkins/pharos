@@ -11,8 +11,10 @@
 //! 4. an online provider, only when the operator turned one on.
 //!
 //! Local sources are read on every request so an edited sidecar shows on the
-//! next play. Online answers, hits and misses alike, are remembered per item.
+//! next play. Online answers, hits and misses alike, are remembered per item,
+//! in memory and, when a cache directory is set, on disk (B361/V301).
 
+pub mod cache;
 pub mod embedded;
 pub mod lrc;
 pub mod lrclib;
@@ -137,8 +139,16 @@ const ONLINE_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Default)]
 pub struct LyricsFinder {
     online: Option<Arc<dyn OnlineLyrics>>,
-    memo: Mutex<HashMap<u64, Option<Lyrics>>>,
+    memo: Mutex<HashMap<u64, Remembered>>,
     down_until: Mutex<Option<Instant>>,
+    disk: Option<Arc<cache::DiskCache>>,
+}
+
+/// An online answer held in memory: when it was given, so a miss can lapse.
+#[derive(Clone)]
+struct Remembered {
+    found: Option<Lyrics>,
+    at: Instant,
 }
 
 impl LyricsFinder {
@@ -147,7 +157,14 @@ impl LyricsFinder {
             online: Some(online),
             memo: Mutex::default(),
             down_until: Mutex::default(),
+            disk: None,
         }
+    }
+
+    /// Keep online answers under `dir` as well, so they outlive the process.
+    pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
+        self.disk = Some(Arc::new(cache::DiskCache::new(dir)));
+        self
     }
 
     pub async fn find(&self, item: &MediaItem) -> Option<Lyrics> {
@@ -189,6 +206,10 @@ impl LyricsFinder {
         if let Some(known) = self.remembered(item.id) {
             return known;
         }
+        if let Some(known) = self.read_disk(item.id, online.name(), &song).await {
+            self.remember(item.id, known.clone());
+            return known;
+        }
         if self.cooling_down() {
             tracing::debug!(
                 media.id = item.id,
@@ -200,6 +221,8 @@ impl LyricsFinder {
         match online.find(&song).await {
             Ok(found) => {
                 self.remember(item.id, found.clone());
+                self.write_disk(item.id, online.name(), song, found.clone())
+                    .await;
                 found
             }
             Err(e) => {
@@ -231,7 +254,9 @@ impl LyricsFinder {
     }
 
     fn remembered(&self, id: u64) -> Option<Option<Lyrics>> {
-        self.memo.lock().ok()?.get(&id).cloned()
+        let r = self.memo.lock().ok()?.get(&id).cloned()?;
+        // A miss lapses as it does on disk; a long-running server asks again.
+        (r.found.is_some() || r.at.elapsed() < cache::MISS_TTL).then_some(r.found)
     }
 
     fn remember(&self, id: u64, found: Option<Lyrics>) {
@@ -239,7 +264,49 @@ impl LyricsFinder {
             if memo.len() >= ONLINE_MEMO_MAX {
                 memo.clear();
             }
-            memo.insert(id, found);
+            memo.insert(
+                id,
+                Remembered {
+                    found,
+                    at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// A standing answer from the disk cache, `None` when there is none.
+    async fn read_disk(
+        &self,
+        id: u64,
+        provider: &'static str,
+        song: &Song,
+    ) -> Option<Option<Lyrics>> {
+        let disk = Arc::clone(self.disk.as_ref()?);
+        let song = song.clone();
+        let cached = tokio::task::spawn_blocking(move || disk.get(id, provider, &song))
+            .await
+            .ok()
+            .flatten()?;
+        tracing::debug!(
+            media.id = id,
+            provider,
+            "lyrics: online answer from the disk cache"
+        );
+        Some(match cached {
+            cache::Cached::Found(l) => Some(l),
+            cache::Cached::Missing => None,
+        })
+    }
+
+    async fn write_disk(&self, id: u64, provider: &'static str, song: Song, found: Option<Lyrics>) {
+        let Some(disk) = self.disk.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let written =
+            tokio::task::spawn_blocking(move || disk.put(id, provider, &song, found.as_ref()))
+                .await;
+        if let Err(e) = written {
+            tracing::warn!(media.id = id, error = %e, "lyrics: cache write task failed");
         }
     }
 }
@@ -388,6 +455,35 @@ mod tests {
         *finder.down_until.lock().unwrap() = Some(Instant::now());
         assert_eq!(finder.find(&item).await, None);
         assert_eq!(down.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn online_answers_outlive_the_finder_through_the_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("lyrics");
+        let item = song_item(dir.path());
+        let words = Lyrics::from_lines(vec![line(Some(0), "remote")], Origin::Online);
+
+        let first = Arc::new(Fixed(Ok(words.clone()), Default::default()));
+        let finder = LyricsFinder::with_online(first.clone()).with_cache(cache.clone());
+        assert_eq!(finder.find(&item).await, words);
+        assert_eq!(first.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A restarted server answers from disk without asking the provider.
+        let second = Arc::new(Fixed(Ok(None), Default::default()));
+        let finder = LyricsFinder::with_online(second.clone()).with_cache(cache.clone());
+        assert_eq!(finder.find(&item).await, words);
+        assert_eq!(second.1.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A miss is kept too, so it is not asked again on every play.
+        let mut other = item.clone();
+        other.id = 2;
+        let miss = Arc::new(Fixed(Ok(None), Default::default()));
+        let finder = LyricsFinder::with_online(miss.clone()).with_cache(cache.clone());
+        assert_eq!(finder.find(&other).await, None);
+        let finder = LyricsFinder::with_online(miss.clone()).with_cache(cache);
+        assert_eq!(finder.find(&other).await, None);
+        assert_eq!(miss.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
