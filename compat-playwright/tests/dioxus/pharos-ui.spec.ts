@@ -1949,6 +1949,13 @@ test.describe("pharos Dioxus UI play queue", () => {
     await expect(ask).toBeHidden();
     await expect(entries).toHaveCount(count);
     await expect(page.locator(".pharos-listen")).toBeVisible();
+    // Escape still cancels once focus has left the panel.
+    await panel.getByRole("button", { name: "Clear", exact: true }).click();
+    await expect(ask).toBeVisible();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("Escape");
+    await expect(ask).toBeHidden();
+    await expect(entries).toHaveCount(count);
     await panel.getByRole("button", { name: "Clear", exact: true }).click();
     await ask.getByRole("button", { name: "Clear queue" }).click();
     await expect(entries).toHaveCount(0);
