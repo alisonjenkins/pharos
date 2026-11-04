@@ -3,13 +3,14 @@
 //! backends — the column types (TEXT / REAL / INTEGER|BIGINT) map identically —
 //! so the two `SeriesMetadataStore` impls share one decode path.
 
-use pharos_core::SeriesMetadata;
+use pharos_core::{ExternalRatings, SeriesMetadata};
 
 /// Column list for `SELECT`s, in the [`SeriesMetaRow`] field order.
 pub(crate) const SERIES_META_COLUMNS: &str = "series_key, series_name, match_provider, \
     match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     overview, community_rating, premiere_date, official_rating, genres, studios, \
-    provider_ids, poster_locator, backdrop_locator, original_language";
+    provider_ids, poster_locator, backdrop_locator, original_language, \
+    imdb_rating, rt_tomatometer";
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct SeriesMetaRow {
@@ -30,6 +31,8 @@ pub(crate) struct SeriesMetaRow {
     pub poster_locator: Option<String>,
     pub backdrop_locator: Option<String>,
     pub original_language: Option<String>,
+    pub imdb_rating: Option<f32>,
+    pub rt_tomatometer: Option<i64>,
 }
 
 impl From<SeriesMetaRow> for SeriesMetadata {
@@ -52,6 +55,10 @@ impl From<SeriesMetaRow> for SeriesMetadata {
             poster_locator: r.poster_locator,
             backdrop_locator: r.backdrop_locator,
             original_language: r.original_language,
+            ratings: ExternalRatings {
+                imdb: r.imdb_rating,
+                tomatometer: r.rt_tomatometer.and_then(|v| u16::try_from(v).ok()),
+            },
         }
     }
 }
