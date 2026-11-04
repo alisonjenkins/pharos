@@ -12,6 +12,7 @@
 //! accelerated impl) happens at the wiring layer.
 
 pub mod admission;
+pub mod audio_features;
 pub mod backend;
 pub mod capability;
 pub mod device;
