@@ -128,7 +128,8 @@ fn write(dir: &Path, path: &Path, record: &Record) -> std::io::Result<()> {
     Ok(())
 }
 
-fn key(provider: &str, song: &Song) -> String {
+/// What an answer was asked about; the memo and the disk compare it alike.
+pub(super) fn key(provider: &str, song: &Song) -> String {
     format!(
         "{provider}\n{}\n{}\n{}\n{}",
         song.title,
