@@ -571,6 +571,27 @@ async fn serve_image(
             .await;
         }
     }
+    // An episode's own Primary row is the series-folder poster (the sidecar
+    // provider probes the show folder for episodes, and synth series/season
+    // tiles rely on that), so serve the episode's own still ahead of it.
+    if !synth_id
+        && index == 0
+        && matches!(role, ImageRole::Primary)
+        && matches!(item.kind, pharos_core::MediaKind::Episode)
+    {
+        if let Some(still) = episode_still_path(state, &item).await {
+            return serve_local_artwork(
+                &still,
+                role,
+                head_only,
+                format,
+                state,
+                req_width,
+                if_none_match,
+            )
+            .await;
+        }
+    }
     // LIB-D5 — local-sidecar-first resolution. D4 records artwork
     // discovered at scan time (poster.jpg / fanart.jpg / logo.png /…
     // beside the media, or under the series folder for episodes) as
@@ -1073,6 +1094,81 @@ async fn local_artwork_path(
     }
 }
 
+/// The still that belongs to episode `item` itself, if one exists on disk: a
+/// per-file sidecar beside the media (`<stem>.jpg`, `<stem>-thumb.jpg`, …)
+/// first, then a provider's episode image. Show-level art the scanner also
+/// records against the episode (`folder.jpg`, `landscape.jpg`) never counts.
+async fn episode_still_path(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+) -> Option<std::path::PathBuf> {
+    let rows = match state.stores.artwork_for(item.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = item.id, "artwork lookup failed");
+            return None;
+        }
+    };
+    for locator in episode_still_candidates(&item.path, &rows) {
+        let path = std::path::PathBuf::from(locator);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+        tracing::warn!(
+            media.id = item.id,
+            path = %path.display(),
+            "recorded episode still missing on disk"
+        );
+    }
+    None
+}
+
+/// The locators among an episode's artwork `rows` that are its own image, in
+/// serving order: local per-file sidecars (Primary before Thumb), then
+/// provider Primary, then provider Thumb.
+fn episode_still_candidates<'a>(
+    media: &std::path::Path,
+    rows: &'a [(String, String, String)],
+) -> Vec<&'a str> {
+    let stem = media.file_stem().and_then(|s| s.to_str());
+    let dir = media.parent();
+    let own_sidecar = |locator: &str| {
+        let locator = std::path::Path::new(locator);
+        let name = locator.file_stem().and_then(|s| s.to_str());
+        match (stem, name) {
+            (Some(stem), Some(name)) => {
+                locator.parent() == dir
+                    && name
+                        .strip_prefix(stem)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            }
+            _ => false,
+        }
+    };
+    let mut ranked: Vec<(u8, &str)> = rows
+        .iter()
+        .filter_map(|(role, source, locator)| {
+            let primary = role.eq_ignore_ascii_case("primary");
+            if !primary && !role.eq_ignore_ascii_case("thumb") {
+                return None;
+            }
+            let rank = if source.eq_ignore_ascii_case("local") {
+                if !own_sidecar(locator) {
+                    return None;
+                }
+                0
+            } else if pharos_core::artwork_source_is_item_servable(source) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank + u8::from(!primary), locator.as_str()))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, locator)| locator).collect()
+}
+
 /// Content-type for a local sidecar by extension. Defaults to jpeg for
 /// unknown / missing extensions (the bytes still render in browsers,
 /// and the D4 detector only records png/jpg/jpeg/webp anyway).
@@ -1406,6 +1502,33 @@ mod tests {
     use super::*;
     use crate::state::Stores;
     use actix_web::{test, App};
+
+    #[::core::prelude::v1::test]
+    fn episode_still_candidates_rank_own_sidecars_then_provider_stills() {
+        let row = |role: &str, source: &str, locator: &str| {
+            (role.to_owned(), source.to_owned(), locator.to_owned())
+        };
+        let rows = vec![
+            row("Primary", "local", "/tv/Show/folder.jpg"),
+            row("Thumb", "tvdb", "/cache/thumb/episode/1.jpg"),
+            row("Primary", "tvdb", "/cache/primary/episode/1.jpg"),
+            row("Thumb", "local", "/tv/Show/S1/Show S01E01-thumb.jpg"),
+            row("Thumb", "local", "/tv/Show/S1/landscape.jpg"),
+            row("Thumb", "local", "/tv/Show/S1/Show S01E010-thumb.jpg"),
+            row("Primary", "local", "/tv/Show/S1/Show S01E01.jpg"),
+            row("Logo", "local", "/tv/Show/S1/Show S01E01-logo.png"),
+            row("Primary", "upload", "/cache/upload/1.jpg"),
+        ];
+        assert_eq!(
+            episode_still_candidates(std::path::Path::new("/tv/Show/S1/Show S01E01.mkv"), &rows),
+            vec![
+                "/tv/Show/S1/Show S01E01.jpg",
+                "/tv/Show/S1/Show S01E01-thumb.jpg",
+                "/cache/primary/episode/1.jpg",
+                "/cache/thumb/episode/1.jpg",
+            ]
+        );
+    }
 
     #[::core::prelude::v1::test]
     fn parse_image_format_picks_webp_and_avif() {
