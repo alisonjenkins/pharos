@@ -133,17 +133,12 @@ mod tv {
         let (session, token) = match signed_in {
             Some(s) => s,
             None => {
-                let (code, secret) = android::quick_connect_initiate(&boot, &info)
-                    .await
-                    .map_err(|e| format!("quickConnectInitiate: {e}"))?;
-                log::info!("quick connect code {code}");
-                let _ = ev.unbounded_send(Ev::Code(code));
                 // The server closes a socket not signed in within 30 s
                 // (`auth_deadline`) and rate-limits upgrades, so reconnect
-                // only when the poll finds the socket gone.
+                // only when the socket is gone. An expired code is replaced.
                 let mut boot = boot;
+                let mut secret = None::<String>;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     if closed.get() {
                         log::info!("socket closed while waiting; reconnecting");
                         let mut wait = 2;
@@ -162,9 +157,19 @@ mod tv {
                             }
                         };
                     }
+                    let Some(current) = secret.clone() else {
+                        let (code, s) = android::quick_connect_initiate(&boot, &info)
+                            .await
+                            .map_err(|e| format!("quickConnectInitiate: {e}"))?;
+                        log::info!("quick connect code {code}");
+                        let _ = ev.unbounded_send(Ev::Code(code));
+                        secret = Some(s);
+                        continue;
+                    };
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     let polled = match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        android::quick_connect_poll(&boot, &info, &secret),
+                        android::quick_connect_poll(&boot, &info, &current),
                     )
                     .await
                     {
@@ -174,10 +179,6 @@ mod tv {
                             continue;
                         }
                     };
-                    if matches!(&polled, Err(e) if e.is_disconnected()) {
-                        closed.set(true);
-                        continue;
-                    }
                     match polled {
                         Ok(Some((session, token))) => {
                             android::store_token(&token)?;
@@ -185,6 +186,13 @@ mod tv {
                             break (session, token);
                         }
                         Ok(None) => {}
+                        Err(e) if e.is_disconnected() => closed.set(true),
+                        Err(pharos_client::ClientError::Api {
+                            kind: "notFound", ..
+                        }) => {
+                            log::info!("quick connect code expired; minting another");
+                            secret = None;
+                        }
                         Err(e) => return Err(format!("quickConnectPoll: {e}")),
                     }
                 }
