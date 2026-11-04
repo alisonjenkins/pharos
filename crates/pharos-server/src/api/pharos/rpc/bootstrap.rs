@@ -341,8 +341,8 @@ impl server::bootstrap::Handler for Bootstrap {
     }
 }
 
-/// A refused `quickConnectInitiate`.
-fn qc_denial(refusal: QcRefusal) -> Denial {
+/// A refused `quickConnectInitiate` or `quickConnectAuthorize`.
+pub(super) fn qc_denial(refusal: QcRefusal) -> Denial {
     match refusal {
         QcRefusal::GlobalCap { retry_after_secs } | QcRefusal::IpCap { retry_after_secs } => {
             Denial::Throttled {
@@ -350,7 +350,7 @@ fn qc_denial(refusal: QcRefusal) -> Denial {
                 retry_after_secs,
             }
         }
-        // Not reachable from initiate; mapped for completeness.
+        // Reached when quickConnectAuthorize exceeds MAX_AUTHORIZE_FAILURES.
         QcRefusal::AuthorizeThrottled { retry_after_secs } => Denial::Throttled {
             name: "quick_connect_retry_after_secs",
             retry_after_secs,
