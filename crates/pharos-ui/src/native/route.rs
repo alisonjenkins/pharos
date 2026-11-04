@@ -22,7 +22,7 @@ pub enum Route {
     Account,
     /// Approving a Quick Connect code shown on another device, under `/settings`.
     ApproveDevice,
-    /// The search screen, `/find`: matches from `Library.search` as you type.
+    /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// Watch together (014): the groups to join, `/together`.
     Together,
