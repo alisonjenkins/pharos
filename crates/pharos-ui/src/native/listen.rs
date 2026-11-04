@@ -12,6 +12,7 @@ use super::mixes::{MixBar, MixCtx};
 use super::platform;
 use super::playback::{clock, MediaEvent, MediaState};
 use super::queue::{Entry, QueueAction, Source};
+use super::style_picker::StylePicker;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
     total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
@@ -168,7 +169,7 @@ pub fn ListenView(
         }
     };
     let queued = queue.len();
-    let mut choose = move |next: Style| {
+    let choose = move |next: Style| {
         style.set(next);
         fallback.set(None);
         if let Err(e) = platform::store_theme(STYLE_KEY, next.label()) {
@@ -227,32 +228,24 @@ pub fn ListenView(
                 }
             }
             div { class: "pharos-listen-top",
-                button {
-                    class: "pharos-listen-skip",
-                    r#type: "button",
-                    aria_label: "Back",
-                    onclick: move |_| on_control.call(Control::Back),
-                    Icon { path: ICON_LEAVE }
-                }
-                button {
-                    class: "pharos-listen-skip pharos-shrink",
-                    r#type: "button",
-                    aria_label: "Shrink",
-                    title: "Shrink to a small window",
-                    onclick: move |_| on_control.call(Control::Shrink),
-                    Icon { path: ICON_FLOAT }
-                }
-                div { class: "pharos-visualiser-styles", role: "group", aria_label: "Visualiser",
-                    for s in Style::ALL {
-                        button {
-                            class: "pharos-chip",
-                            r#type: "button",
-                            aria_pressed: if s == current { "true" } else { "false" },
-                            onclick: move |_| choose(s),
-                            "{s.name()}"
-                        }
+                div { class: "pharos-listen-nav",
+                    button {
+                        class: "pharos-listen-skip",
+                        r#type: "button",
+                        aria_label: "Back",
+                        onclick: move |_| on_control.call(Control::Back),
+                        Icon { path: ICON_LEAVE }
+                    }
+                    button {
+                        class: "pharos-listen-skip pharos-shrink",
+                        r#type: "button",
+                        aria_label: "Shrink",
+                        title: "Shrink to a small window",
+                        onclick: move |_| on_control.call(Control::Shrink),
+                        Icon { path: ICON_FLOAT }
                     }
                 }
+                StylePicker { current, on_choose: choose }
                 div { class: "pharos-listen-panels", role: "group", aria_label: "Panels",
                     // Always drawn, so the listener can see where lyrics
                     // live even on a song that has none (B437/V377).
