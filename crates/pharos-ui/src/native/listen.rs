@@ -8,9 +8,10 @@ use dioxus::prelude::*;
 
 use super::browse::track_length;
 use super::lyrics::LyricsPanel;
+use super::mixes::{MixBar, MixCtx};
 use super::platform;
 use super::playback::{clock, MediaEvent, MediaState};
-use super::queue::{Entry, QueueAction};
+use super::queue::{Entry, QueueAction, Source};
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
     total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
@@ -121,6 +122,10 @@ pub fn ListenView(
     queue: Vec<Entry>,
     #[props(default)] shuffled: bool,
     #[props(default)] on_queue: EventHandler<QueueAction>,
+    /// The playing song, when the queue decides what follows it (not in a
+    /// group): what "More like this song" starts a mix from (spec 024).
+    #[props(default)]
+    playing: Option<ItemRef>,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
 ) -> Element {
@@ -271,7 +276,7 @@ pub fn ListenView(
                 }
             }
             if show_queue() {
-                QueuePanel { queue: queue.clone(), shuffled, on_queue }
+                QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
             }
             div { class: "pharos-listen-body",
                 div { class: "pharos-listen-cover",
@@ -400,7 +405,12 @@ pub fn ListenView(
 /// skip to it, drag a row (or use its arrows) to move it, shuffle, remove
 /// or clear.
 #[component]
-fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAction>) -> Element {
+fn QueuePanel(
+    queue: Vec<Entry>,
+    shuffled: bool,
+    on_queue: EventHandler<QueueAction>,
+    #[props(default)] playing: Option<ItemRef>,
+) -> Element {
     // The row being dragged, by key, and the position it would drop at.
     let mut dragging = use_signal(|| None::<u64>);
     let mut over = use_signal(|| None::<usize>);
@@ -450,6 +460,7 @@ fn QueuePanel(queue: Vec<Entry>, shuffled: bool, on_queue: EventHandler<QueueAct
                     }
                 }
             }
+            MixBar { playing }
             if queue.is_empty() {
                 p { class: "pharos-muted pharos-queue-empty",
                     "Nothing queued. Use Play next or Add to queue on any song or album."
@@ -498,6 +509,19 @@ fn QueueRow(
     let key = entry.key;
     let name = entry.name.clone();
     let length = track_length(entry.runtime_ms);
+    // Why a mix picked it, as the server said (spec 024).
+    let mix = try_use_context::<MixCtx>();
+    let why = (entry.source == Source::Mix)
+        .then(|| {
+            mix.and_then(|m| {
+                m.0.read()
+                    .as_ref()
+                    .and_then(|m| m.reasons.get(&entry.id).cloned())
+            })
+        })
+        .flatten()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.join(" · "));
     rsx! {
         li {
             class: "pharos-queue-entry",
@@ -529,6 +553,9 @@ fn QueueRow(
                 title: "Play {name} now",
                 onclick: move |_| on_queue.call(QueueAction::Play(key)),
                 "{name}"
+                if let Some(why) = why {
+                    span { class: "pharos-queue-why pharos-muted", "{why}" }
+                }
             }
             span { class: "pharos-queue-length pharos-muted",
                 if let Some(l) = length { "{l}" }
