@@ -664,7 +664,7 @@ mod tests {
         };
         let answer = vec![
             MemberSeen {
-                member: crate::native::together::Member {
+                member: pharos_client::group::GroupMember {
                     id: "a".into(),
                     name: "Ada".into(),
                     buffering: false,
@@ -678,7 +678,7 @@ mod tests {
                 }],
             },
             MemberSeen {
-                member: crate::native::together::Member {
+                member: pharos_client::group::GroupMember {
                     id: "b".into(),
                     name: "Bo".into(),
                     buffering: false,

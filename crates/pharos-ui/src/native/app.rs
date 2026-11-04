@@ -1471,19 +1471,33 @@ fn BrowseScreen(id: ItemRef) -> Element {
 /// changes (a member joined or left) and when `ids` do (another item). Empty
 /// outside a group, and when the answer fails: the screens simply show no
 /// marks.
+const SEEN_REFRESH_MS: u32 = 30_000;
+
 fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
     let together = use_context::<Together>();
     let view = (together.view)();
     let roster: Vec<String> = view.members.iter().map(|m| m.id.clone()).collect();
-    let active = view.active;
-    let found = use_resource(use_reactive!(|(ids, roster, active)| {
+    let (active, activity) = (view.active, view.activity);
+    // Another member's progress moves without the roster changing: fetch
+    // again on any group update, and every 30 s while the group is active.
+    let mut tick = use_signal(|| 0u32);
+    use_future(move || async move {
+        loop {
+            platform::sleep_ms(SEEN_REFRESH_MS).await;
+            if *tick.peek() == u32::MAX {
+                break;
+            }
+            tick += 1;
+        }
+    });
+    let tick = tick();
+    let found = use_resource(use_reactive!(|(ids, roster, active, activity, tick)| {
         let session = together.current();
         async move {
-            let _ = roster;
+            let _ = (roster, activity, tick);
             let (true, Some(session), false) = (active, session, ids.is_empty()) else {
                 return Vec::new();
             };
-            let ids: Vec<ItemRef> = ids.into_iter().take(seen::MAX_IDS).collect();
             session.seen(ids).await.unwrap_or_else(|e| {
                 platform::warn(&format!("pharos: group seen failed: {}", e.0));
                 Vec::new()

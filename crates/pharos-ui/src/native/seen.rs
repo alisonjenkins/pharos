@@ -2,29 +2,22 @@
 //! server's answer as the screens read it, and how it is worded. Pure, so the
 //! marks are tested without a browser.
 
-use super::together::Member;
 use pharos_client::api::ItemRef;
 
 /// Ids one `seen` call may ask about, the server's cap.
-pub const MAX_IDS: usize = 200;
+pub use pharos_client::group::MAX_SEEN_IDS as MAX_IDS;
+/// The server's answer, as the client reads it.
+pub use pharos_client::group::{ItemSeen, MemberSeen};
 
-/// One item as one member has seen it. A film or episode has `played` and
-/// `position_pct`; a series or season has `played_count` of `total_count`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ItemSeen {
-    pub id: ItemRef,
-    pub played: bool,
-    pub position_pct: u8,
-    pub played_count: u32,
-    pub total_count: u32,
-}
-
-/// What one member has seen of the items asked about. An item the viewer may
-/// not see is missing, and reads as not seen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemberSeen {
-    pub member: Member,
-    pub items: Vec<ItemSeen>,
+/// Adds `part`, another call's answer, to `into`: a member already there gains
+/// the items, a new one is appended. Used to join the answers to chunks of ids.
+pub fn merge(into: &mut Vec<MemberSeen>, part: Vec<MemberSeen>) {
+    for m in part {
+        match into.iter_mut().find(|e| e.member.id == m.member.id) {
+            Some(e) => e.items.extend(m.items),
+            None => into.push(m),
+        }
+    }
 }
 
 /// How a member stands on one item.
@@ -114,6 +107,7 @@ pub fn initial(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pharos_client::group::GroupMember;
 
     fn seen(id: u64, played: bool, pct: u8, count: u32, of: u32) -> ItemSeen {
         ItemSeen {
@@ -153,7 +147,7 @@ mod tests {
 
     #[test]
     fn rows_pair_each_member_with_their_own_mark() {
-        let member = |id: &str, name: &str| Member {
+        let member = |id: &str, name: &str| GroupMember {
             id: id.into(),
             name: name.into(),
             buffering: false,
@@ -175,6 +169,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("Ada", Mark::Seen), ("Bo", Mark::NotSeen)]
         );
+    }
+
+    #[test]
+    fn answers_to_chunks_of_ids_join_per_member() {
+        let member = |id: &str| GroupMember {
+            id: id.into(),
+            name: id.into(),
+            buffering: false,
+        };
+        let mut all = vec![MemberSeen {
+            member: member("a"),
+            items: vec![seen(1, true, 0, 0, 0)],
+        }];
+        merge(
+            &mut all,
+            vec![
+                MemberSeen {
+                    member: member("a"),
+                    items: vec![seen(2, true, 0, 0, 0)],
+                },
+                MemberSeen {
+                    member: member("b"),
+                    items: vec![],
+                },
+            ],
+        );
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].items.len(), 2);
     }
 
     #[test]
