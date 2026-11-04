@@ -71,6 +71,27 @@ impl Target {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("not a quire link target: {0:?}")]
+pub struct ParseTargetError(String);
+
+/// Inverse of [`Target::encode`].
+impl std::str::FromStr for Target {
+    type Err = ParseTargetError;
+
+    fn from_str(v: &str) -> Result<Self, Self::Err> {
+        let (spine, fragment) = match v.split_once('#') {
+            Some((s, f)) => (s, Some(f.to_owned())),
+            None => (v, None),
+        };
+        let spine = Some(spine)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| ParseTargetError(v.chars().take(64).collect()))?;
+        Ok(Target { spine, fragment })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub index: usize,
@@ -636,5 +657,30 @@ fn link(spine: usize, fragment: Option<String>) -> Attr {
     Attr {
         name: "data-quire-link".into(),
         value: Value::Link(Target { spine, fragment }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn a_link_target_round_trips() {
+        for t in [
+            Target {
+                spine: 3,
+                fragment: None,
+            },
+            Target {
+                spine: 0,
+                fragment: Some("n#1".into()),
+            },
+        ] {
+            assert_eq!(t.encode().parse::<Target>().unwrap(), t);
+        }
+        assert!("x".parse::<Target>().is_err());
+        assert!("+1".parse::<Target>().is_err());
+        assert!("#a".parse::<Target>().is_err());
     }
 }
