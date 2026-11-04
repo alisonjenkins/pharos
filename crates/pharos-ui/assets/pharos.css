@@ -2584,6 +2584,7 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   font-size: 0.85em;
 }
 .pharos-stage-transport,
+.pharos-stage-extra,
 .pharos-stage-views {
   display: flex;
   flex: none;

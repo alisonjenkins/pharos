@@ -8,7 +8,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::ItemRef;
 
-use super::listen::{Icon, ICON_FLOAT};
+use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::MediaState;
 use super::route::Route;
@@ -276,6 +276,9 @@ pub fn StageBar(
     image: Option<String>,
     media: MediaState,
     runtime_ms: u64,
+    /// Offer the browser's picture-in-picture window (a video, where the
+    /// browser has one).
+    pip: bool,
     previous: Option<ItemRef>,
     next: Option<ItemRef>,
     error: Option<String>,
@@ -394,6 +397,18 @@ pub fn StageBar(
                             }
                         },
                         Icon { path: ICON_NEXT }
+                    }
+                }
+                if pip {
+                    div { class: "pharos-stage-extra",
+                        button {
+                            class: "pharos-stage-button",
+                            r#type: "button",
+                            aria_label: "Picture in picture",
+                            title: "Picture in picture",
+                            onclick: move |_| on_action.call(StageAction::Player(Control::PictureInPicture)),
+                            Icon { path: ICON_PIP }
+                        }
                     }
                 }
                 div { class: "pharos-stage-views", role: "group", aria_label: "Size",
