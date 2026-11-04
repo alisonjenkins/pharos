@@ -4,8 +4,17 @@ TV: TCL 55" C6K (2024 EU), Google TV, Android 12 (API 31), MediaTek MT9653.
 `ro.product.cpu.abilist` = `armeabi-v7a,armeabi` (32-bit userland only).
 System WebView 156.0.8078.47. Branch `spike/android-tv`, bin `pharos-tv`.
 
-**Verdict: go for slice 1.** Every slice 0 check passed on the TV; the
-gaps below are known work, not blockers.
+**Verdict: go for slice 1, qualified.** Every slice 0 check passed on the
+TV. The spike is a stripped bin, though: it does not prove the real `App`
+runs on Android. About 20 of `web.rs`'s 71 functions read the DOM
+synchronously (`position_ms`, `media_state`, `element_size`, `viewport`,
+`current_path`, `tile_in_view`, `prefers`, `capabilities`, `key_on_itself`,
+`on_a_control`, ...). On the webview renderer the only DOM access is an
+async `document::eval` round trip, and events arrive serialised with no
+element behind them. So `android.rs` cannot copy that surface one to one:
+slice 1 must pick an async surface or a JS-side state mirror pushed into
+Rust. That choice is slice 1's main cost and bears on ADR-0057's premise.
+Eval round-trip latency on the TV is not measured yet.
 
 ## Build
 
@@ -28,7 +37,7 @@ gaps below are known work, not blockers.
 | Playback | 8 Mile, `audio_remux`, hls.js + MSE, hardware `c2.mtk.avc.decoder`, 1920x1080, 1 of 2419 frames dropped, muted; pauses when the app is hidden |
 | D-pad / OK | WebView's own spatial navigation moves focus between `<button>`s; Dioxus `onkeydown` gets ArrowUp/Down/Left/Right, Enter |
 | Media keys | `MediaPlayPause`, `MediaPlay`, `MediaFastForward` arrive as keydown |
-| Manifest | `[application] android_manifest = "android/AndroidManifest.xml"` replaces dx's manifest; app launches via `LEANBACK_LAUNCHER` |
+| Manifest | `[application] android_manifest = "android/AndroidManifest.xml"` replaces dx's manifest; `aapt2 dump badging` shows `leanback-launchable-activity`, `banner=`, touchscreen and leanback `uses-feature-not-required`; app launches via `LEANBACK_LAUNCHER` |
 
 ## What broke, and the fix used
 
@@ -85,6 +94,9 @@ CSS viewport is 960x540 at devicePixelRatio 2.
   and stream URL (the WebView origin `https://dioxus.index.html` has no
   cookie). Slice 1 needs a token-free route (wry custom-protocol proxy or a
   cookie set through JNI) so the token stays out of URLs and logs.
+  Checked 2026-11-04: pharos and jellyfin-web logs show `api_key=REDACTED`,
+  and the token's prefix matches nothing in Loki across every namespace.
+  Logs outside Loki (e.g. a host-level reverse proxy) were not checked.
 - QuickConnect needs the reconnect + re-mint loop above, or a server change
   that lets a pending QuickConnect socket outlive `auth_deadline`.
 - Keep focus inside the Dioxus root at start (`root.focus()`); 011 spatial
