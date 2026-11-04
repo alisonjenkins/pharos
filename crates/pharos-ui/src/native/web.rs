@@ -16,7 +16,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, MediaState, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
+use super::playback::{
+    Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget,
+};
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
 use super::track_follow::{GroupTracksView, TrackChoice};
@@ -1125,6 +1127,7 @@ impl PlaybackEngine for NativeVideo {
         url: &str,
         start_ms: u64,
         on_fatal: OnFatal,
+        _on_fragment: OnFragment,
     ) -> Result<(), String> {
         let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
         let on_error = {
@@ -1263,6 +1266,7 @@ impl PlaybackEngine for HlsJs {
         url: &str,
         start_ms: u64,
         on_fatal: OnFatal,
+        on_fragment: OnFragment,
     ) -> Result<(), String> {
         let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
         let config = js_sys::Object::new();
@@ -1314,20 +1318,60 @@ impl PlaybackEngine for HlsJs {
                 }
             })
         };
-        let on_fragment = {
+        let on_loaded = {
             let budget = Rc::clone(&budget);
-            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, _| {
-                budget.borrow_mut().progressed()
+            Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
+                budget.borrow_mut().progressed();
+                if let Some(load) = fragment_load(&data) {
+                    on_fragment(load);
+                }
             })
         };
         player.on("hlsError", on_error.as_ref().unchecked_ref());
-        player.on("hlsFragLoaded", on_fragment.as_ref().unchecked_ref());
+        player.on("hlsFragLoaded", on_loaded.as_ref().unchecked_ref());
         player.load_source(url);
         player.attach_media(&video);
         self.player = Some(player);
-        self._listeners = vec![on_error, on_fragment];
+        self._listeners = vec![on_error, on_loaded];
         Ok(())
     }
+}
+
+/// A number at `path` in the hls.js object `from`, 0 when absent.
+fn js_number(from: &JsValue, path: &[&str]) -> f64 {
+    let mut at = from.clone();
+    for key in path {
+        at = js_sys::Reflect::get(&at, &(*key).into()).unwrap_or(JsValue::UNDEFINED);
+    }
+    at.as_f64().unwrap_or(0.0)
+}
+
+/// The download an `hlsFragLoaded` event reports; `None` for audio and
+/// subtitle fragments and for ones with no usable timing.
+fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
+    let kind = js_sys::Reflect::get(data, &"frag".into())
+        .ok()
+        .and_then(|f| js_sys::Reflect::get(&f, &"type".into()).ok())
+        .and_then(|t| t.as_string());
+    if kind.as_deref() != Some("main") {
+        return None;
+    }
+    let bytes = js_number(data, &["stats", "loaded"]);
+    let end = js_number(data, &["stats", "loading", "end"]);
+    let first = js_number(data, &["stats", "loading", "first"]);
+    let start = if first > 0.0 {
+        first
+    } else {
+        js_number(data, &["stats", "loading", "start"])
+    };
+    let seconds = js_number(data, &["frag", "duration"]);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let load = FragmentLoad {
+        bytes: bytes.max(0.0) as u64,
+        load_ms: (end - start).max(0.0) as u64,
+        media_ms: (seconds * 1000.0).max(0.0) as u64,
+    };
+    (load.bytes > 0 && load.load_ms > 0 && load.media_ms > 0).then_some(load)
 }
 
 impl Drop for HlsJs {

@@ -17,11 +17,27 @@ pub trait PlaybackEngine {
         url: &str,
         start_ms: u64,
         on_fatal: OnFatal,
+        on_fragment: OnFragment,
     ) -> Result<(), String>;
 }
 
 /// Told why playback stopped for good.
 pub type OnFatal = std::rc::Rc<dyn Fn(String)>;
+
+/// One video fragment the engine downloaded, for measuring the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentLoad {
+    pub bytes: u64,
+    /// From the first byte to the last, so the server's time to start the
+    /// response is not mistaken for a slow link.
+    pub load_ms: u64,
+    /// How much video the fragment holds.
+    pub media_ms: u64,
+}
+
+/// Told of each video fragment downloaded; engines that cannot see
+/// downloads (the browser's own player) never call it.
+pub type OnFragment = std::rc::Rc<dyn Fn(FragmentLoad)>;
 
 /// Which engine plays a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
