@@ -3793,7 +3793,11 @@ impl HlsSegmentCache {
     /// the mp4 muxer stretches the last sample before the hole across it, and
     /// Firefox resuming playback inside that one long sample after a stall
     /// freezes or plays the post-hole audio early.
-    const FILL_AUDIO_HOLES: &str = "aresample=async=1";
+    ///
+    /// B472 — `min_hard_comp` defaults to 0.1 s, and a shorter hole was closed
+    /// up instead, leaving the audio after it early by the hole's length. 20 ms
+    /// is one Opus frame: well clear of millisecond timestamp rounding.
+    const FILL_AUDIO_HOLES: &str = "aresample=async=1:min_hard_comp=0.02";
 
     /// Start time (seconds) of audio segment `seg`: the plain uniform grid.
     ///
@@ -9909,9 +9913,13 @@ mod tests {
     #[test]
     fn every_opus_audio_session_fills_source_holes() {
         for (start_seg, audio_start, want) in [
-            (0, 0.0, "aresample=async=1"),
-            (30, 1.7, "aresample=async=1"),
-            (0, 1.7, "adelay=delays=1700.000ms:all=1,aresample=async=1"),
+            (0, 0.0, "aresample=async=1:min_hard_comp=0.02"),
+            (30, 1.7, "aresample=async=1:min_hard_comp=0.02"),
+            (
+                0,
+                1.7,
+                "adelay=delays=1700.000ms:all=1,aresample=async=1:min_hard_comp=0.02",
+            ),
         ] {
             let a = HlsSegmentCache::audio_hls_args(
                 Path::new("/m/x.mkv"),
@@ -9941,7 +9949,7 @@ mod tests {
         .unwrap();
         let af = a.iter().position(|x| x == "-af").unwrap();
         let ca = a.iter().position(|x| x == "-c:a").unwrap();
-        assert_eq!(a[af + 1], "aresample=async=1", "{a:?}");
+        assert_eq!(a[af + 1], "aresample=async=1:min_hard_comp=0.02", "{a:?}");
         assert!(af < ca, "{a:?}");
     }
 
