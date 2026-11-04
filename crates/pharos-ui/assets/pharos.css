@@ -275,13 +275,23 @@ input:focus-visible {
   object-fit: cover;
   display: block;
 }
-.pharos-avatar-settings {
+.pharos-avatar-settings,
+.pharos-playback-settings {
   display: grid;
   gap: 0.75rem;
   justify-items: start;
 }
-.pharos-avatar-settings h3 {
+.pharos-avatar-settings h3,
+.pharos-playback-settings h3 {
   margin: 0;
+}
+.pharos-playback-settings label {
+  display: grid;
+  gap: 0.25rem;
+}
+.pharos-playback-settings p {
+  margin: 0;
+  max-width: 40rem;
 }
 .pharos-avatar-large {
   display: grid;
