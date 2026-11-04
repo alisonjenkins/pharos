@@ -43,8 +43,6 @@ const STALL_WINDOW_MS: u64 = 30_000;
 const STALLS_TO_STEP_DOWN: usize = 2;
 /// Two `waiting`/`stalled` events this close are one stall.
 const STALL_MERGE_MS: u64 = 2_000;
-/// A seek's own `waiting`, reported just before `seeked`, is not a stall.
-const SEEK_GRACE_MS: u64 = 3_000;
 /// After a start or a change the buffer is filling; nothing is decided.
 const SETTLE_MS: u64 = 15_000;
 /// The link must keep the headroom this long before stepping up.
@@ -198,6 +196,7 @@ pub struct Watch {
     stalls: Vec<u64>,
     quiet_until: u64,
     headroom_since: Option<u64>,
+    seeking_since: Option<u64>,
 }
 
 impl Watch {
@@ -219,6 +218,7 @@ impl Watch {
             stalls: Vec::new(),
             quiet_until: now.saturating_add(SETTLE_MS),
             headroom_since: None,
+            seeking_since: None,
         }
     }
 
@@ -253,6 +253,9 @@ impl Watch {
 
     /// The video ran out of data at `now`.
     pub fn stalled(&mut self, now: u64) {
+        if self.seeking_since.is_some() {
+            return;
+        }
         let merged = self
             .stalls
             .last()
@@ -264,15 +267,20 @@ impl Watch {
         self.headroom_since = None;
     }
 
-    /// A seek finished at `now`; the `waiting` it caused was no stall.
-    pub fn seeked(&mut self, now: u64) {
-        self.stalls
-            .retain(|&t| now.saturating_sub(t) > SEEK_GRACE_MS);
+    /// A seek started at `now`; every `waiting` until it finishes is its own.
+    pub fn seeking(&mut self, now: u64) {
+        self.seeking_since = Some(now);
+    }
+
+    /// The seek finished; the `waiting`s it caused were no stalls.
+    pub fn seeked(&mut self) {
+        self.seeking_since = None;
     }
 
     /// A player (re)started at `now`: its buffer is filling.
     pub fn restarted(&mut self, now: u64) {
         self.quiet_until = now.saturating_add(SETTLE_MS);
+        self.seeking_since = None;
     }
 
     /// Decides at `now`; applies and returns a change.
@@ -582,9 +590,47 @@ mod tests {
         let mut w = watch();
         downloads(&mut w, 4_700_000, 20_000_000, 3);
         w.stalled(20 * MS);
+        w.seeking(25 * MS);
         w.stalled(25 * MS);
-        w.seeked(26 * MS);
+        w.seeked();
         assert_eq!(w.evaluate(26 * MS), None);
+    }
+
+    #[test]
+    fn a_slow_seek_is_not_a_stall() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.seeking(20 * MS);
+        w.stalled(20 * MS);
+        w.seeked();
+        assert_eq!(w.evaluate(24 * MS), None);
+        // One real stall after the seek is still one: the seek's waiting did not count.
+        w.stalled(25 * MS);
+        assert_eq!(w.evaluate(25 * MS), None);
+    }
+
+    #[test]
+    fn two_slow_seeks_do_not_step_down() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.seeking(20 * MS);
+        w.stalled(20 * MS);
+        w.seeked();
+        w.seeking(30 * MS);
+        w.stalled(30 * MS);
+        w.seeked();
+        assert_eq!(w.evaluate(35 * MS), None);
+    }
+
+    #[test]
+    fn a_stall_after_a_seek_still_counts() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        w.seeking(20 * MS);
+        w.seeked();
+        w.stalled(25 * MS);
+        w.stalled(30 * MS);
+        assert!(w.evaluate(30 * MS).is_some());
     }
 
     #[test]
