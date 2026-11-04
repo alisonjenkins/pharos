@@ -33,6 +33,7 @@ pub mod seen;
 pub mod stage;
 pub mod together;
 pub mod together_view;
+pub mod track_follow;
 pub mod trail;
 pub mod views;
 pub mod visualiser;
