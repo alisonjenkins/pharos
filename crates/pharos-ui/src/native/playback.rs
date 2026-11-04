@@ -467,6 +467,53 @@ pub fn skip_label(kind: SegmentKind) -> &'static str {
     }
 }
 
+/// Where the end credits start: the latest outro the server detected in the
+/// second half of a video `total_ms` long. Credits in the first half (a cold
+/// open's) are not the end.
+pub fn credits_start(segments: &[Segment], total_ms: u64) -> Option<u64> {
+    segments
+        .iter()
+        .filter(|s| s.kind == SegmentKind::Outro)
+        .filter(|s| s.start_ms >= total_ms / 2 && s.start_ms < total_ms)
+        .map(|s| s.start_ms)
+        .max()
+}
+
+/// What is left to watch of a video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Left {
+    pub ms: u64,
+    /// `ms` runs to where the credits start, not to the end.
+    pub before_credits: bool,
+}
+
+/// What is left to watch from `at_ms`: up to the credits while they are
+/// still ahead, else to the end. `None` while the length is unknown or once
+/// nothing is left.
+pub fn left_to_watch(segments: &[Segment], at_ms: u64, total_ms: u64) -> Option<Left> {
+    let left = match credits_start(segments, total_ms) {
+        Some(credits) if at_ms < credits => Left {
+            ms: credits - at_ms,
+            before_credits: true,
+        },
+        _ => Left {
+            ms: total_ms.checked_sub(at_ms)?,
+            before_credits: false,
+        },
+    };
+    (left.ms > 0).then_some(left)
+}
+
+/// "Ends at 10:42 PM", or "Ends at 10:40 PM (before credits)", from the
+/// local time it ends at.
+pub fn ends_at_label(time: &str, before_credits: bool) -> String {
+    if before_credits {
+        format!("Ends at {time} (before credits)")
+    } else {
+        format!("Ends at {time}")
+    }
+}
+
 /// `at_ms` as a percentage of `total_ms`, for a left offset on the seek bar.
 pub fn percent(at_ms: u64, total_ms: u64) -> f64 {
     if total_ms == 0 {
@@ -672,6 +719,83 @@ mod tests {
         let sets = [wide, sprites()];
         assert_eq!(preview_set(&sets).map(|s| s.width), Some(320));
         assert_eq!(preview_set(&[]), None);
+    }
+
+    #[test]
+    fn credits_are_the_latest_outro_in_the_second_half() {
+        let at = |kind, start_ms| Segment {
+            kind,
+            start_ms,
+            end_ms: start_ms + 60_000,
+        };
+        let total = 1_200_000;
+        assert_eq!(credits_start(&[], total), None);
+        assert_eq!(
+            credits_start(&[at(SegmentKind::Outro, 1_100_000)], total),
+            Some(1_100_000)
+        );
+        // A cold open's credits, an intro, or an outro past the end are not the end.
+        assert_eq!(
+            credits_start(&[at(SegmentKind::Outro, 30_000)], total),
+            None
+        );
+        assert_eq!(
+            credits_start(&[at(SegmentKind::Intro, 1_100_000)], total),
+            None
+        );
+        assert_eq!(credits_start(&[at(SegmentKind::Outro, total)], total), None);
+        assert_eq!(
+            credits_start(
+                &[
+                    at(SegmentKind::Outro, 900_000),
+                    at(SegmentKind::Outro, 1_000_000)
+                ],
+                total
+            ),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn what_is_left_stops_at_the_credits_until_they_play() {
+        let outro = Segment {
+            kind: SegmentKind::Outro,
+            start_ms: 1_100_000,
+            end_ms: 1_200_000,
+        };
+        let total = 1_200_000;
+        assert_eq!(
+            left_to_watch(&[outro], 100_000, total),
+            Some(Left {
+                ms: 1_000_000,
+                before_credits: true
+            })
+        );
+        assert_eq!(
+            left_to_watch(&[outro], 1_150_000, total),
+            Some(Left {
+                ms: 50_000,
+                before_credits: false
+            })
+        );
+        assert_eq!(
+            left_to_watch(&[], 200_000, total),
+            Some(Left {
+                ms: 1_000_000,
+                before_credits: false
+            })
+        );
+        assert_eq!(left_to_watch(&[], total, total), None);
+        assert_eq!(left_to_watch(&[], 5, 0), None);
+    }
+
+    #[test]
+    fn the_estimate_says_when_it_stops_before_the_credits() {
+        assert_eq!(ends_at_label("10:42 PM", false), "Ends at 10:42 PM");
+        assert_eq!(
+            ends_at_label("22:40", true),
+            "Ends at 22:40 (before credits)"
+        );
     }
 
     #[test]
