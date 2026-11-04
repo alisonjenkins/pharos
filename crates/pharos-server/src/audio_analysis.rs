@@ -32,7 +32,7 @@
 //! # Signals
 //!
 //! ```text
-//! pharos_audio_analysis_total{outcome,tempo}  outcome: analysed | nothing | undecodable | error | missing
+//! pharos_audio_analysis_total{outcome,tempo}  outcome: analysed | nothing | undecodable | error | missing | unscanned
 //!                                             tempo:   tag | analysis | none
 //! pharos_audio_analysis_seconds               per-song wall time, decode included
 //! pharos_audio_analysis_pending               songs left at the start of a pass
@@ -44,7 +44,7 @@
 
 use crate::bg_io::BgPermit;
 use pharos_core::{AudioAnalysis, MediaItem, MediaKind, MediaStore, TempoSource};
-use pharos_transcode::audio_features::{window_for, AudioFeatures, TempoOrigin, ANALYSIS_VERSION};
+use pharos_transcode::audio_features::{window_for, AudioFeatures, ANALYSIS_VERSION};
 use pharos_transcode::protocol::WorkerError;
 use pharos_transcode::worker::{LibavWorkerPool, PoolError};
 use std::path::PathBuf;
@@ -96,6 +96,9 @@ pub enum Outcome {
     /// The file could not be stat'd; not stored. The scanner removes rows for
     /// files that are gone.
     Missing,
+    /// The file on disk differs from what the last scan saw; not decoded until
+    /// the scanner catches up.
+    Unscanned,
 }
 
 impl Outcome {
@@ -106,14 +109,19 @@ impl Outcome {
             Outcome::Undecodable => "undecodable",
             Outcome::Error => "error",
             Outcome::Missing => "missing",
+            Outcome::Unscanned => "unscanned",
         }
     }
 }
 
 /// The `tempo` label.
-fn tempo_label(a: Option<&AudioAnalysis>) -> &'static str {
+/// The `tempo` label when no tempo is known.
+pub const NO_TEMPO: &str = "none";
+
+/// The `tempo` label: `TempoSource::label()`, or [`NO_TEMPO`].
+pub fn tempo_label(a: Option<&AudioAnalysis>) -> &'static str {
     a.and_then(|a| a.tempo_source)
-        .map_or("none", TempoSource::label)
+        .map_or(NO_TEMPO, TempoSource::label)
 }
 
 /// Whether `item` is a song this sweep should analyse now.
@@ -131,14 +139,7 @@ pub fn needs_analysis(item: &MediaItem) -> bool {
 pub fn verdict(result: &Result<AudioFeatures, PoolError>) -> (Option<AudioAnalysis>, Outcome) {
     match result {
         Ok(f) => {
-            let bpm = f.bpm().map(|(b, o)| {
-                let src = match o {
-                    TempoOrigin::Tag => TempoSource::Tag,
-                    TempoOrigin::Analysis => TempoSource::Analysis,
-                };
-                (b, src)
-            });
-            let a = AudioAnalysis::from_readings(bpm, f.energy, ANALYSIS_VERSION);
+            let a = AudioAnalysis::from_readings(f.bpm(), f.energy, ANALYSIS_VERSION);
             let outcome = if a.bpm_mille.is_some() || a.energy_mille.is_some() {
                 Outcome::Analysed
             } else {
@@ -201,6 +202,7 @@ pub struct PassSummary {
     pub undecodable: usize,
     pub errors: usize,
     pub missing: usize,
+    pub unscanned: usize,
 }
 
 /// Analyse every song in `items` that needs it, one at a time.
@@ -228,7 +230,7 @@ pub async fn run_pass<S: MediaStore, A: Analyser>(
             metrics::counter!(
                 "pharos_audio_analysis_total",
                 "outcome" => Outcome::Missing.label(),
-                "tempo" => "none",
+                "tempo" => NO_TEMPO,
             )
             .increment(1);
             tracing::warn!(
@@ -238,6 +240,35 @@ pub async fn run_pass<S: MediaStore, A: Analyser>(
             );
             continue;
         };
+        // A file changed since the last scan: its result would be stored
+        // against a signature the row does not carry yet, read back as
+        // unanalysed, and decoded again every pass. Leave it to the scanner,
+        // which stamps the new signature (and re-probes) first.
+        match store.scan_state(it.id).await {
+            Ok(Some(st)) if st.file_mtime != 0 && (st.file_mtime, st.file_size) != sig => {
+                sum.unscanned += 1;
+                metrics::counter!(
+                    "pharos_audio_analysis_total",
+                    "outcome" => Outcome::Unscanned.label(),
+                    "tempo" => NO_TEMPO,
+                )
+                .increment(1);
+                tracing::debug!(
+                    item = %it.id,
+                    path = %it.path.display(),
+                    scanned_mtime = st.file_mtime,
+                    scanned_size = st.file_size,
+                    disk_mtime = sig.0,
+                    disk_size = sig.1,
+                    "audio analysis: file changed since the last scan; waiting for the scanner",
+                );
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(item = %it.id, error = %e, "audio analysis: scan state read failed");
+            }
+        }
         let (start_ms, dur_ms) = window_for(it.probe.duration_ms);
         // Hold the gate for the decode only.
         let result = {
@@ -322,6 +353,7 @@ pub async fn run_pass<S: MediaStore, A: Analyser>(
         undecodable = sum.undecodable,
         errors = sum.errors,
         missing = sum.missing,
+        unscanned = sum.unscanned,
         "audio analysis: pass complete",
     );
     sum
@@ -516,10 +548,9 @@ mod tests {
         );
 
         // The file changes; the scan stamps its new signature.
-        lib.store
-            .mark_seen(1, scan, mtime + 60, size)
-            .await
-            .unwrap();
+        std::fs::write(&path, b"a longer file").unwrap();
+        let (mtime2, size2) = signature(&path).await.unwrap();
+        lib.store.mark_seen(1, scan, mtime2, size2).await.unwrap();
         let items = lib.store.list().await.unwrap();
         assert_eq!(
             items[0].probe.audio_analysis, None,
@@ -622,9 +653,60 @@ mod tests {
             Outcome::Undecodable,
             Outcome::Error,
             Outcome::Missing,
+            Outcome::Unscanned,
         ];
         let labels: std::collections::HashSet<_> = all.iter().map(|o| o.label()).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn tempo_labels_are_distinct() {
+        let tag = AudioAnalysis {
+            tempo_source: Some(TempoSource::Tag),
+            ..AudioAnalysis::default()
+        };
+        let est = AudioAnalysis {
+            tempo_source: Some(TempoSource::Analysis),
+            ..AudioAnalysis::default()
+        };
+        let labels: std::collections::HashSet<_> = [
+            tempo_label(Some(&tag)),
+            tempo_label(Some(&est)),
+            tempo_label(None),
+            tempo_label(Some(&AudioAnalysis::default())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(labels.len(), 3, "{labels:?}");
+        assert_eq!(tempo_label(None), NO_TEMPO);
+    }
+
+    /// A file changed on disk since the last scan is not decoded: its result
+    /// could not be read back until the scanner stamps the new signature, so
+    /// decoding it would repeat every pass.
+    #[tokio::test]
+    async fn a_file_changed_since_the_scan_waits_for_the_scanner() {
+        let lib = library(&[(1, "tagged.mp3", MediaKind::Audio)]).await;
+        let path = lib.items[0].path.clone();
+        let (mtime, size) = signature(&path).await.unwrap();
+        let scan = lib.store.begin_scan(path.parent().unwrap()).await.unwrap();
+        lib.store
+            .mark_seen(1, scan, mtime - 60, size)
+            .await
+            .unwrap();
+        let fake = Fake {
+            script: HashMap::from([("tagged.mp3".into(), Ok(tagged()))]),
+            ..Fake::default()
+        };
+        let items = lib.store.list().await.unwrap();
+        let sum = run_pass(&lib.store, &fake, &gate(), &items).await;
+        assert_eq!((sum.unscanned, fake.calls().len()), (1, 0));
+
+        // The scanner catches up: now it is analysed.
+        lib.store.mark_seen(1, scan, mtime, size).await.unwrap();
+        let items = lib.store.list().await.unwrap();
+        let sum = run_pass(&lib.store, &fake, &gate(), &items).await;
+        assert_eq!((sum.analysed, fake.calls().len()), (1, 1));
     }
 
     /// ODD — the failure path records as much as the success path: every
