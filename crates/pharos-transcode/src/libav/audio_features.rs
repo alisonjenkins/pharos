@@ -115,34 +115,30 @@ pub fn audio_features(src: &Path, start_ms: u64, dur_ms: u64) -> Result<AudioFea
     // Land at or before the window; the pts gate trims the lead-in. The
     // range must include the target itself: `..start_us` makes libav's max
     // `start_us - 1`, below the target, and avformat_seek_file refuses every
-    // such seek with EPERM (B446). A container that cannot seek is read from
-    // the top instead, so the gate never waits for a start it will not reach.
-    let start_ms = if start_ms > 0 {
+    // such seek with EPERM (B446). A container that cannot seek is reopened
+    // and read from the top; the pts gate still skips to the requested start,
+    // so the window stays the one asked for.
+    if start_ms > 0 {
         let start_us = origin_us.saturating_add(
             i64::try_from(start_ms)
                 .unwrap_or(i64::MAX)
                 .saturating_mul(1000),
         );
-        match ictx.seek(start_us, ..=start_us) {
-            Ok(()) => start_ms,
-            Err(e) => {
-                tracing::debug!(
-                    target: "libav",
-                    start_us,
-                    error = %e,
-                    "audio features: seek refused, reopening to read the window from the top"
-                );
-                // A failed seek may already have read packets, leaving the
-                // input anywhere (even at EOF, which would store an empty
-                // analysis). Reopen so the read really starts at the top.
-                ictx = format::input(src)
-                    .map_err(|e| FrameError::Other(format!("reopen after seek: {e}")))?;
-                0
-            }
+        if let Err(e) = ictx.seek(start_us, ..=start_us) {
+            tracing::debug!(
+                target: "libav",
+                start_us,
+                error = %e,
+                "audio features: seek refused, reopening and decoding up to the window"
+            );
+            // A failed seek may already have read packets, leaving the input
+            // anywhere (even at EOF, which would store an empty analysis).
+            // Reopen so the read really starts at the top; the pts gate keeps
+            // the requested start.
+            ictx = format::input(src)
+                .map_err(|e| FrameError::Other(format!("reopen after seek: {e}")))?;
         }
-    } else {
-        0
-    };
+    }
     let end_ms = start_ms + dur_ms;
 
     // The sample count bounds the decode whatever the timestamps say.
