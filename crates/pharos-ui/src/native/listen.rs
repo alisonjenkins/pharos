@@ -731,14 +731,16 @@ fn lyrics_title(have: bool, loading: bool, failed: bool) -> &'static str {
     }
 }
 
-/// The Lyrics chip's own words. A finished lookup that found none says so,
+/// The Lyrics chip's own words, since a touch screen shows no tooltip: a
+/// pending lookup says it is looking, a finished one that found none says so,
 /// and one that failed says the lyrics are unavailable, not that there are
 /// none (B479).
 fn lyrics_label(have: bool, loading: bool, failed: bool) -> &'static str {
     match (have, loading, failed) {
+        (true, _, _) => "Lyrics",
+        (false, true, _) => "Looking for lyrics",
         (false, false, true) => "Lyrics unavailable",
         (false, false, false) => "No lyrics",
-        _ => "Lyrics",
     }
 }
 
@@ -1140,7 +1142,7 @@ mod tests {
             "The lyrics could not be loaded"
         );
         assert_eq!(lyrics_label(true, false, false), "Lyrics");
-        assert_eq!(lyrics_label(false, true, false), "Lyrics");
+        assert_eq!(lyrics_label(false, true, false), "Looking for lyrics");
         assert_eq!(lyrics_label(false, false, false), "No lyrics");
         // B479: a failed lookup never claims the song has none.
         assert_eq!(lyrics_label(false, false, true), "Lyrics unavailable");
