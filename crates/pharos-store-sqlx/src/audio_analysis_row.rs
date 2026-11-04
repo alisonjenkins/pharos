@@ -40,6 +40,7 @@ pub(crate) fn decode(c: AnalysisColumns<'_>) -> Option<AudioAnalysis> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn cols(analysed: (i64, i64), file: Option<(i64, i64)>) -> AnalysisColumns<'static> {
