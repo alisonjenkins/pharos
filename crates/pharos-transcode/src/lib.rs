@@ -1504,7 +1504,7 @@ fn build_args_for_pipeline(
     // streaming. The webm/mpegts muxers reject it ("Unrecognized option"), so
     // scope it to the mp4-family muxers. WebM is inherently streamable (live
     // cluster writing). `Fmp4` needs the SAME fragmentation flags: the VP9-in-
-    // HLS path (see api::jellyfin::fmp4) generates each segment as a self-
+    // HLS path (see pharos_cache::fmp4) generates each segment as a self-
     // contained fragmented mp4 (`ftyp moov moof mdat`), then splits off the
     // init so per-segment output concatenates in hls.js.
     if matches!(opts.container, Container::Mp4 | Container::Fmp4) {
