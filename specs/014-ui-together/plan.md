@@ -153,6 +153,47 @@ player-shortcut PR (#607), which touches the same files.
   fetches again when the roster (Member/Joined/Left) or the ids change.
   `InThisGroup`, `SeenDots` and the strip's mark are pure components.
 
+## US7 and US8: group tracks and who did what (one more `schemaVersion` bump)
+
+- **Contract.**
+  ```capnp
+  struct GroupMember { ...; ownTracks @3 :Bool; }         # US7: not following the group's tracks
+  struct GroupSummary { ...; tracks @4 :GroupTracks; }    # what a late joiner starts on
+  # A stream index of the playing item; `set` false means the group has made no
+  # choice yet (each member keeps the player's default). `off` is subtitles off.
+  struct TrackChoice { set @0 :Bool; index @1 :UInt32; off @2 :Bool; }
+  struct GroupTracks { audio @0 :TrackChoice; subtitle @1 :TrackChoice; by @2 :Text; }
+  interface Membership {
+    ...
+    setTracks    @9  (ctx, audio :TrackChoice, subtitle :TrackChoice, playlistItemId :Text) -> (result :Done);  # `set` false leaves that one as it is; a stale `playlistItemId` is dropped
+    followTracks @10 (ctx, follow :Bool) -> (result :Done);
+  }
+  struct GroupUpdate {
+    union { ...; tracks @8 :GroupTracks; }
+    struct At { ...; by @2 :Text; }   # member id that caused it; "" when the group did (all ready)
+  }
+  ```
+- **Server.** `pharos-sync`: `ServerMsg::{Play, Pause, Seek}` carry
+  `by: Option<MemberId>` (serde-default, so the `/sync/v1/ws` wire stays
+  compatible); the actor fills it from the command's sender. The group keeps
+  `GroupTracks` and each member's `own_tracks`; `GroupMsg::SetTracks` and
+  `GroupMsg::FollowTracks` update them and broadcast `ServerMsg::Tracks` and
+  `MemberJoined`-style member updates; a queue change resets the tracks. The
+  Jellyfin translation drops `Tracks` and ignores `by`. Counted in
+  `pharos_group_tracks_total{outcome}` (`applied`, `not_in_group`, `unchanged`, `stale`).
+  ADR (number at merge): group tracks are advisory group state, applied by
+  each following client, never by the server's stream choice.
+- **UI.** `GroupSession` applies a `tracks` update to the player when the
+  member follows (pure `follows_group(own, update) -> Option<Picks>`); the
+  player's audio and subtitle menus send `setTracks` while following and only
+  change the local player under "Just me"; "Follow group" re-applies the
+  group's picks. A pure `activity` module turns updates into lines ("Sam
+  paused at 12:04"); the strip keeps the last 3 and the watch page shows the
+  newest for 4 s over the video.
+- **Ids.** V395 (a group play, pause or seek names its member, or none for the
+  group), V396 (group tracks: late joiners start on them, a queue change clears
+  them, an own-tracks member is never switched), B455–B459 for bugs found.
+
 ## Observability (FR-005)
 
 "Group feels out of sync" is answered by `groupDrift` samples (ms, per group,

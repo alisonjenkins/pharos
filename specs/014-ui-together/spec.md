@@ -72,6 +72,30 @@ seen the item playing. It answers "who needs catching up?" and "who has seen
 this film?". A member's state is shown only to others in the same group, and
 only for items the viewer may see (ADR-0054, V365).
 
+### US7 — the group's audio and subtitles, with a personal override (P1)
+
+Alison, 2026-11-04: "sync around the subtitles and audio track switching ...
+with the ability for people to override". A group has one audio track and one
+subtitle choice (a track or off). When a member changes either from the
+player's menu, every member who follows the group switches with them. A member
+can tick "Just me" in the menu: from then on their own picks stay theirs and
+the group's changes pass them by, until they tick "Follow group" again, which
+puts them back on the group's tracks. A late joiner starts on the group's
+tracks. The member strip marks a member on their own tracks. Moving the group
+to another item clears its choice (the new item's tracks differ). jellyfin-web
+members are not affected; their SyncPlay has no track sync (V396).
+
+### US8 — what is going on in the group (P1)
+
+Alison, 2026-11-04: "the member list to show if someone is buffering and who
+paused, seeked or whatever so people in the group know what is going on". The
+member strip shows each member's state (buffering, on their own tracks), and a
+group play, pause, seek or track change names who did it ("Sam paused at
+12:04", "Ali skipped to 40:10", "Waiting for Sam"). The newest line also shows
+over the video for a few seconds even while the player's controls are hidden,
+and the strip keeps the last few. A change the group makes on its own (everyone
+ready, so play starts) says so instead of naming anyone (V395).
+
 ## Functional Requirements
 
 - **FR-001** Group-sync client implementing `docs/group-sync-protocol.md` over
