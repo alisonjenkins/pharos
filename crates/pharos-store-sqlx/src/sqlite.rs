@@ -933,7 +933,8 @@ impl MediaStore for SqliteStore {
         analysis: pharos_core::AudioAnalysis,
         signature: (i64, u64),
     ) -> DomainResult<()> {
-        let id_i64 = i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
         let size_i64 = i64::try_from(signature.1)
             .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
         sqlx::query(
