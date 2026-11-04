@@ -63,6 +63,49 @@ fn an_untagged_song_has_its_tempo_estimated_from_the_window() {
     );
 }
 
+/// A stream whose timestamps start well past 0 (here ~101 s, as in a
+/// transport-stream rip) still has its window measured from the song's start.
+/// Taken as absolute, every frame would sit past the window's end and the
+/// song would be stored as analysed with nothing in it, for good.
+#[test]
+fn a_stream_with_a_late_origin_is_windowed_from_its_own_start() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ts = dir.path().join("late.ts");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.8*sin(2*PI*60*t)*exp(-30*mod(t\\,0.5)):s=44100:d=40",
+            "-ac",
+            "2",
+            "-c:a",
+            "mp2",
+            "-output_ts_offset",
+            "100",
+        ])
+        .arg(&ts)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg fixture");
+    let f = audio_features(&ts, 10_000, 20_000).unwrap();
+    assert!(
+        (f.analysed_seconds - 20.0).abs() < 0.5,
+        "decoded {} s of a 20 s window",
+        f.analysed_seconds
+    );
+    let bpm = f.analysed_bpm.expect("a steady kick has a tempo");
+    assert!((bpm - 120.0).abs() <= 1.0, "read {bpm}");
+}
+
 #[test]
 fn a_bpm_tag_is_read_and_skips_the_estimator() {
     if !ffmpeg_available() {
