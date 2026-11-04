@@ -17,6 +17,7 @@ use super::account::AccountMenu;
 use super::account_settings;
 use super::activity;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::approve_device;
 use super::backdrop::Backdrop;
 use super::browse::{self, Neighbours};
 use super::diagnostics;
@@ -1156,6 +1157,7 @@ fn Screen(route: Route) -> Element {
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
         Route::Appearance => rsx! { AppearanceScreen {} },
         Route::Account => rsx! { AccountScreen {} },
+        Route::ApproveDevice => rsx! { ApproveDeviceScreen {} },
         Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
@@ -1496,6 +1498,47 @@ fn AccountScreen() -> Element {
             on_crossfade: move |seconds| {
                 set_crossfade_seconds(seconds);
                 crossfade.set(seconds);
+            },
+        }
+    }
+}
+
+/// The Approve a device page: authorizes a Quick Connect code over the native session.
+#[component]
+fn ApproveDeviceScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut busy = use_signal(|| false);
+    let mut outcome = use_signal(|| None::<Result<(), String>>);
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("approve_device: {what} failed: {e}"));
+    };
+    rsx! {
+        approve_device::ApproveDeviceView {
+            busy: busy(),
+            outcome: outcome(),
+            on_approve: move |code: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                outcome.set(None);
+                spawn(async move {
+                    let result = api
+                        .quick_connect_authorize(&call("approve_device", "quick_connect_authorize"), &code)
+                        .await;
+                    if let Err(e) = &result {
+                        report(e, "quick connect authorize");
+                    }
+                    outcome.set(Some(result.map_err(|e| approve_device::refusal_message(&e))));
+                    busy.set(false);
+                });
             },
         }
     }
