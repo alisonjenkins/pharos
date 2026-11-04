@@ -372,6 +372,62 @@ if (!window.__pharosKeys) {
             }
             let hls = document::eval(&format!("{HLS_JS}\nreturn typeof globalThis.Hls + ' ' + (globalThis.Hls && Hls.isSupported());")).await;
             status.write().push(format!("hls.js loaded: {hls:?}"));
+
+            let _ = document::eval("await new Promise(r => setTimeout(r, 3000)); return 1;").await;
+
+            let mut rtt = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let t0 = std::time::Instant::now();
+                let _ = document::eval("return document.querySelectorAll('.tile').length;").await;
+                rtt.push(t0.elapsed().as_micros());
+            }
+            let rtt_min = rtt.iter().copied().min().unwrap_or(0);
+            let rtt_max = rtt.iter().copied().max().unwrap_or(0);
+            let rtt_p50 = pct(&mut rtt, 0.50);
+            let rtt_p95 = pct(&mut rtt, 0.95);
+            log::info!(
+                "bench rtt (200 evals): min={rtt_min}µs p50={rtt_p50}µs p95={rtt_p95}µs max={rtt_max}µs"
+            );
+
+            let mut batch = Vec::with_capacity(50);
+            for _ in 0..50 {
+                let t0 = std::time::Instant::now();
+                let _ = document::eval(
+                    r#"return {w: innerWidth, h: innerHeight, sy: scrollY, a: document.activeElement && document.activeElement.className, n: document.querySelectorAll('.tile').length, t: (document.getElementById('v')||{}).currentTime || 0, p: (document.getElementById('v')||{}).paused, vw: (document.getElementById('v')||{}).videoWidth || 0, r: document.querySelector('.root') ? document.querySelector('.root').getBoundingClientRect().width : 0, d: devicePixelRatio};"#,
+                )
+                .await;
+                batch.push(t0.elapsed().as_micros());
+            }
+            let batch_p50 = pct(&mut batch, 0.50);
+            let batch_p95 = pct(&mut batch, 0.95);
+            log::info!("bench batched read (50 evals): p50={batch_p50}µs p95={batch_p95}µs");
+
+            let mut e = document::eval(
+                r#"for (let i = 0; i < 300; i++) { dioxus.send({i, t: performance.now(), w: innerWidth}); await new Promise(r => requestAnimationFrame(r)); } return 'done';"#,
+            );
+            let mut gaps = Vec::with_capacity(300);
+            let t_start = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..300 {
+                let _ = e.recv::<serde_json::Value>().await;
+                let now = std::time::Instant::now();
+                if let Some(prev) = last {
+                    gaps.push(now.duration_since(prev).as_micros());
+                }
+                last = Some(now);
+            }
+            let total_ms = t_start.elapsed().as_millis();
+            let gap_p50 = pct(&mut gaps, 0.50);
+            let gap_p95 = pct(&mut gaps, 0.95);
+            let gap_max = gaps.iter().copied().max().unwrap_or(0);
+            log::info!(
+                "bench push throughput (300 frames): gap p50={gap_p50}µs p95={gap_p95}µs max={gap_max}µs total={total_ms}ms"
+            );
+
+            let summary = format!(
+                "bench: rtt min={rtt_min} p50={rtt_p50} p95={rtt_p95} max={rtt_max}µs | batch p50={batch_p50} p95={batch_p95}µs | push gap p50={gap_p50} p95={gap_p95} max={gap_max}µs ({total_ms}ms)"
+            );
+            status.write().push(summary);
         });
 
         let play = move |id: ItemRef| {
@@ -430,6 +486,16 @@ if (!window.__pharosKeys) {
                 }
             }
         }
+    }
+
+    fn pct(v: &mut Vec<u128>, p: f64) -> u128 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        let p = if p > 1.0 { p / 100.0 } else { p };
+        let idx = ((v.len().saturating_sub(1) as f64) * p).round() as usize;
+        v.get(idx).copied().unwrap_or(0)
     }
 
     fn capabilities(probe: Option<&serde_json::Value>) -> Capabilities {
