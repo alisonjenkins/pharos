@@ -597,6 +597,12 @@ impl<P: Prober> FsScanner<P> {
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
         let groups = group_editions(paths);
+        // A file now grouped under another may still hold its own row from an
+        // earlier pass; that row is swept, so its viewers' state moves first.
+        let folded: Vec<(PathBuf, PathBuf)> = groups
+            .iter()
+            .flat_map(|(primary, alts)| alts.iter().map(|(_, alt)| (alt.clone(), primary.clone())))
+            .collect();
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
 
@@ -1064,6 +1070,9 @@ impl<P: Prober> FsScanner<P> {
         // incomplete walk — sweeping would prune every not-yet-seen file. Skip
         // it; a later full scan reconciles genuine deletions.
         let cancelled = is_cancelled();
+        if !cancelled {
+            settle_copies(store, scan_id, &folded).await?;
+        }
         let root_prefix = root.to_string_lossy();
         let swept = if cancelled {
             tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
@@ -2093,6 +2102,59 @@ fn record_edition_drift(
     metrics::counter!("pharos_scan_reprobe_total", "reason" => reason.label()).increment(1);
 }
 
+/// Settle each file now grouped as a version of another before the sweep.
+/// When the primary was written this pass, the copy's old row hands each
+/// viewer's played, resume and favourite state to it (idempotent: the store
+/// keeps the furthest state) and is then swept. When it was not (its probe
+/// failed, or it is known bad), the copy keeps its own row, so a playable
+/// copy never vanishes behind an unplayable primary.
+async fn settle_copies<S: MediaStore>(
+    store: &S,
+    scan_id: i64,
+    folded: &[(PathBuf, PathBuf)],
+) -> DomainResult<()> {
+    for (alt, primary) in folded {
+        let Some(from) = store.id_at_path(alt).await? else {
+            continue;
+        };
+        let into = match store.id_at_path(primary).await? {
+            Some(into) => store
+                .scan_state(into)
+                .await?
+                .filter(|s| s.last_seen_scan_id == scan_id)
+                .map(|_| into),
+            None => None,
+        };
+        match into {
+            Some(into) if into != from => {
+                store.merge_user_data(from, into).await?;
+                tracing::info!(
+                    from = %from,
+                    into = %into,
+                    version = %alt.display(),
+                    "folded a copy's row into the item it is now a version of",
+                );
+            }
+            Some(_) => {}
+            None => {
+                let Ok(meta) = tokio::fs::metadata(alt).await else {
+                    continue;
+                };
+                store
+                    .mark_seen(from, scan_id, mtime_secs(&meta), meta.len())
+                    .await?;
+                tracing::warn!(
+                    row = %from,
+                    version = %alt.display(),
+                    primary = %primary.display(),
+                    "kept a copy as its own item: the file it groups under was not written this pass",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// P41 — group walk output into `(primary, Vec<(edition_label, alt_path)>)`
 /// tuples. Files whose stem matches `Title - <known_edition>` and that
 /// share a directory + a primary file (`Title.ext`) are demoted to
@@ -2152,7 +2214,141 @@ pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, 
     for path in orphan_alts {
         out.push((path, Vec::new()));
     }
+    group_episode_copies(out)
+}
+
+/// Fold copies of one episode into a single group: files under the same show
+/// folder that parse to the same season and episode span (`Season 01` and
+/// `Season 1` both holding S01E02, or a `.avi` beside its `.mkv` re-rip). The
+/// best-ranked file stays primary; the others become versions labelled by what
+/// tells them apart in their names.
+fn group_episode_copies(
+    groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
+) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
+    type Key = (String, u32, u32, u32);
+    type Group = (PathBuf, Vec<(String, PathBuf)>);
+    let mut by_episode: BTreeMap<Key, Vec<Group>> = BTreeMap::new();
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups {
+        match episode_copy_key(&group.0) {
+            Some(key) => by_episode.entry(key).or_default().push(group),
+            None => out.push(group),
+        }
+    }
+    for mut copies in by_episode.into_values() {
+        copies.sort_by(|a, b| {
+            copy_rank(&a.0)
+                .cmp(&copy_rank(&b.0))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let mut copies = copies.into_iter();
+        let Some((primary, mut alts)) = copies.next() else {
+            continue;
+        };
+        for (path, editions) in copies {
+            let label = copy_label(&primary, &path);
+            tracing::debug!(
+                primary = %primary.display(),
+                copy = %path.display(),
+                label = %label,
+                "grouped a copy of an episode as a version",
+            );
+            alts.push((label, path));
+            alts.extend(editions);
+        }
+        out.push((primary, alts));
+    }
     out
+}
+
+/// `(show folder, season, first episode, last episode)` for an episode file
+/// whose name carries both numbers; `None` keeps the file out of copy grouping.
+fn episode_copy_key(path: &Path) -> Option<(String, u32, u32, u32)> {
+    if !is_episode_path(path) {
+        return None;
+    }
+    let info = parse_series_info(path)?;
+    let first = info.episode_number?;
+    let name = path.file_name()?.to_str()?;
+    let last = episode_span_end(name)
+        .filter(|l| *l > first)
+        .unwrap_or(first);
+    Some((info.series_folder?, info.season_number?, first, last))
+}
+
+static EP_SPAN_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)s\d{1,4}e\d{1,4}(?:[-_ ]?e(\d{1,4}))+").ok()
+});
+
+/// The last episode of a multi-episode name (`S01E01-E02`, `S01E01E02`), so a
+/// double episode never groups with a single one.
+fn episode_span_end(name: &str) -> Option<u32> {
+    EP_SPAN_RE
+        .as_ref()?
+        .captures(name)?
+        .get(1)?
+        .as_str()
+        .parse()
+        .ok()
+}
+
+/// Lower ranks first: containers that direct-play broadly before legacy ones.
+fn copy_rank(path: &Path) -> u8 {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("mkv") => 0,
+        Some("mp4") => 1,
+        Some("m4v") => 2,
+        Some("webm") => 3,
+        _ => 4,
+    }
+}
+
+/// What sets `copy` apart from `primary` by name: the differing tail of the
+/// stem (`HDTV-1080p Proper`), else its container (`AVI`), else its folder.
+fn copy_label(primary: &Path, copy: &Path) -> String {
+    let stem = |p: &Path| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (a, b) = (stem(primary), stem(copy));
+    let common = a
+        .char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map_or(a.len().min(b.len()), |((i, _), _)| i);
+    // Back up to a word start so `WEBDL-1080p` is not cut to `EBDL-1080p`.
+    let start = b
+        .get(..common)
+        .and_then(|head| head.rfind([' ', '.', '-', '_', '[', '(']))
+        .map_or(0, |i| i + 1);
+    let tail = b
+        .get(start..)
+        .unwrap_or("")
+        .trim_matches(|c: char| c.is_whitespace() || "-_.[]()".contains(c));
+    if !tail.is_empty() && a != b {
+        return tail.to_string();
+    }
+    let ext = |p: &Path| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_uppercase)
+    };
+    if ext(primary) != ext(copy) {
+        if let Some(e) = ext(copy) {
+            return e;
+        }
+    }
+    copy.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("Copy")
+        .to_string()
 }
 
 /// Heuristic: does `path` look like a TV episode?
@@ -2796,6 +2992,8 @@ mod tests {
         reject_ids: Mutex<HashSet<MediaId>>,
         // Number of `alternate_sources` reads, to prove the skip path avoids them.
         alternate_sources_calls: AtomicUsize,
+        // Every `merge_user_data(from, into)` call, in order.
+        merged: Mutex<Vec<(MediaId, MediaId)>>,
     }
 
     impl MediaStore for MemStore {
@@ -3071,6 +3269,14 @@ mod tests {
                 .insert(id, fp);
             Ok(())
         }
+        async fn merge_user_data(&self, from: MediaId, into: MediaId) -> DomainResult<()> {
+            self.merged
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?
+                .push((from, into));
+            Ok(())
+        }
+
         async fn rebind_path(&self, id: MediaId, new_path: &Path) -> DomainResult<()> {
             // Mirror the store: UPDATE-only, no-op when the row is absent.
             // Keeps the id (and any associated user_data) intact.
@@ -6246,6 +6452,115 @@ mod tests {
             items[0].probe.alternate_sources[0].video_3d_format,
             Some(Video3DFormat::FullSideBySide)
         );
+    }
+
+    fn names(alts: &[(String, PathBuf)]) -> Vec<&str> {
+        alts.iter().map(|(label, _)| label.as_str()).collect()
+    }
+
+    #[test]
+    fn copies_of_an_episode_in_two_season_folders_group_as_one() {
+        let a = PathBuf::from("/tv/Black Mirror/Season 1/Black Mirror - S01E02 - Fifteen Million Merits WEBDL-1080p.mkv");
+        let b = PathBuf::from("/tv/Black Mirror/Season 01/Black Mirror - S01E02 - Fifteen Million Merits WEBDL-1080p.mkv");
+        let groups = group_editions(vec![a.clone(), b.clone()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, b);
+        assert_eq!(groups[0].1, vec![("Season 1".to_string(), a)]);
+    }
+
+    #[test]
+    fn a_copy_is_labelled_by_what_its_name_adds() {
+        let groups = group_editions(vec![
+            PathBuf::from("/tv/Abbott/Season 5/Abbott - S05E19 - Trip WEBDL-1080p.mkv"),
+            PathBuf::from("/tv/Abbott/Season 5/Abbott - S05E19 - Trip HDTV-1080p Proper.mkv"),
+            PathBuf::from("/tv/BSG/Season 01/BSG - S01E01 - 33.avi"),
+            PathBuf::from("/tv/BSG/Season 01/BSG - S01E01 - 33.mkv"),
+        ]);
+        assert_eq!(groups.len(), 2);
+        let abbott = groups
+            .iter()
+            .find(|g| g.0.starts_with("/tv/Abbott"))
+            .unwrap();
+        assert!(abbott
+            .0
+            .ends_with("Abbott - S05E19 - Trip HDTV-1080p Proper.mkv"));
+        assert_eq!(names(&abbott.1), ["WEBDL-1080p"]);
+        let bsg = groups.iter().find(|g| g.0.starts_with("/tv/BSG")).unwrap();
+        assert_eq!(
+            bsg.0.extension().unwrap(),
+            "mkv",
+            "mkv outranks avi as primary"
+        );
+        assert_eq!(names(&bsg.1), ["AVI"]);
+    }
+
+    #[test]
+    fn different_episodes_shows_and_spans_stay_apart() {
+        let groups = group_editions(vec![
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02.mkv"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E02.mkv"),
+            PathBuf::from("/tv/Foo/Season 02/Foo S02E01.mkv"),
+            PathBuf::from("/tv/Bar/Season 01/Bar S01E01.mkv"),
+            PathBuf::from("/films/Heat (1995).mkv"),
+        ]);
+        assert_eq!(groups.len(), 6);
+        assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn a_copy_with_its_own_row_folds_into_the_primary() {
+        let td = TempDir::new().unwrap();
+        let older = "Show/Season 1/Show - S01E02 - Pilot.mkv";
+        let newer = "Show/Season 01/Show - S01E02 - Pilot.mkv";
+        write_file(td.path(), older, b"first copy").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber::default());
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        let before = store.list().await.unwrap();
+        assert_eq!(before.len(), 1);
+        let old_id = before[0].id;
+
+        write_file(td.path(), newer, b"second copy").await;
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 1, "the copy's own row is swept");
+        let item = &items[0];
+        assert!(item.path.ends_with(newer));
+        assert_eq!(item.probe.alternate_sources.len(), 1);
+        assert!(item.probe.alternate_sources[0].path.ends_with(older));
+        assert_eq!(*store.merged.lock().unwrap(), vec![(old_id, item.id)]);
+    }
+
+    #[tokio::test]
+    async fn a_copy_keeps_its_row_when_its_primary_cannot_be_probed() {
+        let td = TempDir::new().unwrap();
+        let good = "Show/Season 1/Show - S01E02 - Pilot.avi";
+        let bad = "Show/Season 01/Show - S01E02 - Pilot.mkv";
+        write_file(td.path(), good, b"playable copy").await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let kept = store.list().await.unwrap()[0].id;
+
+        write_file(td.path(), bad, b"corrupt copy").await;
+        let prober = FakeProber {
+            force_fail_for: Some("Pilot.mkv".into()),
+            ..Default::default()
+        };
+        FsScanner::new(prober)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].id, kept);
+        assert!(items[0].path.ends_with(good));
+        assert!(store.merged.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
