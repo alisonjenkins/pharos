@@ -53,6 +53,10 @@ const HEADROOM_HOLD_MS: u64 = 60_000;
 const MIN_SAMPLES: u32 = 3;
 /// Smaller downloads say little about the link.
 const MIN_SAMPLE_BYTES: u64 = 100_000;
+/// Downloads faster than this are cache hits, not a measure of the link.
+const MIN_LOAD_MS: u64 = 50;
+/// No single download is believed above this, in bits per second.
+const MAX_LINK_BPS: u64 = 200_000_000;
 /// Weight of the newest download in the throughput average, in percent.
 const EWMA_NEW_PERCENT: u64 = 30;
 /// Step down below this multiple of the stream's bitrate, in tenths.
@@ -226,10 +230,11 @@ impl Watch {
     /// A fragment of `bytes` took `load_ms` to download and holds
     /// `media_ms` of video.
     pub fn fragment(&mut self, bytes: u64, load_ms: u64, media_ms: u64) {
-        if bytes < MIN_SAMPLE_BYTES || load_ms == 0 || media_ms == 0 {
+        // A cache hit answers in a millisecond; that says nothing of the link.
+        if bytes < MIN_SAMPLE_BYTES || load_ms < MIN_LOAD_MS || media_ms == 0 {
             return;
         }
-        let link = bytes.saturating_mul(8000) / load_ms;
+        let link = (bytes.saturating_mul(8000) / load_ms).min(MAX_LINK_BPS);
         let stream = bytes.saturating_mul(8000) / media_ms;
         let blend = |old: Option<u64>, new: u64| {
             old.map_or(new, |old| {
@@ -605,6 +610,22 @@ mod tests {
         let mut w = watch();
         downloads(&mut w, 4_700_000, 1_200_000, 2);
         assert_eq!(w.evaluate(20 * MS), None);
+    }
+
+    #[test]
+    fn a_cache_hit_does_not_make_the_link_look_fast() {
+        let mut w = watch();
+        downloads(&mut w, 4_700_000, 20_000_000, 3);
+        let before = (w.estimate_bps, w.samples);
+        w.fragment(100_000, 1, 6_000);
+        assert_eq!((w.estimate_bps, w.samples), before);
+    }
+
+    #[test]
+    fn no_single_download_is_believed_above_200_mbit() {
+        let mut w = watch();
+        w.fragment(10_000_000, 50, 6_000);
+        assert_eq!(w.estimate_bps, Some(200_000_000));
     }
 
     #[test]
