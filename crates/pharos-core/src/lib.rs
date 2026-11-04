@@ -3584,6 +3584,13 @@ pub trait UserPrefStore: Send + Sync {
         key: &str,
         value: &[u8],
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Removes `key` for `user`; `true` when there was a value to remove.
+    fn delete_user_pref(
+        &self,
+        user: UserId,
+        key: &str,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
 }
 
 /// Persisted transcode negotiation for a PlaySessionId (Phase B1 —
