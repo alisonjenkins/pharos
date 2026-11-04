@@ -11,12 +11,13 @@
 
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
-    CollectionStore, DetectedSegment, GenreStore, LibraryKind, LibraryStore, MediaId, MediaItem,
-    MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind, MediaSegmentStore,
-    MediaStore, PersistedSyncGroup, PersistedTranscodeSession, PersonKind, PersonRef, PersonStore,
-    PlaylistStore, PreferenceStore, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
-    StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    CollectionStore, DetectedSegment, ExternalRatings, GenreStore, LibraryKind, LibraryStore,
+    MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind,
+    MediaSegmentStore, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, PersonKind,
+    PersonRef, PersonStore, PlaylistStore, PreferenceStore, RatingsStore, RatingsTarget,
+    SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore, StudioStore, SyncGroupStore,
+    TagStore, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy,
+    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -71,6 +72,7 @@ where
         + pharos_core::TranscodeSessionStore
         + pharos_core::SyncGroupStore
         + pharos_core::SeriesMetadataStore
+        + pharos_core::RatingsStore
         + pharos_core::MediaSegmentStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
@@ -1308,6 +1310,100 @@ where
     assert!(!need2
         .iter()
         .any(|c| c.series_key == "/media/conformance/Conformance Show (2001)"));
+
+    // -----------------------------------------------------------------
+    // RatingsStore (B341): shows lead the due list, a film carries its IMDb
+    // id, and a lookup's scores survive a rescan's put and a re-enrichment's
+    // upsert, because neither names the ratings columns.
+    // -----------------------------------------------------------------
+    let show_key = "/media/conformance/Conformance Show (2001)".to_string();
+    let mut film = media_item(9501, "Rated Film");
+    film.metadata.production_year = Some(1999);
+    film.metadata.provider_ids.imdb = Some("tt0133093".into());
+    MediaStore::put(&store, film.clone()).await.unwrap();
+    let due = RatingsStore::needing_ratings(&store, 1000, 500)
+        .await
+        .unwrap();
+    let show_at = due
+        .iter()
+        .position(|d| d.target == RatingsTarget::Series(show_key.clone()))
+        .expect("the show is due");
+    let film_due = due
+        .iter()
+        .find(|d| d.target == RatingsTarget::Item(9501))
+        .expect("the film is due");
+    assert!(
+        due.iter()
+            .take(show_at)
+            .all(|d| matches!(d.target, RatingsTarget::Series(_))),
+        "shows come before films"
+    );
+    assert_eq!(film_due.imdb_id.as_deref(), Some("tt0133093"));
+    assert_eq!(film_due.title, "Rated Film");
+    assert_eq!(film_due.year, Some(1999));
+    let show_due = &due[show_at];
+    assert_eq!(show_due.title, "Conformance Show");
+    assert_eq!(show_due.year, Some(2001));
+    assert_eq!(show_due.imdb_id, None);
+
+    let scores = ExternalRatings {
+        imdb: Some(8.7),
+        tomatometer: Some(83),
+    };
+    RatingsStore::set_ratings(&store, &RatingsTarget::Item(9501), scores, 1_000)
+        .await
+        .unwrap();
+    RatingsStore::set_ratings(
+        &store,
+        &RatingsTarget::Series(show_key.clone()),
+        scores,
+        1_000,
+    )
+    .await
+    .unwrap();
+    let due = RatingsStore::needing_ratings(&store, 1000, 500)
+        .await
+        .unwrap();
+    assert!(!due.iter().any(|d| d.target == RatingsTarget::Item(9501)));
+    assert!(!due
+        .iter()
+        .any(|d| d.target == RatingsTarget::Series(show_key.clone())));
+    let due = RatingsStore::needing_ratings(&store, 1000, 2_000)
+        .await
+        .unwrap();
+    assert!(
+        due.iter().any(|d| d.target == RatingsTarget::Item(9501)),
+        "due again after the TTL"
+    );
+
+    MediaStore::put(&store, film).await.unwrap();
+    let got = MediaStore::get(&store, 9501).await.unwrap();
+    assert_eq!(
+        got.metadata.ratings, scores,
+        "a rescan's put keeps the scores"
+    );
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        SeriesMetadata {
+            series_key: show_key.clone(),
+            series_name: "Conformance Show".into(),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(1_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let got = SeriesMetadataStore::series_metadata_by_keys(&store, std::slice::from_ref(&show_key))
+        .await
+        .unwrap();
+    assert_eq!(
+        got[&show_key].ratings, scores,
+        "a re-enrichment keeps the scores"
+    );
+    RatingsStore::set_ratings(&store, &RatingsTarget::Item(424_242), scores, 1_000)
+        .await
+        .unwrap();
 
     // -----------------------------------------------------------------
     // SortKey::ParentalRating: the CASE ranking must order identically on

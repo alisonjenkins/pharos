@@ -1404,6 +1404,8 @@ where
             provider_ids,
             poster_locator: hit.poster_locator,
             backdrop_locator: hit.backdrop_locator,
+            // The upsert never writes the ratings columns.
+            ratings: Default::default(),
         })
         .await?;
     Ok(true)

@@ -84,6 +84,9 @@ pub mod provider_ids_json;
 /// Shared `series_metadata` row shape (T9-series), used by both store backends.
 pub(crate) mod series_meta_row;
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod ratings;
+
 // JSON adapter for the Vec<String> metadata columns —
 // production_locations + trailers (T67). Same pattern.
 pub mod string_list_json;
