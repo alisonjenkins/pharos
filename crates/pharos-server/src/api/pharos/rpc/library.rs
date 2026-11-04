@@ -9,7 +9,7 @@ use pharos_api::pharos_capnp::{
     SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData, Video3DFormat};
+use pharos_core::{LibraryKind, MediaItem, MediaKind, MediaProbe, UserItemData, Video3DFormat};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 
 use super::session::Session;
@@ -444,7 +444,11 @@ impl server::library::Handler for Library {
             let count = u32::try_from(item.probe.alternate_sources.len())
                 .unwrap_or(u32::MAX)
                 .saturating_add(1);
-            write_versions(out.reborrow().init_versions(count), &item);
+            write_versions(
+                out.reborrow().init_versions(count),
+                &item,
+                user.policy.admin,
+            );
         }
         let mut list = out.init_segments(len(&segments));
         for (i, (kind, s)) in (0..).zip(&segments) {
@@ -1272,16 +1276,70 @@ fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
 }
 
 /// An item's playable files, the primary first (022 FR-002). An edition's
-/// id is what `Playback.negotiate` takes as `version`.
-fn write_versions(mut out: capnp::struct_list::Builder<'_, version::Owned>, item: &MediaItem) {
+/// id is what `Playback.negotiate` takes as `version`. Paths go to admins only.
+fn write_versions(
+    mut out: capnp::struct_list::Builder<'_, version::Owned>,
+    item: &MediaItem,
+    admin: bool,
+) {
     let mut primary = out.reborrow().get(0);
     primary.set_primary(true);
     primary.set_stereo(wire_stereo(item.probe.video_3d_format));
+    write_version_facts(primary, &item.probe, &item.path, admin);
     for (i, alt) in (1..out.len()).zip(&item.probe.alternate_sources) {
         let mut v = out.reborrow().get(i);
         v.set_id(alt.id.as_str());
         v.set_name(alt.name.as_deref().unwrap_or_default());
         v.set_stereo(wire_stereo(alt.video_3d_format));
+        match alt.probe.as_deref() {
+            Some(probe) => write_version_facts(v, probe, &alt.path, admin),
+            // Probed before editions carried their own probe: only the flat facts.
+            None => {
+                let flat = MediaProbe {
+                    video_codec: alt.video_codec.clone(),
+                    audio_codec: alt.audio_codec.clone(),
+                    size_bytes: alt.size_bytes,
+                    container: alt.container.clone(),
+                    ..MediaProbe::default()
+                };
+                write_version_facts(v, &flat, &alt.path, admin);
+            }
+        }
+    }
+}
+
+fn write_version_facts(
+    mut v: version::Builder<'_>,
+    probe: &MediaProbe,
+    path: &std::path::Path,
+    admin: bool,
+) {
+    v.set_width(probe.width.unwrap_or_default());
+    v.set_height(probe.height.unwrap_or_default());
+    v.set_video_codec(probe.video_codec.as_deref().unwrap_or_default());
+    v.set_hdr(probe.hdr_format());
+    v.set_size_bytes(probe.size_bytes.unwrap_or_default());
+    // The file's extension, since ffprobe names mkv and webm alike `matroska,webm`.
+    let ext = path.extension().and_then(|e| e.to_str());
+    v.set_container(ext.or(probe.container.as_deref()).unwrap_or_default());
+    if admin {
+        v.set_path(path.to_string_lossy().as_ref());
+    }
+    if probe.audio_tracks.is_empty() {
+        // A single-stream probe records only the flat codec and channels.
+        if let Some(codec) = probe.audio_codec.as_deref() {
+            let mut a = v.init_audio(1).get(0);
+            a.set_codec(codec);
+            a.set_channels(probe.audio_channels.unwrap_or_default());
+        }
+        return;
+    }
+    let mut audio = v.init_audio(len(&probe.audio_tracks));
+    for (i, track) in (0..).zip(&probe.audio_tracks) {
+        let mut a = audio.reborrow().get(i);
+        a.set_language(track.language.as_deref().unwrap_or_default());
+        a.set_codec(track.codec.as_deref().unwrap_or_default());
+        a.set_channels(track.channels.unwrap_or_default());
     }
 }
 

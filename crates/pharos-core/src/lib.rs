@@ -2209,9 +2209,21 @@ impl MediaProbe {
     /// `smpte2084`; HLG broadcast uses `arib-std-b67`; Dolby Vision
     /// ffprobe also reports `smpte2084` for the base layer.
     pub fn video_range(&self) -> &'static str {
+        if self.hdr_format().is_empty() {
+            "SDR"
+        } else {
+            "HDR"
+        }
+    }
+
+    /// The HDR format a version picker names: `HDR10` (`smpte2084`, which
+    /// Dolby Vision's base layer reports too), `HLG` (`arib-std-b67`), or
+    /// empty for SDR.
+    pub fn hdr_format(&self) -> &'static str {
         match self.color_transfer.as_deref() {
-            Some("smpte2084") | Some("arib-std-b67") => "HDR",
-            _ => "SDR",
+            Some("smpte2084") => "HDR10",
+            Some("arib-std-b67") => "HLG",
+            _ => "",
         }
     }
 
