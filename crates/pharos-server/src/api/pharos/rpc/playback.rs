@@ -2,6 +2,7 @@
 //! reporting where it is. Negotiation is `services::playback::grant`, the
 //! reports `services::play_state`, the same as the Jellyfin routes (US4).
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
@@ -88,6 +89,8 @@ impl server::playback::Handler for Playback {
                     stream_url: grant.stream_url,
                     audio: grant.audio_stream_index,
                     subtitle: grant.subtitle_stream_index,
+                    reported_ms: Cell::new(None),
+                    stopped: Cell::new(false),
                 };
                 let conn = self.session.conn();
                 out.set_grant(server::playback_grant::client(grant, &conn));
@@ -109,6 +112,10 @@ struct Grant {
     stream_url: String,
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// The position of the last report, which a stop on release saves.
+    reported_ms: Cell<Option<u64>>,
+    /// Set by `stop`: the playback has ended and a release has nothing to do.
+    stopped: Cell<bool>,
 }
 
 /// The tracks a report names: `None` says nothing about that track.
@@ -172,6 +179,9 @@ impl server::playback_grant::Handler for Grant {
                 .map_err(report_denial),
             Err(denial) => Err(denial),
         };
+        if reported.is_ok() {
+            self.reported_ms.set(Some(params.get_position_ms()));
+        }
         write_done(results.get().init_result(), reported);
         Ok(())
     }
@@ -188,8 +198,55 @@ impl server::playback_grant::Handler for Grant {
                 .map_err(report_denial),
             Err(denial) => Err(denial),
         };
+        // A stop that failed leaves the release to try again.
+        self.stopped.set(stopped.is_ok());
         write_done(results.get().init_result(), stopped);
         Ok(())
+    }
+}
+
+impl Drop for Grant {
+    /// A grant released without a stop, which is how a closed tab or a lost
+    /// connection looks from here, ends its playback as `stop` would: the
+    /// transcode and the session's now-playing go, and the last reported
+    /// position is saved. With no report there is no position to save, so
+    /// the stored one is left alone.
+    fn drop(&mut self) {
+        if self.stopped.get() || crate::state::is_shutting_down() {
+            return;
+        }
+        // The grant can be dropped as the runtime goes down.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let session = Rc::clone(&self.session);
+        let play_session_id = std::mem::take(&mut self.play_session_id);
+        let item_wire_id = std::mem::take(&mut self.item_wire_id);
+        let reported_ms = self.reported_ms.get();
+        actix_web::rt::spawn(async move {
+            let report = Report {
+                play_session_id: Some(&play_session_id),
+                item_wire_id: reported_ms.map(|_| item_wire_id.as_str()),
+                position_ticks: reported_ms.unwrap_or(0).saturating_mul(TICKS_PER_MS),
+                is_paused: false,
+                audio_stream_index: None,
+                subtitle_stream_index: None,
+            };
+            let ended = match session.current_user().await {
+                Ok(user) => play_state::stop(&session.state, &user, report)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(denial) => Err(format!("{denial:?}")),
+            };
+            match ended {
+                Ok(()) => {
+                    tracing::info!(%play_session_id, saved = reported_ms.is_some(), "playback: grant released without a stop, playback ended")
+                }
+                Err(error) => {
+                    tracing::warn!(%play_session_id, %error, "playback: grant released without a stop, ending it failed")
+                }
+            }
+        });
     }
 }
 
