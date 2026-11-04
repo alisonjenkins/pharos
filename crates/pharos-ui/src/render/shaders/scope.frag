@@ -1,7 +1,9 @@
-const float AMPLITUDE = 0.42;
+// The waveform row peaks near 0.9, so the trace stays inside the middle
+// two thirds of the screen however loud the song is.
+const float AMPLITUDE = 0.36;
 
 float trace(float x) {
-    return wave(x) * AMPLITUDE * (0.5 + u_level);
+    return wave(x) * AMPLITUDE;
 }
 
 void main() {
