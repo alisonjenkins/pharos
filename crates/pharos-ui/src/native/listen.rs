@@ -117,6 +117,9 @@ pub fn ListenView(
     next: Option<ItemRef>,
     /// The song's lyrics; `None` while they load or when the server has none.
     lyrics: Option<Lyrics>,
+    /// The lyrics are still being asked for, so `None` is not yet an answer.
+    #[props(default)]
+    lyrics_loading: bool,
     /// What plays after this song (B435/V375).
     #[props(default)]
     queue: Vec<Entry>,
@@ -255,16 +258,18 @@ pub fn ListenView(
                 }
                 div { class: "pharos-listen-panels", role: "group", aria_label: "Panels",
                     // Always drawn, so the listener can see where lyrics
-                    // live even on a song that has none (B437/V377).
+                    // live even on a song that has none (B437/V377). Its
+                    // own words say there are none, since a tooltip never
+                    // shows on a touch screen (B362/V302).
                     button {
                         class: "pharos-chip pharos-lyrics-toggle",
                         r#type: "button",
                         disabled: lyrics.is_none(),
-                        title: if lyrics.is_none() { "No lyrics for this song" } else { "Show or hide the lyrics" },
+                        title: lyrics_title(lyrics.is_some(), lyrics_loading),
                         aria_pressed: if lyrics.is_some() && show_lyrics() { "true" } else { "false" },
                         aria_controls: (lyrics.is_some() && show_lyrics()).then_some(super::lyrics::PANEL_ID),
                         onclick: move |_| toggle_lyrics(),
-                        "Lyrics"
+                        if lyrics.is_none() && !lyrics_loading { "No lyrics" } else { "Lyrics" }
                     }
                     button {
                         class: "pharos-chip pharos-queue-toggle",
@@ -713,6 +718,15 @@ fn QueueRow(
     }
 }
 
+/// The Lyrics chip's tooltip: what it does, or why it does nothing.
+fn lyrics_title(have: bool, loading: bool) -> &'static str {
+    match (have, loading) {
+        (true, _) => "Show or hide the lyrics",
+        (false, true) => "Looking for lyrics",
+        (false, false) => "No lyrics for this song",
+    }
+}
+
 /// "2003 · Trip-hop, Electronic"; `None` when there is neither.
 fn meta_line(year: Option<u16>, genres: &[String]) -> Option<String> {
     let parts: Vec<String> = year
@@ -1073,6 +1087,9 @@ mod tests {
         let toggle = lyrics_toggle(&none);
         assert!(toggle.contains("disabled"), "{toggle}");
         assert!(toggle.contains("No lyrics for this song"), "{toggle}");
+        // B362/V302: the chip itself says so, since a touch screen shows no
+        // tooltip.
+        assert!(none.contains(">No lyrics</button>"), "{none}");
         let empty = render_full(
             "Teardrop",
             None,
@@ -1094,9 +1111,17 @@ mod tests {
         assert!(html.contains("Love, love is a verb"), "{html}");
         assert!(html.contains(r#"aria-controls="pharos-lyrics""#), "{html}");
         assert!(!lyrics_toggle(&html).contains("disabled"), "{html}");
+        assert!(html.contains(">Lyrics</button>"), "{html}");
     }
 
     /// The opening tag of the lyrics toggle.
+    #[test]
+    fn the_lyrics_chip_says_why_it_does_nothing() {
+        assert_eq!(lyrics_title(true, false), "Show or hide the lyrics");
+        assert_eq!(lyrics_title(false, true), "Looking for lyrics");
+        assert_eq!(lyrics_title(false, false), "No lyrics for this song");
+    }
+
     fn lyrics_toggle(html: &str) -> &str {
         html.split_once("pharos-lyrics-toggle")
             .and_then(|(_, rest)| rest.split_once('>'))
