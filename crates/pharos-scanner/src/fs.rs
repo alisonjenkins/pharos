@@ -2635,6 +2635,23 @@ fn plausible_season(digits: &str) -> Option<u32> {
         .filter(|s| !(200..=1927).contains(s) && *s <= 2500)
 }
 
+/// Where the episode number ends in a filename, for the strict (non-
+/// optimistic) episode forms: `S03E07`, `1x07`, `E07`, `Episode 7`. The
+/// episode's own title, when the name carries one, follows it.
+pub(crate) fn episode_token_end(name: &str) -> Option<usize> {
+    EP_EXPRS
+        .iter()
+        .filter(|x| !x.optimistic)
+        .filter_map(|x| x.re.captures(name)?.name("e"))
+        .find(|e| {
+            !name
+                .as_bytes()
+                .get(e.end())
+                .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'i' | b'I' | b'p' | b'P'))
+        })
+        .map(|e| e.end())
+}
+
 /// Parse a "Season N" / "Season NN" / "S01" / "S1" directory name → N.
 fn parse_season_dir(name: &str) -> Option<u32> {
     let n = name.trim();
