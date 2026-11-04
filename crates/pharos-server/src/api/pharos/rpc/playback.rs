@@ -232,15 +232,22 @@ impl Drop for Grant {
                 audio_stream_index: None,
                 subtitle_stream_index: None,
             };
-            let ended = match session.current_user().await {
-                Ok(user) => play_state::stop(&session.state, &user, report)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(denial) => Err(format!("{denial:?}")),
+            // A revoked session saves no position but still ends the
+            // stream and the now-playing it owns.
+            let (ended, saved) = match session.current_user().await {
+                Ok(user) => (
+                    play_state::stop(&session.state, &user, report).await,
+                    reported_ms.is_some(),
+                ),
+                Err(_) => (
+                    play_state::end(&session.state, session.owner(), &play_session_id).await,
+                    false,
+                ),
             };
+            let ended = ended.map_err(|e| e.to_string());
             match ended {
                 Ok(()) => {
-                    tracing::info!(%play_session_id, saved = reported_ms.is_some(), "playback: grant released without a stop, playback ended")
+                    tracing::info!(%play_session_id, saved, "playback: grant released without a stop, playback ended")
                 }
                 Err(error) => {
                     tracing::warn!(%play_session_id, %error, "playback: grant released without a stop, ending it failed")

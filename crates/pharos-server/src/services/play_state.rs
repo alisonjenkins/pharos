@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use pharos_core::{MediaStore, PlaybackProgress, User, UserDataStore};
+use pharos_core::{MediaStore, PlaybackProgress, User, UserDataStore, UserId};
 
 use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::services::access::{check_item, ItemHidden};
@@ -138,6 +138,25 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
     Ok(())
 }
 
+/// Ends `owner`'s playback `session_id`: its stream capability and its
+/// now-playing entry. It reads and writes nothing of the user's, so it needs
+/// no live session: a grant released after its token was revoked still ends
+/// what it started.
+pub async fn end(state: &AppState, owner: UserId, session_id: &str) -> Result<(), ReportError> {
+    // B256: the PlaySessionId authorizes streams on its own, so the
+    // stop that ends the playback ends the capability too.
+    if let Err(e) = state.transcode_sessions.end_held(session_id, owner).await {
+        tracing::warn!(error = %e, "playback stop: transcode session end failed");
+    }
+    state
+        .sessions
+        .apply(SessionEvent::Stopped {
+            session_id: session_id.to_owned(),
+        })
+        .await
+        .map_err(|e| ReportError::RegistryDown(e.to_string()))
+}
+
 /// Records the end of a playback: ends its session and its stream
 /// capability, then stores the final position, or marks the item played
 /// when the player stopped near its end.
@@ -151,18 +170,7 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
             .map_err(ReportError::Withheld)?;
     }
     if let Some(session_id) = r.play_session_id {
-        // B256: the PlaySessionId authorizes streams on its own, so the
-        // stop that ends the playback ends the capability too.
-        if let Err(e) = state.transcode_sessions.end_held(session_id, user.id).await {
-            tracing::warn!(error = %e, "playback stop: transcode session end failed");
-        }
-        state
-            .sessions
-            .apply(SessionEvent::Stopped {
-                session_id: session_id.to_owned(),
-            })
-            .await
-            .map_err(|e| ReportError::RegistryDown(e.to_string()))?;
+        end(state, user.id, session_id).await?;
     }
 
     // Persist final UserData. If the client stopped within the last

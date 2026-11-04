@@ -7,8 +7,8 @@ use pharos_api::pharos_capnp::{
     decision_result, done, error, negotiate_result, playback_grant, session, stream_choice,
 };
 use pharos_core::{
-    MediaItem, MediaKind, MediaProbe, MediaStore as _, UserDataStore as _, UserPolicy,
-    UserStore as _,
+    MediaItem, MediaKind, MediaProbe, MediaStore as _, TokenStore as _, UserDataStore as _,
+    UserPolicy, UserStore as _,
 };
 use pharos_jellyfin_api::dto::{wire_item_id, WireId};
 use pharos_server::services::playback::{self, Capabilities, NegotiateRequest, PlaybackSwitches};
@@ -399,8 +399,10 @@ async fn reports_and_stop_move_the_resume_point_and_end_the_stream() {
 /// B465: a grant released without a stop, as a reload or a dropped
 /// connection releases it, ends its playback: the stream capability closes
 /// and the last reported position is saved. A grant never reported on closes
-/// its stream but leaves the stored position alone.
-/// Disarm check: with `Grant`'s `Drop` returning early, the stream stays open.
+/// its stream but leaves the stored position alone. One whose token was
+/// revoked before it was released still ends its stream capability.
+/// Disarm check: with `Grant`'s `Drop` returning early, the stream stays open;
+/// with it skipping `play_state::end` for a revoked session, the last one does.
 #[actix_web::test]
 async fn a_released_grant_ends_its_playback_at_the_last_report() {
     let (server, fx) = crate::revocation::start().await;
@@ -475,6 +477,32 @@ async fn a_released_grant_ends_its_playback_at_the_last_report() {
         position().await,
         300_000_000,
         "no report, no position written"
+    );
+
+    let (grant, decided) = play().await.unwrap();
+    report(&grant, 60_000, false).await.unwrap();
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    drop(grant);
+    // A revoked token refuses the stream URL on its own, so look at the
+    // capability itself.
+    let mut ended = false;
+    for _ in 0..100 {
+        if fx
+            .state
+            .transcode_sessions
+            .get(&decided.psid)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            ended = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        ended,
+        "a revoked session's released grant still ends its stream"
     );
 }
 
