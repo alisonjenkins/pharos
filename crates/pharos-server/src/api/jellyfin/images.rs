@@ -478,19 +478,31 @@ async fn serve_image(
             // metadata (thumb_url = the old server's local disk path like
             // /config/data/metadata/People/…), which a browser would
             // resolve relative to pharos and 404.
-            return Ok(
-                match person
-                    .thumb_url
-                    .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-                {
-                    Some(url) => HttpResponse::Found()
-                        .insert_header((actix_web::http::header::LOCATION, url))
-                        .finish(),
-                    // Known person, no photo → 404; the client renders its
-                    // initials placeholder.
+            let thumb = person
+                .thumb_url
+                .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+            // A provider portrait is passed through from this origin, so a
+            // page whose CSP allows only 'self' images can show it.
+            if let Some(url) = thumb.as_deref().filter(|u| crate::portrait::is_proxied(u)) {
+                return Ok(match crate::portrait::fetch(url).await {
+                    Some(p) => HttpResponse::Ok()
+                        .content_type(p.content_type)
+                        .insert_header((
+                            actix_web::http::header::CACHE_CONTROL,
+                            "public, max-age=604800",
+                        ))
+                        .body(p.bytes),
                     None => HttpResponse::NotFound().body(""),
-                },
-            );
+                });
+            }
+            return Ok(match thumb {
+                Some(url) => HttpResponse::Found()
+                    .insert_header((actix_web::http::header::LOCATION, url))
+                    .finish(),
+                // Known person, no photo → 404; the client renders its
+                // initials placeholder.
+                None => HttpResponse::NotFound().body(""),
+            });
         }
     }
     let Some(cache) = state.images.as_ref() else {
