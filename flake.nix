@@ -1075,6 +1075,13 @@
           pharos = pharos;
           pharosTestBins = pharosTestBins;
           integrationFixtures = pharosIntegrationFixtures;
+          # Both compiled-deps artifacts behind one output, for CI to pin as a
+          # GC root: the build node's auto-GC otherwise deletes them within
+          # the hour, and every job then recompiles all of crates.io (~2 min).
+          ciWarmRoots = pkgs.linkFarm "pharos-ci-warm-roots" [
+            { name = "deps"; path = pharosDeps; }
+            { name = "ci-deps"; path = pharosCiDeps; }
+          ];
         } // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # `oci` + `jellyfinWebOci` + compose only meaningful on
           # linux. On darwin the same attrs resolve under
