@@ -2002,6 +2002,7 @@ fn summary(g: pharos_client::group::GroupSummary) -> GroupSummary {
         item: g.item,
         tracks: tracks(&g.tracks),
         members: g.members.into_iter().map(member).collect(),
+        you: g.you,
     }
 }
 
