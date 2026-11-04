@@ -29,7 +29,7 @@ use super::playback::{
     volume_setting, Engine, MediaEvent, MediaState, OnFatal, Outgoing, PlaybackEngine, ReportClock,
     SubtitleSwitch, VOLUME_KEY,
 };
-use super::queue::{Queue, QueueAction, QueueCtx};
+use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::route::Route;
 use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
 use super::together_view::{InviteView, TogetherView};
@@ -1787,6 +1787,39 @@ fn Player(
                 // In place of this episode, so Back leaves the show rather than
                 // replaying every episode watched.
                 Control::Play(id) => go(id),
+                // History first, so a song from a mix or the queue goes back
+                // to what played; the album's previous track when there is none.
+                Control::Previous => {
+                    if queued && queue.peek().stepping_back() {
+                        platform::info("pharos: previous ignored reason=stepping_back");
+                        return;
+                    }
+                    let (to, reason) = if state.position_ms > RESTART_AFTER_MS {
+                        (None, "past_start")
+                    } else if let Some(to) = queued
+                        .then(|| {
+                            let mut queue = queue;
+                            let back = queue.write().back(Track::from(&p.detail.item));
+                            back
+                        })
+                        .flatten()
+                    {
+                        (Some(to), "history")
+                    } else if let Some(to) = near.previous {
+                        (Some(to), "album")
+                    } else {
+                        (None, "nothing_before")
+                    };
+                    platform::info(&format!(
+                        "pharos: previous at_ms={} to={} reason={reason}",
+                        state.position_ms,
+                        to.map_or_else(|| "restart".to_owned(), |id| id.to_string())
+                    ));
+                    match to {
+                        Some(id) => go(id),
+                        None => seek(0),
+                    }
+                }
                 Control::Back => {
                     if !platform::go_back() {
                         nav.0.call(Route::Home);

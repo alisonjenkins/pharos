@@ -119,6 +119,8 @@ pub enum Control {
     Back,
     /// Play another item: the previous or next episode.
     Play(ItemRef),
+    /// The previous song, or this one from the start (B464/V406).
+    Previous,
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -555,6 +557,8 @@ pub struct Shortcuts {
     on_control: EventHandler<Control>,
     /// Wheel travel short of a whole notch, kept for the next event.
     carry: Signal<f64>,
+    /// Previous goes through `Control::Previous`, as the song's button does.
+    song: bool,
 }
 
 pub fn use_shortcuts(
@@ -569,10 +573,17 @@ pub fn use_shortcuts(
         next,
         on_control,
         carry: use_signal(|| 0.0),
+        song: false,
     }
 }
 
 impl Shortcuts {
+    /// For a song, where Previous may start it again (B464/V406).
+    pub fn for_song(mut self) -> Self {
+        self.song = true;
+        self
+    }
+
     pub fn wheel(mut self, evt: &WheelEvent) {
         evt.prevent_default();
         let (notches, rest) = wheel_notches(*self.carry.peek(), evt.delta());
@@ -592,7 +603,11 @@ impl Shortcuts {
         if skip != Some(Skip::Previous) {
             return false;
         }
-        self.play(self.previous);
+        if self.song {
+            self.on_control.call(Control::Previous);
+        } else {
+            self.play(self.previous);
+        }
         true
     }
 
@@ -629,7 +644,11 @@ impl Shortcuts {
     pub fn key(self, key: &Key, shift: bool) -> Option<Control> {
         match key {
             Key::Character(k) if shift && k.eq_ignore_ascii_case("p") => {
-                self.previous.map(Control::Play)
+                if self.song {
+                    Some(Control::Previous)
+                } else {
+                    self.previous.map(Control::Play)
+                }
             }
             Key::Character(k) if shift && k.eq_ignore_ascii_case("n") => {
                 self.next.map(Control::Play)

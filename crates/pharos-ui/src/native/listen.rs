@@ -125,7 +125,7 @@ pub fn ListenView(
     on_control: EventHandler<Control>,
 ) -> Element {
     let tap = use_hook(Tap::default);
-    let shortcuts = use_shortcuts(media, previous, next, on_control);
+    let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
     let mut style =
         use_signal(|| Style::parse(platform::stored_theme(STYLE_KEY).ok().flatten().as_deref()));
     let mut fallback = use_signal(|| None::<Fallback>);
@@ -358,6 +358,16 @@ pub fn ListenView(
                         }
                     }
                     div { class: "pharos-listen-transport",
+                        // Always there: with nothing before, it starts the
+                        // song again (B464/V406).
+                        button {
+                            class: "pharos-listen-skip",
+                            r#type: "button",
+                            aria_label: "Previous track",
+                            title: "Previous track",
+                            onclick: move |_| on_control.call(Control::Previous),
+                            Icon { path: ICON_PREVIOUS }
+                        }
                         button {
                             class: "pharos-listen-skip",
                             r#type: "button",
@@ -378,6 +388,19 @@ pub fn ListenView(
                             aria_label: "Forward 10 seconds",
                             onclick: move |_| on_control.call(Control::Seek(media.position_ms + SEEK_STEP_MS)),
                             Icon { path: ICON_FORWARD }
+                        }
+                        button {
+                            class: "pharos-listen-skip",
+                            r#type: "button",
+                            aria_label: "Next track",
+                            title: "Next track",
+                            disabled: next.is_none(),
+                            onclick: move |_| {
+                                if let Some(id) = next {
+                                    on_control.call(Control::Play(id));
+                                }
+                            },
+                            Icon { path: ICON_NEXT }
                         }
                     }
                     div { class: "pharos-listen-volume",
@@ -578,6 +601,8 @@ const ICON_PLAY: &str =
 const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
 const ICON_FORWARD: &str = "M13 7V4l6 5-6 5v-3a5 5 0 1 0 5 5h2a7 7 0 1 1-7-7Z";
+const ICON_PREVIOUS: &str = "M6 6h2v12H6zm3.5 6 8.5 6V6z";
+const ICON_NEXT: &str = "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z";
 const ICON_LEAVE: &str = "M20 11H7.8l5.6-5.6L12 4l-8 8 8 8 1.4-1.4L7.8 13H20Z";
 const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4ZM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6Z";
 /// The queue's icons (B435/V375).
@@ -781,6 +806,65 @@ mod tests {
             );
         }
         assert!(html.contains("1998 · Trip-hop"), "{html}");
+    }
+
+    fn render_next(next: Option<ItemRef>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            move |next: Option<ItemRef>| {
+                rsx! {
+                    ListenView {
+                        title: "Teardrop".to_owned(),
+                        image: None,
+                        year: None,
+                        genres: Vec::new(),
+                        runtime_ms: 330_000,
+                        media: MediaState::default(),
+                        next,
+                        lyrics: None,
+                        on_media: |_| {},
+                        on_control: |_| {},
+                    }
+                }
+            },
+            next,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// The `<button …>` tag whose `aria-label` is `label`.
+    fn button<'a>(html: &'a str, label: &str) -> &'a str {
+        let at = html
+            .find(&format!(r#"aria-label="{label}""#))
+            .unwrap_or_else(|| panic!("no {label} in {html}"));
+        let start = html[..at].rfind("<button").expect("a button");
+        let end = at + html[at..].find('>').expect("a closed tag");
+        &html[start..end]
+    }
+
+    #[test]
+    fn the_transport_steps_tracks_either_side_of_the_seek_buttons() {
+        let html = render_next(Some(ItemRef::Real(7)));
+        let order: Vec<usize> = [
+            "Previous track",
+            "Back 10 seconds",
+            "Play",
+            "Forward 10 seconds",
+            "Next track",
+        ]
+        .iter()
+        .map(|l| html.find(&format!(r#"aria-label="{l}""#)).expect(l))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{html}");
+        assert!(!button(&html, "Next track").contains("disabled"), "{html}");
+        // Previous can always start the song again.
+        assert!(
+            !button(&html, "Previous track").contains("disabled"),
+            "{html}"
+        );
+
+        let last = render_next(None);
+        assert!(button(&last, "Next track").contains("disabled"), "{last}");
     }
 
     #[test]
