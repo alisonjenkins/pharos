@@ -1,6 +1,6 @@
 # ADR-0039: The native UI's GPU layer is WebGL2 via `glow`, behind a `Surface` port, with CSS as the fallback
 
-- **Status:** Accepted
+- **Status:** Superseded in part by ADR-0049 (the `glow` binding and the lost-context rule)
 - **Date:** 2026-11-02T19:20:00Z
 - **Deciders:** Alison Jenkins
 
