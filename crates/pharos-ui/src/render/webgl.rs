@@ -10,7 +10,7 @@ use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 use web_sys::{
-    WebGl2RenderingContext as Gl, WebGlProgram, WebGlTexture, WebGlUniformLocation,
+    WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlTexture, WebGlUniformLocation,
     WebGlVertexArrayObject,
 };
 
@@ -20,6 +20,9 @@ use super::{Fallback, Frame, Surface, DATA_ROWS, DATA_WIDTH};
 /// Device pixels per CSS pixel at most: past this a fill-rate-bound headset
 /// (Quest, Steam Frame) spends GPU time on detail a soft shader never shows.
 const MAX_PIXEL_RATIO: f64 = 1.25;
+
+/// `a_corner` for the one triangle that covers the screen, in 0 to 2.
+const CORNERS: [u8; 6] = [0, 0, 2, 0, 0, 2];
 
 struct Uniforms {
     time: Option<WebGlUniformLocation>,
@@ -34,6 +37,7 @@ struct Uniforms {
 struct Resources {
     program: WebGlProgram,
     vao: WebGlVertexArrayObject,
+    corners: WebGlBuffer,
     texture: WebGlTexture,
     uniforms: Uniforms,
 }
@@ -114,6 +118,15 @@ fn build(gl: &Gl, program: Program) -> Result<Resources, Fallback> {
     let vao = gl
         .create_vertex_array()
         .ok_or_else(|| Fallback::Shader("create vertex array".to_owned()))?;
+    let corners = gl
+        .create_buffer()
+        .ok_or_else(|| Fallback::Shader("create buffer".to_owned()))?;
+    gl.bind_vertex_array(Some(&vao));
+    gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&corners));
+    gl.buffer_data_with_u8_array(Gl::ARRAY_BUFFER, &CORNERS, Gl::STATIC_DRAW);
+    gl.enable_vertex_attrib_array(0);
+    gl.vertex_attrib_pointer_with_i32(0, 2, Gl::UNSIGNED_BYTE, false, 0, 0);
+    gl.bind_vertex_array(None);
     let texture = gl
         .create_texture()
         .ok_or_else(|| Fallback::Shader("create texture".to_owned()))?;
@@ -132,6 +145,7 @@ fn build(gl: &Gl, program: Program) -> Result<Resources, Fallback> {
     Ok(Resources {
         program: handle,
         vao,
+        corners,
         texture,
         uniforms,
     })
@@ -259,6 +273,7 @@ impl Drop for WebglSurface {
         let r = &self.resources;
         self.gl.delete_texture(Some(&r.texture));
         self.gl.delete_vertex_array(Some(&r.vao));
+        self.gl.delete_buffer(Some(&r.corners));
         self.gl.delete_program(Some(&r.program));
         if let Some(lose) = &self.lose {
             lose.lose_context();
