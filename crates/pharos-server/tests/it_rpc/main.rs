@@ -7,6 +7,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod avatar;
 mod bootstrap;
 mod client;
 mod client_api;
