@@ -350,6 +350,13 @@ pub fn TitleView(detail: Detail) -> Element {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
                             if resume { "Resume" } else { "Play" }
                         }
+                        if resume {
+                            Link {
+                                to: Route::WatchFromStart(item.id),
+                                class: "pharos-button pharos-button-secondary",
+                                "Play from start"
+                            }
+                        }
                     }
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
@@ -717,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn a_title_offers_play_or_resume() {
+    fn a_title_offers_play_or_resume_and_play_from_start() {
         let mut movie = item(ItemKind::Movie);
         movie.runtime_ms = 102 * 60_000;
         let detail = Detail {
@@ -734,6 +741,10 @@ mod tests {
         assert!(
             html.contains(r#"href="/ui/watch/1""#) && html.contains(">Play<"),
             "{html}"
+        );
+        assert!(
+            !html.contains("Play from start"),
+            "nothing to resume: {html}"
         );
         assert!(
             html.contains("2001 · 1h 42m") && html.contains("A heist.") && html.contains("Crime"),
@@ -753,6 +764,10 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
+        assert!(
+            html.contains(r#"href="/ui/watch/1/start""#) && html.contains(">Play from start<"),
+            "{html}"
+        );
     }
 
     #[test]

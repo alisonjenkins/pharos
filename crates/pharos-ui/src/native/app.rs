@@ -835,7 +835,14 @@ fn Screen(route: Route) -> Element {
         Route::Title(id) => rsx! { TitleScreen { id } },
         // Another item (the next episode) mounts a new playback rather than
         // re-rendering this one's.
-        Route::Watch(id) => remount_on(&id.to_string(), rsx! { WatchScreen { id } }),
+        Route::Watch(id) => remount_on(
+            &id.to_string(),
+            rsx! { WatchScreen { id, from_start: false } },
+        ),
+        Route::WatchFromStart(id) => remount_on(
+            &format!("{id}/start"),
+            rsx! { WatchScreen { id, from_start: true } },
+        ),
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
@@ -1097,7 +1104,7 @@ impl PartialEq for PlayingRef {
 }
 
 #[component]
-fn WatchScreen(id: ItemRef) -> Element {
+fn WatchScreen(id: ItemRef, from_start: bool) -> Element {
     let ctx = use_context::<Ctx>();
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
@@ -1165,6 +1172,7 @@ fn WatchScreen(id: ItemRef) -> Element {
                         );
                     }
                     let start_ms = match resume_from.get() {
+                        0 if from_start => 0,
                         0 => start_ms(detail.item.position_ms, detail.item.played),
                         here => here,
                     };

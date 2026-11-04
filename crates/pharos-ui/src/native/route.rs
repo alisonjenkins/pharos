@@ -12,6 +12,8 @@ pub enum Route {
     Browse(ItemRef),
     Title(ItemRef),
     Watch(ItemRef),
+    /// Watch from the beginning, whatever position was stored.
+    WatchFromStart(ItemRef),
     SignIn,
     /// The older REST panes (admin, preferences, search, live TV) until they
     /// move to the native API.
@@ -43,6 +45,7 @@ impl Route {
             ["browse", s] => id(s).map_or_else(|| not_found(path), Route::Browse),
             ["title", s] => id(s).map_or_else(|| not_found(path), Route::Title),
             ["watch", s] => id(s).map_or_else(|| not_found(path), Route::Watch),
+            ["watch", s, "start"] => id(s).map_or_else(|| not_found(path), Route::WatchFromStart),
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
             ["find"] => Route::Find,
@@ -58,6 +61,7 @@ impl Route {
             Route::Browse(id) => format!("{MOUNT}/browse/{id}"),
             Route::Title(id) => format!("{MOUNT}/title/{id}"),
             Route::Watch(id) => format!("{MOUNT}/watch/{id}"),
+            Route::WatchFromStart(id) => format!("{MOUNT}/watch/{id}/start"),
             Route::SignIn => format!("{MOUNT}/signin"),
             Route::Manage => format!("{MOUNT}/manage"),
             Route::Appearance => format!("{MOUNT}/settings/appearance"),
@@ -72,7 +76,7 @@ impl Route {
             Route::Home => "home",
             Route::Browse(_) => "browse",
             Route::Title(_) => "title",
-            Route::Watch(_) => "watch",
+            Route::Watch(_) | Route::WatchFromStart(_) => "watch",
             Route::SignIn => "signin",
             Route::Manage => "manage",
             Route::Appearance => "appearance",
@@ -98,6 +102,7 @@ mod tests {
             Route::Browse(ItemRef::Synth(9)),
             Route::Title(ItemRef::Real(42)),
             Route::Watch(ItemRef::Real(42)),
+            Route::WatchFromStart(ItemRef::Synth(42)),
             Route::SignIn,
             Route::Manage,
             Route::Appearance,
@@ -115,7 +120,14 @@ mod tests {
 
     #[test]
     fn unknown_paths_and_bad_ids_are_not_found() {
-        for path in ["/title", "/title/abc", "/title/1/2", "/nope", "/watch/+1"] {
+        for path in [
+            "/title",
+            "/title/abc",
+            "/title/1/2",
+            "/nope",
+            "/watch/+1",
+            "/watch/1/end",
+        ] {
             assert_eq!(Route::parse(path), Route::NotFound(path.into()), "{path}");
         }
     }

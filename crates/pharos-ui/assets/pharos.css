@@ -496,6 +496,14 @@ input:focus-visible {
 .pharos-button:hover {
   opacity: 0.9;
 }
+/* The quieter action beside the main one: Play from start, Mark watched. */
+.pharos-button-secondary {
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  border: 1px solid var(--px-color-border);
+  font: inherit;
+  font-weight: 600;
+}
 .pharos-overview {
   max-width: 60ch;
   line-height: 1.5;
