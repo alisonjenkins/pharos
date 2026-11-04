@@ -241,6 +241,9 @@ pub fn WatchView(
                     onvolumechange: move |_| on_media.call(MediaEvent::Changed),
                     ondurationchange: move |_| on_media.call(MediaEvent::Changed),
                     onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                    onwaiting: move |_| on_media.call(MediaEvent::Waiting),
+                    onstalled: move |_| on_media.call(MediaEvent::Waiting),
+                    oncanplay: move |_| on_media.call(MediaEvent::CanPlay),
                     for (id, t) in text_tracks {
                         track {
                             key: "{id}",
