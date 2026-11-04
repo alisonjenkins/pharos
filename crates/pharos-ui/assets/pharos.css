@@ -1053,6 +1053,90 @@ body:has(.pharos-stage.is-full) .pharos-error {
   color: var(--px-color-accent-fg);
 }
 
+/* "Up next": the next episode and a countdown to it, over the credits.
+   It stays while the rest of the chrome fades. */
+.pharos-up-next {
+  position: absolute;
+  right: 1rem;
+  bottom: 5.5rem;
+  display: flex;
+  gap: 0.9rem;
+  align-items: flex-start;
+  width: min(26rem, calc(100% - 2rem));
+  padding: 0.8rem;
+  box-sizing: border-box;
+  border-radius: var(--px-radius);
+  background: rgb(0 0 0 / 0.78); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-up-next-art {
+  flex: none;
+  width: 9rem;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: calc(var(--px-radius) / 2);
+}
+.pharos-up-next-text {
+  flex: 1;
+  min-width: 0;
+}
+.pharos-up-next-text p {
+  margin: 0;
+}
+.pharos-up-next-eyebrow {
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+.pharos-up-next-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  font-weight: 600;
+}
+.pharos-up-next-number,
+.pharos-up-next-count {
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+.pharos-up-next-bar {
+  height: 3px;
+  margin: 0.45rem 0 0.6rem;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--px-color-accent) var(--pharos-fill, 0%), rgb(255 255 255 / 0.25) 0); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-up-next-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+.pharos-up-next-actions button {
+  padding: 0.45rem 0.9rem;
+  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.pharos-up-next-actions .pharos-up-next-play {
+  border-color: var(--px-color-accent);
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-up-next-actions button:hover,
+.pharos-up-next-actions button:focus-visible {
+  outline: 2px solid var(--px-color-accent);
+  outline-offset: 2px;
+}
+@media (max-width: 30rem) {
+  .pharos-up-next-art {
+    display: none;
+  }
+}
+
 /* Now playing (013 US7): the visualiser fills the window like a video,
    with the song's art and controls in a bar along the bottom so the middle
    stays clear. Without the GPU layer the gradient is the whole look. */

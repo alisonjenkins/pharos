@@ -31,8 +31,9 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
-    volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
-    ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
+    up_next_at, volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing,
+    PlaybackEngine, ReportClock, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
+    MAX_BITRATE_KEY, VOLUME_KEY,
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -47,7 +48,8 @@ use super::views::{
     ErrorNote, FindView, Hits, HomeView, Loading, Nav, Shell, SignInView, StatusView, TitleView,
 };
 use super::watch_view::{
-    text_track_id, Control, Controls, WatchView, OUTGOING_ID, PLAYER_ID, SEEK_ID, VIDEO_ID,
+    text_track_id, total_ms, Control, Controls, UpNextCard, WatchView, OUTGOING_ID, PLAYER_ID,
+    SEEK_ID, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -1867,6 +1869,7 @@ impl PartialEq for PlayingRef {
 #[component]
 fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
+    let replace = use_context::<Replace>();
     let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
     // A song that follows one handing over fades in as that one fades out.
     // Taken by the first player mounted, so a renegotiated one starts as is.
@@ -1960,6 +1963,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             q.upcoming().len(),
             q.shuffled()
         ));
+    });
+    // The next episode's name and still, for the "Up next" card.
+    let upcoming = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let next = near
+            .read()
+            .as_ref()
+            .and_then(|n| n.as_ref())
+            .and_then(|(n, _)| n.next);
+        async move {
+            let (api, next) = (api?, next?);
+            api.detail(&call("watch", "up next"), next)
+                .await
+                .map(|d| d.item)
+                .map_err(|e| platform::warn(&format!("pharos: up next unavailable: {e}")))
+                .ok()
+        }
     });
     // A reconnect replaces the API but must not renegotiate: that would mount
     // a new player mid-song. Only gaining or losing the API does.
@@ -2137,7 +2157,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     playing: p.clone(),
                     last_ms: LastMs(Rc::clone(&last_ms)),
                     near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
+                    upcoming: upcoming.read().clone().flatten(),
                     on_renegotiate: move |next| picks.set(next),
+                    // In place of this episode, as the next-episode button does.
+                    on_advance: move |next| replace.0.call(Route::Watch(next)),
                     watch: watch.clone(),
                     on_quality: move |cap| {
                         store_bitrate(quality::AUTO_RUNG_KEY, cap);
@@ -2237,7 +2260,11 @@ fn Player(
     playing: PlayingRef,
     last_ms: LastMs,
     near: Neighbours,
+    upcoming: Option<Item>,
     on_renegotiate: EventHandler<TrackPicks>,
+    /// Plays the next episode once this one is finished: Up next, or the
+    /// video ending.
+    on_advance: EventHandler<ItemRef>,
     watch: QualityWatch,
     on_quality: EventHandler<u64>,
     slot: Slot,
@@ -2294,6 +2321,9 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    let mut up_next = use_signal(UpNext::default);
+    let mut up_next_step = use_signal(|| UpNextStep::Hidden);
+    let advanced = use_hook(|| Rc::new(Cell::new(false)));
     let StageCtx(stage) = use_context::<StageCtx>();
     // The view alone, so a drag (which moves the spot) does not redraw the
     // player.
@@ -2568,7 +2598,35 @@ fn Player(
         platform::show_text_track(VIDEO_ID, id.as_deref());
     });
 
+    // Finishing this episode for the next: every road to the next episode
+    // that counts as watching this one to its end comes through here.
+    let advance = {
+        let (p, clock, advanced) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&advanced));
+        move |next: ItemRef| {
+            if advanced.replace(true) {
+                return;
+            }
+            clock.borrow_mut().stop();
+            // A stop at the end is how the server marks an item watched,
+            // once, whether or not an earlier stop (page hide) went first.
+            let at = total_ms(&media.peek(), p.detail.item.runtime_ms);
+            let grant = p.grant.borrow().clone();
+            platform::spawn_detached(async move {
+                if let Err(e) = grant.stop(&call("watch", "finish"), at).await {
+                    platform::warn(&format!("pharos: marking watched failed: {e}"));
+                }
+            });
+            on_advance.call(next);
+        }
+    };
+    // Only an episode moves on by itself.
+    // The next episode often arrives after the player mounts, and the media
+    // handlers can outlive the render that made them, so they read it here.
+    let up_next_to = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
+    up_next_to.set(near.next.filter(|_| p.kind == ItemKind::Episode));
+
     let on_media = {
+        let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
         let (p, clock, last_ms, switched) = (
             Rc::clone(&p),
             Rc::clone(&clock),
@@ -2641,7 +2699,24 @@ fn Player(
                     go(to);
                 }
             }
-            media.set(platform::media_state(VIDEO_ID));
+            let state = platform::media_state(VIDEO_ID);
+            media.set(state);
+            if let Some(next) = up_next_to.get() {
+                let total = total_ms(&state, p.detail.item.runtime_ms);
+                let from = up_next_at(&p.detail.segments, total);
+                let step = up_next.write().step(state.position_ms, from, total);
+                if let Some(why) = up_next.peek().moves_on(step, event) {
+                    platform::info(&format!(
+                        "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
+                        state.position_ms
+                    ));
+                    advance(next);
+                    return;
+                }
+                if *up_next_step.peek() != step {
+                    up_next_step.set(step);
+                }
+            }
             if event == MediaEvent::Changed && !burned {
                 // Text tracks load with the metadata; show the picked one.
                 let shown: Option<u32> = *subtitle.peek();
@@ -2684,6 +2759,7 @@ fn Player(
         let session = session.clone();
         let watch = watch.clone();
         let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
+        let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
         move |control: Control| {
             if retiring.get() {
                 return;
@@ -2723,9 +2799,27 @@ fn Player(
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
+                // The next-episode button while the card counts is Play now.
+                Control::Play(id)
+                    if Some(id) == up_next_to.get()
+                        && matches!(*up_next_step.peek(), UpNextStep::Counting { .. }) =>
+                {
+                    platform::info(&format!("pharos: up next: playing {id} (next button)"));
+                    advance(id);
+                }
                 // In place of this episode, so Back leaves the show rather than
                 // replaying every episode watched.
                 Control::Play(id) => go(id),
+                Control::PlayNext => {
+                    if let Some(next) = up_next_to.get() {
+                        platform::info(&format!("pharos: up next: playing {next} (play now)"));
+                        advance(next);
+                    }
+                }
+                Control::CancelNext => {
+                    up_next.write().cancel();
+                    up_next_step.set(UpNextStep::Hidden);
+                }
                 // History first, so a song from a mix or the queue goes back
                 // to what played; the album's previous track when there is none.
                 Control::Previous => {
@@ -2826,6 +2920,10 @@ fn Player(
         subtitle_pick: subtitle(),
         previous: near.previous,
         next,
+        up_next: match (up_next_step(), upcoming.as_ref()) {
+            (UpNextStep::Counting { left_ms }, next) => Some(UpNextCard::of(next, left_ms)),
+            _ => None,
+        },
     };
     let on_leave = {
         let session = session.clone();
