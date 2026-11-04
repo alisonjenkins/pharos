@@ -2065,3 +2065,67 @@ mod burn_on_packed_3d_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_max_bitrate_tests {
+    use super::Capabilities;
+    use pharos_jellyfin_api::device_profile::{
+        negotiate, Decision, ServerCodecSupport, SourceMedia,
+    };
+
+    fn source(bitrate_bps: u64) -> SourceMedia {
+        SourceMedia {
+            container: "mp4".into(),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("eac3".into()),
+            bitrate_bps: Some(bitrate_bps),
+            is_video: true,
+            video_level: None,
+            video_profile: None,
+            audio_channels: None,
+            width: None,
+            height: None,
+            video_bit_depth: None,
+            video_3d_format: None,
+        }
+    }
+
+    fn caps(max_bitrate: u64) -> Capabilities {
+        Capabilities {
+            video_codecs: vec!["h264".into()],
+            audio_codecs: vec!["aac".into()],
+            containers: vec!["mp4".into()],
+            max_bitrate,
+        }
+    }
+
+    fn decide(max_bitrate: u64, source_bps: u64) -> Decision {
+        negotiate(
+            &caps(max_bitrate).profile(),
+            &source(source_bps),
+            &ServerCodecSupport::default(),
+        )
+    }
+
+    /// The remote viewer's case: an audio-remux source at 4.7 Mbit/s must not
+    /// be copied once the viewer capped the stream at 2 Mbit/s.
+    #[test]
+    fn a_source_above_the_viewers_max_is_transcoded_at_that_max() {
+        match decide(2_000_000, 4_700_000) {
+            Decision::Transcode {
+                max_video_bitrate_bps,
+                ..
+            } => assert_eq!(max_video_bitrate_bps, Some(2_000_000)),
+            other => panic!("expected a capped transcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_and_a_source_under_the_max_keep_the_copy() {
+        assert!(matches!(decide(0, 4_700_000), Decision::AudioRemux { .. }));
+        assert!(matches!(
+            decide(8_000_000, 4_700_000),
+            Decision::AudioRemux { .. }
+        ));
+    }
+}
