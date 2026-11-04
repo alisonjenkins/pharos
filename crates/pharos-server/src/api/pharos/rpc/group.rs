@@ -147,6 +147,23 @@ impl Group {
             .register(key.clone(), user.name.clone(), tx.clone());
         deps.sinks.insert(reg.member_id, reg.gen, tx);
         let pump = actix_web::rt::spawn(pump(rx, sink, group.clone()));
+        // The capability is not always dropped when its connection closes
+        // (observed live: the seat outlived the socket until the silence
+        // TTL), so the close itself starts the same loss.
+        let (hook_deps, hook_key) = (deps.clone(), key.clone());
+        let (hook_id, hook_gen, hook_group) = (reg.member_id, reg.gen, group.tx.clone());
+        let hook_pump = pump.abort_handle();
+        self.session.on_connection_close(move || {
+            hook_pump.abort();
+            if hook_deps.hub.conn_gen(&hook_key) != Some(hook_gen) {
+                return;
+            }
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(lose_seat(
+                    hook_deps, hook_key, hook_id, hook_gen, hook_group,
+                ));
+            }
+        });
         Membership {
             session: Rc::clone(&self.session),
             deps: deps.clone(),
@@ -733,23 +750,45 @@ impl Drop for Membership {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let deps = self.deps.clone();
-        let (key, member_id, gen) = (self.key.clone(), self.member_id, self.gen);
-        let group = self.group.tx.clone();
-        runtime.spawn(async move {
-            let _ = group.send(GroupMsg::MemberSocketLost { member_id }).await;
-            tokio::time::sleep(deps.socket_loss_grace).await;
-            // A drain leaves the membership for the next process (B26).
-            if crate::state::is_shutting_down() {
-                return;
-            }
-            // A newer registration of the device bumped the generation.
-            if let Some(group) = deps.hub.remove_if_current_gen(&key, gen) {
-                let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
-                deps.sinks.remove(member_id, gen);
-                tracing::info!(device_id = %key, %member_id, group = %group.group_id, "syncplay: native member removed after its connection stayed gone");
-            }
-        });
+        runtime.spawn(lose_seat(
+            self.deps.clone(),
+            self.key.clone(),
+            self.member_id,
+            self.gen,
+            self.group.tx.clone(),
+        ));
+    }
+}
+
+/// A member's connection is gone: the group stops waiting on it at once and
+/// keeps the seat through the grace, so the same device joining again takes
+/// it over; if none does, the member is removed. Safe to run twice for one
+/// registration (a dropped capability and a closed connection both run it):
+/// the generation fence lets only the first removal act.
+async fn lose_seat(
+    deps: SyncDeps,
+    key: String,
+    member_id: MemberId,
+    gen: u64,
+    group: mpsc::Sender<GroupMsg>,
+) {
+    let _ = group.send(GroupMsg::MemberSocketLost { member_id }).await;
+    tokio::time::sleep(deps.socket_loss_grace).await;
+    // A drain leaves the membership for the next process (B26).
+    if crate::state::is_shutting_down() {
+        return;
+    }
+    // A newer registration of the device bumped the generation.
+    if let Some(group) = deps.hub.remove_if_current_gen(&key, gen) {
+        let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
+        deps.sinks.remove(member_id, gen);
+        metrics::counter!(
+            "pharos_syncplay_member_pruned_total",
+            "connected" => "false",
+            "cause" => "connection_closed",
+        )
+        .increment(1);
+        tracing::info!(device_id = %key, %member_id, group = %group.group_id, "syncplay: native member removed after its connection stayed gone");
     }
 }
 
@@ -1069,6 +1108,60 @@ mod tests {
         ] {
             assert_eq!(translate(&msg, gid(), 0), None, "{msg:?}");
         }
+    }
+
+    /// The removal after a lost connection is counted with its cause and
+    /// leaves the hub, so `pharos_syncplay_member_pruned_total{cause=
+    /// "connection_closed"}` shows it apart from the silence TTL's.
+    #[tokio::test]
+    async fn a_seat_lost_with_its_connection_is_removed_and_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
+        use std::sync::Arc;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+
+        let sinks = MemberSinks::new();
+        let deps = SyncDeps {
+            hub: SessionHub::new(),
+            registry: GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone()))),
+            sinks,
+            socket_loss_grace: std::time::Duration::from_millis(10),
+        };
+        let handle = deps.registry.create().await.unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let key = "user:dev".to_string();
+        let reg = deps.hub.register(key.clone(), "n".into(), tx);
+        deps.hub.attach_group(&key, handle.clone());
+
+        lose_seat(
+            deps.clone(),
+            key.clone(),
+            reg.member_id,
+            reg.gen,
+            handle.tx.clone(),
+        )
+        .await;
+
+        assert_eq!(deps.hub.conn_gen(&key), None, "out of the hub");
+        let count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let labelled = ck.key().name() == "pharos_syncplay_member_pruned_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "cause" && l.value() == "connection_closed");
+                match (labelled, v) {
+                    (true, DebugValue::Counter(n)) => Some(n),
+                    _ => None,
+                }
+            });
+        assert_eq!(count, Some(1));
     }
 
     #[test]

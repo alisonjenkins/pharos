@@ -579,6 +579,7 @@ async fn run<S>(
         }),
     };
     let _ = session.close(cause.reason()).await;
+    ctx.closed();
     record_closed(&cause, conn.id(), ctx.is_signed_in(), started.elapsed());
 }
 
