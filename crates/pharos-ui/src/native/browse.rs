@@ -990,14 +990,13 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
 }
 
 /// The ids the show page asks the group about: the series, the season shown
-/// and the season's episodes, within the server's cap.
+/// and the season's episodes.
 pub fn seen_ids(show: &Show) -> Vec<ItemRef> {
     show.series
         .iter()
         .map(|d| d.item.id)
         .chain(show.selected)
         .chain(show.episodes.items.iter().map(|e| e.id))
-        .take(seen::MAX_IDS)
         .collect()
 }
 
@@ -1911,7 +1910,7 @@ mod tests {
 
     fn seen_by(id: &str, name: &str, items: Vec<seen::ItemSeen>) -> MemberSeen {
         MemberSeen {
-            member: crate::native::together::Member {
+            member: pharos_client::group::GroupMember {
                 id: id.into(),
                 name: name.into(),
                 buffering: false,

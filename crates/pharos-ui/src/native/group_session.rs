@@ -13,7 +13,7 @@ use futures_util::future::LocalBoxFuture;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
 use super::playback::MediaEvent;
-use super::seen::MemberSeen;
+use super::seen::{self, MemberSeen};
 use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
     GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SELF_SEEK_GRACE_MS,
@@ -32,6 +32,9 @@ pub struct GroupView {
     pub members: Vec<Member>,
     /// Why the group is over, once it is.
     pub ended: Option<String>,
+    /// Counts the group's updates, so a screen can fetch what an update may
+    /// have changed (what members have seen) without comparing the rest.
+    pub activity: u64,
 }
 
 /// What the store asks the screens to do.
@@ -114,6 +117,8 @@ pub struct GroupState {
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
     pub ended: Option<String>,
+    /// The group's updates so far.
+    activity: u64,
     /// The item the watch page shows.
     watching: Option<ItemRef>,
     clock: ClockEstimator,
@@ -189,6 +194,7 @@ impl GroupState {
 
     /// Take an update; the actions for the player and screens.
     pub fn apply(&mut self, update: GroupUpdate, now_ms: i64) -> Vec<Action> {
+        self.activity = self.activity.wrapping_add(1);
         match update {
             GroupUpdate::Joined(g) => {
                 self.id = Some(g.id);
@@ -296,6 +302,7 @@ impl GroupState {
             active,
             members: self.members.clone(),
             ended: self.ended.clone(),
+            activity: self.activity,
         }
     }
 }
@@ -374,7 +381,13 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         if !self.active() {
             return Ok(Vec::new());
         }
-        self.client.seen(ids).await
+        // The server answers at most MAX_IDS at a time; ask in chunks so every
+        // id gets its marks.
+        let mut all = Vec::new();
+        for chunk in ids.chunks(seen::MAX_IDS) {
+            seen::merge(&mut all, self.client.seen(chunk.to_vec()).await?);
+        }
+        Ok(all)
     }
 
     pub fn view(&self) -> GroupView {
@@ -1117,9 +1130,18 @@ mod tests {
     fn seen_asks_the_group_only_while_in_one() {
         let rig = rig();
         let ids = vec![ItemRef::Real(1), ItemRef::Real(2)];
+        let many: Vec<ItemRef> = (0..250).map(ItemRef::Real).collect();
+        let _ = rig.session.seen(many).now_or_never();
+        assert_eq!(
+            calls_with(&rig, "seen("),
+            vec!["seen(200)".to_owned(), "seen(50)".to_owned()]
+        );
         let asked = rig.session.seen(ids.clone()).now_or_never();
         assert!(matches!(asked, Some(Ok(_))));
-        assert_eq!(calls_with(&rig, "seen("), vec!["seen(2)".to_owned()]);
+        assert_eq!(
+            calls_with(&rig, "seen(").last().map(String::as_str),
+            Some("seen(2)")
+        );
         let idle = Session::new(FakeGroups::default(), TestEnv::default());
         let none = idle.seen(ids).now_or_never();
         assert!(matches!(none, Some(Ok(v)) if v.is_empty()));

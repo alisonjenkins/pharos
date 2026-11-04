@@ -17,7 +17,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{Engine, MediaState, OnFatal, PlaybackEngine, Recovery, RecoveryBudget};
-use super::seen::{ItemSeen, MemberSeen};
+use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
 use pharos_client::api::ItemRef;
 
@@ -2205,24 +2205,7 @@ impl GroupClient for Groups {
 
     async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError> {
         let m = self.membership()?;
-        let answer = m.seen(&self.call, &ids).await.map_err(group_error)?;
-        Ok(answer
-            .into_iter()
-            .map(|m| MemberSeen {
-                member: member(m.member),
-                items: m
-                    .items
-                    .into_iter()
-                    .map(|i| ItemSeen {
-                        id: i.id,
-                        played: i.played,
-                        position_pct: i.position_pct,
-                        played_count: i.played_count,
-                        total_count: i.total_count,
-                    })
-                    .collect(),
-            })
-            .collect())
+        m.seen(&self.call, &ids).await.map_err(group_error)
     }
 
     async fn leave(&self) -> Result<(), GroupError> {
