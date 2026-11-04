@@ -26,6 +26,8 @@ use super::paging::{Pager, Trigger};
 use super::platform;
 use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
+use super::seen::{self, MemberSeen};
+use super::together_view::{InThisGroup, SeenDots};
 use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
 use pharos_client::mix::radio;
 
@@ -449,7 +451,7 @@ pub async fn load<A: PharosApi>(
 }
 
 #[component]
-pub fn BrowseLayout(browse: Browse) -> Element {
+pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> Element {
     match browse {
         Browse::Grid {
             title,
@@ -457,7 +459,7 @@ pub fn BrowseLayout(browse: Browse) -> Element {
             more,
             library,
         } => rsx! { GridView { title, page, more, library } },
-        Browse::Show(show) => rsx! { ShowView { show } },
+        Browse::Show(show) => rsx! { ShowView { show, seen } },
         Browse::Music {
             title,
             artists,
@@ -948,7 +950,8 @@ fn Hero(title: String, detail: Option<Detail>, facts: Vec<String>, square: bool)
 /// The show page: the series hero, its seasons as tabs (links, so the
 /// season shown is in the URL), and the season's episodes.
 #[component]
-pub fn ShowView(show: Show) -> Element {
+pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element {
+    let in_group = in_this_group(&show, &seen);
     let facts: Vec<String> = [
         show.series
             .as_ref()
@@ -980,22 +983,55 @@ pub fn ShowView(show: Show) -> Element {
             } else if let Some(season) = show.seasons.first() {
                 h3 { class: "pharos-section-title", "{season.name}" }
             }
-            EpisodeList { page: show.episodes.clone() }
+            InThisGroup { rows: in_group }
+            EpisodeList { page: show.episodes.clone(), seen }
         }
+    }
+}
+
+/// The ids the show page asks the group about: the series, the season shown
+/// and the season's episodes, within the server's cap.
+pub fn seen_ids(show: &Show) -> Vec<ItemRef> {
+    show.series
+        .iter()
+        .map(|d| d.item.id)
+        .chain(show.selected)
+        .chain(show.episodes.items.iter().map(|e| e.id))
+        .take(seen::MAX_IDS)
+        .collect()
+}
+
+/// The marks the show page's "In this group" shows: the series' episode
+/// counts, and the shown season's when there is one besides.
+fn in_this_group(show: &Show, seen: &[MemberSeen]) -> Vec<(String, Vec<seen::SeenRow>)> {
+    if seen.is_empty() {
+        return Vec::new();
+    }
+    let series = show.series.as_ref().map(|d| d.item.id);
+    match (series, show.selected) {
+        (Some(series), Some(season)) if series != season => vec![
+            ("Series".to_owned(), seen::rows(seen, series)),
+            ("This season".to_owned(), seen::rows(seen, season)),
+        ],
+        (Some(id), _) | (None, Some(id)) => vec![(String::new(), seen::rows(seen, id))],
+        (None, None) => Vec::new(),
     }
 }
 
 /// A season's episodes as rows: still, number and name, runtime, watched
 /// state and progress. The row opens the episode; Play starts it.
 #[component]
-pub fn EpisodeList(page: Page) -> Element {
+pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Element {
     rsx! {
         if page.items.is_empty() {
             p { class: "pharos-empty", "No episodes yet." }
         }
         ol { class: "pharos-episodes",
             for ep in page.items.iter() {
-                li { key: "{ep.id}", EpisodeRow { episode: ep.clone() } }
+                li {
+                    key: "{ep.id}",
+                    EpisodeRow { episode: ep.clone(), seen: seen::rows(&seen, ep.id) }
+                }
             }
         }
         MoreNote { page }
@@ -1003,7 +1039,7 @@ pub fn EpisodeList(page: Page) -> Element {
 }
 
 #[component]
-fn EpisodeRow(episode: Item) -> Element {
+fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Element {
     let progress = progress_percent(&episode);
     let label = match episode.episode {
         Some(n) => format!("{n}. {}", episode.name),
@@ -1027,6 +1063,7 @@ fn EpisodeRow(episode: Item) -> Element {
                         if let Some(l) = length { "{l}" }
                         if episode.played { " · Watched" }
                     }
+                    SeenDots { rows: seen }
                 }
             }
             Link { to: Route::Watch(episode.id), class: "pharos-button pharos-episode-play",
@@ -1871,6 +1908,92 @@ mod tests {
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
     }
+
+    fn seen_by(id: &str, name: &str, items: Vec<seen::ItemSeen>) -> MemberSeen {
+        MemberSeen {
+            member: crate::native::together::Member {
+                id: id.into(),
+                name: name.into(),
+                buffering: false,
+            },
+            items,
+        }
+    }
+
+    fn show_of_two_episodes() -> Show {
+        const S1: ItemRef = ItemRef::Synth(12);
+        let mut one = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
+        one.episode = Some(1);
+        let mut two = item(ItemRef::Real(2), ItemKind::Episode, "Return");
+        two.episode = Some(2);
+        Show {
+            title: "Show".into(),
+            series: Some(detail(item(ItemRef::Synth(11), ItemKind::Series, "Show"))),
+            seasons: vec![item(S1, ItemKind::Season, "Season 1")],
+            selected: Some(S1),
+            episodes: page(vec![one, two]),
+        }
+    }
+
+    #[test]
+    fn the_show_page_asks_about_the_series_the_season_and_its_episodes() {
+        assert_eq!(
+            seen_ids(&show_of_two_episodes()),
+            vec![
+                ItemRef::Synth(11),
+                ItemRef::Synth(12),
+                ItemRef::Real(1),
+                ItemRef::Real(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_show_in_a_group_shows_counts_and_who_has_seen_each_episode() {
+        let count = |id, seen, of| seen::ItemSeen {
+            id,
+            played: seen == of,
+            position_pct: 0,
+            played_count: seen,
+            total_count: of,
+        };
+        let answer = vec![
+            seen_by(
+                "a",
+                "Ada",
+                vec![
+                    count(ItemRef::Synth(11), 6, 10),
+                    count(ItemRef::Synth(12), 1, 2),
+                    seen::ItemSeen {
+                        id: ItemRef::Real(1),
+                        played: true,
+                        position_pct: 0,
+                        played_count: 0,
+                        total_count: 0,
+                    },
+                ],
+            ),
+            seen_by("b", "Bo", vec![]),
+        ];
+        let show = show_of_two_episodes();
+        let html = render(move || rsx! { ShowView { show: show.clone(), seen: answer.clone() } });
+        assert!(html.contains("In this group"), "{html}");
+        assert!(html.contains("6/10 episodes"), "{html}");
+        assert!(html.contains("This season"), "{html}");
+        assert!(html.contains("1/2 episodes"), "{html}");
+        // The pilot row has a dot each; Ada's is seen, Bo's is not.
+        assert!(html.contains("pharos-seen-dot is-seen"), "{html}");
+        assert!(html.contains("pharos-seen-dot is-unseen"), "{html}");
+    }
+
+    #[test]
+    fn a_show_outside_a_group_has_no_marks() {
+        let show = show_of_two_episodes();
+        let html = render(move || rsx! { ShowView { show: show.clone() } });
+        assert!(!html.contains("In this group"), "{html}");
+        assert!(!html.contains("pharos-seen-dot"), "{html}");
+    }
+
     fn stamp(route: &str, action: &str) -> CallInfo {
         CallInfo {
             ui_route: route.into(),

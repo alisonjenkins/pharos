@@ -8,7 +8,9 @@ use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, Librar
 use super::depth;
 use super::platform;
 use super::route::Route;
+use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
+use super::together_view::InThisGroup;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
 /// instead of reloading the page.
@@ -437,8 +439,16 @@ pub fn TitleView(
     /// The viewer asked to watch this item together.
     #[props(default)]
     on_watch_together: EventHandler<ItemRef>,
+    /// What the group's members have seen, when in one.
+    #[props(default)]
+    seen: Vec<MemberSeen>,
 ) -> Element {
     let item = &detail.item;
+    let in_group = if seen.is_empty() {
+        Vec::new()
+    } else {
+        vec![(String::new(), seen::rows(&seen, item.id))]
+    };
     let facts: Vec<String> = [
         item.year.map(|y| y.to_string()),
         runtime(item.runtime_ms),
@@ -488,6 +498,7 @@ pub fn TitleView(
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
                 }
+                InThisGroup { rows: in_group }
                 if !detail.overview.is_empty() {
                     p { class: "pharos-overview", "{detail.overview}" }
                 }
@@ -637,6 +648,53 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
         }
+    }
+
+    #[test]
+    fn a_title_in_a_group_says_who_has_seen_it() {
+        let detail = Detail {
+            item: item(ItemKind::Movie),
+            overview: String::new(),
+            genres: Vec::new(),
+            chapters: Vec::new(),
+            audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
+            trickplay: Vec::new(),
+            segments: Vec::new(),
+        };
+        let answer = vec![
+            MemberSeen {
+                member: crate::native::together::Member {
+                    id: "a".into(),
+                    name: "Ada".into(),
+                    buffering: false,
+                },
+                items: vec![seen::ItemSeen {
+                    id: ItemRef::Real(1),
+                    played: false,
+                    position_pct: 40,
+                    played_count: 0,
+                    total_count: 0,
+                }],
+            },
+            MemberSeen {
+                member: crate::native::together::Member {
+                    id: "b".into(),
+                    name: "Bo".into(),
+                    buffering: false,
+                },
+                items: vec![],
+            },
+        ];
+        let html = render({
+            let detail = detail.clone();
+            move || rsx! { TitleView { detail: detail.clone(), seen: answer.clone() } }
+        });
+        assert!(html.contains("In this group"), "{html}");
+        assert!(html.contains("Ada") && html.contains("40%"), "{html}");
+        assert!(html.contains("Bo") && html.contains("not seen"), "{html}");
+        let alone = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(!alone.contains("In this group"), "{alone}");
     }
 
     #[test]

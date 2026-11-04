@@ -5,6 +5,9 @@
 use super::together::Member;
 use pharos_client::api::ItemRef;
 
+/// Ids one `seen` call may ask about, the server's cap.
+pub const MAX_IDS: usize = 200;
+
 /// One item as one member has seen it. A film or episode has `played` and
 /// `position_pct`; a series or season has `played_count` of `total_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

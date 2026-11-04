@@ -795,6 +795,69 @@ body:has(.pharos-stage.is-full) .pharos-error {
 .pharos-member-buffering {
   color: var(--px-color-warning);
 }
+/* Watch together, US6: what each member has seen. On the member strip the
+   mark shows on hover or focus; on a detail page it is a plain list; on an
+   episode row it is a dot per member. Colours are the accent for seen, a
+   dimmer accent part-way, and muted when not seen. */
+.pharos-member-seen {
+  display: none;
+  margin-left: 0.25rem;
+  color: var(--px-color-fg-muted);
+}
+.pharos-member:hover .pharos-member-seen,
+.pharos-member:focus .pharos-member-seen,
+.pharos-member:focus-within .pharos-member-seen {
+  display: inline;
+}
+.pharos-member-seen.is-seen {
+  color: var(--px-color-accent);
+}
+.pharos-group-seen {
+  margin: 1rem 0;
+}
+.pharos-seen-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-seen-mark {
+  color: var(--px-color-fg-muted);
+}
+.pharos-seen.is-seen .pharos-seen-mark {
+  color: var(--px-color-accent);
+}
+.pharos-seen-dots {
+  display: inline-flex;
+  gap: 0.25rem;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+.pharos-seen-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 50%;
+  border: 1px solid var(--px-color-border);
+  font-size: 0.65rem;
+  color: var(--px-color-fg-muted);
+  opacity: 0.55;
+}
+.pharos-seen-dot.is-seen {
+  background: var(--px-color-accent);
+  border-color: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  opacity: 1;
+}
+.pharos-seen-dot.is-partway {
+  border-color: var(--px-color-accent);
+  color: var(--px-color-fg);
+  opacity: 1;
+}
 .pharos-groups {
   margin: 0;
   padding: 0;
