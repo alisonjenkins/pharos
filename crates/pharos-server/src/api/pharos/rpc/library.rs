@@ -229,7 +229,7 @@ impl server::library::Handler for Library {
         let mut letters = out.reborrow().init_letters(len_u32(&index.letters));
         for (i, (letter, start)) in (0..).zip(&index.letters) {
             let mut entry = letters.reborrow().get(i);
-            entry.set_letter(letter.encode_utf8(&mut [0; 4]));
+            entry.set_letter(letter.as_str());
             entry.set_start(*start);
         }
         let mut genres = out.init_genres(len_u32(&index.genres));
