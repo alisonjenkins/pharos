@@ -18,7 +18,7 @@ use pharos_client::mix::{
 
 use super::app::{call, Ctx};
 use super::platform;
-use super::queue::{Queue, QueueCtx, Source, Track};
+use super::queue::{Queue, QueueAction, QueueCtx, Source, Track};
 use super::route::Route;
 use super::views::Nav;
 
@@ -94,7 +94,7 @@ pub fn start(
 ) {
     queue.drop_source(Source::Mix);
     queue.drop_source(Source::Album);
-    let generation = mix.as_ref().map_or(1, |m| m.generation + 1);
+    let generation = next_generation();
     platform::info(&format!(
         "pharos: mix start mix={name:?} rules={} seed={} play_now={play_now}",
         spec.rules.len(),
@@ -110,6 +110,33 @@ pub fn start(
         play_first: play_now,
         reasons: HashMap::new(),
     });
+}
+
+/// A number no earlier start had, for the app's life: it never resets, so
+/// an answer for a stopped mix cannot pass for a later one's.
+fn next_generation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Queue a batch as `Source::Mix`. When `first` is to play now it goes to
+/// the front, so starting it takes it out of the queue (songs leave from
+/// the front) instead of leaving a copy behind what the listener added.
+pub fn apply_batch(queue: &mut Queue, tracks: Vec<Track>, first: Option<ItemRef>) {
+    queue.append(tracks, Source::Mix);
+    let Some(first) = first else {
+        return;
+    };
+    let key = queue
+        .upcoming()
+        .iter()
+        .rev()
+        .find(|e| e.id == first && e.source == Source::Mix)
+        .map(|e| e.key);
+    if let Some(key) = key {
+        queue.apply(QueueAction::Move { key, to: 0 }, 0);
+    }
 }
 
 /// Turn the mix off; its songs leave the queue.
@@ -176,7 +203,9 @@ pub fn use_top_up(
                 match result {
                     Ok(batch) => {
                         platform::info(&top_up_line(&name, BATCH, &batch));
-                        m.exhausted = batch.exhausted;
+                        // No songs is the end of the mix whatever the flag
+                        // says: asking again would get none again.
+                        m.exhausted = batch.exhausted || batch.picks.is_empty();
                         let tracks: Vec<Track> =
                             batch.picks.iter().map(|p| Track::from(&p.item)).collect();
                         for p in batch.picks {
@@ -186,7 +215,10 @@ pub fn use_top_up(
                             m.play_first = false;
                             first = tracks.first().map(|t| t.id);
                         }
-                        queue.write().append(tracks, Source::Mix);
+                        let mut q = queue.write();
+                        apply_batch(&mut q, tracks, first);
+                        // Keep reasons only for what is still queued.
+                        m.reasons.retain(|id, _| q.contains(*id));
                     }
                     Err(e) => {
                         platform::warn(&format!(
@@ -225,6 +257,21 @@ async fn store_saved(api: &NativeApi, mixes: &[SavedMix]) -> Result<(), String> 
     .map_err(|e| e.to_string())
 }
 
+/// `m` as it can be stored in `list`: a name a newer app's mix holds gets
+/// a number, so saving never overwrites rules this app cannot read.
+pub fn saved_name(list: &[SavedMix], mut m: SavedMix) -> SavedMix {
+    let newer = |name: &str| list.iter().any(|s| s.name == name && s.newer.is_some());
+    if newer(&m.name) {
+        let base = m.name.clone();
+        let mut n = 2;
+        while newer(&format!("{base} ({n})")) {
+            n += 1;
+        }
+        m.name = format!("{base} ({n})");
+    }
+    m
+}
+
 /// What the mix line in the queue panel says under the mix's name.
 pub fn status_text(mix: &ActiveMix) -> Option<String> {
     if let Some(e) = &mix.error {
@@ -248,9 +295,14 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
     let mut open = use_signal(|| false);
     let mut editing = use_signal(|| None::<SavedMix>);
     let mut saved = use_signal(|| None::<Vec<SavedMix>>);
-    let (Some(MixCtx(mut mix)), Some(QueueCtx(mut queue))) =
-        (try_use_context::<MixCtx>(), try_use_context::<QueueCtx>())
-    else {
+    let mut load_error = use_signal(|| None::<String>);
+    // `playing` is None in a SyncPlay group, where the group picks the
+    // songs: no mix there.
+    let (Some(MixCtx(mut mix)), Some(QueueCtx(mut queue)), Some(_)) = (
+        try_use_context::<MixCtx>(),
+        try_use_context::<QueueCtx>(),
+        playing,
+    ) else {
         return rsx! {};
     };
     let load = move || {
@@ -262,30 +314,37 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
         };
         spawn(async move {
             match load_saved(&api).await {
-                Ok(list) => saved.set(Some(list)),
+                Ok(list) => {
+                    load_error.set(None);
+                    saved.set(Some(list));
+                }
+                // Never an empty list: a save would then wipe the real one.
                 Err(e) => {
                     platform::warn(&format!("pharos: mix saved list unavailable error={e}"));
-                    saved.set(Some(Vec::new()));
+                    load_error.set(Some(e));
                 }
             }
         });
     };
     let mut begin = move |name: String, spec: MixSpec| {
         open.set(false);
-        // While a song plays the mix follows it; it starts at once otherwise.
-        start(
-            &mut queue.write(),
-            &mut mix.write(),
-            name,
-            spec,
-            playing.is_none(),
-        );
+        // The player is open, so a song plays: the mix follows it.
+        start(&mut queue.write(), &mut mix.write(), name, spec, false);
     };
     let mut on_save = move |m: SavedMix| {
         let Some(api) = ctx.and_then(|c| c.api.peek().clone()) else {
             return;
         };
-        let mut list = saved.peek().clone().unwrap_or_default();
+        // Only over a list that loaded: writing over one that did not
+        // would replace every mix the user saved.
+        let Some(mut list) = saved.peek().clone() else {
+            platform::warn(&format!(
+                "pharos: mix not saved mix={:?} reason=list_not_loaded",
+                m.name
+            ));
+            return;
+        };
+        let m = saved_name(&list, m);
         match list.iter_mut().find(|s| s.name == m.name) {
             Some(slot) => *slot = m.clone(),
             None => list.push(m.clone()),
@@ -308,7 +367,12 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
         let Some(api) = ctx.and_then(|c| c.api.peek().clone()) else {
             return;
         };
-        let mut list = saved.peek().clone().unwrap_or_default();
+        let Some(mut list) = saved.peek().clone() else {
+            platform::warn(&format!(
+                "pharos: mix not deleted mix={name:?} reason=list_not_loaded"
+            ));
+            return;
+        };
         list.retain(|s| s.name != name);
         saved.set(Some(list.clone()));
         spawn(async move {
@@ -458,6 +522,8 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             MixEditor {
                 draft,
                 playing,
+                can_save: saved().is_some(),
+                save_note: load_error(),
                 on_close: move |_| editing.set(None),
                 on_save: move |m: SavedMix| {
                     on_save(m);
@@ -516,8 +582,8 @@ pub fn with_value(test: &Test, a: &str, b: &str) -> Test {
             },
         },
         Test::LengthSecs { min, max } => Test::LengthSecs {
-            min: num(a, min / 60) * 60,
-            max: num(b, max / 60) * 60,
+            min: num(a, min / 60).saturating_mul(60),
+            max: num(b, max / 60).saturating_mul(60),
         },
         Test::NotPlayedForDays(d) => Test::NotPlayedForDays(num(a, *d)),
         Test::PlayedWithinDays(d) => Test::PlayedWithinDays(num(a, *d)),
@@ -607,17 +673,17 @@ pub fn draft_problem(draft: &SavedMix) -> Option<String> {
 fn MixEditor(
     draft: SavedMix,
     playing: Option<ItemRef>,
+    /// The saved list has loaded, so a save cannot lose it.
+    can_save: bool,
+    /// Why it has not, when it failed.
+    save_note: Option<String>,
     on_close: EventHandler<()>,
     on_save: EventHandler<SavedMix>,
     on_play: EventHandler<SavedMix>,
 ) -> Element {
     let mut d = use_signal(|| draft.clone());
     let problem = draft_problem(&d.read());
-    let seed_value = match d.read().spec.seed {
-        Seed::None => "none",
-        Seed::Follow => "follow",
-        Seed::Song(_) => "song",
-    };
+    let seed_value = seed_label(d.read().spec.seed);
     let rules = d.read().spec.rules.clone();
     rsx! {
         div {
@@ -721,9 +787,12 @@ fn MixEditor(
                 span { "Like" }
                 select {
                     onchange: move |e: FormEvent| {
-                        d.write().spec.seed = match (e.value().as_str(), playing) {
-                            ("follow", _) => Seed::Follow,
-                            ("song", Some(song)) => Seed::Song(song),
+                        let kept = d.peek().spec.seed;
+                        d.write().spec.seed = match (e.value().as_str(), playing, kept) {
+                            ("follow", _, _) => Seed::Follow,
+                            ("song", Some(song), _) => Seed::Song(song),
+                            // Nothing playing: keep the song it was like.
+                            ("song", None, Seed::Song(song)) => Seed::Song(song),
                             _ => Seed::None,
                         };
                     },
@@ -764,6 +833,11 @@ fn MixEditor(
                 }
                 span { "songs" }
             }
+            if let Some(note) = save_note {
+                p { class: "pharos-mix-problem", role: "status",
+                    "Saved mixes could not be loaded, so this one cannot be saved yet: {note}"
+                }
+            }
             if let Some(p) = problem.clone() {
                 p { class: "pharos-mix-problem", role: "alert", "{p}" }
             }
@@ -778,7 +852,8 @@ fn MixEditor(
                 button {
                     class: "pharos-chip",
                     r#type: "button",
-                    disabled: problem.is_some(),
+                    disabled: problem.is_some() || !can_save,
+                    title: if can_save { "" } else { "Your saved mixes have not loaded yet" },
                     onclick: move |_| on_save.call(d.peek().clone()),
                     "Save"
                 }
@@ -926,6 +1001,46 @@ mod tests {
     }
 
     #[test]
+    fn a_song_played_at_once_goes_to_the_front_so_it_leaves_the_queue() {
+        let mut q = Queue::default();
+        q.add(vec![track(1)]);
+        apply_batch(&mut q, vec![track(5), track(6)], Some(ItemRef::Real(5)));
+        let ids: Vec<ItemRef> = q.upcoming().iter().map(|e| e.id).collect();
+        assert_eq!(ids, [5, 1, 6].map(ItemRef::Real).to_vec());
+        q.started(ItemRef::Real(5), Some(&[]), 0);
+        assert!(!q.contains(ItemRef::Real(5)), "it does not play twice");
+        let mut q = Queue::default();
+        q.add(vec![track(1)]);
+        apply_batch(&mut q, vec![track(5)], None);
+        assert_eq!(q.upcoming().last().map(|e| e.id), Some(ItemRef::Real(5)));
+    }
+
+    #[test]
+    fn generations_never_repeat_even_after_a_stop() {
+        let mut q = Queue::default();
+        let mut m = None;
+        start(&mut q, &mut m, "A".into(), MixSpec::default(), false);
+        let a = m.as_ref().unwrap().generation;
+        stop(&mut q, &mut m);
+        start(&mut q, &mut m, "B".into(), MixSpec::default(), false);
+        assert!(m.as_ref().unwrap().generation > a);
+    }
+
+    #[test]
+    fn saving_keeps_the_name_when_no_newer_mix_holds_it() {
+        let list = vec![SavedMix::new("Gym", MixSpec::default())];
+        // A plain mix of the same name is replaced in place, not renamed.
+        assert_eq!(
+            saved_name(&list, SavedMix::new("Gym", MixSpec::default())).name,
+            "Gym"
+        );
+        assert_eq!(
+            saved_name(&list, SavedMix::new("Run", MixSpec::default())).name,
+            "Run"
+        );
+    }
+
+    #[test]
     fn the_status_line_says_why_the_mix_is_quiet() {
         let mut m = on(MixSpec::default());
         assert_eq!(status_text(&m), None);
@@ -1022,6 +1137,17 @@ mod tests {
     }
 
     #[test]
+    fn there_is_no_mix_bar_in_a_group() {
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
+            use_context_provider(|| MixCtx(Signal::new(None)));
+            rsx! { MixBar { playing: None } }
+        });
+        dom.rebuild_in_place();
+        assert!(!dioxus_ssr::render(&dom).contains("pharos-mix"));
+    }
+
+    #[test]
     fn the_mix_bar_offers_a_mix_and_more_like_this_song() {
         let mut dom = VirtualDom::new(|| {
             use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
@@ -1046,7 +1172,7 @@ mod tests {
                     ..on(MixSpec::default())
                 })))
             });
-            rsx! { MixBar { playing: None } }
+            rsx! { MixBar { playing: Some(ItemRef::Real(1)) } }
         });
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
