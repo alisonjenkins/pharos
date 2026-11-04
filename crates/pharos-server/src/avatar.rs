@@ -132,8 +132,11 @@ pub fn normalise(upload: &[u8]) -> Result<Vec<u8>, AvatarError> {
     let square = picture.resize_to_fill(side, side, FilterType::Lanczos3);
     let mut out = Vec::new();
     let encode = |e: image::ImageError| AvatarError::Encode(e.to_string());
-    if square.color().has_alpha() {
-        DynamicImage::ImageRgba8(square.to_rgba8())
+    // An alpha channel alone is not transparency: a GIF always decodes to
+    // RGBA, so only a pixel that is not fully opaque keeps the PNG.
+    let rgba = square.color().has_alpha().then(|| square.to_rgba8());
+    if let Some(rgba) = rgba.filter(|p| p.pixels().any(|px| px[3] < u8::MAX)) {
+        DynamicImage::ImageRgba8(rgba)
             .write_with_encoder(PngEncoder::new(&mut out))
             .map_err(encode)?;
     } else {
@@ -267,6 +270,21 @@ mod tests {
         let logo = RgbaImage::from_pixel(100, 100, Rgba([0, 0, 0, 0]));
         let out = normalise(&encoded(logo.into(), ImageFormat::Png)).unwrap();
         assert_eq!(image::guess_format(&out).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn an_opaque_picture_with_an_alpha_channel_becomes_jpeg() {
+        let photo = RgbImage::from_pixel(30, 30, Rgb([200, 100, 50]));
+        // GIF decodes to RGBA whatever it holds; a PNG may carry an unused
+        // alpha channel.
+        let opaque_rgba = RgbaImage::from_pixel(30, 30, Rgba([200, 100, 50, 255]));
+        for upload in [
+            encoded(photo.into(), ImageFormat::Gif),
+            encoded(opaque_rgba.into(), ImageFormat::Png),
+        ] {
+            let out = normalise(&upload).unwrap();
+            assert_eq!(image::guess_format(&out).unwrap(), ImageFormat::Jpeg);
+        }
     }
 
     #[test]
