@@ -16,6 +16,11 @@ const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
 const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
 
+/** A song as the Jellyfin item list returns it. */
+type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
+/** Who a song is by: its album artist, or else its first track artist. */
+const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
+
 // Signs in on a small window and answers a home rail that overflows
 // sideways, skipping when the server has no native API or seeded user.
 async function overflowingRail(page: Page, request: APIRequestContext): Promise<Locator> {
@@ -885,7 +890,7 @@ test.describe("pharos Dioxus UI", () => {
       const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
       // An artist with an album: the first tagged track names both.
       const tracks = await json(
-        `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+        `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
       );
       const track = tracks.Items?.find(
         (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
@@ -1842,16 +1847,14 @@ test.describe("pharos Dioxus UI play queue", () => {
       (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
     const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
     const tracks = await json(
-      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
     );
     // The seeded song (05-carefree.mp3) has an album and a track artist but
-    // no album artist tag, so the artist stands in for it.
-    type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
-    const by = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
-    const track = tracks.Items?.find((t: Song) => t.Album && by(t));
+    // no album artist tag, so the artist stands in for it (songBy).
+    const track = tracks.Items?.find((t: Song) => t.Album && songBy(t));
     test.skip(!track, "the seed has no track tagged with an album and artist");
     const artists = await json(`/Artists`);
-    const artist = artists.Items?.find((a: { Name: string }) => a.Name === by(track));
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === songBy(track));
     expect(artist, "the track's artist is listed").toBeTruthy();
 
     await page.goto("/ui/");
@@ -2071,14 +2074,12 @@ test.describe("pharos Dioxus UI stage", () => {
       (await request.get(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token } })).json();
     const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
     const tracks = await json(
-      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Album`,
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
     );
-    const track = tracks.Items?.find(
-      (t: { Album?: string; AlbumArtist?: string }) => t.Album && t.AlbumArtist,
-    );
+    const track = tracks.Items?.find((t: Song) => t.Album && songBy(t));
     test.skip(!track, "the seed has no track tagged with an album and artist");
     const artists = await json(`/Artists`);
-    const artist = artists.Items?.find((a: { Name: string }) => a.Name === track.AlbumArtist);
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === songBy(track));
     expect(artist, "the track's album artist is listed").toBeTruthy();
 
     const lines: string[] = [];
