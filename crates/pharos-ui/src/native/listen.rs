@@ -418,6 +418,8 @@ pub fn ListenView(
 const CLEAR_CANCEL_ID: &str = "pharos-queue-clear-cancel";
 /// The drawer's Clear, which gets focus back when the confirm is cancelled.
 const CLEAR_ID: &str = "pharos-queue-clear";
+/// Where focus lands once a confirmed Clear has removed the Clear button.
+const SHUFFLE_ID: &str = "pharos-queue-shuffle";
 const CLEAR_NOTE_ID: &str = "pharos-queue-clear-note";
 
 /// What plays next, over the visualiser's edge (B435/V375): pick a song to
@@ -454,18 +456,19 @@ fn QueuePanel(
     }));
     let asking = confirming() && total > 0;
     // Focus follows the confirm: to Cancel when it opens, back to Clear when
-    // it is cancelled.
-    let mut returning = use_signal(|| false);
+    // it is cancelled, and to Shuffle once a confirmed Clear has removed
+    // both the dialog and the Clear button.
+    let mut returning = use_signal(|| None::<&'static str>);
     use_effect(move || {
         if confirming() {
             platform::focus_by_id(CLEAR_CANCEL_ID);
-        } else if returning() {
-            returning.set(false);
-            platform::focus_by_id(CLEAR_ID);
+        } else if let Some(id) = returning() {
+            returning.set(None);
+            platform::focus_by_id(id);
         }
     });
     let mut cancel = move || {
-        returning.set(true);
+        returning.set(Some(CLEAR_ID));
         confirming.set(false);
         platform::info(&format!("pharos: queue clear cancelled upcoming={total}"));
     };
@@ -494,6 +497,7 @@ fn QueuePanel(
                 h2 { class: "pharos-queue-title", "Up next" }
                 span { class: "pharos-muted pharos-queue-total", "{count}" }
                 button {
+                    id: SHUFFLE_ID,
                     class: "pharos-chip pharos-queue-shuffle",
                     r#type: "button",
                     aria_pressed: if shuffled { "true" } else { "false" },
@@ -532,6 +536,7 @@ fn QueuePanel(
                             class: "pharos-chip pharos-queue-confirm-clear",
                             r#type: "button",
                             onclick: move |_| {
+                                returning.set(Some(SHUFFLE_ID));
                                 confirming.set(false);
                                 on_queue.call(QueueAction::Clear);
                             },
