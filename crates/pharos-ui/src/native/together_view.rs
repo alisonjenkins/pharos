@@ -5,6 +5,7 @@
 
 use dioxus::prelude::*;
 
+use super::seen::{initial, SeenRow};
 use super::together::{GroupSummary, Member};
 
 /// The Together page: the groups running now, each with a Join button.
@@ -84,7 +85,14 @@ pub fn InviteView(
 /// The members over the player, and Leave. Sits in the watch page's top bar,
 /// so it fades with the rest of the chrome.
 #[component]
-pub fn MemberStrip(members: Vec<Member>, on_leave: EventHandler<()>) -> Element {
+pub fn MemberStrip(
+    members: Vec<Member>,
+    on_leave: EventHandler<()>,
+    /// Each member's mark on the item playing. Hover or focus on a member
+    /// shows it.
+    #[props(default)]
+    seen: Vec<SeenRow>,
+) -> Element {
     rsx! {
         div { class: "pharos-members", role: "group", aria_label: "Watching together",
             ul { class: "pharos-member-list",
@@ -92,7 +100,15 @@ pub fn MemberStrip(members: Vec<Member>, on_leave: EventHandler<()>) -> Element 
                     li {
                         key: "{member.id}",
                         class: if member.buffering { "pharos-member is-buffering" } else { "pharos-member" },
+                        tabindex: if seen.is_empty() { None } else { Some("0") },
                         "{member.name}"
+                        if let Some(row) = seen.iter().find(|r| r.member_id == member.id) {
+                            span {
+                                class: "pharos-member-seen {row.mark.state()}",
+                                title: "{row.name}: {row.mark.label()}",
+                                " {row.mark.label()}"
+                            }
+                        }
                         if member.buffering {
                             span { class: "pharos-member-buffering", role: "status", " buffering" }
                         }
@@ -104,6 +120,55 @@ pub fn MemberStrip(members: Vec<Member>, on_leave: EventHandler<()>) -> Element 
                 r#type: "button",
                 onclick: move |_| on_leave.call(()),
                 "Leave"
+            }
+        }
+    }
+}
+
+/// "In this group": what each member has seen of the item shown. `rows` has
+/// one entry per member, each with the marks to show (a series page shows the
+/// series' and the season's). Nothing renders outside a group.
+#[component]
+pub fn InThisGroup(rows: Vec<(String, Vec<SeenRow>)>) -> Element {
+    if rows.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        section { class: "pharos-group-seen", aria_label: "In this group",
+            h3 { class: "pharos-section-title", "In this group" }
+            for (scope, marks) in rows {
+                if !scope.is_empty() {
+                    p { class: "pharos-muted", "{scope}" }
+                }
+                ul { class: "pharos-seen-list",
+                    for row in marks {
+                        li { key: "{row.member_id}", class: "pharos-seen {row.mark.state()}",
+                            span { class: "pharos-seen-name", "{row.name}" }
+                            span { class: "pharos-seen-mark", " {row.mark.label()}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Small initials for who has seen an episode, on its row. Members who have
+/// not seen it show dimmed, so the row says who is still to catch up.
+#[component]
+pub fn SeenDots(rows: Vec<SeenRow>) -> Element {
+    if rows.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        span { class: "pharos-seen-dots", role: "group", aria_label: "Seen by",
+            for row in rows {
+                span {
+                    key: "{row.member_id}",
+                    class: "pharos-seen-dot {row.mark.state()}",
+                    title: "{row.name}: {row.mark.label()}",
+                    "{initial(&row.name)}"
+                }
             }
         }
     }
@@ -123,6 +188,7 @@ fn member_names(members: &[Member]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::seen::Mark;
 
     fn render(body: impl Fn() -> Element + 'static) -> String {
         let body: std::rc::Rc<dyn Fn() -> Element> = std::rc::Rc::new(body);
@@ -203,5 +269,74 @@ mod tests {
         assert!(html.contains("Ada") && html.contains("Bo"), "{html}");
         assert_eq!(html.matches("pharos-member-buffering").count(), 1, "{html}");
         assert!(html.contains(">Leave<"), "{html}");
+        assert!(!html.contains("pharos-member-seen"), "{html}");
+    }
+
+    fn row(id: &str, name: &str, mark: Mark) -> SeenRow {
+        SeenRow {
+            member_id: id.into(),
+            name: name.into(),
+            mark,
+        }
+    }
+
+    #[test]
+    fn the_strip_shows_each_members_mark_on_the_item_playing() {
+        let html = render(|| {
+            rsx! { MemberStrip {
+                members: vec![member("a", "Ada", false), member("b", "Bo", false)],
+                on_leave: |_| {},
+                seen: vec![row("a", "Ada", Mark::Seen), row("b", "Bo", Mark::Partway(40))],
+            } }
+        });
+        assert!(
+            html.contains("is-seen") && html.contains("> seen<"),
+            "{html}"
+        );
+        assert!(
+            html.contains("40%") && html.contains("is-partway"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn in_this_group_names_each_member_with_a_mark() {
+        let html = render(|| {
+            rsx! { InThisGroup { rows: vec![(String::new(), vec![
+                row("a", "Ada", Mark::Episodes { seen: 6, of: 10 }),
+                row("b", "Bo", Mark::NotSeen),
+            ])] } }
+        });
+        assert!(html.contains("In this group"), "{html}");
+        assert!(
+            html.contains("Ada") && html.contains("6/10 episodes"),
+            "{html}"
+        );
+        assert!(html.contains("Bo") && html.contains("not seen"), "{html}");
+    }
+
+    #[test]
+    fn outside_a_group_nothing_is_shown() {
+        let html = render(|| rsx! { InThisGroup { rows: vec![] } SeenDots { rows: vec![] } });
+        assert!(
+            !html.contains("In this group") && !html.contains("pharos-seen"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_episode_row_shows_an_initial_per_member_dimmed_when_unseen() {
+        let html = render(|| {
+            rsx! { SeenDots { rows: vec![
+                row("a", "Ada", Mark::Seen),
+                row("b", "Bo", Mark::NotSeen),
+            ] } }
+        });
+        assert_eq!(html.matches("pharos-seen-dot ").count(), 2, "{html}");
+        assert!(
+            html.contains("is-seen") && html.contains("is-unseen"),
+            "{html}"
+        );
+        assert!(html.contains(">A<") && html.contains(">B<"), "{html}");
     }
 }

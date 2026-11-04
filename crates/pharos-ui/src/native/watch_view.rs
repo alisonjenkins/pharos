@@ -13,6 +13,7 @@ use super::platform;
 use super::playback::{
     clock, percent, segment_at, skip_label, thumb_at, track_label, MediaEvent, MediaState,
 };
+use super::seen::SeenRow;
 use super::together::Member;
 use super::together_view::MemberStrip;
 
@@ -145,6 +146,9 @@ pub fn WatchView(
     #[props(default)]
     members: Vec<Member>,
     #[props(default)] on_leave: EventHandler<()>,
+    /// Each member's mark on this item, for the member strip.
+    #[props(default)]
+    seen: Vec<SeenRow>,
     /// The item playing, named on the `<video>` as `data-item-id` for tests
     /// that watch several browsers (the sync oracle).
     #[props(default)]
@@ -291,7 +295,7 @@ pub fn WatchView(
                         Icon { path: ICON_FLOAT }
                     }
                     if !members.is_empty() {
-                        MemberStrip { members, on_leave }
+                        MemberStrip { members, on_leave, seen }
                     }
                 }
                 if let Some(seg) = skip {
