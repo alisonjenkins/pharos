@@ -163,8 +163,9 @@ compat-dioxus:
 # `native=on` writes `[server.native_api]` (native sign-in cases run); `native=off`
 # omits it (the not-enabled case runs). Pharos is stopped by PID in the trap.
 # Seeded pharos + Dioxus Playwright suite; native=on|off selects the mode,
-# port lets two worktrees run it at once.
-compat-dioxus-full native="on" port="8096":
+# port lets two worktrees run it at once; config picks the Playwright config
+# (playwright.mixed.config.ts adds a jellyfin-web member via tools/jf-proxy.cjs).
+compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{ native }}" in
@@ -291,7 +292,7 @@ compat-dioxus-full native="on" port="8096":
       echo "compat-dioxus-full: pharos not ready on 127.0.0.1:{{ port }} after 120s" >&2
       exit 1
     fi
-    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:{{ port }} npx playwright test --config playwright.dioxus.config.ts'
+    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:{{ port }} npx playwright test --config {{ config }}'
 
 # Convenience: spin up pharos with seeded data + run Playwright in one
 # shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
