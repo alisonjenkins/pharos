@@ -21,6 +21,32 @@ on:
       - ".github/workflows/syncplay-e2e.yml"
       - "justfile"
 
+  # A SyncPlay change landing on main is tested there too (the job runs
+  # for every non-PR event).
+  push:
+    branches: [main]
+    paths:
+      - "crates/pharos-sync/**"
+      - "crates/pharos-server/src/api/jellyfin/syncplay.rs"
+      - "crates/pharos-server/src/api/jellyfin/hls.rs"
+      - "crates/pharos-server/src/sessions.rs"
+      - "crates/pharos-transcode/**"
+      - "crates/pharos-cache/src/hls_cache.rs"
+      - "crates/pharos-server/src/main.rs"
+      - "compat-playwright/tests/syncplay-*.spec.ts"
+      - "compat-playwright/tests/lib/**"
+      - "compat-playwright/playwright.syncplay.config.ts"
+      - "compat-playwright/tools/jf-proxy.cjs"
+      - "compat-playwright/tools/jf-proxy.test.cjs"
+      # Scripts injected into the jellyfin-web bundle change what the harness's
+      # real browsers see (the VR player added a row to the track menus).
+      - "web-patches/**"
+      - ".github/workflows/syncplay-e2e.yml"
+      - "justfile"
+
+permissions:
+  contents: read
+
 concurrency:
   group: syncplay-e2e-${{ github.ref }}
   cancel-in-progress: true
