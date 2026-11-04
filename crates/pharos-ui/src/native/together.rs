@@ -218,6 +218,8 @@ pub struct GroupSummary {
     pub members: Vec<Member>,
     /// What a late joiner starts on.
     pub tracks: GroupTracksView,
+    /// The receiving member's own id, in the `joined` update; empty in a listing.
+    pub you: String,
 }
 
 /// A refused or failed group call, in words for the viewer.
@@ -445,6 +447,7 @@ impl GroupClient for FakeGroups {
             item: Some(item),
             members: vec![Self::me()],
             tracks: GroupTracksView::default(),
+            you: String::new(),
         };
         groups.push(group.clone());
         self.sinks.borrow_mut().push(sink);
@@ -835,6 +838,7 @@ mod tests {
             item: None,
             members: vec![],
             tracks: GroupTracksView::default(),
+            you: String::new(),
         }]);
         let seen = Rc::new(RefCell::new(vec![]));
         let sink: GroupSink = {
@@ -853,6 +857,7 @@ mod tests {
             item: None,
             members: vec![],
             tracks: GroupTracksView::default(),
+            you: String::new(),
         }]);
         let seen = Rc::new(RefCell::new(vec![]));
         let sink: GroupSink = {
