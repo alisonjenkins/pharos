@@ -33,6 +33,11 @@ impl std::fmt::Display for GroupId {
 pub struct MemberId(pub Uuid);
 
 impl MemberId {
+    /// The `by` of a command that only brings one member up to date (a join,
+    /// a reconnect, a resync) or freezes the group for a buffering member.
+    /// Nobody asked for it, so a client's activity log skips it.
+    pub const CATCH_UP: Self = Self(Uuid::nil());
+
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -177,6 +182,7 @@ pub enum ServerMsg {
         position_ms: u64,
         /// The member whose command caused this; `None` when the group did
         /// (everyone ready) or an older peer sent none (V395).
+        /// [`MemberId::CATCH_UP`] for a catch-up or buffering command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<MemberId>,
     },
@@ -190,6 +196,7 @@ pub enum ServerMsg {
         position_ms: u64,
         /// The member whose command caused this; `None` when the group did
         /// (everyone ready) or an older peer sent none (V395).
+        /// [`MemberId::CATCH_UP`] for a catch-up or buffering command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<MemberId>,
     },
@@ -198,6 +205,7 @@ pub enum ServerMsg {
         position_ms: u64,
         /// The member whose command caused this; `None` when the group did
         /// (everyone ready) or an older peer sent none (V395).
+        /// [`MemberId::CATCH_UP`] for a catch-up or buffering command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by: Option<MemberId>,
     },

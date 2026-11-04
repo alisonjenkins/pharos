@@ -271,8 +271,11 @@ async fn a_client_sets_tracks_follows_and_sees_who_paused() {
     }
     a_member.pause(&a_call).await.expect("pause");
     let by = until(&mut b_seen, |u| match u {
-        // A catch-up pause for a joiner names no one; skip to A's.
-        GroupUpdate::Pause { by: Some(by), .. } => Some(by.clone()),
+        // A catch-up pause for a joiner names no one, or the nil catch-up
+        // marker; skip to A's.
+        GroupUpdate::Pause { by: Some(by), .. } if by != "00000000-0000-0000-0000-000000000000" => {
+            Some(by.clone())
+        }
         _ => None,
     })
     .await;
