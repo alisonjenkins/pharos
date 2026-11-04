@@ -10,13 +10,27 @@ import path from "node:path";
 const { chromium } = createRequire(path.join(process.cwd(), "package.json"))("@playwright/test");
 const root = process.argv[2];
 const server = http.createServer((req, res) => {
-  const file = path.join(root, decodeURIComponent(new URL(req.url, "http://x").pathname).replace(/\/$/, "/index.html"));
+  let rel;
+  try {
+    rel = decodeURIComponent(new URL(req.url, "http://x").pathname).replace(/\/$/, "/index.html");
+  } catch {
+    res.writeHead(400);
+    res.end();
+    return;
+  }
+  // Serve only files under root: a decoded `..%2f` must not climb out of it.
+  const file = path.resolve(root, "." + rel);
+  if (!file.startsWith(path.resolve(root) + path.sep)) {
+    res.writeHead(403);
+    res.end();
+    return;
+  }
   const type = file.endsWith(".wasm") ? "application/wasm" : file.endsWith(".js") ? "text/javascript" : "text/html";
   fs.readFile(file, (err, body) => {
     res.writeHead(err ? 404 : 200, { "content-type": type });
     res.end(err ? "" : body);
   });
-}).listen(0);
+}).listen(0, "127.0.0.1");
 const url = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch({ executablePath: process.env.CHROME || undefined });
 let failed = 0;
