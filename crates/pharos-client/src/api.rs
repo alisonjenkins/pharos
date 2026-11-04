@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     decision_result, detail_result, done, home_result, index_result, item_id, item_query,
-    item_summary, items_result, library, negotiate_result, opt_u16, opt_u32, playback,
+    item_summary, items_result, library, me_result, negotiate_result, opt_u16, opt_u32, playback,
     playback_grant, pref_result, prefs, session, stream_choice, telemetry, track, Kind,
     LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
@@ -381,10 +381,18 @@ pub trait PlaybackGrant {
 /// [`PharosApi`] over a signed-in native session.
 #[derive(Clone)]
 pub struct NativeApi {
+    session: session::Client,
     library: library::Client,
     playback: playback::Client,
     prefs: prefs::Client,
     telemetry: telemetry::Client,
+}
+
+/// The signed-in user, as `Session.me` reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Me {
+    pub name: String,
+    pub is_admin: bool,
 }
 
 /// One client event for `Telemetry.submit`, in plain Rust types.
@@ -400,10 +408,33 @@ impl NativeApi {
     /// The capabilities are pipelined: no round trip until the first call.
     pub fn new(session: &session::Client) -> Self {
         Self {
+            session: session.clone(),
             library: session.library_request().send().pipeline.get_library(),
             playback: session.playback_request().send().pipeline.get_playback(),
             prefs: session.prefs_request().send().pipeline.get_prefs(),
             telemetry: session.telemetry_request().send().pipeline.get_telemetry(),
+        }
+    }
+
+    /// Who is signed in.
+    pub async fn me(&self, call: &CallInfo) -> Result<Me, ClientError> {
+        let mut req = self.session.me_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            me_result::Me(me) => {
+                let me = me?;
+                Ok(Me {
+                    name: text(me.get_name())?,
+                    is_admin: me.get_is_admin(),
+                })
+            }
+            me_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
