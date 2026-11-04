@@ -39,7 +39,7 @@ pub fn fingerprint_windows(
     let mut ictx = format::input(src).map_err(|e| FrameError::BadInput(format!("open: {e}")))?;
     let mut out = Vec::with_capacity(windows.len());
     for &(start_ms, dur_ms) in windows {
-        out.push(fingerprint_one(&mut ictx, start_ms, dur_ms)?);
+        out.push(fingerprint_one(src, &mut ictx, start_ms, dur_ms)?);
     }
     Ok(out)
 }
@@ -48,6 +48,7 @@ pub fn fingerprint_windows(
 /// resampler per call (cheap, in-memory) so successive windows on the same
 /// `ictx` don't share poisoned decoder state.
 fn fingerprint_one(
+    src: &Path,
     ictx: &mut format::context::Input,
     start_ms: u64,
     dur_ms: u64,
@@ -100,7 +101,19 @@ fn fingerprint_one(
     if start_ms > 0 {
         // `..=`: an exclusive end puts max below the target and libav refuses
         // the seek (B446), which decoded every credits window from the top.
-        let _ = ictx.seek(start_us, ..=start_us);
+        if let Err(e) = ictx.seek(start_us, ..=start_us) {
+            // A failed seek may already have read packets, leaving the input
+            // anywhere (even past the window). Reopen so the read starts at
+            // the top and the pts gate trims the lead-in.
+            tracing::debug!(
+                target: "libav",
+                start_us,
+                error = %e,
+                "fingerprint: seek refused, reopening to read the window from the top"
+            );
+            *ictx = format::input(src)
+                .map_err(|e| FrameError::BadInput(format!("reopen after seek: {e}")))?;
+        }
         // Codec buffers may hold pre-seek frames.
         // (ffmpeg-the-third has no public flush_buffers; a fresh decoder isn't
         // worth it — the pts gate discards any stragglers.)
