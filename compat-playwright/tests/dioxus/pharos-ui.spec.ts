@@ -1393,6 +1393,95 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // The title page offers the tracks before playback (B367), named by
+    // language (B365), and the player keeps the volume through a switch,
+    // which mounts a new player (B450).
+    test("the title page picks the audio track and the volume survives a switch", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-preplay-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const dualAudio = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: { "X-Emby-Token": token } },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/08-test-dual-audio.webm"));
+      await expect.poll(dualAudio, { timeout: 60_000 }).toBeTruthy();
+      const movie = await dualAudio();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      const sessions = new Set<string>();
+      page.on("request", (r) => {
+        const url = new URL(r.url());
+        if (!url.pathname.toLowerCase().startsWith(`/videos/${movie.Id}/`)) return;
+        const session = url.searchParams.get("tag") ?? url.searchParams.get("PlaySessionId");
+        if (session) sessions.add(session);
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/title/${nativeId}`);
+      const before = page.locator(".pharos-title-tracks").getByRole("combobox", { name: "Audio" });
+      await expect(before).toBeVisible({ timeout: 30_000 });
+      const labels = await before.locator("option").allTextContents();
+      expect(labels.join(" | ")).toMatch(/English/);
+      expect(labels.join(" | ")).toMatch(/Japanese/);
+      const japanese = await before
+        .locator("option", { hasText: "Japanese" })
+        .getAttribute("value");
+      await before.selectOption(japanese!);
+      await page.locator(".pharos-title .pharos-actions a.pharos-button").first().click();
+
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(1);
+      const picker = page.getByRole("combobox", { name: "Audio" });
+      await expect(picker, "the player starts on the track picked before it").toHaveValue(
+        japanese!,
+      );
+
+      const volume = () =>
+        page.evaluate(() => document.querySelector<HTMLVideoElement>("video")?.volume ?? -1);
+      // Two wheel notches down over the picture (V239).
+      const box = (await page.locator(".pharos-player").boundingBox())!;
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 3);
+      await page.mouse.wheel(0, 120);
+      await page.mouse.wheel(0, 120);
+      await expect.poll(volume).toBeLessThan(0.95);
+      const set = await volume();
+      const english = await picker.locator("option", { hasText: "English" }).getAttribute("value");
+      await page.locator(".pharos-player").hover();
+      await picker.selectOption(english!);
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(2);
+      await expect
+        .poll(volume, { message: "the new player starts at the volume set", timeout: 10_000 })
+        .toBeCloseTo(set, 2);
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // A playlist that never loads is fatal to hls.js with nothing to restart
     // from, so the page must say so rather than show a black box.
     test("an HLS stream that cannot load shows why", async ({ page, request }) => {
