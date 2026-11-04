@@ -65,10 +65,9 @@ pub trait Env {
     /// A client event for telemetry (sent only when the viewer opted in).
     fn report(&self, event: ClientEvent);
     fn ui(&self, ui: Ui);
-    fn info(&self, message: &str);
-    fn warn(&self, message: &str);
     /// A decision the group took, for the console and the field logs.
     fn info(&self, message: &str);
+    fn warn(&self, message: &str);
 }
 
 /// The `<video>` the group drives.
@@ -1382,9 +1381,6 @@ mod tests {
             self.logs.borrow_mut().push(message.to_owned());
         }
         fn warn(&self, _message: &str) {}
-        fn info(&self, message: &str) {
-            self.logs.borrow_mut().push(message.to_owned());
-        }
     }
 
     impl TestEnv {
@@ -1773,6 +1769,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 100_000,
             position_ms: 10_000,
+            by: None,
         });
         rig.env.settle();
         assert!(rig.player.log.borrow().contains(&"seek(10000)".to_owned()));
@@ -1813,6 +1810,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 100_000,
             position_ms: 10_000,
+            by: None,
         });
         rig.env.settle();
         rig.session.on_media(MediaEvent::Waiting);
@@ -1889,6 +1887,7 @@ mod tests {
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: 100_000,
             position_ms: 10_000,
+            by: None,
         });
         rig.env.settle();
         rig.session.on_media(MediaEvent::Waiting);
