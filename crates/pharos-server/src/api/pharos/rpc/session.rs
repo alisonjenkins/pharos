@@ -137,10 +137,13 @@ impl server::session::Handler for Session {
             denial.write(results.get().init_result().init_error());
             return Ok(());
         }
+        // No avatar rather than no answer: the tag only decorates the menu.
+        let avatar_tag = crate::avatar::tag(&self.state.stores, self.user.id).await;
         let mut me = results.get().init_result().init_me();
         me.reborrow().init_id().set_uuid(self.user.id.0.as_bytes());
         me.set_name(self.user.name.as_str());
         me.set_is_admin(self.user.policy.admin);
+        me.set_avatar_tag(avatar_tag.as_deref().unwrap_or_default());
         Ok(())
     }
 
@@ -299,6 +302,102 @@ impl server::session::Handler for Session {
             Err(e) => write_change_password_error(&e, done.init_error()),
         }
         Ok(())
+    }
+
+    /// The session user's own avatar (V362): checked and re-encoded by
+    /// [`crate::avatar::set`]; answers the new tag.
+    async fn set_avatar(
+        self: Rc<Self>,
+        params: wire::SetAvatarParams,
+        results: &mut wire::SetAvatarResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let image = params.get()?.get_image()?;
+        let mut result = results.get().init_result();
+        if image.len() > NATIVE_MAX_AVATAR_BYTES {
+            let mut error = result.init_error();
+            error.set_reason("the picture is too large");
+            let mut limit = error.get_kind().init_limit();
+            limit.set_name("avatar_bytes");
+            limit.set_value(image.len() as u64);
+            limit.set_max(NATIVE_MAX_AVATAR_BYTES as u64);
+            return Ok(());
+        }
+        match crate::avatar::set(&self.state.stores, user.id, image.to_vec()).await {
+            Ok(tag) => result.set_tag(tag.as_str()),
+            Err(e) => write_avatar_error(&e, result.init_error()),
+        }
+        Ok(())
+    }
+
+    async fn remove_avatar(
+        self: Rc<Self>,
+        _params: wire::RemoveAvatarParams,
+        results: &mut wire::RemoveAvatarResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let mut done = results.get().init_result();
+        match crate::avatar::remove(&self.state.stores, user.id).await {
+            Ok(_) => done.set_ok(()),
+            Err(e) => {
+                tracing::warn!(user = %user.name, error = %e, "native avatar remove failed");
+                Denial::Unavailable {
+                    dependency: "user store",
+                }
+                .write(done.init_error());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Largest picture `setAvatar` takes. A WebSocket message is at most 1 MiB,
+/// and the web UI scales a photo down before it sends it.
+pub const NATIVE_MAX_AVATAR_BYTES: usize = 768 * 1024;
+
+/// A refused `setAvatar`: a picture the server would not take is `invalid`
+/// (field `image`), with the reason fit to show; failures of ours are
+/// `unavailable`.
+fn write_avatar_error(
+    error: &crate::avatar::AvatarError,
+    mut out: pharos_api::pharos_capnp::error::Builder<'_>,
+) {
+    use crate::avatar::AvatarError;
+    match error {
+        AvatarError::Empty
+        | AvatarError::TooLarge { .. }
+        | AvatarError::Unsupported
+        | AvatarError::Decode(_) => {
+            out.set_reason(match error {
+                AvatarError::Empty => "the picture is empty",
+                AvatarError::TooLarge { .. } => "the picture is too large",
+                AvatarError::Unsupported => "not a PNG, JPEG, WebP or GIF picture",
+                _ => "the picture could not be read",
+            });
+            let mut invalid = out.get_kind().init_invalid();
+            invalid.set_field("image");
+            invalid.set_value("");
+        }
+        AvatarError::Busy => Denial::Unavailable {
+            dependency: "image decoder",
+        }
+        .write(out),
+        AvatarError::Encode(_) | AvatarError::Store(_) => Denial::Unavailable {
+            dependency: "user store",
+        }
+        .write(out),
     }
 }
 
