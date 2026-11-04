@@ -701,11 +701,12 @@ body:has(.pharos-watch, .pharos-listen) .pharos-error {
 .pharos-player.is-idle {
   cursor: none;
 }
-/* A control reached by keyboard, or a track picker in use (a mouse-opened
-   <select> is focused but not :focus-visible), keeps the chrome shown. */
-.pharos-player.is-idle:not(:has(:focus-visible, select:focus)) .pharos-watch-top,
-.pharos-player.is-idle:not(:has(:focus-visible, select:focus)) .pharos-controls,
-.pharos-player.is-idle:not(:has(:focus-visible, select:focus)) .pharos-skip {
+/* A track picker in use keeps the chrome shown: its open list sends the page
+   no pointer moves. A focused button does not, or a key press would leave
+   the chrome up for the whole film; every key press wakes it anyway. */
+.pharos-player.is-idle:not(:has(select:focus)) .pharos-watch-top,
+.pharos-player.is-idle:not(:has(select:focus)) .pharos-controls,
+.pharos-player.is-idle:not(:has(select:focus)) .pharos-skip {
   opacity: 0;
   pointer-events: none;
 }
