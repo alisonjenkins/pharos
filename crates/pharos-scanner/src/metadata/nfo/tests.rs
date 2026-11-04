@@ -290,6 +290,36 @@ async fn episode_merges_show_nfo_underneath() {
 }
 
 #[tokio::test]
+async fn an_episode_without_its_own_nfo_is_not_titled_with_the_show() {
+    let dir = tempdir().unwrap();
+    let media = dir
+        .path()
+        .join("Breaking Bad - S01E02 - Cat's in the Bag.mkv");
+    std::fs::write(dir.path().join("tvshow.nfo"), TVSHOW_NFO).unwrap();
+
+    let series = SeriesInfo {
+        series_name: "Breaking Bad".into(),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Episode,
+        probe: &p,
+        series: Some(&series),
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+
+    assert_eq!(r.title, None);
+    assert_eq!(r.overview, None);
+    assert_eq!(r.premiere_date, None);
+    // Show-wide fields still apply to the episode.
+    assert_eq!(r.studios, vec!["AMC"]);
+    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
+}
+
+#[tokio::test]
 async fn absent_nfo_yields_empty_result_not_error() {
     let dir = tempdir().unwrap();
     let media = dir.path().join("orphan.mkv");
