@@ -28,7 +28,9 @@ use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
-use super::views::{progress_percent, runtime, Link, PosterTile, Ratings};
+use super::views::{
+    display_name, is_placeholder_episode_name, progress_percent, runtime, Link, PosterTile, Ratings,
+};
 use pharos_client::mix::radio;
 
 /// Most children one browse page lists.
@@ -1090,8 +1092,8 @@ pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Eleme
 fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Element {
     let progress = progress_percent(&episode);
     let label = match episode.episode {
-        Some(n) => format!("{n}. {}", episode.name),
-        None => episode.name.clone(),
+        Some(n) if !is_placeholder_episode_name(&episode) => format!("{n}. {}", episode.name),
+        _ => display_name(&episode),
     };
     let length = runtime(episode.runtime_ms);
     rsx! {
