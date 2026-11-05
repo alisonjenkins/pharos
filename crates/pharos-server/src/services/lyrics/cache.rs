@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::{LyricLine, Lyrics, Origin, Song};
+use super::{LyricLine, Lyrics, Origin, Song, WordStamp};
 
 /// How long a provider's "no lyrics for this song" stands before it is asked
 /// again.
@@ -42,6 +42,14 @@ struct Line {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_ms: Option<u64>,
     text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    words: Vec<Word>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Word {
+    at: u32,
+    start_ms: u64,
 }
 
 impl DiskCache {
@@ -82,6 +90,14 @@ impl DiskCache {
                     .map(|l| LyricLine {
                         start_ms: l.start_ms,
                         text: l.text,
+                        words: l
+                            .words
+                            .into_iter()
+                            .map(|w| WordStamp {
+                                at: w.at,
+                                start_ms: w.start_ms,
+                            })
+                            .collect(),
                     })
                     .collect(),
                 Origin::Online,
@@ -119,6 +135,14 @@ impl DiskCache {
                     .map(|l| Line {
                         start_ms: l.start_ms,
                         text: l.text.clone(),
+                        words: l
+                            .words
+                            .iter()
+                            .map(|w| Word {
+                                at: w.at,
+                                start_ms: w.start_ms,
+                            })
+                            .collect(),
                     })
                     .collect()
             }),
@@ -181,10 +205,21 @@ mod tests {
                 LyricLine {
                     start_ms: Some(1_000),
                     text: "One".into(),
+                    words: vec![
+                        WordStamp {
+                            at: 0,
+                            start_ms: 1_000,
+                        },
+                        WordStamp {
+                            at: 3,
+                            start_ms: 1_400,
+                        },
+                    ],
                 },
                 LyricLine {
                     start_ms: Some(2_000),
                     text: String::new(),
+                    words: Vec::new(),
                 },
             ],
             Origin::Online,
@@ -258,5 +293,28 @@ mod tests {
         std::fs::write(dir.path().join("7.json"), b"{not json").unwrap();
         let cache = DiskCache::new(dir.path().to_path_buf());
         assert_eq!(cache.get(7, "lrclib", &song()), None);
+    }
+
+    #[test]
+    fn an_old_entry_without_words_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = song();
+        let raw = serde_json::json!({
+            "key": key("lrclib", &song),
+            "fetched_at": 1_700_000_000u64,
+            "lines": [{ "start_ms": 1_000u64, "text": "One" }],
+        });
+        std::fs::write(dir.path().join("7.json"), raw.to_string()).unwrap();
+        let cache = DiskCache::new(dir.path().to_path_buf());
+        let expected = Lyrics::from_lines(
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "One".into(),
+                words: Vec::new(),
+            }],
+            Origin::Online,
+        )
+        .unwrap();
+        assert_eq!(cache.get(7, "lrclib", &song), Some(Cached::Found(expected)));
     }
 }

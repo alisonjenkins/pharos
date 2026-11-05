@@ -1,22 +1,38 @@
 //! LRC text to lyric lines. Text with no timestamped line is plain lyrics,
 //! one line per line, so the same parser serves `.lrc`, `.txt` and tag text.
 
-use super::LyricLine;
+use super::{LyricLine, WordStamp};
 
 /// Parse lyrics text. Timestamped text gives synced lines sorted by start;
 /// otherwise each line is kept as written, minus blank lines at either end.
 pub fn parse(text: &str) -> Vec<LyricLine> {
     let mut offset_ms: i64 = 0;
-    let mut timed: Vec<(u64, String)> = Vec::new();
+    let mut timed: Vec<(u64, String, Vec<WordStamp>)> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim();
         if let Some(ms) = offset_tag(line) {
             offset_ms = ms;
             continue;
         }
-        let (stamps, words) = stamps(line);
+        let (stamps, raw_words) = stamps(line);
+        if stamps.is_empty() {
+            continue;
+        }
+        let (cleaned, word_times) = word_stamps(raw_words);
+        // Word times are absolute, so a line repeated under several `[mm:ss]`
+        // stamps keeps none.
+        let keep_words = stamps.len() == 1;
         for at in stamps {
-            timed.push((at, strip_word_stamps(words)));
+            let valid_words = keep_words && word_times.first().map_or(true, |w| w.start_ms >= at);
+            timed.push((
+                at,
+                cleaned.clone(),
+                if valid_words {
+                    word_times.clone()
+                } else {
+                    Vec::new()
+                },
+            ));
         }
     }
     if timed.is_empty() {
@@ -25,9 +41,16 @@ pub fn parse(text: &str) -> Vec<LyricLine> {
     // LRC's offset moves every line earlier when positive.
     let mut lines: Vec<LyricLine> = timed
         .into_iter()
-        .map(|(at, text)| LyricLine {
+        .map(|(at, text, words)| LyricLine {
             start_ms: Some(shift(at, offset_ms)),
             text,
+            words: words
+                .into_iter()
+                .map(|w| WordStamp {
+                    at: w.at,
+                    start_ms: shift(w.start_ms, offset_ms),
+                })
+                .collect(),
         })
         .collect();
     lines.sort_by_key(|l| l.start_ms);
@@ -52,6 +75,7 @@ fn plain(text: &str) -> Vec<LyricLine> {
         .map(|l| LyricLine {
             start_ms: None,
             text: (*l).to_owned(),
+            words: Vec::new(),
         })
         .collect()
 }
@@ -143,27 +167,74 @@ fn all_digits(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Drop enhanced-LRC word stamps (`<00:12.30>`) from a line's words.
-fn strip_word_stamps(words: &str) -> String {
+/// Pull enhanced-LRC word stamps (`<00:12.30>`) from a line's words,
+/// returning the whitespace-normalised text and the stamps at their char
+/// offsets in that text. Decreasing stamps are dropped.
+fn word_stamps(words: &str) -> (String, Vec<WordStamp>) {
     let mut out = String::with_capacity(words.len());
+    let mut chars = 0u32;
+    let mut in_word = false;
+    let mut pending = Vec::<u64>::new();
+    let mut stamps = Vec::<WordStamp>::new();
+    let mut push_text = |piece: &str, pending: &mut Vec<u64>, stamps: &mut Vec<WordStamp>| {
+        for ch in piece.chars() {
+            if ch.is_whitespace() {
+                if in_word {
+                    for start_ms in pending.drain(..) {
+                        stamps.push(WordStamp {
+                            at: chars,
+                            start_ms,
+                        });
+                    }
+                    in_word = false;
+                }
+            } else {
+                if !in_word && chars > 0 {
+                    out.push(' ');
+                    chars = chars.saturating_add(1);
+                }
+                for start_ms in pending.drain(..) {
+                    stamps.push(WordStamp {
+                        at: chars,
+                        start_ms,
+                    });
+                }
+                out.push(ch);
+                chars = chars.saturating_add(1);
+                in_word = true;
+            }
+        }
+    };
     let mut rest = words;
     while let Some(open) = rest.find('<') {
         let (before, after) = rest.split_at(open);
-        out.push_str(before);
+        push_text(before, &mut pending, &mut stamps);
         let stamp = after
             .get(1..)
             .and_then(|a| a.split_once('>'))
-            .filter(|(inner, _)| timestamp_ms(inner).is_some());
+            .and_then(|(inner, tail)| timestamp_ms(inner).map(|ms| (ms, tail)));
         match stamp {
-            Some((_, tail)) => rest = tail,
+            Some((ms, tail)) => {
+                pending.push(ms);
+                rest = tail;
+            }
             None => {
-                out.push('<');
+                push_text("<", &mut pending, &mut stamps);
                 rest = after.get(1..).unwrap_or_default();
             }
         }
     }
-    out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    push_text(rest, &mut pending, &mut stamps);
+    for start_ms in pending {
+        stamps.push(WordStamp {
+            at: chars,
+            start_ms,
+        });
+    }
+    if out.is_empty() || stamps.windows(2).any(|w| w[0].start_ms > w[1].start_ms) {
+        stamps.clear();
+    }
+    (out, stamps)
 }
 
 #[cfg(test)]
@@ -223,9 +294,195 @@ mod tests {
     }
 
     #[test]
-    fn word_stamps_are_dropped_from_the_text() {
+    fn word_stamps_are_kept_with_their_cleaned_char_offsets() {
+        let lines = parse("[00:12.00]<00:12.00>Hello <00:12.50>world<00:13.40>");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(12_000),
+                text: "Hello world".into(),
+                words: vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 12_000
+                    },
+                    WordStamp {
+                        at: 6,
+                        start_ms: 12_500
+                    },
+                    WordStamp {
+                        at: 11,
+                        start_ms: 13_400
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn word_stamps_with_extra_spaces_map_to_cleaned_offsets() {
+        let lines = parse("[00:01.00]  <00:01.00>  Hello   <00:01.50>   world  <00:02.00>  ");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "Hello world".into(),
+                words: vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 1_000
+                    },
+                    WordStamp {
+                        at: 6,
+                        start_ms: 1_500
+                    },
+                    WordStamp {
+                        at: 11,
+                        start_ms: 2_000
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn offset_shifts_word_stamps_like_line_stamps() {
+        let lines = parse("[offset:+500]\n[00:01.00]<00:01.00>Hello <00:01.50>world<00:02.00>");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(500),
+                text: "Hello world".into(),
+                words: vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 500
+                    },
+                    WordStamp {
+                        at: 6,
+                        start_ms: 1_000
+                    },
+                    WordStamp {
+                        at: 11,
+                        start_ms: 1_500
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_with_multiple_line_stamps_keeps_no_word_stamps() {
+        let lines = parse("[00:10.00][00:30.00]<00:10.00>Chorus <00:10.50>line");
+        assert_eq!(
+            starts(&lines),
+            vec![(Some(10_000), "Chorus line"), (Some(30_000), "Chorus line")]
+        );
+        assert!(lines.iter().all(|l| l.words.is_empty()));
+    }
+
+    #[test]
+    fn decreasing_word_stamps_are_dropped() {
+        let lines = parse("[00:01.00]<00:01.50>Hello <00:01.20>world");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "Hello world".into(),
+                words: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn word_stamps_earlier_than_their_line_stamp_are_dropped() {
+        let lines = parse("[00:10.00]<00:01.00>Hello <00:01.50>world");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(10_000),
+                text: "Hello world".into(),
+                words: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_word_end_stamp_before_whitespace_marks_the_end_of_that_word() {
+        let lines = parse("[00:01.00]<00:01.00>Hello<00:01.40> <00:01.80>world<00:02.20>");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "Hello world".into(),
+                words: vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 1_000
+                    },
+                    WordStamp {
+                        at: 5,
+                        start_ms: 1_400
+                    },
+                    WordStamp {
+                        at: 6,
+                        start_ms: 1_800
+                    },
+                    WordStamp {
+                        at: 11,
+                        start_ms: 2_200
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_with_only_a_word_stamp_and_no_text_keeps_no_words() {
+        let lines = parse("[00:02.00]<00:02.00>");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(2_000),
+                text: String::new(),
+                words: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_without_word_stamps_has_empty_words() {
+        let lines = parse("[00:01.00]Hello world");
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "Hello world".into(),
+                words: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_stamp_angle_brackets_are_kept_in_the_text() {
         let lines = parse("[00:01.00]<00:01.00>Hello <00:01.50>world <3");
-        assert_eq!(starts(&lines), vec![(Some(1_000), "Hello world <3")]);
+        assert_eq!(
+            lines,
+            vec![LyricLine {
+                start_ms: Some(1_000),
+                text: "Hello world <3".into(),
+                words: vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 1_000
+                    },
+                    WordStamp {
+                        at: 6,
+                        start_ms: 1_500
+                    },
+                ],
+            }]
+        );
     }
 
     #[test]

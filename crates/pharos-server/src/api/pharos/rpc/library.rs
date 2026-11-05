@@ -276,6 +276,12 @@ impl server::library::Handler for Library {
             let mut w = lines.reborrow().get(i);
             w.set_start_ms(line.start_ms.unwrap_or(0));
             w.set_text(line.text.as_str());
+            let mut words = w.init_words(len_u32(&line.words));
+            for (j, word) in (0..).zip(&line.words) {
+                let mut ww = words.reborrow().get(j);
+                ww.set_at(word.at);
+                ww.set_start_ms(word.start_ms);
+            }
         }
         Ok(())
     }
