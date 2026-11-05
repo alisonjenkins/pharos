@@ -1786,13 +1786,85 @@ pub fn scroll_to_top() {
 /// it will settle, not where the animation has it this frame.
 pub fn tile_top(at: u32) -> Option<f64> {
     let window = web_sys::window()?;
-    let mut node: Option<web_sys::HtmlElement> = grid_tiles()?.item(at)?.dyn_into().ok();
-    let mut page_top = 0.0;
+    let tile: web_sys::HtmlElement = grid_tiles()?.item(at)?.dyn_into().ok()?;
+    Some(page_top(tile) - window.scroll_y().unwrap_or(0.0))
+}
+
+/// Where `el` sits on the page, in CSS px, from layout offsets, so a tile
+/// mid-way through an animated transform reports where it will settle.
+fn page_top(el: web_sys::HtmlElement) -> f64 {
+    let mut node = Some(el);
+    let mut top = 0.0;
     while let Some(el) = node {
-        page_top += f64::from(el.offset_top());
+        top += f64::from(el.offset_top());
         node = el.offset_parent().and_then(|p| p.dyn_into().ok());
     }
-    Some(page_top - window.scroll_y().unwrap_or(0.0))
+    top
+}
+
+/// Places each arriving grid tile for the library transition by where it
+/// sits on screen: its row and column (`--fx-row`, `--fx-col`, and their
+/// sum `--fx-wave`, B578). Tiles already placed keep their place unless
+/// `again`, so a page landing later never restarts a tile that has arrived;
+/// `again` is for a grid scrolled back to where the viewer left it after
+/// its tiles were placed (B579).
+pub fn stage_arrival(again: bool) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Ok(grids) = document.query_selector_all(".pharos-grid") else {
+        return;
+    };
+    for at in 0..grids.length() {
+        let Some(grid) = grids
+            .item(at)
+            .and_then(|g| g.dyn_into::<web_sys::Element>().ok())
+        else {
+            continue;
+        };
+        let Ok(found) = grid.query_selector_all(":scope > li.pharos-arrive") else {
+            continue;
+        };
+        let tiles: Vec<web_sys::HtmlElement> = (0..found.length())
+            .filter_map(|at| found.item(at)?.dyn_into().ok())
+            .collect();
+        if !tiles.is_empty() {
+            stage_grid(&window, &tiles, again);
+        }
+    }
+}
+
+/// [`stage_arrival`] for one grid's arriving `tiles`, so each grid's wave
+/// counts its own rows.
+fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: bool) {
+    let boxes: Vec<(f64, f64)> = tiles
+        .iter()
+        .map(|t| (page_top(t.clone()), f64::from(t.offset_height())))
+        .collect();
+    let cells = super::browse::arrival_cells(&boxes, window.scroll_y().unwrap_or(0.0));
+    for (tile, (row, col)) in tiles.iter().zip(cells) {
+        if !again && tile.has_attribute("data-fx") {
+            continue;
+        }
+        let style = tile.style();
+        let set = [
+            ("--fx-row", row.to_string()),
+            ("--fx-col", col.to_string()),
+            ("--fx-wave", (row + col).to_string()),
+        ]
+        .iter()
+        .try_for_each(|(name, value)| style.set_property(name, value))
+        .and_then(|()| tile.set_attribute("data-fx", ""));
+        // One tile that refuses keeps the rest of the wave in place.
+        if let Err(e) = set {
+            warn(&format!(
+                "pharos: arrival stage failed row={row} col={col} error={e:?}"
+            ));
+        }
+    }
 }
 
 /// Scrolls the page so the browse tile at `at` sits `top` px below the
