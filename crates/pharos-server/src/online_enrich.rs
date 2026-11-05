@@ -63,6 +63,10 @@ pub struct EnrichedMetadata {
     pub artwork: Vec<RemoteArt>,
     /// The language the title was made in, as the provider states it.
     pub original_language: Option<String>,
+    /// The provider's text per language it was asked for, plus its
+    /// base-record text marked `is_original` (ADR-0062). `title`/`overview`
+    /// above already hold the English text when the provider had it.
+    pub texts: Vec<pharos_core::LocalizedText>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
@@ -115,6 +119,24 @@ pub trait OnlineEnricher: Send + Sync {
         kind: MediaKind,
         id: &str,
     ) -> impl Future<Output = Vec<RemoteImage>> + Send;
+
+    /// The record's text in each of `languages` plus its base-record text
+    /// (ADR-0062), addressed like [`fetch`](Self::fetch). A language the
+    /// provider does not have comes back as a row with no title and no
+    /// overview; one whose request failed is left out, so it is asked again.
+    /// `None` when the record itself could not be read. Providers without
+    /// per-language text return `None`.
+    fn fetch_texts(
+        &self,
+        kind: MediaKind,
+        id: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+        languages: &[String],
+    ) -> impl Future<Output = Option<Vec<pharos_core::LocalizedText>>> + Send {
+        let _ = (kind, id, season, episode, languages);
+        async { None }
+    }
 }
 
 /// Sets `slot` only when it is currently unset — local data always wins

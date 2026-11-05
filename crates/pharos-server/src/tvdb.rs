@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::online_enrich::{EnrichedMetadata, RemoteArt};
-use pharos_core::{ArtworkRole, MediaKind, SearchCandidate};
+use pharos_core::{ArtworkRole, LocalizedText, MediaKind, SearchCandidate};
 
 /// TVDB v4 REST base.
 const API_BASE: &str = "https://api4.thetvdb.com/v4";
@@ -156,21 +157,24 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// `None` if login fails, the retry also fails, or the final status
     /// isn't `200`.
     async fn authed_get(&self, path: &str) -> Option<String> {
-        let mut token = self.ensure_token().await?;
+        match self.authed_get_status(path).await? {
+            (200, body) => Some(body),
+            _ => None,
+        }
+    }
+
+    /// [`authed_get`](Self::authed_get) that hands back the final status
+    /// with the body, so a caller can tell "TVDB has no such record" (404)
+    /// from a failed request. `None` only when no token could be had.
+    async fn authed_get_status(&self, path: &str) -> Option<(u16, String)> {
+        let token = self.ensure_token().await?;
         let (status, body) = self.transport.get(path, &token).await;
-        if status == 401 {
-            *self.token.write().await = None;
-            token = self.ensure_token().await?;
-            let (status2, body2) = self.transport.get(path, &token).await;
-            if status2 != 200 {
-                return None;
-            }
-            return Some(body2);
+        if status != 401 {
+            return Some((status, body));
         }
-        if status != 200 {
-            return None;
-        }
-        Some(body)
+        *self.token.write().await = None;
+        let token = self.ensure_token().await?;
+        Some(self.transport.get(path, &token).await)
     }
 
     /// Search TVDB for a series by name (optionally narrowed by year).
@@ -187,24 +191,150 @@ impl<T: TvdbTransport> TvdbClient<T> {
         parse_series_search(&body)
     }
 
-    /// Fetch a TVDB series' extended detail record by id.
+    /// Fetch a TVDB series' extended detail record by id, with its title and
+    /// overview in English when TVDB has them (B564): the base record is in
+    /// the language the show was made in, which for anime is Japanese.
     pub async fn get_series(&self, id: &str) -> Option<EnrichedMetadata> {
-        let body = self.authed_get(&format!("/series/{id}/extended")).await?;
-        parse_series_detail(&body)
+        let mut md = self
+            .series_record(id, &[DEFAULT_LANGUAGE.to_string()])
+            .await?;
+        prefer_language(&mut md, DEFAULT_LANGUAGE);
+        Some(md)
+    }
+
+    /// The series record with `texts` holding each of `languages` plus the
+    /// original. `?meta=translations` inlines every translation TVDB has, so
+    /// this is one request whatever the languages.
+    async fn series_record(&self, id: &str, languages: &[String]) -> Option<EnrichedMetadata> {
+        let body = self
+            .authed_get(&format!("/series/{id}/extended?meta=translations"))
+            .await?;
+        let mut md = parse_series_detail(&body)?;
+        let all = parse_series_texts(&body);
+        md.texts = pick_languages(all, languages, |lang, outcome| {
+            record_translation("tvdb", lang, outcome);
+            if outcome == TranslationOutcome::Missing {
+                tracing::info!(
+                    tvdb.series_id = id,
+                    language = lang,
+                    reason = "series has no translation in this language",
+                    "tvdb text falls back to the default text"
+                );
+            }
+        });
+        Some(md)
     }
 
     /// Fetch a single episode's detail by series id + season/episode
-    /// number, via the series' episode list.
+    /// number, via the series' episode list, with its name and overview in
+    /// English when TVDB has them (B564).
     pub async fn get_episode(
         &self,
         series_id: &str,
         season: u32,
         episode: u32,
     ) -> Option<EnrichedMetadata> {
+        let (mut md, _) = self
+            .episode_record(series_id, season, episode, &[DEFAULT_LANGUAGE.to_string()])
+            .await?;
+        prefer_language(&mut md, DEFAULT_LANGUAGE);
+        Some(md)
+    }
+
+    /// The episode record with `texts` holding each of `languages` plus the
+    /// original. The episode list names the languages each episode has
+    /// (`nameTranslations`/`overviewTranslations`), so a language it does not
+    /// list is recorded missing without a request; one it lists costs one
+    /// `/episodes/{id}/translations/{lang}`. The flag is true when one of
+    /// those requests failed, so its language has no row.
+    async fn episode_record(
+        &self,
+        series_id: &str,
+        season: u32,
+        episode: u32,
+        languages: &[String],
+    ) -> Option<(EnrichedMetadata, bool)> {
         let body = self
             .authed_get(&format!("/series/{series_id}/episodes/default"))
             .await?;
-        parse_episode_detail(&body, season, episode)
+        let mut md = parse_episode_detail(&body, season, episode)?;
+        let langs = parse_episode_languages(&body, season, episode);
+        let mut texts = Vec::new();
+        let mut failed = false;
+        if let Some(orig) = &langs.original {
+            texts.push(LocalizedText {
+                language: orig.clone(),
+                title: md.title.clone(),
+                overview: md.overview.clone(),
+                is_original: true,
+            });
+        }
+        for lang in languages {
+            let fallback = |reason: &str| {
+                tracing::info!(
+                    tvdb.series_id = series_id,
+                    tvdb.episode_id = md.provider_id.as_deref().unwrap_or_default(),
+                    season,
+                    episode,
+                    language = lang.as_str(),
+                    reason,
+                    "tvdb text falls back to the default text"
+                );
+            };
+            if langs.original.as_deref() == Some(lang.as_str()) {
+                record_translation("tvdb", lang, TranslationOutcome::Original);
+                continue;
+            }
+            let ep_id = md
+                .provider_id
+                .as_deref()
+                .filter(|_| langs.listed.contains(lang));
+            let Some(ep_id) = ep_id else {
+                record_translation("tvdb", lang, TranslationOutcome::Missing);
+                fallback("episode lists no translation in this language");
+                texts.push(missing_text(lang));
+                continue;
+            };
+            let path = format!("/episodes/{ep_id}/translations/{lang}");
+            match self.authed_get_status(&path).await {
+                Some((200, body)) => match parse_translation(&body) {
+                    Some(t) => {
+                        record_translation("tvdb", lang, TranslationOutcome::Translated);
+                        texts.push(LocalizedText {
+                            language: lang.clone(),
+                            ..t
+                        });
+                    }
+                    None => {
+                        record_translation("tvdb", lang, TranslationOutcome::Missing);
+                        fallback("translation record carried no text");
+                        texts.push(missing_text(lang));
+                    }
+                },
+                Some((404, _)) => {
+                    record_translation("tvdb", lang, TranslationOutcome::Missing);
+                    fallback("translation request answered 404");
+                    texts.push(missing_text(lang));
+                }
+                other => {
+                    failed = true;
+                    record_translation("tvdb", lang, TranslationOutcome::Error);
+                    let status = other.map(|(s, _)| s.to_string());
+                    tracing::warn!(
+                        tvdb.series_id = series_id,
+                        tvdb.episode_id = ep_id,
+                        season,
+                        episode,
+                        language = lang.as_str(),
+                        status = status.as_deref().unwrap_or("no token"),
+                        "tvdb translation request failed; text falls back to the default text \
+                         and is asked again next pass"
+                    );
+                }
+            }
+        }
+        md.texts = texts;
+        Some((md, failed))
     }
 
     /// Download the raw bytes of a TVDB artwork/image CDN URL. `None` on
@@ -570,6 +700,175 @@ pub(crate) fn parse_episode_detail(
     })
 }
 
+fn text_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(decode_entities)
+}
+
+fn missing_text(lang: &str) -> LocalizedText {
+    LocalizedText {
+        language: lang.to_string(),
+        ..LocalizedText::default()
+    }
+}
+
+/// Every language's text from a `/series/{id}/extended?meta=translations`
+/// body (`data.translations.{name,overview}Translations[]`), one row per
+/// language, the base-record language marked `is_original`. That language is
+/// the translation TVDB flags `isPrimary`, else the series' `originalLanguage`;
+/// its row carries the base record's own text.
+pub(crate) fn parse_series_texts(body: &str) -> Vec<LocalizedText> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(data) = v.get("data") else {
+        return Vec::new();
+    };
+    let mut rows: std::collections::BTreeMap<String, LocalizedText> = Default::default();
+    let mut primary = None;
+    let tr = data.get("translations");
+    for (list, field) in [
+        ("nameTranslations", "name"),
+        ("overviewTranslations", "overview"),
+    ] {
+        let entries = tr
+            .and_then(|t| t.get(list))
+            .and_then(|l| l.as_array())
+            .into_iter()
+            .flatten();
+        for e in entries {
+            if e.get("isAlias").and_then(|x| x.as_bool()) == Some(true) {
+                continue;
+            }
+            let Some(lang) = e.get("language").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let row = rows
+                .entry(lang.to_string())
+                .or_insert_with(|| missing_text(lang));
+            let text = text_field(e, field);
+            if field == "name" {
+                row.title = row.title.take().or(text);
+            } else {
+                row.overview = row.overview.take().or(text);
+            }
+            if e.get("isPrimary").and_then(|x| x.as_bool()) == Some(true) {
+                primary = Some(lang.to_string());
+            }
+        }
+    }
+    let original = primary.or_else(|| text_field(data, "originalLanguage"));
+    if let Some(orig) = original {
+        let row = rows
+            .entry(orig.clone())
+            .or_insert_with(|| missing_text(&orig));
+        row.is_original = true;
+        // The base record's own text wins: it is what enrichment stored, and
+        // B564's replace pass recognises provider text by equality with it.
+        row.title = text_field(data, "name").or(row.title.take());
+        row.overview = text_field(data, "overview").or(row.overview.take());
+    }
+    rows.into_values()
+        .filter(|r| r.title.is_some() || r.overview.is_some())
+        .collect()
+}
+
+/// The rows of `all` for each of `languages`, plus the original, with a
+/// no-text row for a language TVDB does not have. `seen` is told each wanted
+/// language's outcome.
+fn pick_languages(
+    all: Vec<LocalizedText>,
+    languages: &[String],
+    mut seen: impl FnMut(&str, TranslationOutcome),
+) -> Vec<LocalizedText> {
+    let mut out: Vec<LocalizedText> = all
+        .into_iter()
+        .filter(|r| r.is_original || languages.contains(&r.language))
+        .collect();
+    for lang in languages {
+        match out.iter().find(|r| &r.language == lang) {
+            Some(r) if r.is_original => seen(lang, TranslationOutcome::Original),
+            Some(r) if r.overview.is_some() || r.title.is_some() => {
+                seen(lang, TranslationOutcome::Translated)
+            }
+            _ => {
+                seen(lang, TranslationOutcome::Missing);
+                out.push(missing_text(lang));
+            }
+        }
+    }
+    out
+}
+
+/// Put `lang`'s title and overview from `md.texts` into `md.title` /
+/// `md.overview` where it has them; the base-record text stays otherwise.
+pub(crate) fn prefer_language(md: &mut EnrichedMetadata, lang: &str) {
+    let Some(row) = md.texts.iter().find(|r| r.language == lang) else {
+        return;
+    };
+    if let Some(t) = &row.title {
+        md.title = Some(t.clone());
+    }
+    if let Some(o) = &row.overview {
+        md.overview = Some(o.clone());
+    }
+}
+
+/// The languages one episode's text exists in, from the series episode list.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct EpisodeLanguages {
+    /// The series' `originalLanguage` (`data.series`): TVDB writes base
+    /// records in it.
+    pub original: Option<String>,
+    /// The episode's `nameTranslations` and `overviewTranslations` codes.
+    pub listed: Vec<String>,
+}
+
+pub(crate) fn parse_episode_languages(body: &str, season: u32, episode: u32) -> EpisodeLanguages {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return EpisodeLanguages::default();
+    };
+    let data = v.get("data");
+    let original = data
+        .and_then(|d| d.get("series"))
+        .and_then(|s| text_field(s, "originalLanguage"));
+    let ep = data
+        .and_then(|d| d.get("episodes"))
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .find(|e| {
+            e.get("seasonNumber").and_then(|x| x.as_u64()) == Some(u64::from(season))
+                && e.get("number").and_then(|x| x.as_u64()) == Some(u64::from(episode))
+        });
+    let mut listed: Vec<String> = ["nameTranslations", "overviewTranslations"]
+        .iter()
+        .filter_map(|k| ep.and_then(|e| e.get(*k)).and_then(|l| l.as_array()))
+        .flatten()
+        .filter_map(|l| l.as_str().map(str::to_string))
+        .collect();
+    listed.sort();
+    listed.dedup();
+    EpisodeLanguages { original, listed }
+}
+
+/// A `/episodes/{id}/translations/{lang}` body's text; `None` when it carries
+/// neither a name nor an overview.
+pub(crate) fn parse_translation(body: &str) -> Option<LocalizedText> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = v.get("data")?;
+    let t = LocalizedText {
+        language: text_field(data, "language").unwrap_or_default(),
+        title: text_field(data, "name"),
+        overview: text_field(data, "overview"),
+        is_original: false,
+    };
+    (t.title.is_some() || t.overview.is_some()).then_some(t)
+}
+
 /// [`crate::online_enrich::OnlineEnricher`] impl backed by [`TvdbClient`].
 /// TVDB is TV-only: `supports` gates to [`MediaKind::Episode`], so the
 /// orchestrator (T9) skips this provider for movies/audio and relies on
@@ -638,6 +937,29 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
         // series id the caller resolved.
         self.0.list_series_artworks(id).await
     }
+
+    async fn fetch_texts(
+        &self,
+        kind: MediaKind,
+        id: &str,
+        season: Option<u32>,
+        episode: Option<u32>,
+        languages: &[String],
+    ) -> Option<Vec<LocalizedText>> {
+        if kind != MediaKind::Episode {
+            return None;
+        }
+        match (season, episode) {
+            // A failed translation request fails the whole record, so the
+            // backfill ages it a day and counts it toward its failure stop
+            // instead of asking for it again on every pass.
+            (Some(s), Some(e)) => {
+                let (md, failed) = self.0.episode_record(id, s, e, languages).await?;
+                (!failed).then_some(md.texts)
+            }
+            _ => self.0.series_record(id, languages).await.map(|md| md.texts),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +1008,7 @@ mod tests {
         logins: Arc<Mutex<VecDeque<String>>>,
         gets: Arc<Mutex<VecDeque<(u16, String)>>>,
         login_count: Arc<AtomicUsize>,
+        paths: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeTransport {
@@ -717,13 +1040,27 @@ mod tests {
             self
         }
 
+        fn push_status(self, status: u16, body: &str) -> Self {
+            self.gets
+                .lock()
+                .expect("lock")
+                .push_back((status, body.to_string()));
+            self
+        }
+
         fn login_count(&self) -> usize {
             self.login_count.load(Ordering::SeqCst)
+        }
+
+        /// Every path requested, in order.
+        fn paths(&self) -> Vec<String> {
+            self.paths.lock().expect("lock").clone()
         }
     }
 
     impl TvdbTransport for FakeTransport {
-        async fn get(&self, _path: &str, _bearer: &str) -> (u16, String) {
+        async fn get(&self, path: &str, _bearer: &str) -> (u16, String) {
+            self.paths.lock().expect("lock").push(path.to_string());
             self.gets
                 .lock()
                 .expect("lock")
@@ -948,6 +1285,219 @@ mod tests {
     fn tvdb_parse_episode_detail_none_on_malformed_body() {
         assert!(super::parse_episode_detail("not json", 1, 1).is_none());
         assert!(super::parse_episode_detail("{}", 1, 1).is_none());
+    }
+
+    /// A Japanese base record with an English translation inline.
+    const ANIME_SERIES: &str = r#"{"data":{"id":76666,"name":"ドラゴンボール",
+        "overview":"悟空の冒険。","originalLanguage":"jpn",
+        "translations":{
+          "nameTranslations":[
+            {"language":"jpn","name":"ドラゴンボール","isPrimary":true},
+            {"language":"eng","name":"Dragon Ball"},
+            {"language":"eng","name":"DB","isAlias":true}],
+          "overviewTranslations":[
+            {"language":"jpn","overview":"悟空の冒険。","isPrimary":true},
+            {"language":"eng","overview":"Goku sets out.","isPrimary":false},
+            {"language":"fra","overview":"Goku part."}]}}}"#;
+
+    fn by_lang<'a>(texts: &'a [LocalizedText], lang: &str) -> Option<&'a LocalizedText> {
+        texts.iter().find(|t| t.language == lang)
+    }
+
+    #[tokio::test]
+    async fn series_text_is_english_when_tvdb_has_it() {
+        let t = FakeTransport::new().push_login("jwt").push_ok(ANIME_SERIES);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c.get_series("76666").await.unwrap();
+        assert_eq!(t.paths(), vec!["/series/76666/extended?meta=translations"]);
+        assert_eq!(md.overview.as_deref(), Some("Goku sets out."));
+        assert_eq!(md.title.as_deref(), Some("Dragon Ball"));
+        let orig = by_lang(&md.texts, "jpn").expect("original kept");
+        assert!(orig.is_original);
+        assert_eq!(orig.overview.as_deref(), Some("悟空の冒険。"));
+        let eng = by_lang(&md.texts, "eng").expect("english row");
+        assert!(!eng.is_original);
+        assert!(
+            by_lang(&md.texts, "fra").is_none(),
+            "only asked-for languages are kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn series_without_english_keeps_the_original_and_records_the_miss() {
+        let body = r#"{"data":{"id":1,"name":"ドラゴンボール","overview":"悟空の冒険。",
+            "originalLanguage":"jpn","translations":{"overviewTranslations":[
+            {"language":"jpn","overview":"悟空の冒険。","isPrimary":true}]}}}"#;
+        let t = FakeTransport::new().push_login("jwt").push_ok(body);
+        let c = TvdbClient::with_transport("key".into(), t);
+        let md = c.get_series("1").await.unwrap();
+        assert_eq!(md.overview.as_deref(), Some("悟空の冒険。"));
+        let eng = by_lang(&md.texts, "eng").expect("a miss is recorded");
+        assert_eq!(
+            (eng.title.as_deref(), eng.overview.as_deref()),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn series_texts_fall_back_to_original_language_and_base_text() {
+        let body = r#"{"data":{"name":"Les Revenants","overview":"Un village.",
+            "originalLanguage":"fra"}}"#;
+        let texts = super::parse_series_texts(body);
+        assert_eq!(
+            texts,
+            vec![LocalizedText {
+                language: "fra".into(),
+                title: Some("Les Revenants".into()),
+                overview: Some("Un village.".into()),
+                is_original: true,
+            }]
+        );
+    }
+
+    const ANIME_EPISODES: &str = r#"{"data":{"series":{"id":76666,"originalLanguage":"jpn"},
+        "episodes":[{"id":9,"seasonNumber":1,"number":1,"name":"ブルマと孫悟空",
+        "overview":"ブルマが…","nameTranslations":["jpn","eng"],
+        "overviewTranslations":["jpn","eng"]},
+        {"id":10,"seasonNumber":1,"number":2,"name":"えっ!","overview":"…",
+        "nameTranslations":["jpn"],"overviewTranslations":["jpn"]}]}}"#;
+
+    #[tokio::test]
+    async fn episode_text_is_english_from_its_translation() {
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .push_ok(ANIME_EPISODES)
+            .push_ok(r#"{"data":{"language":"eng","name":"The Secret of the Dragon Balls","overview":"Bulma meets Goku."}}"#);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c.get_episode("76666", 1, 1).await.unwrap();
+        assert_eq!(
+            t.paths(),
+            vec![
+                "/series/76666/episodes/default",
+                "/episodes/9/translations/eng"
+            ]
+        );
+        assert_eq!(md.title.as_deref(), Some("The Secret of the Dragon Balls"));
+        assert_eq!(md.overview.as_deref(), Some("Bulma meets Goku."));
+        let orig = by_lang(&md.texts, "jpn").expect("original kept");
+        assert!(orig.is_original);
+        assert_eq!(orig.title.as_deref(), Some("ブルマと孫悟空"));
+    }
+
+    #[tokio::test]
+    async fn episode_not_listing_english_costs_no_request() {
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .push_ok(ANIME_EPISODES);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c.get_episode("76666", 1, 2).await.unwrap();
+        assert_eq!(t.paths(), vec!["/series/76666/episodes/default"]);
+        assert_eq!(md.title.as_deref(), Some("えっ!"));
+        let eng = by_lang(&md.texts, "eng").expect("a miss is recorded");
+        assert_eq!(eng.overview, None);
+    }
+
+    #[tokio::test]
+    async fn episode_translation_404_is_a_miss_and_a_failure_is_not_recorded() {
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .push_ok(ANIME_EPISODES)
+            .push_status(404, "");
+        let c = TvdbClient::with_transport("key".into(), t);
+        let md = c.get_episode("76666", 1, 1).await.unwrap();
+        assert_eq!(md.overview.as_deref(), Some("ブルマが…"));
+        assert!(by_lang(&md.texts, "eng").is_some_and(|r| r.overview.is_none()));
+
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .push_ok(ANIME_EPISODES)
+            .push_status(500, "");
+        let c = TvdbClient::with_transport("key".into(), t);
+        let md = c.get_episode("76666", 1, 1).await.unwrap();
+        assert_eq!(md.overview.as_deref(), Some("ブルマが…"));
+        assert!(
+            by_lang(&md.texts, "eng").is_none(),
+            "a failed request leaves no row, so it is asked again"
+        );
+    }
+
+    #[tokio::test]
+    async fn english_show_needs_no_translation_request() {
+        let body = r#"{"data":{"series":{"originalLanguage":"eng"},"episodes":[
+            {"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming",
+             "overview":"Lord Stark...","overviewTranslations":["eng","fra"]}]}}"#;
+        let t = FakeTransport::new().push_login("jwt").push_ok(body);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c.get_episode("121361", 1, 1).await.unwrap();
+        assert_eq!(t.paths().len(), 1);
+        assert_eq!(md.overview.as_deref(), Some("Lord Stark..."));
+        assert_eq!(md.texts.len(), 1);
+        assert!(md.texts[0].is_original && md.texts[0].language == "eng");
+    }
+
+    /// The signal (B564): each language decision is counted. Fails when the
+    /// client stops recording.
+    #[tokio::test]
+    async fn translation_decisions_are_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .push_ok(ANIME_EPISODES)
+            .push_ok(r#"{"data":{"name":"A","overview":"B"}}"#)
+            .push_ok(ANIME_EPISODES)
+            .push_ok(ANIME_SERIES);
+        let c = TvdbClient::with_transport("key".into(), t);
+        c.get_episode("76666", 1, 1).await.unwrap();
+        c.get_episode("76666", 1, 2).await.unwrap();
+        c.get_series("76666").await.unwrap();
+        let mut seen = Vec::new();
+        for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
+            if ck.key().name() != "pharos_metadata_translation_total" {
+                continue;
+            }
+            let outcome = ck
+                .key()
+                .labels()
+                .find(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            if let DebugValue::Counter(n) = v {
+                seen.push((outcome, n));
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![("missing".to_string(), 1), ("translated".to_string(), 2)]
+        );
+    }
+
+    /// A failed translation request makes `fetch_texts` fail, so the backfill
+    /// does not take the record as done and ask again on every pass.
+    #[tokio::test]
+    async fn a_failed_translation_request_fails_the_texts_fetch() {
+        use crate::online_enrich::OnlineEnricher;
+        let fetch = |status: u16| async move {
+            let t = FakeTransport::new()
+                .push_login("jwt")
+                .push_ok(ANIME_EPISODES)
+                .push_status(status, "");
+            TvdbEnricher(TvdbClient::with_transport("key".into(), t))
+                .fetch_texts(
+                    MediaKind::Episode,
+                    "76666",
+                    Some(1),
+                    Some(1),
+                    &["eng".into()],
+                )
+                .await
+        };
+        assert!(fetch(500).await.is_none());
+        let missed = fetch(404).await.expect("a 404 is an answer");
+        assert!(by_lang(&missed, "eng").is_some_and(|r| r.overview.is_none()));
     }
 
     #[test]
