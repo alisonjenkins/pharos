@@ -2157,7 +2157,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         here => here,
                     };
                     Ok(PlayingRef(Rc::new(Playing {
-                        title: detail.item.name.clone(),
+                        title: super::views::display_name(&detail.item),
                         kind: detail.item.kind,
                         image: detail.item.image.clone(),
                         url: decision.stream_url,
