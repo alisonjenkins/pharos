@@ -454,7 +454,11 @@ pub fn episode_title(stem: &str) -> Option<String> {
     };
     let words: Vec<&str> = spaced
         .split_whitespace()
-        .take_while(|w| !is_release_word(w))
+        // A spaced name can still carry a dotted release tail
+        // (`720p.HDTV.x264-GRP [PublicHD]`): its first segment decides.
+        .take_while(|w| {
+            !is_release_word(w) && !w.split(['.', '_']).next().is_some_and(is_release_word)
+        })
         .collect();
     let title = words.join(" ");
     let title = title.trim_matches(|c: char| c == '-' || c.is_whitespace());
@@ -468,7 +472,7 @@ pub fn episode_title(stem: &str) -> Option<String> {
 fn is_release_word(word: &str) -> bool {
     static RELEASE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|[xh]26[45](?:-\w+)?|hevc)$",
+                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|4k|uhd|[xh]26[45](?:-\w+)?|hevc)$",
             )
             .map_err(|e| tracing::error!(error = %e, "invalid release-word regex"))
             .ok()
@@ -771,6 +775,13 @@ mod tests {
             ("Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE", None),
             ("Show - S01E04", None),
             ("Movie (1999)", None),
+            // A dotted release tail in a spaced name, a 4K/UHD tag, and an
+            // episode marker that opens the stem.
+            ("Show.S01E03.720p.HDTV.x264-GRP [PublicHD]", None),
+            ("Show.S01E02.4K.WEB-DL", None),
+            ("Show - S01E02 - Pilot UHD", Some("Pilot")),
+            ("E01 - Pilot", Some("Pilot")),
+            ("EP02 - The Return", Some("The Return")),
         ];
         for (stem, want) in cases {
             assert_eq!(episode_title(stem).as_deref(), want, "{stem}");
