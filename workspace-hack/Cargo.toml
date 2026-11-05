@@ -72,6 +72,7 @@ sha1_smol = { version = "1", default-features = false, features = ["std"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 simd-adler32 = { version = "0.3" }
+skrifa = { version = "0.49" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }
@@ -86,6 +87,7 @@ tokio-util = { version = "0.7", features = ["codec", "compat", "io", "rt"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
+unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
@@ -149,6 +151,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
+unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
 
