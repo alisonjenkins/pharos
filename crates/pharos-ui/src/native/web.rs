@@ -887,6 +887,19 @@ fn storage(kept: Kept) -> Result<web_sys::Storage, String> {
         .ok_or_else(|| format!("{name} is unavailable"))
 }
 
+/// Focuses the text field `id` and selects all of it, ready for Ctrl+C.
+pub fn select_field(id: &str) {
+    let Some(field) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    else {
+        return;
+    };
+    let _ = field.focus();
+    field.select();
+}
+
 /// Moves keyboard focus to the element `id`, when it is there and focusable.
 pub fn focus_by_id(id: &str) {
     use wasm_bindgen::JsCast;
@@ -949,6 +962,54 @@ fn pip_document() -> Option<PipDocument> {
     web_sys::window()
         .and_then(|w| w.document())
         .map(|d| d.unchecked_into())
+}
+
+/// The page's `scheme://host[:port]`, for links meant for another device.
+pub fn page_origin() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().origin().ok())
+        .unwrap_or_default()
+}
+
+/// Puts `text` on the clipboard; `false` when the browser refused or has no
+/// clipboard (`navigator.clipboard` needs a secure context, so plain-http
+/// LAN pages have none).
+pub async fn copy_text(text: &str) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let clipboard = js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("clipboard"))
+        .ok()
+        .filter(|c| !c.is_undefined() && !c.is_null());
+    let Some(clipboard) = clipboard else {
+        info("pharos: copy outcome=refused reason=no_clipboard");
+        return false;
+    };
+    let Some(write) = js_sys::Reflect::get(&clipboard, &JsValue::from_str("writeText"))
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+    else {
+        info("pharos: copy outcome=refused reason=no_write_text");
+        return false;
+    };
+    let promise = match write.call1(&clipboard, &JsValue::from_str(text)) {
+        Ok(p) => js_sys::Promise::from(p),
+        Err(e) => {
+            warn(&format!(
+                "pharos: copy outcome=failed reason=threw error={e:?}"
+            ));
+            return false;
+        }
+    };
+    match wasm_bindgen_futures::JsFuture::from(promise).await {
+        Ok(_) => true,
+        Err(e) => {
+            warn(&format!(
+                "pharos: copy outcome=failed reason=rejected error={e:?}"
+            ));
+            false
+        }
+    }
 }
 
 /// Whether the browser can hand a video to its own picture-in-picture

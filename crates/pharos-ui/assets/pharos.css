@@ -1120,6 +1120,66 @@ body:has(.pharos-stage.is-full) .pharos-error {
   margin-left: auto;
   flex-shrink: 0;
 }
+/* Start a group from the player; once in one, Invite opens its link. */
+.pharos-together-start {
+  margin-left: auto;
+}
+.pharos-together-start,
+.pharos-invite-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-shrink: 0;
+  padding: 0 0.5rem;
+}
+.pharos-invite {
+  position: absolute;
+  top: 3.75rem;
+  right: 0.75rem;
+  width: min(24rem, calc(100% - 1.5rem));
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.9rem;
+  border-radius: 8px;
+  background: rgb(0 0 0 / 0.8); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-invite-text {
+  margin: 0;
+  font-size: var(--px-type-step--1);
+}
+.pharos-invite-link {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--px-type-step--1);
+}
+.pharos-invite-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-invite .pharos-button {
+  padding: 0.4rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+}
+.pharos-invite-note {
+  font-size: var(--px-type-step--1);
+}
+@media (max-width: 40rem) {
+  .pharos-together-start .pharos-control-label,
+  .pharos-invite-toggle .pharos-control-label {
+    display: none;
+  }
+}
 .pharos-member-list {
   display: flex;
   gap: 0.5rem;
