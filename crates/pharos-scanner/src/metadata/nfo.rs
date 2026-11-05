@@ -39,7 +39,7 @@
 //! logs at `warn` and skips it, never aborting the scan. The parser never
 //! panics.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use pharos_core::{
     ArtworkRef, ArtworkRole, ArtworkSource, DomainError, DomainResult, MediaKind, MetadataProvider,
@@ -102,6 +102,7 @@ impl MetadataProvider for NfoProvider {
             match std::fs::read(&candidate) {
                 Ok(bytes) => {
                     let mut parsed = parse_nfo(&bytes, &candidate)?;
+                    locate_local_art(&mut parsed, &candidate);
                     if show_nfo {
                         drop_episode_fields(&mut parsed);
                     }
@@ -627,6 +628,67 @@ fn push_artwork(result: &mut MetadataResult, role: ArtworkRole, value: &str) {
     {
         result.artwork.push(aref);
     }
+}
+
+/// B571 — point every local art path in an NFO at a file that exists.
+/// Kodi writes art paths relative to the NFO; Jellyfin writes them absolute
+/// as seen inside its own container (`/media/TV/<show>/fanart.jpg`, or its
+/// internal `/config/data/metadata/...` cache), which names nothing on this
+/// host. A relative path is joined to the NFO's folder; an absolute path
+/// that does not exist is replaced by the file of the same name beside the
+/// NFO. A path that still names no file is dropped, so it can neither win
+/// its role over a sidecar image nor be stored as a dead row (V484).
+fn locate_local_art(result: &mut MetadataResult, nfo: &Path) {
+    let Some(dir) = nfo.parent() else {
+        return;
+    };
+    let mut kept: Vec<(ArtworkRole, PathBuf)> = Vec::new();
+    result.artwork.retain_mut(|art| {
+        let ArtworkSource::LocalFile(path) = &art.source else {
+            return true;
+        };
+        let found = if path.is_relative() {
+            // No `..`: a relative path stays inside the NFO's folder, so an
+            // NFO cannot hand the image route a file outside the library.
+            let inside = path
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+            Some(dir.join(path)).filter(|p| inside && p.is_file())
+        } else if path.is_file() {
+            Some(path.clone())
+        } else {
+            path.file_name()
+                .map(|name| dir.join(name))
+                .filter(|p| p.is_file())
+        };
+        match found {
+            Some(local) => {
+                if local != *path {
+                    tracing::debug!(
+                        nfo = %nfo.display(),
+                        role = art.role.as_str(),
+                        written = %path.display(),
+                        found = %local.display(),
+                        "nfo art path relocated beside its nfo"
+                    );
+                }
+                // Two written paths can land on one file; keep it once.
+                let first = !kept.contains(&(art.role, local.clone()));
+                kept.push((art.role, local.clone()));
+                art.source = ArtworkSource::LocalFile(local);
+                first
+            }
+            None => {
+                tracing::debug!(
+                    nfo = %nfo.display(),
+                    role = art.role.as_str(),
+                    written = %path.display(),
+                    "nfo art path names no file here; dropped"
+                );
+                false
+            }
+        }
+    });
 }
 
 /// A `<year>` payload — first 4-digit run within the plausible window.

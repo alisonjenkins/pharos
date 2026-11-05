@@ -796,3 +796,114 @@ fn the_show_name_check_reads_an_nfo_with_a_mismatched_end_tag() {
     let names = identity::parse_names(nfo.as_bytes()).expect("parse_nfo reads this NFO");
     assert_eq!(names.title.as_deref(), Some("Super Dragon Ball Heroes"));
 }
+
+/// [`FOREIGN_TVSHOW_NFO`] renamed to the folder's own show, so its art is
+/// kept, with `<fanart>` set to `fanart`.
+fn own_show_nfo(fanart: &str) -> String {
+    FOREIGN_TVSHOW_NFO
+        .replace("Super Dragon Ball Heroes", "Dragon Ball")
+        .replace("スーパードラゴンボールヒーローズ", "ドラゴンボール")
+        .replace("/media/TV/Dragon Ball/fanart.jpg", fanart)
+}
+
+/// The episode's Backdrop from its NFOs, with `fanart.jpg` in the show
+/// folder.
+async fn episode_backdrop(fanart: &str) -> (tempfile::TempDir, Option<ArtworkSource>) {
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (dir, media, series) = dragon_ball(&own_show_nfo(fanart), &episode);
+    std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
+    let p = probe();
+    let r = NfoProvider::new()
+        .fetch(&request(&media, &p, &series))
+        .await
+        .unwrap();
+    let backdrop = r
+        .artwork
+        .into_iter()
+        .find(|a| a.role == ArtworkRole::Backdrop)
+        .map(|a| a.source);
+    (dir, backdrop)
+}
+
+/// B571 — Jellyfin writes art paths as its own container sees them.
+#[tokio::test]
+async fn a_jellyfin_art_path_is_found_beside_its_nfo() {
+    let (dir, backdrop) = episode_backdrop("/media/TV/Dragon Ball/fanart.jpg").await;
+    assert_eq!(
+        backdrop,
+        Some(ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
+    );
+}
+
+#[tokio::test]
+async fn a_relative_art_path_is_read_from_its_nfos_folder() {
+    let (dir, backdrop) = episode_backdrop("fanart.jpg").await;
+    assert_eq!(
+        backdrop,
+        Some(ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
+    );
+}
+
+#[tokio::test]
+async fn an_art_path_naming_no_file_here_is_dropped() {
+    let (_dir, backdrop) =
+        episode_backdrop("/config/data/metadata/library/ab/abcdef/backdrop.jpg").await;
+    assert_eq!(backdrop, None);
+}
+
+#[tokio::test]
+async fn an_art_url_is_kept_as_written() {
+    let (_dir, backdrop) = episode_backdrop("https://example.test/fanart.jpg").await;
+    assert_eq!(
+        backdrop,
+        Some(ArtworkSource::Url("https://example.test/fanart.jpg".into()))
+    );
+}
+
+#[tokio::test]
+async fn an_art_path_climbing_out_of_its_nfos_folder_is_dropped() {
+    let (_dir, backdrop) = episode_backdrop("../fanart.jpg").await;
+    assert_eq!(backdrop, None);
+}
+
+#[tokio::test]
+async fn two_art_paths_found_as_one_file_are_kept_once() {
+    let show = own_show_nfo("/media/TV/Dragon Ball/fanart.jpg").replace(
+        "</art>",
+        "  <fanart>/config/data/metadata/library/ab/abc/fanart.jpg</fanart>\n  </art>",
+    );
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (dir, media, series) = dragon_ball(&show, &episode);
+    std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
+    let p = probe();
+    let r = NfoProvider::new()
+        .fetch(&request(&media, &p, &series))
+        .await
+        .unwrap();
+    let backdrops: Vec<_> = r
+        .artwork
+        .iter()
+        .filter(|a| a.role == ArtworkRole::Backdrop)
+        .collect();
+    assert_eq!(backdrops.len(), 1, "{backdrops:?}");
+}
+
+/// B571 — with the NFO's dead path dropped, the show folder's own image
+/// wins the episode's Backdrop through the resolver.
+#[tokio::test]
+async fn a_dead_nfo_art_path_gives_way_to_the_show_folders_image() {
+    let show = own_show_nfo("/config/data/metadata/library/ab/abc/backdrop.jpg");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (dir, media, series) = dragon_ball(&show, &episode);
+    std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
+    let p = probe();
+    let resolver = crate::metadata::MetadataResolver::new()
+        .with_provider(NfoProvider::new())
+        .with_provider(crate::metadata::sidecar::SidecarArtworkProvider);
+    let r = resolver.resolve(&request(&media, &p, &series)).await;
+    let backdrop = r.artwork.iter().find(|a| a.role == ArtworkRole::Backdrop);
+    assert_eq!(
+        backdrop.map(|a| &a.source),
+        Some(&ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
+    );
+}
