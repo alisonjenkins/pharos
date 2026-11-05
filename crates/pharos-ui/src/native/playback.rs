@@ -707,6 +707,11 @@ impl UpNext {
             self.shown_at = None;
             return UpNextStep::Hidden;
         }
+        // A seek back inside the card's window counts from where it landed,
+        // so the countdown and its bar start over together.
+        if self.shown_at.is_some_and(|shown| at_ms < shown) {
+            self.shown_at = Some(at_ms);
+        }
         let shown = *self.shown_at.get_or_insert(at_ms);
         let end = total_ms.max(shown);
         let due = if from.credits {
@@ -1174,6 +1179,32 @@ mod tests {
             }
         );
         assert_eq!(up.step(1_200_000, from, total), UpNextStep::Go);
+    }
+
+    /// Disarm check: without the reset on a seek back, the second step reads
+    /// `of_ms: 5_000` beside `left_ms: 60_000`.
+    #[test]
+    fn up_next_counts_again_from_a_seek_back_inside_its_window() {
+        let mut up = UpNext::default();
+        let from = Some(UpNextFrom {
+            at_ms: 1_140_000,
+            credits: false,
+        });
+        let total = 1_200_000;
+        assert_eq!(
+            up.step(1_195_000, from, total),
+            UpNextStep::Counting {
+                left_ms: 5_000,
+                of_ms: 5_000
+            }
+        );
+        assert_eq!(
+            up.step(1_140_000, from, total),
+            UpNextStep::Counting {
+                left_ms: 60_000,
+                of_ms: 60_000
+            }
+        );
     }
 
     #[test]
