@@ -461,6 +461,7 @@ pub(super) async fn upgrade(
                 .body(refused.label()));
         }
     };
+    ctx.set_media_token_ttl_secs(cfg.media_token_ttl_secs.get());
     let (response, session, stream) = actix_ws::handle(&req, body)?;
     let stream = stream
         .max_frame_size(MAX_FRAME)

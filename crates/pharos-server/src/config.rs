@@ -722,6 +722,12 @@ pub struct NativeApiConfig {
     /// pending QuickConnect polls extend `auth_deadline_secs`.
     #[serde(default = "default_native_max_unauthenticated_secs")]
     pub max_unauthenticated_secs: NonZeroU32,
+    /// How long a token from `Session.mediaToken` stays valid (ADR-0058), at
+    /// most [`MAX_MEDIA_TOKEN_TTL_SECS`]. It reaches only item images and
+    /// what lies under `/videos/{id}/` and `/audio/{id}/`, and a native
+    /// client asks for a fresh one before it expires.
+    #[serde(default = "default_native_media_token_ttl_secs")]
+    pub media_token_ttl_secs: NonZeroU32,
 }
 
 impl Default for NativeApiConfig {
@@ -733,8 +739,32 @@ impl Default for NativeApiConfig {
             revalidate_secs: default_native_revalidate_secs(),
             auth_deadline_secs: default_native_auth_deadline_secs(),
             max_unauthenticated_secs: default_native_max_unauthenticated_secs(),
+            media_token_ttl_secs: default_native_media_token_ttl_secs(),
         }
     }
+}
+
+/// Longest `media_token_ttl_secs` accepted: a day. A media token outlives a
+/// sign-out until it expires (ADR-0058), so its lifetime stays bounded.
+pub const MAX_MEDIA_TOKEN_TTL_SECS: u32 = 86_400;
+
+impl NativeApiConfig {
+    /// Names the first field outside its accepted range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.media_token_ttl_secs.get() > MAX_MEDIA_TOKEN_TTL_SECS {
+            return Err("media_token_ttl_secs");
+        }
+        Ok(())
+    }
+}
+
+fn default_native_media_token_ttl_secs() -> NonZeroU32 {
+    // Checked at compile time. Six hours: a long film plus a pause.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(21_600) {
+        Some(n) => n,
+        None => panic!("the default media token lifetime must not be zero"),
+    };
+    DEFAULT
 }
 
 fn default_native_max_unauthenticated_secs() -> NonZeroU32 {
@@ -1374,6 +1404,8 @@ pub enum ConfigError {
     TrustedProxies(String),
     #[error("server.login_throttle.{0} must not be 0: it would disable the login throttle")]
     LoginThrottleZero(&'static str),
+    #[error("server.native_api.{0} is out of range (media_token_ttl_secs: at most 86400)")]
+    NativeApiRange(&'static str),
 }
 
 impl Config {
@@ -1387,6 +1419,10 @@ impl Config {
             .login_throttle
             .validate()
             .map_err(ConfigError::LoginThrottleZero)?;
+        cfg.server
+            .native_api
+            .validate()
+            .map_err(ConfigError::NativeApiRange)?;
         Ok(cfg)
     }
 
@@ -1567,6 +1603,16 @@ mod tests {
     }
 
     /// B541: the auth deadline defaults to 30 s and a zero is refused.
+    /// B542: a media token's lifetime is capped at a day.
+    #[test]
+    fn a_media_token_ttl_over_a_day_is_rejected() {
+        assert!(NativeApiConfig::default().validate().is_ok());
+        let ok: NativeApiConfig = toml::from_str("media_token_ttl_secs = 86400").expect("parses");
+        assert!(ok.validate().is_ok());
+        let long: NativeApiConfig = toml::from_str("media_token_ttl_secs = 86401").expect("parses");
+        assert_eq!(long.validate(), Err("media_token_ttl_secs"));
+    }
+
     #[test]
     fn a_zero_auth_deadline_is_rejected() {
         assert_eq!(NativeApiConfig::default().auth_deadline_secs.get(), 30);

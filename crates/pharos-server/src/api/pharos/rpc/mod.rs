@@ -129,6 +129,8 @@ pub struct ConnectionCtx {
     client_ip: std::net::IpAddr,
     limits: limits::ConnectionLimits,
     max_per_user: u32,
+    /// `[server.native_api].media_token_ttl_secs`, for `Session.mediaToken`.
+    media_token_ttl_secs: std::cell::Cell<u32>,
     slot: RefCell<limits::Slot>,
     /// Every token a `resume` succeeded with, and its user, re-checked while
     /// the connection lives so revoking one ends it (T025a, T025).
@@ -148,6 +150,10 @@ pub struct ConnectionCtx {
     on_close: RefCell<Vec<Box<dyn FnOnce()>>>,
 }
 
+/// The media token lifetime of a connection nobody configured: the config
+/// default (six hours).
+const DEFAULT_MEDIA_TOKEN_TTL_SECS: u32 = 21_600;
+
 impl ConnectionCtx {
     /// A new connection's context, or why the server refuses it: too many
     /// connections that have not signed in, server-wide or from `client_ip`.
@@ -163,6 +169,7 @@ impl ConnectionCtx {
             client_ip,
             limits: limits.clone(),
             max_per_user,
+            media_token_ttl_secs: std::cell::Cell::new(DEFAULT_MEDIA_TOKEN_TTL_SECS),
             slot: RefCell::new(slot),
             resumed: RefCell::new(Vec::new()),
             ended: RefCell::new(Vec::new()),
@@ -170,6 +177,16 @@ impl ConnectionCtx {
             extend_auth: tokio::sync::Notify::new(),
             on_close: RefCell::new(Vec::new()),
         }))
+    }
+
+    /// Sets the lifetime `Session.mediaToken` gives its tokens, from
+    /// `[server.native_api].media_token_ttl_secs`.
+    pub fn set_media_token_ttl_secs(&self, secs: u32) {
+        self.media_token_ttl_secs.set(secs);
+    }
+
+    pub(crate) fn media_token_ttl_secs(&self) -> u32 {
+        self.media_token_ttl_secs.get()
     }
 
     /// Requests an extension of the auth deadline if the connection is not
