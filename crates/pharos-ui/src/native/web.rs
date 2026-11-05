@@ -500,6 +500,7 @@ fn lift_cues(cues: &JsValue) {
     let line = JsValue::from_str("line");
     let vertical = JsValue::from_str("vertical");
     let cue_text = JsValue::from_str("text");
+    let region = JsValue::from_str("region");
     let text = |cue: &JsValue, key: &JsValue| {
         js_sys::Reflect::get(cue, key)
             .ok()
@@ -510,9 +511,15 @@ fn lift_cues(cues: &JsValue) {
             continue;
         };
         // Only horizontal cues: for `vertical:rl`/`lr` a numeric line moves
-        // the cue sideways, not up.
+        // the cue sideways, not up. A cue in a WebVTT region keeps the
+        // region's placement (a numeric line would take it out of the
+        // region); a browser without regions has no `region` at all.
+        let in_region = js_sys::Reflect::get(&cue, &region)
+            .ok()
+            .is_some_and(|r| !r.is_null() && !r.is_undefined());
         if text(&cue, &line).as_deref() == Some("auto")
             && text(&cue, &vertical).as_deref() == Some("")
+            && !in_region
         {
             let lines = text(&cue, &cue_text).unwrap_or_default();
             let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(lifted_line(&lines)));
