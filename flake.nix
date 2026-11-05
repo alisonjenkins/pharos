@@ -704,6 +704,57 @@
           };
         };
 
+        # ADR-0066: lyric word times by forced alignment, in an image of its
+        # own so torch stays out of `oci`. CI does not publish it.
+        alignerModel = pkgs.fetchurl {
+          url = "https://dl.fbaipublicfiles.com/mms/torchaudio/ctc_alignment_mling_uroman/model.pt";
+          hash = "sha256-IO8Sljq0kkvvSaxPx/WK1dou5DssEbyMhTybkOzbxoA=";
+        };
+        # torch.hub finds the MMS_FA weights under $TORCH_HOME/hub/checkpoints,
+        # so the service never downloads at run time.
+        alignerTorchHome = pkgs.linkFarm "pharos-aligner-torch-home" [
+          {
+            name = "hub/checkpoints/model.pt";
+            path = alignerModel;
+          }
+        ];
+        aligner = pkgs.python3Packages.buildPythonApplication {
+          pname = "pharos-aligner";
+          version = "0.1.0";
+          pyproject = true;
+          src = ./aligner;
+          build-system = [ pkgs.python3Packages.setuptools ];
+          dependencies = [
+            pkgs.python3Packages.torch
+            pkgs.python3Packages.torchaudio
+          ];
+          nativeCheckInputs = [ pkgs.python3Packages.pytestCheckHook ];
+          makeWrapperArgs = [
+            "--prefix PATH : ${pkgs.ffmpeg-headless}/bin"
+            "--set-default TORCH_HOME ${alignerTorchHome}"
+          ];
+        };
+        alignerImage = pkgs.dockerTools.streamLayeredImage {
+          name = "pharos-aligner";
+          tag = "latest";
+          architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
+          contents = [ aligner ];
+          extraCommands = ''
+            mkdir -p etc tmp
+            printf 'root:x:0:0::/root:/sbin/nologin\npharos:x:1000:1000::/tmp:/sbin/nologin\n' > etc/passwd
+            printf 'root:x:0:\npharos:x:1000:\n' > etc/group
+            chmod 1777 tmp
+          '';
+          config = {
+            Entrypoint = [ "${aligner}/bin/pharos-aligner" ];
+            User = "1000:1000";
+            ExposedPorts = {
+              "8790/tcp" = { };
+            };
+            Env = [ "PHAROS_ALIGNER_MEDIA_ROOT=/var/lib/pharos/media" ];
+          };
+        };
+
         # The pharos Dioxus UI compiled to a static WASM bundle via `dx`.
         # Built reproducibly in the nix sandbox: cargo deps are vendored from
         # Cargo.lock (offline), wasm-bindgen-cli is `wasmBindgenCli` above,
@@ -1151,6 +1202,8 @@
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
           pharosUiOci = pharosUiImage;
+          inherit aligner;
+          alignerOci = alignerImage;
           pharosUiBundle = pharosUiBundle;
           testMediaOci = testMediaImage;
           testMediaTree = pharosTestMedia;
