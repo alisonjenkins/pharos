@@ -26,6 +26,7 @@
 | `group_drift` | info (sampled) | playhead vs group clock while playing (014, 1 per 10 s) | group, drift_ms |
 | `group_hard_seek` | warn | drift past the hard-seek threshold (014) | group, drift_ms |
 | `group_wait` | info | time spent waiting on other members (014) | group, wait_ms |
+| `playback_resume` | info (warn on timeout) | a paused song resumed, once it sounded or after 5 s (B563) | click_to_playing_ms, playing_to_audible_ms, ready_state, buffered_ahead_ms, context_state, base_latency_ms, output_latency_ms, engine |
 
 ## Server-side signals produced from them (labels bounded via `label()`)
 
