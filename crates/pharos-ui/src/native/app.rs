@@ -1949,6 +1949,7 @@ fn AppearanceScreen() -> Element {
                     );
                 }
                 platform::apply_subtitle_size(size);
+                platform::relift_cues(VIDEO_ID);
                 subtitle_size.set(size);
                 platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
             },
