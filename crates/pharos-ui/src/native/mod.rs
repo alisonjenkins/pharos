@@ -28,6 +28,8 @@ mod platform;
 #[path = "web.rs"]
 mod platform;
 pub mod playback;
+/// For the non-native player's `<video>` (V455).
+pub use platform::lift_cues_as_shown;
 pub mod quality;
 pub mod queue;
 pub mod rails;
