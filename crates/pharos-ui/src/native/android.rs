@@ -185,6 +185,8 @@ pub fn forget_token() {
 }
 
 /// Connect and spawn the driver, retrying with backoff until it works.
+/// `base` must already have passed `tv_auth::rpc_url`: a bad base would
+/// fail every attempt, so it is refused before this loop, not retried.
 async fn connect_until_up(base: &str, qc: &mut QuickConnect) -> (bootstrap::Client, Closed) {
     loop {
         match connect(base).await {
@@ -311,7 +313,7 @@ pub struct SignedIn {
 
 /// Sign in by QuickConnect: mint a code, hand it to `show_code`, and poll
 /// until someone approves it. Runs until approved (drop the future to
-/// cancel). The server closes a socket not signed in within 30 s, so this
+/// cancel); a server address that is not `https://` is an error at once. The server closes a socket not signed in within 30 s, so this
 /// reconnects, with backoff, only once the socket has closed; a code that
 /// expires (`notFound`) is replaced by a new one. Must run inside a
 /// `LocalSet`, which drives the connection.
@@ -319,7 +321,10 @@ pub async fn quick_connect_sign_in(
     base: &str,
     info: &CallInfo,
     mut show_code: impl FnMut(&str),
-) -> SignedIn {
+) -> Result<SignedIn, String> {
+    // A bad server address is permanent: refuse it now instead of retrying
+    // the socket forever.
+    tv_auth::rpc_url(base)?;
     let mut qc = QuickConnect::new();
     let mut link: Option<(bootstrap::Client, Closed)> = None;
     loop {
@@ -358,12 +363,12 @@ pub async fn quick_connect_sign_in(
         match qc.on_poll(&polled) {
             Action::Finish => {
                 if let Polled::Approved((session, token)) = polled {
-                    return SignedIn {
+                    return Ok(SignedIn {
                         client,
                         closed,
                         session,
                         token,
-                    };
+                    });
                 }
                 // `on_poll` finishes only on `Approved`; if that ever changes,
                 // say so and keep polling rather than spin.
