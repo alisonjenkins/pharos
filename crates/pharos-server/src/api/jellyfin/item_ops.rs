@@ -784,13 +784,14 @@ async fn get_lyrics(
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // `for_item` applies the item-access policy itself.
-    let found = crate::services::lyrics::for_item(&state, &user.0, id)
+    let found = crate::services::lyrics::for_item(&state, &user.0, id, false)
         .await
         .map_err(|e| match e {
             DetailError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
             DetailError::NotFound => error::ErrorNotFound("not found"),
             DetailError::Store(other) => error::ErrorInternalServerError(other.to_string()),
-        })?;
+        })?
+        .map(|(lyrics, _)| lyrics);
     // B78/V38 — typed LyricDto, not a json! literal.
     Ok(crate::api::jellyfin::wire::json(&LyricDto::from(found)))
 }

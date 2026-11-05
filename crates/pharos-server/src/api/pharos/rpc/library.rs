@@ -244,7 +244,9 @@ impl server::library::Handler for Library {
         params: wire::LyricsParams,
         results: &mut wire::LyricsResults,
     ) -> Result<(), capnp::Error> {
-        let id = read_item_id(params.get()?.get_id()?)?;
+        let p = params.get()?;
+        let id = read_item_id(p.get_id()?)?;
+        let want_words = p.get_want_words();
         let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
@@ -258,7 +260,7 @@ impl server::library::Handler for Library {
             out.init_lyrics();
             return Ok(());
         };
-        let found = match lyrics::for_item(&self.session.state, &user, id).await {
+        let found = match lyrics::for_item(&self.session.state, &user, id, want_words).await {
             Ok(found) => found,
             Err(e) => {
                 item_denial(id, &e, "lyrics").write(out.init_error());
@@ -266,11 +268,12 @@ impl server::library::Handler for Library {
             }
         };
         let mut out = out.init_lyrics();
-        let Some(found) = found else {
+        let Some((found, words_pending)) = found else {
             return Ok(());
         };
         out.set_synced(found.synced());
         out.set_source(found.origin.label());
+        out.set_words_pending(words_pending);
         let mut lines = out.init_lines(len_u32(&found.lines));
         for (i, line) in (0..).zip(&found.lines) {
             let mut w = lines.reborrow().get(i);
