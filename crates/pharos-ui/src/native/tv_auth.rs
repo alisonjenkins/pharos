@@ -198,6 +198,9 @@ pub fn rpc_url(base: &str) -> Result<String, String> {
     if host.is_empty() {
         return Err(format!("no host in server {base:?}"));
     }
+    if host.chars().any(char::is_whitespace) {
+        return Err(format!("whitespace in the host of server {base:?}"));
+    }
     Ok(format!("wss://{host}/pharos/rpc"))
 }
 
@@ -223,6 +226,8 @@ mod tests {
             "ws://tv.example.com",
             "tv.example.com",
             "https://",
+            "https://tv.exa mple.com",
+            "https://tv.example.com\t",
         ] {
             assert!(rpc_url(bad).is_err(), "{bad} must be refused");
         }
