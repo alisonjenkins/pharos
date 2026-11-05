@@ -288,13 +288,13 @@ async fn a_media_token_is_refused_everywhere_else() {
 #[actix_web::test]
 async fn a_media_token_stops_working_when_its_lifetime_ends() {
     let rig = rig().await;
-    let (session, _) = signed_in(&rig, Some(1)).await;
+    let (session, _) = signed_in(&rig, Some(2)).await;
     let (token, _) = media_token(&session).await.unwrap();
     let app = test::init_service(build_app(rig.state.clone())).await;
     // Images stay anonymous (B286), so the stream is what shows the expiry.
     let stream = format!("/Videos/7/stream?static=true&api_key={token}");
     assert_eq!(status!(app, "GET", &stream), StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     assert_eq!(status!(app, "GET", &stream), StatusCode::UNAUTHORIZED);
 }
 
