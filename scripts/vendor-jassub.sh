@@ -8,7 +8,7 @@
 # against the integrity npm published for it before anything is unpacked.
 #
 # Usage: nix develop -c scripts/vendor-jassub.sh   (from the repository root;
-# the dev shell supplies curl and openssl)
+# the dev shell supplies curl, openssl and node)
 set -euo pipefail
 
 OUT=crates/pharos-ui/assets/vendor/jassub
@@ -30,6 +30,58 @@ NOTICES="jassub 1.8.8 sha512-Vtw27Z0/hN2Tm2Qs4HAR+eONwwSD5ULo/hisPvmiaW9Ya6aFCt7
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+
+# license_text NAME PACKAGE_JSON: the full licence text for a package whose
+# tarball ships none, from its package.json `license` and `author`. Only the
+# licences these dependencies use are known; any other stops the script.
+license_text() {
+  local spdx author
+  # node is in the dev shell; the author is a string or {name, ...}.
+  spdx=$(node -e 'const p = require(process.argv[1]); console.log(p.license || "")' "$(realpath "$2")")
+  author=$(node -e 'const a = require(process.argv[1]).author;
+    console.log((a && typeof a === "object" ? a.name : a) || "")' "$(realpath "$2")")
+  case "$spdx" in
+    MIT)
+      [[ -n "$author" ]] || { echo "$1: MIT with no author" >&2; exit 1; }
+      cat <<MIT
+$1 (MIT licence; text written by scripts/vendor-jassub.sh because the
+package ships no licence file)
+
+Copyright (c) $author
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+MIT
+      ;;
+    Apache-2.0)
+      # The Apache text, vendored and checked so a rebuild cannot change it.
+      echo "$APACHE_SHA256  $APACHE_TEXT" | sha256sum -c --quiet - >&2
+      printf '%s (Apache License 2.0; the package ships no licence file)\n\n' "$1"
+      cat "$APACHE_TEXT"
+      ;;
+    *)
+      echo "$1: no licence text known for '$spdx'" >&2
+      exit 1
+      ;;
+  esac
+}
+APACHE_TEXT=scripts/licenses/Apache-2.0.txt
+APACHE_SHA256=cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
 
 # fetch NAME VERSION INTEGRITY DIR: unpack the checked tarball into DIR.
 fetch() {
@@ -78,9 +130,10 @@ for dep in abslink lfa-ponyfill rvfc-polyfill throughput; do
   if [[ -n "$lic" ]]; then
     cp "$lic" "$OUT/LICENSE.$dep"
   else
-    # Some tarballs carry no licence file; record what package.json says.
-    sed -n 's/^ *"license": *"\(.*\)",*$/\1/p' "$WORK/node_modules/$dep/package.json" |
-      sed "s/^/$dep: /; s/\$/ (package.json; the tarball has no licence file)/" > "$OUT/LICENSE.$dep"
+    # Some tarballs carry no licence file, and their repositories have none
+    # either: write the full text of the licence package.json names, with
+    # its author as the copyright holder, so the bundled copy carries it.
+    license_text "$dep" "$WORK/node_modules/$dep/package.json" > "$OUT/LICENSE.$dep"
   fi
 done
 
