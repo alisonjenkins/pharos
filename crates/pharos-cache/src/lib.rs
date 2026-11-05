@@ -10,8 +10,8 @@
 //!   `tokio::sync::Mutex`.
 //! - [`image_cache`] — poster / backdrop / chapter thumb extractor.
 //!   Falls through to ffmpeg `-ss` for video, ID3 attached_pic for
-//!   audio. Format-negotiates webp / avif via the FfmpegBackend
-//!   transcode_image path.
+//!   audio. Encodes webp / avif copies from the source in a background
+//!   queue (ADR-0063).
 //! - [`trickplay_cache`] — sprite-sheet thumb grid used by jellyfin-web
 //!   for scrub previews. Generates one tile-grid per interval.
 //! - [`subtitle_cache`] — extracted / converted subtitle blob cache.
@@ -28,7 +28,7 @@ pub use hls_cache::{
     compose_generation, generation, install_placement_fingerprint, AudioDropReport,
     AudioRenditionFile, HlsSegmentCache, HLS_GEN_VERSION,
 };
-pub use image_cache::{ImageCache, ImageRole};
+pub use image_cache::{EncodeLookup, Encoded, EncodedFormat, ImageCache, ImageRole};
 pub use single_flight::KeyedLocks;
 pub use subtitle_cache::SubtitleCache;
 pub use trickplay_cache::TrickplayCache;
