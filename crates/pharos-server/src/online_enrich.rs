@@ -81,6 +81,10 @@ pub struct EnrichedMetadata {
     /// base-record text marked `is_original` (ADR-0062). `title`/`overview`
     /// above already hold the English text when the provider had it.
     pub texts: Vec<pharos_core::LocalizedText>,
+    /// An episode record's own `(season, episode)` in the provider's
+    /// numbering, which differs from the file's when the episode's name
+    /// placed it on another record (B570).
+    pub episode_number: Option<(u32, u32)>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
@@ -111,13 +115,16 @@ pub trait OnlineEnricher: Send + Sync {
     /// [`search`](Self::search) + `match_best`, or a stored provider id).
     /// `season`/`episode` are set together when fetching a single episode
     /// under a TV series id; both `None` fetches the movie/series-level
-    /// record.
+    /// record. `name` is the episode's own name, from its filename: a
+    /// provider that counts the season differently can place the episode by
+    /// it (B570).
     fn fetch(
         &self,
         kind: MediaKind,
         id: &str,
         season: Option<u32>,
         episode: Option<u32>,
+        name: Option<&str>,
     ) -> impl Future<Output = Option<EnrichedMetadata>> + Send;
 
     /// Download the raw bytes of an artwork URL from
@@ -146,9 +153,10 @@ pub trait OnlineEnricher: Send + Sync {
         id: &str,
         season: Option<u32>,
         episode: Option<u32>,
+        name: Option<&str>,
         languages: &[String],
     ) -> impl Future<Output = TextsFetch> + Send {
-        let _ = (kind, id, season, episode, languages);
+        let _ = (kind, id, season, episode, name, languages);
         async { TextsFetch::NotFound }
     }
 }
