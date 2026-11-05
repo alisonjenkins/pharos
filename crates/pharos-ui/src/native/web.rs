@@ -31,6 +31,8 @@ const SESSION: &str = "/pharos/session";
 pub struct Open {
     pub conn: Connection,
     pub api: NativeApi,
+    /// The server's schemaVersion; `None` when it could not be asked.
+    pub server_schema: Option<u32>,
 }
 
 pub enum OpenError {
@@ -50,10 +52,21 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             return Err(OpenError::NotOpened(probe().await));
         }
     };
-    match pharos_client::resume(&conn.bootstrap, call).await {
+    let (server_schema, resumed) = futures_util::future::join(
+        pharos_client::server_schema_version(&conn.bootstrap, call),
+        pharos_client::resume(&conn.bootstrap, call),
+    )
+    .await;
+    let server_schema = server_schema
+        .inspect_err(|e| {
+            web_sys::console::warn_1(&format!("pharos: serverInfo failed: {e}").into())
+        })
+        .ok();
+    match resumed {
         Ok(session) => Ok(Open {
             api: NativeApi::new(&session),
             conn,
+            server_schema,
         }),
         Err(e) if e.needs_sign_in() => Err(OpenError::NotSignedIn),
         Err(e) => Err(OpenError::Resume(e.to_string())),
@@ -237,6 +250,13 @@ pub fn go_back() -> bool {
         .and_then(|s| s.as_string())
         .is_some_and(|s| s == IN_APP);
     pushed && history.back().is_ok()
+}
+
+/// Load the page again, for a server newer than this build.
+pub fn reload() {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().reload();
+    }
 }
 
 /// `history.replaceState` to `path`: a redirect, which Back should skip.
