@@ -1371,8 +1371,9 @@
               export ANDROID_NDK_HOME=$(ls -d ${androidHome}/ndk/* | head -1)
               export JAVA_HOME=${apkgs.jdk17.home}
               # Plain `cargo clippy/check --target <android>` (dx sets these
-              # itself) needs the NDK's clang for ring's C and the linker.
-              ndk_bin=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+              # itself) needs the NDK's clang for ring's C and the linker. The
+              # prebuilt dir is per host (linux-x86_64, darwin-x86_64), so find it.
+              ndk_bin=$(ls -d "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin | head -1)
               export CC_armv7_linux_androideabi=$ndk_bin/armv7a-linux-androideabi24-clang
               export AR_armv7_linux_androideabi=$ndk_bin/llvm-ar
               export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$CC_armv7_linux_androideabi
