@@ -95,8 +95,8 @@ CSS viewport is 960x540 at devicePixelRatio 2.
   out of URLs, and ADR-0059 revokes it with its session; no token-free route
   is needed). As spiked: the device token went in `?api_key=` on every image
   and stream URL (the WebView origin `https://dioxus.index.html` has no
-  cookie). Slice 1 needs a token-free route (wry custom-protocol proxy or a
-  cookie set through JNI) so the token stays out of URLs and logs.
+  cookie). Slice 1 puts the Media-scoped token in `?api_key=` instead, as
+  ADR-0058 decides, so the full device token is not in those URLs.
   Checked 2026-11-04: pharos and jellyfin-web logs show `api_key=REDACTED`,
   and the token's prefix matches nothing in Loki across every namespace.
   Logs outside Loki (e.g. a host-level reverse proxy) were not checked.
