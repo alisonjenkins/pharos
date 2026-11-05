@@ -4703,6 +4703,12 @@ mod tests {
             out_bytes: 7,
         });
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        // With one registered dispatcher, tracing caches a callsite's interest
+        // from whichever thread hits it first; a parallel test dispatching
+        // with no subscriber would switch this capture off (B426). A second
+        // registered dispatcher keeps every hit asking.
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         {
             let _g = tracing::subscriber::set_default(subscriber);
             s.submit(
