@@ -659,3 +659,11 @@ fn the_show_name_check_rejects_a_conflicting_region_or_year() {
         );
     }
 }
+
+#[test]
+fn the_show_name_check_reads_an_nfo_with_a_mismatched_end_tag() {
+    let nfo =
+        "<tvshow><plot>Trunks returns.</plott><title>Super Dragon Ball Heroes</title></tvshow>";
+    let names = identity::parse_names(nfo.as_bytes()).expect("parse_nfo reads this NFO");
+    assert_eq!(names.title.as_deref(), Some("Super Dragon Ball Heroes"));
+}

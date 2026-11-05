@@ -175,7 +175,10 @@ fn read_names(path: &Path) -> Option<NfoNames> {
 
 pub(super) fn parse_names(bytes: &[u8]) -> Option<NfoNames> {
     let mut reader = Reader::from_reader(bytes);
-    reader.config_mut().trim_text(true);
+    // Same tolerance as `parse_nfo`: an NFO it reads must be judged too.
+    let cfg = reader.config_mut();
+    cfg.trim_text(true);
+    cfg.check_end_names = false;
     let mut names = NfoNames::default();
     // Open element names from the root down.
     let mut stack: Vec<String> = Vec::new();
