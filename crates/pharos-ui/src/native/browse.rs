@@ -292,6 +292,19 @@ pub enum Browse {
     },
 }
 
+impl Browse {
+    /// The parent this page lists, for the tab title.
+    pub fn name(&self) -> String {
+        match self {
+            Browse::Grid { title, .. } | Browse::Music { title, .. } => title.clone(),
+            Browse::Show(show) => show.title.clone(),
+            Browse::Artist { detail, .. } | Browse::Album { detail, .. } => {
+                detail.item.name.clone()
+            }
+        }
+    }
+}
+
 /// A series page: its detail when it could be read, its seasons, the season
 /// shown and that season's episodes.
 #[derive(Debug, Clone, PartialEq)]
