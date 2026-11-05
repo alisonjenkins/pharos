@@ -3043,6 +3043,66 @@ test.describe("pharos Dioxus UI song handover", () => {
     ).toBe(before);
   });
 
+  // V472: Shift+N / Shift+P skip from anywhere in the page, not only with
+  // the player focused, and the media session's nexttrack / previoustrack
+  // (the media keys and the system's media controls) do the same; a skip
+  // with nowhere to go is not offered to the system.
+  test("Shift+N and the media session skip tracks from anywhere in the page", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    await page.addInitScript(() => {
+      const handlers: Record<string, unknown> = {};
+      (window as unknown as { skipHandlers: typeof handlers }).skipHandlers = handlers;
+      const session = navigator.mediaSession;
+      const set = session.setActionHandler.bind(session);
+      session.setActionHandler = (action, handler) => {
+        handlers[action] = handler;
+        set(action, handler);
+      };
+    });
+    const skips: string[] = [];
+    page.on("console", (m) => {
+      const skip = /^pharos: track skip (dir=\w+ source=\w+)/.exec(m.text())?.[1];
+      if (skip) skips.push(skip);
+    });
+    const handler = (action: string) =>
+      page.evaluate(
+        (action) =>
+          typeof (window as unknown as { skipHandlers: Record<string, unknown> }).skipHandlers[
+            action
+          ],
+        action,
+      );
+    const { next } = await playIntoQueuedSong(page, request, 0);
+    await expect.poll(() => handler("nexttrack")).toBe("function");
+
+    // Focus on the page, not the player.
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("Shift+N");
+    await expect(page).toHaveURL(new RegExp(`${next}$`), { timeout: 15_000 });
+    expect(skips).toContain("dir=next source=keyboard");
+    // The system offers a next track exactly when the Next button would play one.
+    const nextButton = page.getByRole("button", { name: "Next track" });
+    await expect(nextButton).toBeVisible({ timeout: 15_000 });
+    await expect
+      .poll(async () => (await handler("nexttrack")) === "function")
+      .toBe(await nextButton.isEnabled());
+
+    await expect
+      .poll(() => page.locator("#pharos-video").evaluate((a: HTMLMediaElement) => a.readyState), {
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
+    await page.evaluate(() =>
+      (
+        (window as unknown as { skipHandlers: Record<string, () => void> }).skipHandlers
+      ).previoustrack(),
+    );
+    await expect.poll(() => skips.at(-1)).toBe("dir=previous source=media_session");
+  });
+
   test("a crossfade plays the next song under the end of this one", async ({ page, request }) => {
     test.setTimeout(90_000);
     // A 6 s song caps the fade at a third of it, about 2 s.
