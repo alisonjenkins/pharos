@@ -5,8 +5,8 @@
 
 use pharos_core::{MediaItem, MediaKind};
 use pharos_jellyfin_api::dto::{
-    build_layout, build_media_streams_with_subtitles, wire_item_id, MediaStreamDto,
-    SubtitleStreamCtx,
+    build_layout, build_media_streams_with_subtitles, sidecar_base_index, wire_item_id,
+    MediaStreamDto, SubtitleStreamCtx,
 };
 
 use crate::api::jellyfin::subtitles::{
@@ -47,8 +47,11 @@ pub struct Tracks {
 
 /// The item's audio tracks and its embedded and sidecar subtitles, in the
 /// order PlaybackInfo lists them. Text subtitles of every format, ASS
-/// included, are offered as WebVTT: the native player renders no ASS (013
-/// FR-003 leaves its renderer open), and a plain-text cue beats a burn.
+/// included, are offered as WebVTT, which the player draws unless it has an
+/// ASS renderer (ADR-0057) and fetches the script from the `stream.ass` beside
+/// it. A `.ass`/`.ssa` sidecar carries its real codec so that renderer finds
+/// it (026 FR-012, V489); the Jellyfin wire still lists every sidecar as
+/// `webvtt`.
 /// Image subtitles are offered as PNGs when `draws_images` (the server can
 /// extract them, [`extracts_image_subtitles`]), else they burn.
 pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
@@ -57,7 +60,18 @@ pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
     }
     let id = wire_item_id(item.id);
     let mut out = Tracks::default();
-    for s in streams(item).await {
+    let sidecar_base = sidecar_base_index(&item.probe);
+    let sidecars = discover_sidecars(&item.path).await;
+    for mut s in streams(item).await {
+        if s.kind == "Subtitle" && s.index >= sidecar_base {
+            let offset = usize::try_from(s.index - sidecar_base).unwrap_or(usize::MAX);
+            if let Some(codec) = sidecars
+                .get(offset)
+                .and_then(|(path, _)| sidecar_script_codec(path))
+            {
+                s.codec = Some(codec.to_owned());
+            }
+        }
         match s.kind {
             "Audio" => out.audio.push(track(s, None)),
             "Subtitle" => {
@@ -80,6 +94,19 @@ pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
         }
     }
     out
+}
+
+/// `ass` or `ssa` for a sidecar script of that extension; `None` for any
+/// other sidecar, which stays WebVTT.
+fn sidecar_script_codec(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("ass") {
+        Some("ass")
+    } else if ext.eq_ignore_ascii_case("ssa") {
+        Some("ssa")
+    } else {
+        None
+    }
 }
 
 /// Whether this server extracts image subtitles for a player to draw.
