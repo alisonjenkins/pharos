@@ -967,6 +967,9 @@ fn NativeApp(route: Route) -> Element {
     let mut api = use_signal(|| None::<NativeApi>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
+    // A page loaded before a deploy reconnects to the newer server, which may
+    // send values this build cannot read: it asks to be reloaded.
+    let outdated = use_signal(|| false);
     let mut marks = use_signal(|| 0u32);
     use_context_provider(|| Ctx {
         api,
@@ -1098,7 +1101,7 @@ fn NativeApp(route: Route) -> Element {
                 }
                 // A reconnect keeps the old API until the new one resumes,
                 // so the screens keep what they loaded.
-                task.set(Some(spawn(connect(machine, api, epoch, delay))));
+                task.set(Some(spawn(connect(machine, api, outdated, epoch, delay))));
             }
             Phase::Connecting | Phase::Ready => {}
             _ => {
@@ -1164,6 +1167,12 @@ fn NativeApp(route: Route) -> Element {
                     }
                 },
                 search: rsx! { TopSearch {} },
+                if outdated() {
+                    p { class: "pharos-error", role: "alert",
+                        "Pharos has been updated. Reload to keep using it. "
+                        button { class: "pharos-button", onclick: move |_| platform::reload(), "Reload" }
+                    }
+                }
                 if let Some(message) = notice {
                     ErrorNote { message }
                 }
@@ -1220,12 +1229,23 @@ fn NativeApp(route: Route) -> Element {
 async fn connect(
     mut machine: Signal<Machine>,
     mut api: Signal<Option<NativeApi>>,
+    mut outdated: Signal<bool>,
     epoch: u32,
     delay_ms: u32,
 ) {
     platform::sleep_ms(delay_ms).await;
     let event = match platform::open(&call("connect", "resume")).await {
         Ok(mut open) => {
+            if open
+                .server_schema
+                .is_some_and(pharos_client::is_outdated_by)
+            {
+                platform::warn(&format!(
+                    "pharos: server schema {:?} is newer than this page's",
+                    open.server_schema
+                ));
+                outdated.set(true);
+            }
             api.set(Some(open.api.clone()));
             platform::install_telemetry(&open.api);
             machine.write().apply(Event::Resumed { epoch });
