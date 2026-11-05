@@ -17,6 +17,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use std::collections::HashSet;
 use tokio::sync::RwLock;
 
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
@@ -121,6 +122,8 @@ pub struct TvdbClient<T: TvdbTransport> {
     api_key: String,
     transport: T,
     token: Arc<RwLock<Option<String>>>,
+    /// Ids found to be no episode's (B584), so not asked about again.
+    series_ids: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TvdbClient<ReqwestTransport> {
@@ -138,6 +141,7 @@ impl<T: TvdbTransport> TvdbClient<T> {
             api_key,
             transport,
             token: Arc::new(RwLock::new(None)),
+            series_ids: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -267,6 +271,75 @@ impl<T: TvdbTransport> TvdbClient<T> {
         Some(md)
     }
 
+    /// B584 — the series an episode's `id` names. An episode NFO written by
+    /// Jellyfin or Kodi holds the EPISODE's own TVDB id, while an episode
+    /// with no NFO of its own inherits the show's id from `tvshow.nfo`, so
+    /// the id is read as an episode first: `/episodes/{id}` naming this
+    /// `season` and `episode` gives its `seriesId`. Anything else (no such
+    /// episode, or one at other numbers, which is a series id that happens
+    /// to be an episode's too) keeps `id` as the series id. A failed request
+    /// fails the record, so the backfill retries it rather than stamping it.
+    async fn episode_series(
+        &self,
+        id: &str,
+        season: u32,
+        episode: u32,
+    ) -> Result<String, TextsFetch> {
+        // An id with anything but digits is no TVDB id; it is not put in a
+        // path of its own (the series path keeps its old handling).
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(id.to_string());
+        }
+        // Every episode of a show without its own NFO shares the show's id:
+        // ask once, not once per episode.
+        if self.series_ids.read().await.contains(id) {
+            return Ok(id.to_string());
+        }
+        let (status, body) = self
+            .authed_get_status(&format!("/episodes/{id}"))
+            .await
+            .ok_or(TextsFetch::Failed)?;
+        let (series, reason) = match status {
+            200 => match parse_episode_series(&body)? {
+                // B570 moves a renumbered episode up to this many numbers;
+                // the NFO's episode id names the same record nearby.
+                Some((series, (s, e)))
+                    if s == season && u64::from(e.abs_diff(episode)) <= EPISODE_NAME_MAX_SHIFT =>
+                {
+                    (series, "an episode id near the file's numbers")
+                }
+                Some(_) => (id.to_string(), "an episode far from the file's numbers"),
+                None => (
+                    id.to_string(),
+                    "an episode record with no series or numbers",
+                ),
+            },
+            404 => (id.to_string(), "no episode has this id"),
+            _ => return Err(TextsFetch::Failed),
+        };
+        let read_through = series != id;
+        if read_through {
+            tracing::info!(
+                tvdb.id = id,
+                tvdb.series_id = series.as_str(),
+                season,
+                episode,
+                reason,
+                "tvdb episode lookup: an episode id, read through to its series"
+            );
+        } else {
+            tracing::debug!(
+                tvdb.id = id,
+                season,
+                episode,
+                reason,
+                "tvdb episode lookup: the id is used as the series id"
+            );
+            self.series_ids.write().await.insert(id.to_string());
+        }
+        Ok(series)
+    }
+
     /// The episode record with `texts` holding each of `languages` plus the
     /// original. The episode list names the languages each episode has
     /// (`nameTranslations`/`overviewTranslations`), so a language it does not
@@ -282,6 +355,8 @@ impl<T: TvdbTransport> TvdbClient<T> {
         name: Option<&str>,
         languages: &[String],
     ) -> Result<(EnrichedMetadata, bool), TextsFetch> {
+        let series_id = self.episode_series(series_id, season, episode).await?;
+        let series_id = series_id.as_str();
         let body = self
             .record_body(&format!("/series/{series_id}/episodes/default"))
             .await?;
@@ -686,6 +761,23 @@ fn entity_char(name: &str) -> Option<char> {
             char::from_u32(code)
         }
     }
+}
+
+/// A series id and an episode's (season, number) in it.
+type EpisodeOfSeries = (String, (u32, u32));
+
+/// B584 — an `/episodes/{id}` body's series id and (season, number):
+/// `Ok(None)` for a record without them, `Err` for a body that is not
+/// JSON (cut off in transit), which fails the fetch.
+fn parse_episode_series(body: &str) -> Result<Option<EpisodeOfSeries>, TextsFetch> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| TextsFetch::Failed)?;
+    let Some(data) = v.get("data") else {
+        return Ok(None);
+    };
+    let series = data.get("seriesId").and_then(|x| x.as_u64());
+    Ok(series
+        .zip(episode_number(data))
+        .map(|(id, at)| (id.to_string(), at)))
 }
 
 /// Parse a TVDB `/series/{id}/episodes/default` list response body,
@@ -1180,6 +1272,10 @@ mod tests {
         gets: Arc<Mutex<VecDeque<(u16, String)>>>,
         login_count: Arc<AtomicUsize>,
         paths: Arc<Mutex<Vec<String>>>,
+        /// Fixed answers by path, outside the queue. An `/episodes/{id}`
+        /// lookup with no route here is a 404 (B584): most ids in these
+        /// tests are series ids.
+        routes: Arc<Mutex<Vec<(String, u16, String)>>>,
     }
 
     impl FakeTransport {
@@ -1219,6 +1315,14 @@ mod tests {
             self
         }
 
+        fn route(self, path: &str, status: u16, body: &str) -> Self {
+            self.routes
+                .lock()
+                .expect("lock")
+                .push((path.to_string(), status, body.to_string()));
+            self
+        }
+
         fn login_count(&self) -> usize {
             self.login_count.load(Ordering::SeqCst)
         }
@@ -1232,6 +1336,21 @@ mod tests {
     impl TvdbTransport for FakeTransport {
         async fn get(&self, path: &str, _bearer: &str) -> (u16, String) {
             self.paths.lock().expect("lock").push(path.to_string());
+            let routed = self
+                .routes
+                .lock()
+                .expect("lock")
+                .iter()
+                .find_map(|(p, status, body)| (p == path).then(|| (*status, body.clone())));
+            if let Some(answer) = routed {
+                return answer;
+            }
+            let episode_lookup = path
+                .strip_prefix("/episodes/")
+                .is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit()));
+            if episode_lookup {
+                return (404, String::new());
+            }
             self.gets
                 .lock()
                 .expect("lock")
@@ -1528,6 +1647,87 @@ mod tests {
         assert_eq!(e.provider_id.as_deref(), Some("104"));
     }
 
+    /// B584 — an episode NFO's id is the episode's own: it is read through
+    /// `/episodes/{id}` to its series, and the record is then placed by name.
+    #[tokio::test]
+    async fn an_episode_id_is_read_through_to_its_series() {
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route(
+                "/episodes/103",
+                200,
+                r#"{"data":{"id":103,"seriesId":71470,"seasonNumber":1,"number":3}}"#,
+            )
+            .route("/series/71470/episodes/default", 200, TNG_S1);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c
+            .get_episode("103", 1, 3, Some("The Naked Now"))
+            .await
+            .expect("the series' record");
+        assert_eq!(md.title.as_deref(), Some("The Naked Now"));
+        assert_eq!(md.provider_id.as_deref(), Some("102"));
+        assert_eq!(
+            t.paths()[..2],
+            ["/episodes/103", "/series/71470/episodes/default"]
+        );
+
+        // Jellyfin's id may name the record one number off the file's.
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route(
+                "/episodes/102",
+                200,
+                r#"{"data":{"id":102,"seriesId":71470,"seasonNumber":1,"number":2}}"#,
+            )
+            .route("/series/71470/episodes/default", 200, TNG_S1);
+        let c = TvdbClient::with_transport("key".into(), t);
+        let md = c.get_episode("102", 1, 3, Some("The Naked Now")).await;
+        assert_eq!(md.and_then(|m| m.provider_id).as_deref(), Some("102"));
+
+        // A record with no series id is no episode to read through.
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route(
+                "/episodes/71470",
+                200,
+                r#"{"data":{"id":71470,"seriesId":null}}"#,
+            )
+            .route("/series/71470/episodes/default", 200, TNG_S1);
+        let c = TvdbClient::with_transport("key".into(), t);
+        assert!(c.get_episode("71470", 1, 3, None).await.is_some());
+    }
+
+    /// B584 — an id naming an episode far from the file's numbers is a
+    /// series id that happens to be an episode's too, so it is used as the
+    /// series id, and asked about once; a failed lookup fails the record
+    /// rather than guessing.
+    #[tokio::test]
+    async fn an_id_is_a_series_id_unless_its_episode_is_at_the_files_numbers() {
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route(
+                "/episodes/71470",
+                200,
+                r#"{"data":{"id":71470,"seriesId":5,"seasonNumber":1,"number":9}}"#,
+            )
+            .route("/series/71470/episodes/default", 200, TNG_S1);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let md = c.get_episode("71470", 1, 3, None).await.expect("record");
+        assert_eq!(md.provider_id.as_deref(), Some("103"));
+        c.get_episode("71470", 1, 4, None).await.expect("record");
+        let asked = t.paths().iter().filter(|p| *p == "/episodes/71470").count();
+        assert_eq!(asked, 1, "a series id is asked about once");
+
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route("/episodes/71470", 500, "");
+        let c = TvdbClient::with_transport("key".into(), t);
+        assert!(matches!(
+            c.episode_record("71470", 1, 3, None, &[]).await,
+            Err(TextsFetch::Failed)
+        ));
+    }
+
     #[test]
     fn tvdb_parse_episode_detail_none_when_no_match() {
         let body = r#"{"data":{"episodes":[{"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming"}]}}"#;
@@ -1626,6 +1826,7 @@ mod tests {
         assert_eq!(
             t.paths(),
             vec![
+                "/episodes/76666",
                 "/series/76666/episodes/default",
                 "/episodes/9/translations/eng"
             ]
@@ -1663,6 +1864,7 @@ mod tests {
         assert_eq!(
             t.paths(),
             vec![
+                "/episodes/71470",
                 "/series/71470/episodes/default",
                 "/episodes/102/translations/fra"
             ]
@@ -1685,7 +1887,10 @@ mod tests {
             .push_ok(ANIME_EPISODES);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c.get_episode("76666", 1, 2, None).await.unwrap();
-        assert_eq!(t.paths(), vec!["/series/76666/episodes/default"]);
+        assert_eq!(
+            t.paths(),
+            vec!["/episodes/76666", "/series/76666/episodes/default"]
+        );
         assert_eq!(md.title.as_deref(), Some("えっ!"));
         let eng = by_lang(&md.texts, "eng").expect("a miss is recorded");
         assert_eq!(eng.overview, None);
@@ -1723,7 +1928,8 @@ mod tests {
         let t = FakeTransport::new().push_login("jwt").push_ok(body);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c.get_episode("121361", 1, 1, None).await.unwrap();
-        assert_eq!(t.paths().len(), 1);
+        // The series-id check (B584) and the list; no translation.
+        assert_eq!(t.paths().len(), 2);
         assert_eq!(md.overview.as_deref(), Some("Lord Stark..."));
         assert_eq!(md.texts.len(), 1);
         assert!(md.texts[0].is_original && md.texts[0].language == "eng");
