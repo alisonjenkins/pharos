@@ -782,6 +782,11 @@ mod tests {
             ("Show - S01E02 - Pilot UHD", Some("Pilot")),
             ("E01 - Pilot", Some("Pilot")),
             ("EP02 - The Return", Some("The Return")),
+            (
+                "S03E07 - The Enemy (Director's Cut)",
+                Some("The Enemy (Director's Cut)"),
+            ),
+            ("Star Trek - S03E07 - WEBRip-720p", None),
         ];
         for (stem, want) in cases {
             assert_eq!(episode_title(stem).as_deref(), want, "{stem}");
