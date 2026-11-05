@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 15;
+const schemaVersion :UInt32 = 16;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -176,7 +176,8 @@ interface Library {
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
   index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
-  lyrics @9 (ctx :CallContext, id :ItemId) -> (result :LyricsResult);
+  # wantWords is set by a client showing karaoke; it lets the server ask the aligner for word times.
+  lyrics @9 (ctx :CallContext, id :ItemId, wantWords :Bool) -> (result :LyricsResult);
   mix @10 (ctx :CallContext, spec :MixSpec, recent :List(ItemId), count :UInt32) -> (result :MixResult);
 }
 struct ItemDetail {
@@ -218,7 +219,8 @@ struct DetailResult { union { detail @0 :ItemDetail; error @1 :Error; } }
 struct LyricWord { at @0 :UInt32; startMs @1 :UInt64; }
 # `words` is empty unless the source timed words.
 struct LyricLine { startMs @0 :UInt64; text @1 :Text; words @2 :List(LyricWord); }
-struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; }
+# wordsPending: word times are being worked out; ask again in a little while.
+struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; wordsPending @3 :Bool; }
 struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
 
 # A dynamic mix (spec 024): rules the next songs must, should or should not
