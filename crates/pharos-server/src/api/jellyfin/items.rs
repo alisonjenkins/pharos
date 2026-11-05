@@ -1979,21 +1979,30 @@ async fn shows_episodes(
         q.limit,
     );
     let start = window.start;
-    let dtos: Vec<BaseItemDto> = eps
-        .get(window)
-        .unwrap_or(&[])
+    let page = eps.get(window).unwrap_or(&[]);
+    // ADR-0062 — each episode's description in the language the user picked.
+    let overviews = crate::services::metadata_text::episode_overviews(
+        &state,
+        user.0.id,
+        page.iter().map(|(_, item)| *item),
+    )
+    .await;
+    let dtos: Vec<BaseItemDto> = page
         .iter()
         .map(|(idx, item)| {
             let ud = user_data.get(*idx).copied().unwrap_or_default();
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
-                .with_converted_book(
-                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
-                )
-                .with_trickplay(
-                    &item.probe,
-                    &state.generated_trickplay_widths(item.id),
-                    state.trickplay_interval_ms,
-                )
+            let mut dto = BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud);
+            if let Some(text) = overviews.get(&item.id) {
+                dto.overview = Some(text.clone());
+            }
+            dto.with_converted_book(
+                crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+            )
+            .with_trickplay(
+                &item.probe,
+                &state.generated_trickplay_widths(item.id),
+                state.trickplay_interval_ms,
+            )
         })
         .collect();
     let _ = q.user_id.as_deref();
@@ -6037,11 +6046,13 @@ pub(crate) async fn virtual_shows_page(
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            let meta_map = state
+            let mut meta_map = state
                 .stores
                 .series_metadata_by_keys(&keys)
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            // ADR-0062 — each show's description in the user's language.
+            crate::services::metadata_text::localize_series(state, user_id, &mut meta_map).await;
             for ep in &episodes {
                 let Some(series) = ep.series.as_ref() else {
                     continue;
@@ -6192,11 +6203,13 @@ async fn synth_series_or_season(
             }
             // T9-series — fold in the show's provider-sourced metadata.
             use pharos_core::SeriesMetadataStore;
-            let meta_map = state
+            let mut meta_map = state
                 .stores
                 .series_metadata_by_keys(&[series.series_key().to_string()])
                 .await
                 .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+            // ADR-0062 — the show's description in the user's language.
+            crate::services::metadata_text::localize_series(state, user.id, &mut meta_map).await;
             return Ok(Some(series_dto(
                 &state.server_id,
                 series,
