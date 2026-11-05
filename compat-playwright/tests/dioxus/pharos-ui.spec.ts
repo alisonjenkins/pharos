@@ -985,13 +985,33 @@ test.describe("pharos Dioxus UI", () => {
       await backTo("back");
 
       // A title opened straight after scrolling, inside the settle delay,
-      // still comes back to that scroll.
-      await page.mouse.move(400, 400);
-      await page.mouse.wheel(0, 120);
-      await expect.poll(async () => (await place()).top).not.toBe(left.top);
-      left = await place();
-      name = (await tiles.nth(left.at).innerText()).trim();
-      await tiles.nth(left.at).locator("a").first().click();
+      // still comes back to that scroll. All in one page task, so the click
+      // lands two frames after the scroll event (well inside 150 ms) and on
+      // a link already in view, with nothing scrolling it there first.
+      const quick = await page.evaluate(
+        () =>
+          new Promise<{ at: number; top: number; name: string; ms: number }>((done) => {
+            const started = performance.now();
+            window.scrollBy(0, 120);
+            requestAnimationFrame(() =>
+              requestAnimationFrame(() => {
+                const items = [
+                  ...document.querySelectorAll("section.pharos-browse ul.pharos-grid li"),
+                ];
+                const at = items.findIndex((li) => li.getBoundingClientRect().bottom > 0);
+                const top = Math.round(items[at].getBoundingClientRect().top);
+                const name = (items[at] as HTMLElement).innerText.trim();
+                const ms = performance.now() - started;
+                items[at].querySelector("a")?.click();
+                done({ at, top, name, ms });
+              }),
+            );
+          }),
+      );
+      expect(quick.ms, "the click came inside the settle delay").toBeLessThan(150);
+      expect(quick.top).not.toBe(left.top);
+      left = { at: quick.at, top: quick.top };
+      name = quick.name;
       await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
       await page.goBack();
       await backTo("back inside the settle delay");
