@@ -2955,6 +2955,16 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   width: 100%;
   height: 100%;
 }
+/* The mini stage is 7rem wide: a full-size spinner and its caption would
+   spill over the stage bar, so it gets a small spinner and no caption. */
+.pharos-stage.is-mini .pharos-watch-spinner {
+  width: 2rem;
+  height: 2rem;
+  border-width: 3px;
+}
+.pharos-stage.is-mini .pharos-watch-loading-caption {
+  display: none;
+}
 .pharos-stage.is-mini .pharos-stage-bar {
   flex: 1;
   min-width: 0;
