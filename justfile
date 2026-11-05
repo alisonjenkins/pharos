@@ -168,7 +168,7 @@ compat-playwright:
 # Assumes pharos is running with `[server].ui_dir` pointed at a
 # `dx build` output. Skips cleanly when `/ui/` is not served.
 # Build the bundle once via:
-#   nix develop --command dx build --package pharos-ui --bin pharos-ui-web --release
+#   nix develop --command dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release
 # then point `[server].ui_dir` at `target/dx/pharos-ui-web/release/web/public`.
 compat-dioxus:
     nix develop --command bash -c 'cd compat-playwright && npx playwright test --config playwright.dioxus.config.ts'
