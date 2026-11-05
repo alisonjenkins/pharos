@@ -140,6 +140,90 @@ pub fn classify_failure(stderr: &str, is_hw: bool) -> WorkerError {
     WorkerError::Other(tail)
 }
 
+/// True when ffmpeg reached the end of its input without ever opening the
+/// encoder.
+///
+/// A window with no video frames looks like this (B550): a hardware encoder
+/// is opened by its first frame, and with none it is opened at EOF without a
+/// frames context and refuses. But a real device fault looks the same: a
+/// hwupload that cannot configure, or a profile the card does not offer,
+/// also leaves the encoder unopened at EOF. So this alone decides nothing;
+/// [`window_has_video`] settles which one it was.
+pub fn encoder_never_opened(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("could not open encoder before eof")
+}
+
+/// Whether the source has a video packet inside the job's window, asked of
+/// ffprobe. `None` when that cannot be told: a job with no bounded window, or
+/// an ffprobe that failed.
+///
+/// A title's audio can outrun its video by minutes (Dragon Ball S01E05: video
+/// ends at 1244 s, the second audio track at 1350 s), and the segment grid
+/// follows the container duration, so the tail windows hold no picture.
+pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
+    let tps = pharos_core::time::TICKS_PER_SECOND as f64;
+    let start = spec.opts.start_position_ticks as f64 / tps;
+    let dur = spec.opts.duration_ticks? as f64 / tps;
+    let input = spec.input.to_str()?;
+    let out = tokio::process::Command::new(ffprobe_bin())
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            &format!("{start:.3}%+{dur:.3}"),
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            input,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(has_packet_in(
+        &String::from_utf8_lossy(&out.stdout),
+        start,
+        start + dur,
+    ))
+}
+
+/// Whether any ffprobe `pts_time` line falls in `[start, end)`. The read
+/// starts at the keyframe before `start`, so earlier packets are expected
+/// and do not count.
+fn has_packet_in(csv: &str, start: f64, end: f64) -> bool {
+    csv.lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
+        .any(|t| t >= start - 0.001 && t < end)
+}
+
+/// ffprobe beside the ffmpeg the worker runs, so a pinned `PHAROS_FFMPEG`
+/// build is probed with its own sibling.
+fn ffprobe_bin() -> String {
+    let ffmpeg = PathBuf::from(ffmpeg_bin());
+    match ffmpeg.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("ffprobe").to_string_lossy().into(),
+        _ => "ffprobe".to_string(),
+    }
+}
+
+/// B550/V460: a hardware failure on a window that holds no source video is
+/// [`WorkerError::NoFrames`], not a device fault, so the device is not cooled.
+/// Anything else keeps its classification.
+pub fn settle_no_frames(err: WorkerError, has_video: Option<bool>) -> WorkerError {
+    match (err, has_video) {
+        (WorkerError::DeviceBusy(why), Some(false)) => WorkerError::NoFrames(why),
+        (err, _) => err,
+    }
+}
+
 /// Resolved output target for a spawn job.
 pub enum SpawnTarget {
     /// Write to this file path (FileDirect / cached segment).
@@ -188,6 +272,8 @@ pub fn spawn_job_args(spec: &JobSpec) -> Result<(Vec<String>, SpawnTarget), Work
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     /// A hardware failure is transient — the scheduler retries elsewhere — AND
@@ -381,5 +467,116 @@ mod tests {
             WorkerError::Other(s) => assert!(s.contains("Fontconfig")),
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    /// The live B550 stderr: a VAAPI window past the end of the video.
+    const NO_FRAMES_STDERR: &str = "Failed to create /var/lib/pharos/.cache for shader cache (Permission denied)---disabling.\n\
+[h264_vaapi @ 0x6072df8a22c0] A hardware frames reference is required to associate the encoding device.\n\
+[vost#0:0/h264_vaapi @ 0x6072df8a1e00] [enc:h264_vaapi @ 0x6072df950040] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n\
+[vf#0:0 @ 0x6072df8bfb00] Error sending frames to consumers: Invalid argument\n\
+[vost#0:0/h264_vaapi @ 0x6072df8a1e00] [enc:h264_vaapi @ 0x6072df950040] Could not open encoder before EOF\n\
+[out#0/mp4 @ 0x6072df84e540] Nothing was written into output file, because at least one of its streams received no packets.\n";
+
+    /// A real device fault with frames present, reproduced locally with a
+    /// profile the card does not offer: the same EOF line, so stderr alone
+    /// cannot tell the two apart.
+    const PROFILE_FAULT_STDERR: &str = "[h264_vaapi @ 0x55555573a440] No usable encoding profile found.\n\
+[vost#0:0/h264_vaapi @ 0x55555573a180] [enc:h264_vaapi @ 0x5555557a2f80] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.\n\
+[vost#0:0/h264_vaapi @ 0x55555573a180] [enc:h264_vaapi @ 0x5555557a2f80] Could not open encoder before EOF\n\
+[out#0/mp4 @ 0x5555556eb000] Nothing was written into output file, because at least one of its streams received no packets.\n";
+
+    #[test]
+    fn an_unopened_encoder_is_a_device_fault_until_the_window_is_shown_empty() {
+        for stderr in [NO_FRAMES_STDERR, PROFILE_FAULT_STDERR] {
+            assert!(encoder_never_opened(stderr));
+            let e = classify_failure(stderr, true);
+            assert!(matches!(e, WorkerError::DeviceBusy(_)), "{e:?}");
+        }
+        assert!(!encoder_never_opened("some weird libx264 explosion"));
+
+        let e = settle_no_frames(classify_failure(NO_FRAMES_STDERR, true), Some(false));
+        let WorkerError::NoFrames(why) = &e else {
+            panic!("expected NoFrames, got {e:?}");
+        };
+        assert!(why.contains("Could not open encoder before EOF"), "{why}");
+        assert!(!e.is_transient());
+        assert_eq!(e.label(), "no_frames");
+        assert!(
+            e.to_string()
+                .starts_with("no source frames in the window: "),
+            "{e}"
+        );
+
+        // Video in the window, or no answer: the device fault stands.
+        for has_video in [Some(true), None] {
+            let e = settle_no_frames(classify_failure(PROFILE_FAULT_STDERR, true), has_video);
+            assert!(matches!(e, WorkerError::DeviceBusy(_)), "{e:?}");
+        }
+        // Only a device fault is ever re-read.
+        let e = settle_no_frames(WorkerError::BadInput("x".into()), Some(false));
+        assert!(matches!(e, WorkerError::BadInput(_)), "{e:?}");
+    }
+
+    #[test]
+    fn only_packets_inside_the_window_count_as_video() {
+        // ffprobe reads from the keyframe before the start.
+        let csv = "1237.319000\n1240.000000,\n1243.909000\n";
+        assert!(!has_packet_in(csv, 1289.976, 1295.982));
+        assert!(has_packet_in(csv, 1239.0, 1245.0));
+        assert!(!has_packet_in("", 0.0, 6.0));
+        assert!(!has_packet_in("N/A\n", 0.0, 6.0));
+    }
+
+    #[tokio::test]
+    async fn a_window_past_the_end_of_the_video_has_no_video() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("short.mkv");
+        // 2 s of picture under 6 s of sound: the Dragon Ball shape.
+        let status = tokio::process::Command::new(ffmpeg_bin())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc=size=64x48:rate=24:duration=2")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=6",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&path)
+            .status()
+            .await
+            .expect("ffmpeg must be on PATH inside the devShell (see CLAUDE.md)");
+        assert!(status.success());
+        let tps = pharos_core::time::TICKS_PER_SECOND;
+        let mut spec = JobSpec {
+            job_id: crate::protocol::JobId(1),
+            input: path,
+            opts: crate::TranscodeOptions::default(),
+            device: DeviceId::hw(crate::hwaccel::HwAccel::Vaapi, 0),
+            decode_offload: crate::DecodeOffload::Allowed,
+            vaapi_pipeline: crate::VaapiPipeline::Hybrid,
+            sink: OutputSink::FileDirect {
+                path: dir.path().join("out.mp4"),
+            },
+            filler: None,
+        };
+        spec.opts.duration_ticks = Some(tps);
+        spec.opts.start_position_ticks = 0;
+        assert_eq!(window_has_video(&spec).await, Some(true));
+        spec.opts.start_position_ticks = 4 * tps;
+        assert_eq!(window_has_video(&spec).await, Some(false));
+        spec.opts.duration_ticks = None;
+        assert_eq!(window_has_video(&spec).await, None);
     }
 }
