@@ -458,6 +458,16 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
         return;
     };
+    thread_local! {
+        /// One `cuechange` handler for every shown track: it lifts the cues
+        /// that load after the track is shown.
+        static ON_CUE_CHANGE: Closure<dyn FnMut(web_sys::Event)> =
+            Closure::new(|e: web_sys::Event| {
+                if let Some(track) = e.target() {
+                    lift_cues(&js_sys::Reflect::get(&track, &"activeCues".into()).unwrap_or_default());
+                }
+            });
+    }
     for i in 0..tracks.length() {
         if let Some(t) = tracks.get(i) {
             let on = track_id.is_some_and(|id| t.id() == id);
@@ -466,6 +476,39 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
             } else {
                 web_sys::TextTrackMode::Disabled
             });
+            if on {
+                lift_cues(&js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default());
+                ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
+            }
+        }
+    }
+}
+
+/// Set `line = -2` on each cue in the `TextTrackCueList` `cues` still placed
+/// by the browser (`line` is `"auto"`), so its last line sits one line above
+/// the picture's bottom edge instead of on it (B545). `line` is the standard
+/// `VTTCue` setting, so Firefox honours it too, unlike the
+/// `::-webkit-media-text-track-*` pseudo-elements.
+fn lift_cues(cues: &JsValue) {
+    if cues.is_null() || cues.is_undefined() {
+        return;
+    }
+    let length = js_sys::Reflect::get(cues, &"length".into())
+        .ok()
+        .and_then(|n| n.as_f64())
+        .unwrap_or(0.0) as u32;
+    let line = JsValue::from_str("line");
+    for i in 0..length {
+        let Ok(cue) = js_sys::Reflect::get_u32(cues, i) else {
+            continue;
+        };
+        if js_sys::Reflect::get(&cue, &line)
+            .ok()
+            .and_then(|v| v.as_string())
+            .as_deref()
+            == Some("auto")
+        {
+            let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(-2.0));
         }
     }
 }
