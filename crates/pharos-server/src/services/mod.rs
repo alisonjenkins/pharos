@@ -7,6 +7,7 @@ pub mod auth;
 pub mod group_seen;
 pub mod library;
 pub mod lyrics;
+pub mod metadata_text;
 pub mod mix;
 pub mod play_state;
 pub mod playback;
