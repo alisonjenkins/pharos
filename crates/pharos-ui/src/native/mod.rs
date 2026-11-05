@@ -45,6 +45,7 @@ pub mod seen;
 pub mod settings;
 pub mod stage;
 pub mod style_picker;
+pub mod subtitles;
 pub mod together;
 pub mod together_view;
 pub mod track_follow;
