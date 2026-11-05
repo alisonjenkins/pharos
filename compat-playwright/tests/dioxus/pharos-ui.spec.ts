@@ -3064,7 +3064,7 @@ test.describe("pharos Dioxus UI song handover", () => {
     });
     const skips: string[] = [];
     page.on("console", (m) => {
-      const skip = /^pharos: track skip (dir=\w+ source=\w+) item=/.exec(m.text())?.[1];
+      const skip = /^pharos: track skip (dir=\w+ source=\w+) item=\S+ to=(?!none(?:\s|$))\S+/.exec(m.text())?.[1];
       if (skip) skips.push(skip);
     });
     const handler = (action: string) =>
