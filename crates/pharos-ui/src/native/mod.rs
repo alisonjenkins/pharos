@@ -54,3 +54,4 @@ pub mod tv_auth;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;
+pub mod whats_new;
