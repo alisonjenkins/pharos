@@ -9,7 +9,9 @@
 reviews:
   auto_review:
     enabled: true
-    # Title match is a substring check: every merge-queue PR is titled
-    # "Batch <letter>: ...".
+    # Title match is a case-insensitive substring check: every merge-queue
+    # PR is titled "Batch <letter>: ...". A feature PR whose title says
+    # "batch " is skipped too (#823 was); comment `@coderabbitai review`
+    # on it for a one-off review.
     ignore_title_keywords:
       - "Batch "
