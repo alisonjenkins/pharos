@@ -666,7 +666,7 @@ mod tests {
         assert!(!sel.is_empty(), "select missing: {html}");
         assert_eq!(sel.matches("selected").count(), 1, "{sel}");
         assert!(
-            sel.contains("value=\"matrix\" selected") || sel.contains("selected=\"true\""),
+            start_tag(sel, "value=\"matrix\"").contains("selected"),
             "{sel}"
         );
         for fx in LibraryTransition::ALL {
@@ -681,7 +681,7 @@ mod tests {
         let sel = library_transition_select(&sel_html);
         assert_eq!(sel.matches("selected").count(), 1, "{sel}");
         assert!(
-            sel.contains("value=\"fade\" selected") || sel.contains("selected=\"true\""),
+            start_tag(sel, "value=\"fade\"").contains("selected"),
             "{sel}"
         );
     }
