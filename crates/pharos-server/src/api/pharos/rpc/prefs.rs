@@ -15,8 +15,15 @@ use super::session::Session;
 /// Value bytes `true` or `false`; absent means off.
 pub(super) const DIAGNOSTICS_OPT_IN: &str = "diagnostics.opt_in";
 
+/// The language show and episode descriptions are shown in (ADR-0062): a
+/// three-letter code, `OriginalLanguage`, or empty for the default. Not a row
+/// of its own: it reads and writes `DescriptionLanguagePreference` in the
+/// user's Jellyfin configuration, so the native UI and jellyfin-web set the
+/// same thing.
+pub(super) const DESCRIPTION_LANGUAGE: &str = "description.language";
+
 /// Keys a client may read and write; any other key is refused.
-const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN];
+const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN, DESCRIPTION_LANGUAGE];
 
 /// Largest value one pref may hold: a toggle or a small settings document,
 /// never a blob, and a bound on what one user can make the database keep.
@@ -101,6 +108,13 @@ impl Prefs {
     async fn read(&self, key: capnp::text::Reader<'_>) -> Result<Option<Vec<u8>>, Denial> {
         let user = self.session.current_user().await?;
         let key = allowed_key("get", key, 0)?;
+        if key == DESCRIPTION_LANGUAGE {
+            let stores = &self.session.state.stores;
+            let value = crate::services::metadata_text::language_setting(stores, user.id)
+                .await
+                .map_err(|e| store_denial("get", key, &e))?;
+            return Ok((!value.is_empty()).then(|| value.into_bytes()));
+        }
         self.session
             .state
             .stores
@@ -124,6 +138,23 @@ impl Prefs {
                 value: value.len() as u64,
                 max: MAX_PREF_VALUE_BYTES as u64,
             });
+        }
+        if key == DESCRIPTION_LANGUAGE {
+            use crate::services::metadata_text::{set_language_setting, SetLanguageError};
+            let text =
+                std::str::from_utf8(value).map_err(|_| Denial::Invalid { field: "value" })?;
+            return set_language_setting(&self.session.state.stores, user.id, text)
+                .await
+                .map_err(|e| match e {
+                    SetLanguageError::Invalid => {
+                        tracing::warn!(key, size = value.len(), "pref refused: not a language");
+                        Denial::Invalid { field: "value" }
+                    }
+                    SetLanguageError::Unreadable => {
+                        store_denial("set", key, &"stored configuration is not a JSON object")
+                    }
+                    SetLanguageError::Store(e) => store_denial("set", key, &e),
+                });
         }
         self.session
             .state
