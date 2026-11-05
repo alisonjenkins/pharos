@@ -145,7 +145,7 @@ pub fn classify_chapter_title(title: &str) -> Option<&'static str> {
 /// the king" stay ordinary chapters.
 fn theme_song(lc: &str) -> Option<&str> {
     let mut words = lc
-        .split(|c: char| !c.is_ascii_alphanumeric())
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty());
     let first = words.next()?.trim_end_matches(|c: char| c.is_ascii_digit());
     words
@@ -188,6 +188,9 @@ mod tests {
         );
         assert_eq!(classify_chapter_title("Chapter 4"), None);
         assert_eq!(classify_chapter_title("The Beach"), None);
+        // A word in another script stays part of the title, not a break
+        // after "ED".
+        assert_eq!(classify_chapter_title("ED後のシーン"), None);
     }
 
     #[actix_web::test]
