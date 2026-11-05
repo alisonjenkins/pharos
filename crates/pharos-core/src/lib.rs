@@ -819,6 +819,12 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
     }
 }
 
+/// Score gap within which [`match_best`] treats inexact matches as tied. The
+/// prefix credit (0.1 × the share of the longer title the query covers)
+/// differs by a few hundredths between two subtitles of one franchise and says
+/// nothing about which one is meant.
+const PREFIX_NEAR_TIE: f32 = 0.03;
+
 /// Best-scoring candidate over `min_confidence`, else None. A candidate's
 /// title similarity is the best over its title and aliases; score = that ×
 /// year factor. Among candidates over `min_confidence`, one whose name equals
@@ -829,8 +835,12 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
 /// ("Doctor Who" 1963 vs "Doctor Who (2005)"). When several candidates match
 /// exactly, the one matching by an earlier name wins: a provider lists a
 /// show's own title and translation before its aliases, and an alias is how
-/// the 2023 live-action ONE PIECE also answers to "One Piece". Remaining ties
-/// resolve to the earliest candidate.
+/// the 2023 live-action ONE PIECE also answers to "One Piece". With no exact
+/// match, candidates within [`PREFIX_NEAR_TIE`] of the best score go to the
+/// earliest-premiered: the query is then a franchise name that every entry
+/// extends with a subtitle, and the folder that carries just that name is
+/// almost always the original ("Code Geass" is the 2006 series, not the 2024
+/// Rozé of the Recapture). Remaining ties resolve to the earliest candidate.
 pub fn match_best(
     query_title: &str,
     query_year: Option<u32>,
@@ -840,6 +850,7 @@ pub fn match_best(
     let query = normalize_title(query_title);
     // (index of the first name that equals the query, score, candidate)
     let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
+    let mut inexact: Vec<(f32, &SearchCandidate)> = Vec::new();
     for c in candidates {
         let names = || std::iter::once(&c.title).chain(&c.aliases);
         let exact_at = names().position(|n| normalize_title(n) == query);
@@ -862,6 +873,16 @@ pub fn match_best(
         if beats {
             best = Some((exact_at, score, c));
         }
+        if exact_at.is_none() {
+            inexact.push((score, c));
+        }
+    }
+    if let Some((None, top, _)) = best {
+        best = inexact
+            .into_iter()
+            .filter(|(score, _)| *score >= top - PREFIX_NEAR_TIE)
+            .min_by_key(|(_, c)| c.year.unwrap_or(u32::MAX))
+            .map(|(score, c)| (None, score, c));
     }
     best.map(|(_, confidence, c)| MatchOutcome {
         id: c.id.clone(),
