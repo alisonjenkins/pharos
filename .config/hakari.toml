@@ -35,3 +35,12 @@ workspace-members = ["pharos-api", "pharos-client", "pharos-ui", "quire", "quire
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
+
+# pharos-ui's `mobile` feature (Android TV, spec 025) turns on dioxus/mobile,
+# which pulls wry and GTK on Linux. Hakari assumes all features of every
+# workspace member are on, so without this it unifies `mobile` into every
+# crate that depends on workspace-hack and breaks host builds that have no
+# glib. pharos-ui is already kept off the hack (see final-excludes); keep its
+# features out of the unified set too.
+[traversal-excludes]
+workspace-members = ["pharos-ui"]
