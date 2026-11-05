@@ -1602,7 +1602,6 @@ mod tests {
         assert_eq!(cfg.max_connections_per_user.get(), 2);
     }
 
-    /// B541: the auth deadline defaults to 30 s and a zero is refused.
     /// B542: a media token's lifetime is capped at a day.
     #[test]
     fn a_media_token_ttl_over_a_day_is_rejected() {
@@ -1613,6 +1612,7 @@ mod tests {
         assert_eq!(long.validate(), Err("media_token_ttl_secs"));
     }
 
+    /// B541: the auth deadline defaults to 30 s and a zero is refused.
     #[test]
     fn a_zero_auth_deadline_is_rejected() {
         assert_eq!(NativeApiConfig::default().auth_deadline_secs.get(), 30);
