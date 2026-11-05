@@ -1662,8 +1662,19 @@ pub fn scroll_to_top() {
 
 /// How far the top of the browse tile at `at` is below the top of the
 /// viewport, in CSS px; negative when it is scrolled partly out above.
+///
+/// Measured from layout offsets rather than the bounding rect, so a tile
+/// still mid-way through its arrival animation (a transform) reports where
+/// it will settle, not where the animation has it this frame.
 pub fn tile_top(at: u32) -> Option<f64> {
-    Some(grid_tiles()?.item(at)?.get_bounding_client_rect().top())
+    let window = web_sys::window()?;
+    let mut node: Option<web_sys::HtmlElement> = grid_tiles()?.item(at)?.dyn_into().ok();
+    let mut page_top = 0.0;
+    while let Some(el) = node {
+        page_top += f64::from(el.offset_top());
+        node = el.offset_parent().and_then(|p| p.dyn_into().ok());
+    }
+    Some(page_top - window.scroll_y().unwrap_or(0.0))
 }
 
 /// Scrolls the page so the browse tile at `at` sits `top` px below the
