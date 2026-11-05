@@ -111,6 +111,17 @@ test("a new account is walked through setup with live demos, then never again", 
     .toBe("pharos-arrive-pop");
   expect(await page.evaluate(() => localStorage.getItem("pharos.library.transition"))).toBe("pop");
   await expect(page.locator("html")).toHaveAttribute("data-library-transition", "pop");
+  await box.getByRole("button", { name: "Next" }).click();
+
+  // The controls effect plays on a stand-in player that hides its chrome
+  // and brings it back on a loop.
+  await expect(box.getByRole("heading", { name: "Controls effect" })).toBeVisible();
+  await box.getByRole("radio", { name: "Burn" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-overlay-fx", "burn");
+  expect(await page.evaluate(() => localStorage.getItem("pharos.overlay.effect"))).toBe("burn");
+  const player = box.locator(".pharos-whats-new-player");
+  await expect(player).toHaveClass(/is-idle/, { timeout: 5_000 });
+  await expect(player).not.toHaveClass(/is-idle/, { timeout: 5_000 });
 
   await box.getByRole("button", { name: "Start watching" }).click();
   await expect(box).toHaveCount(0);
