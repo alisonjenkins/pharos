@@ -2,6 +2,7 @@
 //! drives [`Machine`], and the screens that load data for the pure views.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use dioxus::core::spawn_forever;
@@ -79,6 +80,15 @@ pub fn Root() -> Element {
         Rc::new(platform::on_pop_state(move |path| {
             route.set(Route::parse(&path))
         }))
+    });
+    // The tab names the page, and the item on it once that has loaded.
+    let names = use_signal(HashMap::<ItemRef, String>::new);
+    use_context_provider(|| PageNames(names));
+    use_effect(move || {
+        let at = route();
+        let names = names.read();
+        let name = at.item().and_then(|id| names.get(&id)).map(String::as_str);
+        platform::set_title(&at.page_title(name));
     });
     // One player for the session (spec 020): the stage follows the route,
     // and a play while it is compact stays where the listener is.
@@ -1016,6 +1026,22 @@ struct Editing {
     base: String,
 }
 
+/// The names of the items pages have loaded, for the tab title. By id, as
+/// the screen and the compact player beside it each load their own.
+#[derive(Clone, Copy)]
+struct PageNames(Signal<HashMap<ItemRef, String>>);
+
+fn use_page_name(id: ItemRef, name: Option<String>) {
+    let PageNames(mut names) = use_context::<PageNames>();
+    use_effect(use_reactive!(|(id, name)| {
+        if let Some(name) = name {
+            if names.peek().get(&id) != Some(&name) {
+                names.write().insert(id, name);
+            }
+        }
+    }));
+}
+
 /// Navigation that replaces the current history entry, for redirects.
 #[derive(Clone, Copy)]
 struct Replace(EventHandler<Route>);
@@ -1146,6 +1172,14 @@ fn NativeApp(route: Route) -> Element {
             start_over.set(Some(id));
             nav.0.call(Route::Watch(id));
         }))
+    });
+    // Signing out forgets the names pages loaded, so the tab title of a
+    // signed-out page never shows the last user's item to the next one.
+    let PageNames(mut names) = use_context::<PageNames>();
+    use_effect(move || {
+        if matches!(machine.read().phase(), Phase::SignIn { .. }) && !names.peek().is_empty() {
+            names.write().clear();
+        }
     });
     // Signing out ends the session, and the player with it; signing in
     // again on the watch route, which never changed, plays its item.
@@ -2212,12 +2246,23 @@ fn BrowseScreen(id: ItemRef) -> Element {
                 platform::warn(&line)
             })
             .await;
-            Some(settle(ctx.machine, result))
+            Some((id, settle(ctx.machine, result)))
         }
     }));
     let state = listing.read();
+    // The last parent's listing shows until this one's loads, under its name.
+    let name = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .filter(|(asked, _)| *asked == id)
+        .and_then(|(_, r)| r.as_ref().ok())
+        .map(|browse| browse.name(id));
+    use_page_name(id, name);
     loaded(
-        state.as_ref().and_then(Option::as_ref),
+        state
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(|(_, result)| result),
         |browse: &browse::Browse| {
             rsx! { SeenBrowse { browse: browse.clone() } }
         },
@@ -2337,6 +2382,13 @@ fn TitleScreen(id: ItemRef) -> Element {
         });
     };
     let state = detail.read();
+    let name = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .filter(|(asked, _)| *asked == id)
+        .and_then(|(_, r)| r.as_ref().ok())
+        .map(|d| super::views::page_name(&d.item));
+    use_page_name(id, name);
     rsx! {
         if let Some(message) = group_error.read().clone() {
             ErrorNote { message }
@@ -2712,6 +2764,14 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         }
     });
     let state = playing.read();
+    // The song handing over is not the page's.
+    let name = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|r| r.as_ref().ok())
+        .filter(|_| matches!(slot, Slot::Current { .. }))
+        .map(|p| super::views::page_name(&p.0.detail.item));
+    use_page_name(id, name);
     // The stage bar, and its Close, comes with a loaded player; a compact
     // window still loading or failed needs a way out of its own.
     let stranded = ctx_stage.read().view != View::Full
