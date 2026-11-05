@@ -17,6 +17,7 @@ use pharos_client::api::{
 use pharos_client::{CallInfo, ClientError};
 
 use super::app::{call, remount_on, Ctx};
+use super::art::Art;
 use super::group_app::Together;
 use super::letters::{self, Wheel, LETTERS};
 use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
@@ -1397,7 +1398,7 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
             Link { to: Route::Title(episode.id), class: "pharos-episode-link",
                 div { class: "pharos-episode-still",
                     if let Some(src) = &episode.image {
-                        img { src: "{src}", alt: "", loading: "lazy", decoding: "async" }
+                        Art { src: src.clone(), sizes: "11rem" }
                     }
                     if let Some(p) = progress {
                         div { class: "pharos-progress", style: "width: {p}%" }

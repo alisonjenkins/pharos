@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind, Page};
 
+use super::art::{Art, POSTER_SIZES};
 use super::depth;
 use super::find::SUGGEST_LIMIT;
 use super::palette::Row;
@@ -580,7 +581,7 @@ fn SearchHit(item: Item) -> Element {
     rsx! {
         Link { to: open_route(&item), class: "pharos-search-hit",
             match &item.image {
-                Some(src) => rsx! { img { class: "pharos-search-thumb", src: "{src}", alt: "", loading: "lazy" } },
+                Some(src) => rsx! { Art { src: src.clone(), sizes: "2.25rem", class: "pharos-search-thumb" } },
                 None => rsx! { span { class: "pharos-search-thumb", "aria-hidden": "true", "{initial(&item.name)}" } },
             }
             span { class: "pharos-search-text",
@@ -635,7 +636,7 @@ pub fn PosterTile(item: Item) -> Element {
                 onpointermove: move |evt| depth::tilt(&evt),
                 onpointerleave: move |evt| depth::untilt(&evt),
                 match &item.image {
-                    Some(src) => rsx! { img { src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
+                    Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
                     None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "{initial(&item.name)}" } },
                 }
                 if item.played {
@@ -689,7 +690,7 @@ pub fn TitleView(
         article { class: "pharos-title",
             div { class: "pharos-title-art",
                 if let Some(src) = &item.image {
-                    img { src: "{src}", alt: "" }
+                    Art { src: src.clone(), sizes: "16rem", lazy: false }
                 }
             }
             div { class: "pharos-title-body",
