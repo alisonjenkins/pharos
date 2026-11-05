@@ -85,6 +85,11 @@ pub struct EnrichedMetadata {
     /// numbering, which differs from the file's when the episode's name
     /// placed it on another record (B570).
     pub episode_number: Option<(u32, u32)>,
+    /// B588 — the names of the episodes near this one in its season (within
+    /// the shift B570 places by name), so a stored title can be recognised
+    /// as a neighbour's rather than this episode's in another language.
+    /// Empty from providers that do not list a season.
+    pub neighbour_titles: Vec<String>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The

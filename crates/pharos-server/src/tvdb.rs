@@ -833,8 +833,27 @@ pub(crate) fn parse_episode_detail(
         also_tmdb_id: extract_tmdb_remote_id(ep),
         artwork: art,
         episode_number: episode_number(ep),
+        neighbour_titles: episode_number(ep)
+            .map(|at| neighbour_titles(episodes, at))
+            .unwrap_or_default(),
         ..EnrichedMetadata::default()
     })
+}
+
+/// B588 — the names of the episodes in `at`'s season within
+/// [`EPISODE_NAME_MAX_SHIFT`] of its number, not counting `at` itself.
+fn neighbour_titles(episodes: &[serde_json::Value], at: (u32, u32)) -> Vec<String> {
+    episodes
+        .iter()
+        .filter_map(|e| {
+            let (season, number) = episode_number(e)?;
+            let near = season == at.0
+                && number != at.1
+                && u64::from(number.abs_diff(at.1)) <= EPISODE_NAME_MAX_SHIFT;
+            near.then(|| e.get("name").and_then(|x| x.as_str()).map(decode_entities))
+                .flatten()
+        })
+        .collect()
 }
 
 /// Lowest [`title_similarity`] at which an episode's own name, from its
@@ -1641,6 +1660,15 @@ mod tests {
 
     /// B570 — an episode the list has no record for at its number is still
     /// found by its name.
+    #[test]
+    fn an_episode_record_names_its_neighbours() {
+        let e = super::parse_episode_detail(TNG_S1, 1, 3, Some("Code of Honor")).unwrap();
+        assert_eq!(
+            e.neighbour_titles,
+            ["Encounter at Farpoint", "The Naked Now", "The Last Outpost"]
+        );
+    }
+
     #[test]
     fn an_episode_past_the_end_of_the_list_is_found_by_its_name() {
         let e = super::parse_episode_detail(TNG_S1, 1, 5, Some("The Last Outpost")).unwrap();
