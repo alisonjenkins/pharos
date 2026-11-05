@@ -397,6 +397,14 @@ pub struct AppState {
             )>,
         >,
     >,
+    /// Synthesised series/season/artist/album wire ids → the parent filter
+    /// each names, so a `ParentId` lookup does not re-run four `SELECT
+    /// DISTINCT` scans per request. See `items::synth_parent_filter`.
+    pub(crate) synth_parents:
+        Arc<std::sync::Mutex<Option<Arc<crate::api::jellyfin::items::SynthParents>>>>,
+    /// Single-flight guard for rebuilding `synth_parents`; lookups that hit
+    /// the memo never wait on it.
+    pub(crate) synth_parents_build: Arc<tokio::sync::Mutex<()>>,
     /// T73 — recent activity entries (logins, etc.) for the dashboard's
     /// Activity panel, newest-first. In-memory ring buffer (session-scoped, not
     /// persisted — the panel wants "recent activity", and a bounded buffer keeps
@@ -465,6 +473,16 @@ impl AppState {
             map.clear();
         }
         map.get(id).copied()
+    }
+
+    /// The synth ParentId memo as it stands, shared rather than copied.
+    pub(crate) fn synth_parents_memo(
+        &self,
+    ) -> Option<Arc<crate::api::jellyfin::items::SynthParents>> {
+        self.synth_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Record that artwork changed, invalidating the synth-image memo.
@@ -704,6 +722,8 @@ impl AppState {
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            synth_parents: Arc::new(std::sync::Mutex::new(None)),
+            synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
@@ -820,6 +840,8 @@ impl AppState {
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            synth_parents: Arc::new(std::sync::Mutex::new(None)),
+            synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             next_activity_id: Arc::new(std::sync::atomic::AtomicI64::new(1)),
             waveform: Default::default(),
