@@ -5420,6 +5420,7 @@ dependencies = [
  "log",
  "pharos-api",
  "pharos-client",
+ "pharos-subs",
  "rustls",
  "serde",
  "serde_json",
