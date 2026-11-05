@@ -346,8 +346,10 @@ pub struct AppState {
     /// at once for distinct synth ids; without this each would run its own
     /// full-library `list()` (seconds each, 13k rows). The first miss takes
     /// this lock, builds the whole synth-id → representative map in one scan,
-    /// and every other request then hits the memo.
-    pub synth_image_warm: Arc<tokio::sync::Mutex<()>>,
+    /// and every other request then hits the memo. Holds the
+    /// [`list_generation`](Self::list_generation) of the last uncached
+    /// confirm scan, so misses at that generation skip straight to a negative.
+    pub synth_image_warm: Arc<tokio::sync::Mutex<Option<(u64, u64)>>>,
     /// Held across `services::user_data::update`'s read-modify-write, so two
     /// writes to one user's state (a native client pipelines them) cannot
     /// each store the row the other read before it. Keyed by (user, item), so
@@ -728,7 +730,7 @@ impl AppState {
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            synth_image_warm: Arc::new(tokio::sync::Mutex::new(None)),
             user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
@@ -847,7 +849,7 @@ impl AppState {
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
+            synth_image_warm: Arc::new(tokio::sync::Mutex::new(None)),
             user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             bg_io: Arc::new(tokio::sync::Semaphore::new(BG_IO_MAX)),
@@ -1124,6 +1126,17 @@ impl AppState {
         });
     }
 
+    /// What the item list cache is keyed on: the library generation and the
+    /// artwork epoch. Artwork counts too: `has_primary_art` picks synth
+    /// poster representatives, and the backfill records art without a rescan.
+    pub fn list_generation(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.library_generation.load(Ordering::Relaxed),
+            self.artwork_epoch.load(Ordering::Relaxed),
+        )
+    }
+
     /// Full `media_items` list, cached until the library changes (see
     /// `item_list_cache`). Callers that only read/filter the list (home-screen
     /// rows, synth Series/Season resolution) should use this instead of
@@ -1136,14 +1149,7 @@ impl AppState {
         /// Backstop: even if some mutation path forgets to bump the generation,
         /// the cache refreshes at least this often.
         const LIST_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-        // Artwork counts too: `has_primary_art` picks synth poster
-        // representatives, and the backfill records art without a rescan.
-        let gen = (
-            self.library_generation
-                .load(std::sync::atomic::Ordering::Relaxed),
-            self.artwork_epoch
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let gen = self.list_generation();
         let mut guard = self.item_list_cache.lock().await;
         if let Some((cached_gen, at, items)) = guard.as_ref() {
             if *cached_gen == gen && at.elapsed() < LIST_CACHE_MAX_AGE {
