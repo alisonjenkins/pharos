@@ -107,10 +107,11 @@ pub(crate) fn detect_artwork(req: &MetadataRequest<'_>) -> Vec<ArtworkRef> {
 
     // Item-level: the directory holding the media file.
     if let Some(dir) = item_dir {
-        if item_dir_is_show && foreign.show {
-            // The show folder's own art belongs to the other show, but a
-            // trusted episode's `<stem>-thumb` / `-poster` / `-fanart` beside
-            // it is still its own.
+        if foreign.show {
+            // The show folder's own art, and a season folder's folder.jpg /
+            // fanart.jpg from the same scrape, belong to the other show, but
+            // a trusted episode's `<stem>-thumb` / `-poster` / `-fanart`
+            // beside it is still its own.
             detect_per_file_in_dir(dir, stem, &mut out);
         } else {
             detect_in_dir(dir, stem, &mut out);
