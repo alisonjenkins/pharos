@@ -18,8 +18,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    is_loading, lifted_line, Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine,
-    Recovery, RecoveryBudget, SubtitleSize,
+    cue_chars_per_line, cue_font_px, is_loading, lifted_line, Engine, FragmentLoad, MediaState,
+    OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -452,22 +452,63 @@ pub fn set_volume(video_id: &str, volume: f64, muted: bool) {
     }
 }
 
+thread_local! {
+    /// The `<video>` whose track is shown, measured on each lift.
+    static CUE_VIDEO: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// One `cuechange` handler for every shown track: it lifts the cues
+    /// that load after the track is shown, at the player's size then.
+    static ON_CUE_CHANGE: Closure<dyn FnMut(web_sys::Event)> =
+        Closure::new(|e: web_sys::Event| {
+            if let Some(track) = e.target() {
+                let per_line = CUE_VIDEO.with(|v| cue_chars_for(&v.borrow()));
+                lift_cues(
+                    &js_sys::Reflect::get(&track, &"activeCues".into()).unwrap_or_default(),
+                    per_line,
+                );
+            }
+        });
+    /// The non-native player's `change` handler on its `TextTrackList`.
+    static ON_TRACKS_CHANGE: std::cell::RefCell<Option<Closure<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lifts the cues of each track the `<video>` `video_id` shows (V455), now
+/// and whenever the browser's own caption menu changes the shown track: the
+/// non-native player (`views/player.rs`) has no `show_text_track`.
+pub fn lift_cues_as_shown(video_id: &str) {
+    let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
+        return;
+    };
+    CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
+    let id = video_id.to_owned();
+    let list = tracks.clone();
+    let lift = move || {
+        for i in 0..list.length() {
+            if let Some(t) = list.get(i) {
+                if t.mode() == web_sys::TextTrackMode::Showing {
+                    lift_cues(
+                        &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
+                        cue_chars_for(&id),
+                    );
+                    ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
+                }
+            }
+        }
+    };
+    lift();
+    let on_change = Closure::<dyn FnMut()>::new(lift);
+    tracks.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    // The previous player's handler goes once this one replaces it.
+    ON_TRACKS_CHANGE.with(|c| *c.borrow_mut() = Some(on_change));
+}
+
 /// Shows the text track whose `<track id>` is `track_id`, hiding the rest;
 /// `None` hides them all.
 pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
         return;
     };
-    thread_local! {
-        /// One `cuechange` handler for every shown track: it lifts the cues
-        /// that load after the track is shown.
-        static ON_CUE_CHANGE: Closure<dyn FnMut(web_sys::Event)> =
-            Closure::new(|e: web_sys::Event| {
-                if let Some(track) = e.target() {
-                    lift_cues(&js_sys::Reflect::get(&track, &"activeCues".into()).unwrap_or_default());
-                }
-            });
-    }
+    CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
     for i in 0..tracks.length() {
         if let Some(t) = tracks.get(i) {
             let on = track_id.is_some_and(|id| t.id() == id);
@@ -477,20 +518,46 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
                 web_sys::TextTrackMode::Disabled
             });
             if on {
-                lift_cues(&js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default());
+                lift_cues(
+                    &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
+                    cue_chars_for(video_id),
+                );
                 ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
             }
         }
     }
 }
 
+/// About how many characters fit on a cue line in the `<video>` `video_id`
+/// now (`cue_chars_per_line`), from its width, the viewport's height and the
+/// `--pharos-subtitle-scale` the Subtitle size choice sets.
+fn cue_chars_for(video_id: &str) -> usize {
+    let Some(window) = web_sys::window() else {
+        return usize::MAX;
+    };
+    let width = element_width(video_id);
+    let height = window
+        .inner_height()
+        .ok()
+        .and_then(|h| h.as_f64())
+        .unwrap_or(0.0);
+    let scale = window
+        .document()
+        .and_then(|d| d.document_element())
+        .and_then(|e| window.get_computed_style(&e).ok().flatten())
+        .and_then(|s| s.get_property_value("--pharos-subtitle-scale").ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(1.0);
+    cue_chars_per_line(width, cue_font_px(width, height, scale))
+}
+
 /// Set `line` on each horizontal cue in the `TextTrackCueList` `cues`
 /// still placed by the browser (`line` is `"auto"`) to what `lifted_line`
-/// gives for its nonblank text lines, so its last line sits one line above
-/// the picture's bottom edge instead of on it (B545). `line` is the standard
-/// `VTTCue` setting, so Firefox honours it too, unlike the
+/// gives for its text at `chars_per_line`, so its last rendered line sits one
+/// line above the picture's bottom edge instead of on it (B545). `line` is
+/// the standard `VTTCue` setting, so Firefox honours it too, unlike the
 /// `::-webkit-media-text-track-*` pseudo-elements.
-fn lift_cues(cues: &JsValue) {
+fn lift_cues(cues: &JsValue, chars_per_line: usize) {
     if cues.is_null() || cues.is_undefined() {
         return;
     }
@@ -523,7 +590,11 @@ fn lift_cues(cues: &JsValue) {
             && !in_region
         {
             let lines = text(&cue, &cue_text).unwrap_or_default();
-            let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(lifted_line(&lines)));
+            let _ = js_sys::Reflect::set(
+                &cue,
+                &line,
+                &JsValue::from_f64(lifted_line(&lines, chars_per_line)),
+            );
         }
     }
 }

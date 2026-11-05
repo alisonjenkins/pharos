@@ -143,6 +143,7 @@ pub fn PlayerView(
     let audios = tracks.audio.clone();
     // Stable id on the media element so Fullscreen can target it.
     let media_dom_id = format!("pharos-media-{item_id}");
+    let cue_dom_id = media_dom_id.clone();
     let mut minimised = use_signal(|| false);
     let current_max_label = current_max_bitrate
         .map(|b| b.to_string())
@@ -178,6 +179,8 @@ pub fn PlayerView(
                     id: "{media_dom_id}",
                     // Subtitle size + backdrop from pharos.css (V455).
                     class: "pharos-cues",
+                    // Cues end a line above the picture's edge (V455).
+                    onloadedmetadata: move |_| crate::native::lift_cues_as_shown(&cue_dom_id),
                     controls: true,
                     autoplay: true,
                     playsinline: true,

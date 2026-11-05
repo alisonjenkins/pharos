@@ -1274,12 +1274,6 @@ body:has(.pharos-stage.is-full) .pharos-error {
     margin-inline: auto;
   }
 }
-/* The non-native player doesn't move its cues with `lift_cues` (only the
-   native player's `.pharos-video` does), so WebKit would snap the last line
-   to the picture's bottom edge and cut off the backdrop's lower corners. */
-.pharos-cues::-webkit-media-text-track-container {
-  transform: translateY(-4%);
-}
 .pharos-control-row {
   display: flex;
   align-items: center;
