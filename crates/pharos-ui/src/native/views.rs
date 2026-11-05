@@ -861,6 +861,14 @@ pub fn display_name(item: &Item) -> String {
     item.name.clone()
 }
 
+/// An item's name for the tab title: an episode's carries its show's.
+pub fn page_name(item: &Item) -> String {
+    match (&item.kind, &item.series_name) {
+        (ItemKind::Episode, Some(series)) => format!("{} · {series}", display_name(item)),
+        _ => display_name(item),
+    }
+}
+
 /// Empty, the show's own name, or a file name with an `S01E02` in it; the
 /// server's `apply_enrichment` replaces the same stand-ins.
 pub fn is_placeholder_episode_name(item: &Item) -> bool {
@@ -1791,6 +1799,19 @@ mod tests {
         let mut film = item(ItemKind::Movie);
         film.name = "Show.S01E01".into();
         assert_eq!(display_name(&film), "Show.S01E01");
+    }
+
+    #[test]
+    fn an_episode_page_is_named_with_its_show() {
+        let mut e = item(ItemKind::Episode);
+        e.name = "Pilot".into();
+        e.series_name = Some("Breaking Bad".into());
+        assert_eq!(page_name(&e), "Pilot · Breaking Bad");
+        e.series_name = None;
+        assert_eq!(page_name(&e), "Pilot");
+        let mut film = item(ItemKind::Movie);
+        film.name = "Alien".into();
+        assert_eq!(page_name(&film), "Alien");
     }
 
     #[test]

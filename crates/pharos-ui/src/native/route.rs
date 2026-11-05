@@ -33,6 +33,9 @@ pub enum Route {
     NotFound(String),
 }
 
+/// The product name, as the browser tab shows it.
+pub const APP_NAME: &str = "Pharos";
+
 /// Where the server mounts the app, and Dioxus.toml's `base_path`.
 pub const MOUNT: &str = "/ui";
 
@@ -80,6 +83,34 @@ impl Route {
             Route::Together => format!("{MOUNT}/together"),
             Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
             Route::NotFound(path) => path.clone(),
+        }
+    }
+
+    /// The item the page shows, if it shows one.
+    pub fn item(&self) -> Option<ItemRef> {
+        match self {
+            Route::Browse(id) | Route::Title(id) | Route::Watch(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// The browser tab's title: the page's name, or `name` (the item on the
+    /// page, once loaded), then the app's.
+    pub fn page_title(&self, name: Option<&str>) -> String {
+        let page = match self {
+            Route::Home | Route::SignIn => None,
+            Route::Browse(_) | Route::Title(_) | Route::Watch(_) => name,
+            Route::Manage => Some("Manage"),
+            Route::Appearance => Some("Appearance"),
+            Route::Account => Some("Account"),
+            Route::ApproveDevice => Some("Approve a device"),
+            Route::Find => Some("Search"),
+            Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
+            Route::NotFound(_) => Some("Not found"),
+        };
+        match page {
+            Some(page) => format!("{page} · {APP_NAME}"),
+            None => APP_NAME.to_owned(),
         }
     }
 
@@ -137,6 +168,17 @@ mod tests {
         ] {
             assert_eq!(Route::parse(&route.path()), route, "{route:?}");
         }
+    }
+
+    #[test]
+    fn the_tab_names_the_page_then_the_app() {
+        assert_eq!(Route::Home.page_title(None), "Pharos");
+        assert_eq!(Route::Appearance.page_title(None), "Appearance · Pharos");
+        let title = Route::Title(ItemRef::Real(42));
+        assert_eq!(title.page_title(Some("Alien")), "Alien · Pharos");
+        // Still loading: the app's name, never the last page's.
+        assert_eq!(title.page_title(None), "Pharos");
+        assert_eq!(Route::Home.page_title(Some("Alien")), "Pharos");
     }
 
     #[test]
