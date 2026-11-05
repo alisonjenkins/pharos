@@ -1299,6 +1299,67 @@
           '';
         };
 
+        # 025: `dx build --platform android` for the TV app. Deliberately NOT
+        # under `devShells`: `nix flake check` builds every devShell, and this
+        # one pulls the unfree Android SDK/NDK. `nix develop .#android` still
+        # resolves it from here.
+        legacyPackages.android =
+          let
+            # Its own nixpkgs import: the Android SDK is unfree and needs its
+            # licence accepted, which the main `pkgs` does not allow.
+            apkgs = import nixpkgs {
+              inherit system;
+              overlays = [ (import rust-overlay) ];
+              config = {
+                allowUnfree = true;
+                android_sdk.accept_license = true;
+              };
+            };
+            # dx 0.7 generates a Gradle project with compileSdk/targetSdk 34.
+            sdk = apkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "34" ];
+              buildToolsVersions = [ "34.0.0" "35.0.0" ];
+              includeNDK = true;
+              includeEmulator = false;
+              includeSystemImages = false;
+            };
+            androidToolchain = rustToolchain.override {
+              targets = [
+                "armv7-linux-androideabi"
+                "aarch64-linux-android"
+              ];
+            };
+            androidHome = "${sdk.androidsdk}/libexec/android-sdk";
+          in
+          apkgs.mkShell {
+            packages = [
+              androidToolchain
+              pkgs.dioxus-cli
+              pkgs.capnproto
+              pkgs.pkg-config
+              apkgs.jdk17
+              sdk.platform-tools
+            ];
+            shellHook = ''
+              unset LD_LIBRARY_PATH
+              export ANDROID_HOME=${androidHome}
+              export ANDROID_SDK_ROOT=${androidHome}
+              export ANDROID_NDK_HOME=$(ls -d ${androidHome}/ndk/* | head -1)
+              export JAVA_HOME=${apkgs.jdk17.home}
+              # Plain `cargo clippy/check --target <android>` (dx sets these
+              # itself) needs the NDK's clang for ring's C and the linker.
+              ndk_bin=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+              export CC_armv7_linux_androideabi=$ndk_bin/armv7a-linux-androideabi24-clang
+              export AR_armv7_linux_androideabi=$ndk_bin/llvm-ar
+              export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=$CC_armv7_linux_androideabi
+              export CC_aarch64_linux_android=$ndk_bin/aarch64-linux-android24-clang
+              export AR_aarch64_linux_android=$ndk_bin/llvm-ar
+              export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC_aarch64_linux_android
+              # AGP's own aapt2 from maven is a generic-linux binary; use the SDK's.
+              export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/35.0.0/aapt2"
+            '';
+          };
+
         # `nix flake check` gates the shipped artifact on the whole suite +
         # lints + doctests + a release build — same source + toolchain as
         # `.#pharos`. These are independent derivations sharing only the
