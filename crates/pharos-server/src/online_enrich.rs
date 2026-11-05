@@ -13,6 +13,20 @@ use pharos_core::{
     SearchCandidate,
 };
 
+/// What [`OnlineEnricher::fetch_texts`] got for one record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TextsFetch {
+    /// The record's rows, one per language asked for plus the original.
+    Found(Vec<pharos_core::LocalizedText>),
+    /// The provider answered that it has no such record (a 404, or an
+    /// episode its series' list does not hold). The provider is up, so this
+    /// does not count toward the backfill's outage stop.
+    NotFound,
+    /// A request failed: no token, a transport error or a status other than
+    /// 200 or 404, including one translation request of several.
+    Failed,
+}
+
 /// One piece of remote artwork a provider can offer: its role (Primary /
 /// Backdrop / Thumb / ...) and the fully-qualified URL to fetch the bytes
 /// from. Downloading is deferred to [`OnlineEnricher::fetch_image_bytes`]
@@ -123,9 +137,9 @@ pub trait OnlineEnricher: Send + Sync {
     /// The record's text in each of `languages` plus its base-record text
     /// (ADR-0062), addressed like [`fetch`](Self::fetch). A language the
     /// provider does not have comes back as a row with no title and no
-    /// overview; one whose request failed is left out, so it is asked again.
-    /// `None` when the record itself could not be read. Providers without
-    /// per-language text return `None`.
+    /// overview. [`TextsFetch::NotFound`] when the provider answered that it
+    /// has no such record, [`TextsFetch::Failed`] when a request failed.
+    /// Providers without per-language text answer `NotFound`.
     fn fetch_texts(
         &self,
         kind: MediaKind,
@@ -133,9 +147,9 @@ pub trait OnlineEnricher: Send + Sync {
         season: Option<u32>,
         episode: Option<u32>,
         languages: &[String],
-    ) -> impl Future<Output = Option<Vec<pharos_core::LocalizedText>>> + Send {
+    ) -> impl Future<Output = TextsFetch> + Send {
         let _ = (kind, id, season, episode, languages);
-        async { None }
+        async { TextsFetch::NotFound }
     }
 }
 
