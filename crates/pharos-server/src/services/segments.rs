@@ -121,7 +121,8 @@ pub fn classify_chapter_title(title: &str) -> Option<&'static str> {
         return Some("Intro");
     }
     if lc.contains("outro")
-        || lc.contains("credits")
+        // A post-credits scene is a scene to watch, not the credits.
+        || (lc.contains("credits") && !lc.contains("scene"))
         || lc.contains("closing")
         || matches!(song, Some("ed" | "ending"))
     {
@@ -191,6 +192,7 @@ mod tests {
         // A word in another script stays part of the title, not a break
         // after "ED".
         assert_eq!(classify_chapter_title("ED後のシーン"), None);
+        assert_eq!(classify_chapter_title("Post-Credits Scene"), None);
     }
 
     #[actix_web::test]
