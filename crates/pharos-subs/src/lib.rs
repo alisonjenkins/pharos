@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 
 mod model;
+mod morph;
 mod parse;
+mod raster;
 
 pub use model::{Event, Format, Overrides, ParseStats, Rgba, Run, Script, Style};
 pub use parse::decode;
