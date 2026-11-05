@@ -122,7 +122,7 @@ snapshot plus `PlaySessionId` to the client-log endpoint.
 - **FR-003** Subtitles: WebVTT rendered by the DOM layer with token-styled cues;
   ASS/SSA via a JS renderer (libass-wasm/JASSUB) `[NEEDS CLARIFICATION]`;
   image subs (PGS) via burn-in as the server decides today. Superseded for
-  image subs by spec 019 / ADR-0058: the player draws them from server-extracted
+  image subs by spec 019 / ADR-0060: the player draws them from server-extracted
   PNGs.
 - **FR-004** Trickplay sprites fetched from `Videos/{id}/Trickplay/...` and
   uploaded as GPU textures for zero-latency scrubbing.

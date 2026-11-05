@@ -1,6 +1,6 @@
 # Plan: image subtitles drawn by the native player
 
-**Spec**: `spec.md` · **ADR**: 0058
+**Spec**: `spec.md` · **ADR**: 0060
 
 ## Stack and boundaries
 
