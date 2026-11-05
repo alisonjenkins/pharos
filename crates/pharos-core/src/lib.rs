@@ -1381,6 +1381,79 @@ pub trait SeriesMetadataStore: Send + Sync {
     fn readmit_searched_tv(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
+/// A provider's title and description for one show or episode in one
+/// language (ADR-0062). `title` and `overview` both `None` records a language
+/// the provider was asked for and does not have, so it is not asked again on
+/// every pass. `is_original` marks the provider's base-record text: the
+/// language the record was written in, kept so "original" stays recoverable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalizedText {
+    /// ISO 639-2 three-letter code as the provider names it (`eng`, `jpn`).
+    pub language: String,
+    pub title: Option<String>,
+    pub overview: Option<String>,
+    pub is_original: bool,
+}
+
+/// What a [`LocalizedText`] row describes: a stored episode, or a show by
+/// its [`SeriesMetadata::series_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TranslationOwner {
+    Item(MediaId),
+    Series(String),
+}
+
+/// A stored show or episode that has no [`LocalizedText`] row yet for
+/// `language`, with what is needed to ask the provider for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranslationGap {
+    pub owner: TranslationOwner,
+    /// The matched provider (`"tvdb"`).
+    pub provider: String,
+    /// The SERIES id on `provider` (an episode is addressed by its series
+    /// plus season and episode number, the way enrichment fetches it).
+    pub series_external_id: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub language: String,
+}
+
+/// Per-language provider text for shows and episodes (ADR-0062). Split from
+/// [`MediaStore`] like [`RatingsStore`] so in-memory test stores don't have to
+/// implement it.
+pub trait MetadataTranslationStore: Send + Sync {
+    /// Insert or replace `owner`'s rows for each text's language, stamped
+    /// `fetched_at` (unix seconds).
+    fn upsert_translations(
+        &self,
+        owner: &TranslationOwner,
+        texts: &[LocalizedText],
+        fetched_at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Every stored row for `owners` whose language is one of `languages`, or
+    /// that is the original (`is_original`) when `with_original` is set.
+    /// Batched: one query for a whole list page.
+    fn translations_for(
+        &self,
+        owners: &[TranslationOwner],
+        languages: &[String],
+        with_original: bool,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(TranslationOwner, LocalizedText)>>> + Send;
+
+    /// Shows and episodes matched on `provider` (`search`/`nfo_id`/`manual`
+    /// matches with an external id) that have no row for `language`, or whose
+    /// row recording a missing translation predates `missing_cutoff`. Shows
+    /// first, then episodes, at most `limit`.
+    fn translation_gaps(
+        &self,
+        provider: &str,
+        language: &str,
+        missing_cutoff: i64,
+        limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<TranslationGap>>> + Send;
+}
+
 /// What a ratings lookup is for: a stored film, or a show by its
 /// [`SeriesMetadata::series_key`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
