@@ -27,6 +27,29 @@ fn image_cache_control() -> String {
     format!("private, max-age={IMAGE_MAX_AGE_SECS}")
 }
 
+/// A JPEG answering a `?format=avif|webp` request while that encode is still
+/// queued. It must not be kept for the week the real format would be: the
+/// browser revalidates it each time, and the changed ETag brings the encoded
+/// copy once it exists.
+const IMAGE_PENDING_CACHE_CONTROL: &str = "private, no-cache";
+
+/// How long a client may keep an image response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageFreshness {
+    Settled,
+    /// The JPEG stand-in for a format whose encode is pending.
+    Pending,
+}
+
+impl ImageFreshness {
+    fn cache_control(self) -> String {
+        match self {
+            Self::Settled => image_cache_control(),
+            Self::Pending => IMAGE_PENDING_CACHE_CONTROL.to_owned(),
+        }
+    }
+}
+
 /// A content ETag from the served file's length + mtime — stable while the
 /// cached bytes are, and rotates when the cache re-extracts / re-encodes.
 /// `None` if the file vanished (the caller then 404s on the body read).
@@ -67,6 +90,7 @@ fn if_none_match_of(req: &HttpRequest) -> Option<&str> {
 async fn deliver_image(
     final_path: &std::path::Path,
     content_type: &'static str,
+    freshness: ImageFreshness,
     head_only: bool,
     if_none_match: Option<&str>,
 ) -> HttpResponse {
@@ -74,7 +98,7 @@ async fn deliver_image(
     let etag = file_etag(final_path).await;
     if if_none_match_hit(if_none_match, etag.as_deref()) {
         let mut resp = HttpResponse::NotModified();
-        resp.insert_header((CACHE_CONTROL, image_cache_control()));
+        resp.insert_header((CACHE_CONTROL, freshness.cache_control()));
         if let Some(t) = &etag {
             resp.insert_header((ETAG, t.clone()));
         }
@@ -82,7 +106,7 @@ async fn deliver_image(
     }
     let mut resp = HttpResponse::Ok();
     resp.content_type(content_type);
-    resp.insert_header((CACHE_CONTROL, image_cache_control()));
+    resp.insert_header((CACHE_CONTROL, freshness.cache_control()));
     if let Some(t) = &etag {
         resp.insert_header((ETAG, t.clone()));
     }
@@ -284,7 +308,14 @@ async fn serve_chapter_image(
         .map_err(|e| error::ErrorInternalServerError(format!("chapter image: {e}")))?;
     // B89 — chapter thumbs are the heaviest per-item image after B88 turned
     // them on; cache them client-side like every other artwork.
-    Ok(deliver_image(&path, "image/jpeg", false, if_none_match_of(req)).await)
+    Ok(deliver_image(
+        &path,
+        "image/jpeg",
+        ImageFreshness::Settled,
+        false,
+        if_none_match_of(req),
+    )
+    .await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -693,46 +724,19 @@ async fn serve_image(
             return Ok(HttpResponse::NotFound().body(""));
         }
     };
-    // Downscale to the client-requested display width (capped per role) before
-    // serving. The extracted/stored cache jpeg is full source resolution (a
-    // 1080p video frame, a full-size embedded cover); shipping that for a
-    // `fillWidth=300` grid tile made the client decode a multi-MB bitmap per
-    // item → a RAM-tight TV's LMK SIGKILL'd the app on scroll. `scaled_artwork`
-    // caches per-width (keyed on path+mtime+width) and no-ops small inputs, so
-    // this is a one-time encode per (image, width). Logo/Banner/Art/Disc return
-    // None (alpha PNGs a JPEG rescale would wreck) → served untouched.
-    let jpeg_path = match effective_width(role, req_width) {
-        Some(width) => {
-            cache
-                .scaled_artwork(&jpeg_path, width)
-                .instrument(tracing::info_span!("image.resize", width))
-                .await
-        }
-        None => jpeg_path,
-    };
-    // P46 + P48 — optional re-encode to webp / avif via the
-    // FfmpegBackend trait (was a direct Command::new in P46; routed
-    // through the backend so the swap to ffmpeg-next in P49+ touches
-    // exactly one place). Cached as a sibling path so subsequent
-    // fetches skip the encode entirely.
-    let (final_path, content_type) = match format {
-        ImageFormat::Jpeg => (jpeg_path, "image/jpeg"),
-        ImageFormat::Webp => match transcode_via_backend(state, &jpeg_path, "webp").await {
-            Ok(p) => (p, "image/webp"),
-            Err(e) => {
-                tracing::warn!(error = %e, "webp transcode failed; serving jpeg");
-                (jpeg_path, "image/jpeg")
-            }
-        },
-        ImageFormat::Avif => match transcode_via_backend(state, &jpeg_path, "avif").await {
-            Ok(p) => (p, "image/avif"),
-            Err(e) => {
-                tracing::warn!(error = %e, "avif transcode failed; serving jpeg");
-                (jpeg_path, "image/jpeg")
-            }
-        },
-    };
-    Ok(deliver_image(&final_path, content_type, head_only, if_none_match).await)
+    // The extracted/stored cache jpeg is full source resolution (a 1080p video
+    // frame, a full-size embedded cover); it is sized and encoded for the
+    // client exactly like a local sidecar.
+    serve_local_artwork(
+        &jpeg_path,
+        role,
+        head_only,
+        format,
+        state,
+        req_width,
+        if_none_match,
+    )
+    .await
 }
 
 /// The `ImageTags.Primary` a synthesised folder (library / album / artist)
@@ -1193,12 +1197,13 @@ fn content_type_for_ext(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// LIB-D5 — serve a recorded local sidecar file directly. Honours the
-/// `?format=` webp/avif negotiation by transcoding through the same
-/// backend the frame-extract path uses, but writes the transcoded copy
-/// into the cache directory (keyed by a hash of the sidecar path) so we
-/// never pollute the user's media folder. A transcode failure — or no
-/// cache to write into — falls back to the original sidecar bytes.
+/// LIB-D5 — serve an artwork file (a recorded local sidecar, or the image
+/// cache's extracted frame) sized for the client.
+///
+/// `?format=avif|webp` is answered from the encoded copy once the background
+/// encode has made it, and from the sized JPEG until then (marked so the
+/// client does not keep it). Encoded and scaled copies live in the cache
+/// directory, never in the user's media folder.
 #[allow(clippy::too_many_arguments)]
 async fn serve_local_artwork(
     path: &std::path::Path,
@@ -1213,76 +1218,54 @@ async fn serve_local_artwork(
     // (capped per role) and serve the cached copy — a full-res multi-MB sidecar
     // read off NFS was costing 1-4s per tile in a library grid AND made the
     // client decode a giant bitmap (the home-screen scroll OOM). Only opaque
-    // photographic roles are scaled; Logo/Banner/Art/Disc are usually small
-    // PNGs with alpha that a JPEG re-encode would wreck, so they pass through
-    // untouched (`effective_width` → None).
-    let target_width: Option<u32> = effective_width(role, req_width);
-    let scaled;
-    let path = match (target_width, state.images.as_ref()) {
-        (Some(width), Some(cache)) => {
-            scaled = cache
-                .scaled_artwork(path, width)
-                .instrument(tracing::info_span!("image.resize", width))
-                .await;
-            scaled.as_path()
-        }
-        _ => path,
+    // photographic roles are scaled or re-encoded; Logo/Banner/Art/Disc are
+    // usually small PNGs with alpha that a re-encode would wreck, so they pass
+    // through untouched (`effective_width` → None).
+    let (Some(width), Some(cache)) = (effective_width(role, req_width), state.images.as_ref())
+    else {
+        return Ok(deliver_image(
+            path,
+            content_type_for_ext(path),
+            ImageFreshness::Settled,
+            head_only,
+            if_none_match,
+        )
+        .await);
     };
-    let ext = match format {
-        ImageFormat::Jpeg => None,
-        ImageFormat::Webp => Some("webp"),
-        ImageFormat::Avif => Some("avif"),
-    };
-    let (final_path, content_type): (std::path::PathBuf, &'static str) = match ext {
-        None => (path.to_path_buf(), content_type_for_ext(path)),
-        Some(ext) => match transcode_sidecar(state, path, ext).await {
-            Ok(p) => (
-                p,
-                if ext == "webp" {
-                    "image/webp"
-                } else {
-                    "image/avif"
-                },
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, target_ext = ext, "sidecar transcode failed; serving original");
-                (path.to_path_buf(), content_type_for_ext(path))
+    let mut freshness = ImageFreshness::Settled;
+    if let Some(encoded) = format.encoded() {
+        match cache
+            .encoded_artwork(path, width, encoded)
+            .instrument(tracing::info_span!("image.encoded_lookup"))
+            .await
+        {
+            pharos_cache::Encoded::Ready(out) => {
+                return Ok(deliver_image(
+                    &out,
+                    encoded.content_type(),
+                    ImageFreshness::Settled,
+                    head_only,
+                    if_none_match,
+                )
+                .await);
             }
-        },
-    };
-    Ok(deliver_image(&final_path, content_type, head_only, if_none_match).await)
-}
-
-/// Transcode a local sidecar into `ext` (webp/avif), writing the output
-/// into a cache-owned `sidecar/` subdir keyed by a hash of the source
-/// path so re-encodes are skipped and the user's media folder is left
-/// untouched. Errors if no image cache is configured.
-#[tracing::instrument(name = "image.encode", skip_all, fields(ext = %ext))]
-async fn transcode_sidecar(
-    state: &AppState,
-    src: &std::path::Path,
-    ext: &str,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    let cache = state
-        .images
-        .as_ref()
-        .ok_or_else(|| std::io::Error::other("image cache not configured"))?;
-    use xxhash_rust::xxh3::xxh3_64;
-    let key = xxh3_64(src.as_os_str().as_encoded_bytes());
-    let dir = cache.root().join("sidecar");
-    tokio::fs::create_dir_all(&dir).await?;
-    let out = dir.join(format!("{key:016x}.{ext}"));
-    if tokio::fs::try_exists(&out).await.unwrap_or(false) {
-        return Ok(out);
+            pharos_cache::Encoded::Pending => freshness = ImageFreshness::Pending,
+            // The JPEG is the final answer for a source that cannot be encoded.
+            pharos_cache::Encoded::Unavailable => {}
+        }
     }
-    let tmp = dir.join(format!("{key:016x}.{ext}.tmp"));
-    state
-        .ffmpeg
-        .transcode_image(src, ext, &tmp)
-        .await
-        .map_err(|e| std::io::Error::other(format!("backend {ext} transcode: {e}")))?;
-    tokio::fs::rename(&tmp, &out).await?;
-    Ok(out)
+    let scaled = cache
+        .scaled_artwork(path, width)
+        .instrument(tracing::info_span!("image.resize", width))
+        .await;
+    Ok(deliver_image(
+        &scaled,
+        content_type_for_ext(&scaled),
+        freshness,
+        head_only,
+        if_none_match,
+    )
+    .await)
 }
 
 /// P46 — client-requested image encoding. Modern web clients +
@@ -1294,6 +1277,16 @@ enum ImageFormat {
     Jpeg,
     Webp,
     Avif,
+}
+
+impl ImageFormat {
+    fn encoded(self) -> Option<pharos_cache::EncodedFormat> {
+        match self {
+            Self::Jpeg => None,
+            Self::Webp => Some(pharos_cache::EncodedFormat::Webp),
+            Self::Avif => Some(pharos_cache::EncodedFormat::Avif),
+        }
+    }
 }
 
 fn parse_image_format(qs: &str) -> ImageFormat {
@@ -1385,30 +1378,6 @@ fn effective_width(role: ImageRole, requested: Option<u32>) -> Option<u32> {
         _ => return None,
     };
     Some(requested.map_or(cap, |w| w.min(cap)))
-}
-
-/// P46 + P48 — transcode the cached jpeg into a sibling `.{ext}`
-/// file via the `FfmpegBackend` trait. Atomic via `.tmp → final` so
-/// concurrent first-readers don't observe a half-written output.
-#[tracing::instrument(name = "image.encode", skip_all, fields(ext = %ext))]
-async fn transcode_via_backend(
-    state: &AppState,
-    jpeg_path: &std::path::Path,
-    ext: &str,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    let mut out = jpeg_path.to_path_buf();
-    out.set_extension(ext);
-    if tokio::fs::try_exists(&out).await.unwrap_or(false) {
-        return Ok(out);
-    }
-    let tmp = jpeg_path.with_extension(format!("{ext}.tmp"));
-    state
-        .ffmpeg
-        .transcode_image(jpeg_path, ext, &tmp)
-        .await
-        .map_err(|e| std::io::Error::other(format!("backend {ext} transcode: {e}")))?;
-    tokio::fs::rename(&tmp, &out).await?;
-    Ok(out)
 }
 
 async fn upload_image(
@@ -1964,6 +1933,62 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), PNG_1X1, "served bytes must be the sidecar");
+    }
+
+    #[actix_web::test]
+    async fn avif_is_served_once_encoded_and_the_stand_in_is_not_kept() {
+        use pharos_core::MediaStore;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        // A real decodable image: the encode runs the real ffmpeg on it.
+        let poster = dir.path().join("poster.jpg");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .args(["testsrc=s=800x1200", "-frames:v", "1", "-y"])
+            .arg(&poster)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        put_movie(&state, 56, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(56, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let get = |uri: &'static str| test::TestRequest::get().uri(uri).to_request();
+        let header = |resp: &actix_web::dev::ServiceResponse, name: &str| {
+            resp.headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let cold = test::call_service(&app, get("/items/56/images/primary?format=avif")).await;
+        assert_eq!(cold.status(), 200);
+        assert_eq!(header(&cold, "content-type"), "image/jpeg");
+        assert_eq!(header(&cold, "cache-control"), IMAGE_PENDING_CACHE_CONTROL);
+
+        let mut warm = None;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let resp = test::call_service(&app, get("/items/56/images/primary?format=avif")).await;
+            if header(&resp, "content-type") == "image/avif" {
+                warm = Some(resp);
+                break;
+            }
+        }
+        let warm = warm.expect("the queued encode never landed");
+        assert_eq!(header(&warm, "cache-control"), image_cache_control());
+        let body = test::read_body(warm).await;
+        assert_eq!(&body[4..12], b"ftypavif", "the body must be an AVIF file");
+
+        let plain = test::call_service(&app, get("/items/56/images/primary")).await;
+        assert_eq!(header(&plain, "content-type"), "image/jpeg");
+        assert_eq!(header(&plain, "cache-control"), image_cache_control());
     }
 
     #[actix_web::test]
