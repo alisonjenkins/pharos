@@ -24,6 +24,11 @@ pub struct Nav(pub EventHandler<Route>);
 #[derive(Clone, Copy)]
 pub struct MarkPlayed(pub EventHandler<(ItemRef, bool)>);
 
+/// Plays an item from 0 s whatever position was saved, provided by the app
+/// root.
+#[derive(Clone, Copy)]
+pub struct PlayFromStart(pub EventHandler<ItemRef>);
+
 /// A button that marks `id` watched, or unwatched when `played`. `what`
 /// names a whole group it marks, such as "season".
 #[component]
@@ -467,6 +472,9 @@ pub fn TitleView(
     /// The viewer asked to watch this item together.
     #[props(default)]
     on_watch_together: EventHandler<ItemRef>,
+    /// The viewer asked to play this part-watched item from the start.
+    #[props(default)]
+    on_play_from_start: EventHandler<ItemRef>,
     /// What the group's members have seen, when in one.
     #[props(default)]
     seen: Vec<MemberSeen>,
@@ -509,6 +517,19 @@ pub fn TitleView(
                     if item.kind.playable() {
                         Link { to: Route::Watch(item.id), class: "pharos-button",
                             if resume { "Resume" } else { "Play" }
+                        }
+                    }
+                    if item.kind.playable() && resume {
+                        {
+                            let id = item.id;
+                            rsx! {
+                                button {
+                                    class: "pharos-button pharos-button-secondary",
+                                    r#type: "button",
+                                    onclick: move |_| on_play_from_start.call(id),
+                                    "Play from start"
+                                }
+                            }
                         }
                     }
                     if can_watch_together(item.kind) {
@@ -1125,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn a_title_offers_play_or_resume_and_a_watched_mark() {
+    fn a_title_offers_play_or_resume_play_from_start_and_a_watched_mark() {
         let mut movie = item(ItemKind::Movie);
         movie.runtime_ms = 102 * 60_000;
         let detail = Detail {
@@ -1145,6 +1166,10 @@ mod tests {
         );
         assert!(html.contains(">Mark watched<"), "{html}");
         assert!(
+            !html.contains("Play from start"),
+            "nothing to resume: {html}"
+        );
+        assert!(
             html.contains("2001 · 1h 42m") && html.contains("A heist.") && html.contains("Crime"),
             "{html}"
         );
@@ -1162,6 +1187,7 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
+        assert!(html.contains(">Play from start<"), "{html}");
 
         let mut watched = item(ItemKind::Episode);
         watched.played = true;
