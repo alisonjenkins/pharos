@@ -2448,6 +2448,7 @@ fn WhatsNew(route: Route) -> Element {
     let mut replay = use_signal(|| 0_u32);
     let mut library_transition = use_signal(stored_library_transition);
     let mut subtitle_size = use_signal(stored_subtitle_size);
+    let mut overlay_effect = use_signal(stored_overlay_effect);
     let themes = use_context::<Themes>();
     // Mounted afresh for each sign-in: the last user's state goes.
     use_hook(move || {
@@ -2526,6 +2527,7 @@ fn WhatsNew(route: Route) -> Element {
         theme_auto: *themes.active.read() == device::AUTO,
         subtitle_size: subtitle_size(),
         library_transition: library_transition(),
+        overlay_effect: overlay_effect(),
     };
     rsx! {
         WhatsNewView {
@@ -2570,6 +2572,19 @@ fn WhatsNew(route: Route) -> Element {
                         library_transition.set(fx);
                         platform::info(&format!(
                             "pharos: library_transition set={} from=whats_new",
+                            fx.as_str()
+                        ));
+                    }
+                    Pick::OverlayEffect(fx) => {
+                        if let Err(e) = store_overlay_effect(fx) {
+                            platform::warn(&format!(
+                                "pharos: whats_new overlay_effect not kept error={e}"
+                            ));
+                        }
+                        platform::apply_overlay_effect(fx);
+                        overlay_effect.set(fx);
+                        platform::info(&format!(
+                            "pharos: overlay_effect set={} from=whats_new",
                             fx.as_str()
                         ));
                     }
