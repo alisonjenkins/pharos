@@ -33,6 +33,8 @@ pub const SAMPLE_EVERY_S: u64 = 10;
 pub struct GroupView {
     /// In a group now.
     pub active: bool,
+    /// The group's id, for its invite link.
+    pub id: Option<String>,
     pub members: Vec<Member>,
     /// This member is on their own tracks ("Just me").
     pub own_tracks: bool,
@@ -484,6 +486,7 @@ impl GroupState {
     pub fn view(&self, active: bool) -> GroupView {
         GroupView {
             active,
+            id: self.id.clone(),
             members: self.members.clone(),
             own_tracks: self.own_tracks,
             log: self.log.clone(),
@@ -2289,6 +2292,55 @@ mod tests {
             &logged,
             "pharos: group player attached reason=session_created"
         ));
+    }
+
+    /// A group started from the player (V479): the video already playing is
+    /// the group's from the start, at its own place, and keeps playing once
+    /// the group plays; the view names the group for its invite link.
+    #[test]
+    fn a_group_started_mid_watch_drives_the_video_already_playing() {
+        let (seat, _) = seat();
+        let env = TestEnv::default();
+        env.now.set(100_000);
+        let video = Rc::new(TestPlayer::default());
+        video.position.set(42_000);
+        seat.attach(ItemRef::Real(7), video.clone());
+        let session = seat.session(|| new_session(&env));
+        let made = session.create(ItemRef::Real(7), video.position_ms());
+        assert!(matches!(made.now_or_never(), Some(Ok(_))));
+        env.settle();
+        let groups = session.client.calls();
+        assert!(groups.contains(&"create(7,42000)".to_owned()), "{groups:?}");
+        let view = session.view();
+        assert!(view.active);
+        assert_eq!(view.id.as_deref(), Some("g2"));
+        let sink = session.client.sinks().remove(0);
+        sink(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "p1".into(),
+            position_ms: 42_000,
+            playing: true,
+        });
+        sink(GroupUpdate::Play {
+            at_server_ms: 100_000,
+            position_ms: 42_000,
+            by: None,
+        });
+        env.settle();
+        assert!(!video.paused(), "{:?}", video.log.borrow());
+        assert!(
+            video
+                .log
+                .borrow()
+                .iter()
+                .all(|l| !l.starts_with("seek(") || l == "seek(42000)"),
+            "only the group's own place: {:?}",
+            video.log.borrow()
+        );
+        assert_eq!(
+            session.inner.borrow().state.watching,
+            Some(ItemRef::Real(7))
+        );
     }
 
     #[test]
