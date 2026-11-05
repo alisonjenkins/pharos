@@ -17,7 +17,7 @@ treated as build output.
 
 ## How it runs
 
-`dx bundle --platform android` builds `pharos-ui` for `aarch64-linux-android`
+`dx build --platform android --package pharos-ui` builds `pharos-ui` for `aarch64-linux-android`
 (and `armv7` if a target TV needs it). The components run as native Rust;
 the system WebView only draws the DOM Dioxus emits. Nothing is compiled to
 WASM on this target.

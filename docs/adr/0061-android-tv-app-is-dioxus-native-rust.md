@@ -15,11 +15,13 @@ native API already has what a TV needs: device tokens, QuickConnect and a
 ## Decision
 
 We will build the Android TV app from the same `pharos-ui` components using
-Dioxus's Android target (`dx bundle --platform android`), written only in
-Rust. A third platform module, `native/android.rs`, implements the same
-surface as `web.rs` with a native websocket into
+Dioxus's Android target (`dx build --platform android --package pharos-ui`),
+written only in Rust. A third platform module, `native/android.rs`, will
+implement the same surface as `web.rs` with a native websocket into
 `pharos_client::connect_stream`, device-token sign-in and app-private
-storage. Playback starts on the WebView's `<video>` + hls.js behind the
+storage. Slice 1 adds its socket and QuickConnect sign-in; the `platform`
+alias still points at `host.rs` until the shared `App` runs on Android, so
+that wiring is pending. Playback starts on the WebView's `<video>` + hls.js behind the
 existing `PlaybackEngine` trait; native MediaCodec/ExoPlayer is reached later
 through JNI from Rust behind the same trait. No Kotlin or Java is
 hand-written. Signing happens outside Nix; the key never enters the store.
