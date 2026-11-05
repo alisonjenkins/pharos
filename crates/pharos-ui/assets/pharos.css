@@ -630,13 +630,15 @@ input:focus-visible {
 }
 
 /* A browse grid's cards arrive with the viewer's chosen transition when it
-   mounts: a library opening or the viewer switching to another (V476). Only the first
-   tiles carry `.pharos-arrive` (browse.rs `arrival`), staggered by their
-   place `--fx-i`; the rain scatters them by `--fx-r` instead. Every effect
-   animates `transform` and `opacity` alone, so it stays on the compositor on
-   TV and headset GPUs. */
+   mounts: a library opening or the viewer switching to another (V476). The
+   tiles from the first in view carry `.pharos-arrive` (browse.rs `arrival`),
+   staggered corner to corner by their row plus column on screen
+   (`--fx-wave`, set by web.rs `stage_arrival` once they are in the page);
+   the rain scatters them by `--fx-r` instead. Every effect animates
+   `transform` and `opacity` alone, so it stays on the compositor on TV and
+   headset GPUs. */
 :is(.pharos-browse, .pharos-artist) .pharos-arrive {
-  animation: 380ms cubic-bezier(0.2, 0.7, 0.2, 1) calc(var(--fx-i, 0) * 25ms) backwards pharos-arrive-fade;
+  animation: 380ms cubic-bezier(0.2, 0.7, 0.2, 1) calc(var(--fx-wave, 0) * 45ms) backwards pharos-arrive-fade;
 }
 :root[data-library-transition="none"] :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   animation: none;

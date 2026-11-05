@@ -262,6 +262,8 @@ pub fn tile_top(_at: u32) -> Option<f64> {
     None
 }
 
+pub fn stage_arrival(_again: bool) {}
+
 pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
     false
 }
