@@ -295,7 +295,13 @@ impl<U: UserStore> BuiltinAuth<U> {
         // as a wrong password.
         if password.expose().is_empty() {
             metrics::counter!("pharos_login_empty_password_total").increment(1);
-            tracing::warn!(user.name = %name, reason = "empty_password", "sign-in refused");
+            // The typed name may be a pasted secret: log its length only, as
+            // the other refusals do.
+            tracing::warn!(
+                name_len = name.chars().count(),
+                reason = "empty_password",
+                "sign-in refused"
+            );
             return Err(Denial::Refused {
                 reason: LoginFailure::BadPassword,
                 name_mismatch: NameMismatch::None,
@@ -2013,6 +2019,30 @@ mod tests {
             for reason in ["unknown_user", "bad_password", "disabled", "throttled"] {
                 assert_eq!(counts.get(reason), Some(&1), "{reason}: {counts:?}");
             }
+        }
+
+        #[tokio::test]
+        async fn an_empty_password_refusal_does_not_echo_the_name() {
+            let buf = Buf::default();
+            let sub = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            let _g = tracing::subscriber::set_default(sub);
+            let auth = super::fresh().await;
+            let t = LoginThrottle::new(cfg());
+            let r = t
+                .verify(&auth, "PastedSecret", &SecretString::new(""), ip(3))
+                .await;
+            assert!(matches!(r, Err(LoginRefusal::Invalid)), "{r:?}");
+            let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                log.lines()
+                    .any(|l| l.contains("reason=\"empty_password\"") && l.contains("name_len=12")),
+                "{log}"
+            );
+            assert!(!log.contains("PastedSecret"), "typed name echoed: {log}");
         }
 
         #[test]
