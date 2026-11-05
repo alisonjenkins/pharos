@@ -1226,11 +1226,14 @@ pub fn current_search() -> String {
 const SCROLL_SETTLE_MS: i32 = 150;
 
 /// A window `scroll` listener and its pending settle timer; both go on drop,
-/// so a timer cannot fire for a page that has been left. A settle still
-/// pending then runs at once instead: the scroll it waited on is the last
-/// one this page saw, and leaving inside the delay must not lose it.
+/// so a timer cannot fire for a page that has been left. A click anywhere
+/// (seen first, in the capture phase) runs a pending settle at once, while
+/// the page is still where the viewer left it: following a link inside the
+/// delay must not lose the scroll it waited on. A settle still pending on
+/// drop is dropped, not run, since by then the next view has moved the page.
 pub struct ScrollWatch {
     listener: Closure<dyn FnMut(web_sys::Event)>,
+    flush: Closure<dyn FnMut(web_sys::Event)>,
     pending: Rc<Cell<Option<i32>>>,
     _settled: Rc<Closure<dyn FnMut()>>,
 }
@@ -1242,9 +1245,11 @@ impl Drop for ScrollWatch {
                 "scroll",
                 self.listener.as_ref().unchecked_ref(),
             );
-            // A settle still pending is dropped, not run: leaving through a
-            // link scrolls the page to the top before the grid goes, so the
-            // place read now would be that top, not where the viewer was.
+            let _ = window.remove_event_listener_with_callback_and_bool(
+                "click",
+                self.flush.as_ref().unchecked_ref(),
+                true,
+            );
             if let Some(timer) = self.pending.take() {
                 window.clear_timeout_with_handle(timer);
             }
@@ -1252,7 +1257,8 @@ impl Drop for ScrollWatch {
     }
 }
 
-/// Call `on_settled` once the page has stopped scrolling.
+/// Call `on_settled` once the page has stopped scrolling, or straight away
+/// on a click while a settle is pending.
 pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch {
     let pending = Rc::new(Cell::new(None::<i32>));
     let fired = pending.clone();
@@ -1278,6 +1284,18 @@ pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch 
                 .ok(),
         );
     });
+    let waiting = pending.clone();
+    let now = settled.clone();
+    let flush = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let Some(timer) = waiting.take() else {
+            return;
+        };
+        if let Some(window) = web_sys::window() {
+            window.clear_timeout_with_handle(timer);
+        }
+        let settled: &js_sys::Function = (*now).as_ref().unchecked_ref();
+        let _ = settled.call0(&JsValue::NULL);
+    });
     if let Some(window) = web_sys::window() {
         let options = web_sys::AddEventListenerOptions::new();
         options.set_passive(true);
@@ -1286,9 +1304,15 @@ pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch 
             listener.as_ref().unchecked_ref(),
             &options,
         );
+        let _ = window.add_event_listener_with_callback_and_bool(
+            "click",
+            flush.as_ref().unchecked_ref(),
+            true,
+        );
     }
     ScrollWatch {
         listener,
+        flush,
         pending,
         _settled: settled,
     }
