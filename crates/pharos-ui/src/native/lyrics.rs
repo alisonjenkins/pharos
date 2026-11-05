@@ -4,15 +4,16 @@
 //! lyrics are text to scroll through.
 //!
 //! Karaoke mode (B483/V427), when the listener turns it on: the line being
-//! sung is drawn large and filled in from left to right as it is sung. LRC
-//! times lines, not words, so the fill runs across each word by its
-//! syllables and ends early when a pause follows.
+//! sung is drawn large and filled in from left to right as it is sung. When a
+//! line carries enhanced-LRC word times (B496), the fill follows them;
+//! otherwise it runs across each word by its syllables and ends early when a
+//! pause follows.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use dioxus::prelude::*;
-use pharos_client::api::Lyrics;
+use pharos_client::api::{LyricLine, Lyrics};
 
 use super::platform;
 
@@ -89,9 +90,10 @@ fn syllables(word: &str) -> u32 {
 }
 
 /// How far through line `i` the singer is at `position_ms`, in percent: 0 at
-/// its start, weighted across its words by syllable count, and reaching 100
-/// at the next line's start (or [`LAST_LINE_MS`] later for the last line) or
-/// after [`SYLLABLE_MS`] per syllable when a pause follows.
+/// its start, following its word timestamps when it has them or weighted
+/// across its words by syllable count, and reaching 100 at the next line's
+/// start (or [`LAST_LINE_MS`] later for the last line) or after
+/// [`SYLLABLE_MS`] per syllable when a pause follows.
 pub fn line_progress(lyrics: &Lyrics, i: usize, position_ms: u64) -> f64 {
     let Some(line) = lyrics.lines.get(i) else {
         return 0.0;
@@ -100,6 +102,9 @@ pub fn line_progress(lyrics: &Lyrics, i: usize, position_ms: u64) -> f64 {
         .lines
         .get(i + 1)
         .map_or(line.start_ms.saturating_add(LAST_LINE_MS), |l| l.start_ms);
+    if !line.words.is_empty() {
+        return word_progress(line, end, position_ms);
+    }
     let span = end.saturating_sub(line.start_ms);
     if span == 0 {
         return 100.0;
@@ -154,6 +159,58 @@ pub fn line_progress(lyrics: &Lyrics, i: usize, position_ms: u64) -> f64 {
         (pos, char_count as f64)
     };
     (char_pos / chars * 100.0).clamp(0.0, 100.0)
+}
+
+/// [`line_progress`] for a line with word times: the fill runs straight from
+/// stamp to stamp, and on from the last one by syllables as if untimed.
+fn word_progress(line: &LyricLine, end: u64, position_ms: u64) -> f64 {
+    let len = line.text.chars().count();
+    if len == 0 {
+        return 100.0;
+    }
+    let mut points = Vec::with_capacity(line.words.len() + 2);
+    if line.words.first().map_or(true, |w| w.at != 0) {
+        points.push((line.start_ms, 0usize));
+    }
+    for w in &line.words {
+        let at = usize::try_from(w.at).unwrap_or(usize::MAX).min(len);
+        let prev_time = points.last().map_or(0, |&(t, _)| t);
+        points.push((w.start_ms.max(prev_time), at));
+    }
+    if let Some(&(last_time, last_pos)) = points.last() {
+        if last_pos < len {
+            let rest_byte = line
+                .text
+                .char_indices()
+                .nth(last_pos)
+                .map_or(line.text.len(), |(b, _)| b);
+            let rest = &line.text[rest_byte..];
+            let tail_syllables = rest.split_whitespace().map(syllables).sum::<u32>().max(1);
+            let cap = u64::from(tail_syllables).saturating_mul(SYLLABLE_MS);
+            points.push((last_time.saturating_add(cap).min(end).max(last_time), len));
+        }
+    }
+    let idx = points.partition_point(|&(t, _)| t <= position_ms);
+    if idx == 0 {
+        return 0.0;
+    }
+    let Some(&(t1, p1)) = points.get(idx) else {
+        return 100.0;
+    };
+    let (t0, p0) = points[idx - 1];
+    let dt = t1.saturating_sub(t0);
+    // Lines and character counts are small, so these fit an f64 exactly.
+    #[allow(clippy::cast_precision_loss)]
+    let (pos, chars) = {
+        let pos = if dt == 0 {
+            p1 as f64
+        } else {
+            let f = position_ms.saturating_sub(t0) as f64 / dt as f64;
+            p0 as f64 + f * (p1 as f64 - p0 as f64)
+        };
+        (pos, len as f64)
+    };
+    (pos / chars * 100.0).clamp(0.0, 100.0)
 }
 
 #[component]
@@ -271,7 +328,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use pharos_client::api::LyricLine;
+    use pharos_client::api::LyricWord;
 
     fn synced(starts: &[u64]) -> Lyrics {
         Lyrics {
@@ -372,6 +429,85 @@ mod tests {
         // 39 chars; 2500 ms is 4.5 syllables, halfway through "five" (21/39).
         assert!((line_progress(&l, 0, 2_500) - 21.0 / 39.0 * 100.0).abs() < 1e-9);
         assert!((line_progress(&l, 0, 5_000) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stamped_words_fill_at_their_times() {
+        let l = Lyrics {
+            synced: true,
+            lines: vec![
+                LyricLine {
+                    start_ms: 1_000,
+                    text: "Hello world".into(),
+                    words: vec![
+                        LyricWord {
+                            at: 0,
+                            start_ms: 1_000,
+                        },
+                        LyricWord {
+                            at: 6,
+                            start_ms: 1_500,
+                        },
+                        LyricWord {
+                            at: 11,
+                            start_ms: 2_400,
+                        },
+                    ],
+                },
+                LyricLine {
+                    start_ms: 5_000,
+                    text: "next".into(),
+                    words: Vec::new(),
+                },
+            ],
+        };
+        assert!((line_progress(&l, 0, 900) - 0.0).abs() < f64::EPSILON);
+        assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 1_500) - 6.0 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 1_950) - 8.5 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 2_400) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_partially_stamped_line_falls_back_to_the_syllable_cap_after_the_last_stamp() {
+        let l = Lyrics {
+            synced: true,
+            lines: vec![
+                LyricLine {
+                    start_ms: 1_000,
+                    text: "Hello world".into(),
+                    words: vec![LyricWord {
+                        at: 6,
+                        start_ms: 1_500,
+                    }],
+                },
+                LyricLine {
+                    start_ms: 10_000,
+                    text: "next".into(),
+                    words: Vec::new(),
+                },
+            ],
+        };
+        // No stamp at 0, so (1000, 0) -> (1500, 6); "world" (1 syllable = 700 ms) ends at 2200.
+        assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 1_850) - 8.5 / 11.0 * 100.0).abs() < 1e-9);
+        assert!((line_progress(&l, 0, 2_200) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_word_stamp_past_the_last_line_end_keeps_points_ordered() {
+        let l = Lyrics {
+            synced: true,
+            lines: vec![LyricLine {
+                start_ms: 0,
+                text: "Hello world".into(),
+                words: vec![LyricWord {
+                    at: 0,
+                    start_ms: 6_000,
+                }],
+            }],
+        };
+        assert!((line_progress(&l, 0, 5_500) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
