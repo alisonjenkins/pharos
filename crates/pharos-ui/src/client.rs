@@ -483,6 +483,9 @@ pub struct UserConfiguration {
     pub remember_audio_selections: bool,
     pub remember_subtitle_selections: bool,
     pub enable_next_episode_auto_play: bool,
+    /// The language show descriptions are shown in (ADR-0062); empty is the
+    /// server default. Carried so a save does not clear it.
+    pub description_language_preference: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -498,6 +501,7 @@ struct UserConfigurationDto {
     remember_audio_selections: bool,
     remember_subtitle_selections: bool,
     enable_next_episode_auto_play: bool,
+    description_language_preference: String,
 }
 
 impl Default for UserConfigurationDto {
@@ -513,6 +517,7 @@ impl Default for UserConfigurationDto {
             remember_audio_selections: true,
             remember_subtitle_selections: true,
             enable_next_episode_auto_play: true,
+            description_language_preference: String::new(),
         }
     }
 }
@@ -539,6 +544,7 @@ pub fn parse_user_configuration_response(bytes: &[u8]) -> Result<UserConfigurati
         remember_audio_selections: c.remember_audio_selections,
         remember_subtitle_selections: c.remember_subtitle_selections,
         enable_next_episode_auto_play: c.enable_next_episode_auto_play,
+        description_language_preference: c.description_language_preference,
     })
 }
 
@@ -554,6 +560,7 @@ pub fn user_configuration_to_dto_json(c: &UserConfiguration) -> serde_json::Valu
         "RememberAudioSelections": c.remember_audio_selections,
         "RememberSubtitleSelections": c.remember_subtitle_selections,
         "EnableNextEpisodeAutoPlay": c.enable_next_episode_auto_play,
+        "DescriptionLanguagePreference": c.description_language_preference,
     })
 }
 
@@ -2256,6 +2263,7 @@ mod tests {
             remember_audio_selections: false,
             remember_subtitle_selections: false,
             enable_next_episode_auto_play: false,
+            description_language_preference: "fra".into(),
         };
         let body = serde_json::json!({ "Configuration": user_configuration_to_dto_json(&cfg) });
         let bytes = body.to_string();
