@@ -654,7 +654,8 @@ input:focus-visible {
   font: inherit;
   font-size: 1rem;
 }
-.pharos-filter-direction {
+.pharos-filter-direction,
+.pharos-filter-reset {
   padding: 0.45rem 1rem;
 }
 
