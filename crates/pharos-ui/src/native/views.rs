@@ -657,9 +657,9 @@ pub fn PosterTile(item: Item) -> Element {
 #[component]
 pub fn TitleView(
     detail: Detail,
-    /// The viewer asked to watch this item together.
+    /// The viewer asked to watch this item together, from this position.
     #[props(default)]
-    on_watch_together: EventHandler<ItemRef>,
+    on_watch_together: EventHandler<(ItemRef, u64)>,
     /// The viewer asked to play this part-watched item from the start.
     #[props(default)]
     on_play_from_start: EventHandler<ItemRef>,
@@ -722,13 +722,31 @@ pub fn TitleView(
                     }
                     if can_watch_together(item.kind) {
                         {
+                            // A part-watched title starts its group where the
+                            // viewer left off, or over (B556/V466).
                             let id = item.id;
+                            let from = start_ms(item.position_ms, item.played);
                             rsx! {
-                                button {
-                                    class: "pharos-button",
-                                    r#type: "button",
-                                    onclick: move |_| on_watch_together.call(id),
-                                    "Watch together"
+                                if resume {
+                                    button {
+                                        class: "pharos-button",
+                                        r#type: "button",
+                                        onclick: move |_| on_watch_together.call((id, from)),
+                                        "Resume together"
+                                    }
+                                    button {
+                                        class: "pharos-button pharos-button-secondary",
+                                        r#type: "button",
+                                        onclick: move |_| on_watch_together.call((id, 0)),
+                                        "Watch together from start"
+                                    }
+                                } else {
+                                    button {
+                                        class: "pharos-button",
+                                        r#type: "button",
+                                        onclick: move |_| on_watch_together.call((id, 0)),
+                                        "Watch together"
+                                    }
                                 }
                             }
                         }
@@ -1534,6 +1552,10 @@ mod tests {
             "nothing to resume: {html}"
         );
         assert!(
+            html.contains(">Watch together<") && !html.contains("Resume together"),
+            "nothing to resume together: {html}"
+        );
+        assert!(
             html.contains("2001 · 1h 42m") && html.contains("A heist.") && html.contains("Crime"),
             "{html}"
         );
@@ -1552,6 +1574,8 @@ mod tests {
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
         assert!(html.contains(">Play from start<"), "{html}");
+        assert!(html.contains(">Resume together<"), "{html}");
+        assert!(html.contains(">Watch together from start<"), "{html}");
 
         let mut watched = item(ItemKind::Episode);
         watched.played = true;

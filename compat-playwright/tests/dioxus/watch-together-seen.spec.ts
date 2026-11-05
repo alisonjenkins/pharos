@@ -95,7 +95,7 @@ test.describe("pharos Dioxus UI watch together: who has seen what", () => {
     try {
       // V starts the group; A joins by the invite link.
       await v.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
-      await v.page.getByRole("button", { name: "Watch together" }).click();
+      await v.page.getByRole("button", { name: "Watch together", exact: true }).click();
       await expect(v.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
       await expect(v.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
       const groups = await json("/SyncPlay/List");
