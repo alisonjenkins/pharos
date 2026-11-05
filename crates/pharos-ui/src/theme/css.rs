@@ -492,6 +492,21 @@ mod tests {
     }
 
     #[test]
+    fn the_subtitle_demo_scales_like_the_player() {
+        use crate::native::playback::SubtitleSize;
+        for size in SubtitleSize::ALL {
+            if size == SubtitleSize::Medium {
+                continue;
+            }
+            let attr = format!("[data-subtitle-size=\"{}\"]", size.as_str());
+            let player = rule(SHEET, &format!(":root{attr}"));
+            let demo = rule(SHEET, &format!(".pharos-whats-new-subs{attr}"));
+            assert_eq!(player.trim(), demo.trim(), "{}", size.as_str());
+        }
+        assert!(rule(SHEET, ".pharos-whats-new-cue").contains("var(--pharos-subtitle-scale)"));
+    }
+
+    #[test]
     fn the_sheet_uses_no_pre_010_variable() {
         const OLD_VARS: &[&str] = &[
             "--bg)",
