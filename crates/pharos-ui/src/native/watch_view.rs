@@ -277,15 +277,18 @@ pub fn WatchView(
                     onmousedown: move |evt: MouseEvent| shortcuts.mouse_down(&evt),
                     onplaying: move |_| on_media.call(MediaEvent::Playing),
                     onpause: move |_| on_media.call(MediaEvent::Pause),
+                    onseeking: move |_| on_media.call(MediaEvent::Changed),
                     onseeked: move |_| on_media.call(MediaEvent::Seeked),
                     ontimeupdate: move |_| on_media.call(MediaEvent::TimeUpdate),
                     onended: move |_| on_media.call(MediaEvent::Ended),
                     onvolumechange: move |_| on_media.call(MediaEvent::Changed),
                     ondurationchange: move |_| on_media.call(MediaEvent::Changed),
                     onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
+                    onloadeddata: move |_| on_media.call(MediaEvent::Changed),
                     onwaiting: move |_| on_media.call(MediaEvent::Waiting),
                     onstalled: move |_| on_media.call(MediaEvent::Waiting),
                     oncanplay: move |_| on_media.call(MediaEvent::CanPlay),
+                    oncanplaythrough: move |_| on_media.call(MediaEvent::Changed),
                     for (id, t) in text_tracks {
                         track {
                             key: "{id}",
@@ -295,6 +298,17 @@ pub fn WatchView(
                             srclang: "{t.language}",
                             label: track_label(&t, 0),
                         }
+                    }
+                }
+                if media.loading {
+                    div {
+                        class: "pharos-watch-loading",
+                        role: "status",
+                        aria_live: "polite",
+                        "data-loading": "true",
+                        span { class: "pharos-watch-spinner", aria_hidden: "true" }
+                        span { class: "pharos-watch-loading-label", "Loading" }
+                        span { class: "pharos-watch-loading-caption", "Waiting for the server…" }
                     }
                 }
                 div { class: "pharos-watch-top",
@@ -1079,6 +1093,22 @@ mod tests {
             "toast inside the top bar: {html}"
         );
         assert!(!render_group(true, false, None).contains("pharos-activity-toast"));
+    }
+
+    #[test]
+    fn the_loading_overlay_shows_outside_the_chrome_only_while_loading() {
+        assert!(!render(controls()).contains("pharos-watch-loading"));
+        let mut c = controls();
+        c.media.loading = true;
+        let html = render(c);
+        let loading = html
+            .find(r#"<div class="pharos-watch-loading""#)
+            .expect("loading overlay rendered");
+        let top = html.find(r#"class="pharos-watch-top""#).expect("top bar");
+        assert!(loading < top, "{html}");
+        assert!(html.contains(r#"data-loading="true""#), "{html}");
+        assert!(html.contains("Loading"), "{html}");
+        assert!(html.contains("Waiting for the server…"), "{html}");
     }
 
     #[test]
