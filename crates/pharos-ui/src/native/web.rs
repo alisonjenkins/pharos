@@ -159,6 +159,12 @@ pub async fn sleep_ms(ms: u32) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+pub fn set_title(title: &str) {
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        document.set_title(title);
+    }
+}
+
 pub fn current_path() -> String {
     web_sys::window()
         .and_then(|w| w.location().pathname().ok())
