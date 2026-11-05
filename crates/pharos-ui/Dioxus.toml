@@ -4,7 +4,9 @@ name = "pharos-ui"
 android_manifest = "android/AndroidManifest.xml"
 
 [web.app]
-# title lives in index.html (setting it here too double-renders it).
+# dx writes this into index.html's `{app_title}`; without the placeholder it
+# appends it to whatever title is there ("pharosdioxus | ⛺").
+title = "Pharos"
 default_platform = "web"
 # pharos serves the bundle under /ui/ (ADR-0038); this prefixes the URLs dx
 # writes into index.html and must match `route::MOUNT`.
