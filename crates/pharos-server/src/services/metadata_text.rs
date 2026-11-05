@@ -10,14 +10,23 @@
 
 use std::collections::HashMap;
 
+use crate::metadata_language::DescriptionLanguage;
+use crate::state::AppState;
 use pharos_core::{
     LocalizedText, MediaId, MediaItem, MediaKind, MetadataTranslationStore, PreferenceStore,
     SeriesMetadata, TranslationOwner, UserId,
 };
-use pharos_jellyfin_api::dto::UserConfigurationDto;
 
-use crate::metadata_language::DescriptionLanguage;
-use crate::state::AppState;
+/// The stored `DescriptionLanguagePreference`, read on its own: a field the
+/// typed configuration would reject (a `null` where it wants a list, say)
+/// must not lose a valid language setting. Missing or not a string is "".
+fn stored_preference(raw: &str) -> Result<String, serde_json::Error> {
+    let v: serde_json::Value = serde_json::from_str(raw)?;
+    Ok(v.get("DescriptionLanguagePreference")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
 
 /// The description language `user` picked. A missing or unreadable
 /// configuration is the default: a corrupt blob must not hide a page.
@@ -26,8 +35,8 @@ pub async fn description_language<S: PreferenceStore>(
     user: UserId,
 ) -> DescriptionLanguage {
     match store.get_user_configuration(user).await {
-        Ok(Some(raw)) => match serde_json::from_str::<UserConfigurationDto>(&raw) {
-            Ok(c) => DescriptionLanguage::parse(&c.description_language_preference),
+        Ok(Some(raw)) => match stored_preference(&raw) {
+            Ok(p) => DescriptionLanguage::parse(&p),
             Err(e) => {
                 tracing::warn!(user.id = %user, error = %e, "user configuration does not parse; descriptions use the default language");
                 DescriptionLanguage::Default
@@ -66,11 +75,8 @@ pub async fn language_setting<S: PreferenceStore>(
         .await
         .map_err(|e| e.to_string())?;
     Ok(raw
-        .and_then(|r| serde_json::from_str::<UserConfigurationDto>(&r).ok())
-        .map(|c| {
-            canonical_setting(&c.description_language_preference)
-                .unwrap_or(c.description_language_preference)
-        })
+        .and_then(|r| stored_preference(&r).ok())
+        .map(|p| canonical_setting(&p).unwrap_or(p))
         .unwrap_or_default())
 }
 
@@ -424,6 +430,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(language_setting(&s, uid).await.unwrap(), "fra");
+        // A field the typed configuration would reject does not lose a valid
+        // language setting.
+        s.set_user_configuration(
+            uid,
+            r#"{"DescriptionLanguagePreference":"fra","OrderedViews":null}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(language_setting(&s, uid).await.unwrap(), "fra");
+        assert!(matches!(
+            description_language(&s, uid).await,
+            DescriptionLanguage::Code(c) if c == "fra"
+        ));
         set_language_setting(&s, uid, "OriginalLanguage")
             .await
             .unwrap();
