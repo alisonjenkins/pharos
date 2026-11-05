@@ -1259,6 +1259,12 @@ body:has(.pharos-stage.is-full) .pharos-error {
   font-size: calc(var(--pharos-subtitle-scale) * max(14px, min(2.8cqw, 5vh)));
   background: rgb(0 0 0 / 0.4); /* not themed: subtitles sit on the video, whose colours no theme sets */
 }
+/* The non-native player's full screen button puts the video itself in the
+   top layer, out of its `.pharos-player` container, so its cues size
+   against the viewport then. */
+.pharos-cues:fullscreen::cue {
+  font-size: calc(var(--pharos-subtitle-scale) * max(14px, min(2.8vw, 5vh)));
+}
 @supports selector(::-webkit-media-text-track-display) {
   .pharos-video::cue,
   .pharos-cues::cue {

@@ -614,10 +614,12 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
 }
 
 /// Where the `<video>` `video_id`'s cues are laid out now: the width a cue
-/// of `size` 100 spans (the video's) and the cue font size (`cue_font_px`)
-/// from the width CSS resolves `cqw` against (the enclosing
-/// `.pharos-player`, else the video), the viewport's height and the
-/// `--pharos-subtitle-scale` the Subtitle size choice sets.
+/// of `size` 100 spans (the picture's: `.pharos-video` is `object-fit:
+/// contain`, so a letterboxed picture is narrower than its element) and the
+/// cue font size (`cue_font_px`) from the width CSS resolves `cqw` against
+/// (the enclosing `.pharos-player`, else the video; the viewport while the
+/// video itself is full screen, as pharos.css sizes it then), the viewport's
+/// height and the `--pharos-subtitle-scale` the Subtitle size choice sets.
 #[derive(Clone, Copy)]
 struct CueBox {
     width: f64,
@@ -638,17 +640,41 @@ fn cue_box_for(video_id: &str) -> CueBox {
     else {
         return none;
     };
-    let width = video.get_bounding_client_rect().width();
-    let container = video
-        .closest(".pharos-player")
-        .ok()
-        .flatten()
-        .map_or(width, |p| p.get_bounding_client_rect().width());
+    let rect = video.get_bounding_client_rect();
+    let natural = |key: &str| {
+        js_sys::Reflect::get(&video, &key.into())
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+    };
+    let (picture_w, picture_h) = (natural("videoWidth"), natural("videoHeight"));
+    let width = if picture_w > 0.0 && picture_h > 0.0 {
+        rect.width().min(rect.height() * picture_w / picture_h)
+    } else {
+        rect.width()
+    };
     let height = window
         .inner_height()
         .ok()
         .and_then(|h| h.as_f64())
         .unwrap_or(0.0);
+    let full_screen = window
+        .document()
+        .and_then(|d| d.fullscreen_element())
+        .is_some_and(|e| e.id() == video_id);
+    let container = if full_screen {
+        window
+            .inner_width()
+            .ok()
+            .and_then(|w| w.as_f64())
+            .unwrap_or(rect.width())
+    } else {
+        video
+            .closest(".pharos-player")
+            .ok()
+            .flatten()
+            .map_or(rect.width(), |p| p.get_bounding_client_rect().width())
+    };
     let scale = window
         .document()
         .and_then(|d| d.document_element())
