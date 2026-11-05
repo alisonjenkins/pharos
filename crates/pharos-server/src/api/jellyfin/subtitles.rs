@@ -104,7 +104,149 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     .route(
         "/videos/{id}/subtitles/{stream_index}/images/{n}.png",
         web::get().to(image_subtitle_png),
+    )
+    // Spec 026 — an embedded font cut to the glyphs one subtitle track draws,
+    // for the native player's ASS renderer.
+    .route(
+        "/videos/{id}/subtitles/{stream_index}/fonts/{n}",
+        web::get().to(subtitle_font),
     );
+}
+
+/// The font attachment `n` (its stream index), subset to the glyphs the
+/// subtitle at `stream_index` draws (026 FR-010, V488). The whole font when
+/// it cannot be subset, counted as `outcome="whole"`.
+async fn subtitle_font(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    path: web::Path<(String, u32, u32)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    use crate::services::font_subset::{
+        ass_codepoints, font_mime, is_font_attachment, subset, FONT_SUBSET_VERSION,
+    };
+    let (id_str, stream_index, n) = path.into_inner();
+    bearer(&state, &req, &id_str, "subtitle_font").await?;
+    let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
+        .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
+    let item =
+        super::media_source::load_named(&state, super::media_source::Route::Subtitles, id, None)
+            .await?;
+    let Some(attachment) = item
+        .probe
+        .attachments
+        .iter()
+        .find(|a| a.stream_index == n && is_font_attachment(a))
+    else {
+        return Err(error::ErrorNotFound("no font attachment at that index"));
+    };
+    let sidecar_base = sidecar_base_index(&item.probe);
+    let script_mtime = if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
+        let sidecars = discover_sidecars(&item.path).await;
+        let Some((sidecar, _)) = sidecars.get(offset) else {
+            return Err(error::ErrorNotFound("no sidecar at that index"));
+        };
+        mtime_secs(sidecar).await
+    } else {
+        let Some(track) = item
+            .probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.stream_index == stream_index)
+        else {
+            return Err(error::ErrorNotFound("no subtitle stream at that index"));
+        };
+        let codec = track.codec.as_deref().unwrap_or("");
+        if is_image_subtitle_codec(codec) {
+            return Err(error::ErrorUnsupportedMediaType(format!(
+                "{codec} is an image subtitle; it has no fonts"
+            )));
+        }
+        mtime_secs(&item.path).await
+    };
+    let respond = |body: Vec<u8>, outcome: &'static str| {
+        metrics::counter!("pharos_subtitle_font_total", "outcome" => outcome).increment(1);
+        tracing::debug!(
+            media.id = id,
+            subtitle = stream_index,
+            font = n,
+            outcome,
+            bytes = body.len(),
+            "subtitle font served"
+        );
+        HttpResponse::Ok()
+            .content_type(font_mime(attachment))
+            .insert_header((header::CACHE_CONTROL, "private, max-age=300"))
+            .insert_header((header::CONTENT_SECURITY_POLICY, ATTACHMENT_CSP))
+            .body(body)
+    };
+
+    let media_mtime = mtime_secs(&item.path).await;
+    let dir = state.subtitles.as_ref().and_then(|c| {
+        c.font_dir(
+            &item.path,
+            media_mtime,
+            stream_index,
+            script_mtime,
+            FONT_SUBSET_VERSION,
+        )
+    });
+    let cached = dir.as_ref().map(|d| d.join(n.to_string()));
+    if let Some(file) = &cached {
+        if let Ok(body) = tokio::fs::read(file).await {
+            return Ok(respond(body, "cached"));
+        }
+    }
+
+    let script = ass_script(&state, &item, stream_index).await?;
+    let Some(attachments) = state.images.as_ref() else {
+        return Err(error::ErrorNotFound("no attachment cache"));
+    };
+    let indices: Vec<u32> = item
+        .probe
+        .attachments
+        .iter()
+        .map(|a| a.stream_index)
+        .collect();
+    let extracted = attachments
+        .ensure_all_attachments(id, &item.path, &indices)
+        .await
+        .map_err(|e| error::ErrorNotFound(format!("attachment: {e}")))?;
+    let font: std::sync::Arc<[u8]> = tokio::fs::read(extracted.join(n.to_string()))
+        .await
+        .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?
+        .into();
+    let codepoints = ass_codepoints(&String::from_utf8_lossy(&script));
+    let cut = {
+        let font = std::sync::Arc::clone(&font);
+        tokio::task::spawn_blocking(move || subset(&font, &codepoints)).await
+    };
+    let cut = match cut {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            tracing::warn!(media.id = id, subtitle = stream_index, font = n, file = ?attachment.filename, error = %e, "subtitle font not subset; serving it whole");
+            return Ok(respond(font.to_vec(), "whole"));
+        }
+        Err(e) => {
+            tracing::warn!(media.id = id, subtitle = stream_index, font = n, file = ?attachment.filename, error = %e, "subsetter panicked; serving the font whole");
+            return Ok(respond(font.to_vec(), "whole"));
+        }
+    };
+    if let (Some(dir), Some(file)) = (&dir, &cached) {
+        // Temp file then rename, so a concurrent reader never sees half a font.
+        let tmp = dir.join(format!("{n}.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let stored = async {
+            tokio::fs::create_dir_all(dir).await?;
+            tokio::fs::write(&tmp, &cut).await?;
+            tokio::fs::rename(&tmp, file).await
+        }
+        .await;
+        if let Err(e) = stored {
+            tracing::warn!(dir = %dir.display(), error = %e, "could not cache a subset font");
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+    }
+    Ok(respond(cut, "subset"))
 }
 
 /// The manifest of an image subtitle track, its `file` names rewritten to
@@ -365,7 +507,7 @@ const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
 
 /// Font mimetypes Matroska muxers write. Only these are served inline,
 /// for SubtitlesOctopus; anything else is a download (V195).
-fn is_font(mime: &str) -> bool {
+pub(crate) fn is_font(mime: &str) -> bool {
     let mime = mime
         .split(';')
         .next()

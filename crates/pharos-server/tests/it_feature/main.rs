@@ -13,4 +13,5 @@ mod jellyfin_feature_metadata;
 mod jellyfin_feature_user_policy;
 mod playback_access;
 mod playlists;
+mod subtitle_fonts;
 mod thin_endpoints;
