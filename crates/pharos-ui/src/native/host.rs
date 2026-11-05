@@ -52,10 +52,6 @@ pub fn current_path() -> String {
     "/".into()
 }
 
-pub fn current_search() -> String {
-    String::new()
-}
-
 pub fn push(_path: &str) {}
 
 pub fn reload() {}
@@ -242,6 +238,26 @@ pub fn tile_in_view(_at: u32) -> bool {
 
 pub fn scroll_to_tile(_at: u32) -> bool {
     false
+}
+
+pub fn scroll_to_top() {}
+
+pub fn tile_top(_at: u32) -> Option<f64> {
+    None
+}
+
+pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
+    false
+}
+
+pub fn current_search() -> String {
+    String::new()
+}
+
+pub struct ScrollWatch;
+
+pub fn on_scroll_settled(_on_settled: impl FnMut() + 'static) -> ScrollWatch {
+    ScrollWatch
 }
 
 pub fn center_child(_id: &str, _at: u32) -> bool {
