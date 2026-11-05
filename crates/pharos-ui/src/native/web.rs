@@ -1232,7 +1232,7 @@ const SCROLL_SETTLE_MS: i32 = 150;
 pub struct ScrollWatch {
     listener: Closure<dyn FnMut(web_sys::Event)>,
     pending: Rc<Cell<Option<i32>>>,
-    settled: Rc<Closure<dyn FnMut()>>,
+    _settled: Rc<Closure<dyn FnMut()>>,
 }
 
 impl Drop for ScrollWatch {
@@ -1242,10 +1242,11 @@ impl Drop for ScrollWatch {
                 "scroll",
                 self.listener.as_ref().unchecked_ref(),
             );
+            // A settle still pending is dropped, not run: leaving through a
+            // link scrolls the page to the top before the grid goes, so the
+            // place read now would be that top, not where the viewer was.
             if let Some(timer) = self.pending.take() {
                 window.clear_timeout_with_handle(timer);
-                let settled: &js_sys::Function = (*self.settled).as_ref().unchecked_ref();
-                let _ = settled.call0(&JsValue::NULL);
             }
         }
     }
@@ -1289,7 +1290,7 @@ pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch 
     ScrollWatch {
         listener,
         pending,
-        settled,
+        _settled: settled,
     }
 }
 
