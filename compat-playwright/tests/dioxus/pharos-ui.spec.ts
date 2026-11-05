@@ -1806,9 +1806,12 @@ test.describe("pharos Dioxus UI", () => {
             paused: v.paused,
             volume: v.volume,
             muted: v.muted,
-            showing: Array.from(v.textTracks)
-              .filter((t) => t.mode === "showing")
-              .map((t) => ({ id: t.id, cues: t.cues?.length ?? 0 })),
+            // Loaded tracks: "showing" is the browser drawing the cues; "hidden"
+            // is pharos-subs drawing them on a canvas (spec 026), which falls
+            // back to "showing" where WebGL2 is missing.
+            active: Array.from(v.textTracks)
+              .filter((t) => t.mode !== "disabled")
+              .map((t) => ({ id: t.id, mode: t.mode, cues: t.cues?.length ?? 0 })),
           };
         });
       await expect.poll(async () => (await media()).duration, { timeout: 30_000 }).toBeGreaterThan(0);
@@ -1821,17 +1824,27 @@ test.describe("pharos Dioxus UI", () => {
       const before = page.url();
       await picker.selectOption(option!);
       await expect
-        .poll(async () => (await media()).showing, { timeout: 15_000 })
+        .poll(async () => (await media()).active, { timeout: 15_000 })
         .toEqual([expect.objectContaining({ id: `pharos-sub-${option}` })]);
       await expect
-        .poll(async () => (await media()).showing[0]?.cues ?? 0, { timeout: 15_000 })
+        .poll(async () => (await media()).active[0]?.cues ?? 0, { timeout: 15_000 })
         .toBeGreaterThan(0);
       expect(page.url(), "a text subtitle does not leave the page").toBe(before);
+      // Drawn by pharos-subs: the track is hidden and a canvas follows the
+      // video. Otherwise the renderer fell back and the track shows.
+      const drawnByRust = (await media()).active[0]?.mode === "hidden";
+      if (drawnByRust) {
+        await expect(page.locator("canvas.pharos-rust-subs")).toBeAttached();
+      } else {
+        await expect(page.locator("canvas.pharos-rust-subs")).toHaveCount(0);
+      }
       // In a phone-wide player a cue that wraps ends a line above the
       // picture's edge too: lifted past -2 (V455).
       const viewport = page.viewportSize();
       await page.setViewportSize({ width: 360, height: 640 });
-      const lifted = await page.evaluate(async (id) => {
+      const lifted = drawnByRust
+        ? null
+        : await page.evaluate(async (id) => {
         const v = document.getElementById("pharos-video") as HTMLVideoElement;
         const track = Array.from(v.textTracks).find((t) => t.id === id)!;
         const cue = new VTTCue(
@@ -1847,10 +1860,11 @@ test.describe("pharos Dioxus UI", () => {
         track.removeCue(cue);
         return line;
       }, `pharos-sub-${option}`);
-      expect(lifted).toBeLessThanOrEqual(-3);
+      if (!drawnByRust) expect(lifted).toBeLessThanOrEqual(-3);
       if (viewport) await page.setViewportSize(viewport);
       await picker.selectOption("off");
-      await expect.poll(async () => (await media()).showing).toEqual([]);
+      await expect.poll(async () => (await media()).active).toEqual([]);
+      await expect(page.locator("canvas.pharos-rust-subs")).toHaveCount(0);
 
       // The chrome fades soon after the last activity while playing, even
       // with a track just picked or a control focused by a key press (B430).
