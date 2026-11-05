@@ -120,16 +120,6 @@ pub trait FfmpegBackend: Send + Sync {
         src: &'a Path,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, BackendError>> + Send + 'a>>;
 
-    /// P46 — JPEG → WebP / AVIF transcode for the image format
-    /// query. `target_ext` is one of `"webp"` or `"avif"`; output
-    /// bytes are written to `out`.
-    fn transcode_image<'a>(
-        &'a self,
-        src: &'a Path,
-        target_ext: &'a str,
-        out: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>>;
-
     /// P42 — sample the source's audio stream into `target_bins`
     /// RMS-dB readings. Returns a `Vec<f32>` of length `target_bins`
     /// (zero-padded on short reads); callers convert dB → linear.
