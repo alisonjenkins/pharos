@@ -903,10 +903,12 @@ where
 /// is only the old matcher's answer; fed back to [`resolve`] it would skip the
 /// search, keep the show a re-match exists to replace, and be recorded as an
 /// NFO id that no later re-admission reaches. An id that differs from the
-/// stamped match came from local data and is kept.
+/// stamped match came from local data and is kept. Only an episode's: the
+/// re-admission ([`TV_MATCH_VERSION`]) is for shows, so a movie's TTL
+/// refresh keeps fetching the record it matched instead of searching again.
 fn trusted_provider_ids(item: &MediaItem) -> ProviderIds {
     let mut ids = item.metadata.provider_ids.clone();
-    if item.match_source.as_deref() != Some("search") {
+    if item.kind != MediaKind::Episode || item.match_source.as_deref() != Some("search") {
         return ids;
     }
     let stamped = item.match_external_id.as_deref();
@@ -2957,6 +2959,7 @@ mod tests {
     #[test]
     fn a_provider_id_from_local_data_outlives_a_search_match() {
         let mut item = MediaItem {
+            kind: MediaKind::Episode,
             match_provider: Some("tvdb".into()),
             match_external_id: Some("374456".into()),
             match_source: Some("search".into()),
@@ -2971,5 +2974,21 @@ mod tests {
         item.match_source = Some("nfo_id".into());
         item.metadata.provider_ids.tvdb = Some("374456".into());
         assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("374456"));
+    }
+
+    /// The show matcher's re-admission does not reach movies, so a movie's
+    /// TTL refresh fetches the record its search matched rather than
+    /// searching again. Disarm check: dropping the kind guard fails this.
+    #[test]
+    fn a_movies_searched_id_is_kept_for_its_refresh() {
+        let mut item = MediaItem {
+            kind: MediaKind::Movie,
+            match_provider: Some("tmdb".into()),
+            match_external_id: Some("603".into()),
+            match_source: Some("search".into()),
+            ..MediaItem::default()
+        };
+        item.metadata.provider_ids.tmdb = Some("603".into());
+        assert_eq!(trusted_provider_ids(&item).tmdb.as_deref(), Some("603"));
     }
 }
