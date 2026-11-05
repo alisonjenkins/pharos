@@ -13,3 +13,4 @@ mod media_segments;
 mod probe_roundtrip;
 mod put_batch;
 mod sqlite_store;
+mod whats_new_migration;
