@@ -2,6 +2,8 @@
 //! both wires (B360/V300).
 
 use pharos_api::pharos_capnp::{lyrics_result, session};
+use pharos_client::api::{ItemRef, LyricLine, LyricWord, Lyrics, NativeApi, PharosApi as _};
+use pharos_client::CallInfo;
 use pharos_core::{MediaItem, MediaKind, MediaStore as _, UserPolicy};
 use pharos_server::services::{library::DetailError, lyrics};
 
@@ -62,6 +64,12 @@ async fn native_lyrics_serve_sidecars_and_answer_nothing_without_them() {
     put_song(&fx, 401, dir.path().join("plain.mp3")).await;
     std::fs::write(dir.path().join("plain.txt"), "Verse one\n\nVerse two\n").unwrap();
     put_song(&fx, 402, dir.path().join("bare.mp3")).await;
+    put_song(&fx, 403, dir.path().join("enhanced.mp3")).await;
+    std::fs::write(
+        dir.path().join("enhanced.lrc"),
+        "[00:01.00]<00:01.00>Hello <00:01.50>world<00:02.20>\n",
+    )
+    .unwrap();
 
     let (client, _closed) = crate::revocation::connect(&server).await;
     let session = crate::revocation::signed_in(&client, &fx.admin_token).await;
@@ -73,6 +81,33 @@ async fn native_lyrics_serve_sidecars_and_answer_nothing_without_them() {
             "sidecar_lrc".to_owned(),
             vec![(1_500, "First".to_owned()), (4_000, "Second".to_owned())]
         )
+    );
+    let api = NativeApi::new(&session);
+    assert_eq!(
+        api.lyrics(&CallInfo::default(), ItemRef::Real(403))
+            .await
+            .unwrap(),
+        Lyrics {
+            synced: true,
+            lines: vec![LyricLine {
+                start_ms: 1_000,
+                text: "Hello world".to_owned(),
+                words: vec![
+                    LyricWord {
+                        at: 0,
+                        start_ms: 1_000,
+                    },
+                    LyricWord {
+                        at: 6,
+                        start_ms: 1_500,
+                    },
+                    LyricWord {
+                        at: 11,
+                        start_ms: 2_200,
+                    },
+                ],
+            }],
+        }
     );
     let (synced, source, lines) = wire_lyrics(&session, 401).await;
     assert!(!synced);
