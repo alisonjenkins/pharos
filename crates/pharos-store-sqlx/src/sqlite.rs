@@ -3165,6 +3165,26 @@ impl SeriesMetadataStore for SqliteStore {
             .collect())
     }
 
+    async fn readmit_searched_tv(&self) -> DomainResult<u64> {
+        let shows = sqlx::query(
+            "UPDATE series_metadata SET metadata_refreshed_at = NULL \
+             WHERE match_source IN ('search', 'none')",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?
+        .rows_affected();
+        let episodes = sqlx::query(
+            "UPDATE media_items SET metadata_refreshed_at = NULL \
+             WHERE kind = 'episode' AND match_source IN ('search', 'none')",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?
+        .rows_affected();
+        Ok(shows + episodes)
+    }
+
     async fn upsert_series_metadata(&self, meta: SeriesMetadata) -> DomainResult<()> {
         let genres = crate::string_list_json::encode(&meta.genres).unwrap_or_else(|| "[]".into());
         let studios = crate::string_list_json::encode(&meta.studios).unwrap_or_else(|| "[]".into());

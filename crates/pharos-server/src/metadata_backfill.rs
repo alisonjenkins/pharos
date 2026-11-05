@@ -239,6 +239,13 @@ where
             had_work: false,
         });
     }
+    if tvdb.is_some() || tmdb.is_some() {
+        // Non-fatal: a config store that cannot be read or written must not
+        // stop enrichment. The next pass tries again.
+        if let Err(e) = readmit_stale_tv_matches(store).await {
+            tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
+        }
+    }
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -963,6 +970,51 @@ fn upsert_art(
     } else {
         chosen.push((provider, art.clone()));
     }
+}
+
+/// Version of the show matcher ([`pharos_core::match_best`] over the TVDB and
+/// TMDB series searches). Bump it when a change would choose a different show
+/// for a search already answered, so the stored answers are re-asked.
+///
+/// 1 (B557): TVDB hits scored by their English translation and aliases, an
+/// exact name ahead of a prefix match, a franchise name to the original.
+pub(crate) const TV_MATCH_VERSION: u32 = 1;
+
+/// Key under which the [`TV_MATCH_VERSION`] that produced the stored show and
+/// episode search matches is recorded.
+const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
+
+/// Re-admit every searched show and episode once the matcher that chose them
+/// has changed. Unlike album art, an ABSENT record is stale too: every search
+/// match made before this key existed came from the matcher B557 replaced,
+/// which handed 29 of the deployed library's shows to a fan work, an abridged
+/// parody or the wrong entry of a franchise. A fresh install has no searched
+/// rows, so re-admitting there costs nothing. NFO and manual matches are not
+/// touched. One config read per pass once the versions agree.
+async fn readmit_stale_tv_matches<S>(store: &S) -> DomainResult<()>
+where
+    S: SeriesMetadataStore + pharos_store_sqlx::ServerConfigStore,
+{
+    let want = TV_MATCH_VERSION.to_string();
+    let have = store
+        .load_named_config(TV_MATCH_VERSION_KEY)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    if have.as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    let readmitted = store.readmit_searched_tv().await?;
+    tracing::info!(
+        readmitted,
+        from = have.as_deref().unwrap_or("none"),
+        to = want.as_str(),
+        "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+    );
+    store
+        .set_named_config(TV_MATCH_VERSION_KEY, &want)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    Ok(())
 }
 
 /// Key under which the album-art matcher version that produced the CURRENT
@@ -2785,5 +2837,58 @@ mod tests {
             need.is_empty(),
             "a none-matched show stays out of the eligible set until the TTL cutoff"
         );
+    }
+
+    /// B557 — the show matcher changed, so every show and episode it had
+    /// answered by search is asked again at once, not when the TTL expires.
+    /// NFO-sourced matches are the user's own and stay put.
+    #[tokio::test]
+    async fn a_new_show_matcher_re_admits_searched_shows_and_episodes_once() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 2, "Dragon Ball", "/tv/Dragon Ball").await;
+        s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
+            .await
+            .unwrap();
+        s.set_item_match(2, "tvdb", "76666", "nfo_id", None, NOW)
+            .await
+            .unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Dragon Ball".into(),
+            series_name: "Dragon Ball".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("374456".into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
+
+        readmit_stale_tv_matches(&s).await.unwrap();
+
+        let shows = s.series_needing_match(10, NOW - 1).await.unwrap();
+        assert_eq!(shows.len(), 1, "the searched show is eligible again");
+        let items: Vec<_> = s
+            .items_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(items, [1], "only the searched episode, not the NFO one");
+
+        // Recorded: the next pass re-admits nothing.
+        s.set_item_match(1, "tvdb", "76666", "search", Some(0.85), NOW)
+            .await
+            .unwrap();
+        readmit_stale_tv_matches(&s).await.unwrap();
+        assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
     }
 }
