@@ -173,6 +173,16 @@ pub fn on_key(_on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> KeyLis
     KeyListener
 }
 
+pub struct TrackSkips;
+
+pub fn on_track_skip(
+    _on_skip: impl FnMut(super::watch_view::Skip, &'static str) -> bool + 'static,
+) -> TrackSkips {
+    TrackSkips
+}
+
+pub fn offer_track_skips(_previous: bool, _next: bool) {}
+
 pub fn palette_keys() -> &'static str {
     "Ctrl+K"
 }
