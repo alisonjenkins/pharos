@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::{SubtitleSize, MAX_BITRATE_CHOICES};
+use super::playback::{LibraryTransition, SubtitleSize, MAX_BITRATE_CHOICES};
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -84,6 +84,8 @@ pub fn AppearanceView(
     on_max_quality: EventHandler<u64>,
     subtitle_size: SubtitleSize,
     on_subtitle_size: EventHandler<SubtitleSize>,
+    #[props(default)] library_transition: LibraryTransition,
+    #[props(default)] on_library_transition: EventHandler<LibraryTransition>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -158,6 +160,28 @@ pub fn AppearanceView(
                 }
                 p { id: "subtitle-size-help",
                     "Saved on this device."
+                }
+            }
+            fieldset { class: "pharos-library-transition",
+                legend { "Library transition" }
+                label { r#for: "library-transition", "How cards arrive when you open or switch libraries" }
+                select {
+                    id: "library-transition",
+                    aria_describedby: "library-transition-help",
+                    onchange: move |ev| {
+                        on_library_transition.call(LibraryTransition::parse(&ev.value()));
+                    },
+                    for fx in LibraryTransition::ALL {
+                        option {
+                            key: "{fx.as_str()}",
+                            value: "{fx.as_str()}",
+                            selected: fx == library_transition,
+                            "{fx.label()}"
+                        }
+                    }
+                }
+                p { id: "library-transition-help",
+                    "Saved on this device. Off whenever the system asks for reduced motion."
                 }
             }
             fieldset { class: "pharos-diagnostics",
@@ -592,6 +616,74 @@ mod tests {
             "{sel}"
         );
         assert!(html.contains("Saved on this device."), "{html}");
+    }
+
+    fn page_with_library_transition(fx: Option<LibraryTransition>) -> String {
+        render(move || {
+            rsx! {
+                AppearanceView {
+                    themes: Vec::new(),
+                    auto: false,
+                    editor: None,
+                    notice: None,
+                    diagnostics: false,
+                    diagnostics_key: 0,
+                    max_quality: 0,
+                    on_max_quality: |_| {},
+                    subtitle_size: SubtitleSize::default(),
+                    on_subtitle_size: |_| {},
+                    library_transition: fx.unwrap_or_default(),
+                    on_library_transition: |_| {},
+                    on_diagnostics: |_| {},
+                    on_pick: |_| {},
+                    on_auto: |_| {},
+                    on_customise: |_| {},
+                    on_edit_custom: |_| {},
+                    on_delete: |_| {},
+                    on_export: |_| {},
+                    on_import_file: |_| {},
+                    on_import_paste: |_| {},
+                    on_edit: |_| {},
+                    on_save: |_| {},
+                    on_cancel: |_| {},
+                }
+            }
+        })
+    }
+
+    fn library_transition_select(html: &str) -> &str {
+        let start = html.find("id=\"library-transition\"").unwrap_or(html.len());
+        let end = html[start..]
+            .find("</select>")
+            .map_or(html.len(), |e| start + e);
+        &html[start..end]
+    }
+
+    #[test]
+    fn library_transition_select_marks_only_the_stored_choice() {
+        let html = page_with_library_transition(Some(LibraryTransition::Matrix));
+        let sel = library_transition_select(&html);
+        assert!(!sel.is_empty(), "select missing: {html}");
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(
+            sel.contains("value=\"matrix\" selected") || sel.contains("selected=\"true\""),
+            "{sel}"
+        );
+        for fx in LibraryTransition::ALL {
+            assert!(sel.contains(fx.label()), "{} missing: {sel}", fx.label());
+        }
+        assert!(html.contains("reduced motion"), "{html}");
+    }
+
+    #[test]
+    fn library_transition_defaults_to_fade() {
+        let sel_html = page_with_library_transition(None);
+        let sel = library_transition_select(&sel_html);
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(
+            sel.contains("value=\"fade\" selected") || sel.contains("selected=\"true\""),
+            "{sel}"
+        );
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {
