@@ -4339,3 +4339,25 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   background: var(--px-color-accent);
   box-shadow: 0 0 0 2px var(--px-color-surface);
 }
+/* The controls effect demo: a small stand-in player whose chrome the sheet's
+   `data-overlay-fx` rules hide and bring back (V500). */
+.pharos-whats-new-player {
+  height: auto;
+  aspect-ratio: 16 / 9;
+  margin: 0.75rem 0;
+  border-radius: var(--px-radius);
+  background: linear-gradient(170deg, var(--px-color-surface-raised), var(--px-color-bg));
+  overflow: hidden;
+}
+.pharos-whats-new-player.is-idle {
+  cursor: auto;
+}
+.pharos-whats-new-player-title {
+  font-weight: 600;
+}
+.pharos-whats-new-player-bar {
+  display: block;
+  height: 0.35rem;
+  border-radius: 3px;
+  background: linear-gradient(to right, var(--px-color-accent) 40%, color-mix(in srgb, var(--px-color-fg) 30%, transparent) 40%);
+}

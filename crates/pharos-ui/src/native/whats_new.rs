@@ -19,7 +19,8 @@
 use dioxus::prelude::*;
 
 use super::appearance::ThemeCard;
-use super::playback::{LibraryTransition, SubtitleSize};
+use super::platform;
+use super::playback::{LibraryTransition, OverlayEffect, SubtitleSize};
 
 /// The pref holding the newest entry id the viewer has been shown.
 pub const SEEN_PREF: &str = "whats_new.seen";
@@ -40,6 +41,7 @@ pub enum Setting {
     Theme,
     SubtitleSize,
     LibraryTransition,
+    ControlsEffect,
 }
 
 impl Setting {
@@ -48,6 +50,7 @@ impl Setting {
             Setting::Theme => "Pick a theme",
             Setting::SubtitleSize => "Subtitle size",
             Setting::LibraryTransition => "Library card transitions",
+            Setting::ControlsEffect => "Controls effect",
         }
     }
 
@@ -56,6 +59,9 @@ impl Setting {
             Setting::Theme => "Colours for the whole app. The page changes as you pick.",
             Setting::SubtitleSize => "How big subtitles are drawn over a video.",
             Setting::LibraryTransition => "Pick how a library's cards arrive when you open it.",
+            Setting::ControlsEffect => {
+                "Pick how the player's controls hide while you watch, and come back when you move."
+            }
         }
     }
 }
@@ -137,6 +143,12 @@ pub const ENTRIES: &[Entry] = &[
         kind: Kind::Fix,
         title: "Up next on time",
         text: "Up next shows well before the end of an episode with no detected credits.",
+    },
+    Entry {
+        id: 10,
+        kind: Kind::Setting(Setting::ControlsEffect),
+        title: "Controls effect",
+        text: "Pick how the player's controls hide while you watch, and come back when you move.",
     },
 ];
 
@@ -339,6 +351,7 @@ pub struct Choices {
     pub theme_auto: bool,
     pub subtitle_size: SubtitleSize,
     pub library_transition: LibraryTransition,
+    pub overlay_effect: OverlayEffect,
 }
 
 /// A pick made on a setting's page.
@@ -348,6 +361,7 @@ pub enum Pick {
     ThemeAuto,
     SubtitleSize(SubtitleSize),
     LibraryTransition(LibraryTransition),
+    OverlayEffect(OverlayEffect),
 }
 
 /// The top bar's button that opens the dialog when it did not splash, or
@@ -567,6 +581,23 @@ fn SettingPage(
                         }
                     }
                 },
+                Setting::ControlsEffect => rsx! {
+                    ControlsDemo {}
+                    div {
+                        class: "pharos-whats-new-choices",
+                        role: "radiogroup",
+                        aria_label: "Controls effect",
+                        for fx in OverlayEffect::ALL {
+                            Choice {
+                                key: "{fx.as_str()}",
+                                value: fx.as_str(),
+                                label: fx.label(),
+                                checked: fx == choices.overlay_effect,
+                                on_pick: move |()| on_pick.call(Pick::OverlayEffect(fx)),
+                            }
+                        }
+                    }
+                },
             }
             p { class: "pharos-whats-new-help",
                 "Saved on this device. You can change it later in Appearance."
@@ -636,6 +667,40 @@ fn TransitionDemo(fx: LibraryTransition, replay: u32) -> Element {
         }
     };
     super::app::remount_on(&key, tiles)
+}
+
+/// How long the controls demo holds each state: long enough to see the
+/// controls at rest before the next hide, and every effect is over in 300 ms.
+const DEMO_HOLD_MS: u32 = 1_400;
+
+/// A stand-in player whose top strip and control bar hide and come back on
+/// a loop. It is a `.pharos-player` with the real chrome classes, so the
+/// sheet's controls effect rules (V491), which follow `data-overlay-fx` on
+/// `<html>`, run on it exactly as on a video (V500).
+#[component]
+fn ControlsDemo() -> Element {
+    let mut idle = use_signal(|| false);
+    use_future(move || async move {
+        loop {
+            platform::sleep_ms(DEMO_HOLD_MS).await;
+            idle.toggle();
+        }
+    });
+    let class = if idle() {
+        "pharos-player pharos-whats-new-player is-idle"
+    } else {
+        "pharos-player pharos-whats-new-player"
+    };
+    rsx! {
+        div { class, aria_hidden: "true",
+            div { class: "pharos-watch-top",
+                span { class: "pharos-whats-new-player-title", "Episode 1" }
+            }
+            div { class: "pharos-controls",
+                span { class: "pharos-whats-new-player-bar" }
+            }
+        }
+    }
 }
 
 /// The changelog page: features first, then fixes, each newest first.
@@ -716,7 +781,10 @@ mod tests {
     fn an_existing_account_sees_new_settings_then_the_newest_notes() {
         let unseen = Unseen::since(Some(0));
         assert_eq!(unseen.flow, Flow::WhatsNew);
-        assert_eq!(unseen.settings, vec![Setting::LibraryTransition]);
+        assert_eq!(
+            unseen.settings,
+            vec![Setting::LibraryTransition, Setting::ControlsEffect]
+        );
         assert!(!unseen.settings.contains(&Setting::Theme), "setup only");
         assert!(unseen.notes.len() <= MAX_NOTES);
         for pair in unseen.notes.windows(2) {
@@ -735,7 +803,7 @@ mod tests {
     #[test]
     fn only_entries_after_the_seen_id_show() {
         let unseen = Unseen::since(Some(1));
-        assert!(unseen.settings.is_empty());
+        assert_eq!(unseen.settings, vec![Setting::ControlsEffect]);
         assert!(unseen.notes.iter().all(|e| e.id > 1));
         assert!(!unseen.notes.is_empty());
     }
@@ -856,6 +924,7 @@ mod tests {
             theme_auto: false,
             subtitle_size: SubtitleSize::Large,
             library_transition: LibraryTransition::Warp,
+            overlay_effect: OverlayEffect::Burn,
         }
     }
 
@@ -925,6 +994,25 @@ mod tests {
         assert_eq!(html.matches("aria-checked=\"true\"").count(), 1, "{html}");
         assert!(
             html.contains("aria-checked=\"true\" data-choice=\"warp\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_controls_effect_page_demos_on_a_stand_in_player() {
+        let html = page(Some(0), at(Some(0), Page::Setting(Setting::ControlsEffect)));
+        assert!(html.contains("Controls effect"), "{html}");
+        // The sheet's controls effect rules match the demo by these classes.
+        for class in [
+            "pharos-player pharos-whats-new-player",
+            "pharos-watch-top",
+            "pharos-controls",
+        ] {
+            assert!(html.contains(class), "{class} missing: {html}");
+        }
+        assert_eq!(html.matches("aria-checked=\"true\"").count(), 1, "{html}");
+        assert!(
+            html.contains("aria-checked=\"true\" data-choice=\"burn\""),
             "{html}"
         );
     }
