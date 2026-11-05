@@ -1035,7 +1035,10 @@ async fn read_progress(out: &Path) -> Option<(u64, f64)> {
             _ => {}
         }
     }
-    Some((frames?, out_time_secs?))
+    // An encode that wrote no frame reports `out_time_us=N/A`. Reading that
+    // as "no report" waved a zero-frame segment through every check below
+    // and cached it, moof-less, as a 200 (B552); it is a report of nothing.
+    Some((frames?, out_time_secs.unwrap_or(0.0)))
 }
 
 /// `Some(reason)` when the produced segment carries less than it advertises.
@@ -8331,6 +8334,27 @@ mod tests {
         write_progress(&out, 144, 6.006).await;
         let got = read_progress(&out).await;
         assert_eq!(short_of_frames(got, &segment_transcode_opts(), false), None);
+    }
+
+    #[tokio::test]
+    async fn an_encode_that_wrote_no_frame_reports_zero_frames() {
+        // ffmpeg's final block for a window past the end of the picture: no
+        // frame, so no output time either.
+        let td = TempDir::new().unwrap();
+        let out = td.path().join("seg.mp4");
+        tokio::fs::write(
+            progress_sidecar_path(&out),
+            "frame=0\nfps=0.00\nbitrate=N/A\ntotal_size=810\nout_time_us=N/A\n\
+             out_time_ms=N/A\nout_time=N/A\nprogress=end\n",
+        )
+        .await
+        .unwrap();
+        let got = read_progress(&out).await;
+        assert_eq!(got, Some((0, 0.0)));
+        // The final window too: zero frames is a filler, never a short tail.
+        let why = short_of_frames(got, &segment_transcode_opts(), true)
+            .expect("a zero-frame window must be rejected");
+        assert!(why.contains("no video frames"), "{why}");
     }
 
     #[tokio::test]
