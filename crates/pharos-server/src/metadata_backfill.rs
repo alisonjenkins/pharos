@@ -1646,6 +1646,7 @@ mod tests {
                     id: id.to_string(),
                     title: title.to_string(),
                     year,
+                    aliases: Vec::new(),
                 })
                 .collect();
             self

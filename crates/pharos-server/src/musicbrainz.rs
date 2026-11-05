@@ -1456,6 +1456,7 @@ mod tests {
                 id: c.id.clone(),
                 title: c.title.clone(),
                 year: c.year,
+                aliases: Vec::new(),
             })
             .collect();
         let via_match_best = pharos_core::match_best(
