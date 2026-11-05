@@ -91,6 +91,10 @@ pub(crate) mod series_meta_row;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod ratings;
 
+/// Per-language provider text for shows and episodes (ADR-0062).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod translations;
+
 // JSON adapter for the Vec<String> metadata columns —
 // production_locations + trailers (T67). Same pattern.
 pub mod string_list_json;
