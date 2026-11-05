@@ -3082,6 +3082,7 @@ test.describe("pharos Dioxus UI song handover", () => {
         action,
       );
     const { next } = await playIntoQueuedSong(page, request, 0);
+    const first = new URL(page.url()).pathname;
     await expect.poll(() => handler("nexttrack")).toBe("function");
 
     // Focus on the page, not the player.
@@ -3117,8 +3118,14 @@ test.describe("pharos Dioxus UI song handover", () => {
       ).previoustrack(),
     );
     await expect.poll(() => skips.at(-1)).toBe("dir=previous source=media_session");
-    // Back on the first song, the system's next goes to the queued one again.
-    await expect(page).not.toHaveURL(new RegExp(`${next}$`), { timeout: 15_000 });
+    // Back on the first song, the system's next goes to the queued one again
+    // once that song's player is up and has offered it.
+    await expect(page).toHaveURL(new RegExp(`${first}$`), { timeout: 15_000 });
+    await expect
+      .poll(() => page.locator("#pharos-video").evaluate((a: HTMLMediaElement) => a.readyState), {
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
     await expect.poll(() => handler("nexttrack")).toBe("function");
     await page.evaluate(() =>
       (
