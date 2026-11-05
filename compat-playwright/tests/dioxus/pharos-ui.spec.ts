@@ -3062,10 +3062,16 @@ test.describe("pharos Dioxus UI song handover", () => {
         set(action, handler);
       };
     });
+    // Every skip a player took, `to=none` included, so a count sees an extra
+    // dispatch that found nowhere to go; `to` is checked separately.
     const skips: string[] = [];
+    const destinations: string[] = [];
     page.on("console", (m) => {
-      const skip = /^pharos: track skip (dir=\w+ source=\w+) item=\S+ to=(?!none(?:\s|$))\S+/.exec(m.text())?.[1];
-      if (skip) skips.push(skip);
+      const skip = /^pharos: track skip (dir=\w+ source=\w+) item=\S+ to=(\S+)/.exec(m.text());
+      if (skip) {
+        skips.push(skip[1]);
+        destinations.push(skip[2]);
+      }
     });
     const handler = (action: string) =>
       page.evaluate(
@@ -3112,6 +3118,7 @@ test.describe("pharos Dioxus UI song handover", () => {
     await expect.poll(() => skips.at(-1)).toBe("dir=previous source=keyboard");
     await page.waitForTimeout(500);
     expect(skips.slice(before)).toEqual(["dir=previous source=keyboard"]);
+    expect(destinations).not.toContain("none");
   });
 
   test("a crossfade plays the next song under the end of this one", async ({ page, request }) => {
