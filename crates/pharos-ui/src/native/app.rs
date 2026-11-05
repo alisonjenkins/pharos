@@ -43,7 +43,9 @@ use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::resume::{ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
-use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
+use super::stage::{
+    Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View, STAGE_ID,
+};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
@@ -1593,10 +1595,14 @@ fn StageView() -> Element {
         slots.push((key, handoff.from, Slot::Outgoing(handoff)));
     }
     let class = format!("pharos-stage is-{}", s.view.label());
-    let style = format!(
+    let mut style = format!(
         "--pharos-stage-x: {:.4}; --pharos-stage-y: {:.4};",
         s.spot.x, s.spot.y
     );
+    if let Some(w) = s.width {
+        style.push_str(&format!(" --pharos-stage-user-w: {w:.0}px;"));
+    }
+    let floating = s.view == View::Floating;
     rsx! {
         div { id: STAGE_ID, class, style,
             // Another item (the next episode) mounts a new playback rather
@@ -1608,6 +1614,9 @@ fn StageView() -> Element {
                     "inert": slot.hidden().then_some("true"),
                     WatchScreen { id, slot }
                 }
+            }
+            if floating {
+                StageGrip {}
             }
         }
     }
