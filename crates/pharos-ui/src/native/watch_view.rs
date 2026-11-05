@@ -379,8 +379,9 @@ pub fn WatchView(
                         ondurationchange: move |_| on_media.call(MediaEvent::Changed),
                         onloadedmetadata: move |_| on_media.call(MediaEvent::Changed),
                         onloadeddata: move |_| on_media.call(MediaEvent::Changed),
+                        // Not `stalled`: Chrome fires it under MSE whenever appends pause
+                        // for 3 s, while the video plays on.
                         onwaiting: move |_| on_media.call(MediaEvent::Waiting),
-                        onstalled: move |_| on_media.call(MediaEvent::Waiting),
                         oncanplay: move |_| on_media.call(MediaEvent::CanPlay),
                         oncanplaythrough: move |_| on_media.call(MediaEvent::Changed),
                         for (id, t) in text_tracks {

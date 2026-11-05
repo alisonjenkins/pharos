@@ -644,7 +644,7 @@ pub enum MediaEvent {
     /// Volume, duration or metadata changed: the controls redraw, nothing
     /// is reported.
     Changed,
-    /// Playback ran out of data to show (`waiting`, `stalled`). Not a
+    /// Playback ran out of data to show (`waiting`). Not a
     /// progress report; a group member tells the others it is buffering.
     Waiting,
     /// Enough data to play from the current position (`canplay`). Not a
