@@ -643,9 +643,12 @@ fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) ->
                         class: "pharos-seek-chapter",
                         style: "left: {percent(ch.start_ms, total)}%",
                         title: "{ch.name}",
+                        // A tick already played dims, so the ones ahead stand out.
+                        "data-passed": ch.start_ms <= c.media.position_ms,
                     }
                 }
             }
+            span { class: "pharos-seek-knob", style: "left: {played}%" }
             if let Some((at, time, chapter, thumb)) = hover {
                 div { class: "pharos-seek-preview", style: "left: {at}%",
                     if let Some(t) = thumb {
@@ -1122,6 +1125,21 @@ mod tests {
         );
     }
 
+    /// B569/V482: the knob rides the end of the fill, and a tick the video
+    /// has passed is marked so it dims.
+    #[test]
+    fn the_seek_bar_marks_passed_chapters_and_the_play_head() {
+        let mut c = controls();
+        c.media.position_ms = 600_000;
+        let html = render(c);
+        assert!(
+            html.contains(r#"class="pharos-seek-knob" style="left: 50%""#),
+            "{html}"
+        );
+        assert!(html.contains("data-passed=true"), "{html}");
+        assert!(!html.contains("data-passed=false"), "{html}");
+    }
+
     #[test]
     fn the_controls_offer_skip_tracks_and_chapters() {
         let html = render(controls());
@@ -1130,6 +1148,8 @@ mod tests {
         // One tick for "Act one" a quarter of the way along; none at 0.
         assert!(html.contains("left: 25%"), "{html}");
         assert_eq!(html.matches("pharos-seek-chapter\"").count(), 1, "{html}");
+        // V482: "Act one" lies ahead of 0:30, so its tick is not yet passed.
+        assert!(html.contains("data-passed=false"), "{html}");
         // Only the text subtitle becomes a <track>.
         assert!(
             html.contains(r#"id="pharos-sub-3""#) && !html.contains("pharos-sub-4"),
