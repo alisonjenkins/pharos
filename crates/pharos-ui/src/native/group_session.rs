@@ -33,6 +33,9 @@ pub const PING_EVERY_S: u64 = 30;
 pub const COMMAND_TIMEOUT_MS: u32 = 10_000;
 /// Clock re-sync cadence, and the `groupDrift` sample cadence.
 pub const SAMPLE_EVERY_S: u64 = 10;
+/// Playhead travel past a buffering report that proves the video plays
+/// again: two `timeupdate`s of real playback, more than a gap nudge moves it.
+pub const PLAYING_AGAIN_MS: u64 = 500;
 
 /// What the group shows the viewer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -518,6 +521,8 @@ struct Inner {
     tracker: DriftTracker,
     rate: f64,
     buffering_sent: bool,
+    /// Where the playhead was when buffering was reported.
+    buffering_at_ms: u64,
     /// When this member said ready, until the group's next play: the time it
     /// spent waiting on the others.
     ready_sent_ms: Option<i64>,
@@ -1320,6 +1325,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             // `held_waiting` stays set: the drift check keeps off a player
             // still waiting until `canplay` or `playing` clears it.
             inner.buffering_sent = true;
+            inner.buffering_at_ms = player.position_ms();
             (
                 inner.state.playlist_item_id.clone(),
                 player.position_ms(),
@@ -1364,8 +1370,26 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                         inner.held_waiting = true;
                     } else {
                         inner.buffering_sent = true;
+                        inner.buffering_at_ms = player.position_ms();
                         buffering = Some(true);
                     }
+                }
+                // A video can play on with no `canplay` or `playing` after a
+                // wait; the playhead moving is the recovery it never announced.
+                MediaEvent::TimeUpdate
+                    if inner.buffering_sent
+                        && !player.paused()
+                        && player.position_ms()
+                            >= inner.buffering_at_ms.saturating_add(PLAYING_AGAIN_MS) =>
+                {
+                    line = Some(format!(
+                        "pharos: group buffering ended reason=playhead_moved from_ms={} position_ms={}",
+                        inner.buffering_at_ms,
+                        player.position_ms()
+                    ));
+                    inner.buffering_sent = false;
+                    inner.held_waiting = false;
+                    buffering = Some(false);
                 }
                 MediaEvent::CanPlay | MediaEvent::Seeked | MediaEvent::Playing => {
                     if matches!(event, MediaEvent::CanPlay | MediaEvent::Playing) {
@@ -2191,6 +2215,53 @@ mod tests {
         rig.session.on_media(MediaEvent::Waiting);
         rig.env.settle();
         assert_eq!(calls_with(&rig, "buffering").len(), 1);
+    }
+
+    /// A wait the video recovers from with no `canplay` or `playing` still
+    /// ends: the group is not held paused while this member plays on.
+    #[test]
+    fn buffering_ends_once_the_playhead_moves_on_its_own() {
+        let rig = playing_rig();
+        rig.env.now.set(200_000);
+        rig.player.position.set(26_761);
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+
+        // Under the threshold: a gap nudge, not playback.
+        rig.player.position.set(27_000);
+        rig.session.on_media(MediaEvent::TimeUpdate);
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "buffering"), ["buffering(,26761,true)"]);
+
+        rig.player.position.set(27_261);
+        rig.session.on_media(MediaEvent::TimeUpdate);
+        rig.session.on_media(MediaEvent::TimeUpdate);
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "buffering"),
+            ["buffering(,26761,true)", "buffering(,27261,false)"]
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group buffering ended reason=playhead_moved from_ms=26761 position_ms=27261")
+                .len(),
+            1
+        );
+    }
+
+    /// The group's own freeze pauses the video; a paused playhead that
+    /// reports where it sits has not recovered.
+    #[test]
+    fn a_paused_video_does_not_end_buffering_by_time() {
+        let rig = playing_rig();
+        rig.env.now.set(200_000);
+        rig.player.position.set(26_761);
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.player.paused.set(true);
+        rig.player.position.set(40_000);
+        rig.session.on_media(MediaEvent::TimeUpdate);
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "buffering"), ["buffering(,26761,true)"]);
     }
 
     #[test]
