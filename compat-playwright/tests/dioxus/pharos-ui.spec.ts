@@ -1176,6 +1176,55 @@ test.describe("pharos Dioxus UI", () => {
     // B500: an episode row's tick, the season and the show each mark
     // watched and unwatched, and a part-watched episode can play from the
     // start instead of resuming.
+    test("the tab names the page, then Pharos", async ({ page, request }) => {
+      test.setTimeout(90_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-title-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+      const episodes = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Episode&Fields=SeriesId`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      const episode = (episodes.Items ?? []).find(
+        (i: { SeriesName?: string }) => i.SeriesName === "Another Show",
+      );
+      test.skip(!episode, "pharos has no seeded Another Show episode");
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await expect(page).toHaveTitle("Pharos");
+
+      await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
+      await expect(page).toHaveTitle("Another Show · Pharos", { timeout: 15_000 });
+      const nativeId = BigInt(`0x${episode.Id}`).toString();
+      await page.goto(`/ui/title/${nativeId}`);
+      await expect(page).toHaveTitle(/^.+ · Another Show · Pharos$/, { timeout: 15_000 });
+      const named = await page.title();
+      await page.goto(`/ui/watch/${nativeId}`);
+      await expect(page).toHaveTitle(named, { timeout: 15_000 });
+      await page.goto("/ui/settings/appearance");
+      await expect(page).toHaveTitle("Appearance · Pharos", { timeout: 15_000 });
+    });
+
     test("an episode, its season and its show mark watched, and play from start", async ({
       page,
       request,
