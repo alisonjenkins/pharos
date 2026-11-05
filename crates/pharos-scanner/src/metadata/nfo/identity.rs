@@ -67,6 +67,9 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
             );
         }
     }
+    // An episode with no NFO of its own (none, unreadable) shares the show
+    // NFO's verdict: a `<stem>-thumb` beside it came from the same scrape.
+    out.episode = out.show;
     let episode_path = sibling_nfo(req.path);
     if let Some(path) = episode_path
         .as_deref()
