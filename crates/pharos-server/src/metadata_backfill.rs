@@ -684,7 +684,7 @@ where
     // Fold the record onto the item (local data always wins — apply_enrichment
     // only fills gaps), then stamp the matched provider id if we hadn't one.
     let counts = store.item_entity_counts(item.id).await?;
-    let moved = reidentified(&item, &enriched);
+    let moved = reidentified(&item, &enriched) || nfo_names_another(&item, &enriched);
     if moved {
         adopt_reidentified(&mut item, &enriched);
     }
@@ -913,6 +913,39 @@ fn reidentified(item: &MediaItem, enriched: &EnrichedMetadata) -> bool {
         .as_ref()
         .and_then(|s| Some((s.season_number?, s.episode_number?)));
     matches!((file, enriched.episode_number), (Some(f), Some(r)) if f != r)
+}
+
+/// Lowest [`pharos_core::title_similarity`] at which two episode names are
+/// the same episode's (the bar `tvdb::pick_episode` places a record by).
+const SAME_EPISODE_NAME: f32 = 0.9;
+
+/// B588 — whether the stored (NFO) title names a NEIGHBOUR of the record
+/// the filename's episode name matches. Jellyfin wrote some NFOs in an order
+/// shifted from both the files and the provider's, so the record and the
+/// file agree (whatever number the record is at) and only the NFO's text and
+/// still are another episode's. A stored title that is this episode's name
+/// in another language matches no neighbour, so it stays.
+fn nfo_names_another(item: &MediaItem, enriched: &EnrichedMetadata) -> bool {
+    let (Some(name), Some(record)) = (episode_name(item), enriched.title.as_deref()) else {
+        return false;
+    };
+    let same = |a: &str, b: &str| pharos_core::title_similarity(a, b) >= SAME_EPISODE_NAME;
+    let another = same(&name, record)
+        && !same(&item.title, record)
+        && enriched
+            .neighbour_titles
+            .iter()
+            .any(|n| same(&item.title, n));
+    if another {
+        tracing::info!(
+            media.id = item.id,
+            file_name = %name,
+            stored_title = %item.title,
+            record_title = record,
+            "T9 metadata backfill: the record matches the filename's episode, the NFO names another"
+        );
+    }
+    another
 }
 
 /// B570 — take a re-identified episode's text from its record. Local data
@@ -3210,6 +3243,7 @@ mod tests {
             title: Some("The Naked Now".into()),
             overview: Some("An infection.".into()),
             episode_number: Some(number),
+            neighbour_titles: vec!["Encounter at Farpoint".into(), "Code of Honor".into()],
             artwork: vec![RemoteArt {
                 role: ArtworkRole::Primary,
                 url: "https://artworks.thetvdb.com/naked-now.jpg".into(),
@@ -3259,15 +3293,80 @@ mod tests {
         );
     }
 
-    /// B570 — a record at the file's own number leaves the NFO's text and
-    /// still alone, however its name reads.
+    /// B588 — a record at the file's own number that is the episode the
+    /// filename names replaces an NFO that names another: the NFO, not the
+    /// provider, was written in a shifted numbering.
+    #[tokio::test]
+    async fn a_record_named_as_the_file_replaces_an_nfo_naming_another() {
+        let s = store().await;
+        let item = put_shifted_episode(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail(naked_now((1, 3)))
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let ep = s.get(900_570).await.unwrap();
+        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
+        let art = s.artwork_for(900_570).await.unwrap();
+        assert!(
+            art.iter()
+                .any(|(role, source, _)| role == "Thumb" && source == "tvdb"),
+            "{art:?}"
+        );
+    }
+
+    /// B588 — an NFO title that is this episode's name in another language
+    /// names no neighbour, so it stays.
+    #[tokio::test]
+    async fn an_nfo_title_in_another_language_stays() {
+        let s = store().await;
+        let mut item = put_shifted_episode(&s).await;
+        item.title = "Le Maintenant Nu".into();
+        s.put(item.clone()).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail(naked_now((1, 3)))
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.get(900_570).await.unwrap().title, "Le Maintenant Nu");
+    }
+
+    /// B570, B588 — a record at the file's own number that names neither the
+    /// file's episode leaves the NFO's text and still alone.
     #[tokio::test]
     async fn an_episode_on_its_own_number_keeps_its_local_text_and_still() {
         let s = store().await;
         let item = put_shifted_episode(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 3)))
+            .with_detail(EnrichedMetadata {
+                title: Some("Le Maintenant Nu".into()),
+                ..naked_now((1, 3))
+            })
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
