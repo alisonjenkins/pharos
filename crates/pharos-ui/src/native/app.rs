@@ -978,15 +978,26 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| MixCtx(mix));
     mixes::use_top_up(api, queue, mix);
     use_context_provider(|| {
+        let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
         MarkPlayed(EventHandler::new(move |(id, played): (ItemRef, bool)| {
             let Some(api) = api.peek().clone() else {
                 return;
             };
+            // One mark per item at a time: a second click before the reload
+            // would record a second play.
+            if !marking.borrow_mut().insert(id) {
+                platform::info(&format!(
+                    "pharos: mark {id} played={played} skipped: one in flight"
+                ));
+                return;
+            }
+            let marking = Rc::clone(&marking);
             spawn(async move {
                 let result = api.set_played(&call("mark", "played"), id, played).await;
                 if let Err(e) = settle(machine, result) {
                     platform::warn(&format!("pharos: marking {id} played={played} failed: {e}"));
                 }
+                marking.borrow_mut().remove(&id);
                 // Reload either way: a season that failed part way through
                 // has some episodes marked, and the screen shows what is stored.
                 marks += 1;
