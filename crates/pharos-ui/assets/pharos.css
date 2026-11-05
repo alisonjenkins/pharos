@@ -583,11 +583,15 @@ input:focus-visible {
 /* A browse grid's cards arrive with the viewer's chosen transition when it
    mounts: a library opening or the viewer switching to another (V476). The
    tiles from the first in view carry `.pharos-arrive` (browse.rs `arrival`),
-   staggered corner to corner by their row plus column on screen
-   (`--fx-wave`, set by web.rs `stage_arrival` once they are in the page);
-   the rain scatters them by `--fx-r` instead. Every effect animates
-   `transform` and `opacity` alone, so it stays on the compositor on TV and
-   headset GPUs. */
+   and web.rs `stage_arrival` places each by where it sits on screen: its row
+   and column (`--fx-row`, `--fx-col`, their sum `--fx-wave`) and its pull
+   from the middle of the viewport (`--fx-dx`, `--fx-dy`, `--fx-d`) once it
+   is in the page. Each effect moves differently
+   (V492): Fade sweeps corner to corner, Pop bursts in at random like
+   popcorn, Flip turns each row over like cards, Warp flies everything out
+   from the middle of the screen, and the rain scatters by `--fx-r`. Every
+   effect animates `transform` and `opacity` alone, so it stays on the
+   compositor on TV and headset GPUs. */
 :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   animation: 380ms cubic-bezier(0.2, 0.7, 0.2, 1) calc(var(--fx-wave, 0) * 45ms) backwards pharos-arrive-fade;
 }
@@ -596,16 +600,22 @@ input:focus-visible {
 }
 :root[data-library-transition="pop"] :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   animation-name: pharos-arrive-pop;
-  animation-duration: 420ms;
-  animation-timing-function: cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation-duration: 560ms;
+  animation-timing-function: ease-out;
+  animation-delay: calc(var(--fx-r, 0) * 45ms + var(--fx-row, 0) * 30ms);
 }
 :root[data-library-transition="flip"] :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   animation-name: pharos-arrive-flip;
-  animation-duration: 520ms;
+  animation-duration: 720ms;
+  animation-timing-function: cubic-bezier(0.3, 0.6, 0.25, 1);
+  animation-delay: calc(var(--fx-row, 0) * 120ms + var(--fx-col, 0) * 25ms);
+  backface-visibility: hidden;
 }
 :root[data-library-transition="warp"] :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   animation-name: pharos-arrive-warp;
-  animation-duration: 600ms;
+  animation-duration: 760ms;
+  animation-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  animation-delay: calc(var(--fx-d, 0) * 380ms);
 }
 :root[data-library-transition="matrix"] :is(.pharos-browse, .pharos-artist) .pharos-arrive {
   position: relative;
@@ -627,25 +637,58 @@ input:focus-visible {
 @keyframes pharos-arrive-fade {
   from {
     opacity: 0;
-    transform: translateY(0.5rem);
+    transform: translateY(1.25rem);
   }
 }
+/* Bursts up past full size with a twist, then settles. */
 @keyframes pharos-arrive-pop {
-  from {
+  0% {
     opacity: 0;
-    transform: scale(0.6);
+    transform: scale(0.2) rotate(-14deg);
+  }
+  45% {
+    opacity: 1;
+    transform: scale(1.16) rotate(5deg);
+  }
+  70% {
+    transform: scale(0.94) rotate(-2deg);
+  }
+  86% {
+    transform: scale(1.03) rotate(0.5deg);
+  }
+  100% {
+    transform: none;
   }
 }
+/* Turns over from its back, lifted towards the viewer, overshooting a
+   little; the back face is hidden, so it shows from edge-on. */
 @keyframes pharos-arrive-flip {
-  from {
+  0% {
     opacity: 0;
-    transform: perspective(60rem) rotateY(-90deg);
+    transform: perspective(40rem) translateZ(5rem) rotateY(-180deg);
+  }
+  45% {
+    opacity: 1;
+  }
+  70% {
+    transform: perspective(40rem) translateZ(2rem) rotateY(14deg);
+  }
+  100% {
+    transform: perspective(40rem) translateZ(0) rotateY(0deg);
   }
 }
+/* Flies out from the middle of the screen, from far behind it: the offset
+   comes before the perspective so it is in screen px, not projected. */
 @keyframes pharos-arrive-warp {
-  from {
+  0% {
     opacity: 0;
-    transform: perspective(60rem) translateZ(-40rem) rotateX(30deg);
+    transform: translate(var(--fx-dx, 0px), var(--fx-dy, 0px)) perspective(40rem) translateZ(-200rem);
+  }
+  25% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(0px, 0px) perspective(40rem) translateZ(0);
   }
 }
 @keyframes pharos-arrive-rain {

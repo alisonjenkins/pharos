@@ -1026,8 +1026,8 @@ fn PagedGrid(
                 Some(top) => platform::scroll_tile_to(target, top),
                 None => platform::scroll_to_tile(target),
             };
-            // The arriving tiles were placed before the page scrolled them
-            // into view.
+            // The warp's pull was measured before the page scrolled the
+            // arriving tiles into view.
             if placed && kept.is_some() {
                 platform::stage_arrival(true);
             }
@@ -1233,8 +1233,8 @@ fn arrival(at: usize, from: usize, album: bool) -> (Option<&'static str>, Option
 
 /// The row and column on screen of each arriving tile, given each one's
 /// top and height in page px in grid order and the page px at the top of
-/// the viewport: the wave runs corner to corner by row plus column (B578),
-/// whatever the grid's width. Rows
+/// the viewport: the wave runs corner to corner by row plus column (B578)
+/// and the flip turns row by row (V492), whatever the grid's width. Rows
 /// count from the first that reaches into view, so a grid reopened part way
 /// down starts its wave on screen (B579); rows above it are all row 0.
 pub fn arrival_cells(tiles: &[(f64, f64)], view_top: f64) -> Vec<(usize, usize)> {
@@ -1262,6 +1262,26 @@ pub fn arrival_cells(tiles: &[(f64, f64)], view_top: f64) -> Vec<(usize, usize)>
         .into_iter()
         .map(|(row, col)| (row.saturating_sub(skip), col))
         .collect()
+}
+
+/// How far the warp carries an arriving tile (V492): the offset in CSS px
+/// from the tile's centre to the viewport's, which it flies out from, and
+/// its distance from there as a share of the viewport's half diagonal (0 at
+/// the middle, 1 at a corner, at most 2 below the fold), which orders the
+/// ripple. `tile` is its left, top, width and height in viewport px.
+pub fn arrival_pull(tile: (f64, f64, f64, f64), view: (f64, f64)) -> (f64, f64, f64) {
+    const FARTHEST: f64 = 2.0;
+    let (left, top, width, height) = tile;
+    let (half_w, half_h) = (view.0 / 2.0, view.1 / 2.0);
+    let dx = half_w - (left + width / 2.0);
+    let dy = half_h - (top + height / 2.0);
+    let corner = half_w.hypot(half_h);
+    let share = if corner > 0.0 {
+        (dx.hypot(dy) / corner).min(FARTHEST)
+    } else {
+        0.0
+    };
+    (dx, dy, share)
 }
 
 /// The tiles of a page; the one at `sentinel` carries [`SENTINEL_ID`].
@@ -2133,6 +2153,24 @@ mod tests {
             vec![(0, 0), (0, 1), (0, 2), (0, 0), (0, 1), (0, 2), (1, 0)]
         );
         assert!(arrival_cells(&[], 0.0).is_empty());
+    }
+
+    #[test]
+    fn the_warp_flies_each_tile_out_from_the_middle_of_the_screen() {
+        let view = (1000.0, 600.0);
+        // A tile centred on the screen goes nowhere and leads the ripple.
+        assert_eq!(
+            arrival_pull((450.0, 250.0, 100.0, 100.0), view),
+            (0.0, 0.0, 0.0)
+        );
+        // One in the top left corner starts from the middle, a whole half
+        // diagonal away.
+        let (dx, dy, share) = arrival_pull((-50.0, -50.0, 100.0, 100.0), view);
+        assert_eq!((dx, dy), (500.0, 300.0));
+        assert!((share - 1.0).abs() < 1e-9, "{share}");
+        // Far below the fold it is last, but no later than twice that.
+        assert_eq!(arrival_pull((450.0, 5000.0, 100.0, 100.0), view).2, 2.0);
+        assert_eq!(arrival_pull((0.0, 0.0, 0.0, 0.0), (0.0, 0.0)).2, 0.0);
     }
 
     /// B490: switching libraries from the top bar keeps the same `GridView`

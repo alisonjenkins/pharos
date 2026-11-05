@@ -1787,27 +1787,30 @@ pub fn scroll_to_top() {
 pub fn tile_top(at: u32) -> Option<f64> {
     let window = web_sys::window()?;
     let tile: web_sys::HtmlElement = grid_tiles()?.item(at)?.dyn_into().ok()?;
-    Some(page_top(tile) - window.scroll_y().unwrap_or(0.0))
+    Some(page_offset(tile).1 - window.scroll_y().unwrap_or(0.0))
 }
 
-/// Where `el` sits on the page, in CSS px, from layout offsets, so a tile
-/// mid-way through an animated transform reports where it will settle.
-fn page_top(el: web_sys::HtmlElement) -> f64 {
+/// Where `el` sits on the page, its left and top in CSS px, from layout
+/// offsets, so a tile mid-way through an animated transform reports where
+/// it will settle.
+fn page_offset(el: web_sys::HtmlElement) -> (f64, f64) {
     let mut node = Some(el);
-    let mut top = 0.0;
+    let (mut left, mut top) = (0.0, 0.0);
     while let Some(el) = node {
+        left += f64::from(el.offset_left());
         top += f64::from(el.offset_top());
         node = el.offset_parent().and_then(|p| p.dyn_into().ok());
     }
-    top
+    (left, top)
 }
 
 /// Places each arriving grid tile for the library transition by where it
 /// sits on screen: its row and column (`--fx-row`, `--fx-col`, and their
-/// sum `--fx-wave`, B578). Tiles already placed keep their place unless
-/// `again`, so a page landing later never restarts a tile that has arrived;
-/// `again` is for a grid scrolled back to where the viewer left it after
-/// its tiles were placed (B579).
+/// sum `--fx-wave`, B578) and the warp's pull from the middle of the
+/// viewport (`--fx-dx`, `--fx-dy`, `--fx-d`, V492). Tiles already placed
+/// keep their place unless `again`, so a page landing later never restarts
+/// a tile that has arrived; `again` is for a grid scrolled back to where the
+/// viewer left it after its tiles were placed.
 pub fn stage_arrival(again: bool) {
     let Some(window) = web_sys::window() else {
         return;
@@ -1840,20 +1843,38 @@ pub fn stage_arrival(again: bool) {
 /// [`stage_arrival`] for one grid's arriving `tiles`, so each grid's wave
 /// counts its own rows.
 fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: bool) {
+    let offsets: Vec<(f64, f64)> = tiles.iter().map(|t| page_offset(t.clone())).collect();
+    let scroll = (
+        window.scroll_x().unwrap_or(0.0),
+        window.scroll_y().unwrap_or(0.0),
+    );
     let boxes: Vec<(f64, f64)> = tiles
         .iter()
-        .map(|t| (page_top(t.clone()), f64::from(t.offset_height())))
+        .zip(&offsets)
+        .map(|(tile, (_, top))| (*top, f64::from(tile.offset_height())))
         .collect();
-    let cells = super::browse::arrival_cells(&boxes, window.scroll_y().unwrap_or(0.0));
-    for (tile, (row, col)) in tiles.iter().zip(cells) {
+    let cells = super::browse::arrival_cells(&boxes, scroll.1);
+    let px = |v: Result<JsValue, JsValue>| v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let view = (px(window.inner_width()), px(window.inner_height()));
+    for ((tile, (left, top)), (row, col)) in tiles.iter().zip(offsets).zip(cells) {
         if !again && tile.has_attribute("data-fx") {
             continue;
         }
+        let place = (
+            left - scroll.0,
+            top - scroll.1,
+            f64::from(tile.offset_width()),
+            f64::from(tile.offset_height()),
+        );
+        let (dx, dy, share) = super::browse::arrival_pull(place, view);
         let style = tile.style();
         let set = [
             ("--fx-row", row.to_string()),
             ("--fx-col", col.to_string()),
             ("--fx-wave", (row + col).to_string()),
+            ("--fx-dx", format!("{dx:.0}px")),
+            ("--fx-dy", format!("{dy:.0}px")),
+            ("--fx-d", format!("{share:.3}")),
         ]
         .iter()
         .try_for_each(|(name, value)| style.set_property(name, value))
