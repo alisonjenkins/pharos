@@ -3101,6 +3101,16 @@ test.describe("pharos Dioxus UI song handover", () => {
         timeout: 15_000,
       })
       .toBeGreaterThan(0);
+    // Past the restart threshold Previous restarts the song rather than going
+    // back, so start from the top before asking for the previous track.
+    await page.locator("#pharos-video").evaluate((a: HTMLMediaElement) => {
+      a.pause();
+      a.currentTime = 0;
+    });
+    // The slider shows the position the player itself acts on.
+    await expect
+      .poll(async () => Number(await page.getByRole("slider", { name: "Seek" }).inputValue()))
+      .toBeLessThan(1_000);
     await page.evaluate(() =>
       (
         (window as unknown as { skipHandlers: Record<string, () => void> }).skipHandlers
