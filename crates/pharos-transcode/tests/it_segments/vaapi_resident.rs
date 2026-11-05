@@ -331,3 +331,108 @@ async fn the_inspector_blocks_a_rotated_and_an_interlaced_source_and_passes_a_pl
         "a file ffmpeg cannot open is not a clean bill of health"
     );
 }
+
+/// B550/V460: a window past the end of the picture, where a longer audio
+/// track keeps the container running, fails on real VAAPI exactly as a device
+/// fault does. The worker must read it as `NoFrames` once the source shows the
+/// window empty, and leave a window that does hold video a device fault.
+#[test]
+fn a_window_past_the_end_of_the_video_is_no_frames_on_real_vaapi() {
+    use pharos_transcode::protocol::{JobId, JobSpec, OutputSink, WorkerError};
+    use pharos_transcode::worker::exec;
+
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let Some(dev) = usable_vaapi_device() else {
+        eprintln!("skipping: no usable VAAPI render node (vainfo)");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.mkv");
+    // 3 s of picture under 12 s of sound.
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg("testsrc2=duration=3:size=640x360:rate=24")
+        .args(["-f", "lavfi", "-i", "sine=duration=12"])
+        .args(["-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"])
+        .arg(&input)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "fixture generation failed");
+
+    let mut o = opts(SourceVideoKind::Plain8BitSdr, SourceCodec::H264);
+    o.start_position_ticks = 6 * 10_000_000;
+    o.duration_ticks = Some(3 * 10_000_000);
+    let out = dir.path().join("tail.ts");
+    let args = ffmpeg_transcode_args_pipeline(
+        input.to_str().unwrap(),
+        &o,
+        dev,
+        out.to_str().unwrap(),
+        DecodeOffload::Allowed,
+        None,
+        VaapiPipeline::Hybrid,
+    );
+    let run = Command::new("ffmpeg")
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success(),
+        "a window with no picture cannot encode"
+    );
+    assert!(exec::encoder_never_opened(&stderr), "{stderr}");
+    let classified = exec::classify_failure(&stderr, true);
+    assert!(
+        matches!(classified, WorkerError::DeviceBusy(_)),
+        "{classified:?}"
+    );
+
+    let spec = JobSpec {
+        job_id: JobId(1),
+        input: input.clone(),
+        opts: o,
+        device: dev,
+        decode_offload: DecodeOffload::Allowed,
+        vaapi_pipeline: VaapiPipeline::Hybrid,
+        sink: OutputSink::FileDirect { path: out },
+        filler: None,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let has_video = rt.block_on(exec::window_has_video(&spec));
+    assert_eq!(has_video, Some(false));
+    let settled = exec::settle_no_frames(classified, has_video);
+    assert!(matches!(settled, WorkerError::NoFrames(_)), "{settled:?}");
+    assert!(!settled.is_transient(), "must not cool the device");
+
+    // Positive control: the same title's first window has video and encodes.
+    let mut head = spec;
+    head.opts.start_position_ticks = 0;
+    assert_eq!(rt.block_on(exec::window_has_video(&head)), Some(true));
+    let head_out = dir.path().join("head.ts");
+    let args = ffmpeg_transcode_args_pipeline(
+        input.to_str().unwrap(),
+        &head.opts,
+        dev,
+        head_out.to_str().unwrap(),
+        DecodeOffload::Allowed,
+        None,
+        VaapiPipeline::Hybrid,
+    );
+    assert!(run_frames(&args, &head_out) > 0);
+}
