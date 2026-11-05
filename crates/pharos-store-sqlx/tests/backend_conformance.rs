@@ -280,6 +280,247 @@ where
         .await
         .expect("an API key is not a session and must survive");
 
+    // B543 / V438 — a child token goes with its parent, whichever way the
+    // parent goes; an unrelated token and a stranger's token stay.
+    {
+        use pharos_core::{TokenId, TokenScope, TokenSelector};
+        let child_of = |parent: TokenId| {
+            let store = &store;
+            async move {
+                TokenStore::issue_child_with_ttl(
+                    store,
+                    uid,
+                    "child-device",
+                    3600,
+                    TokenScope::Media,
+                    &parent,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let live = |secret: &pharos_core::AuthToken| {
+            let store = &store;
+            let secret = secret.0.expose().to_owned();
+            async move { TokenStore::resolve(store, &secret).await.is_ok() }
+        };
+
+        // By secret.
+        let parent = TokenStore::issue_with_ttl(&store, uid, "p-secret", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let child = child_of(parent.id.clone()).await;
+        assert_eq!(
+            TokenStore::count_live_children(
+                &store,
+                uid,
+                TokenSelector::Token(parent.secret.0.expose())
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        TokenStore::revoke(&store, parent.secret.0.expose())
+            .await
+            .unwrap();
+        assert!(!live(&child.secret).await, "revoke takes the child");
+
+        // By id.
+        let parent = TokenStore::issue_with_ttl(&store, uid, "p-id", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let child = child_of(parent.id.clone()).await;
+        TokenStore::revoke_by_id(&store, &parent.id).await.unwrap();
+        assert!(!live(&child.secret).await, "revoke_by_id takes the child");
+
+        // By device; the child's own device id does not match.
+        let parent = TokenStore::issue_with_ttl(&store, uid, "p-device", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let child = child_of(parent.id.clone()).await;
+        assert_eq!(
+            TokenStore::count_live_children(&store, uid, TokenSelector::Device("p-device"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            TokenStore::revoke_tokens_by_device(&store, uid, "p-device")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !live(&child.secret).await,
+            "revoke_tokens_by_device takes the child"
+        );
+
+        // By session sweep; the kept token's own children are not counted.
+        let parent = TokenStore::issue_with_ttl(&store, uid, "p-sweep", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let child = child_of(parent.id.clone()).await;
+        let keep = TokenStore::issue(&store, uid, "p-keep").await.unwrap();
+        assert_eq!(
+            TokenStore::count_live_children(
+                &store,
+                uid,
+                TokenSelector::AllExcept(Some(keep.0.expose()))
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            TokenStore::count_live_children(
+                &store,
+                uid,
+                TokenSelector::AllExcept(Some(parent.secret.0.expose()))
+            )
+            .await
+            .unwrap(),
+            0,
+            "the kept parent's child is not counted"
+        );
+        TokenStore::revoke_sessions_except(&store, uid, Some(keep.0.expose()))
+            .await
+            .unwrap();
+        assert!(!live(&child.secret).await, "the sweep takes the child");
+        assert!(live(&keep).await);
+
+        // An expired child is not counted; a missing parent is refused; a
+        // child of one parent survives another parent's revoke.
+        let parent = TokenStore::issue_with_ttl(&store, uid, "p-exp", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let other = TokenStore::issue_with_ttl(&store, uid, "p-other", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let expired = TokenStore::issue_child_with_ttl(
+            &store,
+            uid,
+            "child-device",
+            -10,
+            TokenScope::Media,
+            &parent.id,
+        )
+        .await
+        .unwrap();
+        let live_child = child_of(other.id.clone()).await;
+        assert_eq!(
+            TokenStore::count_live_children(
+                &store,
+                uid,
+                TokenSelector::Token(parent.secret.0.expose())
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        TokenStore::revoke(&store, parent.secret.0.expose())
+            .await
+            .unwrap();
+        assert!(!live(&expired.secret).await);
+        assert!(
+            live(&live_child.secret).await,
+            "another parent's child stays"
+        );
+        assert!(
+            TokenStore::issue_child_with_ttl(
+                &store,
+                uid,
+                "child-device",
+                60,
+                TokenScope::Media,
+                &TokenId("nope".into()),
+            )
+            .await
+            .is_err(),
+            "a child needs a stored parent"
+        );
+
+        // A child never outlives its parent, and an expired or missing
+        // parent issues nothing.
+        let short = TokenStore::issue_with_ttl(&store, uid, "p-short", 10, TokenScope::Full)
+            .await
+            .unwrap();
+        let clamped = TokenStore::issue_child_with_ttl(
+            &store,
+            uid,
+            "child-device",
+            3600,
+            TokenScope::Media,
+            &short.id,
+        )
+        .await
+        .unwrap();
+        assert!(
+            clamped.expires_at <= short.expires_at,
+            "child {} outlives parent {}",
+            clamped.expires_at,
+            short.expires_at
+        );
+        let roomy = TokenStore::issue_child_with_ttl(
+            &store,
+            uid,
+            "child-device",
+            5,
+            TokenScope::Media,
+            &short.id,
+        )
+        .await
+        .unwrap();
+        assert!(roomy.expires_at < short.expires_at, "a shorter ttl is kept");
+        let gone = TokenStore::issue_with_ttl(&store, uid, "p-gone", -10, TokenScope::Full)
+            .await
+            .unwrap();
+        assert!(matches!(
+            TokenStore::issue_child_with_ttl(
+                &store,
+                uid,
+                "child-device",
+                60,
+                TokenScope::Media,
+                &gone.id,
+            )
+            .await,
+            Err(pharos_core::AuthError::InvalidToken)
+        ));
+        assert!(matches!(
+            TokenStore::issue_child_with_ttl(
+                &store,
+                uid,
+                "child-device",
+                60,
+                TokenScope::Media,
+                &TokenId("nope".into()),
+            )
+            .await,
+            Err(pharos_core::AuthError::InvalidToken)
+        ));
+
+        // Deleting the user takes parent and child.
+        let doomed = user_record("doomed");
+        let did = doomed.id;
+        UserStore::create(&store, doomed).await.unwrap();
+        let p = TokenStore::issue_with_ttl(&store, did, "d", 3600, TokenScope::Full)
+            .await
+            .unwrap();
+        let c = TokenStore::issue_child_with_ttl(
+            &store,
+            did,
+            "child-device",
+            60,
+            TokenScope::Media,
+            &p.id,
+        )
+        .await
+        .unwrap();
+        UserStore::delete(&store, did).await.unwrap();
+        assert!(!live(&c.secret).await, "user delete takes the child");
+        assert!(!live(&p.secret).await);
+    }
+
     // -----------------------------------------------------------------
     // 4. MediaStore
     // -----------------------------------------------------------------
