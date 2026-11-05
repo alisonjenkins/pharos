@@ -171,9 +171,11 @@ pub fn cue_width_share(size: f64, position: Option<f64>, position_align: &str, a
             _ => "center",
         },
     };
+    // WebVTT's computed position: only `left` and `right` move `auto` off
+    // the middle; `start` and `end` anchor a box that starts at 50%.
     let position = position.unwrap_or(match align {
-        "left" | "start" => 0.0,
-        "right" | "end" => 100.0,
+        "left" => 0.0,
+        "right" => 100.0,
         _ => 50.0,
     });
     let position = position.clamp(0.0, 100.0);
@@ -209,19 +211,36 @@ pub fn lifted_line(cue_text: &str, chars_per_line: usize) -> f64 {
     let per_line = chars_per_line.max(1);
     let lines: usize = cue_text
         .lines()
-        .map(visible_chars)
-        .filter(|&n| n > 0)
-        .map(|n| n.div_ceil(per_line))
+        .map(|line| wrapped_lines(&visible_text(line), per_line))
         .sum();
     -(lines.max(1) as f64 + 1.0)
 }
 
-/// The characters of a cue text line outside its `<...>` tags, blanks at
-/// either end not counted.
-fn visible_chars(line: &str) -> usize {
+/// The rendered lines `text` wraps to at `per_line` characters, wrapped as
+/// a browser does, at spaces: a word that does not fit on the current line
+/// starts the next, and a word longer than a line breaks across lines.
+fn wrapped_lines(text: &str, per_line: usize) -> usize {
+    let mut lines = 0;
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let len = word.chars().count();
+        if used > 0 && used + 1 + len <= per_line {
+            used += 1 + len;
+        } else {
+            lines += len.div_ceil(per_line).max(1);
+            used = match len % per_line {
+                0 => per_line,
+                rest => rest,
+            };
+        }
+    }
+    lines
+}
+
+/// A cue text line without its `<...>` tags.
+fn visible_text(line: &str) -> String {
     let mut in_tag = false;
-    line.trim()
-        .chars()
+    line.chars()
         .filter(|&c| match c {
             '<' => {
                 in_tag = true;
@@ -233,7 +252,7 @@ fn visible_chars(line: &str) -> usize {
             }
             _ => !in_tag,
         })
-        .count()
+        .collect()
 }
 
 /// `part` of `whole` in percent, for placing a cue on the canvas.
@@ -914,6 +933,12 @@ mod tests {
         // Tags take no room on screen.
         assert_eq!(lifted_line("<i>twelve chars</i>", 12), -2.0);
         assert_eq!(lifted_line("<c.yellow>x</c>", 1), -2.0);
+        // Lines break at spaces: 20 characters, but no two words share a
+        // 10-character line.
+        assert_eq!(lifted_line("WARMER WARMER WARMER", 10), -4.0);
+        // A word longer than a line breaks across lines.
+        assert_eq!(lifted_line("abcdefghijklmnopqrstuvwxy", 10), -4.0);
+        assert_eq!(lifted_line("   ", 10), -2.0);
     }
 
     /// Disarm check: returning `size` alone, the positioned cases read 100.
@@ -933,7 +958,11 @@ mod tests {
             30.0
         );
         // `auto` follows the text alignment.
-        assert_eq!(cue_width_share(100.0, None, "auto", "start"), 100.0);
+        // WebVTT puts an `auto` start or end cue at 50%, anchored by its
+        // alignment, so it spans half the picture.
+        assert_eq!(cue_width_share(100.0, None, "auto", "start"), 50.0);
+        assert_eq!(cue_width_share(100.0, None, "auto", "end"), 50.0);
+        assert_eq!(cue_width_share(100.0, None, "auto", "left"), 100.0);
         assert_eq!(cue_width_share(100.0, Some(25.0), "auto", "end"), 25.0);
         assert_eq!(cue_width_share(30.0, Some(50.0), "auto", "center"), 30.0);
     }

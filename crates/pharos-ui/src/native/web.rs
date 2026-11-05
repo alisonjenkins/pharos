@@ -477,8 +477,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// A `ResizeObserver` and the callback it calls.
-type CueResize = (JsValue, Closure<dyn FnMut()>);
+/// The `<video>` a `ResizeObserver` watches, the observer and the callback
+/// it calls.
+type CueResize = (JsValue, JsValue, Closure<dyn FnMut()>);
 
 /// Lifts the cues of each track the `<video>` `video_id` shows, for its
 /// size now.
@@ -505,14 +506,23 @@ fn lift_shown_cues(video_id: &str) {
 /// `ResizeObserver` is reached through `js_sys::Reflect`, as web-sys keeps it
 /// behind a feature this crate does not enable.
 fn watch_cue_video(video_id: &str) {
-    let same = CUE_VIDEO.with(|v| *v.borrow() == video_id);
-    let watching = CUE_RESIZE.with(|r| r.borrow().is_some());
     CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
-    if same && watching {
+    let Some(video) = video_element(video_id) else {
+        return;
+    };
+    let video: JsValue = video.into();
+    // The same id can name a new `<video>` (the player left and opened
+    // again), so the observer is kept only while it watches this element.
+    let same = CUE_RESIZE.with(|r| {
+        r.borrow()
+            .as_ref()
+            .is_some_and(|(seen, _, _)| *seen == video)
+    });
+    if same {
         return;
     }
     CUE_RESIZE.with(|r| {
-        if let Some((observer, _)) = r.borrow_mut().take() {
+        if let Some((_, observer, _)) = r.borrow_mut().take() {
             if let Ok(disconnect) = js_sys::Reflect::get(&observer, &"disconnect".into()) {
                 if let Some(f) = disconnect.dyn_ref::<js_sys::Function>() {
                     let _ = f.call0(&observer);
@@ -520,7 +530,7 @@ fn watch_cue_video(video_id: &str) {
             }
         }
     });
-    let (Some(window), Some(video)) = (web_sys::window(), video_element(video_id)) else {
+    let Some(window) = web_sys::window() else {
         return;
     };
     let Ok(ctor) = js_sys::Reflect::get(&window, &"ResizeObserver".into()) else {
@@ -540,7 +550,14 @@ fn watch_cue_video(video_id: &str) {
             let _ = f.call1(&observer, &video);
         }
     }
-    CUE_RESIZE.with(|r| *r.borrow_mut() = Some((observer, on_resize)));
+    CUE_RESIZE.with(|r| *r.borrow_mut() = Some((video, observer, on_resize)));
+}
+
+/// Lifts the shown cues of the `<video>` `video_id` again for the font size
+/// the Subtitle size choice just set, since a larger size can wrap a cue onto
+/// more lines.
+pub fn relift_cues(video_id: &str) {
+    lift_shown_cues(video_id);
 }
 
 /// Lifts the cues of each track the `<video>` `video_id` shows (V455), now
