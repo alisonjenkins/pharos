@@ -96,6 +96,20 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
+    // A play click put the page in fullscreen; the player leaving the full
+    // view (Back, the floating window, Close) takes it out again.
+    let shown_full = use_memo(move || {
+        let s = stage.read();
+        s.item.is_some() && s.view == View::Full
+    });
+    let mut was_full = use_signal(|| false);
+    use_effect(move || {
+        let full = shown_full();
+        if *was_full.peek() && !full {
+            platform::exit_page_fullscreen();
+        }
+        was_full.set(full);
+    });
     // Shift+P / Shift+N and the media keys skip tracks from anywhere in
     // the page, for whichever player is on show (B562).
     let skips = use_context_provider(TrackSkipCtx::default);

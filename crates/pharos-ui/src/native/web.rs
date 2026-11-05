@@ -939,6 +939,58 @@ pub fn toggle_fullscreen(id: &str) {
     }
 }
 
+/// Puts the whole page in fullscreen, from a play click: the player is not
+/// mounted yet, and the gesture is gone once it is. The page stays fullscreen
+/// across the players the stage mounts, so the next episode keeps it.
+pub fn enter_page_fullscreen() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if document.fullscreen_element().is_some() {
+        info("pharos: fullscreen action=enter skipped reason=already-fullscreen");
+        return;
+    }
+    let Some(root) = document.document_element() else {
+        return;
+    };
+    // web-sys drops the promise, and with it the browser's refusal.
+    match root.unchecked_into::<FsElement>().request_fullscreen() {
+        Ok(promise) => spawn_detached(async move {
+            match wasm_bindgen_futures::JsFuture::from(promise).await {
+                Ok(_) => info("pharos: fullscreen action=enter target=page reason=play"),
+                Err(e) => warn(&format!(
+                    "pharos: fullscreen action=enter target=page refused reason={e:?}"
+                )),
+            }
+        }),
+        Err(e) => warn(&format!(
+            "pharos: fullscreen action=enter target=page refused reason={e:?}"
+        )),
+    }
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_name = Element)]
+    type FsElement;
+    #[wasm_bindgen(method, catch, js_name = requestFullscreen)]
+    fn request_fullscreen(this: &FsElement) -> Result<js_sys::Promise, JsValue>;
+}
+
+/// Leaves the fullscreen [`enter_page_fullscreen`] started; the player's own
+/// fullscreen (the F key) is left alone.
+pub fn exit_page_fullscreen() {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let page = document.document_element();
+    if page.is_none() || document.fullscreen_element() != page {
+        return;
+    }
+    document.exit_fullscreen();
+    info("pharos: fullscreen action=exit target=page reason=player-left-full");
+}
+
 // The Picture-in-Picture API is not among the enabled web-sys features.
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
@@ -1016,6 +1068,11 @@ pub async fn copy_text(text: &str) -> bool {
 /// window (`document.pictureInPictureEnabled`; missing in Firefox).
 pub fn pip_supported() -> bool {
     pip_document().and_then(|d| d.picture_in_picture_enabled()) == Some(true)
+}
+
+/// Whether a video is in the browser's picture-in-picture window.
+pub fn pip_active() -> bool {
+    pip_document().is_some_and(|d| d.picture_in_picture_element().is_some())
 }
 
 /// Hands the video `id` to the browser's picture-in-picture window, or

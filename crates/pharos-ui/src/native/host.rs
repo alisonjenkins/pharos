@@ -174,6 +174,14 @@ pub async fn copy_text(_text: &str) -> bool {
     false
 }
 
+pub fn enter_page_fullscreen() {}
+
+pub fn exit_page_fullscreen() {}
+
+pub fn pip_active() -> bool {
+    false
+}
+
 pub fn pip_supported() -> bool {
     false
 }
