@@ -2571,11 +2571,11 @@ static EP_EXPRS: std::sync::LazyLock<Vec<EpExpr>> = std::sync::LazyLock::new(|| 
         // 1x02, 01x02, S01x02 (the CxE / NxNN convention).
         compile(r"(?i)(?:^|[\\/._ \[(-])s?(?<s>\d{1,4})x(?<e>\d+)", false),
         // EP12 / EP_12.
-        compile(r"(?i)[\\/._ \[(-]ep_?(?<e>\d+)", false),
+        compile(r"(?i)(?:^|[\\/._ \[(-])ep_?(?<e>\d+)", false),
         // Episode 12 (word, no season).
         compile(r"(?i)episode[ ._-]*(?<e>\d+)", false),
         // E12 at a separator boundary (Show E01, name.E05.).
-        compile(r"(?i)[\\/._ \[(-]e(?<e>\d+)", false),
+        compile(r"(?i)(?:^|[\\/._ \[(-])e(?<e>\d+)", false),
         // ---- second pass: optimistic absolute numbering (1-3 digits) ----
         // Fansub dash: "Series - 07" (greedy prefix → the LAST " - ").
         compile(r"(?i)^.* - (?<e>\d{1,3})", true),
