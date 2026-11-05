@@ -354,8 +354,16 @@ impl server::session::Handler for Session {
                     error = %e,
                     "native media token refused"
                 );
-                Denial::Unavailable {
-                    dependency: "token store",
+                // An `InvalidToken` here is the session's own token, revoked
+                // or expired since `current_user()`: answer it as revoked so
+                // the client signs in again instead of retrying a store fault.
+                match e {
+                    AuthError::InvalidToken => Denial::Revoked {
+                        reason: "session ended",
+                    },
+                    _ => Denial::Unavailable {
+                        dependency: "token store",
+                    },
                 }
                 .write(result.init_error());
             }
