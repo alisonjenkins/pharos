@@ -660,6 +660,38 @@ fn match_best_prefers_an_exact_title_over_an_exact_alias() {
     assert_eq!(m.id, "81797");
 }
 
+/// From the live TVDB search for "Code Geass": every entry extends the name,
+/// and an alias of the 2024 sequel ("Code Geass: Dakkan no Z") is the
+/// shortest, so it scored highest.
+#[test]
+fn match_best_a_franchise_name_goes_to_the_original() {
+    let cands = vec![
+        cand(
+            "443905",
+            "コードギアス 奪還のロゼ",
+            Some(2024),
+            &[
+                "Code Geass: Rozé of the Recapture",
+                "Code Geass: Dakkan no Z",
+            ],
+        ),
+        cand(
+            "79525",
+            "コードギアス 反逆のルルーシュ",
+            Some(2006),
+            &["Code Geass: Lelouch of the Rebellion"],
+        ),
+        cand(
+            "471756",
+            "コードギアス 星追いのアスパル",
+            None,
+            &["Code Geass: Aspar the Star Chaser"],
+        ),
+    ];
+    let m = match_best("Code Geass", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "79525");
+}
+
 #[test]
 fn match_best_an_exact_name_under_the_floor_does_not_shut_out_a_prefix_match() {
     let cands = vec![
