@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 14;
+const schemaVersion :UInt32 = 15;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -212,7 +212,12 @@ struct DetailResult { union { detail @0 :ItemDetail; error @1 :Error; } }
 # verses. No lines means the song has none. `source` names where they came
 # from: `sidecar_lrc`, `embedded_synced`, `embedded_text`, `sidecar_text` or
 # `online`, empty when there are none.
-struct LyricLine { startMs @0 :UInt64; text @1 :Text; }
+# A word timestamp inside a `LyricLine`. `at` is the char (Unicode scalar)
+# offset in the line's text where the stamp falls; a stamp at the text's length
+# marks the end of the last word.
+struct LyricWord { at @0 :UInt32; startMs @1 :UInt64; }
+# `words` is empty unless the source timed words.
+struct LyricLine { startMs @0 :UInt64; text @1 :Text; words @2 :List(LyricWord); }
 struct Lyrics { synced @0 :Bool; lines @1 :List(LyricLine); source @2 :Text; }
 struct LyricsResult { union { lyrics @0 :Lyrics; error @1 :Error; } }
 
