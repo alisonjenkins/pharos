@@ -196,46 +196,6 @@ impl FfmpegBackend for SpawnBackend {
         })
     }
 
-    fn transcode_image<'a>(
-        &'a self,
-        src: &'a Path,
-        target_ext: &'a str,
-        out: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
-        Box::pin(async move {
-            let input = src.to_str().ok_or(BackendError::NonUtf8Path)?;
-            let out_str = out.to_str().ok_or(BackendError::NonUtf8Path)?;
-            let codec = match target_ext {
-                "webp" => "libwebp",
-                "avif" => "libaom-av1",
-                _ => return Err(BackendError::UnsupportedCodec(target_ext.to_string())),
-            };
-            let mut cmd = Command::new(&self.ffmpeg);
-            cmd.args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-i",
-                input,
-                "-c:v",
-                codec,
-            ]);
-            if target_ext == "avif" {
-                cmd.args(["-still-picture", "1", "-cpu-used", "8"]);
-            } else {
-                cmd.args(["-quality", "80"]);
-            }
-            cmd.arg(out_str);
-            let status = cmd.status().await?;
-            if !status.success() {
-                return Err(BackendError::Ffmpeg(format!("{target_ext} transcode")));
-            }
-            Ok(())
-        })
-    }
-
     fn waveform_rms<'a>(
         &'a self,
         src: &'a Path,
