@@ -490,6 +490,7 @@ where
     // Provider by kind: Episode prefers TVDB (fallback TMDB when TVDB isn't
     // configured); Movie is TMDB. When the kind's providers are all absent,
     // skip the item (leaves it eligible for a later pass with a key present).
+    item.metadata.provider_ids = trusted_provider_ids(&item);
     let provider_ids = item.metadata.provider_ids.clone();
     let (matched_provider, resolved) = match item.kind {
         MediaKind::Movie => match tmdb {
@@ -896,6 +897,28 @@ where
         .set_item_match(id, provider, external_id, "manual", None, now)
         .await?;
     Ok(())
+}
+
+/// `item`'s provider ids without the one an earlier search stamped. That id
+/// is only the old matcher's answer; fed back to [`resolve`] it would skip the
+/// search, keep the show a re-match exists to replace, and be recorded as an
+/// NFO id that no later re-admission reaches. An id that differs from the
+/// stamped match came from local data and is kept.
+fn trusted_provider_ids(item: &MediaItem) -> ProviderIds {
+    let mut ids = item.metadata.provider_ids.clone();
+    if item.match_source.as_deref() != Some("search") {
+        return ids;
+    }
+    let stamped = item.match_external_id.as_deref();
+    let slot = match item.match_provider.as_deref() {
+        Some("tmdb") => &mut ids.tmdb,
+        Some("tvdb") => &mut ids.tvdb,
+        _ => return ids,
+    };
+    if slot.as_deref() == stamped {
+        *slot = None;
+    }
+    ids
 }
 
 /// Resolve one item against a single provider: determine the external id
@@ -2890,5 +2913,63 @@ mod tests {
             .unwrap();
         readmit_stale_tv_matches(&s).await.unwrap();
         assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
+    }
+
+    /// B557 — a re-admitted episode is searched again. The id its old search
+    /// stamped into `provider_ids` must not pass for an NFO id, or the episode
+    /// keeps the wrong show and is recorded as `nfo_id`, out of reach of any
+    /// later re-admission.
+    #[tokio::test]
+    async fn a_re_admitted_episode_is_searched_again_not_resolved_by_its_old_id() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
+            .await
+            .unwrap();
+        readmit_stale_tv_matches(&s).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
+            .with_detail(enriched_overview("Goku's adventures"));
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("search"));
+        assert_eq!(got.match_external_id.as_deref(), Some("76666"));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("76666"));
+    }
+
+    #[test]
+    fn a_provider_id_from_local_data_outlives_a_search_match() {
+        let mut item = MediaItem {
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("374456".into()),
+            match_source: Some("search".into()),
+            ..MediaItem::default()
+        };
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb, None);
+
+        item.metadata.provider_ids.tvdb = Some("76666".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("76666"));
+
+        item.match_source = Some("nfo_id".into());
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("374456"));
     }
 }
