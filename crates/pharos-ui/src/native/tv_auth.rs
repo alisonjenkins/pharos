@@ -201,6 +201,17 @@ pub fn rpc_url(base: &str) -> Result<String, String> {
     if host.chars().any(char::is_whitespace) {
         return Err(format!("whitespace in the host of server {base:?}"));
     }
+    // Only `host[:port]`: userinfo (`trusted@attacker`) would send the
+    // secret to the host after the `@`, and a path, query or fragment
+    // would land in front of `/pharos/rpc`.
+    if let Some(bad) = host
+        .chars()
+        .find(|c| matches!(c, '@' | '?' | '#' | '/' | '\\'))
+    {
+        return Err(format!(
+            "{bad:?} in the host of server {base:?}: give only https://host[:port]"
+        ));
+    }
     Ok(format!("wss://{host}/pharos/rpc"))
 }
 
@@ -221,6 +232,10 @@ mod tests {
             rpc_url("https://tv.example.com/").as_deref(),
             Ok("wss://tv.example.com/pharos/rpc")
         );
+        assert_eq!(
+            rpc_url("https://tv.example.com:8443").as_deref(),
+            Ok("wss://tv.example.com:8443/pharos/rpc")
+        );
         for bad in [
             "http://tv.example.com",
             "ws://tv.example.com",
@@ -228,6 +243,10 @@ mod tests {
             "https://",
             "https://tv.exa mple.com",
             "https://tv.example.com\t",
+            "https://tv.example.com@attacker.example",
+            "https://tv.example.com?x=1",
+            "https://tv.example.com#frag",
+            "https://tv.example.com/jellyfin",
         ] {
             assert!(rpc_url(bad).is_err(), "{bad} must be refused");
         }
