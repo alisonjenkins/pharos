@@ -14,8 +14,10 @@ mod model;
 mod morph;
 mod parse;
 mod raster;
+mod renderer;
 
 pub use fonts::{FontError, FontId};
 pub use frame::{Config, Frame, Mask, MaskKind, Rect, RenderStats, SubtitleStyle, Viewport};
 pub use model::{Event, Format, Overrides, ParseStats, Rgba, Run, Script, Style};
 pub use parse::decode;
+pub use renderer::Renderer;
