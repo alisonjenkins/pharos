@@ -81,6 +81,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "AudioDestinationNode",
     "AnalyserNode",
     "MediaElementAudioSourceNode",
+    "TimeRanges",
     "CssStyleDeclaration",
     "Navigator",
     "DomRect",
