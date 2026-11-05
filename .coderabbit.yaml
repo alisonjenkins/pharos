@@ -7,6 +7,9 @@
 # chase those rounds. Findings on a batch go into the next batch instead of
 # blocking it, so the batch is not reviewed at all.
 reviews:
+  # A repo file replaces the org UI settings instead of layering on them, so
+  # restate the org's profile; without it reviews dropped to CHILL.
+  profile: assertive
   auto_review:
     enabled: true
     # Title match is a case-insensitive substring check: every merge-queue
