@@ -956,7 +956,8 @@ body:has(.pharos-stage.is-full) .pharos-error {
 /* WebVTT cues: an outline and soft shadow instead of the browser's opaque
    box. `::cue` takes no border-radius or padding, so any box stays square;
    the dark outline keeps white text readable on a white frame. */
-.pharos-video::cue {
+.pharos-video::cue,
+.pharos-cues::cue {
   color: #fff; /* not themed: subtitles sit on the video, whose colours no theme sets */
   background: transparent;
   text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 3px #000, 0 2px 6px rgb(0 0 0 / 0.8); /* not themed: subtitles sit on the video */
@@ -1248,15 +1249,19 @@ body:has(.pharos-stage.is-full) .pharos-error {
 :root[data-subtitle-size="extra-large"] {
   --pharos-subtitle-scale: 1.65;
 }
-/* `.pharos-video::cue`, not `video::cue`: the outline rule above has that
+/* `.pharos-cues` carries the same cue look to the non-native player's
+   <video> (views/player.rs) without `.pharos-video`'s full-frame layout.
+   `.pharos-video::cue`, not `video::cue`: the outline rule above has that
    specificity, and a plainer selector here would lose the backdrop to its
    `transparent` (the halo is that rule's outline). */
-.pharos-video::cue {
+.pharos-video::cue,
+.pharos-cues::cue {
   font-size: calc(var(--pharos-subtitle-scale) * max(14px, min(2.8cqw, 5vh)));
   background: rgb(0 0 0 / 0.4); /* not themed: subtitles sit on the video, whose colours no theme sets */
 }
 @supports selector(::-webkit-media-text-track-display) {
-  .pharos-video::cue {
+  .pharos-video::cue,
+  .pharos-cues::cue {
     background: transparent;
   }
   video::-webkit-media-text-track-display {
