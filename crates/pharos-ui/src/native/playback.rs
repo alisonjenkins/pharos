@@ -3,7 +3,7 @@
 //! progress. The browser answers come in as plain values, so all of it is
 //! tested on the host.
 
-use pharos_client::api::{Capabilities, Segment, SegmentKind, Track, Trickplay};
+use pharos_client::api::{Capabilities, Font, Segment, SegmentKind, Track, Trickplay};
 
 /// Something that turns a stream URL into playback on the page's `<video>`
 /// (009 Boundaries: each external dependency sits behind an adapter). The
@@ -1099,11 +1099,43 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
+/// The URLs of the file's embedded fonts, each cut to the glyphs the subtitle
+/// at `subtitle` draws, for the ASS renderer to load up front (026 FR-010):
+/// libass then matches a style's `Fontname` against the fonts' own names.
+pub fn subtitle_font_urls(fonts: &[Font], subtitle: u32) -> Vec<String> {
+    fonts
+        .iter()
+        .map(|f| f.url.replace("{subtitle}", &subtitle.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// V488 (B572): every embedded font is fetched for the track being drawn.
+    #[test]
+    fn each_font_url_names_the_track_it_is_cut_for() {
+        let font = |index, url: &str| Font {
+            index,
+            url: url.into(),
+            ..Font::default()
+        };
+        let fonts = [
+            font(4, "/videos/7/subtitles/{subtitle}/fonts/4"),
+            font(6, "/videos/7/subtitles/{subtitle}/fonts/6"),
+        ];
+        assert_eq!(
+            subtitle_font_urls(&fonts, 3),
+            [
+                "/videos/7/subtitles/3/fonts/4",
+                "/videos/7/subtitles/3/fonts/6"
+            ]
+        );
+        assert!(subtitle_font_urls(&[], 3).is_empty());
+    }
 
     /// Disarm check: with `lifted_line` returning -2 for every cue, the two-
     /// and three-line cases fail.

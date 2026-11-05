@@ -33,9 +33,9 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms,
-    styled_subtitle_url, subtitle_switch, up_next_at, volume_setting, Engine, LibraryTransition,
-    MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine,
-    ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
+    styled_subtitle_url, subtitle_font_urls, subtitle_switch, up_next_at, volume_setting, Engine,
+    LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect,
+    PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
     LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::quality::{self, Watch};
@@ -3418,11 +3418,12 @@ fn Player(
             let Some(url) = script else {
                 return;
             };
+            let fonts = subtitle_font_urls(&p.detail.fonts, shown.unwrap_or_default());
             let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
             spawn(async move {
                 let report: Rc<dyn Fn(Result<(), String>)> =
                     Rc::new(move |result| styled_events.send((pick, result)));
-                match platform::styled_subtitles(VIDEO_ID, &url, Rc::clone(&report)).await {
+                match platform::styled_subtitles(VIDEO_ID, &url, &fonts, Rc::clone(&report)).await {
                     Ok(s) if styled_for.get() == pick => *styled.borrow_mut() = Some(s),
                     Ok(_) => {}
                     Err(e) => report(Err(e)),
