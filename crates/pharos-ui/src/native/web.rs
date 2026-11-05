@@ -2726,8 +2726,92 @@ impl super::visualiser::AudioTap for WebAudioTap {
 
 impl Drop for WebAudioTap {
     fn drop(&mut self) {
+        TAPS.with(|taps| taps.borrow_mut().retain(|t| t.context != self.context));
         let _ = self.context.close();
     }
+}
+
+/// A live tap's nodes, so a resume (B563) can read them without the
+/// visualiser that owns the tap.
+struct TapNodes {
+    media: web_sys::HtmlMediaElement,
+    context: web_sys::AudioContext,
+    analyser: web_sys::AnalyserNode,
+}
+
+thread_local! {
+    static TAPS: RefCell<Vec<TapNodes>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_tap<T>(media: &web_sys::HtmlMediaElement, f: impl FnOnce(&TapNodes) -> T) -> Option<T> {
+    TAPS.with(|taps| taps.borrow().iter().find(|t| t.media == *media).map(f))
+}
+
+/// A number property of `target` in milliseconds, from seconds; `None` where
+/// the browser has not got it (Firefox has no `outputLatency` before 132).
+fn seconds_prop_ms(target: &JsValue, name: &str) -> Option<f64> {
+    js_sys::Reflect::get(target, &JsValue::from_str(name))
+        .ok()
+        .and_then(|v| v.as_f64())
+        .map(|s| s * 1000.0)
+}
+
+/// The media element `id` and its audio path as a resume finds them.
+pub fn resume_context(id: &str) -> super::resume::ResumeContext {
+    use super::resume::{AudioPath, ResumeContext};
+    let Some(media) = video_element(id) else {
+        return ResumeContext::unavailable();
+    };
+    let now = media.current_time();
+    let buffered = media.buffered();
+    let ahead = (0..buffered.length())
+        .filter_map(|i| Some((buffered.start(i).ok()?, buffered.end(i).ok()?)))
+        .find(|(start, end)| *start <= now && now <= *end)
+        .map_or(0.0, |(_, end)| end - now);
+    let src = media.current_src();
+    let engine = if src.starts_with("blob:") {
+        "hlsjs"
+    } else if src.split('?').next().is_some_and(|p| p.ends_with(".m3u8")) {
+        "native_hls"
+    } else {
+        "direct"
+    };
+    let audio = with_tap(&media, |t| AudioPath {
+        context_state: js_sys::Reflect::get(&t.context, &JsValue::from_str("state"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        base_latency_ms: seconds_prop_ms(&t.context, "baseLatency"),
+        output_latency_ms: seconds_prop_ms(&t.context, "outputLatency"),
+    });
+    ResumeContext {
+        ready_state: media.ready_state(),
+        buffered_ahead_ms: seconds_to_ms(ahead),
+        engine,
+        muted: media.muted() || media.volume() <= 0.0,
+        audio,
+    }
+}
+
+/// The largest sample in the tap's latest window on the media element `id`,
+/// divided by its volume, or `None` with no tap, no volume, or a context
+/// that is not running: a suspended context does not refresh the analyser,
+/// whose last window may still hold sound from before the pause.
+pub fn tap_peak(id: &str) -> Option<f32> {
+    let media = video_element(id)?;
+    let volume = media.volume() as f32;
+    if media.muted() || volume <= 0.0 {
+        return None;
+    }
+    with_tap(&media, |t| {
+        if context_state(&t.context) != "running" {
+            return None;
+        }
+        let mut wave = vec![0.0_f32; t.analyser.fft_size() as usize];
+        t.analyser.get_float_time_domain_data(&mut wave);
+        Some(wave.iter().fold(0.0_f32, |peak, s| peak.max(s.abs())) / volume)
+    })
+    .flatten()
 }
 
 /// Route the media element `media_id` through an analyser. A media element
@@ -2766,6 +2850,13 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         .connect_with_audio_node(&context.destination())
         .map_err(js)?;
     let _ = context.resume();
+    TAPS.with(|taps| {
+        taps.borrow_mut().push(TapNodes {
+            media: media.clone(),
+            context: context.clone(),
+            analyser: analyser.clone(),
+        })
+    });
     Ok(Box::new(WebAudioTap {
         context,
         analyser,
