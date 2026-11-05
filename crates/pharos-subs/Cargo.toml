@@ -7,13 +7,14 @@ license.workspace = true
 publish.workspace = true
 description = "Pure-Rust subtitle renderer (SRT, WebVTT, ASS/SSA) producing alpha masks"
 
+# Deliberately no workspace-hack: it unifies native-only features (tokio/mio)
+# that do not compile for wasm32. See .config/hakari.toml final-excludes.
 [dependencies]
 encoding_rs = { version = "0.8", optional = true }
 harfrust = "0.15"
 skrifa = "0.49"
-unicode-bidi = { version = "0.3", default-features = false, features = ["std"] }
+unicode-bidi = { version = "0.3", default-features = false, features = ["std", "hardcoded-data"] }
 unicode-linebreak = "0.1"
-workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
 # Legacy codepage decoding for sidecar files that are not UTF-8.

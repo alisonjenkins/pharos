@@ -5340,7 +5340,6 @@ dependencies = [
  "skrifa",
  "unicode-bidi",
  "unicode-linebreak",
- "workspace-hack",
 ]
 
 [[package]]
