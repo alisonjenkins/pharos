@@ -41,6 +41,85 @@ pub async fn description_language<S: PreferenceStore>(
     }
 }
 
+/// Why a description-language setting was not stored.
+#[derive(Debug)]
+pub enum SetLanguageError {
+    /// Not a language code, `OriginalLanguage` or empty.
+    Invalid,
+    /// The stored configuration is not a JSON object, so setting one field
+    /// in it would throw the rest away.
+    Unreadable,
+    /// The configuration could not be read or written.
+    Store(String),
+}
+
+/// The stored description-language setting as written, empty when unset.
+pub async fn language_setting<S: PreferenceStore>(
+    store: &S,
+    user: UserId,
+) -> Result<String, String> {
+    let raw = store
+        .get_user_configuration(user)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(raw
+        .and_then(|r| serde_json::from_str::<UserConfigurationDto>(&r).ok())
+        .map(|c| c.description_language_preference)
+        .unwrap_or_default())
+}
+
+/// Store `value` as `user`'s description language, in their Jellyfin
+/// configuration (`DescriptionLanguagePreference`) so jellyfin-web and the
+/// native UI read and write the same setting. Every other field of the
+/// stored configuration, known or not, is kept as it was; a stored value
+/// that is not a JSON object is refused rather than overwritten. The value
+/// is stored in the form the settings pages offer: `fr` becomes `fra`,
+/// English becomes empty.
+pub async fn set_language_setting<S: PreferenceStore>(
+    store: &S,
+    user: UserId,
+    value: &str,
+) -> Result<(), SetLanguageError> {
+    let value = canonical_setting(value).ok_or(SetLanguageError::Invalid)?;
+    let raw = store
+        .get_user_configuration(user)
+        .await
+        .map_err(|e| SetLanguageError::Store(e.to_string()))?;
+    let mut cfg = match raw {
+        None => serde_json::json!({}),
+        Some(r) => match serde_json::from_str::<serde_json::Value>(&r) {
+            Ok(v) if v.is_object() => v,
+            _ => {
+                tracing::warn!(user.id = %user, size = r.len(), "description language not set: stored configuration is not a JSON object");
+                return Err(SetLanguageError::Unreadable);
+            }
+        },
+    };
+    cfg["DescriptionLanguagePreference"] = value.as_str().into();
+    store
+        .set_user_configuration(user, &cfg.to_string())
+        .await
+        .map_err(|e| SetLanguageError::Store(e.to_string()))?;
+    tracing::info!(user.id = %user, description_language = value, "description language set");
+    Ok(())
+}
+
+/// `raw` as the settings pages offer it, or `None` when it names no
+/// language.
+fn canonical_setting(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    match DescriptionLanguage::parse(raw) {
+        DescriptionLanguage::Original => Some(crate::metadata_language::ORIGINAL.to_string()),
+        DescriptionLanguage::Code(code) => Some(code),
+        DescriptionLanguage::Default => crate::metadata_language::normalize(raw)
+            .filter(|c| c == crate::metadata_language::DEFAULT_LANGUAGE)
+            .map(|_| String::new()),
+    }
+}
+
 /// The text to show for one owner from its stored rows, `None` to keep the
 /// default column.
 fn pick<'a>(lang: &DescriptionLanguage, rows: &'a [LocalizedText]) -> Option<&'a str> {
@@ -300,6 +379,63 @@ mod tests {
         assert_eq!(
             shown(&s, "OriginalLanguage").await,
             ("ブルマが…".into(), "悟空の冒険。".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_the_language_keeps_the_rest_of_the_configuration() {
+        use pharos_core::{SecretString, UserPolicy, UserRecord, UserStore};
+        let s = store().await;
+        let uid = UserId::new();
+        UserStore::create(
+            &s,
+            UserRecord {
+                id: uid,
+                name: "mika".into(),
+                password_hash: SecretString::new("$argon2id$fake"),
+                policy: UserPolicy::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(language_setting(&s, uid).await.unwrap(), "");
+        s.set_user_configuration(uid, r#"{"AudioLanguagePreference":"jpn","SomethingNew":1}"#)
+            .await
+            .unwrap();
+        set_language_setting(&s, uid, "fra").await.unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&s.get_user_configuration(uid).await.unwrap().unwrap()).unwrap();
+        assert_eq!(raw["AudioLanguagePreference"], "jpn");
+        assert_eq!(raw["SomethingNew"], 1);
+        assert_eq!(language_setting(&s, uid).await.unwrap(), "fra");
+        set_language_setting(&s, uid, "ja").await.unwrap();
+        assert_eq!(language_setting(&s, uid).await.unwrap(), "jpn");
+        set_language_setting(&s, uid, "en").await.unwrap();
+        assert_eq!(language_setting(&s, uid).await.unwrap(), "");
+        set_language_setting(&s, uid, "OriginalLanguage")
+            .await
+            .unwrap();
+        assert_eq!(
+            description_language(&s, uid).await,
+            DescriptionLanguage::Original
+        );
+        set_language_setting(&s, uid, "").await.unwrap();
+        assert_eq!(
+            description_language(&s, uid).await,
+            DescriptionLanguage::Default
+        );
+        assert!(matches!(
+            set_language_setting(&s, uid, "not a language").await,
+            Err(SetLanguageError::Invalid)
+        ));
+        s.set_user_configuration(uid, "[1,2]").await.unwrap();
+        assert!(matches!(
+            set_language_setting(&s, uid, "fra").await,
+            Err(SetLanguageError::Unreadable)
+        ));
+        assert_eq!(
+            s.get_user_configuration(uid).await.unwrap().unwrap(),
+            "[1,2]"
         );
     }
 
