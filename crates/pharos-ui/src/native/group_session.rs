@@ -503,6 +503,10 @@ impl GroupState {
     }
 }
 
+/// A queued group command: the epoch of the membership it was made in,
+/// its kind for the diagnostics, and the RPC.
+type QueuedCommand = (u64, String, LocalBoxFuture<'static, Result<(), GroupError>>);
+
 #[derive(Default)]
 struct Inner {
     state: GroupState,
@@ -525,9 +529,10 @@ struct Inner {
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
-    /// Group commands not yet sent; one task sends them one at a time, so the
-    /// server sees them in the order the viewer caused them.
-    commands: VecDeque<(String, LocalBoxFuture<'static, Result<(), GroupError>>)>,
+    /// Group commands not yet sent, each with the epoch of the membership it
+    /// was made in; one task sends them one at a time, so the server sees
+    /// them in the order the viewer caused them.
+    commands: VecDeque<QueuedCommand>,
     /// A task is working through `commands`.
     draining: bool,
     /// That task has a command's RPC out and unanswered.
@@ -651,6 +656,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let shown = inner.state.watching;
         // The drain task outlives a membership; its queue must too, or a
         // second task would start beside it and the order would be lost.
+        // Commands of the old membership stay queued but are dropped when
+        // reached, so none reaches the new group.
         let commands = std::mem::take(&mut inner.commands);
         let (draining, in_flight) = (inner.draining, inner.in_flight);
         *inner = Inner {
@@ -1235,7 +1242,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let (queued, start) = {
             let mut inner = self.inner.borrow_mut();
             let queued = inner.commands.len() + usize::from(inner.in_flight);
-            inner.commands.push_back((kind.clone(), fut.boxed_local()));
+            let epoch = inner.epoch;
+            inner
+                .commands
+                .push_back((epoch, kind.clone(), fut.boxed_local()));
             let start = !inner.draining;
             inner.draining = true;
             (queued, start)
@@ -1259,9 +1269,19 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                     }
                     next
                 };
-                let Some((kind, next)) = next else {
+                let Some((epoch, kind, next)) = next else {
                     return;
                 };
+                // The client resolves its membership only when the command
+                // is polled, so a command of an earlier membership would
+                // reach the group joined since: drop it instead.
+                let now = me.inner.borrow().epoch;
+                if epoch != now {
+                    me.env.info(&format!(
+                        "pharos: group command dropped kind={kind} reason=membership_changed epoch={epoch} now={now}"
+                    ));
+                    continue;
+                }
                 match select(next, me.env.sleep(COMMAND_TIMEOUT_MS)).await {
                     Either::Left((Err(e), _)) => me
                         .env
@@ -2000,18 +2020,44 @@ mod tests {
     }
 
     /// Joining again resets the membership, not the queue a running drain
-    /// task works through.
+    /// task works through; a command of the old membership still queued is
+    /// dropped when reached, never sent to the new group.
     #[test]
-    fn a_new_membership_keeps_the_command_queue_and_its_drain() {
+    fn a_new_membership_keeps_the_drain_and_drops_the_old_commands() {
         let rig = rig();
         rig.groups.hold_buffering();
         rig.session.on_media(MediaEvent::Waiting);
+        assert!(rig.session.seek(5_000));
         let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
         pump(&rig.env, &mut live);
         assert!(rig.session.inner.borrow().in_flight);
-        let _ = rig.session.join("g1").now_or_never();
+        let epoch = rig.session.inner.borrow().epoch;
+        // The fake ends a group its last member leaves, so this join is
+        // refused; the new membership was still prepared (a new epoch).
+        assert!(
+            rig.session.join("g1").now_or_never().is_some(),
+            "the join runs to its end"
+        );
+        assert!(rig.session.inner.borrow().epoch > epoch);
+        {
+            let inner = rig.session.inner.borrow();
+            assert!(inner.draining && inner.in_flight);
+            assert_eq!(inner.commands.len(), 1, "the old seek is still queued");
+        }
+        rig.groups.release_buffering(0);
+        pump(&rig.env, &mut live);
+        assert!(
+            calls_with(&rig, "seek").is_empty(),
+            "the old seek is dropped"
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group command dropped kind=seek(5000)")
+                .len(),
+            1
+        );
         let inner = rig.session.inner.borrow();
-        assert!(inner.draining && inner.in_flight);
+        assert!(!inner.draining && !inner.in_flight && inner.commands.is_empty());
     }
 
     /// Polls the tasks the session spawned, keeping the parked ones, until a
