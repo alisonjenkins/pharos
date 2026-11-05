@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use super::diagnostics::{self, Sink};
 use super::rails;
+use super::watch_view::Skip;
 use gloo_net::http::Request;
 use pharos_client::api::{Capabilities, ClientEvent, ClientEventKind, ClientLevel, NativeApi};
 use pharos_client::browser::{self, Connection};
@@ -1119,6 +1120,149 @@ pub fn on_key(mut on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> Key
             window.add_event_listener_with_callback("keydown", listener.as_ref().unchecked_ref());
     }
     KeyListener(listener)
+}
+
+/// The page-wide track skips, removed on drop: a window `keydown`
+/// listener and the media session's `previoustrack` / `nexttrack` actions.
+pub struct TrackSkips {
+    keys: Closure<dyn FnMut(web_sys::KeyboardEvent)>,
+    _actions: [Closure<dyn FnMut()>; 2],
+}
+
+thread_local! {
+    /// The media session actions [`on_track_skip`] made, for
+    /// [`offer_track_skips`] to set or clear.
+    static SKIP_ACTIONS: RefCell<Option<[js_sys::Function; 2]>> = const { RefCell::new(None) };
+    /// What [`offer_track_skips`] last offered, so a redraw that changes
+    /// nothing does not set the handlers again.
+    static SKIPS_OFFERED: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
+}
+
+impl Drop for TrackSkips {
+    fn drop(&mut self) {
+        offer_track_skips(false, false);
+        SKIP_ACTIONS.set(None);
+        SKIPS_OFFERED.set(None);
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("keydown", self.keys.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// `navigator.mediaSession`, where the browser has one. web-sys keeps it
+/// behind `web_sys_unstable_apis`, so it is reached by name.
+fn media_session() -> Option<JsValue> {
+    let navigator = web_sys::window()?.navigator();
+    js_sys::Reflect::get(&navigator, &JsValue::from_str("mediaSession"))
+        .ok()
+        .filter(|s| !s.is_undefined() && !s.is_null())
+}
+
+/// `mediaSession.setActionHandler(action, handler)`; `None` clears it.
+fn set_action_handler(session: &JsValue, action: &str, handler: Option<&js_sys::Function>) {
+    let Some(set) = js_sys::Reflect::get(session, &JsValue::from_str("setActionHandler"))
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+    else {
+        return;
+    };
+    let handler = handler.map_or(JsValue::NULL, |f| f.clone().into());
+    // A browser that does not know the action throws; it then has no
+    // button for it either.
+    if let Err(e) = set.call2(session, &JsValue::from_str(action), &handler) {
+        info(&format!("pharos: media session {action} refused: {e:?}"));
+    }
+}
+
+/// Call `on_skip` for a track skip asked for anywhere in the page (B562):
+/// Shift+P / Shift+N with the focus outside a text field, or the media
+/// keys and the system's media controls, which reach the page as the media
+/// session's `previoustrack` / `nexttrack`. Its answer for a key is
+/// whether it took the press. The actions are offered to the system only
+/// once [`offer_track_skips`] says there is somewhere to go.
+pub fn on_track_skip(on_skip: impl FnMut(Skip, &'static str) -> bool + 'static) -> TrackSkips {
+    let on_skip = Rc::new(RefCell::new(on_skip));
+    let keys = {
+        let on_skip = Rc::clone(&on_skip);
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            // Shift, not Caps Lock; Ctrl+Shift+P is a private window.
+            if !e.shift_key()
+                || e.ctrl_key()
+                || e.alt_key()
+                || e.meta_key()
+                || e.repeat()
+                || e.default_prevented()
+            {
+                return;
+            }
+            let skip = match e.key().as_str() {
+                "P" | "p" => Skip::Previous,
+                "N" | "n" => Skip::Next,
+                _ => return,
+            };
+            if in_text_field(&e) {
+                return;
+            }
+            if (on_skip.borrow_mut())(skip, "keyboard") {
+                e.prevent_default();
+            }
+        })
+    };
+    let action = |skip: Skip| {
+        let on_skip = Rc::clone(&on_skip);
+        Closure::<dyn FnMut()>::new(move || {
+            (on_skip.borrow_mut())(skip, "media_session");
+        })
+    };
+    let actions = [action(Skip::Previous), action(Skip::Next)];
+    SKIP_ACTIONS.set(Some(
+        actions
+            .each_ref()
+            .map(|a| a.as_ref().unchecked_ref::<js_sys::Function>().clone()),
+    ));
+    if let Some(window) = web_sys::window() {
+        let _ = window.add_event_listener_with_callback("keydown", keys.as_ref().unchecked_ref());
+    }
+    TrackSkips {
+        keys,
+        _actions: actions,
+    }
+}
+
+/// Offer the system the previous and next track where there is one, so its
+/// media controls grey out a button that would do nothing.
+pub fn offer_track_skips(previous: bool, next: bool) {
+    if SKIPS_OFFERED.replace(Some((previous, next))) == Some((previous, next)) {
+        return;
+    }
+    let Some(session) = media_session() else {
+        return;
+    };
+    SKIP_ACTIONS.with_borrow(|actions| {
+        let [on_previous, on_next] = match actions {
+            Some([p, n]) => [Some(p), Some(n)],
+            None => [None, None],
+        };
+        set_action_handler(&session, "previoustrack", on_previous.filter(|_| previous));
+        set_action_handler(&session, "nexttrack", on_next.filter(|_| next));
+    });
+}
+
+/// The key went to a field that takes text, where Shift+N is a capital N;
+/// a slider or checkbox keeps the skip.
+fn in_text_field(e: &web_sys::KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| {
+            el.closest(
+                "input:not([type=range], [type=checkbox], [type=radio], [type=button]), \
+                 textarea, select, [contenteditable]:not([contenteditable=false])",
+            )
+            .ok()
+            .flatten()
+        })
+        .is_some()
 }
 
 /// How the palette's shortcut is written on this device: Cmd on Apple's.
