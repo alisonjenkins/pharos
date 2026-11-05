@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/ui-subtitle-renderer`
 **Created**: 2026-11-05T21:30:00Z
-**Status**: Draft (awaiting Alison's go-ahead before slice 1)
+**Status**: Ready
 **Scope**: The native web UI (`/ui/`, 013/017), the Android TV app (025, WebView first) and later phone and native-video clients draw every text subtitle (SRT, WebVTT, ASS/SSA, embedded or sidecar) with one Rust crate, `pharos-subs`, instead of the browser's `<track>`/`::cue` and the vendored JASSUB. Image subtitles (019) and jellyfin-web are unchanged.
 **Decision record**: ADR-0064. **Backlog**: B572-B577. **Verification**: V485-V490.
 
