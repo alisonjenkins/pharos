@@ -670,6 +670,42 @@ fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
     assert!(art.is_empty(), "{art:?}");
 }
 
+/// An episode with no NFO of its own under a foreign `tvshow.nfo` shares its
+/// verdict, so the `-thumb` the same scrape left beside it is dropped.
+/// Disarm check: trusting an absent episode NFO keeps the thumb.
+#[test]
+fn an_episode_without_its_own_nfo_shares_a_foreign_show_nfos_verdict() {
+    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
+    std::fs::remove_file(media.with_extension("nfo")).unwrap();
+    let p = probe();
+    let req = request(&media, &p, &series);
+    let foreign = identity::foreign_nfos(&req);
+    assert!(foreign.show && foreign.episode, "{foreign:?}");
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(art.is_empty(), "{art:?}");
+}
+
+/// Under a foreign `tvshow.nfo`, a season folder's generic art is from the
+/// same scrape and is dropped; a trusted episode's own `-thumb` stays.
+/// Disarm check: probing the season folder with `detect_in_dir` again picks
+/// up its folder.jpg.
+#[test]
+fn a_foreign_shows_season_folder_art_is_dropped() {
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let season = media.parent().unwrap();
+    std::fs::write(season.join("folder.jpg"), b"jpg").unwrap();
+    std::fs::write(season.join("fanart.jpg"), b"jpg").unwrap();
+    let p = probe();
+    let req = request(&media, &p, &series);
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(
+        !has_local(&art, "folder.jpg") && !has_local(&art, "fanart.jpg"),
+        "{art:?}"
+    );
+    assert!(has_local(&art, "-thumb.jpg"), "{art:?}");
+}
+
 /// The show names the deployed library's `tvshow.nfo` files carry for folders
 /// whose name differs from them (2026-11-05). Every one but the last two names
 /// the folder's show; those two are scraper misidentifications.
