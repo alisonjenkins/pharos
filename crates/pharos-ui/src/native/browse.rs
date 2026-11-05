@@ -162,6 +162,105 @@ impl Narrow {
             Order::Released | Order::Added => Rail::Years,
         }
     }
+
+    /// The URL query naming this choice, `?` included; empty for the
+    /// default, so a library as it opens keeps its bare URL (B560).
+    pub fn to_query(&self) -> String {
+        let mut pairs = Vec::new();
+        if self.order != Order::Name {
+            pairs.push(format!("sort={}", self.order.token()));
+        }
+        if self.descending != self.order.starts_descending() {
+            pairs.push(format!(
+                "dir={}",
+                if self.descending { "desc" } else { "asc" }
+            ));
+        }
+        if let Some(genre) = &self.genre {
+            pairs.push(format!("genre={}", encode_component(genre)));
+        }
+        match self.played {
+            Some(true) => pairs.push("watched=watched".to_owned()),
+            Some(false) => pairs.push("watched=unwatched".to_owned()),
+            None => {}
+        }
+        if pairs.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", pairs.join("&"))
+        }
+    }
+
+    /// The choice a URL query names, `?` optional; a missing or unknown
+    /// value keeps the default.
+    pub fn from_query(query: &str) -> Self {
+        let mut order = Order::Name;
+        let mut descending = None;
+        let mut genre = None;
+        let mut played = None;
+        for pair in query.trim_start_matches('?').split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = decode_component(value);
+            match (key, value.as_str()) {
+                ("sort", v) => order = Order::from_token(v).unwrap_or(Order::Name),
+                ("dir", "asc") => descending = Some(false),
+                ("dir", "desc") => descending = Some(true),
+                ("genre", v) if !v.is_empty() => genre = Some(v.to_owned()),
+                ("watched", "watched") => played = Some(true),
+                ("watched", "unwatched") => played = Some(false),
+                _ => {}
+            }
+        }
+        Self {
+            order,
+            descending: descending.unwrap_or(order.starts_descending()),
+            genre,
+            played,
+        }
+    }
+}
+
+/// `s` with everything but unreserved URL characters percent-encoded.
+fn encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// A query value decoded: `+` is a space, `%XX` a byte; a malformed escape
+/// is kept as written.
+fn decode_component(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (b, hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            _ => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A loaded browse screen.
@@ -2356,6 +2455,72 @@ mod tests {
             "a new order keeps the filters"
         );
         assert_eq!(newest.rail(), Rail::Years);
+    }
+
+    #[test]
+    fn a_library_choice_round_trips_through_its_query() {
+        assert_eq!(
+            Narrow::default().to_query(),
+            "",
+            "the default is the bare URL"
+        );
+        assert_eq!(Narrow::from_query(""), Narrow::default());
+        for narrow in [
+            Narrow::default().ordered(Order::Added),
+            Narrow {
+                descending: true,
+                ..Narrow::default()
+            },
+            Narrow {
+                descending: false,
+                genre: Some("Sci-Fi & Fantasy".into()),
+                played: Some(false),
+                ..Narrow::default().ordered(Order::Released)
+            },
+            Narrow {
+                genre: Some("Comédie+ 100%".into()),
+                played: Some(true),
+                ..Narrow::default()
+            },
+        ] {
+            let query = narrow.to_query();
+            assert!(
+                !query.contains(' ') && query.matches('&').count() < 4,
+                "{query}"
+            );
+            assert_eq!(Narrow::from_query(&query), narrow, "{query}");
+        }
+        assert_eq!(
+            Narrow::default().ordered(Order::Added).to_query(),
+            "?sort=added",
+            "a date order's own direction is left out"
+        );
+    }
+
+    #[test]
+    fn a_library_query_reads_what_it_can_and_ignores_the_rest() {
+        let narrow =
+            Narrow::from_query("?sort=bogus&dir=up&genre=Sci-Fi+%26+Fantasy&watched=x&y=1");
+        assert_eq!(
+            narrow,
+            Narrow {
+                genre: Some("Sci-Fi & Fantasy".into()),
+                ..Narrow::default()
+            }
+        );
+        assert_eq!(
+            Narrow::from_query("genre=100%2"),
+            Narrow {
+                genre: Some("100%2".into()),
+                ..Narrow::default()
+            },
+            "a broken escape is kept as written"
+        );
+        assert_eq!(
+            Narrow::from_query("genre=a%+1b").genre.as_deref(),
+            Some("a% 1b"),
+            "a sign is not a hex digit"
+        );
     }
 
     #[test]
