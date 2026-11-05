@@ -19,6 +19,7 @@ mod library;
 mod limits;
 mod login;
 mod lyrics;
+mod media_token;
 mod mix;
 mod password;
 mod playback;
