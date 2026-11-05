@@ -5305,13 +5305,20 @@ async fn synth_album_or_artist(
                 "MusicAlbum",
             )
         };
+        // B580 — an album sits under its artist, as the music browse
+        // (library → artists → albums) has it, so a track's breadcrumb
+        // trail climbs through both to the Music library. With no artist
+        // tag the album sits straight under its library.
+        it.parent_id = holding_library(state, &tracks);
         if let Some(a) = artist {
+            let id = artist_id_for(&a);
+            it.parent_id = Some(id.clone());
             // `Artists` (strings) as well as `AlbumArtists` (NameGuidPair) —
             // see SynthItemDto::artists for why the client needs both.
             it.artists = Some(vec![a.clone()]);
             it.album_artists = Some(vec![NameGuidPairDto {
                 name: a.clone(),
-                id: artist_id_for(&a),
+                id,
             }]);
             it.album_artist = Some(a);
         }
@@ -5351,6 +5358,8 @@ async fn synth_album_or_artist(
                 backdrop_image_tags: Some(Vec::new()),
                 genres: Some(Vec::new()),
                 tags: Some(Vec::new()),
+                // B580 — the library holding the artist's tracks.
+                parent_id: holding_library(state, &tracks),
                 ..SynthItemDto::folder(
                     id_str.to_string(),
                     name.to_string(),
@@ -5713,6 +5722,27 @@ async fn library_view_for_id(
         .await
         .into_iter()
         .find(|v| v.get("Id").and_then(|i| i.as_str()) == Some(id_str))
+}
+
+/// B580 — the library a synthesised album or artist sits under: the one
+/// holding most of its `tracks`, the lowest wire id on a tie. Album and
+/// artist ids are names, so one can span libraries; counting keeps the
+/// answer the same from one request to the next whatever order the tracks
+/// come in.
+fn holding_library(state: &AppState, tracks: &[&MediaItem]) -> Option<String> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for track in tracks {
+        if let Some(library) = library_parent_id(state, track) {
+            *counts.entry(library).or_default() += 1;
+        }
+    }
+    // `max_by_key` keeps the last of equal maxima; iterate high to low so
+    // that is the lowest id.
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(library, _)| library)
 }
 
 /// Library-root id whose path prefixes this item, if any. Used to
