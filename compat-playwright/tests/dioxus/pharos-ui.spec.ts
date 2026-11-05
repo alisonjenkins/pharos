@@ -3020,6 +3020,84 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
 
+  // The floating window resizes from a top corner, away from the edge it
+  // sits nearest, keeping the opposite bottom corner put (B573).
+  test("the floating window resizes by its corner handle and the arrow keys", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    await page.setViewportSize({ width: 1200, height: 800 });
+    await signIn(page);
+    await openFirstHit(page, "Playwright");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    const stage = page.locator(".pharos-stage.is-floating");
+    await expect(stage).toBeVisible();
+    const grip = stage.getByRole("button", { name: "Resize the player with the arrow keys" });
+    await expect(grip).toHaveAttribute("data-grip", "top-left");
+
+    const before = (await stage.boundingBox())!;
+    const handle = (await grip.boundingBox())!;
+    await page.mouse.move(handle.x + 4, handle.y + 4);
+    await page.mouse.down();
+    await page.mouse.move(handle.x + 4 - 160, handle.y + 4, { steps: 8 });
+    await page.mouse.up();
+    const after = (await stage.boundingBox())!;
+    expect(after.width).toBeCloseTo(before.width + 160, 0);
+    expect(after.height, "the video keeps its shape").toBeCloseTo(
+      before.height + (160 * 9) / 16,
+      0,
+    );
+    expect(after.x + after.width, "the right edge stays").toBeCloseTo(
+      before.x + before.width,
+      0,
+    );
+    expect(after.y + after.height, "the bottom edge stays").toBeCloseTo(
+      before.y + before.height,
+      0,
+    );
+    await expect
+      .poll(() => page.evaluate(() => sessionStorage.getItem("pharos.stage.width")))
+      .toBe(String(Math.round(after.width)));
+
+    // Right moves the left-hand handle inwards: one step narrower.
+    await grip.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect.poll(async () => (await stage.boundingBox())!.width).toBeCloseTo(
+      after.width - 16,
+      0,
+    );
+
+    // The width outlives a reload of the tab.
+    const width = (await stage.boundingBox())!.width;
+    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+    await openFirstHit(page, "Playwright");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await expect.poll(async () => (await stage.boundingBox())!.width).toBeCloseTo(width, 0);
+    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+
+    // A song's window is the strip alone: nothing to resize.
+    await openFirstHit(page, "carefree");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
+    await expect(stage).toBeVisible();
+    await expect(grip).toBeHidden();
+  });
+
   test("the compact player keeps every control in view at 320px", async ({ page, request }) => {
     test.setTimeout(120_000);
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {

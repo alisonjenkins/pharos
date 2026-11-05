@@ -20,10 +20,17 @@ pub const STAGE_ID: &str = "pharos-stage";
 const SPOT_KEY: &str = "pharos.stage.spot";
 /// The view used when the player is not full, kept for the tab.
 const VIEW_KEY: &str = "pharos.stage.view";
+/// The floating window's width once resized, kept for the tab.
+const WIDTH_KEY: &str = "pharos.stage.width";
 /// The floating window's drag handle.
 const STRIP_CLASS: &str = "pharos-stage-strip";
 /// How far an arrow key moves the floating window, in px (FR-007).
 pub const KEY_STEP_PX: f64 = 16.0;
+/// The narrowest the floating window resizes to, in px: the strip's
+/// buttons with picture-in-picture need about 15rem.
+pub const MIN_WIDTH_PX: f64 = 240.0;
+/// How a video window's height follows its width: the picture is 16:9.
+const VIDEO_ASPECT: f64 = 9.0 / 16.0;
 
 /// How the player is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +137,82 @@ impl Spot {
     }
 }
 
+/// The floating window's resize handle: a top corner, over the video (the
+/// strip along the bottom carries Close), on the side away from the edge
+/// the window sits nearest. A resize keeps the opposite bottom corner put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Grip {
+    pub left: bool,
+}
+
+impl Grip {
+    pub fn for_spot(spot: Spot) -> Self {
+        Grip {
+            left: spot.x >= 0.5,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        if self.left {
+            "top-left"
+        } else {
+            "top-right"
+        }
+    }
+}
+
+/// A resize of the floating window: its new width and the spot that keeps
+/// the corner opposite `grip` where it was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Resized {
+    pub width: f64,
+    pub spot: Spot,
+}
+
+/// The floating video window `window` px at `spot`, its `grip` moved by
+/// `delta` px. The height is tied to the width, so the width follows the
+/// pointer along whichever axis it moved further, within [`MIN_WIDTH_PX`]
+/// and the viewport's width and height.
+pub fn resized(
+    spot: Spot,
+    grip: Grip,
+    delta: (f64, f64),
+    viewport: (f64, f64),
+    window: (f64, f64),
+) -> Resized {
+    let along_x = if grip.left { -delta.0 } else { delta.0 };
+    let along_y = -delta.1 / VIDEO_ASPECT;
+    let grow = if along_y.abs() > along_x.abs() {
+        along_y
+    } else {
+        along_x
+    };
+    let widest = viewport
+        .0
+        .min(window.0 + (viewport.1 - window.1) / VIDEO_ASPECT);
+    let width = (window.0 + grow)
+        .min(widest)
+        .max(MIN_WIDTH_PX)
+        .min(viewport.0);
+    let height = window.1 + (width - window.0) * VIDEO_ASPECT;
+    let (x, y) = spot.origin(viewport, window);
+    let origin = (
+        if grip.left { x + window.0 - width } else { x },
+        y + window.1 - height,
+    );
+    Resized {
+        width,
+        spot: Spot::at(origin, viewport, (width, height)),
+    }
+}
+
+fn decode_width(s: &str) -> Option<f64> {
+    s.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|w| w.is_finite() && *w >= MIN_WIDTH_PX)
+}
+
 /// What plays and how it is shown.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stage {
@@ -139,6 +222,8 @@ pub struct Stage {
     /// The view to use when the player leaves full: floating or mini.
     pub compact: View,
     pub spot: Spot,
+    /// The floating window's width in px once resized; none is the default.
+    pub width: Option<f64>,
     /// Counts the items played, so each one mounts its own player even when
     /// an item comes round again.
     pub play: u32,
@@ -154,6 +239,7 @@ impl Default for Stage {
             view: View::Full,
             compact: View::Floating,
             spot: Spot::default(),
+            width: None,
             play: 0,
             handoff: None,
         }
@@ -189,6 +275,7 @@ impl Stage {
                 .as_deref()
                 .and_then(Spot::decode)
                 .unwrap_or_default(),
+            width: read(WIDTH_KEY).as_deref().and_then(decode_width),
             ..Stage::default()
         }
     }
@@ -326,6 +413,21 @@ impl Stage {
     /// drag, not on every move.
     pub fn keep_spot(&self) {
         store(SPOT_KEY, &self.spot.encode());
+    }
+
+    /// Resize the floating window.
+    pub fn resize(&mut self, to: Resized) {
+        self.width = Some(to.width);
+        self.spot = to.spot;
+    }
+
+    /// Remember the floating window's size and spot for the tab, at the end
+    /// of a resize.
+    pub fn keep_size(&self) {
+        if let Some(w) = self.width {
+            store(WIDTH_KEY, &format!("{w:.0}"));
+        }
+        self.keep_spot();
     }
 
     /// Stop showing anything.
@@ -589,6 +691,100 @@ pub fn StageClose(item: ItemRef) -> Element {
     }
 }
 
+/// A resize in progress: where the pointer and the window started.
+#[derive(Debug, Clone, Copy)]
+struct Resizing {
+    pointer: (f64, f64),
+    spot: Spot,
+    grip: Grip,
+    window: (f64, f64),
+}
+
+/// The floating window's resize handle, on the corner [`Grip::for_spot`]
+/// picks. Drag it, or focus it and use the arrow keys. Shown for a video
+/// only: a song's window is the strip alone.
+#[component]
+pub fn StageGrip() -> Element {
+    let StageCtx(mut stage) = use_context::<StageCtx>();
+    let mut resizing = use_signal(|| None::<Resizing>);
+    // Mid-resize the grip stays on its corner, though the spot moves.
+    let grip = resizing
+        .read()
+        .map_or_else(|| Grip::for_spot(stage.read().spot), |r| r.grip);
+    let start = move |pointer: (f64, f64)| {
+        let spot = stage.peek().spot;
+        Resizing {
+            pointer,
+            spot,
+            grip: Grip::for_spot(spot),
+            window: platform::element_size(STAGE_ID),
+        }
+    };
+    let to = move |r: Resizing, delta: (f64, f64)| {
+        resized(r.spot, r.grip, delta, platform::viewport(), r.window)
+    };
+    let log = move || {
+        let s = stage.peek();
+        platform::info(&format!(
+            "pharos: stage resize width={:.0} x={:.3} y={:.3}",
+            s.width.unwrap_or_default(),
+            s.spot.x,
+            s.spot.y
+        ));
+    };
+    rsx! {
+        button {
+            class: "pharos-stage-grip",
+            r#type: "button",
+            "data-grip": grip.label(),
+            aria_label: "Resize the player with the arrow keys",
+            title: "Drag to resize",
+            onkeydown: move |evt: KeyboardEvent| {
+                // Every arrow changes the width by one step; up and down
+                // move the handle by the height that step gives.
+                let rise = KEY_STEP_PX * VIDEO_ASPECT;
+                let delta = match evt.key() {
+                    Key::ArrowLeft => (-KEY_STEP_PX, 0.0),
+                    Key::ArrowRight => (KEY_STEP_PX, 0.0),
+                    Key::ArrowUp => (0.0, -rise),
+                    Key::ArrowDown => (0.0, rise),
+                    _ => return,
+                };
+                evt.prevent_default();
+                let r = to(start((0.0, 0.0)), delta);
+                stage.write().resize(r);
+                stage.peek().keep_size();
+                log();
+            },
+            onpointerdown: move |evt: PointerEvent| {
+                let at = evt.client_coordinates();
+                platform::capture_pointer(&evt);
+                resizing.set(Some(start((at.x, at.y))));
+            },
+            onpointermove: move |evt: PointerEvent| {
+                let Some(r) = *resizing.peek() else {
+                    return;
+                };
+                let at = evt.client_coordinates();
+                stage.write().resize(to(r, (at.x - r.pointer.0, at.y - r.pointer.1)));
+            },
+            onpointerup: move |_| {
+                if resizing.peek().is_some() {
+                    resizing.set(None);
+                    stage.peek().keep_size();
+                    log();
+                }
+            },
+            onpointercancel: move |_| {
+                if resizing.peek().is_some() {
+                    resizing.set(None);
+                    stage.peek().keep_size();
+                }
+            },
+        }
+    }
+}
+
 const ICON_CLOSE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4Z";
 
 #[cfg(test)]
@@ -597,6 +793,68 @@ mod tests {
 
     const VIEWPORT: (f64, f64) = (1000.0, 800.0);
     const WINDOW: (f64, f64) = (320.0, 220.0);
+
+    #[test]
+    fn the_grip_sits_on_the_top_corner_away_from_the_nearest_edge() {
+        assert_eq!(Grip::for_spot(Spot::default()).label(), "top-left");
+        assert_eq!(Grip::for_spot(Spot { x: 0.2, y: 0.9 }).label(), "top-right");
+    }
+
+    #[test]
+    fn a_resize_keeps_the_opposite_corner_in_place() {
+        for spot in [
+            Spot::default(),
+            Spot { x: 0.0, y: 1.0 },
+            Spot { x: 0.3, y: 0.7 },
+        ] {
+            let grip = Grip::for_spot(spot);
+            let out = |v: f64, toward_start: bool| if toward_start { -v } else { v };
+            let delta = (out(80.0, grip.left), 0.0);
+            let r = resized(spot, grip, delta, VIEWPORT, WINDOW);
+            assert!((r.width - 400.0).abs() < 1e-9, "{r:?}");
+            let height = WINDOW.1 + 80.0 * VIDEO_ASPECT;
+            let (x0, y0) = spot.origin(VIEWPORT, WINDOW);
+            let (x1, y1) = r.spot.origin(VIEWPORT, (r.width, height));
+            let far = |a: f64, size: f64, at_start: bool| if at_start { a + size } else { a };
+            assert!(
+                (far(x0, WINDOW.0, grip.left) - far(x1, r.width, grip.left)).abs() < 1e-6,
+                "{spot:?} x"
+            );
+            assert!(
+                (far(y0, WINDOW.1, true) - far(y1, height, true)).abs() < 1e-6,
+                "{spot:?} y"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vertical_drag_resizes_through_the_aspect() {
+        let grip = Grip::for_spot(Spot::default());
+        let r = resized(Spot::default(), grip, (0.0, -90.0), VIEWPORT, WINDOW);
+        assert!((r.width - 480.0).abs() < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn a_resize_stays_between_the_minimum_and_the_viewport() {
+        let grip = Grip::for_spot(Spot::default());
+        let small = resized(Spot::default(), grip, (5000.0, 0.0), VIEWPORT, WINDOW);
+        assert!((small.width - MIN_WIDTH_PX).abs() < 1e-9, "{small:?}");
+        let big = resized(Spot::default(), grip, (-5000.0, 0.0), VIEWPORT, WINDOW);
+        assert!((big.width - VIEWPORT.0).abs() < 1e-9, "{big:?}");
+        // On a wide, short viewport the height reaches it first.
+        let short = (1600.0, 500.0);
+        let big = resized(Spot::default(), grip, (-5000.0, 0.0), short, WINDOW);
+        let height = WINDOW.1 + (big.width - WINDOW.0) * VIDEO_ASPECT;
+        assert!((height - short.1).abs() < 1e-6, "{big:?}");
+    }
+
+    #[test]
+    fn a_stored_width_below_the_minimum_or_garbage_is_dropped() {
+        assert_eq!(decode_width("480"), Some(480.0));
+        assert_eq!(decode_width("12"), None);
+        assert_eq!(decode_width("NaN"), None);
+        assert_eq!(decode_width("wide"), None);
+    }
 
     #[test]
     fn the_default_spot_is_the_bottom_right_corner() {

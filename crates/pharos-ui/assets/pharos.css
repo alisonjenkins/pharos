@@ -3432,7 +3432,9 @@ body::before {
   display: none;
 }
 .pharos-stage.is-floating {
-  --pharos-stage-w: min(20rem, 60vw);
+  /* A resized window keeps its width (inline `--pharos-stage-user-w`),
+     never wider than the viewport. */
+  --pharos-stage-w: min(var(--pharos-stage-user-w, min(20rem, 60vw)), 100vw);
   /* Never taller than the viewport: on a short one the video gives way
      (it is contained) and the strip stays in view. */
   --pharos-stage-h: min(calc(var(--pharos-stage-w) * 9 / 16 + 3.25rem + 3px), 100%);
@@ -3631,11 +3633,50 @@ body:has(.pharos-stage.is-mini) .pharos-main {
 .pharos-stage.is-floating .pharos-stage-art {
   display: none;
 }
+/* The resize handle: a top corner over the video, on the side away from
+   the edge the window sits nearest. A song's window has no picture to
+   size, so no handle. */
+.pharos-stage-grip {
+  position: absolute;
+  z-index: 1;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  background:
+    linear-gradient(135deg, transparent 45%, var(--px-color-fg-muted) 45% 55%, transparent 55%),
+    linear-gradient(135deg, transparent 70%, var(--px-color-fg-muted) 70% 80%, transparent 80%);
+  opacity: 0.7;
+  touch-action: none;
+}
+.pharos-stage-grip:hover,
+.pharos-stage-grip:focus-visible {
+  opacity: 1;
+}
+.pharos-stage-grip:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
+}
+.pharos-stage-grip[data-grip="top-left"] {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+  rotate: 180deg;
+}
+.pharos-stage-grip[data-grip="top-right"] {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+  rotate: -90deg;
+}
+.pharos-stage.is-floating:not(:has(.pharos-watch)) .pharos-stage-grip {
+  display: none;
+}
 @media (max-width: 40rem) {
   /* The strip needs about 15rem with picture-in-picture; at 320px the
      60vw window clipped Close. */
   .pharos-stage.is-floating {
-    --pharos-stage-w: min(20rem, 100vw);
+    --pharos-stage-w: min(var(--pharos-stage-user-w, 20rem), 100vw);
   }
   .pharos-stage.is-mini .pharos-watch {
     width: 5rem;
