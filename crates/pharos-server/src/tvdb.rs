@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
-use crate::online_enrich::{EnrichedMetadata, RemoteArt};
+use crate::online_enrich::{EnrichedMetadata, RemoteArt, TextsFetch};
 use pharos_core::{ArtworkRole, LocalizedText, MediaKind, SearchCandidate};
 
 /// TVDB v4 REST base.
@@ -166,6 +166,16 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// [`authed_get`](Self::authed_get) that hands back the final status
     /// with the body, so a caller can tell "TVDB has no such record" (404)
     /// from a failed request. `None` only when no token could be had.
+    /// A record body for the text fetch: 200 is the body, 404 is
+    /// [`TextsFetch::NotFound`], anything else [`TextsFetch::Failed`].
+    async fn record_body(&self, path: &str) -> Result<String, TextsFetch> {
+        match self.authed_get_status(path).await {
+            Some((200, body)) => Ok(body),
+            Some((404, _)) => Err(TextsFetch::NotFound),
+            _ => Err(TextsFetch::Failed),
+        }
+    }
+
     async fn authed_get_status(&self, path: &str) -> Option<(u16, String)> {
         let token = self.ensure_token().await?;
         let (status, body) = self.transport.get(path, &token).await;
@@ -197,7 +207,8 @@ impl<T: TvdbTransport> TvdbClient<T> {
     pub async fn get_series(&self, id: &str) -> Option<EnrichedMetadata> {
         let mut md = self
             .series_record(id, &[DEFAULT_LANGUAGE.to_string()])
-            .await?;
+            .await
+            .ok()?;
         prefer_language(&mut md, DEFAULT_LANGUAGE);
         Some(md)
     }
@@ -205,11 +216,17 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// The series record with `texts` holding each of `languages` plus the
     /// original. `?meta=translations` inlines every translation TVDB has, so
     /// this is one request whatever the languages.
-    async fn series_record(&self, id: &str, languages: &[String]) -> Option<EnrichedMetadata> {
+    /// A body that does not parse is [`TextsFetch::Failed`]: TVDB answered,
+    /// but not with a record.
+    async fn series_record(
+        &self,
+        id: &str,
+        languages: &[String],
+    ) -> Result<EnrichedMetadata, TextsFetch> {
         let body = self
-            .authed_get(&format!("/series/{id}/extended?meta=translations"))
+            .record_body(&format!("/series/{id}/extended?meta=translations"))
             .await?;
-        let mut md = parse_series_detail(&body)?;
+        let mut md = parse_series_detail(&body).ok_or(TextsFetch::Failed)?;
         let all = parse_series_texts(&body);
         md.texts = pick_languages(all, languages, |lang, outcome| {
             record_translation("tvdb", lang, outcome);
@@ -222,7 +239,7 @@ impl<T: TvdbTransport> TvdbClient<T> {
                 );
             }
         });
-        Some(md)
+        Ok(md)
     }
 
     /// Fetch a single episode's detail by series id + season/episode
@@ -236,7 +253,8 @@ impl<T: TvdbTransport> TvdbClient<T> {
     ) -> Option<EnrichedMetadata> {
         let (mut md, _) = self
             .episode_record(series_id, season, episode, &[DEFAULT_LANGUAGE.to_string()])
-            .await?;
+            .await
+            .ok()?;
         prefer_language(&mut md, DEFAULT_LANGUAGE);
         Some(md)
     }
@@ -246,18 +264,19 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// (`nameTranslations`/`overviewTranslations`), so a language it does not
     /// list is recorded missing without a request; one it lists costs one
     /// `/episodes/{id}/translations/{lang}`. The flag is true when one of
-    /// those requests failed, so its language has no row.
+    /// those requests failed, so its language has no row. An episode the
+    /// list does not hold is [`TextsFetch::NotFound`].
     async fn episode_record(
         &self,
         series_id: &str,
         season: u32,
         episode: u32,
         languages: &[String],
-    ) -> Option<(EnrichedMetadata, bool)> {
+    ) -> Result<(EnrichedMetadata, bool), TextsFetch> {
         let body = self
-            .authed_get(&format!("/series/{series_id}/episodes/default"))
+            .record_body(&format!("/series/{series_id}/episodes/default"))
             .await?;
-        let mut md = parse_episode_detail(&body, season, episode)?;
+        let mut md = parse_episode_detail(&body, season, episode).ok_or(TextsFetch::NotFound)?;
         let langs = parse_episode_languages(&body, season, episode);
         let mut texts = Vec::new();
         let mut failed = false;
@@ -334,7 +353,7 @@ impl<T: TvdbTransport> TvdbClient<T> {
             }
         }
         md.texts = texts;
-        Some((md, failed))
+        Ok((md, failed))
     }
 
     /// Download the raw bytes of a TVDB artwork/image CDN URL. `None` on
@@ -945,19 +964,23 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
         season: Option<u32>,
         episode: Option<u32>,
         languages: &[String],
-    ) -> Option<Vec<LocalizedText>> {
+    ) -> TextsFetch {
         if kind != MediaKind::Episode {
-            return None;
+            return TextsFetch::NotFound;
         }
         match (season, episode) {
             // A failed translation request fails the whole record, so the
             // backfill ages it a day and counts it toward its failure stop
             // instead of asking for it again on every pass.
-            (Some(s), Some(e)) => {
-                let (md, failed) = self.0.episode_record(id, s, e, languages).await?;
-                (!failed).then_some(md.texts)
-            }
-            _ => self.0.series_record(id, languages).await.map(|md| md.texts),
+            (Some(s), Some(e)) => match self.0.episode_record(id, s, e, languages).await {
+                Ok((_, true)) => TextsFetch::Failed,
+                Ok((md, false)) => TextsFetch::Found(md.texts),
+                Err(miss) => miss,
+            },
+            _ => match self.0.series_record(id, languages).await {
+                Ok(md) => TextsFetch::Found(md.texts),
+                Err(miss) => miss,
+            },
         }
     }
 }
@@ -1495,9 +1518,42 @@ mod tests {
                 )
                 .await
         };
-        assert!(fetch(500).await.is_none());
-        let missed = fetch(404).await.expect("a 404 is an answer");
+        assert_eq!(fetch(500).await, TextsFetch::Failed);
+        let TextsFetch::Found(missed) = fetch(404).await else {
+            panic!("a 404 is an answer");
+        };
         assert!(by_lang(&missed, "eng").is_some_and(|r| r.overview.is_none()));
+    }
+
+    /// An episode the series' list does not hold, or a series TVDB answers
+    /// 404 for, is `NotFound`; a failed list request is `Failed`.
+    #[tokio::test]
+    async fn a_record_tvdb_does_not_have_is_not_a_failure() {
+        use crate::online_enrich::OnlineEnricher;
+        let episode = |t: FakeTransport, season: u32| async move {
+            TvdbEnricher(TvdbClient::with_transport("key".into(), t))
+                .fetch_texts(
+                    MediaKind::Episode,
+                    "76666",
+                    Some(season),
+                    Some(1),
+                    &["eng".into()],
+                )
+                .await
+        };
+        let list = || {
+            FakeTransport::new()
+                .push_login("jwt")
+                .push_ok(ANIME_EPISODES)
+        };
+        assert_eq!(episode(list(), 99).await, TextsFetch::NotFound);
+        let failed = FakeTransport::new().push_login("jwt").push_status(500, "");
+        assert_eq!(episode(failed, 1).await, TextsFetch::Failed);
+        let series = FakeTransport::new().push_login("jwt").push_status(404, "");
+        let got = TvdbEnricher(TvdbClient::with_transport("key".into(), series))
+            .fetch_texts(MediaKind::Episode, "76666", None, None, &["eng".into()])
+            .await;
+        assert_eq!(got, TextsFetch::NotFound);
     }
 
     #[test]

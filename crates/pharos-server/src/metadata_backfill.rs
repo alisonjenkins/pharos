@@ -37,9 +37,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bg_io::BgPermit;
 use crate::config::MetadataConfig;
+use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::musicbrainz::{AlbumArtResolver, MusicBrainzClient};
 use crate::online_enrich::{
     apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
+    TextsFetch,
 };
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
@@ -47,8 +49,9 @@ use crate::tvdb::{ReqwestTransport, TvdbEnricher};
 use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
-    match_best, ArtworkRole, DomainResult, GenreStore, MediaItem, MediaKind, MediaStore,
-    PersonStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
+    match_best, ArtworkRole, DomainResult, GenreStore, LocalizedText, MediaItem, MediaKind,
+    MediaStore, MetadataTranslationStore, PersonStore, PreferenceStore, ProviderIds,
+    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, TranslationGap, TranslationOwner,
 };
 use pharos_scanner::FilenameProvider;
 
@@ -230,6 +233,9 @@ where
         + GenreStore
         + PersonStore
         + SeriesMetadataStore
+        + MetadataTranslationStore
+        + PreferenceStore
+        + pharos_core::UserStore
         + pharos_store_sqlx::ServerConfigStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
@@ -295,6 +301,15 @@ where
                 had_work |= series_had_work;
             }
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
+        }
+    }
+
+    // B564 — text of shows and episodes matched before English was asked for,
+    // and of every language a user has picked since.
+    if let (Some(tv), true) = (tvdb, cfg.fetch_translations) {
+        match translation_pass(store, bg_io, tv, now).await {
+            Ok(stored) => had_work |= stored > 0,
+            Err(e) => tracing::warn!(error = %e, "metadata translation pass aborted"),
         }
     }
     Ok(PassStats { enriched, had_work })
@@ -441,7 +456,7 @@ pub(crate) async fn enrich_one<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
 {
     let stem = search_stem(&item);
 
@@ -655,6 +670,18 @@ where
     // only fills gaps), then stamp the matched provider id if we hadn't one.
     let counts = store.item_entity_counts(item.id).await?;
     let applied = apply_enrichment(&mut item, counts, &enriched);
+    // B564 — a refresh of an item stored before English was asked for still
+    // holds the base-record text, which fill-if-empty would keep.
+    // `fetch_translations` is the kill switch for this rewrite too.
+    if cfg.fetch_translations
+        && adopt_default_text(
+            Some(&mut item.title),
+            &mut item.metadata.overview,
+            &enriched.texts,
+        )
+    {
+        log_adopted(&TranslationOwner::Item(item.id), "enrichment");
+    }
     match matched_provider {
         "tmdb" if item.metadata.provider_ids.tmdb.is_none() => {
             item.metadata.provider_ids.tmdb = Some(external_id.clone());
@@ -665,6 +692,13 @@ where
         _ => {}
     }
     store.put(item.clone()).await?;
+    store_texts(
+        store,
+        &TranslationOwner::Item(item.id),
+        &enriched.texts,
+        now,
+    )
+    .await;
 
     // Join entities are linked only when the item had none (apply_enrichment's
     // fill-if-empty gate) — a curated NFO cast/genre list is never diluted.
@@ -860,7 +894,7 @@ pub(crate) async fn apply_manual_match<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
 {
     store
         .set_item_match(id, provider, external_id, "manual", None, now)
@@ -1342,7 +1376,7 @@ async fn enrich_series_pass<Tv, Tm, S>(
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore,
+    S: SeriesMetadataStore + MetadataTranslationStore,
 {
     let providers = SeriesProviders { tvdb, tmdb };
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -1394,7 +1428,7 @@ async fn enrich_one_series<Tv, Tm, S>(
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore,
+    S: SeriesMetadataStore + MetadataTranslationStore,
 {
     // B125 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
     // deployed library's 178 shows were marked `none` by TVDB alone, almost all
@@ -1496,7 +1530,363 @@ where
             ratings: Default::default(),
         })
         .await?;
+    store_texts(
+        store,
+        &TranslationOwner::Series(cand.series_key.clone()),
+        &hit.enriched.texts,
+        now,
+    )
+    .await;
     Ok(true)
+}
+
+/// Most shows and episodes one [`translation_pass`] asks the provider about.
+/// Each costs one or two requests.
+const TRANSLATIONS_PER_PASS: i64 = 500;
+
+/// A language the provider did not have is asked about again after this long:
+/// TVDB's volunteers add translations over time.
+const MISSING_RETRY_SECS: i64 = 30 * 86_400;
+
+/// A record that could not be read is asked about again after this long, so a
+/// show TVDB cannot place does not hold the front of every pass.
+const FAILED_RETRY_SECS: i64 = 86_400;
+
+/// Consecutive unreadable records after which a pass stops: the provider is
+/// down, and marking everything behind them failed would only delay them.
+const MAX_CONSECUTIVE_FAILURES: usize = 3;
+
+/// B564 / ADR-0062 — fill in the provider text missing for matched shows and
+/// episodes: English, plus every language a user has picked. Shows and
+/// episodes stored before English was asked for get their base-record
+/// description replaced by the English one ([`adopt_default_text`]). Returns
+/// how many owners got rows.
+async fn translation_pass<Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    tvdb: &Tv,
+    now: i64,
+) -> DomainResult<usize>
+where
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + SeriesMetadataStore
+        + MetadataTranslationStore
+        + PreferenceStore
+        + pharos_core::UserStore,
+{
+    let languages = wanted_languages(store).await;
+    let cutoff = now.saturating_sub(MISSING_RETRY_SECS);
+    let todo = collect_gaps(
+        store,
+        tvdb.provider(),
+        &languages,
+        cutoff,
+        TRANSLATIONS_PER_PASS,
+    )
+    .await?;
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    tracing::info!(
+        owners = todo.len(),
+        languages = ?languages,
+        "metadata translation pass: fetching provider text"
+    );
+    let mut stored = 0usize;
+    let mut failures = 0usize;
+    for (gap, langs) in todo {
+        let texts = {
+            let _permit = BgPermit::acquire(bg_io).await;
+            tvdb.fetch_texts(
+                MediaKind::Episode,
+                &gap.series_external_id,
+                gap.season,
+                gap.episode,
+                &langs,
+            )
+            .await
+        };
+        tokio::time::sleep(REQUEST_SPACING).await;
+        let misses = || -> Vec<LocalizedText> {
+            langs
+                .iter()
+                .map(|l| LocalizedText {
+                    language: l.clone(),
+                    ..LocalizedText::default()
+                })
+                .collect()
+        };
+        let texts = match texts {
+            TextsFetch::Found(texts) => texts,
+            // The provider answered and has no such record: not an outage.
+            // Every language is recorded missing now, so the record waits
+            // MISSING_RETRY_SECS and the records behind it are reached.
+            TextsFetch::NotFound => {
+                for lang in &langs {
+                    record_translation(tvdb.provider(), lang, TranslationOutcome::Missing);
+                }
+                tracing::info!(
+                    owner = ?gap.owner,
+                    provider = tvdb.provider(),
+                    series_external_id = %gap.series_external_id,
+                    season = gap.season,
+                    episode = gap.episode,
+                    languages = ?langs,
+                    reason = "provider has no such record",
+                    "tvdb text falls back to the default text"
+                );
+                failures = 0;
+                if store_texts(store, &gap.owner, &misses(), now).await {
+                    stored += 1;
+                }
+                continue;
+            }
+            TextsFetch::Failed => {
+                for lang in &langs {
+                    record_translation(tvdb.provider(), lang, TranslationOutcome::Error);
+                }
+                failures += 1;
+                tracing::warn!(
+                    owner = ?gap.owner,
+                    provider = tvdb.provider(),
+                    series_external_id = %gap.series_external_id,
+                    season = gap.season,
+                    episode = gap.episode,
+                    languages = ?langs,
+                    "metadata translation pass: record could not be read; text stays the default"
+                );
+                // Mark the languages missing, aged so they are asked again after
+                // FAILED_RETRY_SECS rather than MISSING_RETRY_SECS.
+                let aged = now.saturating_sub(MISSING_RETRY_SECS - FAILED_RETRY_SECS);
+                store_texts(store, &gap.owner, &misses(), aged).await;
+                // Stop only after marking this record, so a run of records the
+                // provider cannot place moves the front of the gap list forward
+                // instead of holding it.
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    tracing::warn!(
+                        failures,
+                        "metadata translation pass: stopping, the provider looks unavailable"
+                    );
+                    break;
+                }
+                continue;
+            }
+        };
+        failures = 0;
+        if let Err(e) = adopt_for_owner(store, &gap.owner, &texts).await {
+            tracing::warn!(error = %e, owner = ?gap.owner, "metadata translation pass: could not replace the default text");
+        }
+        if store_texts(store, &gap.owner, &texts, now).await {
+            stored += 1;
+        }
+    }
+    Ok(stored)
+}
+
+/// English plus every language a user has picked for descriptions, in a
+/// stable order. A user whose configuration cannot be read is skipped: the
+/// worst case is a language filled in a pass later.
+/// The owners one translation pass asks for, each with the languages it
+/// is missing: at most `budget` owners. One request per owner covers all
+/// its missing languages.
+///
+/// Every language first gets an equal share of the budget, so a user's
+/// language is fetched alongside the English backlog instead of waiting
+/// for all of it to drain (English is a gap on every show stored before
+/// it was asked for). Budget a language leaves unused then goes to the
+/// languages that still have gaps, in order.
+async fn collect_gaps<S>(
+    store: &S,
+    provider: &str,
+    languages: &[String],
+    cutoff: i64,
+    budget: i64,
+) -> DomainResult<Vec<(TranslationGap, Vec<String>)>>
+where
+    S: MetadataTranslationStore,
+{
+    let mut todo: Vec<(TranslationGap, Vec<String>)> = Vec::new();
+    let mut index: std::collections::HashMap<TranslationOwner, usize> = Default::default();
+    let count = i64::try_from(languages.len()).unwrap_or(i64::MAX).max(1);
+    let share = (budget / count).max(1);
+    // How many gaps each language has asked for so far; a later, larger
+    // query returns those first again (the gap order is stable).
+    let mut asked = vec![0i64; languages.len()];
+    for round in 0..2 {
+        for (n, lang) in languages.iter().enumerate() {
+            let room = budget - i64::try_from(todo.len()).unwrap_or(i64::MAX);
+            if room <= 0 {
+                return Ok(todo);
+            }
+            let limit = if round == 0 {
+                share.min(room)
+            } else {
+                asked[n] + room
+            };
+            if round == 1 && asked[n] < share {
+                // Fewer gaps than its share: none left to ask for.
+                continue;
+            }
+            let gaps = store
+                .translation_gaps(provider, lang, cutoff, limit)
+                .await?;
+            asked[n] = i64::try_from(gaps.len()).unwrap_or(i64::MAX);
+            for gap in gaps {
+                match index.get(&gap.owner) {
+                    Some(&i) => {
+                        if !todo[i].1.contains(lang) {
+                            todo[i].1.push(lang.clone());
+                        }
+                    }
+                    None => {
+                        if i64::try_from(todo.len()).unwrap_or(i64::MAX) >= budget {
+                            continue;
+                        }
+                        index.insert(gap.owner.clone(), todo.len());
+                        todo.push((gap, vec![lang.clone()]));
+                    }
+                }
+            }
+        }
+    }
+    Ok(todo)
+}
+
+async fn wanted_languages<S>(store: &S) -> Vec<String>
+where
+    S: PreferenceStore + pharos_core::UserStore,
+{
+    use crate::metadata_language::DescriptionLanguage;
+    let mut out = std::collections::BTreeSet::new();
+    match store.list().await {
+        Ok(users) => {
+            for u in users {
+                let Ok(Some(raw)) = store.get_user_configuration(u.id).await else {
+                    continue;
+                };
+                let Ok(cfg) =
+                    serde_json::from_str::<pharos_jellyfin_api::dto::UserConfigurationDto>(&raw)
+                else {
+                    continue;
+                };
+                if let DescriptionLanguage::Code(c) =
+                    DescriptionLanguage::parse(&cfg.description_language_preference)
+                {
+                    out.insert(c);
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "metadata translation pass: could not list users"),
+    }
+    let mut langs = vec![DEFAULT_LANGUAGE.to_string()];
+    langs.extend(out.into_iter().filter(|l| l != DEFAULT_LANGUAGE));
+    langs
+}
+
+/// Store `texts` for `owner`, logging rather than failing: the rows are a
+/// cache of provider text, and a failed write is retried by the next pass.
+/// `true` when there was something to store and it was stored.
+async fn store_texts<S: MetadataTranslationStore>(
+    store: &S,
+    owner: &TranslationOwner,
+    texts: &[LocalizedText],
+    now: i64,
+) -> bool {
+    if texts.is_empty() {
+        return false;
+    }
+    match store.upsert_translations(owner, texts, now).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, owner = ?owner, "could not store provider text per language");
+            false
+        }
+    }
+}
+
+/// [`adopt_default_text`] for a stored show or episode, written back when
+/// it changed anything.
+async fn adopt_for_owner<S>(
+    store: &S,
+    owner: &TranslationOwner,
+    texts: &[LocalizedText],
+) -> DomainResult<()>
+where
+    S: MediaStore + SeriesMetadataStore,
+{
+    match owner {
+        TranslationOwner::Item(id) => {
+            let mut item = store.get(*id).await?;
+            if adopt_default_text(Some(&mut item.title), &mut item.metadata.overview, texts) {
+                store.put(item).await?;
+                log_adopted(owner, "translation pass");
+            }
+        }
+        TranslationOwner::Series(key) => {
+            let mut map = store
+                .series_metadata_by_keys(std::slice::from_ref(key))
+                .await?;
+            if let Some(mut meta) = map.remove(key) {
+                if adopt_default_text(None, &mut meta.overview, texts) {
+                    store.upsert_series_metadata(meta).await?;
+                    log_adopted(owner, "translation pass");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn log_adopted(owner: &TranslationOwner, by: &'static str) {
+    tracing::info!(
+        owner = ?owner,
+        by,
+        language = DEFAULT_LANGUAGE,
+        "replaced a stored provider base-record description with the English text"
+    );
+}
+
+/// B564 / V474 — replace provider base-record text in the default columns
+/// with the English text from `texts`. Only a value equal to the base
+/// record's own text is replaced, so text from a local NFO, or one a person
+/// edited, is never touched (local wins). Nothing changes when the record was
+/// written in English, or TVDB has no English text. `true` when something
+/// changed.
+pub(crate) fn adopt_default_text(
+    title: Option<&mut String>,
+    overview: &mut Option<String>,
+    texts: &[LocalizedText],
+) -> bool {
+    let Some(orig) = texts.iter().find(|t| t.is_original) else {
+        return false;
+    };
+    if orig.language == DEFAULT_LANGUAGE {
+        return false;
+    }
+    let Some(eng) = texts
+        .iter()
+        .find(|t| t.language == DEFAULT_LANGUAGE && !t.is_original)
+    else {
+        return false;
+    };
+    let same = |stored: &str, base: &Option<String>| {
+        base.as_deref().is_some_and(|b| b.trim() == stored.trim())
+    };
+    let mut changed = false;
+    if let Some(new) = &eng.overview {
+        if overview.as_deref().is_some_and(|o| same(o, &orig.overview)) {
+            *overview = Some(new.clone());
+            changed = true;
+        }
+    }
+    if let (Some(title), Some(new)) = (title, &eng.title) {
+        if same(title, &orig.title) {
+            *title = new.clone();
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// One provider's answer for a show, with its artwork already cached.
@@ -1706,6 +2096,8 @@ mod tests {
         search: Vec<SearchCandidate>,
         detail: Option<EnrichedMetadata>,
         image_bytes: Option<Vec<u8>>,
+        texts: TextsFetch,
+        asked: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
     }
 
     impl FakeEnricher {
@@ -1715,6 +2107,8 @@ mod tests {
                 search: Vec::new(),
                 detail: None,
                 image_bytes: None,
+                texts: TextsFetch::Failed,
+                asked: Default::default(),
             }
         }
 
@@ -1724,6 +2118,8 @@ mod tests {
                 search: Vec::new(),
                 detail: None,
                 image_bytes: None,
+                texts: TextsFetch::Failed,
+                asked: Default::default(),
             }
         }
 
@@ -1748,6 +2144,22 @@ mod tests {
         fn with_image_bytes(mut self, bytes: Vec<u8>) -> Self {
             self.image_bytes = Some(bytes);
             self
+        }
+
+        fn with_texts(mut self, texts: Vec<LocalizedText>) -> Self {
+            self.texts = TextsFetch::Found(texts);
+            self
+        }
+
+        /// Every record answers that the provider has no such record.
+        fn with_texts_not_found(mut self) -> Self {
+            self.texts = TextsFetch::NotFound;
+            self
+        }
+
+        /// The languages each `fetch_texts` call asked for.
+        fn asked(&self) -> Vec<Vec<String>> {
+            self.asked.lock().unwrap().clone()
         }
     }
 
@@ -1784,6 +2196,17 @@ mod tests {
             _id: &str,
         ) -> Vec<crate::online_enrich::RemoteImage> {
             vec![]
+        }
+        async fn fetch_texts(
+            &self,
+            _kind: MediaKind,
+            _id: &str,
+            _season: Option<u32>,
+            _episode: Option<u32>,
+            languages: &[String],
+        ) -> TextsFetch {
+            self.asked.lock().unwrap().push(languages.to_vec());
+            self.texts.clone()
         }
     }
 
@@ -3037,5 +3460,434 @@ mod tests {
         };
         item.metadata.provider_ids.tmdb = Some("603".into());
         assert_eq!(trusted_provider_ids(&item).tmdb.as_deref(), Some("603"));
+    }
+
+    // --- B564: provider text per language ---------------------------------
+
+    fn text(lang: &str, title: &str, overview: &str, original: bool) -> LocalizedText {
+        LocalizedText {
+            language: lang.into(),
+            title: Some(title.into()),
+            overview: Some(overview.into()),
+            is_original: original,
+        }
+    }
+
+    fn anime_texts() -> Vec<LocalizedText> {
+        vec![
+            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
+            text(
+                "eng",
+                "The Secret of the Dragon Balls",
+                "Bulma meets Goku.",
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn adopt_replaces_only_the_base_record_text() {
+        let mut title = "ブルマと孫悟空".to_string();
+        let mut overview = Some(" ブルマが…".to_string());
+        assert!(adopt_default_text(
+            Some(&mut title),
+            &mut overview,
+            &anime_texts()
+        ));
+        assert_eq!(title, "The Secret of the Dragon Balls");
+        assert_eq!(overview.as_deref(), Some("Bulma meets Goku."));
+
+        // Local NFO text is not the provider's: left alone.
+        let mut title = "Bulma and Son Goku".to_string();
+        let mut overview = Some("Une description française.".to_string());
+        assert!(!adopt_default_text(
+            Some(&mut title),
+            &mut overview,
+            &anime_texts()
+        ));
+        assert_eq!(overview.as_deref(), Some("Une description française."));
+
+        // No English at TVDB: the original stays.
+        let mut overview = Some("ブルマが…".to_string());
+        assert!(!adopt_default_text(
+            None,
+            &mut overview,
+            &anime_texts()[..1]
+        ));
+
+        // English-made: nothing to replace.
+        let eng_only = [text("eng", "Pilot", "Lord Stark...", true)];
+        let mut overview = Some("Lord Stark...".to_string());
+        assert!(!adopt_default_text(None, &mut overview, &eng_only));
+    }
+
+    /// An anime episode and show stored before B564, with TVDB's Japanese
+    /// base-record text. Matched by NFO id, so the show-matcher version
+    /// check in `run` does not re-admit them for a fresh search.
+    async fn put_anime(s: &SqliteStore) {
+        let item = MediaItem {
+            id: 77,
+            path: "/tv/Dragon Ball/S01E01.mkv".into(),
+            title: "ブルマと孫悟空".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Dragon Ball".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/Dragon Ball".into()),
+                series_year: Some(1986),
+            }),
+            metadata: pharos_core::MediaMetadata {
+                overview: Some("ブルマが…".into()),
+                ..Default::default()
+            },
+            ..MediaItem::default()
+        };
+        s.put(item).await.unwrap();
+        s.set_item_match(77, "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            .await
+            .unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Dragon Ball".into(),
+            series_name: "Dragon Ball".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("76666".into()),
+            match_source: Some("nfo_id".into()),
+            metadata_refreshed_at: Some(NOW),
+            overview: Some("悟空の冒険。".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn translation_pass_replaces_stored_base_record_text_with_english() {
+        let s = store().await;
+        put_anime(&s).await;
+        let tvdb = FakeEnricher::tvdb().with_texts(vec![
+            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
+            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
+            text(
+                "eng",
+                "The Secret of the Dragon Balls",
+                "Bulma meets Goku.",
+                false,
+            ),
+        ]);
+        // One fake answers for show and episode alike; give each its own.
+        let ep_texts = anime_texts();
+        let show_texts = vec![
+            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
+            text("eng", "Dragon Ball", "Goku sets out.", false),
+        ];
+        adopt_for_owner(&s, &TranslationOwner::Item(77), &ep_texts)
+            .await
+            .unwrap();
+        adopt_for_owner(
+            &s,
+            &TranslationOwner::Series("/tv/Dragon Ball".into()),
+            &show_texts,
+        )
+        .await
+        .unwrap();
+        let ep = s.get(77).await.unwrap();
+        assert_eq!(ep.title, "The Secret of the Dragon Balls");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(ep.match_source.as_deref(), Some("nfo_id"), "still matched");
+        let show = s
+            .series_metadata_by_keys(&["/tv/Dragon Ball".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            show["/tv/Dragon Ball"].overview.as_deref(),
+            Some("Goku sets out.")
+        );
+
+        // The pass stores rows for both owners and asks once each.
+        let stored = translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap();
+        assert_eq!(stored, 2);
+        assert_eq!(tvdb.asked(), vec![vec!["eng".to_string()]; 2]);
+        let rows = s
+            .translations_for(&[TranslationOwner::Item(77)], &[], true)
+            .await
+            .unwrap();
+        assert!(rows
+            .iter()
+            .any(|(_, t)| t.is_original && t.language == "jpn"));
+        // Nothing left to ask.
+        assert_eq!(translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap(), 0);
+    }
+
+    /// The record that trips the outage stop is marked before the pass
+    /// stops, so the next pass starts behind it rather than on it.
+    #[tokio::test]
+    async fn the_record_that_stops_a_pass_is_marked_first() {
+        let s = store().await;
+        put_anime(&s).await;
+        for id in [78u32, 79] {
+            let mut item = s.get(77).await.unwrap();
+            item.id = u64::from(id);
+            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            if let Some(series) = item.series.as_mut() {
+                series.episode_number = Some(id);
+            }
+            s.put(item).await.unwrap();
+            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+                .await
+                .unwrap();
+        }
+        // No texts: every record is unreadable.
+        let tvdb = FakeEnricher::tvdb();
+        assert_eq!(translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap(), 0);
+        assert_eq!(tvdb.asked().len(), MAX_CONSECUTIVE_FAILURES);
+        // Four owners (three episodes and the show); the three asked are all
+        // marked, so the next pass asks only the fourth.
+        translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap();
+        assert_eq!(tvdb.asked().len(), MAX_CONSECUTIVE_FAILURES + 1);
+    }
+
+    #[tokio::test]
+    async fn translation_pass_end_to_end_through_run() {
+        let s = store().await;
+        put_anime(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_texts(anime_texts());
+        let cfg = MetadataConfig::default();
+        run(
+            &s,
+            &sem(2),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &cfg,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let ep = s.get(77).await.unwrap();
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_leaves_stored_text_alone() {
+        let s = store().await;
+        put_anime(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_texts(anime_texts());
+        let cfg = MetadataConfig {
+            fetch_translations: false,
+            ..MetadataConfig::default()
+        };
+        run(
+            &s,
+            &sem(2),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &cfg,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(tvdb.asked().is_empty());
+        let ep = s.get(77).await.unwrap();
+        assert_eq!(ep.metadata.overview.as_deref(), Some("ブルマが…"));
+    }
+
+    /// Records the provider has no such record for (anime numbered
+    /// absolutely, say) are not an outage: a pass marks every one of them
+    /// missing for MISSING_RETRY_SECS and goes on, however many there are,
+    /// so the owners behind them are reached.
+    #[tokio::test]
+    async fn records_the_provider_does_not_have_do_not_stop_a_pass() {
+        let s = store().await;
+        put_anime(&s).await;
+        for id in [78u32, 79, 80, 81] {
+            let mut item = s.get(77).await.unwrap();
+            item.id = u64::from(id);
+            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            if let Some(series) = item.series.as_mut() {
+                series.episode_number = Some(id);
+            }
+            s.put(item).await.unwrap();
+            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+                .await
+                .unwrap();
+        }
+        let tvdb = FakeEnricher::tvdb().with_texts_not_found();
+        // Six owners (five episodes and the show), all asked in one pass.
+        assert_eq!(translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap(), 6);
+        assert_eq!(tvdb.asked().len(), 6);
+        const { assert!(MAX_CONSECUTIVE_FAILURES < 6) };
+        // Marked for the long wait: a day later nothing is asked again.
+        translation_pass(&s, &sem(2), &tvdb, NOW + FAILED_RETRY_SECS + 1)
+            .await
+            .unwrap();
+        assert_eq!(tvdb.asked().len(), 6);
+    }
+
+    /// A user's language gets its share of a pass even when the English
+    /// backlog alone fills the budget: with room for two owners and six
+    /// owners missing both languages, French is still asked for.
+    #[tokio::test]
+    async fn a_user_language_is_not_starved_by_the_english_backlog() {
+        let s = store().await;
+        put_anime(&s).await;
+        for id in [78u32, 79, 80, 81] {
+            let mut item = s.get(77).await.unwrap();
+            item.id = u64::from(id);
+            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            if let Some(series) = item.series.as_mut() {
+                series.episode_number = Some(id);
+            }
+            s.put(item).await.unwrap();
+            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+                .await
+                .unwrap();
+        }
+        let langs = vec!["eng".to_string(), "fra".to_string()];
+        let todo = collect_gaps(&s, "tvdb", &langs, NOW, 2).await.unwrap();
+        assert_eq!(todo.len(), 2, "the budget caps the owners");
+        assert!(
+            todo.iter().any(|(_, l)| l.contains(&"fra".to_string())),
+            "French gets a share: {:?}",
+            todo.iter().map(|(_, l)| l.clone()).collect::<Vec<_>>()
+        );
+        // Room the shares leave (both languages picked the same owners)
+        // goes back to the languages that still have gaps.
+        let todo = collect_gaps(&s, "tvdb", &langs, NOW, 4).await.unwrap();
+        assert_eq!(todo.len(), 4);
+    }
+
+    /// The kill switch also holds for a re-enrichment: `enrich_one` keeps the
+    /// stored base-record text when `fetch_translations` is off, and replaces
+    /// it with the English text when it is on.
+    #[tokio::test]
+    async fn the_kill_switch_also_holds_for_a_re_enrichment() {
+        for (fetch, want) in [(false, "砂の惑星…"), (true, "A duke's son...")] {
+            let s = store().await;
+            put_movie(&s, 900_400, "Dune (2021)").await;
+            let mut item = s.get(900_400).await.unwrap();
+            item.metadata.overview = Some("砂の惑星…".into());
+            s.put(item).await.unwrap();
+            let (_td, cache) = cache();
+            let tmdb = FakeEnricher::tmdb()
+                .with_search(vec![("438631", "Dune", Some(2021))])
+                .with_detail(EnrichedMetadata {
+                    texts: vec![
+                        text("jpn", "Dune", "砂の惑星…", true),
+                        text("eng", "Dune", "A duke's son...", false),
+                    ],
+                    ..EnrichedMetadata::default()
+                });
+            let cfg = MetadataConfig {
+                fetch_translations: fetch,
+                ..MetadataConfig::default()
+            };
+            let item = s.get(900_400).await.unwrap();
+            enrich_one(
+                &s,
+                &sem(4),
+                &cache,
+                Some(&tmdb),
+                None::<&FakeEnricher>,
+                &cfg,
+                item,
+                NOW,
+            )
+            .await
+            .unwrap();
+            let got = s.get(900_400).await.unwrap();
+            assert_eq!(
+                got.metadata.overview.as_deref(),
+                Some(want),
+                "fetch_translations = {fetch}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_language_a_user_picked_is_fetched_too() {
+        use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
+        let s = store().await;
+        put_anime(&s).await;
+        let user = UserRecord {
+            id: UserId::new(),
+            name: "amélie".into(),
+            password_hash: SecretString::new("$argon2id$fake"),
+            policy: UserPolicy::default(),
+        };
+        let uid = user.id;
+        UserStore::create(&s, user).await.unwrap();
+        s.set_user_configuration(uid, r#"{"DescriptionLanguagePreference":"fre"}"#)
+            .await
+            .unwrap();
+        assert_eq!(wanted_languages(&s).await, vec!["eng", "fra"]);
+        let tvdb = FakeEnricher::tvdb().with_texts(anime_texts());
+        translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap();
+        assert!(tvdb
+            .asked()
+            .iter()
+            .all(|langs| langs == &vec!["eng".to_string(), "fra".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_record_is_retried_after_a_day_not_every_pass() {
+        let s = store().await;
+        put_anime(&s).await;
+        let tvdb = FakeEnricher::tvdb(); // fetch_texts answers None
+        assert_eq!(translation_pass(&s, &sem(2), &tvdb, NOW).await.unwrap(), 0);
+        assert_eq!(tvdb.asked().len(), 2);
+        translation_pass(&s, &sem(2), &tvdb, NOW + 60)
+            .await
+            .unwrap();
+        assert_eq!(tvdb.asked().len(), 2, "not asked again within the day");
+        translation_pass(&s, &sem(2), &tvdb, NOW + FAILED_RETRY_SECS + 1)
+            .await
+            .unwrap();
+        assert_eq!(tvdb.asked().len(), 4, "asked again after a day");
+    }
+
+    #[tokio::test]
+    async fn enrichment_stores_the_text_rows() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
+            .with_detail(EnrichedMetadata {
+                overview: Some("Bulma meets Goku.".into()),
+                texts: anime_texts(),
+                ..EnrichedMetadata::default()
+            });
+        run(
+            &s,
+            &sem(2),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let rows = s
+            .translations_for(&[TranslationOwner::Item(1)], &["eng".into()], true)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let show = s
+            .translations_for(
+                &[TranslationOwner::Series("/tv/Dragon Ball".into())],
+                &["eng".into()],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(show.len(), 1);
     }
 }

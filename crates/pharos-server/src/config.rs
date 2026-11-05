@@ -331,6 +331,13 @@ pub struct MetadataConfig {
     /// without waiting a full interval between passes. Default 21600 (6h).
     #[serde(default = "default_refresh_interval_secs")]
     pub refresh_interval_secs: u64,
+    /// Ask the provider for the text of shows and episodes matched before
+    /// B564 in English and in every language a user picked, and replace a
+    /// stored description that is the provider's base-record text (not local
+    /// NFO text) with the English one (ADR-0062). The kill switch for that
+    /// rewrite. Default true.
+    #[serde(default = "default_true")]
+    pub fetch_translations: bool,
 }
 
 fn default_refresh_ttl_days() -> u32 {
@@ -356,6 +363,7 @@ impl Default for MetadataConfig {
             max_per_pass: default_max_per_pass(),
             match_min_confidence: default_match_min_confidence(),
             refresh_interval_secs: default_refresh_interval_secs(),
+            fetch_translations: true,
         }
     }
 }
