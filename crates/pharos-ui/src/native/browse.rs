@@ -1036,8 +1036,8 @@ fn PagedGrid(
             platform::warn(&format!("pharos: grid place not kept: {e}"));
         }
     };
-    // Leaving for a title inside the settle delay runs the pending settle
-    // as the watch drops, so that scroll's place is still kept (V470).
+    // Kept once scrolling settles, never as the grid goes: by then the
+    // router has scrolled the page to the top for the next view (V470).
     use_hook(move || {
         place.map(|key| std::rc::Rc::new(platform::on_scroll_settled(move || keep_place(&key))))
     });
