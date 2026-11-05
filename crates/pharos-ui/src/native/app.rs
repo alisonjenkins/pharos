@@ -38,6 +38,8 @@ use super::playback::{
     ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
     LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
+use super::playback_settings;
+use super::privacy;
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::resume::{ResumeProbe, ResumeReport};
@@ -1528,6 +1530,8 @@ fn Screen(route: Route) -> Element {
         Route::Appearance => rsx! { AppearanceScreen {} },
         Route::Account => rsx! { AccountScreen {} },
         Route::ApproveDevice => rsx! { ApproveDeviceScreen {} },
+        Route::Playback => rsx! { PlaybackScreen {} },
+        Route::Privacy => rsx! { PrivacyScreen {} },
         Route::Find => rsx! { FindRedirect {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
@@ -1977,7 +1981,6 @@ fn AccountScreen() -> Element {
     let mut outcome = use_signal(|| None::<account_settings::Outcome>);
     let mut avatar_busy = use_signal(|| false);
     let mut avatar_outcome = use_signal(|| None::<account_settings::Outcome>);
-    let mut crossfade = use_signal(crossfade_seconds);
     let mut description_language = use_signal(String::new);
     // Set once the viewer picks a language, so the mount read, if it answers
     // later, does not put the stored (older) value back on screen.
@@ -2093,11 +2096,6 @@ fn AccountScreen() -> Element {
                     avatar_busy.set(false);
                 });
             },
-            crossfade_s: crossfade(),
-            on_crossfade: move |seconds| {
-                set_crossfade_seconds(seconds);
-                crossfade.set(seconds);
-            },
             description_language: description_language(),
             on_description_language: move |value: String| {
                 let Some(api) = ctx.api.peek().clone() else {
@@ -2194,24 +2192,8 @@ fn AppearanceScreen() -> Element {
     let themes = use_context::<Themes>();
     let mut editing = use_signal(|| None::<Editing>);
     let notice = use_signal(|| None::<Notice>);
-    let ctx = use_context::<Ctx>();
-    let mut diagnostics = use_signal(platform::opted_in);
-    let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
-    let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut library_transition = use_signal(stored_library_transition);
     let mut overlay_effect = use_signal(stored_overlay_effect);
-    // Bumped when a save fails: the box is keyed on it, so the browser's
-    // flipped checkbox is rebuilt from the server value.
-    let mut diagnostics_gen = use_signal(|| 0_u32);
-    // The box shows the server's choice, not whatever was cached at sign-in.
-    use_future(move || async move {
-        let api = ctx.api.peek().clone();
-        if let Some(api) = api {
-            if let Ok(on) = platform::load_opted_in(&api).await {
-                diagnostics.set(on);
-            }
-        }
-    });
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -2231,12 +2213,8 @@ fn AppearanceScreen() -> Element {
         .as_ref()
         .map(|state| editor_view(state, &themes.catalogue.read()));
     let notice_now = notice.read().clone();
-    let diagnostics_on = *diagnostics.read();
-    let max_quality_now = *max_quality.read();
-    let subtitle_size_now = *subtitle_size.read();
     let library_transition_now = *library_transition.read();
     let overlay_effect_now = *overlay_effect.read();
-    let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
         AppearanceView {
@@ -2244,30 +2222,6 @@ fn AppearanceScreen() -> Element {
             auto,
             editor,
             notice: notice_now,
-            diagnostics: diagnostics_on,
-            diagnostics_key,
-            max_quality: max_quality_now,
-            on_max_quality: move |bps: u64| {
-                store_bitrate(MAX_BITRATE_KEY, bps);
-                max_quality.set(bps);
-                platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
-            },
-            subtitle_size: subtitle_size_now,
-            on_subtitle_size: move |size: SubtitleSize| {
-                if let Err(e) = store_subtitle_size(size) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the subtitle size on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
-                }
-                platform::apply_subtitle_size(size);
-                platform::relift_cues(VIDEO_ID);
-                subtitle_size.set(size);
-                platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
-            },
             library_transition: library_transition_now,
             on_library_transition: move |fx: LibraryTransition| {
                 if let Err(e) = store_library_transition(fx) {
@@ -2298,25 +2252,6 @@ fn AppearanceScreen() -> Element {
                 overlay_effect.set(fx);
                 platform::info(&format!("pharos: overlay_effect set={}", fx.as_str()));
             },
-            on_diagnostics: move |on: bool| {
-                let api = ctx.api.peek().clone();
-                let server_before = *diagnostics.peek();
-                spawn(async move {
-                    let saved = match api {
-                        Some(api) => platform::set_opted_in(&api, on).await.map(|()| on),
-                        None => Err("not signed in".to_owned()),
-                    };
-                    if let Err(e) = &saved {
-                        notify(
-                            notice,
-                            format!("Could not save the diagnostics choice: {e}"),
-                            true,
-                        );
-                        diagnostics_gen.with_mut(|g| *g = g.wrapping_add(1));
-                    }
-                    diagnostics.set(diagnostics::shown_after_save(saved, server_before));
-                });
-            },
             on_pick: move |name: String| {
                 editing.set(None);
                 themes.choose(name.clone());
@@ -2336,6 +2271,94 @@ fn AppearanceScreen() -> Element {
             on_edit: move |edit: Edit| edit_draft(themes, editing, edit),
             on_save: move |()| save_editor(themes, editing, notice),
             on_cancel: move |()| cancel(themes, editing, notice),
+        }
+    }
+}
+
+/// The Playback page: this device's quality ceiling, subtitle size and
+/// crossfade, each kept in local storage.
+#[component]
+fn PlaybackScreen() -> Element {
+    let notice = use_signal(|| None::<Notice>);
+    let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
+    let mut subtitle_size = use_signal(stored_subtitle_size);
+    let mut crossfade = use_signal(crossfade_seconds);
+    rsx! {
+        playback_settings::PlaybackView {
+            notice: notice.read().clone(),
+            max_quality: max_quality(),
+            on_max_quality: move |bps: u64| {
+                store_bitrate(MAX_BITRATE_KEY, bps);
+                max_quality.set(bps);
+                platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
+            },
+            subtitle_size: subtitle_size(),
+            on_subtitle_size: move |size: SubtitleSize| {
+                if let Err(e) = store_subtitle_size(size) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the subtitle size on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                platform::apply_subtitle_size(size);
+                platform::relift_cues(VIDEO_ID);
+                subtitle_size.set(size);
+                platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
+            },
+            crossfade_s: crossfade(),
+            on_crossfade: move |seconds| {
+                set_crossfade_seconds(seconds);
+                crossfade.set(seconds);
+            },
+        }
+    }
+}
+
+/// The Privacy page: the account's diagnostics opt-in, saved on the server.
+#[component]
+fn PrivacyScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let notice = use_signal(|| None::<Notice>);
+    let mut diagnostics = use_signal(platform::opted_in);
+    // Bumped when a save fails: the box is keyed on it, so the browser's
+    // flipped checkbox is rebuilt from the server value.
+    let mut diagnostics_gen = use_signal(|| 0_u32);
+    // The box shows the server's choice, not whatever was cached at sign-in.
+    use_future(move || async move {
+        let api = ctx.api.peek().clone();
+        if let Some(api) = api {
+            if let Ok(on) = platform::load_opted_in(&api).await {
+                diagnostics.set(on);
+            }
+        }
+    });
+    rsx! {
+        privacy::PrivacyView {
+            notice: notice.read().clone(),
+            diagnostics: diagnostics(),
+            diagnostics_key: diagnostics_gen(),
+            on_diagnostics: move |on: bool| {
+                let api = ctx.api.peek().clone();
+                let server_before = *diagnostics.peek();
+                spawn(async move {
+                    let saved = match api {
+                        Some(api) => platform::set_opted_in(&api, on).await.map(|()| on),
+                        None => Err("not signed in".to_owned()),
+                    };
+                    if let Err(e) = &saved {
+                        notify(
+                            notice,
+                            format!("Could not save the diagnostics choice: {e}"),
+                            true,
+                        );
+                        diagnostics_gen.with_mut(|g| *g = g.wrapping_add(1));
+                    }
+                    diagnostics.set(diagnostics::shown_after_save(saved, server_before));
+                });
+            },
         }
     }
 }

@@ -3321,7 +3321,7 @@ test.describe("pharos Dioxus UI stage", () => {
 // one fading out under the new one (ADR-0053).
 test.describe("pharos Dioxus UI song handover", () => {
   // Signs in, queues Carefree's album and plays the short seeded song (6 s)
-  // before it, with `crossfade` seconds chosen on the Account page.
+  // before it, with `crossfade` seconds chosen on the Playback page.
   async function playIntoQueuedSong(page: Page, request: APIRequestContext, crossfade: number) {
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
       headers: { Accept: "application/json" },
@@ -3366,10 +3366,10 @@ test.describe("pharos Dioxus UI song handover", () => {
     await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
     if (crossfade > 0) {
       // Off until the listener turns it on.
-      await page.goto("/ui/settings/account");
-      const choice = page.locator("#crossfade");
-      await expect(choice).toHaveValue("0");
-      await choice.selectOption(String(crossfade));
+      await page.goto("/ui/settings/playback");
+      await expect(page.locator("#crossfade-0")).toHaveAttribute("aria-pressed", "true");
+      await page.locator(`#crossfade-${crossfade}`).click();
+      await expect(page.locator(`#crossfade-${crossfade}`)).toHaveAttribute("aria-pressed", "true");
     }
     await page.goto(`/ui/browse/${nativeSynth(queued!.AlbumId!)}`);
     await expect(page.locator("section.pharos-album h2")).toHaveText(queued!.Album!, {
