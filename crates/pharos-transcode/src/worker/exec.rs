@@ -155,6 +155,9 @@ pub fn encoder_never_opened(stderr: &str) -> bool {
         .contains("could not open encoder before eof")
 }
 
+/// How long [`window_has_video`] waits for ffprobe.
+const WINDOW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Whether the source has a video packet inside the job's window, asked of
 /// ffprobe. `None` when that cannot be told: a job with no bounded window, or
 /// an ffprobe that failed.
@@ -167,7 +170,8 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
     let start = spec.opts.start_position_ticks as f64 / tps;
     let dur = spec.opts.duration_ticks? as f64 / tps;
     let input = spec.input.to_str()?;
-    let out = tokio::process::Command::new(ffprobe_bin())
+    let mut probe = tokio::process::Command::new(ffprobe_bin());
+    probe
         .args([
             "-v",
             "error",
@@ -182,9 +186,24 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
             input,
         ])
         .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true);
+    // Bounded: the worker sends no progress while it probes, and a stalled
+    // read (a stale NFS handle, B218) must not outlast the scheduler's
+    // heartbeat. No answer keeps the device fault, the safe reading.
+    let out = match tokio::time::timeout(WINDOW_PROBE_TIMEOUT, probe.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "window video probe could not run");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = WINDOW_PROBE_TIMEOUT.as_secs(),
+                "window video probe timed out"
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
         return None;
     }
