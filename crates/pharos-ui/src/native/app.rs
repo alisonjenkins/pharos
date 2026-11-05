@@ -39,6 +39,7 @@ use super::playback::{
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
+use super::resume::{ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
@@ -555,6 +556,54 @@ async fn fade(id: &'static str, from: f64, to: f64, fade_ms: u64, cancel: Rc<Cel
             return;
         }
         platform::sleep_ms(FADE_STEP_MS).await;
+    }
+}
+
+/// How often a resume in flight reads the analyser (B563).
+const RESUME_STEP_MS: u32 = 10;
+
+/// A resume in flight, and a count of resumes so a superseded watch stops.
+type ResumeSlot = Rc<RefCell<(u64, Option<ResumeProbe>)>>;
+
+fn report_resume(report: &ResumeReport) {
+    platform::info(&report.line());
+    platform::report_event(report.event());
+}
+
+/// Start timing a resume of the media element `id`, before `play()` so its
+/// `playing` cannot come first. Returns the resume's number.
+fn start_resume(id: &str, slot: &ResumeSlot) -> u64 {
+    let mut slot = slot.borrow_mut();
+    slot.0 = slot.0.wrapping_add(1);
+    slot.1 = Some(ResumeProbe::start(
+        platform::now_ms(),
+        platform::resume_context(id),
+    ));
+    slot.0
+}
+
+/// Measure resume number `resume` of the media element `id` until it
+/// sounds, is paused again, or times out (V473).
+async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
+    loop {
+        platform::sleep_ms(RESUME_STEP_MS).await;
+        let report = {
+            let mut slot = slot.borrow_mut();
+            if slot.0 != resume {
+                return;
+            }
+            let Some(probe) = slot.1.as_mut() else {
+                return;
+            };
+            if probe.done() {
+                return;
+            }
+            probe.frame(platform::now_ms(), platform::tap_peak(id))
+        };
+        if let Some(report) = report {
+            report_resume(&report);
+            return;
+        }
     }
 }
 
@@ -2724,6 +2773,7 @@ fn Player(
     // out until the next is ready, but its end no longer moves the queue.
     let handed_off = use_hook(|| Rc::new(Cell::new(false)));
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
+    let resume: ResumeSlot = use_hook(|| Rc::new(RefCell::new((0, None))));
     let fade_in_ms = use_hook(|| fade_in.0.take());
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
@@ -3144,9 +3194,21 @@ fn Player(
         let (retiring, crossfading) = (Rc::clone(&retiring), Rc::clone(&crossfading));
         let handed_off = Rc::clone(&handed_off);
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
+        let resume = Rc::clone(&resume);
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
+            }
+            let resumed = match event {
+                MediaEvent::Playing => {
+                    let now = platform::now_ms();
+                    resume.borrow_mut().1.as_mut().and_then(|p| p.playing(now))
+                }
+                MediaEvent::Pause => resume.borrow_mut().1.as_mut().and_then(ResumeProbe::paused),
+                _ => None,
+            };
+            if let Some(report) = resumed {
+                report_resume(&report);
             }
             match event {
                 MediaEvent::Waiting => {
@@ -3272,6 +3334,7 @@ fn Player(
         let watch = watch.clone();
         let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
+        let resume = Rc::clone(&resume);
         move |control: Control| {
             if retiring.get() {
                 return;
@@ -3290,8 +3353,14 @@ fn Player(
             };
             match control {
                 Control::TogglePlay => {
+                    let resuming = platform::media_state(VIDEO_ID)
+                        .paused
+                        .then(|| start_resume(VIDEO_ID, &resume));
                     if !session().is_some_and(|s| s.toggle_play()) {
                         platform::toggle_play(VIDEO_ID);
+                    }
+                    if let Some(n) = resuming {
+                        spawn(watch_resume(VIDEO_ID, Rc::clone(&resume), n));
                     }
                 }
                 // An unknown length (0) clamps nothing rather than everything.

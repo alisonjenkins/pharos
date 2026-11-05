@@ -34,6 +34,7 @@ pub mod playback;
 pub mod quality;
 pub mod queue;
 pub mod rails;
+pub mod resume;
 pub mod route;
 pub mod seen;
 pub mod stage;

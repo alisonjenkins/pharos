@@ -340,6 +340,20 @@ pub fn media_playing(_id: &str) -> bool {
     false
 }
 
+pub fn resume_context(_id: &str) -> super::resume::ResumeContext {
+    super::resume::ResumeContext {
+        ready_state: 0,
+        buffered_ahead_ms: 0,
+        engine: "none",
+        muted: false,
+        audio: None,
+    }
+}
+
+pub fn tap_peak(_id: &str) -> Option<f32> {
+    None
+}
+
 /// The host has no server: the in-memory groups.
 pub type Groups = super::together::FakeGroups;
 
