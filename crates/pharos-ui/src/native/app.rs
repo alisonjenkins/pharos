@@ -1017,7 +1017,9 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| palette);
     use_hook(move || {
         Rc::new(platform::on_key(move |key, ctrl, meta| {
-            let toggle = palette::is_toggle(key, ctrl, meta);
+            // Signed out there is no palette to open: leave the key alone
+            // rather than open one that pops up right after sign-in.
+            let toggle = palette::is_toggle(key, ctrl, meta) && api.peek().is_some();
             if toggle {
                 let shut = !*palette.0.peek();
                 palette.0.set(shut);
@@ -1450,6 +1452,20 @@ fn PaletteScreen() -> Element {
             &search.text.read(),
             page,
         )
+    });
+    // Results arrive after the highlight was set: keep it on a row that
+    // exists, so Enter opens what is highlighted.
+    use_effect(move || {
+        let len = rows.read().len();
+        let now = *active.peek();
+        let kept = match now {
+            _ if len == 0 => None,
+            Some(at) if at < len => Some(at),
+            _ => Some(0),
+        };
+        if kept != now {
+            active.set(kept);
+        }
     });
     let failed = match &*search.hits.read() {
         Hits::Failed(message) => Some(message.clone()),
