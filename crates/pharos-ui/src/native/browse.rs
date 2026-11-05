@@ -1020,9 +1020,10 @@ fn PagedGrid(
             requests.send(Ask::Through(target));
         }
     });
-    // Not while a jump is under way: its pages are still landing.
+    // Not while a jump is under way: its pages are still landing. `try_peek`:
+    // this also runs as the grid is torn down, when the signal may be gone.
     let keep_place = move |key: &str| {
-        if jump.peek().is_some() {
+        if jump.try_peek().map_or(true, |j| j.is_some()) {
             return;
         }
         let Some(at) = platform::first_visible_tile() else {
@@ -1035,17 +1036,10 @@ fn PagedGrid(
             platform::warn(&format!("pharos: grid place not kept: {e}"));
         }
     };
-    let settled_place = place.clone();
+    // Leaving for a title inside the settle delay runs the pending settle
+    // as the watch drops, so that scroll's place is still kept (V470).
     use_hook(move || {
-        settled_place
-            .map(|key| std::rc::Rc::new(platform::on_scroll_settled(move || keep_place(&key))))
-    });
-    // Leaving for a title inside the settle delay drops the timer with the
-    // grid, so the place is kept once more as the grid goes (V470).
-    use_drop(move || {
-        if let Some(key) = &place {
-            keep_place(key);
-        }
+        place.map(|key| std::rc::Rc::new(platform::on_scroll_settled(move || keep_place(&key))))
     });
     let mut go = move |target: u32| {
         land.set(None);
