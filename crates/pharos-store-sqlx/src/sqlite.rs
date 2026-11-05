@@ -594,6 +594,7 @@ impl crate::ServerConfigStore for SqliteStore {
     /// the match (the synth id is a one-way hash, so the components must be
     /// recovered from the column values). Episodes only (the only rows with a
     /// series). Cheap: distinct over an indexed-ish small column set.
+    #[tracing::instrument(skip(self))]
     async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String)>(
             "SELECT DISTINCT series_folder, series_name FROM media_items \
@@ -606,6 +607,7 @@ impl crate::ServerConfigStore for SqliteStore {
 
     /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys,
     /// for resolving a `?ParentId=<season synth id>`.
+    #[tracing::instrument(skip(self))]
     async fn distinct_season_keys(&self) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String, i64)>(
             "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
@@ -619,6 +621,7 @@ impl crate::ServerConfigStore for SqliteStore {
     /// LIB-B2 — distinct non-empty artist + album_artist names, for resolving
     /// a `?ParentId=<artist synth id>`. Union of both probe columns (the
     /// in-memory parent pivot matched either).
+    #[tracing::instrument(skip(self))]
     async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
@@ -632,6 +635,7 @@ impl crate::ServerConfigStore for SqliteStore {
 
     /// LIB-B2 — distinct non-empty album names, for resolving a
     /// `?ParentId=<album synth id>`.
+    #[tracing::instrument(skip(self))]
     async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
@@ -646,6 +650,7 @@ impl crate::ServerConfigStore for SqliteStore {
     /// `?ParentId=<genre synth id>` against the LEGACY probe column when the
     /// `item_genres` entity join is empty (rows scanned before LIB-C4 and not
     /// yet backfilled) — preserving the legacy in-memory fallback.
+    #[tracing::instrument(skip(self))]
     async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
