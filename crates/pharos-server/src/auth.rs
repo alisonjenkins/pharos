@@ -374,6 +374,11 @@ impl<U: UserStore> BuiltinAuth<U> {
         password: &SecretString,
         admin: bool,
     ) -> AuthResult<CreateUserOutcome> {
+        // V211: no account has an empty password, whichever caller asks.
+        if password.expose().is_empty() {
+            tracing::warn!(user.name = %name, reason = "empty_password", "user create refused");
+            return Err(AuthError::InvalidCredentials);
+        }
         let hash = self.hash_password_off_worker(password).await?;
         let record = UserRecord {
             id: UserId::new(),
@@ -1052,6 +1057,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_refuses_an_empty_password() {
+        let auth = fresh().await;
+        assert!(matches!(
+            auth.create_user("ali", &SecretString::new(""), false).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        assert!(auth.users().lookup_by_name("ali").await.is_err());
+    }
+
+    #[tokio::test]
     async fn empty_password_refusal_is_counted_and_skips_argon2() {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let _m = metrics::set_default_local_recorder(&rec);
@@ -1059,10 +1074,17 @@ mod tests {
         seed(&auth, "ali", "").await;
         let _ = auth.authenticate("ali", &SecretString::new("")).await;
         let _ = auth.authenticate("nobody", &SecretString::new("")).await;
-        let refused = counter_value(&rec, "pharos_login_empty_password_total");
-        assert_eq!(refused, 2, "each empty-password sign-in must be counted");
+        // One snapshot for both counters, so reading the first cannot hide
+        // the second.
+        let counters = counters(&rec);
+        let read = |name: &str| counters.get(name).copied().unwrap_or(0);
         assert_eq!(
-            dummy_verify_count(&rec),
+            read("pharos_login_empty_password_total"),
+            2,
+            "each empty-password sign-in must be counted"
+        );
+        assert_eq!(
+            read("pharos_auth_dummy_verify_total"),
             0,
             "an empty password is refused before any argon2 work"
         );
@@ -1079,6 +1101,22 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    /// Every counter in one snapshot of `rec`, by name.
+    fn counters(
+        rec: &metrics_util::debugging::DebuggingRecorder,
+    ) -> std::collections::HashMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        rec.snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, v)| match v {
+                DebugValue::Counter(n) => Some((key.key().name().to_owned(), n)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn dummy_verify_count(rec: &metrics_util::debugging::DebuggingRecorder) -> u64 {
