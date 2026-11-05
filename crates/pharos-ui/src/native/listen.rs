@@ -123,6 +123,13 @@ impl Scrub {
 pub fn ListenView(
     title: String,
     image: Option<String>,
+    /// The track's artists, in display order.
+    #[props(default)]
+    artists: Vec<String>,
+    #[props(default)] album: Option<String>,
+    /// The track's number on its album (Jellyfin's `IndexNumber`).
+    #[props(default)]
+    track: Option<u32>,
     year: Option<u16>,
     genres: Vec<String>,
     runtime_ms: u64,
@@ -227,7 +234,7 @@ pub fn ListenView(
     } else {
         0.0
     };
-    let meta = meta_line(year, &genres);
+    let meta = meta_line(&artists, album.as_deref(), track, year, &genres);
     let on_key = move |evt: KeyboardEvent| {
         // Ctrl+K opens the palette; it must not also toggle play.
         if chorded(&evt) {
@@ -347,7 +354,7 @@ pub fn ListenView(
                     p { class: "pharos-listen-eyebrow", "Now playing" }
                     h2 { class: "pharos-listen-title", title: "{title}", "{title}" }
                     if let Some(meta) = meta {
-                        p { class: "pharos-listen-meta", "{meta}" }
+                        p { class: "pharos-listen-meta", title: "{meta}", "{meta}" }
                     }
                     audio {
                         id: media_id,
@@ -775,13 +782,25 @@ fn lyrics_label(have: bool, loading: bool, failed: bool) -> &'static str {
     }
 }
 
-/// "2003 · Trip-hop, Electronic"; `None` when there is neither.
-fn meta_line(year: Option<u16>, genres: &[String]) -> Option<String> {
-    let parts: Vec<String> = year
-        .map(|y| y.to_string())
-        .into_iter()
-        .chain((!genres.is_empty()).then(|| genres.join(", ")))
-        .collect();
+/// "Massive Attack · Mezzanine · Track 3 · 1998 · Trip-hop, Electronic",
+/// leaving out what is not known; `None` when nothing is.
+fn meta_line(
+    artists: &[String],
+    album: Option<&str>,
+    track: Option<u32>,
+    year: Option<u16>,
+    genres: &[String],
+) -> Option<String> {
+    let parts: Vec<String> = [
+        (!artists.is_empty()).then(|| artists.join(", ")),
+        album.filter(|a| !a.is_empty()).map(str::to_owned),
+        track.filter(|&n| n > 0).map(|n| format!("Track {n}")),
+        year.map(|y| y.to_string()),
+        (!genres.is_empty()).then(|| genres.join(", ")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
@@ -963,6 +982,9 @@ mod tests {
                     ListenView {
                         title: title.clone(),
                         image: image.clone(),
+                        artists: vec!["Massive Attack".to_owned()],
+                        album: Some("Mezzanine".to_owned()),
+                        track: Some(3),
                         year: Some(1998),
                         genres: vec!["Trip-hop".to_owned()],
                         runtime_ms: 330_000,
@@ -997,7 +1019,10 @@ mod tests {
                 "{label}"
             );
         }
-        assert!(html.contains("1998 · Trip-hop"), "{html}");
+        assert!(
+            html.contains("Massive Attack · Mezzanine · Track 3 · 1998 · Trip-hop"),
+            "{html}"
+        );
     }
 
     fn render_next(next: Option<ItemRef>) -> String {
@@ -1318,13 +1343,33 @@ mod tests {
 
     #[test]
     fn the_meta_line_shows_what_there_is() {
-        assert_eq!(meta_line(None, &[]), None);
-        assert_eq!(meta_line(Some(2003), &[]).as_deref(), Some("2003"));
+        let none = |year, genres: &[String]| meta_line(&[], None, None, year, genres);
+        assert_eq!(none(None, &[]), None);
+        assert_eq!(none(Some(2003), &[]).as_deref(), Some("2003"));
         let genres = ["Rock".to_owned(), "Pop".to_owned()];
-        assert_eq!(meta_line(None, &genres).as_deref(), Some("Rock, Pop"));
+        assert_eq!(none(None, &genres).as_deref(), Some("Rock, Pop"));
         assert_eq!(
-            meta_line(Some(2003), &genres).as_deref(),
+            none(Some(2003), &genres).as_deref(),
             Some("2003 · Rock, Pop")
+        );
+    }
+
+    #[test]
+    fn the_meta_line_names_the_artist_album_and_track_first() {
+        let artists = ["Massive Attack".to_owned(), "Liz Fraser".to_owned()];
+        let genres = ["Trip-hop".to_owned()];
+        assert_eq!(
+            meta_line(&artists, Some("Mezzanine"), Some(3), Some(1998), &genres).as_deref(),
+            Some("Massive Attack, Liz Fraser · Mezzanine · Track 3 · 1998 · Trip-hop")
+        );
+        assert_eq!(
+            meta_line(&artists[..1], None, Some(3), None, &[]).as_deref(),
+            Some("Massive Attack · Track 3")
+        );
+        // A missing number or an empty album name is left out, not shown blank.
+        assert_eq!(
+            meta_line(&[], Some(""), Some(0), Some(1998), &[]).as_deref(),
+            Some("1998")
         );
     }
 
