@@ -8,7 +8,7 @@ use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, MediaState, PlaybackEngine};
+use super::playback::{Engine, MediaState, PlaybackEngine, SubtitleSize};
 
 const NO_BROWSER: &str = "the native app needs a browser";
 
@@ -239,6 +239,8 @@ pub fn apply_tokens(_declarations: &[(String, String)]) -> Result<(), String> {
 pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
     Ok(())
 }
+
+pub fn apply_subtitle_size(_size: SubtitleSize) {}
 
 pub fn prefers(_query: &str) -> bool {
     false

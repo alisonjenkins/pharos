@@ -32,7 +32,8 @@ use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms, subtitle_switch,
     volume_setting, Engine, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine,
-    ReportClock, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, VOLUME_KEY,
+    ReportClock, SubtitleSize, SubtitleSwitch, CROSSFADE_KEY, MAX_BITRATE_KEY, SUBTITLE_SIZE_KEY,
+    VOLUME_KEY,
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -240,6 +241,7 @@ struct Boot {
 /// Load the custom themes, then apply the device's stored choice before the
 /// first native paint, logging which theme and, on a fallback, why.
 fn boot_theme() -> Boot {
+    platform::apply_subtitle_size(stored_subtitle_size());
     let mut catalogue = theme::shipped();
     log_lines(&device::load_custom(
         &mut catalogue,
@@ -415,6 +417,28 @@ fn store_bitrate(key: &str, bps: u64) {
     if let Err(e) = platform::store_theme(key, &bps.to_string()) {
         let name = key.rsplit('.').next().unwrap_or(key);
         platform::warn(&format!("pharos: {name} storage write failed error={e}"));
+    }
+}
+
+fn stored_subtitle_size() -> SubtitleSize {
+    match platform::stored_theme(SUBTITLE_SIZE_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or(SubtitleSize::Medium, SubtitleSize::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: subtitle_size storage read failed error={e}"
+            ));
+            SubtitleSize::Medium
+        }
+    }
+}
+
+fn store_subtitle_size(size: SubtitleSize) {
+    if let Err(e) = platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()) {
+        platform::warn(&format!(
+            "pharos: subtitle_size storage write failed error={e}"
+        ));
     }
 }
 
@@ -1554,6 +1578,7 @@ fn AppearanceScreen() -> Element {
     let ctx = use_context::<Ctx>();
     let mut diagnostics = use_signal(platform::opted_in);
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
+    let mut subtitle_size = use_signal(stored_subtitle_size);
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -1587,6 +1612,7 @@ fn AppearanceScreen() -> Element {
     let notice_now = notice.read().clone();
     let diagnostics_on = *diagnostics.read();
     let max_quality_now = *max_quality.read();
+    let subtitle_size_now = *subtitle_size.read();
     let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
@@ -1602,6 +1628,13 @@ fn AppearanceScreen() -> Element {
                 store_bitrate(MAX_BITRATE_KEY, bps);
                 max_quality.set(bps);
                 platform::info(&format!("pharos: max_bitrate set={}", max_bitrate_label(bps)));
+            },
+            subtitle_size: subtitle_size_now,
+            on_subtitle_size: move |size: SubtitleSize| {
+                store_subtitle_size(size);
+                platform::apply_subtitle_size(size);
+                subtitle_size.set(size);
+                platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
             },
             on_diagnostics: move |on: bool| {
                 let api = ctx.api.peek().clone();
