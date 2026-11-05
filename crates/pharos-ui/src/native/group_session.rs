@@ -7,9 +7,11 @@
 //! network. The app supplies browser versions, the tests supply fakes.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
 use futures_util::future::LocalBoxFuture;
+use futures_util::FutureExt as _;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
 use super::activity::{self, ActivityLog, Event, TrackKind};
@@ -516,6 +518,11 @@ struct Inner {
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
+    /// Group commands not yet sent; one task sends them one at a time, so the
+    /// server sees them in the order the viewer caused them.
+    commands: VecDeque<LocalBoxFuture<'static, Result<(), GroupError>>>,
+    /// A task is working through `commands`.
+    draining: bool,
 }
 
 impl Inner {
@@ -1173,7 +1180,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             return false;
         }
         let client = self.client.clone();
-        self.command(async move {
+        let kind = if paused { "unpause" } else { "pause" };
+        self.command(kind.to_owned(), async move {
             if paused {
                 client.unpause().await
             } else {
@@ -1189,18 +1197,58 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             return false;
         }
         let client = self.client.clone();
-        self.command(async move { client.seek(position_ms).await });
+        self.command(format!("seek({position_ms})"), async move {
+            client.seek(position_ms).await
+        });
         true
     }
 
-    fn command(&self, fut: impl std::future::Future<Output = Result<(), GroupError>> + 'static) {
+    /// Sends a group command after every earlier one has been answered: two
+    /// RPCs in flight can reach the server, and the group, in reverse order
+    /// (buffering end before its start leaves a member buffering for good).
+    /// `kind` names the command and its key argument, `queued` how many wait
+    /// ahead of it, for the diagnostics.
+    fn command(
+        &self,
+        kind: String,
+        fut: impl std::future::Future<Output = Result<(), GroupError>> + 'static,
+    ) {
         let Some(me) = self.me() else {
             return;
         };
+        let (queued, start) = {
+            let mut inner = self.inner.borrow_mut();
+            let queued = inner.commands.len();
+            inner.commands.push_back(fut.boxed_local());
+            let start = !inner.draining;
+            inner.draining = true;
+            (queued, start)
+        };
+        self.env.info(&format!(
+            "pharos: group command sent kind={kind} queued={queued}"
+        ));
+        if !start {
+            return;
+        }
         self.env.spawn(Box::pin(async move {
-            if let Err(e) = fut.await {
-                me.env
-                    .warn(&format!("pharos: group command failed: {}", e.0));
+            loop {
+                // The borrow ends before the await; `draining` clears in the
+                // same borrow that finds the queue empty.
+                let next = {
+                    let mut inner = me.inner.borrow_mut();
+                    let next = inner.commands.pop_front();
+                    if next.is_none() {
+                        inner.draining = false;
+                    }
+                    next
+                };
+                let Some(next) = next else {
+                    return;
+                };
+                if let Err(e) = next.await {
+                    me.env
+                        .warn(&format!("pharos: group command failed: {}", e.0));
+                }
             }
         }));
     }
@@ -1243,7 +1291,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
 
     fn report_buffering(&self, playlist: String, position_ms: u64, buffering: bool) {
         let client = self.client.clone();
-        self.command(async move { client.buffering(playlist, position_ms, buffering).await });
+        self.command(format!("buffering({buffering})"), async move {
+            client.buffering(playlist, position_ms, buffering).await
+        });
     }
 
     /// The local video's events, as the group needs them: buffering when it
@@ -1321,7 +1371,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         }
         if send_ready {
             let client = self.client.clone();
-            self.command(async move { client.ready(playlist, position, playing).await });
+            self.command(format!("ready(playing={playing})"), async move {
+                client.ready(playlist, position, playing).await
+            });
         }
     }
 }
@@ -1426,8 +1478,6 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Seat<C, E> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-
-    use futures_util::FutureExt as _;
 
     use super::*;
     use crate::native::together::{ClockSample, FakeGroups};
@@ -1845,6 +1895,62 @@ mod tests {
             calls_with(&rig, "buffering"),
             ["buffering(pl-7,3000,true)", "buffering(pl-7,3000,false)"]
         );
+    }
+
+    /// A server that answers slowly must not reorder what the viewer did:
+    /// waiting then canplay reaches it as buffering true, then false.
+    #[test]
+    fn group_commands_reach_the_server_in_the_order_they_were_sent() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 3_000,
+            playing: false,
+        });
+        rig.player.position.set(3_000);
+        rig.player.paused.set(true);
+        rig.session.on_media(MediaEvent::CanPlay);
+        rig.env.settle();
+
+        rig.groups.hold_buffering();
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.session.on_media(MediaEvent::CanPlay);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        // The later call answers first, if it was already on the wire.
+        rig.groups.release_buffering(1);
+        pump(&rig.env, &mut live);
+        rig.groups.release_buffering(0);
+        pump(&rig.env, &mut live);
+        // Once the first is through, the second may start.
+        rig.groups.release_buffering(1);
+        pump(&rig.env, &mut live);
+        assert_eq!(
+            calls_with(&rig, "buffering"),
+            ["buffering(pl-7,3000,true)", "buffering(pl-7,3000,false)"]
+        );
+        let sent = rig.env.logged("pharos: group command sent kind=buffering");
+        assert_eq!(
+            sent,
+            [
+                "pharos: group command sent kind=buffering(true) queued=0",
+                "pharos: group command sent kind=buffering(false) queued=1",
+            ]
+        );
+    }
+
+    /// Polls the tasks the session spawned, keeping the parked ones, until a
+    /// pass changes nothing.
+    fn pump(env: &TestEnv, live: &mut Vec<LocalBoxFuture<'static, ()>>) {
+        loop {
+            live.extend(env.tasks.borrow_mut().drain(..));
+            let before = live.len();
+            live.retain_mut(|t| t.now_or_never().is_none());
+            if live.len() == before && env.tasks.borrow().is_empty() {
+                return;
+            }
+        }
     }
 
     /// The session's own seek makes the video wait; that wait is not the group
