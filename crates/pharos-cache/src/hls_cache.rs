@@ -413,6 +413,12 @@ pub fn source_open_failure(msg: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether a transcode failure message is [`pharos_transcode::protocol::WorkerError::NoFrames`],
+/// matched by its Display prefix after [`pharos_transcode::scheduler::SchedError::Failed`] wraps it.
+pub fn no_frames_failure(msg: &str) -> bool {
+    msg.contains("no source frames in the window: ")
+}
+
 /// Count a request refused because its source cannot be opened. Same series
 /// DirectPlay records (`pharos_source_unreadable_total`), so a storage incident
 /// is one query whichever delivery path the viewer was on.
@@ -3226,6 +3232,11 @@ impl HlsSegmentCache {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(progress_sidecar_path(&tmp)).await;
                     let _ = tokio::fs::remove_file(partial_segment_path(&tmp)).await;
+                    if matches!(&e, HlsCacheError::Transcode(msg) if no_frames_failure(msg)) {
+                        partial = None;
+                        shortfall = Some("no video frames at all".to_string());
+                        break;
+                    }
                     // A source that would not open is not an encode failure:
                     // re-classify it so the log, the outcome counter and the
                     // HTTP status all say "storage", and remember it so the
@@ -7288,6 +7299,134 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_no_frames_worker_failure_serves_filler_without_retrying_mid_file_and_at_the_final_segment()
+    {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerError, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Spawner {
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl WorkerSpawner for Spawner {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    Ok(Box::new(NoFramesTestWorker { id, real_attempts }) as Box<dyn Worker>)
+                })
+            }
+        }
+        struct NoFramesTestWorker {
+            id: WorkerId,
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Worker for NoFramesTestWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    if job.filler.is_none() {
+                        real_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return WorkerRunResult::Failed(WorkerError::NoFrames(
+                            "Could not open encoder before EOF".into(),
+                        ));
+                    }
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    let _ = tokio::fs::write(
+                        pharos_transcode::progress_sidecar_path(path),
+                        "frame=144\nout_time_us=6006000\n",
+                    )
+                    .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Spawner {
+                real_attempts: real_attempts.clone(),
+            }),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        );
+        let cache = cache.with_scheduler(sched);
+
+        let mid_opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        assert!(
+            !mid_opts.window.is_final(),
+            "precondition: must be a mid-file window"
+        );
+        let final_opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            window: pharos_core::SegmentWindow::for_segment(0, None, Some(3.0)),
+            ..slow_opts()
+        };
+        assert!(
+            final_opts.window.is_final(),
+            "precondition: must be the final window"
+        );
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let mid_bytes = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(cache.segment_bytes(45, 0, &source, &mid_opts, JobClass::Interactive))
+        })
+        .expect("a mid-file window with NoFrames must serve a filler, not 500");
+        assert_eq!(mid_bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "NoFrames must go straight to the filler without looping the decode-preroll retry ladder"
+        );
+
+        let final_bytes = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(cache.segment_bytes(46, 0, &source, &final_opts, JobClass::Interactive))
+        })
+        .expect("a final window with NoFrames must serve a filler, not 500");
+        assert_eq!(final_bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the final window must also run only one real attempt before the filler"
+        );
+
+        let filler_count = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == "pharos_segment_produced_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == "filler")
+            })
+            .map(|(.., v)| v);
+        assert!(
+            matches!(filler_count, Some(DebugValue::Counter(2))),
+            "both segments must be counted as Filler; got {filler_count:?}"
+        );
+    }
+
     /// Regression pin for T113/B189: a FINAL window with a genuine (nonzero)
     /// short tail is the source's honest shape, not damage, and must keep
     /// being served with its own real bytes — never routed through the
@@ -9866,6 +10005,33 @@ mod tests {
             None,
             "a missing ffmpeg binary is a server fault, not an unreadable source"
         );
+    }
+
+    #[test]
+    fn a_no_frames_worker_failure_display_prefix_is_recognised() {
+        use pharos_transcode::protocol::WorkerError;
+        use pharos_transcode::scheduler::SchedError;
+
+        let worker_err = WorkerError::NoFrames("Could not open encoder before EOF".into());
+        assert!(
+            worker_err
+                .to_string()
+                .starts_with("no source frames in the window: "),
+            "WorkerError::NoFrames Display prefix moved: {worker_err}"
+        );
+        assert!(no_frames_failure(&worker_err.to_string()));
+        let sched_err = SchedError::Failed(worker_err);
+        assert!(no_frames_failure(&sched_err.to_string()));
+
+        assert!(!no_frames_failure(
+            &SchedError::Failed(WorkerError::DeviceBusy("out of sessions".into())).to_string()
+        ));
+        assert!(!no_frames_failure(
+            &SchedError::Failed(WorkerError::DecodeFailed("decode error rate".into())).to_string()
+        ));
+        assert!(!no_frames_failure(
+            "ffmpeg exited unsuccessfully: exit status: 1"
+        ));
     }
 
     /// B218 — once a source has failed to open, the next request inside the
