@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
-use pharos_core::{AuthError, DomainResult, SecretString, User, UserId, UserPrefStore};
+use pharos_core::{
+    AuthError, DomainResult, SecretString, TokenScope, TokenStore, User, UserId, UserPrefStore,
+};
 
 use super::bootstrap::{qc_denial, token_denial};
 use super::group::Group;
@@ -271,6 +273,88 @@ impl server::session::Handler for Session {
         Ok(())
     }
 
+    /// A narrow token for image loaders and media players that cannot send
+    /// the device token or a cookie (B542, V437, ADR-0058). It reaches only
+    /// GET and HEAD on item images and on everything under `/videos/{id}/`
+    /// and `/audio/{id}/` (streams, playlists, subtitles, trickplay,
+    /// attachments, lyrics), expires after
+    /// `[server.native_api].media_token_ttl_secs`, and is bound to the
+    /// device `pharos-native:media`. A revoked or ended session is refused
+    /// like any other call.
+    async fn media_token(
+        self: Rc<Self>,
+        _params: wire::MediaTokenParams,
+        results: &mut wire::MediaTokenResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                let outcome = match denial {
+                    Denial::Unavailable { .. } => MediaTokenOutcome::StoreUnavailable,
+                    _ => MediaTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::info!(
+                    outcome = outcome.label(),
+                    denial = ?denial,
+                    "native media token refused"
+                );
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let ttl_secs = self.ctx.media_token_ttl_secs();
+        // Read before the store fixes the token's expiry, so the client is
+        // never told a later time than the server enforces.
+        let expires_at = expires_at_ms(ttl_secs);
+        let issued = self
+            .state
+            .stores
+            .issue_with_ttl(
+                user.id,
+                MEDIA_TOKEN_DEVICE_ID,
+                i64::from(ttl_secs),
+                TokenScope::Media,
+            )
+            .await;
+        let result = results.get().init_result();
+        match issued {
+            Ok(issued) => {
+                MediaTokenOutcome::Ok.count();
+                let secret = issued.secret.0.expose();
+                // The id prefix names the token in the log; the secret
+                // never reaches it.
+                tracing::info!(
+                    user = %user.name,
+                    token_id = %issued.id.0.chars().take(8).collect::<String>(),
+                    ttl_secs,
+                    "native media token issued"
+                );
+                let mut out = result.init_token();
+                out.set_token(secret);
+                out.set_expires_at_ms(expires_at);
+            }
+            Err(e) => {
+                let outcome = match e {
+                    AuthError::Backend(_) => MediaTokenOutcome::StoreUnavailable,
+                    _ => MediaTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::warn!(
+                    user = %user.name,
+                    outcome = outcome.label(),
+                    error = %e,
+                    "native media token refused"
+                );
+                Denial::Unavailable {
+                    dependency: "token store",
+                }
+                .write(result.init_error());
+            }
+        }
+        Ok(())
+    }
+
     /// The user's own password (V361): see [`change_own_password`]. This
     /// session's token is kept, so the caller stays signed in here; the
     /// user's other sessions close.
@@ -447,6 +531,50 @@ impl server::session::Handler for Session {
     }
 }
 
+/// The device id a media token is stored under: the session's own device
+/// id is not kept past sign-in, so every native media token shares one.
+const MEDIA_TOKEN_DEVICE_ID: &str = "pharos-native:media";
+
+/// Milliseconds since the Unix epoch at which a token issued now with
+/// `ttl_secs` expires.
+fn expires_at_ms(ttl_secs: u32) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now + Duration::from_secs(u64::from(ttl_secs))).as_millis() as u64
+}
+
+/// How a `Session.mediaToken` call ended: the `outcome` label of
+/// `pharos_media_token_issued_total`. A dashboard contract: bounded, stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaTokenOutcome {
+    /// A token was issued.
+    Ok,
+    /// The token store could not answer.
+    StoreUnavailable,
+    /// The session was revoked or ended, or the store refused to issue.
+    Rejected,
+}
+
+impl MediaTokenOutcome {
+    #[cfg(test)]
+    pub(crate) const ALL: [MediaTokenOutcome; 3] =
+        [Self::Ok, Self::StoreUnavailable, Self::Rejected];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn count(self) {
+        metrics::counter!("pharos_media_token_issued_total", "outcome" => self.label())
+            .increment(1);
+    }
+}
+
 /// Largest picture `setAvatar` takes. A WebSocket message is at most 1 MiB,
 /// and the web UI scales a photo down before it sends it.
 pub const NATIVE_MAX_AVATAR_BYTES: usize = 768 * 1024;
@@ -521,4 +649,16 @@ fn write_change_password_error(
         }
     };
     denial.write(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MediaTokenOutcome;
+
+    /// The outcome labels are a dashboard contract: fixed and distinct.
+    #[test]
+    fn media_token_outcome_labels_are_stable_and_distinct() {
+        let labels: Vec<_> = MediaTokenOutcome::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, ["ok", "store_unavailable", "rejected"]);
+    }
 }
