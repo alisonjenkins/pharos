@@ -1166,6 +1166,85 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // B551: a seek that waits on the server shows a spinner over the video,
+    // outside the chrome that hides on idle, and it goes once data arrives.
+    test("a seek that waits on the server shows a loading spinner", async ({ page, request }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-spin-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/fixture-1.webm"));
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, { timeout: 30_000 })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      // Force the HLS path, as the playback test above does.
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+        };
+      });
+      // Hold every segment after the first until released: the seek below
+      // then has to wait on the "server".
+      let release: () => void = () => {};
+      const released = new Promise<void>((r) => (release = r));
+      const segment = /\/videos\/[^?]*\/a?(\d+)\.(?:ts|m4s)(?:\?|$)/;
+      await page.route(segment, async (route) => {
+        const seg = Number(segment.exec(route.request().url())?.[1] ?? 0);
+        if (seg > 0) await released;
+        await route.continue();
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/watch/${nativeId}`);
+      const video = () =>
+        page.evaluate(() => {
+          const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+          return { duration: v?.duration || 0, time: v?.currentTime ?? 0 };
+        });
+      await expect.poll(async () => (await video()).duration, { timeout: 30_000 }).toBeGreaterThan(12);
+      const spinner = page.locator(".pharos-watch-loading");
+
+      const { duration } = await video();
+      await page.evaluate((to) => {
+        (document.getElementById("pharos-video") as HTMLVideoElement).currentTime = to;
+      }, Math.floor(duration / 2));
+      await expect(spinner).toBeVisible({ timeout: 5_000 });
+      await expect(spinner).toHaveAttribute("role", "status");
+      // Still there once the idle chrome has hidden.
+      await page.waitForTimeout(3_500);
+      await expect(spinner).toBeVisible();
+
+      release();
+      await expect(spinner).toHaveCount(0, { timeout: 30_000 });
+    });
+
     // 013 US2/FR-003: the watch page draws its own controls. A text subtitle
     // switches in place as a WebVTT track the server converts; volume, mute,
     // play/pause and the seek bar drive the <video>.
