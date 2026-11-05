@@ -1,15 +1,21 @@
 //! B271: the startup check names exactly the accounts whose password is "".
 
-use pharos_core::{SecretString, UserStore};
+use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
 use pharos_server::{auth::BuiltinAuth, state::Stores};
 
 async fn auth_with(users: &[(&str, &str)]) -> BuiltinAuth<Stores> {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores);
+    // Straight into the store: `create_user` refuses "" now (V211), and
+    // these stand for accounts stored before it did.
     for (name, password) in users {
-        auth.create_user(name, &SecretString::new(*password), false)
-            .await
-            .unwrap();
+        let record = UserRecord {
+            id: UserId::new(),
+            name: (*name).to_owned(),
+            password_hash: auth.hash_password(&SecretString::new(*password)).unwrap(),
+            policy: UserPolicy::default(),
+        };
+        auth.users().create(record).await.unwrap();
     }
     auth
 }
