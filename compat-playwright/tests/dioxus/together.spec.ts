@@ -371,6 +371,59 @@ test.describe("pharos Dioxus UI watch together", () => {
     }
   });
 
+  // B590/V508: a member who opens a song while their group stays on a film
+  // plays it on their own, with the queue's Mix button.
+  test("a song opened while in a group on a film plays on its own, with Mix", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const { nativeId } = await seededMovie(request, "/fixture-1.webm");
+    const a = await signIn(browser, "A");
+    open.push(a);
+    const byA = new Member("A", a.page);
+    try {
+      await a.page.goto(`${PHAROS_URL}/ui/watch/${nativeId}`);
+      await expect
+        .poll(() => byA.probe().then((p) => (p.paused ? 0 : p.currentTime)), {
+          message: "A's video plays",
+          timeout: 30_000,
+        })
+        .toBeGreaterThan(1);
+      await a.page.mouse.move(200, 200);
+      await a.page.getByRole("button", { name: "Watch together" }).click();
+      await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+      await a.page.getByRole("button", { name: "Done" }).click();
+
+      // A leaves the film in the app, still in the group, and finds a song.
+      await a.page.mouse.move(220, 220);
+      await a.page.getByRole("button", { name: "Back" }).click();
+      await a.page.getByRole("combobox", { name: "Search all libraries" }).fill("carefree");
+      const hit = a.page
+        .getByRole("option")
+        .filter({ hasText: /carefree/i })
+        .first()
+        .getByRole("link");
+      await expect(hit).toBeVisible({ timeout: 15_000 });
+      await hit.click();
+      await a.page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+      // The film was shrunk, so the song may start in the small player.
+      await expect(a.page.locator(".pharos-listen")).toHaveCount(1, { timeout: 15_000 });
+      const expand = a.page.locator(".pharos-stage").getByRole("button", { name: "Expand" });
+      if (await expand.isVisible()) {
+        await expand.click();
+      }
+      await expect(a.page.locator(".pharos-listen")).toBeVisible({ timeout: 15_000 });
+
+      await a.page.locator(".pharos-queue-toggle").click();
+      const panel = a.page.getByRole("complementary", { name: "Queue" });
+      await expect(panel).toBeVisible();
+      await expect(panel.getByRole("button", { name: "Mix", exact: true })).toBeVisible();
+    } catch (e) {
+      throw await failure(e, a, a, () => a.lines.join("\n"));
+    }
+  });
+
   // 014 US7 and US8 (T042). 07-test-subtitles.webm carries one audio track and
   // one English WebVTT subtitle; fixture-1.webm has neither a second audio nor
   // any subtitle, so the group's pick would have nothing to land on there.
