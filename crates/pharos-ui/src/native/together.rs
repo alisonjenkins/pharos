@@ -354,6 +354,9 @@ pub fn group_api(api: &NativeApi) -> Groups {
 /// The [`GroupClient`] this build talks to.
 pub use super::platform::Groups;
 
+/// A held `buffering` call: whether it may go, and who to wake when it may.
+type BufferingGate = Rc<(Cell<bool>, RefCell<Option<std::task::Waker>>)>;
+
 /// An in-memory [`GroupClient`] for tests and the pre-network screens. It
 /// keeps its groups and a log of the calls it received.
 #[derive(Clone, Default)]
@@ -365,9 +368,28 @@ pub struct FakeGroups {
     seen: Rc<RefCell<Vec<MemberSeen>>>,
     refuse_follow: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
+    hold_buffering: Rc<Cell<bool>>,
+    buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
 }
 
 impl FakeGroups {
+    /// Makes every `buffering` wait for [`Self::release_buffering`] before it
+    /// is logged, as a slow server would; the gates open in any order.
+    pub fn hold_buffering(&self) {
+        self.hold_buffering.set(true);
+    }
+
+    /// Opens the `n`th held `buffering` call (counted from 0 in the order the
+    /// calls started); a call that has not started yet is ignored.
+    pub fn release_buffering(&self, n: usize) {
+        if let Some(gate) = self.buffering_gates.borrow().get(n) {
+            gate.0.set(true);
+            if let Some(waker) = gate.1.borrow_mut().take() {
+                waker.wake();
+            }
+        }
+    }
+
     /// Makes every `set_tracks` fail, as a dropped connection would.
     pub fn refuse_tracks(&self) {
         self.refuse_tracks.set(true);
@@ -511,6 +533,19 @@ impl GroupClient for FakeGroups {
         position_ms: u64,
         buffering: bool,
     ) -> Result<(), GroupError> {
+        if self.hold_buffering.get() {
+            let gate: BufferingGate = Rc::new((Cell::new(false), RefCell::new(None)));
+            self.buffering_gates.borrow_mut().push(gate.clone());
+            std::future::poll_fn(|cx| {
+                if gate.0.get() {
+                    std::task::Poll::Ready(())
+                } else {
+                    *gate.1.borrow_mut() = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
         self.log(format!(
             "buffering({playlist_item_id},{position_ms},{buffering})"
         ));
