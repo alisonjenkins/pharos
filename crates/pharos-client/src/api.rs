@@ -217,6 +217,13 @@ pub struct Lyrics {
 pub struct LyricLine {
     pub start_ms: u64,
     pub text: String,
+    pub words: Vec<LyricWord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LyricWord {
+    pub at: u32,
+    pub start_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -952,6 +959,14 @@ impl PharosApi for NativeApi {
                             Ok(LyricLine {
                                 start_ms: line.get_start_ms(),
                                 text: text(line.get_text())?,
+                                words: line
+                                    .get_words()?
+                                    .iter()
+                                    .map(|w| LyricWord {
+                                        at: w.get_at(),
+                                        start_ms: w.get_start_ms(),
+                                    })
+                                    .collect(),
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,

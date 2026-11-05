@@ -1149,6 +1149,7 @@ mod tests {
             lines: vec![LyricLine {
                 start_ms: 1_000,
                 text: "Love, love is a verb".to_owned(),
+                words: Vec::new(),
             }],
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(words));
@@ -1165,6 +1166,7 @@ mod tests {
             lines: vec![LyricLine {
                 start_ms: 0,
                 text: "Words".to_owned(),
+                words: Vec::new(),
             }],
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(plain));
