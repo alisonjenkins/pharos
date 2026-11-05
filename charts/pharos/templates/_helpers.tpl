@@ -171,3 +171,24 @@ kind = {{ .kind | quote }}
 [database]
 url = {{ .Values.config.database.url | quote }}
 {{- end -}}
+
+{{/* The media volume source, shared by the server and the aligner. */}}
+{{- define "pharos.mediaVolume" -}}
+{{- $m := .Values.persistence.media }}
+{{- if eq $m.type "existingClaim" }}
+persistentVolumeClaim:
+  claimName: {{ required "persistence.media.existingClaim is required when type=existingClaim" $m.existingClaim }}
+{{- else if eq $m.type "pvc" }}
+persistentVolumeClaim:
+  claimName: {{ include "pharos.fullname" . }}-media
+{{- else if eq $m.type "hostPath" }}
+hostPath:
+  path: {{ required "persistence.media.hostPath is required when type=hostPath" $m.hostPath }}
+{{- else if eq $m.type "nfs" }}
+nfs:
+  server: {{ required "persistence.media.nfs.server is required" $m.nfs.server }}
+  path: {{ required "persistence.media.nfs.path is required" $m.nfs.path }}
+{{- else }}
+emptyDir: {}
+{{- end }}
+{{- end -}}
