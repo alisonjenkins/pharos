@@ -33,10 +33,10 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms,
-    styled_subtitle_url, subtitle_switch, up_next_at, volume_setting, Engine, MediaEvent,
-    MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine, ReportClock, SubtitleSize,
-    SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY, MAX_BITRATE_KEY, SUBTITLE_SIZE_KEY,
-    VOLUME_KEY,
+    styled_subtitle_url, subtitle_switch, up_next_at, volume_setting, Engine, LibraryTransition,
+    MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine, ReportClock,
+    SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY, LIBRARY_TRANSITION_KEY,
+    MAX_BITRATE_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -281,6 +281,7 @@ struct Boot {
 /// first native paint, logging which theme and, on a fallback, why.
 fn boot_theme() -> Boot {
     platform::apply_subtitle_size(stored_subtitle_size());
+    platform::apply_library_transition(stored_library_transition());
     let mut catalogue = theme::shipped();
     log_lines(&device::load_custom(
         &mut catalogue,
@@ -492,6 +493,42 @@ fn store_subtitle_size(size: SubtitleSize) -> Result<(), String> {
     platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()).inspect_err(|e| {
         platform::warn(&format!(
             "pharos: subtitle_size storage write failed error={e}"
+        ));
+    })
+}
+
+thread_local! {
+    /// The library transition chosen on this page load; it outranks storage
+    /// as [`SESSION_SUBTITLE_SIZE`] does.
+    static SESSION_LIBRARY_TRANSITION: Cell<Option<LibraryTransition>> = const { Cell::new(None) };
+}
+
+/// The viewer's library card transition: this page load's choice, else the
+/// stored one, else Fade.
+fn stored_library_transition() -> LibraryTransition {
+    if let Some(fx) = SESSION_LIBRARY_TRANSITION.with(Cell::get) {
+        return fx;
+    }
+    match platform::stored_theme(LIBRARY_TRANSITION_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or(LibraryTransition::default(), LibraryTransition::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: library_transition storage read failed error={e}"
+            ));
+            LibraryTransition::default()
+        }
+    }
+}
+
+/// Keep `fx` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_library_transition(fx: LibraryTransition) -> Result<(), String> {
+    SESSION_LIBRARY_TRANSITION.with(|s| s.set(Some(fx)));
+    platform::store_theme(LIBRARY_TRANSITION_KEY, fx.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: library_transition storage write failed error={e}"
         ));
     })
 }
@@ -2064,6 +2101,7 @@ fn AppearanceScreen() -> Element {
     let mut diagnostics = use_signal(platform::opted_in);
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let mut subtitle_size = use_signal(stored_subtitle_size);
+    let mut library_transition = use_signal(stored_library_transition);
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -2098,6 +2136,7 @@ fn AppearanceScreen() -> Element {
     let diagnostics_on = *diagnostics.read();
     let max_quality_now = *max_quality.read();
     let subtitle_size_now = *subtitle_size.read();
+    let library_transition_now = *library_transition.read();
     let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
@@ -2129,6 +2168,21 @@ fn AppearanceScreen() -> Element {
                 platform::relift_cues(VIDEO_ID);
                 subtitle_size.set(size);
                 platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
+            },
+            library_transition: library_transition_now,
+            on_library_transition: move |fx: LibraryTransition| {
+                if let Err(e) = store_library_transition(fx) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the library transition on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                platform::apply_library_transition(fx);
+                library_transition.set(fx);
+                platform::info(&format!("pharos: library_transition set={}", fx.as_str()));
             },
             on_diagnostics: move |on: bool| {
                 let api = ctx.api.peek().clone();
@@ -3845,6 +3899,13 @@ mod tests {
     /// A subtitle size picked on this page load is what the picker reads back,
     /// even when storage keeps nothing (the host stub stores nothing), so the
     /// picker never falls back to an older value while the new one applies.
+    #[test]
+    fn a_chosen_library_transition_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_library_transition(), LibraryTransition::Fade);
+        store_library_transition(LibraryTransition::Warp).unwrap();
+        assert_eq!(stored_library_transition(), LibraryTransition::Warp);
+    }
+
     #[test]
     fn a_chosen_subtitle_size_outlives_a_storage_that_keeps_nothing() {
         assert_eq!(stored_subtitle_size(), SubtitleSize::Medium);
