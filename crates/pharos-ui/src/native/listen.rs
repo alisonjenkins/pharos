@@ -43,6 +43,15 @@ const LYRICS_HIDDEN: &str = "hidden";
 const KARAOKE_KEY: &str = "pharos.listen.karaoke";
 const KARAOKE_ON: &str = "on";
 
+/// Whether the listener has karaoke mode on on this device.
+pub fn karaoke_on() -> bool {
+    platform::stored_theme(KARAOKE_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(KARAOKE_ON)
+}
+
 /// Device-local: whether the listener opened the queue. It starts closed,
 /// so the visualiser keeps the screen (B435/V375).
 const QUEUE_KEY: &str = "pharos.listen.queue";
@@ -167,13 +176,7 @@ pub fn ListenView(
         }
     };
     let lyrics = lyrics.filter(|l| !l.lines.is_empty());
-    let mut karaoke = use_signal(|| {
-        platform::stored_theme(KARAOKE_KEY)
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some(KARAOKE_ON)
-    });
+    let mut karaoke = use_signal(karaoke_on);
     let mut toggle_karaoke = move || {
         let on = !karaoke();
         karaoke.set(on);
