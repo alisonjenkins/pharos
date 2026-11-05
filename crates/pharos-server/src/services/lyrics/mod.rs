@@ -32,11 +32,22 @@ use crate::services::library::DetailError;
 use crate::state::AppState;
 
 /// One line of lyrics. `start_ms` is set on every line of synced lyrics and
-/// on none of plain ones.
+/// on none of plain ones; `words` holds enhanced-LRC word times when the
+/// line has them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LyricLine {
     pub start_ms: Option<u64>,
     pub text: String,
+    pub words: Vec<WordStamp>,
+}
+
+/// An enhanced-LRC word timestamp (`<mm:ss.xx>`) at char offset `at` in its
+/// line's text, or at the text's char length when it marks the end of the
+/// last word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WordStamp {
+    pub at: u32,
+    pub start_ms: u64,
 }
 
 /// Where a song's lyrics came from. `label()` is a metric label value.
@@ -381,6 +392,7 @@ mod tests {
         LyricLine {
             start_ms,
             text: text.to_owned(),
+            words: Vec::new(),
         }
     }
 
