@@ -397,9 +397,6 @@ pub enum WorkerError {
     /// that when the upstream capability answer is wrong, the cost is one
     /// rendition rather than the device.
     DecodeFailed(String),
-    /// Non-recoverable: the encoder never received a frame because the segment
-    /// window holds no source frames. Carries the ffmpeg reason.
-    NoFrames(String),
     /// Non-recoverable: target codec not encodable by this build. Carries
     /// the underlying reason (which codec / why) so the log is actionable.
     UnsupportedCodec(String),
@@ -411,6 +408,13 @@ pub enum WorkerError {
     Io(String),
     /// Anything else, carrying a human string for the log.
     Other(String),
+    /// Non-recoverable: the encoder never received a frame because the segment
+    /// window holds no source frames. Carries the ffmpeg reason.
+    ///
+    /// Last on purpose: bincode encodes a variant by its index, so a new
+    /// variant goes at the end and a server and worker of different builds
+    /// still agree on the older ones.
+    NoFrames(String),
 }
 
 impl WorkerError {
@@ -514,6 +518,22 @@ mod tests {
 
     use super::*;
     use crate::options::{AudioCodec, Container, VideoCodec};
+
+    /// The labels are a dashboard contract: one per class, never shared.
+    #[test]
+    fn worker_error_labels_are_distinct() {
+        let all = [
+            WorkerError::DeviceBusy(String::new()),
+            WorkerError::DecodeFailed(String::new()),
+            WorkerError::UnsupportedCodec(String::new()),
+            WorkerError::BadInput(String::new()),
+            WorkerError::Io(String::new()),
+            WorkerError::Other(String::new()),
+            WorkerError::NoFrames(String::new()),
+        ];
+        let labels: std::collections::HashSet<&str> = all.iter().map(WorkerError::label).collect();
+        assert_eq!(labels.len(), all.len(), "labels collide: {labels:?}");
+    }
 
     fn sample_job() -> JobSpec {
         JobSpec {
