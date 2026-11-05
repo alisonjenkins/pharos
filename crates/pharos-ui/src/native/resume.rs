@@ -12,6 +12,12 @@ pub const RESUME_TIMEOUT_MS: f64 = 5_000.0;
 /// above the routing's own zero.
 pub const AUDIBLE_PEAK: f32 = 0.001;
 
+/// Whether a play wakes a tap's `AudioContext` in `state` first: only a
+/// suspended one; a closed one cannot be resumed.
+pub fn wakes_context(state: &str) -> bool {
+    state == "suspended"
+}
+
 /// The Web Audio path the song is routed through, when it is tapped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioPath {
@@ -94,6 +100,12 @@ impl ResumeReport {
             (
                 "output_latency_ms",
                 ms(audio.and_then(|a| a.output_latency_ms)),
+            ),
+            (
+                "context_resumed",
+                audio
+                    .is_some_and(|a| wakes_context(&a.context_state))
+                    .to_string(),
             ),
             ("engine", self.context.engine.to_owned()),
         ]
@@ -315,11 +327,34 @@ mod tests {
             report.line(),
             "pharos: resume click_to_playing_ms=12 playing_to_audible_ms=8 ready_state=4 \
              buffered_ahead_ms=180000 context_state=running base_latency_ms=10.0 \
-             output_latency_ms=none engine=direct"
+             output_latency_ms=none context_resumed=false engine=direct"
         );
         let event = report.event();
         assert_eq!(event.kind, ClientEventKind::PlaybackResume);
         assert_eq!(event.level, ClientLevel::Info);
-        assert_eq!(event.fields.len(), 8);
+        assert_eq!(event.fields.len(), 9);
+    }
+
+    #[test]
+    fn only_a_suspended_context_is_woken_and_the_report_says_so() {
+        assert!(wakes_context("suspended"));
+        assert!(!wakes_context("running"));
+        assert!(!wakes_context("closed"));
+        let suspended = ResumeContext {
+            audio: Some(AudioPath {
+                context_state: "suspended".to_owned(),
+                base_latency_ms: None,
+                output_latency_ms: None,
+            }),
+            ..tapped()
+        };
+        let mut probe = ResumeProbe::start(0.0, suspended);
+        probe.playing(5.0);
+        let report = probe.frame(15.0, Some(0.5)).expect("sounded");
+        assert!(
+            report.line().contains("context_resumed=true"),
+            "{}",
+            report.line()
+        );
     }
 }
