@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::MAX_BITRATE_CHOICES;
+use super::playback::{SubtitleSize, MAX_BITRATE_CHOICES};
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -82,6 +82,8 @@ pub fn AppearanceView(
     on_diagnostics: EventHandler<bool>,
     max_quality: u64,
     on_max_quality: EventHandler<u64>,
+    subtitle_size: SubtitleSize,
+    on_subtitle_size: EventHandler<SubtitleSize>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -134,6 +136,28 @@ pub fn AppearanceView(
                 }
                 p { id: "max-quality-help",
                     "Auto adapts to your connection: it lowers the video quality when playback keeps stalling and raises it again when the link allows. A limit you pick is a ceiling Auto never goes above."
+                }
+            }
+            fieldset { class: "pharos-subtitle-size",
+                legend { "Subtitle size" }
+                label { r#for: "subtitle-size", "Text size of subtitles on this device" }
+                select {
+                    id: "subtitle-size",
+                    aria_describedby: "subtitle-size-help",
+                    onchange: move |ev| {
+                        on_subtitle_size.call(SubtitleSize::parse(&ev.value()));
+                    },
+                    for size in SubtitleSize::ALL {
+                        option {
+                            key: "{size.as_str()}",
+                            value: "{size.as_str()}",
+                            selected: size == subtitle_size,
+                            "{size.label()}"
+                        }
+                    }
+                }
+                p { id: "subtitle-size-help",
+                    "Saved on this device."
                 }
             }
             fieldset { class: "pharos-diagnostics",
@@ -422,6 +446,24 @@ mod tests {
         diagnostics: bool,
         max_quality: u64,
     ) -> String {
+        page_with_subtitle_size(
+            themes,
+            editor,
+            notice,
+            diagnostics,
+            max_quality,
+            SubtitleSize::default(),
+        )
+    }
+
+    fn page_with_subtitle_size(
+        themes: Vec<ThemeCard>,
+        editor: Option<EditorView>,
+        notice: Option<Notice>,
+        diagnostics: bool,
+        max_quality: u64,
+        subtitle_size: SubtitleSize,
+    ) -> String {
         render(move || {
             rsx! {
                 AppearanceView {
@@ -433,6 +475,8 @@ mod tests {
                     diagnostics_key: 0,
                     max_quality,
                     on_max_quality: |_| {},
+                    subtitle_size,
+                    on_subtitle_size: |_| {},
                     on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
@@ -508,6 +552,46 @@ mod tests {
         assert!(sel.contains("value=\"0\" selected") || sel.contains("selected=\"true\""));
         assert!(html.contains("adapts to your connection"), "{html}");
         assert!(html.contains("never goes above"), "{html}");
+    }
+
+    #[test]
+    fn subtitle_size_select_marks_only_the_stored_choice() {
+        let html = page_with_subtitle_size(Vec::new(), None, None, false, 0, SubtitleSize::Large);
+        let start = html.find("id=\"subtitle-size\"").unwrap_or(usize::MAX);
+        assert!(start != usize::MAX, "select missing: {html}");
+        let sel = &html[start
+            ..html[start..]
+                .find("</select>")
+                .map_or(html.len(), |e| start + e)];
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(
+            sel.contains("value=\"large\" selected") || sel.contains("selected=\"true\""),
+            "{sel}"
+        );
+        for size in SubtitleSize::ALL {
+            assert!(
+                sel.contains(size.label()),
+                "{} missing: {sel}",
+                size.label()
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_size_defaults_to_medium() {
+        let html = page_full(Vec::new(), None, None, false, 0);
+        let start = html.find("id=\"subtitle-size\"").unwrap_or(usize::MAX);
+        assert!(start != usize::MAX, "select missing: {html}");
+        let sel = &html[start
+            ..html[start..]
+                .find("</select>")
+                .map_or(html.len(), |e| start + e)];
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert!(
+            sel.contains("value=\"medium\" selected") || sel.contains("selected=\"true\""),
+            "{sel}"
+        );
+        assert!(html.contains("Saved on this device."), "{html}");
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {

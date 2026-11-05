@@ -17,6 +17,7 @@ use pharos_ui::client::{
     QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
 use pharos_ui::native::appearance::AppearanceView;
+use pharos_ui::native::playback::SubtitleSize;
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
     LibraryView, LiveTvStatus, LiveTvView, LoginForm, PlayerView, PrefsTab, PrefsView,
@@ -1513,6 +1514,8 @@ fn appearance_page_with(diagnostics: bool) -> Element {
             diagnostics_key: 0,
             max_quality: 0,
             on_max_quality: |_| {},
+            subtitle_size: SubtitleSize::Medium,
+            on_subtitle_size: |_| {},
             on_diagnostics: |_| {},
             on_pick: |_| {},
             on_auto: |_| {},

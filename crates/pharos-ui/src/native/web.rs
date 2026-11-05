@@ -17,7 +17,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget,
+    Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery,
+    RecoveryBudget, SubtitleSize,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -1552,6 +1553,19 @@ pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
     storage(Kept::Device)?
         .set_item(key, value)
         .map_err(|e| format!("{e:?}"))
+}
+
+/// Set `data-subtitle-size` on `<html>` so `video::cue` scales to `size`.
+pub fn apply_subtitle_size(size: SubtitleSize) {
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    else {
+        return;
+    };
+    if let Err(e) = root.set_attribute("data-subtitle-size", size.as_str()) {
+        warn(&format!("pharos: subtitle_size apply failed error={e:?}"));
+    }
 }
 
 /// Whether the media `query` matches now, false when the browser lacks it.

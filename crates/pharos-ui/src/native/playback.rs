@@ -232,6 +232,61 @@ pub fn max_bitrate_label(bps: u64) -> String {
     }
 }
 
+/// Where the viewer's subtitle size choice is kept; absent or unknown is
+/// [`SubtitleSize::Medium`].
+pub const SUBTITLE_SIZE_KEY: &str = "pharos.subtitles.size";
+
+/// How large browser-native subtitles are drawn on this device.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitleSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl SubtitleSize {
+    /// Every size offered, smallest to largest.
+    pub const ALL: [SubtitleSize; 4] = [
+        SubtitleSize::Small,
+        SubtitleSize::Medium,
+        SubtitleSize::Large,
+        SubtitleSize::ExtraLarge,
+    ];
+
+    /// The size a stored [`SUBTITLE_SIZE_KEY`] value holds; anything unknown
+    /// is [`SubtitleSize::Medium`].
+    pub fn parse(stored: &str) -> SubtitleSize {
+        match stored.trim() {
+            "small" => SubtitleSize::Small,
+            "large" => SubtitleSize::Large,
+            "extra-large" => SubtitleSize::ExtraLarge,
+            _ => SubtitleSize::Medium,
+        }
+    }
+
+    /// Both the stored value and the `data-subtitle-size` attribute on `<html>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtitleSize::Small => "small",
+            SubtitleSize::Medium => "medium",
+            SubtitleSize::Large => "large",
+            SubtitleSize::ExtraLarge => "extra-large",
+        }
+    }
+
+    /// The option text shown in the Appearance picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            SubtitleSize::Small => "Small",
+            SubtitleSize::Medium => "Medium",
+            SubtitleSize::Large => "Large",
+            SubtitleSize::ExtraLarge => "Extra large",
+        }
+    }
+}
+
 /// The fade between this song and the next, in ms, for a crossfade of
 /// `seconds` on a song `duration_ms` long: never more than a third of the
 /// song, so a short song is still mostly heard on its own. `None` when off
@@ -548,6 +603,23 @@ mod tests {
         assert_eq!(parse_max_bitrate(""), 0);
         assert_eq!(max_bitrate_label(0), "auto");
         assert_eq!(max_bitrate_label(2_000_000), "2000000");
+    }
+
+    #[test]
+    fn subtitle_size_round_trips_and_falls_back_to_medium() {
+        for size in SubtitleSize::ALL {
+            assert_eq!(SubtitleSize::parse(size.as_str()), size);
+            assert_eq!(SubtitleSize::parse(&format!(" {} ", size.as_str())), size);
+        }
+        assert_eq!(SubtitleSize::parse(""), SubtitleSize::Medium);
+        assert_eq!(SubtitleSize::parse("   "), SubtitleSize::Medium);
+        assert_eq!(SubtitleSize::parse("huge"), SubtitleSize::Medium);
+        assert_eq!(SubtitleSize::parse("Small"), SubtitleSize::Medium);
+        assert_eq!(SubtitleSize::default(), SubtitleSize::Medium);
+        assert_eq!(
+            SubtitleSize::ALL.map(SubtitleSize::label),
+            ["Small", "Medium", "Large", "Extra large"]
+        );
     }
 
     use super::*;
