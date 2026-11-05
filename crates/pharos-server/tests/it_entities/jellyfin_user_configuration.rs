@@ -112,3 +112,59 @@ async fn configuration_post_cannot_target_another_user_unless_admin() {
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// V474: a client that drops the pharos-only `DescriptionLanguagePreference`
+/// key on save must not reset the stored description language; an explicit
+/// value still replaces it.
+#[actix_web::test]
+async fn configuration_post_keeps_description_language_when_omitted() {
+    use pharos_core::PreferenceStore;
+    let f = seed().await;
+    f.state
+        .stores
+        .set_user_configuration(f.me, r#"{"DescriptionLanguagePreference":"jpn"}"#)
+        .await
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let post = |body: serde_json::Value| {
+        test::TestRequest::post()
+            .uri("/Users/Configuration")
+            .insert_header(("X-Emby-Token", f.my_token.clone()))
+            .set_json(body)
+            .to_request()
+    };
+    let stored = || async {
+        let raw = f
+            .state
+            .stores
+            .get_user_configuration(f.me)
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap()
+    };
+
+    let resp = test::call_service(
+        &app,
+        post(serde_json::json!({"AudioLanguagePreference": "eng"})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cfg = stored().await;
+    assert_eq!(cfg["DescriptionLanguagePreference"], "jpn");
+    assert_eq!(cfg["AudioLanguagePreference"], "eng");
+
+    let resp = test::call_service(
+        &app,
+        post(serde_json::json!({"DescriptionLanguagePreference": ""})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(stored().await["DescriptionLanguagePreference"], "");
+}
