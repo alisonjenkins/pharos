@@ -705,7 +705,7 @@
         };
 
         # ADR-0066: lyric word times by forced alignment, in an image of its
-        # own so torch stays out of `oci`. CI does not publish it.
+        # own so torch stays out of `oci`. CI publishes it tagged by store hash.
         alignerModel = pkgs.fetchurl {
           url = "https://dl.fbaipublicfiles.com/mms/torchaudio/ctc_alignment_mling_uroman/model.pt";
           hash = "sha256-IO8Sljq0kkvvSaxPx/WK1dou5DssEbyMhTybkOzbxoA=";
@@ -752,6 +752,10 @@
               "8790/tcp" = { };
             };
             Env = [ "PHAROS_ALIGNER_MEDIA_ROOT=/var/lib/pharos/media" ];
+            # Links the GHCR package to this repository.
+            Labels = {
+              "org.opencontainers.image.source" = "https://github.com/alisonjenkins/pharos";
+            };
           };
         };
 
