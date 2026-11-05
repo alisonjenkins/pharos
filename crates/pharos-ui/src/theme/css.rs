@@ -348,6 +348,68 @@ mod tests {
         }
     }
 
+    /// The bodies of every `@media (prefers-reduced-motion: reduce)` block.
+    fn reduced_motion_blocks(sheet: &str) -> String {
+        const OPEN: &str = "@media (prefers-reduced-motion: reduce) {";
+        let mut out = String::new();
+        let mut rest = sheet;
+        while let Some(at) = rest.find(OPEN) {
+            let body = rest.get(at + OPEN.len()..).expect("valid slice");
+            let mut depth = 1;
+            let end = body
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .map_or(body.len(), |(i, _)| i);
+            out.push_str(body.get(..end).expect("valid slice"));
+            rest = body.get(end..).expect("valid slice");
+        }
+        out
+    }
+
+    /// The declarations of the first rule whose selector list ends with
+    /// `selector`, in `css`.
+    fn rule<'a>(css: &'a str, selector: &str) -> &'a str {
+        let open = format!("{selector} {{");
+        let at = css
+            .find(&open)
+            .unwrap_or_else(|| panic!("no rule for {selector}"));
+        let body = css.get(at + open.len()..).expect("valid slice");
+        body.get(..body.find('}').expect("closed rule"))
+            .expect("valid slice")
+    }
+
+    /// V480: the seek bar's sheen never runs under reduced motion or while
+    /// the chrome is hidden, and its knob and ticks do not animate under
+    /// reduced motion.
+    #[test]
+    fn the_seek_bar_holds_still_for_reduced_motion_and_while_idle() {
+        let reduced = reduced_motion_blocks(SHEET);
+        assert!(
+            rule(&reduced, ".pharos-seek:hover .pharos-seek-played::after")
+                .contains("animation: none"),
+            "{reduced}"
+        );
+        let still = rule(&reduced, ".pharos-seek-knob");
+        assert!(still.contains("transition: none"), "{still}");
+        assert!(
+            reduced.contains(".pharos-seek-track > .pharos-seek-chapter,"),
+            "{reduced}"
+        );
+        assert!(
+            rule(SHEET, ".pharos-player.is-idle .pharos-seek-played::after")
+                .contains("animation: none")
+        );
+        // Only the pointer starts the sheen: no bare rule animates the fill.
+        assert!(!rule(SHEET, ".pharos-seek-played::after").contains("animation"));
+    }
+
     #[test]
     fn the_sheet_uses_no_pre_010_variable() {
         const OLD_VARS: &[&str] = &[
