@@ -536,12 +536,8 @@ fn read_query(
     // listing takes the per-key chain: with one, the Jellyfin route reads it
     // by its legacy rule, newest first when asked ascending (B316). Any other
     // order keeps its one token, and with it the legacy tie-breaks.
-    let by_added = sort_by.as_deref().is_some_and(|s| {
-        matches!(
-            s.split(',').map(str::trim).find(|t| !t.is_empty()),
-            Some("DateCreated" | "DateAdded")
-        )
-    });
+    let by_added = crate::services::library::Sections::of(sort_by.as_deref())
+        == crate::services::library::Sections::Added;
     let order = if q.get_descending() {
         "Descending"
     } else {
