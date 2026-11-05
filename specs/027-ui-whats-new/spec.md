@@ -46,7 +46,9 @@ them. Neither has playback interrupted to do so.
   settings page. The theme restyles the page itself as it is picked; the
   subtitle demo draws a cue over a stand-in picture with the player's scale
   steps (V497); the library card transition demo carries its own
-  `data-library-transition` (V496) and replays per pick.
+  `data-library-transition` (V496) and replays per pick; the controls
+  effect demo is a stand-in player whose chrome hides and comes back on a
+  loop under the chosen effect (V500).
 - **Closing.** Done (Start watching in setup) records `current()` as seen. Remind me later and Escape
   record nothing: the badge stays, and the dialog splashes again on the
   next load or sign-in. A failed save is logged and the dialog stays closed for the page.
@@ -66,7 +68,6 @@ shows in setup too. The test
 
 ## Later slices
 
-- The controls-hiding effect (PR #832) as a setting entry once it lands.
 - More setup pages: description language and maximum quality (both already
   settings; left out of slice 1 to keep setup short).
 - Changelog lines from release notes rather than by hand, if release-please
