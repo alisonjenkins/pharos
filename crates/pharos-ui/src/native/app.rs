@@ -2105,15 +2105,17 @@ fn TitleScreen(id: ItemRef) -> Element {
     });
     // The screen stays mounted when one title page opens another (a search
     // hit, a neighbour), so the load follows `id` instead of running once
-    // (B555).
+    // (B555). The resource keeps its last value while a new id loads, so
+    // each result carries the id it was asked for and a stale one shows as
+    // loading, never as the previous title's controls.
     let detail = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
         async move {
             let api = api?;
-            Some(settle(
-                ctx.machine,
-                api.detail(&call("title", "load"), id).await,
+            Some((
+                id,
+                settle(ctx.machine, api.detail(&call("title", "load"), id).await),
             ))
         }
     }));
@@ -2139,7 +2141,11 @@ fn TitleScreen(id: ItemRef) -> Element {
             ErrorNote { message }
         }
         {loaded(
-            state.as_ref().and_then(Option::as_ref),
+            state
+                .as_ref()
+                .and_then(Option::as_ref)
+                .filter(|(asked, _)| *asked == id)
+                .map(|(_, result)| result),
             |detail: &Detail| {
                 rsx! {
                     SeenTitle {
