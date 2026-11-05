@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 18;
+const schemaVersion :UInt32 = 19;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -201,7 +201,13 @@ struct ItemDetail {
   subtitleTracks @5 :List(Track);
   trickplay @6 :List(Trickplay);    # one per width the server renders; empty when off or unprobed
   segments @7 :List(Segment);
+  fonts @8 :List(Font);             # empty when the file embeds none; an older client ignores it
 }
+# A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
+# url holds `{subtitle}`, the index of the subtitle track the font is fetched
+# for: the server cuts the font to the glyphs that track draws. A track that
+# draws no ASS has no use for any of them.
+struct Font { index @0 :UInt32; filename @1 :Text; mime @2 :Text; url @3 :Text; }
 struct Chapter { name @0 :Text; startMs @1 :UInt64; }
 # An audio or subtitle stream. `index` is what Playback.negotiate takes.
 struct Track {

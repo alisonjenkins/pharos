@@ -190,3 +190,38 @@ pub fn trickplay(state: &AppState, item: &MediaItem) -> Vec<Trickplay> {
         })
         .collect()
 }
+
+/// A font the file embeds, for an ASS renderer (026 FR-010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Font {
+    /// The attachment's stream index: the `{n}` of its route.
+    pub index: u32,
+    pub filename: String,
+    pub mime: String,
+    /// `/videos/{id}/subtitles/{subtitle}/fonts/{n}` with `{subtitle}` left
+    /// for the client to fill with the subtitle track it fetches for.
+    pub url: String,
+}
+
+/// The fonts `item` embeds, in file order. Empty for audio and for a file
+/// with no font attachment.
+pub fn fonts(item: &MediaItem) -> Vec<Font> {
+    if !is_video(item) {
+        return Vec::new();
+    }
+    let id = wire_item_id(item.id);
+    item.probe
+        .attachments
+        .iter()
+        .filter(|a| crate::services::font_subset::is_font_attachment(a))
+        .map(|a| Font {
+            index: a.stream_index,
+            filename: a.filename.clone().unwrap_or_default(),
+            mime: crate::services::font_subset::font_mime(a).to_owned(),
+            url: format!(
+                "/videos/{id}/subtitles/{{subtitle}}/fonts/{}",
+                a.stream_index
+            ),
+        })
+        .collect()
+}

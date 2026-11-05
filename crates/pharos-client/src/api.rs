@@ -202,6 +202,18 @@ pub struct Detail {
     /// server lists them.
     pub trickplay: Vec<Trickplay>,
     pub segments: Vec<Segment>,
+    /// The fonts the file embeds, for drawing an ASS subtitle (026).
+    pub fonts: Vec<Font>,
+}
+
+/// A font the file embeds. `url` holds `{subtitle}`, the index of the
+/// subtitle track it is fetched for: the server cuts it to that track's glyphs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Font {
+    pub index: u32,
+    pub filename: String,
+    pub mime: String,
+    pub url: String,
 }
 
 /// A song's lyrics. When `synced`, every line has the time it is sung from;
@@ -928,6 +940,18 @@ impl PharosApi for NativeApi {
                             })
                         })
                         .collect(),
+                    fonts: d
+                        .get_fonts()?
+                        .iter()
+                        .map(|f| {
+                            Ok(Font {
+                                index: f.get_index(),
+                                filename: text(f.get_filename())?,
+                                mime: text(f.get_mime())?,
+                                url: text(f.get_url())?,
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),

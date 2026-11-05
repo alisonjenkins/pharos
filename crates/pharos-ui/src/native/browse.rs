@@ -2077,6 +2077,7 @@ mod tests {
             subtitle_tracks: Vec::new(),
             trickplay: Vec::new(),
             segments: Vec::new(),
+            fonts: Vec::new(),
         }
     }
 
