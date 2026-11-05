@@ -8,6 +8,7 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 
+use super::art::Art;
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
@@ -497,7 +498,7 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
     rsx! {
         aside { class: "pharos-up-next", aria_label: "Up next",
             if let Some(src) = card.image.clone() {
-                img { class: "pharos-up-next-art", src, alt: "" }
+                Art { src, sizes: "9rem", class: "pharos-up-next-art", lazy: false }
             }
             div { class: "pharos-up-next-text",
                 p { class: "pharos-up-next-eyebrow", "Up next" }
