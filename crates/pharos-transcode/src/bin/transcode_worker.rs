@@ -284,14 +284,16 @@ async fn run_job(
                 "transcode-worker: ffmpeg exited {s} for job {job_id:?}; stderr: {}",
                 stderr_text.trim()
             );
-            let _ = write_frame(
-                wr,
-                &WorkerEvent::Failed {
-                    job_id,
-                    error: exec::classify_failure(&stderr_text, is_hw),
-                },
-            )
-            .await;
+            let mut error = exec::classify_failure(&stderr_text, is_hw);
+            // B550: a device fault whose encoder never opened may only be a
+            // window with no picture in it. Ask the source before the
+            // scheduler cools the device for every other title.
+            if matches!(error, WorkerError::DeviceBusy(_))
+                && exec::encoder_never_opened(&stderr_text)
+            {
+                error = exec::settle_no_frames(error, exec::window_has_video(&spec).await);
+            }
+            let _ = write_frame(wr, &WorkerEvent::Failed { job_id, error }).await;
         }
         Err(e) => {
             let _ = write_frame(
