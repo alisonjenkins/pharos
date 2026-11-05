@@ -3107,6 +3107,21 @@ test.describe("pharos Dioxus UI song handover", () => {
       ).previoustrack(),
     );
     await expect.poll(() => skips.at(-1)).toBe("dir=previous source=media_session");
+    // Back on the first song, the system's next goes to the queued one again.
+    await expect(page).not.toHaveURL(new RegExp(`${next}$`), { timeout: 15_000 });
+    await expect.poll(() => handler("nexttrack")).toBe("function");
+    await page.evaluate(() =>
+      (
+        (window as unknown as { skipHandlers: Record<string, () => void> }).skipHandlers
+      ).nexttrack(),
+    );
+    await expect(page).toHaveURL(new RegExp(`${next}$`), { timeout: 15_000 });
+    await expect.poll(() => skips.at(-1)).toBe("dir=next source=media_session");
+    await expect
+      .poll(() => page.locator("#pharos-video").evaluate((a: HTMLMediaElement) => a.readyState), {
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(0);
 
     // With the focus on a slider, whose own keydown stops propagating, the
     // key still skips, and only once.
