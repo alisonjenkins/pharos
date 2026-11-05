@@ -274,13 +274,11 @@ pub fn WatchView(
         if chorded(&evt) {
             return;
         }
-        let key = evt.key();
-        let control = shortcuts
-            .key(&key, evt.modifiers().shift())
-            .or_else(|| match &key {
-                Key::Character(k) if k == "f" => Some(Control::Fullscreen),
-                key => transport_key(key, &media),
-            });
+        // Shift+P / Shift+N are page-wide (B562), not the player's own.
+        let control = match evt.key() {
+            Key::Character(k) if k == "f" => Some(Control::Fullscreen),
+            key => transport_key(&key, &media),
+        };
         let Some(control) = control else {
             return;
         };
@@ -790,11 +788,20 @@ fn TrackPicker(
     }
 }
 
-/// A neighbour a Shift+click asks for.
+/// A neighbour a Shift+click, Shift+P / Shift+N or a media key asks for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Skip {
     Previous,
     Next,
+}
+
+impl Skip {
+    pub fn label(self) -> &'static str {
+        match self {
+            Skip::Previous => "previous",
+            Skip::Next => "next",
+        }
+    }
 }
 
 /// The skip a mouse button asks for with Shift held: the main button is the
@@ -905,23 +912,6 @@ impl Shortcuts {
     pub fn context_menu(self, evt: &MouseEvent) {
         if evt.modifiers().shift() && !platform::on_a_control(evt) {
             evt.prevent_default();
-        }
-    }
-
-    /// Shift+P / Shift+N.
-    pub fn key(self, key: &Key, shift: bool) -> Option<Control> {
-        match key {
-            Key::Character(k) if shift && k.eq_ignore_ascii_case("p") => {
-                if self.song {
-                    Some(Control::Previous)
-                } else {
-                    self.previous.map(Control::Play)
-                }
-            }
-            Key::Character(k) if shift && k.eq_ignore_ascii_case("n") => {
-                self.next.map(Control::Play)
-            }
-            _ => None,
         }
     }
 
