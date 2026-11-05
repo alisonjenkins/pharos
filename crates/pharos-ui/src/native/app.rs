@@ -3413,7 +3413,8 @@ fn Player(
     let playing_id = p.detail.item.id;
     // A song's next comes from the queue, unless a group decides what plays.
     // A session is kept after its group ends, so ask the group, not it.
-    let queued = audio && !group.active;
+    let grouped = group.drives(playing_id);
+    let queued = audio && !grouped;
     let next = if queued {
         queue.read().next_after(playing_id, near.next)
     } else {
@@ -3818,7 +3819,7 @@ fn Player(
     // In a group the group decides what plays next, as for a song's queue.
     up_next_to.set(
         near.next
-            .filter(|_| p.kind == ItemKind::Episode && !group.active),
+            .filter(|_| p.kind == ItemKind::Episode && !grouped),
     );
 
     let on_media = {
@@ -4001,7 +4002,7 @@ fn Player(
                     // A group's play waits on the group, and a first play
                     // on a load; neither is a resume of a paused song.
                     let state = platform::media_state(VIDEO_ID);
-                    let in_group = session().is_some_and(|s| s.active());
+                    let in_group = session().is_some_and(|s| s.drives());
                     let resuming = (state.paused && state.position_ms > 0 && !in_group)
                         .then(|| start_resume(VIDEO_ID, &resume));
                     if !session().is_some_and(|s| s.toggle_play()) {
@@ -4437,7 +4438,7 @@ fn Player(
                     .collect::<Vec<_>>(),
                 seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
-                autoplay: !group.active,
+                autoplay: !grouped,
                 can_start_together: can_watch_together(p.kind) && !compact,
                 invite,
                 invite_open,
