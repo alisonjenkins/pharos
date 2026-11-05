@@ -271,7 +271,7 @@ pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
             arr.iter()
                 .filter_map(|r| {
                     let id = r.get("tvdb_id")?.as_str()?.to_string();
-                    let title = r.get("name")?.as_str()?.to_string();
+                    let title = decode_entities(r.get("name")?.as_str()?);
                     let year = r
                         .get("year")
                         .and_then(|y| y.as_str())
@@ -289,7 +289,7 @@ pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
                                 .flatten()
                                 .filter_map(|a| a.as_str()),
                         )
-                        .map(str::to_string)
+                        .map(decode_entities)
                         .collect();
                     Some(SearchCandidate {
                         id,
@@ -420,12 +420,12 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
         title: data
             .get("name")
             .and_then(|x| x.as_str())
-            .map(str::to_string),
+            .map(decode_entities),
         overview: data
             .get("overview")
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string),
+            .map(decode_entities),
         production_year: data
             .get("year")
             .and_then(|x| x.as_str())
@@ -459,6 +459,64 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
         artwork: art,
         ..EnrichedMetadata::default()
     })
+}
+
+/// Decode the HTML character references TVDB leaves in its text fields
+/// (search names included, so `R&amp;R` can still match a query exactly), once:
+/// its JSON carries `Dragon Ball R&amp;R` for "R&R", and the UI escapes what
+/// it is given, so the reference showed on screen (B558). A single left-to-
+/// right pass, so `&amp;lt;` becomes `&lt;` rather than `<`. An unknown or
+/// unterminated reference is kept as written.
+pub(crate) fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let decoded = rest
+            .get(1..)
+            .and_then(|r| {
+                r.find(';')
+                    .filter(|&end| end <= MAX_ENTITY_LEN)
+                    .map(|end| &r[..end])
+            })
+            .and_then(|name| Some((entity_char(name)?, name.len() + 2)));
+        match decoded {
+            Some((c, len)) => {
+                out.push(c);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Longest reference body [`decode_entities`] looks for (`#x10FFFF`), so a
+/// stray `&` far from any `;` is not scanned to the end of an overview.
+const MAX_ENTITY_LEN: usize = 8;
+
+fn entity_char(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{a0}'),
+        _ => {
+            let num = name.strip_prefix('#')?;
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
 }
 
 /// Parse a TVDB `/series/{id}/episodes/default` list response body,
@@ -495,12 +553,12 @@ pub(crate) fn parse_episode_detail(
             .get("name")
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string),
+            .map(decode_entities),
         overview: ep
             .get("overview")
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
-            .map(str::to_string),
+            .map(decode_entities),
         premiere_date: ep
             .get("aired")
             .and_then(|x| x.as_str())
@@ -746,6 +804,35 @@ mod tests {
         let pick = |q| pharos_core::match_best(q, None, &cands, 0.7).unwrap().id;
         assert_eq!(pick("Dragon Ball"), "76666");
         assert_eq!(pick("Dragon Ball Z"), "81472");
+    }
+
+    #[test]
+    fn decode_entities_decodes_tvdb_references_once() {
+        assert_eq!(
+            super::decode_entities("Dragon Ball R&amp;R"),
+            "Dragon Ball R&R"
+        );
+        assert_eq!(
+            super::decode_entities("&#39;85 &#x26; &quot;x&quot;"),
+            "'85 & \"x\""
+        );
+        assert_eq!(super::decode_entities("&amp;lt;"), "&lt;");
+        assert_eq!(
+            super::decode_entities("Cagney & Lacey; &bogus; a&"),
+            "Cagney & Lacey; &bogus; a&"
+        );
+    }
+
+    #[test]
+    fn tvdb_series_detail_overview_has_no_html_references() {
+        let body = r#"{"data":{"id":374456,"name":"Dragon Ball R&amp;R",
+            "overview":"Dragon Ball R&amp;R is a fan-made audio manga drama"}}"#;
+        let m = super::parse_series_detail(body).unwrap();
+        assert_eq!(m.title.as_deref(), Some("Dragon Ball R&R"));
+        assert_eq!(
+            m.overview.as_deref(),
+            Some("Dragon Ball R&R is a fan-made audio manga drama")
+        );
     }
 
     #[test]
