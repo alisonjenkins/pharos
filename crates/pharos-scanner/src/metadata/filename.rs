@@ -457,8 +457,10 @@ pub fn episode_title(stem: &str) -> Option<String> {
     // (`The.Long.Night.720p.HDTV`): the title ends at the first release
     // segment, and the segments before it are kept.
     let mut words: Vec<String> = Vec::new();
+    let mut stop: Option<&str> = None;
     for w in spaced.split_whitespace() {
         if is_release_word(w) {
+            stop = Some(w);
             break;
         }
         let segments: Vec<&str> = w.split(['.', '_']).collect();
@@ -470,10 +472,24 @@ pub fn episode_title(stem: &str) -> Option<String> {
                         .filter(|seg| !seg.is_empty())
                         .map(|seg| (*seg).to_string()),
                 );
+                stop = Some(segments[at]);
                 break;
             }
             None => words.push(w.to_string()),
         }
+    }
+    // A dotted or spaced 3D layout (`Half.SBS`, `Full TAB`) splits into two
+    // words, and only the second reads as a release word: its `Half`/`Full`
+    // belongs to the tail, not the title.
+    if stop.is_some_and(|w| {
+        ["sbs", "tab", "ou"]
+            .iter()
+            .any(|m| w.eq_ignore_ascii_case(m))
+    }) && words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("half") || w.eq_ignore_ascii_case("full"))
+    {
+        words.pop();
     }
     let title = words.join(" ");
     let title = title.trim_matches(|c: char| c == '-' || c.is_whitespace());
@@ -492,9 +508,9 @@ fn is_release_word(word: &str) -> bool {
             .map_err(|e| tracing::error!(error = %e, "invalid release-word regex"))
             .ok()
     });
-    // Over-under markers (`OU`, `HOU`, `FOU`) count only in capitals:
-    // "Fou" is a word.
-    matches!(word, "WEB" | "OU" | "HOU" | "FOU")
+    // Over-under markers (`OU`, `HOU`, `FOU`) and a bare `TAB` count only
+    // in capitals: "Fou" and "Tab" are words.
+    matches!(word, "WEB" | "OU" | "HOU" | "FOU" | "TAB")
         || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
 }
 
@@ -815,6 +831,12 @@ mod tests {
             ("Show.S01E02.OU.1080p", None),
             ("Show - S01E02 - Pilot [Half-SBS]", Some("Pilot")),
             ("Show - S01E02 - Pilot [Full-TAB]", Some("Pilot")),
+            ("Show.S01E02.Pilot.Half.SBS.1080p", Some("Pilot")),
+            ("Show.S01E02.Pilot.Full.TAB.1080p", Some("Pilot")),
+            ("Show - S01E02 - Pilot Half.SBS", Some("Pilot")),
+            ("Show - S01E02 - Pilot Full OU", Some("Pilot")),
+            ("Show - S01E02 - Half Measures", Some("Half Measures")),
+            ("Show - S01E02 - The Tab", Some("The Tab")),
             ("Show - S01E02 - Pilot UHD", Some("Pilot")),
             ("E01 - Pilot", Some("Pilot")),
             ("EP02 - The Return", Some("The Return")),
