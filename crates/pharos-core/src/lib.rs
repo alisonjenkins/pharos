@@ -703,12 +703,16 @@ pub fn search_tokens(term: &str) -> Vec<String> {
 
 /// A single search result returned by an online metadata provider, as
 /// input to [`match_best`]. `id` is the provider's own identifier for the
-/// candidate (opaque to this crate).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// candidate (opaque to this crate). `aliases` are the candidate's other
+/// names (an English translation, a romanisation, a former title): TVDB names
+/// an anime by its Japanese title and carries the English one only as a
+/// translation, so scoring `title` alone lets an English-titled fan work win.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchCandidate {
     pub id: String,
     pub title: String,
     pub year: Option<u32>,
+    pub aliases: Vec<String>,
 }
 
 /// The winning [`SearchCandidate`] chosen by [`match_best`], with the
@@ -815,25 +819,47 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
     }
 }
 
-/// Best-scoring candidate over `min_confidence`, else None. Score = title
-/// similarity × year factor. Ties resolve to the earliest candidate.
+/// Best-scoring candidate over `min_confidence`, else None. A candidate's
+/// title similarity is the best over its title and aliases; score = that ×
+/// year factor. Among candidates over `min_confidence`, one whose name equals
+/// the query (after normalization) outranks any that only shares a prefix with
+/// it, whatever the years: otherwise "Dragon Ball R&R" beats "Dragon Ball" when
+/// the real show's year is a year off (B557). An exact name whose year is far
+/// off falls under the floor and so cannot shut out a good prefix match
+/// ("Doctor Who" 1963 vs "Doctor Who (2005)"). Ties resolve to the earliest
+/// candidate.
 pub fn match_best(
     query_title: &str,
     query_year: Option<u32>,
     candidates: &[SearchCandidate],
     min_confidence: f32,
 ) -> Option<MatchOutcome> {
-    let mut best: Option<MatchOutcome> = None;
+    let query = normalize_title(query_title);
+    let mut best: Option<(bool, MatchOutcome)> = None;
     for c in candidates {
-        let score = title_similarity(query_title, &c.title) * year_factor(query_year, c.year);
-        if best.as_ref().map(|b| score > b.confidence).unwrap_or(true) {
-            best = Some(MatchOutcome {
-                id: c.id.clone(),
-                confidence: score,
-            });
+        let names = std::iter::once(&c.title).chain(&c.aliases);
+        let exact = names.clone().any(|n| normalize_title(n) == query);
+        let similarity = names
+            .map(|n| title_similarity(query_title, n))
+            .fold(0.0_f32, f32::max);
+        let score = similarity * year_factor(query_year, c.year);
+        if score < min_confidence {
+            continue;
+        }
+        let beats = best
+            .as_ref()
+            .is_none_or(|(best_exact, b)| (exact, score) > (*best_exact, b.confidence));
+        if beats {
+            best = Some((
+                exact,
+                MatchOutcome {
+                    id: c.id.clone(),
+                    confidence: score,
+                },
+            ));
         }
     }
-    best.filter(|b| b.confidence >= min_confidence)
+    best.map(|(_, b)| b)
 }
 
 /// Parse a bare `YYYY-MM-DD` date (TMDB/TVDB style) to unix seconds at UTC

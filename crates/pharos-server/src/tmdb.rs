@@ -386,7 +386,12 @@ pub(crate) fn parse_movie_search(body: &str) -> Vec<pharos_core::SearchCandidate
                         .get("release_date")
                         .and_then(|d| d.as_str())
                         .and_then(year_of);
-                    Some(pharos_core::SearchCandidate { id, title, year })
+                    Some(pharos_core::SearchCandidate {
+                        id,
+                        title,
+                        year,
+                        aliases: Vec::new(),
+                    })
                 })
                 .collect()
         })
@@ -413,7 +418,12 @@ pub(crate) fn parse_tv_search(body: &str) -> Vec<pharos_core::SearchCandidate> {
                         .get("first_air_date")
                         .and_then(|d| d.as_str())
                         .and_then(year_of);
-                    Some(pharos_core::SearchCandidate { id, title, year })
+                    Some(pharos_core::SearchCandidate {
+                        id,
+                        title,
+                        year,
+                        aliases: Vec::new(),
+                    })
                 })
                 .collect()
         })

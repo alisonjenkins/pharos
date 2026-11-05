@@ -569,11 +569,13 @@ fn match_best_prefers_exact_title_and_year() {
             id: "1".into(),
             title: "The Thing".into(),
             year: Some(2011),
+            aliases: Vec::new(),
         },
         SearchCandidate {
             id: "2".into(),
             title: "The Thing".into(),
             year: Some(1982),
+            aliases: Vec::new(),
         },
     ];
     let m = match_best("The Thing", Some(1982), &cands, 0.7).unwrap();
@@ -587,6 +589,7 @@ fn match_best_rejects_below_threshold() {
         id: "9".into(),
         title: "Completely Different".into(),
         year: None,
+        aliases: Vec::new(),
     }];
     assert!(match_best("The Thing", Some(1982), &cands, 0.7).is_none());
 }
@@ -597,9 +600,52 @@ fn match_best_year_off_by_one_is_partial_not_zero() {
         id: "3".into(),
         title: "Blade Runner".into(),
         year: Some(1983),
+        aliases: Vec::new(),
     }];
     // title exact, year ±1 -> still above threshold
     assert!(match_best("Blade Runner", Some(1982), &cands, 0.7).is_some());
+}
+
+fn cand(id: &str, title: &str, year: Option<u32>, aliases: &[&str]) -> SearchCandidate {
+    SearchCandidate {
+        id: id.into(),
+        title: title.into(),
+        year,
+        aliases: aliases.iter().map(|a| (*a).into()).collect(),
+    }
+}
+
+/// B557: TVDB names an anime by its Japanese title and carries the English
+/// one only as a translation. Scoring the title alone handed "Dragon Ball" to
+/// the English-titled fan work "Dragon Ball R&R" on a prefix match.
+#[test]
+fn match_best_scores_a_candidate_by_its_best_alias() {
+    let cands = vec![
+        cand("374456", "Dragon Ball R&R", Some(2018), &[]),
+        cand("76666", "ドラゴンボール", Some(1986), &["Dragon Ball"]),
+    ];
+    let m = match_best("Dragon Ball", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "76666");
+}
+
+#[test]
+fn match_best_ranks_an_exact_name_over_a_prefix_match_with_a_better_year() {
+    let cands = vec![
+        cand("fan", "Dragon Ball Z Abridged", Some(1990), &[]),
+        cand("real", "ドラゴンボールZ", Some(1989), &["Dragon Ball Z"]),
+    ];
+    let m = match_best("Dragon Ball Z", Some(1990), &cands, 0.7).unwrap();
+    assert_eq!(m.id, "real");
+}
+
+#[test]
+fn match_best_an_exact_name_under_the_floor_does_not_shut_out_a_prefix_match() {
+    let cands = vec![
+        cand("1963", "Doctor Who", Some(1963), &[]),
+        cand("2005", "Doctor Who (2005)", Some(2005), &[]),
+    ];
+    let m = match_best("Doctor Who", Some(2005), &cands, 0.7).unwrap();
+    assert_eq!(m.id, "2005");
 }
 
 #[test]
@@ -623,6 +669,7 @@ fn title_similarity_tolerates_appended_subtitle() {
             id: "cg".into(),
             title: "Code Geass: Lelouch of the Rebellion".into(),
             year: None,
+            aliases: Vec::new(),
         }],
         0.7
     )
@@ -643,6 +690,7 @@ fn title_similarity_tolerates_country_qualifier() {
             id: "fv".into(),
             title: "Forever".into(),
             year: None,
+            aliases: Vec::new(),
         }],
         0.7
     )

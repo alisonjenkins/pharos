@@ -273,7 +273,12 @@ pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
                         .get("year")
                         .and_then(|y| y.as_str())
                         .and_then(|s| s.parse::<u32>().ok());
-                    Some(SearchCandidate { id, title, year })
+                    Some(SearchCandidate {
+                        id,
+                        title,
+                        year,
+                        aliases: Vec::new(),
+                    })
                 })
                 .collect()
         })
