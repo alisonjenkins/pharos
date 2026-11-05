@@ -5,3 +5,9 @@
 //! `wasm32-unknown-unknown`.
 
 #![forbid(unsafe_code)]
+
+mod model;
+mod parse;
+
+pub use model::{Event, Format, Overrides, ParseStats, Rgba, Run, Script, Style};
+pub use parse::decode;
