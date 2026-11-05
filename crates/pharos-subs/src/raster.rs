@@ -95,6 +95,8 @@ pub(crate) struct LinePath {
     lines: Vec<[i32; 4]>,
     cur: (i32, i32),
     start: (i32, i32),
+    /// Horizontal shear (x += y * shear) for synthetic italic.
+    pub shear: f32,
 }
 
 fn fx(v: f32) -> i32 {
@@ -108,7 +110,7 @@ pub(crate) fn isqrt(n: u64) -> u64 {
         return n;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + n / x) / 2;
@@ -119,6 +121,8 @@ pub(crate) fn isqrt(n: u64) -> u64 {
 impl LinePath {
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.cur = (0, 0);
+        self.start = (0, 0);
     }
 
     fn line(&mut self, x: i32, y: i32) {
@@ -217,24 +221,33 @@ impl LinePath {
     }
 }
 
+impl LinePath {
+    fn pt(&self, x: f32, y: f32) -> (i32, i32) {
+        (fx(x + y * self.shear), -fx(y))
+    }
+}
+
 impl PathSink for LinePath {
     fn move_to(&mut self, x: f32, y: f32) {
         // Close the previous contour implicitly: fill rules need closed shapes.
         self.close();
-        self.cur = (fx(x), -fx(y));
+        self.cur = self.pt(x, y);
         self.start = self.cur;
     }
 
     fn line_to(&mut self, x: f32, y: f32) {
-        self.line(fx(x), -fx(y));
+        let p = self.pt(x, y);
+        self.line(p.0, p.1);
     }
 
     fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
-        self.quad_fixed((fx(cx0), -fx(cy0)), (fx(x), -fx(y)));
+        let (c, p) = (self.pt(cx0, cy0), self.pt(x, y));
+        self.quad_fixed(c, p);
     }
 
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        self.cubic_fixed((fx(cx0), -fx(cy0)), (fx(cx1), -fx(cy1)), (fx(x), -fx(y)));
+        let (c1, c2, p) = (self.pt(cx0, cy0), self.pt(cx1, cy1), self.pt(x, y));
+        self.cubic_fixed(c1, c2, p);
     }
 
     fn close(&mut self) {
@@ -366,7 +379,7 @@ mod tests {
     #[test]
     fn curve_circle_area_is_close() {
         let mut p = LinePath::default();
-        let k = 0.552_284_75 * 10.0;
+        let k = 5.522_847_5;
         p.move_to(10.0, 0.0);
         p.curve_to(10.0, k, k, 10.0, 0.0, 10.0);
         p.curve_to(-k, 10.0, -10.0, k, -10.0, 0.0);
