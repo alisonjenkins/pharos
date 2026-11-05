@@ -14,8 +14,8 @@ use pharos_core::{
     PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
     ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
     SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
-    TokenId, TokenRecord, TokenScope, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -1330,6 +1330,37 @@ impl TokenStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
             AnyStore::Postgres(p) => p.issue_with_ttl(user_id, device_id, ttl_secs, scope).await,
+        }
+    }
+
+    async fn issue_child_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+        scope: TokenScope,
+        parent: &TokenId,
+    ) -> AuthResult<IssuedToken> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.issue_child_with_ttl(user_id, device_id, ttl_secs, scope, parent)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.issue_child_with_ttl(user_id, device_id, ttl_secs, scope, parent)
+                    .await
+            }
+        }
+    }
+
+    async fn count_live_children(
+        &self,
+        user: UserId,
+        selector: TokenSelector<'_>,
+    ) -> AuthResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.count_live_children(user, selector).await,
+            AnyStore::Postgres(p) => p.count_live_children(user, selector).await,
         }
     }
 
