@@ -1,6 +1,7 @@
 //! The Account page (`/settings/account`) as a pure view: your avatar over
 //! `Session.setAvatar` / `removeAvatar`, your password over
-//! `Session.changePassword`, and this device's playback choices.
+//! `Session.changePassword`, this device's playback choices, and the language
+//! show descriptions are shown in (ADR-0062).
 
 use dioxus::prelude::*;
 use pharos_client::api::{Me, PASSWORD_CHANGED_REVOKE_FAILED};
@@ -29,6 +30,25 @@ pub fn avatar_refusal_message(error: &ClientError) -> String {
         other => format!("Could not change your picture: {other}"),
     }
 }
+
+/// The `Prefs` key the server maps onto the user's Jellyfin
+/// `DescriptionLanguagePreference`; matches the server's allow-list.
+pub const DESCRIPTION_LANGUAGE_PREF: &str = "description.language";
+
+/// The description languages offered, as (stored value, label). Empty is the
+/// server default, English; `OriginalLanguage` is whatever the show was made in.
+pub const DESCRIPTION_LANGUAGES: [(&str, &str); 10] = [
+    ("", "English (default)"),
+    ("jpn", "Japanese"),
+    ("fra", "French"),
+    ("deu", "German"),
+    ("spa", "Spanish"),
+    ("ita", "Italian"),
+    ("por", "Portuguese"),
+    ("kor", "Korean"),
+    ("zho", "Chinese"),
+    ("OriginalLanguage", "Original language"),
+];
 
 /// How the last change went: `Ok` shows the confirmation, `Err` the message.
 pub type Outcome = Result<(), String>;
@@ -91,6 +111,11 @@ pub fn AccountView(
     #[props(default)]
     crossfade_s: u32,
     #[props(default)] on_crossfade: EventHandler<u32>,
+    /// The stored description language: a value from
+    /// [`DESCRIPTION_LANGUAGES`], or empty for the default.
+    #[props(default)]
+    description_language: String,
+    #[props(default)] on_description_language: EventHandler<String>,
 ) -> Element {
     let name = me.as_ref().map(|me| me.name.clone());
     let has_avatar = me.as_ref().is_some_and(|me| me.avatar_url.is_some());
@@ -157,6 +182,27 @@ pub fn AccountView(
                 }
                 p { id: "crossfade-help", class: "pharos-muted",
                     "Off by default. When on, the next song in the queue starts under the end of this one as it fades out. Kept on this device."
+                }
+            }
+            div { class: "pharos-description-settings", id: "description-settings",
+                h3 { "Descriptions" }
+                label {
+                    "Show and episode descriptions in"
+                    select {
+                        id: "description-language",
+                        aria_describedby: "description-language-help",
+                        onchange: move |e| on_description_language.call(e.value()),
+                        for (value, label) in DESCRIPTION_LANGUAGES {
+                            option {
+                                value: "{value}",
+                                selected: value == description_language,
+                                "{label}"
+                            }
+                        }
+                    }
+                }
+                p { id: "description-language-help", class: "pharos-muted",
+                    "When a show has no description in this language, the English one is shown. Kept with your account, so every device and app uses it."
                 }
             }
             form {
@@ -240,8 +286,12 @@ mod tests {
     }
 
     fn render(outcome: Option<Outcome>, busy: bool) -> String {
+        render_with_language(outcome, busy, String::new())
+    }
+
+    fn render_with_language(outcome: Option<Outcome>, busy: bool, language: String) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(outcome, busy): (Option<Outcome>, bool)| {
+            |(outcome, busy, language): (Option<Outcome>, bool, String)| {
                 rsx! {
                     AccountView {
                         me: Some(Me {
@@ -257,10 +307,11 @@ mod tests {
                         on_change_password: |_| {},
                         on_pick_avatar: |_| {},
                         on_remove_avatar: |_| {},
+                        description_language: language,
                     }
                 }
             },
-            (outcome, busy),
+            (outcome, busy, language),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -284,6 +335,27 @@ mod tests {
         assert!(html.contains("Crossfade between songs"), "{html}");
         assert!(html.contains("<option value=\"0\" selected"), "{html}");
         assert!(html.contains("12 seconds"), "{html}");
+    }
+
+    #[test]
+    fn the_description_language_is_offered_and_starts_on_english() {
+        let html = render(None, false);
+        assert!(html.contains("id=\"description-language\""), "{html}");
+        assert!(html.contains("<option value=\"\" selected"), "{html}");
+        for (value, label) in DESCRIPTION_LANGUAGES {
+            assert!(
+                html.contains(&format!("value=\"{value}\"")),
+                "{value}: {html}"
+            );
+            assert!(html.contains(label), "{label}: {html}");
+        }
+    }
+
+    #[test]
+    fn a_stored_description_language_is_selected() {
+        let html = render_with_language(None, false, "jpn".into());
+        assert!(html.contains("<option value=\"jpn\" selected"), "{html}");
+        assert!(!html.contains("<option value=\"\" selected"), "{html}");
     }
 
     #[test]
