@@ -463,6 +463,17 @@ impl SubtitleSize {
         }
     }
 
+    /// How much of the base text height the Rust subtitle renderer draws
+    /// (spec 026 US1: 75/100/125/150%).
+    pub fn scale(self) -> f32 {
+        match self {
+            SubtitleSize::Small => 0.75,
+            SubtitleSize::Medium => 1.0,
+            SubtitleSize::Large => 1.25,
+            SubtitleSize::ExtraLarge => 1.5,
+        }
+    }
+
     /// The option text shown in the Appearance picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -1027,11 +1038,52 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
+/// The WebVTT URL of a plain text subtitle the Rust renderer draws (spec
+/// 026): SRT-family tracks the server serves as WebVTT. ASS/SSA keep their
+/// own renderer this slice ([`styled_subtitle_url`]); image subtitles are
+/// drawn by the player (019); `None` for both and for a burned track.
+pub fn rust_subtitle_url(track: &Track) -> Option<String> {
+    let text = matches!(
+        track.codec.to_ascii_lowercase().as_str(),
+        "srt" | "subrip" | "webvtt" | "vtt" | "mov_text" | "text"
+    );
+    track.vtt_url.clone().filter(|_| text)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn subtitle_sizes_scale_75_to_150_percent() {
+        let scales = SubtitleSize::ALL.map(SubtitleSize::scale);
+        assert_eq!(scales, [0.75, 1.0, 1.25, 1.5]);
+        assert_eq!(SubtitleSize::default().scale(), 1.0);
+    }
+
+    #[test]
+    fn the_rust_renderer_takes_plain_text_codecs_only() {
+        let track = |codec: &str, vtt: Option<&str>| Track {
+            codec: codec.into(),
+            vtt_url: vtt.map(Into::into),
+            ..Track::default()
+        };
+        let url = Some("/videos/7/subtitles/3/stream.vtt");
+        for codec in ["srt", "SubRip", "webvtt", "vtt", "mov_text", "text"] {
+            assert_eq!(
+                rust_subtitle_url(&track(codec, url)).as_deref(),
+                url,
+                "{codec}"
+            );
+        }
+        // ASS keeps JASSUB; bitmap tracks and burned ones have no WebVTT.
+        for codec in ["ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle", ""] {
+            assert_eq!(rust_subtitle_url(&track(codec, url)), None, "{codec}");
+        }
+        assert_eq!(rust_subtitle_url(&track("srt", None)), None);
+    }
 
     /// Disarm check: with `lifted_line` returning -2 for every cue, the two-
     /// and three-line cases fail.

@@ -10,7 +10,9 @@
 
 use std::fmt;
 
-use pharos_subs::{Frame, RenderStats, Renderer, Script, SubtitleStyle, Viewport};
+use pharos_subs::{Frame, Rect, RenderStats, Renderer, Script, SubtitleStyle, Viewport};
+
+use super::playback::SubtitleSize;
 
 /// Why the renderer could not take a font or a track.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +80,135 @@ impl SubtitleRenderer for RustSubs {
     fn stats(&self) -> RenderStats {
         self.inner.stats()
     }
+}
+
+/// The Pharos look at a viewer's size choice (FR-009).
+pub fn style_for(size: SubtitleSize) -> SubtitleStyle {
+    SubtitleStyle {
+        size_scale: size.scale(),
+        ..SubtitleStyle::default()
+    }
+}
+
+/// Where the picture sits inside a `width` x `height` box that shows it with
+/// `object-fit: contain`; the whole box until the picture's size is known.
+/// Mirrors the image subtitles' `min(100cqw, 100cqh * aw / ah)` (019).
+pub fn content_box(width: u32, height: u32, video_w: u32, video_h: u32) -> Rect {
+    if width == 0 || height == 0 || video_w == 0 || video_h == 0 {
+        return Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+    }
+    let (w, h) = (u64::from(width), u64::from(height));
+    let (vw, vh) = (u64::from(video_w), u64::from(video_h));
+    // Compare aspect ratios without division: video wider than the box fits
+    // to the width, otherwise to the height.
+    let (cw, ch) = if vw * h >= vh * w {
+        (w, (w * vh).div_ceil(vw).min(h))
+    } else {
+        ((h * vw).div_ceil(vh).min(w), h)
+    };
+    Rect {
+        x: ((w - cw) / 2) as i32,
+        y: ((h - ch) / 2) as i32,
+        w: cw as u32,
+        h: ch as u32,
+    }
+}
+
+/// How far the control bar covers the bottom of the player: the distance
+/// from the top of the bar to the bottom of the player while the controls
+/// show, nothing while they are hidden.
+pub fn controls_inset(controls_visible: bool, player_bottom: f64, controls_top: f64) -> u32 {
+    if !controls_visible {
+        return 0;
+    }
+    let covered = player_bottom - controls_top;
+    if covered.is_finite() && covered > 0.0 {
+        covered.round() as u32
+    } else {
+        0
+    }
+}
+
+/// Why a text track fell back to the browser's own cue display. The label
+/// is the `reason` of the `pharos: subtitles fallback` log line (016 FR-014
+/// `pharos_subtitle_render_fallback_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// The renderer rejected the font.
+    Font,
+    /// The font file could not be fetched.
+    FontFetch,
+    /// The track's WebVTT could not be fetched.
+    TrackFetch,
+    /// No WebGL2 context for the compositor.
+    NoWebgl2,
+    /// The compositor lost its context for good or failed to draw.
+    Gpu,
+    /// Fonts, track and GPU were not ready within the first-subtitle budget.
+    Slow,
+}
+
+impl FallbackReason {
+    pub const ALL: [FallbackReason; 6] = [
+        FallbackReason::Font,
+        FallbackReason::FontFetch,
+        FallbackReason::TrackFetch,
+        FallbackReason::NoWebgl2,
+        FallbackReason::Gpu,
+        FallbackReason::Slow,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FallbackReason::Font => "font",
+            FallbackReason::FontFetch => "font_fetch",
+            FallbackReason::TrackFetch => "track_fetch",
+            FallbackReason::NoWebgl2 => "no_webgl2",
+            FallbackReason::Gpu => "gpu",
+            FallbackReason::Slow => "slow",
+        }
+    }
+}
+
+/// The first subtitle must be ready this soon after the viewer picks the
+/// track (spec 026 budget); later, the browser's cues take over.
+pub const FIRST_SUBTITLE_BUDGET_MS: u32 = 300;
+
+/// How the `<track>` of the picked subtitle should be set (spec 026 US1 #1,
+/// #4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackMode {
+    /// The browser draws its cues.
+    Showing,
+    /// Loaded, so its words survive a failure, but not drawn.
+    Hidden,
+}
+
+/// The mode of the picked text track: hidden while the Rust renderer draws it
+/// or is starting (no flash of `::cue` before the first frame), showing once
+/// it is not an option.
+pub fn track_mode(rust: RustState) -> TrackMode {
+    match rust {
+        RustState::Starting | RustState::Active => TrackMode::Hidden,
+        RustState::Off | RustState::Failed => TrackMode::Showing,
+    }
+}
+
+/// Where the Rust renderer is for the picked subtitle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RustState {
+    /// The pick is not a plain text track, or subtitles are off.
+    #[default]
+    Off,
+    Starting,
+    Active,
+    /// Fell back to the browser's cues.
+    Failed,
 }
 
 #[cfg(test)]
@@ -209,6 +340,59 @@ mod tests {
         r.load("WEBVTT\n".to_owned()).unwrap();
         let f = r.frame(2_000, &vp());
         assert!(f.changed && f.masks.is_empty());
+    }
+
+    #[test]
+    fn the_picture_is_letterboxed_or_pillarboxed_like_object_fit_contain() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        // 2.39:1 film in a 16:9 box: bars above and below.
+        assert_eq!(content_box(1920, 1080, 2392, 1000), r(0, 138, 1920, 803));
+        // 4:3 in 16:9: bars at the sides.
+        assert_eq!(content_box(1920, 1080, 640, 480), r(240, 0, 1440, 1080));
+        // Same aspect fills the box.
+        assert_eq!(content_box(1280, 720, 1920, 1080), r(0, 0, 1280, 720));
+        // Unknown picture size: the whole box.
+        assert_eq!(content_box(800, 600, 0, 0), r(0, 0, 800, 600));
+        assert_eq!(content_box(0, 0, 1920, 1080), r(0, 0, 0, 0));
+    }
+
+    #[test]
+    fn subtitles_clear_the_control_bar_only_while_it_shows() {
+        assert_eq!(controls_inset(true, 720.0, 640.0), 80);
+        assert_eq!(controls_inset(false, 720.0, 640.0), 0);
+        // A bar measured off screen or not laid out never pushes them up.
+        assert_eq!(controls_inset(true, 720.0, 800.0), 0);
+        assert_eq!(controls_inset(true, 720.0, f64::NAN), 0);
+    }
+
+    #[test]
+    fn size_choices_change_only_the_scale_of_the_pharos_style() {
+        let base = style_for(SubtitleSize::Medium);
+        assert_eq!(base, SubtitleStyle::default());
+        let big = style_for(SubtitleSize::ExtraLarge);
+        assert_eq!(big.size_scale, 1.5);
+        assert_eq!(
+            SubtitleStyle {
+                size_scale: 1.0,
+                ..big
+            },
+            base
+        );
+    }
+
+    #[test]
+    fn the_browser_cues_show_unless_the_rust_renderer_has_the_track() {
+        assert_eq!(track_mode(RustState::Off), TrackMode::Showing);
+        assert_eq!(track_mode(RustState::Failed), TrackMode::Showing);
+        assert_eq!(track_mode(RustState::Starting), TrackMode::Hidden);
+        assert_eq!(track_mode(RustState::Active), TrackMode::Hidden);
+    }
+
+    #[test]
+    fn fallback_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            FallbackReason::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), FallbackReason::ALL.len());
     }
 
     #[test]
