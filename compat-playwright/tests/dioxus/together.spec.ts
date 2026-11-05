@@ -100,6 +100,8 @@ async function toggleUntil(member: Member, paused: boolean) {
 
 async function signIn(browser: Browser, label: string) {
   const context = await browser.newContext();
+  // A context of its own skips the config's storage: keep what's new off.
+  await context.addInitScript(() => localStorage.setItem("pharos.whats_new", "off"));
   const page = await context.newPage();
   const lines: string[] = [];
   page.on("console", (m) => lines.push(`[${label}] ${m.text()}`));
