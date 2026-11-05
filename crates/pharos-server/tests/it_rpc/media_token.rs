@@ -307,3 +307,202 @@ async fn a_logged_out_session_gets_no_media_token() {
     req.send().promise.await.unwrap();
     assert_eq!(media_token(&session).await, Err("revoked"));
 }
+
+// B543 / V438: a Media token ends with the token that issued it. Each case
+// shows the token working on a stream (images are anonymous, B286), acts,
+// then shows the same request refused at once. Disarm check: issuing the
+// token with `issue_with_ttl` (no parent) fails
+// `native_sign_out_ends_the_media_token_and_counts_it`.
+
+use metrics_util::debugging::DebuggingRecorder;
+use pharos_core::TokenStore;
+use pharos_server::services::auth::{revoke_device, revoke_other_tokens, RevokeCause};
+
+fn stream_uri(token: &str) -> String {
+    format!("/Videos/7/stream?static=true&api_key={token}")
+}
+
+async fn guest(rig: &Rig) -> UserId {
+    rig.state.stores.lookup_by_name("guest").await.unwrap().id
+}
+
+/// The device id of the signed-in session's own token (not the Media one).
+async fn session_device(rig: &Rig, user: UserId) -> String {
+    let devices = rig.state.stores.tokens_for(user).await.unwrap();
+    let own: Vec<_> = devices
+        .iter()
+        .filter(|t| t.device_id != "pharos-native:media")
+        .collect();
+    assert_eq!(own.len(), 1, "{devices:?}");
+    own[0].device_id.clone()
+}
+
+fn revoked(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, cause: &str) -> u64 {
+    crate::telemetry::counter(
+        snapshotter,
+        "pharos_media_token_revoked_total",
+        &[("cause", cause)],
+    )
+}
+
+#[actix_web::test]
+async fn native_sign_out_ends_the_media_token_and_counts_it() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let mut req = session.logout_request();
+    req.get().init_ctx();
+    req.send().promise.await.unwrap();
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(revoked(&snapshotter, "logout"), 1);
+}
+
+#[actix_web::test]
+async fn revoking_the_device_ends_the_media_token() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let user = guest(&rig).await;
+    let device = session_device(&rig, user).await;
+    let dropped = revoke_device(&rig.state, user, &device, RevokeCause::DeviceDeleted)
+        .await
+        .unwrap();
+    assert_eq!(dropped, 1, "only the session token matches the device id");
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(revoked(&snapshotter, "device_deleted"), 1);
+}
+
+#[actix_web::test]
+async fn revoking_the_other_sessions_ends_the_media_token() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let user = guest(&rig).await;
+    let keep = rig.state.stores.issue(user, "keeper").await.unwrap();
+    revoke_other_tokens(
+        &rig.state,
+        user,
+        Some(keep.0.expose()),
+        RevokeCause::PasswordChanged,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+    rig.state
+        .stores
+        .resolve(keep.0.expose())
+        .await
+        .expect("the kept token survives");
+    assert_eq!(revoked(&snapshotter, "password_changed"), 1);
+}
+
+#[actix_web::test]
+async fn revoking_the_parent_by_id_ends_the_media_token() {
+    let rig = rig().await;
+    let client = bootstrap_client(&rig, None);
+    let (session, device_token) = login(&client, "guest", "hunter2").await.ok().unwrap();
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let parent = pharos_core::TokenId(rig.state.stores.token_id(&device_token));
+    rig.state.stores.revoke_by_id(&parent).await.unwrap();
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[actix_web::test]
+async fn disabling_the_user_ends_the_media_token() {
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let user = guest(&rig).await;
+    rig.state
+        .stores
+        .set_policy(
+            user,
+            UserPolicy {
+                is_disabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[actix_web::test]
+async fn deleting_the_user_ends_the_media_token() {
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let app = test::init_service(build_app(rig.state.clone())).await;
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+
+    let user = guest(&rig).await;
+    rig.state.stores.delete(user).await.unwrap();
+
+    assert_eq!(
+        status!(app, "GET", &stream_uri(&token)),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[actix_web::test]
+async fn another_devices_sign_out_leaves_the_media_token_working() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let rig = rig().await;
+    let (session, _) = signed_in(&rig, None).await;
+    let (token, _) = media_token(&session).await.unwrap();
+    let (other, _) = signed_in(&rig, None).await;
+    let app = test::init_service(build_app(rig.state.clone())).await;
+
+    let mut req = other.logout_request();
+    req.get().init_ctx();
+    req.send().promise.await.unwrap();
+
+    assert_eq!(status!(app, "GET", &stream_uri(&token)), StatusCode::OK);
+    assert_eq!(revoked(&snapshotter, "logout"), 0);
+}
