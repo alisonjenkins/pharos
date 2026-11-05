@@ -3,7 +3,7 @@
 use crate::sqlite::SqliteStore;
 use pharos_core::{
     AuthError, AuthResult, AuthToken, IssuedToken, ResolvedToken, SecretString, TokenId,
-    TokenScope, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
+    TokenScope, TokenSelector, TokenStore, UserId, UserPolicy, UserRecord, UserStore,
 };
 use uuid::Uuid;
 
@@ -209,6 +209,104 @@ impl SqliteStore {
     }
 }
 
+impl SqliteStore {
+    /// The one insert behind every issue; `parent_hash` is the token whose
+    /// revoke must take this one with it (`None` for a token of its own).
+    async fn insert_token(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+        scope: TokenScope,
+        parent_hash: Option<&str>,
+    ) -> AuthResult<IssuedToken> {
+        // The raw token is returned to the client but never stored — only
+        // its SHA-256 hash is persisted (a DB leak must not yield usable
+        // tokens). `expires_at` bounds the token's lifetime.
+        let token = Uuid::new_v4().simple().to_string();
+        let id = crate::auth_token::hash(&token);
+        let now = now_unix_secs();
+        let user_bytes = user_id.0.as_bytes().to_vec();
+        let requested_expiry = now.saturating_add(ttl_secs);
+        // A child is inserted from its parent's row, so a missing or expired
+        // parent inserts nothing, and the child never outlives the parent.
+        let row: Option<(i64,)> = match parent_hash {
+            Some(parent) => {
+                sqlx::query_as(
+                    "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope, parent_hash) \
+                 SELECT ?1, ?2, ?3, ?4, \
+                        CASE WHEN p.expires_at IS NULL OR p.expires_at > ?5 THEN ?5 ELSE p.expires_at END, \
+                        ?6, p.token_hash \
+                 FROM auth_tokens p \
+                 WHERE p.token_hash = ?7 AND p.user_id = ?2 AND (p.expires_at IS NULL OR p.expires_at > ?4) \
+                 RETURNING expires_at",
+                )
+                .bind(&id)
+                .bind(user_bytes)
+                .bind(device_id)
+                .bind(now)
+                .bind(requested_expiry)
+                .bind(scope.to_stored())
+                .bind(parent)
+                .fetch_optional(self.pool())
+                .await
+            }
+            None => {
+                sqlx::query_as(
+                    "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
+                 VALUES (?, ?, ?, ?, ?, ?) RETURNING expires_at",
+                )
+                .bind(&id)
+                .bind(user_bytes)
+                .bind(device_id)
+                .bind(now)
+                .bind(requested_expiry)
+                .bind(scope.to_stored())
+                .fetch_optional(self.pool())
+                .await
+            }
+        }
+        .map_err(map_sqlx)?;
+        let (expires_at,) = row.ok_or(AuthError::InvalidToken)?;
+        Ok(IssuedToken {
+            id: TokenId(id),
+            secret: AuthToken(SecretString::new(token)),
+            expires_at,
+        })
+    }
+
+    /// Live (unexpired) children of the tokens `selector` names, for the
+    /// revoke metric. The removal is the `parent_hash` cascade, not this.
+    async fn count_children(&self, user: UserId, selector: TokenSelector<'_>) -> AuthResult<u64> {
+        let user_bytes = user.0.as_bytes().to_vec();
+        let now = now_unix_secs();
+        let query = match selector {
+            TokenSelector::Token(token) => sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM auth_tokens c JOIN auth_tokens p ON c.parent_hash = p.token_hash WHERE p.user_id = ?1 AND (c.expires_at IS NULL OR c.expires_at > ?2) AND p.token_hash = ?3",
+            )
+            .bind(user_bytes)
+            .bind(now)
+            .bind(crate::auth_token::hash(token)),
+            TokenSelector::Device(device_id) => sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM auth_tokens c JOIN auth_tokens p ON c.parent_hash = p.token_hash WHERE p.user_id = ?1 AND (c.expires_at IS NULL OR c.expires_at > ?2) AND p.device_id = ?3",
+            )
+            .bind(user_bytes)
+            .bind(now)
+            .bind(device_id.to_owned()),
+            TokenSelector::AllExcept(keep) => sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM auth_tokens c JOIN auth_tokens p ON c.parent_hash = p.token_hash WHERE p.user_id = ?1 AND (c.expires_at IS NULL OR c.expires_at > ?2) AND substr(p.device_id, 1, length(?3)) <> ?3 \
+                 AND (?4 IS NULL OR p.token_hash <> ?4)",
+            )
+            .bind(user_bytes)
+            .bind(now)
+            .bind(pharos_core::API_KEY_DEVICE_PREFIX)
+            .bind(keep.map(crate::auth_token::hash)),
+        };
+        let (n,) = query.fetch_one(self.pool()).await.map_err(map_sqlx)?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+}
+
 impl TokenStore for SqliteStore {
     async fn issue(&self, user_id: UserId, device_id: &str) -> AuthResult<AuthToken> {
         Ok(self
@@ -230,30 +328,30 @@ impl TokenStore for SqliteStore {
         ttl_secs: i64,
         scope: TokenScope,
     ) -> AuthResult<IssuedToken> {
-        // The raw token is returned to the client but never stored — only
-        // its SHA-256 hash is persisted (a DB leak must not yield usable
-        // tokens). `expires_at` bounds the token's lifetime.
-        let token = Uuid::new_v4().simple().to_string();
-        let id = crate::auth_token::hash(&token);
-        let now = now_unix_secs();
-        let user_bytes = user_id.0.as_bytes().to_vec();
-        sqlx::query(
-            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(user_bytes)
-        .bind(device_id)
-        .bind(now)
-        .bind(now.saturating_add(ttl_secs))
-        .bind(scope.to_stored())
-        .execute(self.pool())
-        .await
-        .map_err(map_sqlx)?;
-        Ok(IssuedToken {
-            id: TokenId(id),
-            secret: AuthToken(SecretString::new(token)),
-        })
+        self.insert_token(user_id, device_id, ttl_secs, scope, None)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, parent), fields(user.id = %user_id, device = %device_id))]
+    async fn issue_child_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+        scope: TokenScope,
+        parent: &TokenId,
+    ) -> AuthResult<IssuedToken> {
+        self.insert_token(user_id, device_id, ttl_secs, scope, Some(&parent.0))
+            .await
+    }
+
+    #[tracing::instrument(skip(self, selector), fields(user.id = %user.0.simple()))]
+    async fn count_live_children(
+        &self,
+        user: UserId,
+        selector: TokenSelector<'_>,
+    ) -> AuthResult<u64> {
+        self.count_children(user, selector).await
     }
 
     #[tracing::instrument(skip(self))]
