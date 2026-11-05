@@ -106,8 +106,15 @@ pub(crate) fn detect_artwork(req: &MetadataRequest<'_>) -> Vec<ArtworkRef> {
     };
 
     // Item-level: the directory holding the media file.
-    if let Some(dir) = item_dir.filter(|_| !(item_dir_is_show && foreign.show)) {
-        detect_in_dir(dir, stem, &mut out);
+    if let Some(dir) = item_dir {
+        if item_dir_is_show && foreign.show {
+            // The show folder's own art belongs to the other show, but a
+            // trusted episode's `<stem>-thumb` / `-poster` / `-fanart` beside
+            // it is still its own.
+            detect_per_file_in_dir(dir, stem, &mut out);
+        } else {
+            detect_in_dir(dir, stem, &mut out);
+        }
     }
 
     // Series-level (episodes only): the show folder carries poster.jpg /
@@ -135,6 +142,30 @@ fn detect_in_dir(dir: &Path, stem: &str, out: &mut Vec<ArtworkRef>) {
             continue;
         }
         if let Some(path) = first_existing(dir, &bases) {
+            out.push(ArtworkRef {
+                role,
+                source: ArtworkSource::LocalFile(path),
+            });
+        }
+    }
+}
+
+/// [`detect_in_dir`] for only the `<stem>-…` per-file names, none of the
+/// folder-wide ones. Nothing for an empty `stem`.
+fn detect_per_file_in_dir(dir: &Path, stem: &str, out: &mut Vec<ArtworkRef>) {
+    if stem.is_empty() {
+        return;
+    }
+    let prefix = format!("{stem}-");
+    for (role, bases) in role_base_names(stem) {
+        if out.iter().any(|a| a.role == role) {
+            continue;
+        }
+        let own: Vec<String> = bases
+            .into_iter()
+            .filter(|b| b.starts_with(&prefix))
+            .collect();
+        if let Some(path) = first_existing(dir, &own) {
             out.push(ArtworkRef {
                 role,
                 source: ArtworkSource::LocalFile(path),

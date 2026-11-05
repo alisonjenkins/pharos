@@ -500,9 +500,25 @@ const FOREIGN_EPISODE_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standa
 /// A show folder holding `tvshow.nfo` and a `Season 01` with one episode, its
 /// NFO and its `-thumb.jpg`. Returns (tempdir, episode path, series info).
 fn dragon_ball(show_nfo: &str, episode_nfo: &str) -> (tempfile::TempDir, PathBuf, SeriesInfo) {
+    dragon_ball_in(show_nfo, episode_nfo, Some("Season 01"))
+}
+
+/// [`dragon_ball`] with the episode in `season` under the show folder, or
+/// in the show folder itself for `None`.
+fn dragon_ball_in(
+    show_nfo: &str,
+    episode_nfo: &str,
+    season: Option<&str>,
+) -> (tempfile::TempDir, PathBuf, SeriesInfo) {
     let dir = tempdir().unwrap();
-    let season = dir.path().join("Season 01");
-    std::fs::create_dir(&season).unwrap();
+    let season = match season {
+        Some(name) => {
+            let season = dir.path().join(name);
+            std::fs::create_dir(&season).unwrap();
+            season
+        }
+        None => dir.path().to_path_buf(),
+    };
     let stem = "Dragon Ball - S01E01 - Secret of the Dragon Balls";
     let media = season.join(format!("{stem}.mkv"));
     std::fs::write(&media, b"").unwrap();
@@ -575,6 +591,83 @@ async fn nfos_naming_the_show_are_kept_with_their_art() {
         local("-thumb.jpg") && local("folder.jpg") && local("logo.png"),
         "{art:?}"
     );
+}
+
+fn request<'a>(
+    media: &'a PathBuf,
+    p: &'a MediaProbe,
+    series: &'a SeriesInfo,
+) -> MetadataRequest<'a> {
+    MetadataRequest {
+        path: media,
+        kind: MediaKind::Episode,
+        probe: p,
+        series: Some(series),
+    }
+}
+
+fn has_local(art: &[pharos_core::ArtworkRef], suffix: &str) -> bool {
+    art.iter().any(|a| {
+        matches!(&a.source, ArtworkSource::LocalFile(p)
+        if p.to_string_lossy().ends_with(suffix))
+    })
+}
+
+/// An episode NFO with no `<showtitle>` came from the same scrape as the
+/// show's, so it shares that verdict.
+#[test]
+fn an_episode_nfo_without_a_show_title_shares_the_show_nfos_verdict() {
+    let episode: String = FOREIGN_EPISODE_NFO
+        .lines()
+        .filter(|l| !l.contains("<showtitle>"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let p = probe();
+    let foreign = identity::foreign_nfos(&request(&media, &p, &series));
+    assert!(foreign.show);
+    assert_eq!(foreign.episode, foreign.show);
+}
+
+/// A foreign `tvshow.nfo` beside a trusted episode NFO: the episode keeps its
+/// own thumb, and the show folder's art is dropped.
+#[test]
+fn a_trusted_episode_keeps_its_thumb_under_a_foreign_show_nfo() {
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let p = probe();
+    let req = request(&media, &p, &series);
+    let foreign = identity::foreign_nfos(&req);
+    assert!(foreign.show && !foreign.episode);
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(has_local(&art, "-thumb.jpg"), "{art:?}");
+    assert!(
+        !has_local(&art, "folder.jpg") && !has_local(&art, "logo.png"),
+        "{art:?}"
+    );
+}
+
+/// An episode in the show folder itself under a foreign `tvshow.nfo`: the
+/// folder-wide art is the other show's, and the trusted episode's own
+/// `-thumb` is still found. Disarm check: probing the folder with
+/// `detect_in_dir` again picks up folder.jpg; skipping it loses the thumb.
+#[test]
+fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (_dir, media, series) = dragon_ball_in(FOREIGN_TVSHOW_NFO, &episode, None);
+    let p = probe();
+    let req = request(&media, &p, &series);
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(
+        !has_local(&art, "folder.jpg") && !has_local(&art, "logo.png"),
+        "{art:?}"
+    );
+    assert!(has_local(&art, "-thumb.jpg"), "{art:?}");
+
+    let (_dir, media, series) = dragon_ball_in(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO, None);
+    let req = request(&media, &p, &series);
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(art.is_empty(), "{art:?}");
 }
 
 /// The show names the deployed library's `tvshow.nfo` files carry for folders

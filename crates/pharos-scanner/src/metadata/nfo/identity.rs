@@ -59,7 +59,7 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
             titles.into_iter().flatten(),
         ) {
             out.show = true;
-            tracing::info!(
+            tracing::debug!(
                 series = series_name,
                 nfo_title = names.title.as_deref().unwrap_or(""),
                 nfo = %path.display(),
@@ -82,7 +82,7 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
                 None => out.show,
             };
             if out.episode {
-                tracing::info!(
+                tracing::debug!(
                     series = series_name,
                     nfo_show_title = names.show_title.as_deref().unwrap_or(""),
                     nfo = %path.display(),
