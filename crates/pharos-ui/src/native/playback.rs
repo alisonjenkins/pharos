@@ -218,12 +218,13 @@ pub fn lifted_line(cue_text: &str, chars_per_line: usize) -> f64 {
 
 /// The rendered lines `text` wraps to at `per_line` characters, wrapped as
 /// a browser does, at spaces: a word that does not fit on the current line
-/// starts the next, and a word longer than a line breaks across lines.
+/// starts the next, and a word longer than a line breaks across lines. A
+/// fullwidth (CJK, Hangul) character counts as two (`cell_width`).
 fn wrapped_lines(text: &str, per_line: usize) -> usize {
     let mut lines = 0;
     let mut used = 0;
     for word in text.split_whitespace() {
-        let len = word.chars().count();
+        let len: usize = word.chars().map(cell_width).sum();
         if used > 0 && used + 1 + len <= per_line {
             used += 1 + len;
         } else {
@@ -235,6 +236,24 @@ fn wrapped_lines(text: &str, per_line: usize) -> usize {
         }
     }
     lines
+}
+
+/// The character cells `c` takes in `wrapped_lines`: a fullwidth glyph (CJK,
+/// kana, Hangul, fullwidth forms) is about 1em wide, against the 0.6em
+/// `cue_chars_per_line` allows a cell, so it counts as two; 2 cells (1.2em)
+/// still errs towards more lines.
+fn cell_width(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
 }
 
 /// A cue text line without its `<...>` tags.
@@ -939,6 +958,11 @@ mod tests {
         // A word longer than a line breaks across lines.
         assert_eq!(lifted_line("abcdefghijklmnopqrstuvwxy", 10), -4.0);
         assert_eq!(lifted_line("   ", 10), -2.0);
+        // Fullwidth glyphs take two cells: ten of them fill two
+        // 10-character lines.
+        assert_eq!(lifted_line("今日はいい天気ですね。", 10), -4.0);
+        assert_eq!(lifted_line("今日はいい天気ですね", 10), -3.0);
+        assert_eq!(lifted_line("안녕하세요", 10), -2.0);
     }
 
     /// Disarm check: returning `size` alone, the positioned cases read 100.

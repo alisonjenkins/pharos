@@ -482,8 +482,9 @@ thread_local! {
 type CueResize = (JsValue, JsValue, Closure<dyn FnMut()>);
 
 /// Lifts the cues of each track the `<video>` `video_id` shows, for its
-/// size now.
-fn lift_shown_cues(video_id: &str) {
+/// size now: every cue (`"cues"`), or only those on screen (`"activeCues"`)
+/// when the rest will be lifted by `ON_CUE_CHANGE` as they come up.
+fn lift_shown_cues(video_id: &str, list: &str) {
     let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
         return;
     };
@@ -492,7 +493,7 @@ fn lift_shown_cues(video_id: &str) {
         if let Some(t) = tracks.get(i) {
             if t.mode() == web_sys::TextTrackMode::Showing {
                 lift_cues(
-                    &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
+                    &js_sys::Reflect::get(&t, &list.into()).unwrap_or_default(),
                     cue_box,
                 );
             }
@@ -540,7 +541,7 @@ fn watch_cue_video(video_id: &str) {
         return;
     };
     let id = video_id.to_owned();
-    let on_resize = Closure::<dyn FnMut()>::new(move || lift_shown_cues(&id));
+    let on_resize = Closure::<dyn FnMut()>::new(move || lift_shown_cues(&id, "activeCues"));
     let Ok(observer) = js_sys::Reflect::construct(ctor, &js_sys::Array::of1(on_resize.as_ref()))
     else {
         return;
@@ -555,9 +556,14 @@ fn watch_cue_video(video_id: &str) {
 
 /// Lifts the shown cues of the `<video>` `video_id` again for the font size
 /// the Subtitle size choice just set, since a larger size can wrap a cue onto
-/// more lines.
+/// more lines. The `<video>` whose cues were last lifted (the non-native player's
+/// `pharos-media-…`) is lifted too when it is not `video_id`.
 pub fn relift_cues(video_id: &str) {
-    lift_shown_cues(video_id);
+    lift_shown_cues(video_id, "cues");
+    let watched = CUE_VIDEO.with(|v| v.borrow().clone());
+    if !watched.is_empty() && watched != video_id {
+        lift_shown_cues(&watched, "cues");
+    }
 }
 
 /// Lifts the cues of each track the `<video>` `video_id` shows (V455), now
@@ -571,7 +577,7 @@ pub fn lift_cues_as_shown(video_id: &str) {
     let id = video_id.to_owned();
     let list = tracks.clone();
     let lift = move || {
-        lift_shown_cues(&id);
+        lift_shown_cues(&id, "cues");
         for i in 0..list.length() {
             if let Some(t) = list.get(i) {
                 if t.mode() == web_sys::TextTrackMode::Showing {
@@ -734,11 +740,16 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
         let in_region = js_sys::Reflect::get(&cue, &region)
             .ok()
             .is_some_and(|r| !r.is_null() && !r.is_undefined());
-        // A cue Pharos lifted before is lifted again for the player's size
-        // now; one whose author set its `line` is left alone.
+        // A cue Pharos lifted before, and still at the line Pharos gave it,
+        // is lifted again for the player's size now; one whose author set
+        // its `line` (before or since) is left alone.
+        let current = js_sys::Reflect::get(&cue, &line)
+            .ok()
+            .and_then(|v| v.as_f64());
         let ours = js_sys::Reflect::get(&cue, &lifted_key)
             .ok()
-            .is_some_and(|v| v.is_truthy());
+            .and_then(|v| v.as_f64())
+            .is_some_and(|previous| current == Some(previous));
         if (ours || text(&cue, &line).as_deref() == Some("auto"))
             && text(&cue, &vertical).as_deref() == Some("")
             && !in_region
@@ -756,12 +767,12 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
                 &text(&cue, &align_key).unwrap_or_default(),
             );
             let chars_per_line = cue_chars_per_line(cue_box.width * share / 100.0, cue_box.font);
-            let _ = js_sys::Reflect::set(
-                &cue,
-                &line,
-                &JsValue::from_f64(lifted_line(&lines, chars_per_line)),
-            );
-            let _ = js_sys::Reflect::set(&cue, &lifted_key, &JsValue::TRUE);
+            // Written only when it moves: most relifted cues keep their line.
+            let lifted = lifted_line(&lines, chars_per_line);
+            if current != Some(lifted) {
+                let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(lifted));
+            }
+            let _ = js_sys::Reflect::set(&cue, &lifted_key, &JsValue::from_f64(lifted));
         }
     }
 }
