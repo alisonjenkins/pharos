@@ -188,7 +188,9 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
     .filter(|t| t.is_finite())
     .unwrap_or(0.0);
     let start = origin + spec.opts.start_position_ticks as f64 / tps;
-    let window = format!("{start:.3}%+{dur:.3}");
+    // An absolute end: ffprobe seeks to the keyframe before `start`, and a
+    // `+dur` would count from there and stop short of the window's end.
+    let window = format!("{start:.3}%{:.3}", start + dur);
     let packets = run_probe(&[
         "-v",
         "error",
