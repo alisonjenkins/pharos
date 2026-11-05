@@ -121,6 +121,7 @@ pub struct MediaState {
     pub paused: bool,
     pub volume: f64,
     pub muted: bool,
+    pub loading: bool,
 }
 
 impl Default for MediaState {
@@ -131,8 +132,19 @@ impl Default for MediaState {
             paused: true,
             volume: 1.0,
             muted: false,
+            loading: false,
         }
     }
+}
+
+/// `HTMLMediaElement.HAVE_FUTURE_DATA`: enough data for the current frame and
+/// at least a little ahead.
+const HAVE_FUTURE_DATA: u16 = 3;
+
+/// Whether the `<video>` is waiting on data: while seeking (paused or not), or
+/// while unpaused without future data to play.
+pub fn is_loading(seeking: bool, ready_state: u16, paused: bool, ended: bool) -> bool {
+    seeking || (ready_state < HAVE_FUTURE_DATA && !ended && (!paused || seeking))
 }
 
 impl MediaState {
@@ -714,7 +726,28 @@ mod tests {
     fn a_new_player_starts_at_the_saved_volume() {
         let state = MediaState::at_volume(Some((0.3, true)));
         assert_eq!((state.volume, state.muted), (0.3, true));
+        assert!(!state.loading);
         assert_eq!(MediaState::at_volume(None), MediaState::default());
+    }
+
+    #[test]
+    fn loading_shows_while_seeking_or_playing_without_future_data() {
+        // Seeking always counts as loading, whether playing or paused.
+        assert!(is_loading(true, 4, false, false));
+        assert!(is_loading(true, 4, true, false));
+        assert!(is_loading(true, 0, true, false));
+        // Initial autoplay load (readyState < 2, unpaused) and mid-play stalls
+        // (readyState == 2 HAVE_CURRENT_DATA, unpaused) are loading.
+        assert!(is_loading(false, 0, false, false));
+        assert!(is_loading(false, 1, false, false));
+        assert!(is_loading(false, 2, false, false));
+        // HAVE_FUTURE_DATA (3) and HAVE_ENOUGH_DATA (4) are ready to play.
+        assert!(!is_loading(false, 3, false, false));
+        assert!(!is_loading(false, 4, false, false));
+        // Paused or ended without an active seek is not waiting on data.
+        assert!(!is_loading(false, 0, true, false));
+        assert!(!is_loading(false, 2, true, false));
+        assert!(!is_loading(false, 2, false, true));
     }
 
     #[test]
