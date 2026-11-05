@@ -118,6 +118,8 @@ pub fn set_volume(_video_id: &str, _volume: f64, _muted: bool) {}
 
 pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}
 
+pub fn lift_cues_as_shown(_video_id: &str) {}
+
 pub struct StyledSubtitles;
 
 pub async fn styled_subtitles(
