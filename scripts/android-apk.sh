@@ -34,8 +34,13 @@ for f in "$PHAROS_ANDROID_KEYSTORE" "$PHAROS_ANDROID_KEYSTORE_PASS_FILE"; do
   fi
 done
 
+# Absolute before the cd below, so a path relative to where this was run
+# still names the same file for apksigner.
+PHAROS_ANDROID_KEYSTORE=$(realpath "$PHAROS_ANDROID_KEYSTORE")
+PHAROS_ANDROID_KEYSTORE_PASS_FILE=$(realpath "$PHAROS_ANDROID_KEYSTORE_PASS_FILE")
+
 root=$(git rev-parse --show-toplevel)
-cd "$root"
+cd "$root" || exit 1
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 out=${PHAROS_ANDROID_APK_OUT:-$target_dir/pharos-tv-$profile.apk}
 
