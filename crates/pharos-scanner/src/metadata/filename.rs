@@ -452,12 +452,29 @@ pub fn episode_title(stem: &str) -> Option<String> {
     } else {
         rest.replace(['.', '_', '[', ']'], " ")
     };
-    let words: Vec<&str> = spaced
-        .split_whitespace()
-        // A spaced name can still carry a dotted release tail
-        // (`720p.HDTV.x264-GRP [PublicHD]`): its first segment decides.
-        .take_while(|w| !is_release_word(w) && !w.split(['.', '_']).any(is_release_word))
-        .collect();
+    // A spaced name can still carry a dotted release tail, alone
+    // (`720p.HDTV.x264-GRP [PublicHD]`) or after a dotted title
+    // (`The.Long.Night.720p.HDTV`): the title ends at the first release
+    // segment, and the segments before it are kept.
+    let mut words: Vec<String> = Vec::new();
+    for w in spaced.split_whitespace() {
+        if is_release_word(w) {
+            break;
+        }
+        let segments: Vec<&str> = w.split(['.', '_']).collect();
+        match segments.iter().position(|seg| is_release_word(seg)) {
+            Some(at) => {
+                words.extend(
+                    segments[..at]
+                        .iter()
+                        .filter(|seg| !seg.is_empty())
+                        .map(|seg| (*seg).to_string()),
+                );
+                break;
+            }
+            None => words.push(w.to_string()),
+        }
+    }
     let title = words.join(" ");
     let title = title.trim_matches(|c: char| c == '-' || c.is_whitespace());
     (!title.is_empty()).then(|| title.to_string())
@@ -470,13 +487,15 @@ pub fn episode_title(stem: &str) -> Option<String> {
 fn is_release_word(word: &str) -> bool {
     static RELEASE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|4k|uhd|[xh]26[45](?:-\w+)?|hevc|avc|(?:bd)?remux|hdr(?:10)?|dovi|mvc|[hf]?sbs|[hf]tab|anaglyph)$",
+                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|4k|uhd|[xh]26[45](?:-\w+)?|hevc|avc|(?:bd)?remux|hdr(?:10)?|dovi|mvc|[hf]?sbs|[hf]tab|anaglyph|3d-mvc|bd-?3d|bluray-?3d|(?:half|full)-(?:sbs|tab|ou))$",
             )
             .map_err(|e| tracing::error!(error = %e, "invalid release-word regex"))
             .ok()
     });
-    // `HOU`/`FOU` (3D over-under) count only in capitals: "Fou" is a word.
-    matches!(word, "WEB" | "HOU" | "FOU") || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
+    // Over-under markers (`OU`, `HOU`, `FOU`) count only in capitals:
+    // "Fou" is a word.
+    matches!(word, "WEB" | "OU" | "HOU" | "FOU")
+        || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
 }
 
 /// Replace scene-release separators with spaces so token-splitting and the
@@ -786,6 +805,16 @@ mod tests {
             ("Show.S01E02.3D.MVC.1080p", Some("3D")),
             ("Show - S01E02 - 3D.HSBS", Some("3D")),
             ("Show - S01E02 - Le Fou", Some("Le Fou")),
+            (
+                "Show - S01E03 - The.Long.Night.720p.HDTV.x264-GRP [PublicHD]",
+                Some("The Long Night"),
+            ),
+            ("Show.S01E02.BD3D.1080p", None),
+            ("Show.S01E02.BluRay3D.1080p", None),
+            ("Show.S01E02.3D-MVC.1080p", None),
+            ("Show.S01E02.OU.1080p", None),
+            ("Show - S01E02 - Pilot [Half-SBS]", Some("Pilot")),
+            ("Show - S01E02 - Pilot [Full-TAB]", Some("Pilot")),
             ("Show - S01E02 - Pilot UHD", Some("Pilot")),
             ("E01 - Pilot", Some("Pilot")),
             ("EP02 - The Return", Some("The Return")),
