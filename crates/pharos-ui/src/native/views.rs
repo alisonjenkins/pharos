@@ -1756,6 +1756,31 @@ mod tests {
         }
     }
 
+    /// A tile shows its IMDb and Rotten Tomatoes scores, decorative beside
+    /// the title; a tile with neither shows no ratings row.
+    #[test]
+    fn a_poster_tile_shows_its_imdb_and_rotten_tomatoes_scores() {
+        let mut rated = item(ItemKind::Movie);
+        rated.name = "Rated".into();
+        rated.imdb_rating = Some(81);
+        rated.critic_rating = Some(45);
+        let html = render(move || rsx! { PosterTile { item: rated.clone() } });
+        assert_eq!(html.matches("pharos-ratings-tile").count(), 1, "{html}");
+        assert!(html.contains(r#"aria-hidden="true""#), "{html}");
+        assert!(html.contains("pharos-rating pharos-rating-imdb"), "{html}");
+        assert!(html.contains(r#"title="IMDb 8.1 out of 10""#), "{html}");
+        assert!(
+            html.contains("pharos-rating pharos-rating-rotten"),
+            "{html}"
+        );
+        assert!(html.contains(r#"title="Rotten Tomatoes 45%""#), "{html}");
+
+        let mut unrated = item(ItemKind::Movie);
+        unrated.name = "Unrated".into();
+        let html = render(move || rsx! { PosterTile { item: unrated.clone() } });
+        assert!(!html.contains("pharos-ratings-tile"), "{html}");
+    }
+
     fn library(id: u64, kind: LibraryKind, name: &str) -> Item {
         let mut l = item(ItemKind::Library);
         l.id = ItemRef::Synth(id);
