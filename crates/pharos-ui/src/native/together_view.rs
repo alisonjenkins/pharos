@@ -143,6 +143,57 @@ pub fn MemberStrip(
     }
 }
 
+/// How others join the group: its invite link to send, a Copy button and
+/// what the copy did. Opens under the player's top bar.
+#[component]
+pub fn InvitePanel(
+    url: String,
+    /// What the last copy did ("Link copied"), if one was tried.
+    note: Option<String>,
+    on_copy: EventHandler<()>,
+    on_close: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div {
+            class: "pharos-invite",
+            role: "dialog",
+            aria_label: "Invite to watch together",
+            p { class: "pharos-invite-text",
+                "Send this link to anyone who can sign in here. They join at the group's place."
+            }
+            input {
+                id: INVITE_LINK_ID,
+                class: "pharos-invite-link",
+                r#type: "text",
+                readonly: true,
+                aria_label: "Invite link",
+                value: "{url}",
+            }
+            div { class: "pharos-invite-actions",
+                button {
+                    class: "pharos-button",
+                    r#type: "button",
+                    onclick: move |_| on_copy.call(()),
+                    "Copy link"
+                }
+                button {
+                    class: "pharos-button pharos-button-secondary",
+                    r#type: "button",
+                    onclick: move |_| on_close.call(()),
+                    "Done"
+                }
+                if let Some(note) = note {
+                    span { class: "pharos-invite-note", role: "status", "{note}" }
+                }
+            }
+        }
+    }
+}
+
+/// The invite link's field, selected for a manual copy when the clipboard
+/// refuses.
+pub const INVITE_LINK_ID: &str = "pharos-invite-link";
+
 /// The newest activity line over the video. It sits beside the chrome, not in
 /// it, so it stays visible while the controls are hidden; the caller passes
 /// `None` once the line is older than the toast time.
@@ -430,5 +481,29 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(">A<") && html.contains(">B<"), "{html}");
+    }
+
+    #[test]
+    fn the_invite_panel_shows_the_link_to_copy_and_what_the_copy_did() {
+        let link = "https://pharos.example/ui/together/g1";
+        let html = render(move || {
+            rsx! { InvitePanel { url: link, note: None, on_copy: |_| {}, on_close: |_| {} } }
+        });
+        assert!(html.contains(&format!(r#"value="{link}""#)), "{html}");
+        assert!(html.contains("readonly"), "{html}");
+        assert!(
+            html.contains(">Copy link<") && html.contains(">Done<"),
+            "{html}"
+        );
+        assert!(!html.contains("pharos-invite-note"), "{html}");
+        let copied = render(move || {
+            rsx! { InvitePanel {
+                url: link,
+                note: Some("Link copied".to_owned()),
+                on_copy: |_| {},
+                on_close: |_| {},
+            } }
+        });
+        assert!(copied.contains(">Link copied<"), "{copied}");
     }
 }
