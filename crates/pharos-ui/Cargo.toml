@@ -116,6 +116,8 @@ js-sys = { version = "0.3", optional = true }
 # the transitive copy.
 getrandom02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
 pharos-client = { path = "../pharos-client" }
+# 026: the pure-Rust subtitle renderer behind the SubtitleRenderer port.
+pharos-subs = { path = "../pharos-subs" }
 serde = { workspace = true }
 serde_json.workspace = true
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde", "std"] }
