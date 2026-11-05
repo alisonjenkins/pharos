@@ -165,6 +165,13 @@ pub fn current_path() -> String {
         .unwrap_or_else(|| "/".into())
 }
 
+/// The query of the page's URL, `?` included, or empty.
+pub fn current_search() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .unwrap_or_default()
+}
+
 /// The `history.state` of every entry the app pushes, which tells an entry
 /// with an app page before it from one opened from outside.
 const IN_APP: &str = "pharos";
