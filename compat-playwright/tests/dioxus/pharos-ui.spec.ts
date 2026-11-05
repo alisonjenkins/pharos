@@ -40,9 +40,11 @@ async function openFirstHit(page: Page, term: string): Promise<void> {
   if (href) {
     await expect(page).toHaveURL((url) => url.pathname === href, { timeout: 15_000 });
   }
-  // The page shows the hit, not the title it was opened from (B555).
-  if (name) {
-    await expect(page.locator(".pharos-main")).toContainText(name, { timeout: 15_000 });
+  // The page shows the hit, not the title it was opened from (B555). An
+  // episode's hit reads "Show - S01E01" where its page heads "Show".
+  const heading = name?.split(" - ")[0];
+  if (heading) {
+    await expect(page.locator(".pharos-main")).toContainText(heading, { timeout: 15_000 });
   }
 }
 
