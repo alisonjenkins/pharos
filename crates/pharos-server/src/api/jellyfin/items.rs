@@ -3708,7 +3708,7 @@ pub(crate) fn on_artist_page(i: &MediaItem, artist: &str) -> bool {
     filed_artist(i).is_some_and(|a| a.eq_ignore_ascii_case(artist))
 }
 
-fn filed_artist(i: &MediaItem) -> Option<&str> {
+pub(crate) fn filed_artist(i: &MediaItem) -> Option<&str> {
     i.probe
         .album_artist
         .as_deref()
