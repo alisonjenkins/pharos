@@ -113,9 +113,19 @@ async fn a_wrong_password_or_unknown_user_is_the_same_401_with_no_cookie() {
 #[actix_web::test]
 async fn an_empty_password_never_signs_in_and_answers_like_a_wrong_one() {
     let fx = seed_rich().await;
-    fx.state
-        .auth
-        .create_user("blank", &pharos_core::SecretString::new(""), false)
+    // Straight into the store, as an account stored before `create_user`
+    // refused "" (V211).
+    let record = pharos_core::UserRecord {
+        id: pharos_core::UserId::new(),
+        name: "blank".to_owned(),
+        password_hash: fx
+            .state
+            .auth
+            .hash_password(&pharos_core::SecretString::new(""))
+            .unwrap(),
+        policy: pharos_core::UserPolicy::default(),
+    };
+    pharos_core::UserStore::create(fx.state.auth.users(), record)
         .await
         .unwrap();
     let wrong = call(&fx, login("guest", "nope")).await;
