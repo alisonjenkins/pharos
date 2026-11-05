@@ -884,6 +884,122 @@ test.describe("pharos Dioxus UI", () => {
       await page.evaluate(() => window.scrollTo(0, 0));
     });
 
+    // B560: a library keeps its filters in the URL and for the tab, and
+    // comes back where it was left, by Back or by the breadcrumb.
+    test("browse keeps a library's filters and place across a title", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-libstate-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const json = async (path: string) =>
+        (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+      const views = await json(`/Users/${user.Id}/Views`);
+      const bulk = views.Items?.find((i: { Name: string }) => i.Name === "Bulk");
+      test.skip(!bulk, "the seed has no Bulk library");
+      await expect
+        .poll(
+          async () =>
+            (
+              await json(
+                `/Users/${user.Id}/Items?ParentId=${bulk.Id}&Recursive=true&Limit=1`,
+              )
+            ).TotalRecordCount ?? 0,
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(100);
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.locator("section.pharos-rail h2 a", { hasText: /^Bulk$/ }).click();
+      const tiles = page.locator("section.pharos-browse ul.pharos-grid li");
+      await expect(tiles.first()).toBeVisible({ timeout: 15_000 });
+      const reset = page.getByRole("button", { name: "Reset filters" });
+      await expect(reset).toHaveCount(0);
+      const bare = new URL(page.url());
+      expect(bare.search).toBe("");
+
+      // Z to A, unwatched only: both land in the URL.
+      await page.getByRole("button", { name: /^Sort direction/ }).click();
+      await page.getByLabel("Watched", { exact: true }).selectOption("unwatched");
+      await expect(page).toHaveURL(/\?dir=desc&watched=unwatched$/);
+      await expect(reset).toBeVisible();
+
+      // Deep into the grid, past its first page, the tile at the top a
+      // little scrolled out.
+      const rail = page.getByRole("navigation", { name: "Jump to letter" });
+      await expect(rail).toBeVisible({ timeout: 15_000 });
+      await rail.getByRole("button", { name: "C", exact: true }).click();
+      await expect(tiles.filter({ hasText: /^CC Bulk/ }).first()).toBeInViewport({
+        timeout: 15_000,
+      });
+      await page.mouse.move(400, 400);
+      await page.mouse.wheel(0, 150);
+      const place = async () =>
+        page.evaluate(() => {
+          const items = [...document.querySelectorAll("section.pharos-browse ul.pharos-grid li")];
+          const at = items.findIndex((li) => li.getBoundingClientRect().bottom > 0);
+          return { at, top: Math.round(items[at].getBoundingClientRect().top) };
+        });
+      await expect.poll(async () => (await place()).at).toBeGreaterThan(100);
+      // Past the settle delay, so the place is kept.
+      await page.waitForTimeout(500);
+      const left = await place();
+      const name = (await tiles.nth(left.at).innerText()).trim();
+
+      const backTo = async (how: string) => {
+        await expect(page).toHaveURL(/\?dir=desc&watched=unwatched$/, { timeout: 15_000 });
+        await expect(page.getByLabel("Watched", { exact: true })).toHaveValue("unwatched");
+        await expect(page.getByRole("button", { name: /^Sort direction/ })).toHaveText(
+          "Z to A",
+        );
+        await expect(tiles.nth(left.at)).toHaveText(name, { timeout: 15_000 });
+        await expect
+          .poll(async () => (await place()).top, { message: how, timeout: 15_000 })
+          .toBe(left.top);
+        expect((await place()).at, how).toBe(left.at);
+      };
+
+      // Back from a title.
+      await tiles.nth(left.at).locator("a").first().click();
+      await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
+      await page.goBack();
+      await backTo("back");
+
+      // The breadcrumb's bare library link: the tab's last choice and place.
+      await tiles.nth(left.at).locator("a").first().click();
+      await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
+      await page.locator("nav.pharos-crumbs a", { hasText: /^Bulk$/ }).click();
+      await backTo("breadcrumb");
+
+      // Reset returns to the bare listing, at the top.
+      await reset.click();
+      await expect(page).toHaveURL(new RegExp(`${bare.pathname}$`));
+      await expect(reset).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /^Sort direction/ })).toHaveText("A to Z");
+      await expect(tiles.filter({ hasText: /^AA Bulk/ }).first()).toBeInViewport({
+        timeout: 15_000,
+      });
+    });
+
     // A TV library lists its series by name and a series opens the show page
     // with its episodes; every step is a click, not a URL.
     test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
