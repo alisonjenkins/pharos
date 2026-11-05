@@ -463,8 +463,9 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     }
 }
 
-/// Set `line = -2` on each horizontal cue in the `TextTrackCueList` `cues`
-/// still placed by the browser (`line` is `"auto"`), so its last line sits one line above
+/// Set `line` on each horizontal cue in the `TextTrackCueList` `cues`
+/// still placed by the browser (`line` is `"auto"`) to what `lifted_line`
+/// gives for its nonblank text lines, so its last line sits one line above
 /// the picture's bottom edge instead of on it (B545). `line` is the standard
 /// `VTTCue` setting, so Firefox honours it too, unlike the
 /// `::-webkit-media-text-track-*` pseudo-elements.
