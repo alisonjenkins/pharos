@@ -309,6 +309,7 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
         id: &str,
         season: Option<u32>,
         episode: Option<u32>,
+        _name: Option<&str>,
     ) -> Option<crate::online_enrich::EnrichedMetadata> {
         match kind {
             pharos_core::MediaKind::Movie => self.0.movie_detail(id).await,

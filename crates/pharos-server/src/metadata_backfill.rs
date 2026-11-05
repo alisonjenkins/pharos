@@ -442,6 +442,17 @@ fn search_stem(item: &MediaItem) -> &str {
     }
 }
 
+/// An episode's own name, from its filename ("S01E03 - The Naked Now"): the
+/// cross-check that places it in a provider that numbers its season
+/// differently (B570). Not its stored title, which an NFO written in the
+/// provider's numbering may have set to the wrong episode's name.
+fn episode_name(item: &MediaItem) -> Option<String> {
+    if item.kind != MediaKind::Episode {
+        return None;
+    }
+    pharos_scanner::metadata::filename::episode_title(search_stem(item))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn enrich_one<Tm, Tv, S>(
     store: &S,
@@ -459,6 +470,7 @@ where
     S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
 {
     let stem = search_stem(&item);
+    let name = episode_name(&item);
 
     // Search key: a movie parses (title, year) from its filename; an episode
     // searches by SERIES name/year (the fetch narrows to season/episode) — the
@@ -524,6 +536,7 @@ where
                     year,
                     season,
                     episode,
+                    name.as_deref(),
                     &provider_ids,
                     bg_io,
                     cfg,
@@ -547,6 +560,7 @@ where
                         year,
                         season,
                         episode,
+                        name.as_deref(),
                         &provider_ids,
                         bg_io,
                         cfg,
@@ -564,6 +578,7 @@ where
                         year,
                         season,
                         episode,
+                        name.as_deref(),
                         &provider_ids,
                         bg_io,
                         cfg,
@@ -669,6 +684,10 @@ where
     // Fold the record onto the item (local data always wins — apply_enrichment
     // only fills gaps), then stamp the matched provider id if we hadn't one.
     let counts = store.item_entity_counts(item.id).await?;
+    let moved = reidentified(&item, &enriched);
+    if moved {
+        adopt_reidentified(&mut item, &enriched);
+    }
     let applied = apply_enrichment(&mut item, counts, &enriched);
     // B564 — a refresh of an item stored before English was asked for still
     // holds the base-record text, which fill-if-empty would keep.
@@ -723,13 +742,15 @@ where
             // the series-level TMDB id.
             let series_tmdb = {
                 let _permit = BgPermit::acquire(bg_io).await;
-                tvdb_e.fetch(item.kind, &external_id, None, None).await
+                tvdb_e
+                    .fetch(item.kind, &external_id, None, None, None)
+                    .await
             }
             .and_then(|m| m.also_tmdb_id);
             if let Some(tid) = series_tmdb {
                 let tmdb_meta = {
                     let _permit = BgPermit::acquire(bg_io).await;
-                    tmdb_e.fetch(item.kind, &tid, None, None).await
+                    tmdb_e.fetch(item.kind, &tid, None, None, None).await
                 };
                 if let Some(m) = tmdb_meta {
                     for art in &m.artwork {
@@ -752,6 +773,32 @@ where
         .filter(|(_, source, _)| source.eq_ignore_ascii_case("local"))
         .map(|(role, _, _)| role.to_ascii_lowercase())
         .collect();
+    // B570 — a re-identified episode's `<stem>-thumb` was saved by the same
+    // scrape as its NFO, so it is the wrong episode's still: the record's
+    // still replaces it as the Thumb, which outranks the show-folder Primary
+    // the season tiles rely on (and which stays).
+    if moved {
+        match enriched
+            .artwork
+            .iter()
+            .find(|a| a.role == ArtworkRole::Primary)
+        {
+            Some(still) => chosen.push((
+                matched_provider,
+                RemoteArt {
+                    role: ArtworkRole::Thumb,
+                    url: still.url.clone(),
+                },
+            )),
+            None if local_roles.contains("thumb") => tracing::info!(
+                media.id = item.id,
+                provider = matched_provider,
+                external_id = %external_id,
+                "T9 metadata backfill: re-identified episode's record has no still; its scraped Thumb stays"
+            ),
+            None => {}
+        }
+    }
 
     // How many art roles this item ends up covered by — newly cached here, or
     // already held by a local sidecar. Zero on a Hit is the #113 signal: the
@@ -762,7 +809,8 @@ where
             tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (not cached)");
             continue;
         }
-        if local_roles.contains(&art.role.as_str().to_ascii_lowercase()) {
+        let replaces_scrape = moved && art.role == ArtworkRole::Thumb;
+        if !replaces_scrape && local_roles.contains(&art.role.as_str().to_ascii_lowercase()) {
             art_covered += 1;
             tracing::debug!(role = ?art.role, item = item.id, "T9 metadata backfill: skipping art role (local sidecar present)");
             continue;
@@ -855,6 +903,41 @@ async fn is_manual<S: MediaStore>(store: &S, id: pharos_core::MediaId) -> bool {
         .ok()
         .and_then(|i| i.match_source)
         .is_some_and(|s| s.eq_ignore_ascii_case("manual"))
+}
+
+/// B570 — whether the provider placed episode `item` on a record numbered
+/// differently from its file, by the episode's own name.
+fn reidentified(item: &MediaItem, enriched: &EnrichedMetadata) -> bool {
+    let file = item
+        .series
+        .as_ref()
+        .and_then(|s| Some((s.season_number?, s.episode_number?)));
+    matches!((file, enriched.episode_number), (Some(f), Some(r)) if f != r)
+}
+
+/// B570 — take a re-identified episode's text from its record. Local data
+/// normally wins, but this item's NFO was written in the provider's numbering
+/// for the episode next to it, so its title and plot are another episode's.
+fn adopt_reidentified(item: &mut MediaItem, enriched: &EnrichedMetadata) {
+    tracing::info!(
+        media.id = item.id,
+        stored_title = %item.title,
+        record_title = enriched.title.as_deref().unwrap_or(""),
+        record_number = ?enriched.episode_number,
+        "T9 metadata backfill: episode re-identified by its name; its NFO text described another episode"
+    );
+    if let Some(title) = enriched
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        item.title = title.to_string();
+    }
+    // Replaced even when the record has none: the NFO's plot and air date
+    // are the neighbouring episode's, which is worse than none.
+    item.metadata.overview = enriched.overview.clone();
+    item.metadata.premiere_date = enriched.premiere_date;
 }
 
 /// T11 — apply a user's manual Identify choice: persist the override with
@@ -981,6 +1064,7 @@ async fn resolve<E: OnlineEnricher>(
     year: Option<u32>,
     season: Option<u32>,
     episode: Option<u32>,
+    name: Option<&str>,
     provider_ids: &ProviderIds,
     bg_io: &Arc<Semaphore>,
     cfg: &MetadataConfig,
@@ -1007,7 +1091,9 @@ async fn resolve<E: OnlineEnricher>(
     };
     let enriched = {
         let _permit = BgPermit::acquire(bg_io).await;
-        enricher.fetch(kind, &external_id, season, episode).await
+        enricher
+            .fetch(kind, &external_id, season, episode, name)
+            .await
     };
     match enriched {
         Some(e) => Resolved::Hit {
@@ -1596,6 +1682,21 @@ where
     let mut stored = 0usize;
     let mut failures = 0usize;
     for (gap, langs) in todo {
+        // The episode's own name places it as enrichment did (B570).
+        let name = match &gap.owner {
+            TranslationOwner::Item(id) => match MediaStore::get(store, *id).await {
+                Ok(item) => episode_name(&item),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        owner = ?gap.owner,
+                        "metadata translation pass: could not read the episode; placing it by number"
+                    );
+                    None
+                }
+            },
+            TranslationOwner::Series(_) => None,
+        };
         let texts = {
             let _permit = BgPermit::acquire(bg_io).await;
             tvdb.fetch_texts(
@@ -1603,6 +1704,7 @@ where
                 &gap.series_external_id,
                 gap.season,
                 gap.episode,
+                name.as_deref(),
                 &langs,
             )
             .await
@@ -1930,6 +2032,7 @@ async fn resolve_series<E: OnlineEnricher>(
         cand.series_year,
         None,
         None,
+        None,
         &ProviderIds::default(),
         bg_io,
         cfg,
@@ -2184,6 +2287,7 @@ mod tests {
             _id: &str,
             _season: Option<u32>,
             _episode: Option<u32>,
+            _name: Option<&str>,
         ) -> Option<EnrichedMetadata> {
             self.detail.clone()
         }
@@ -2203,6 +2307,7 @@ mod tests {
             _id: &str,
             _season: Option<u32>,
             _episode: Option<u32>,
+            _name: Option<&str>,
             languages: &[String],
         ) -> TextsFetch {
             self.asked.lock().unwrap().push(languages.to_vec());
@@ -3056,6 +3161,139 @@ mod tests {
             "backdrop should still be added: {art:?}"
         );
         assert_eq!(backdrop.unwrap().1, "tmdb");
+    }
+
+    /// An NFO-identified episode as a scrape in the provider's numbering left
+    /// it: the file is "S01E03 - The Naked Now", its NFO and `-thumb` are
+    /// Code of Honor's.
+    async fn put_shifted_episode(s: &SqliteStore) -> MediaItem {
+        let dir = "/tv/Star Trek The Next Generation/Season 01";
+        let stem = "Star Trek - The Next Generation - S01E03 - The Naked Now WEBDL-1080p";
+        let mut item = MediaItem {
+            id: 900_570,
+            path: format!("{dir}/{stem}.mkv").into(),
+            title: "Code of Honor".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Star Trek The Next Generation".into(),
+                season_number: Some(1),
+                episode_number: Some(3),
+                series_folder: Some("/tv/Star Trek The Next Generation".into()),
+                series_year: None,
+            }),
+            ..MediaItem::default()
+        };
+        item.metadata.overview = Some("Tasha Yar is kidnapped.".into());
+        item.metadata.provider_ids.tvdb = Some("71470".into());
+        s.put(item).await.unwrap();
+        s.set_artwork(
+            900_570,
+            "Thumb",
+            "local",
+            &format!("{dir}/{stem}-thumb.jpg"),
+        )
+        .await
+        .unwrap();
+        s.set_artwork(
+            900_570,
+            "Primary",
+            "local",
+            "/tv/Star Trek The Next Generation/folder.jpg",
+        )
+        .await
+        .unwrap();
+        s.get(900_570).await.unwrap()
+    }
+
+    fn naked_now(number: (u32, u32)) -> EnrichedMetadata {
+        EnrichedMetadata {
+            title: Some("The Naked Now".into()),
+            overview: Some("An infection.".into()),
+            episode_number: Some(number),
+            artwork: vec![RemoteArt {
+                role: ArtworkRole::Primary,
+                url: "https://artworks.thetvdb.com/naked-now.jpg".into(),
+            }],
+            ..EnrichedMetadata::default()
+        }
+    }
+
+    /// B570 — an episode the provider placed by its name on another number
+    /// takes that record's title, plot and still over its NFO's, which were
+    /// written for the episode next to it. The show-folder Primary stays.
+    #[tokio::test]
+    async fn a_reidentified_episode_replaces_its_scraped_text_and_still() {
+        let s = store().await;
+        let item = put_shifted_episode(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail(naked_now((1, 2)))
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let ep = s.get(900_570).await.unwrap();
+        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
+        let art = s.artwork_for(900_570).await.unwrap();
+        let role = |r: &str| art.iter().find(|(role, _, _)| role == r).cloned();
+        assert_eq!(
+            role("Thumb").map(|r| r.1).as_deref(),
+            Some("tvdb"),
+            "{art:?}"
+        );
+        assert_eq!(
+            role("Primary").map(|r| r.1).as_deref(),
+            Some("local"),
+            "{art:?}"
+        );
+    }
+
+    /// B570 — a record at the file's own number leaves the NFO's text and
+    /// still alone, however its name reads.
+    #[tokio::test]
+    async fn an_episode_on_its_own_number_keeps_its_local_text_and_still() {
+        let s = store().await;
+        let item = put_shifted_episode(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail(naked_now((1, 3)))
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let ep = s.get(900_570).await.unwrap();
+        assert_eq!(ep.title, "Code of Honor");
+        assert_eq!(
+            ep.metadata.overview.as_deref(),
+            Some("Tasha Yar is kidnapped.")
+        );
+        let art = s.artwork_for(900_570).await.unwrap();
+        assert!(
+            art.iter()
+                .any(|(role, source, _)| role == "Thumb" && source == "local"),
+            "{art:?}"
+        );
     }
 
     #[tokio::test]
