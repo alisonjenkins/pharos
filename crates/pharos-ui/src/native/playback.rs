@@ -147,19 +147,61 @@ pub fn cues_at(cues: &ImageCues, ms: u64) -> impl Iterator<Item = &ImageCue> {
         .filter(move |c| c.start_ms <= ms && ms < c.end_ms)
 }
 
+/// The font size in px pharos.css gives a cue in a player `width_px` wide
+/// in a viewport `viewport_h_px` tall at size `scale` (V455): `scale x
+/// max(14px, min(2.8cqw, 5vh))`.
+pub fn cue_font_px(width_px: f64, viewport_h_px: f64, scale: f64) -> f64 {
+    scale * (width_px * 0.028).min(viewport_h_px * 0.05).max(14.0)
+}
+
+/// About how many characters fit on one rendered cue line in a player
+/// `width_px` wide at `font_px`, erring low: the browser does not say where
+/// it wraps, and a cue lifted a line too far is better than one on the edge.
+/// A cue box spans at most the picture, less its padding, and 0.6em is wider
+/// than the average subtitle glyph.
+pub fn cue_chars_per_line(width_px: f64, font_px: f64) -> usize {
+    if font_px <= 0.0 || width_px <= 0.0 {
+        return usize::MAX;
+    }
+    ((width_px * 0.9) / (font_px * 0.6)).floor().max(1.0) as usize
+}
+
 /// The `line` a horizontal cue whose `line` is `auto` is moved to (V455):
 /// one line clear of the picture's bottom edge. A snap-to-lines cue with a
 /// negative `line` puts its first line that many lines from the bottom, so a
-/// cue of `n` lines needs `-(n + 1)` to end one line up rather than on the
-/// edge. Lines come from the cue's own breaks; one that wraps on screen is
-/// not counted (the browser does not say where it wraps).
-pub fn lifted_line(cue_text: &str) -> f64 {
-    let lines = cue_text
+/// cue of `n` rendered lines needs `-(n + 1)` to end one line up rather than
+/// on the edge. Each of the cue's own lines counts as the rendered lines it
+/// wraps to at `chars_per_line` (`cue_chars_per_line`), its markup tags not
+/// counted (B545).
+pub fn lifted_line(cue_text: &str, chars_per_line: usize) -> f64 {
+    let per_line = chars_per_line.max(1);
+    let lines: usize = cue_text
         .lines()
-        .filter(|l| !l.trim().is_empty())
+        .map(visible_chars)
+        .filter(|&n| n > 0)
+        .map(|n| n.div_ceil(per_line))
+        .sum();
+    -(lines.max(1) as f64 + 1.0)
+}
+
+/// The characters of a cue text line outside its `<...>` tags, blanks at
+/// either end not counted.
+fn visible_chars(line: &str) -> usize {
+    let mut in_tag = false;
+    line.trim()
+        .chars()
+        .filter(|&c| match c {
+            '<' => {
+                in_tag = true;
+                false
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                false
+            }
+            _ => !in_tag,
+        })
         .count()
-        .max(1);
-    -(lines as f64 + 1.0)
 }
 
 /// `part` of `whole` in percent, for placing a cue on the canvas.
@@ -821,11 +863,39 @@ mod tests {
     /// and three-line cases fail.
     #[test]
     fn a_cue_is_lifted_one_line_above_its_last_line() {
-        assert_eq!(lifted_line("Hello"), -2.0);
-        assert_eq!(lifted_line(""), -2.0);
-        assert_eq!(lifted_line("Hello\nthere"), -3.0);
-        assert_eq!(lifted_line("one\ntwo\nthree"), -4.0);
-        assert_eq!(lifted_line("one\n\ntwo\n"), -3.0);
+        assert_eq!(lifted_line("Hello", 80), -2.0);
+        assert_eq!(lifted_line("", 80), -2.0);
+        assert_eq!(lifted_line("Hello\nthere", 80), -3.0);
+        assert_eq!(lifted_line("one\ntwo\nthree", 80), -4.0);
+        assert_eq!(lifted_line("one\n\ntwo\n", 80), -3.0);
+    }
+
+    /// Disarm check: counting only the cue's own breaks, the wrapped cases
+    /// read -2 and -3 and fail.
+    #[test]
+    fn a_cue_that_wraps_is_lifted_above_its_last_rendered_line() {
+        let long = "a line of subtitle text long enough to wrap";
+        assert_eq!(long.chars().count(), 43);
+        assert_eq!(lifted_line(long, 20), -4.0);
+        assert_eq!(lifted_line(long, 43), -2.0);
+        assert_eq!(lifted_line(&format!("{long}\nshort"), 30), -4.0);
+        // Tags take no room on screen.
+        assert_eq!(lifted_line("<i>twelve chars</i>", 12), -2.0);
+        assert_eq!(lifted_line("<c.yellow>x</c>", 1), -2.0);
+    }
+
+    #[test]
+    fn cue_size_follows_the_player_and_its_floor() {
+        // 1000px wide, tall viewport: 2.8cqw = 28px.
+        assert_eq!(cue_font_px(1000.0, 2000.0, 1.0), 28.0);
+        // Short viewport: 5vh = 20px wins.
+        assert_eq!(cue_font_px(1000.0, 400.0, 1.0), 20.0);
+        // Narrow: the 14px floor, then the scale.
+        assert_eq!(cue_font_px(300.0, 800.0, 0.8), 14.0 * 0.8);
+        assert_eq!(cue_chars_per_line(1000.0, 28.0), 53);
+        assert_eq!(cue_chars_per_line(360.0, 14.0 * 1.65), 23);
+        assert_eq!(cue_chars_per_line(0.0, 14.0), usize::MAX);
+        assert_eq!(cue_chars_per_line(10.0, 100.0), 1);
     }
 
     #[test]

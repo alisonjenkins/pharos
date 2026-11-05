@@ -1616,6 +1616,28 @@ test.describe("pharos Dioxus UI", () => {
         .poll(async () => (await media()).showing[0]?.cues ?? 0, { timeout: 15_000 })
         .toBeGreaterThan(0);
       expect(page.url(), "a text subtitle does not leave the page").toBe(before);
+      // In a phone-wide player a cue that wraps ends a line above the
+      // picture's edge too: lifted past -2 (V455).
+      const viewport = page.viewportSize();
+      await page.setViewportSize({ width: 360, height: 640 });
+      const lifted = await page.evaluate(async (id) => {
+        const v = document.getElementById("pharos-video") as HTMLVideoElement;
+        const track = Array.from(v.textTracks).find((t) => t.id === id)!;
+        const cue = new VTTCue(
+          v.currentTime,
+          v.currentTime + 60,
+          "a subtitle line long enough to wrap in a phone-sized player",
+        );
+        track.addCue(cue);
+        for (let i = 0; i < 50 && cue.line === "auto"; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        const line = cue.line;
+        track.removeCue(cue);
+        return line;
+      }, `pharos-sub-${option}`);
+      expect(lifted).toBeLessThanOrEqual(-3);
+      if (viewport) await page.setViewportSize(viewport);
       await picker.selectOption("off");
       await expect.poll(async () => (await media()).showing).toEqual([]);
 
