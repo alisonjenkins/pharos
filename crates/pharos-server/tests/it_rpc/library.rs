@@ -2140,6 +2140,69 @@ async fn a_music_library_lists_its_artists_then_albums_then_tracks() {
     );
 }
 
+/// B580: a track's breadcrumb trail climbs to the Music library: a track
+/// names its album, an album its artist (or its library when untagged), an
+/// artist the library holding most of its tracks.
+/// Disarm check: with `synth_album_or_artist` leaving `parent_id` unset,
+/// the album names no parent and the trail stops there.
+#[actix_web::test]
+async fn a_tracks_parents_climb_through_album_and_artist_to_its_library() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _};
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for, WireId};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let music = seed_music_libraries(&fx).await;
+    // An album with no artist tags, and one more "Alpha" song in the other
+    // library (Alpha keeps four of five in Music).
+    for (id, path, artist, album) in [
+        (707, "/libMusic/Loose/1-1.flac", None, "Loose"),
+        (
+            708,
+            "/libOther/Alpha/Stray/1-1.flac",
+            Some("Alpha"),
+            "Stray",
+        ),
+    ] {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: path.into(),
+                title: "Song".into(),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    artist: artist.map(Into::into),
+                    album_artist: artist.map(Into::into),
+                    album: Some(album.into()),
+                    ..MediaProbe::default()
+                },
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let parent = |id: String| wire_parent(&session, WireId::parse(&id).unwrap());
+
+    assert_eq!(
+        parent(WireId::Real(701).to_string()).await,
+        Some(album_id_for("First"))
+    );
+    assert_eq!(
+        parent(album_id_for("First")).await,
+        Some(artist_id_for("Alpha"))
+    );
+    assert_eq!(parent(album_id_for("Loose")).await, Some(music.clone()));
+    assert_eq!(parent(artist_id_for("Alpha")).await, Some(music));
+    assert_eq!(
+        parent(artist_id_for("Gamma")).await,
+        Some("e".repeat(32)),
+        "an artist sits under the library that holds it"
+    );
+}
+
 /// Every native `Library.query` counts under
 /// `pharos_rpc_query_total{shape,outcome}`: which listing answered it and
 /// whether it had a page, a refusal counted as `error`.
