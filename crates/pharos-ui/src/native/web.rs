@@ -18,8 +18,9 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    cue_chars_per_line, cue_font_px, is_loading, lifted_line, Engine, FragmentLoad, MediaState,
-    OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
+    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine,
+    FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget,
+    SubtitleSize,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -470,6 +471,76 @@ thread_local! {
     /// The non-native player's `change` handler on its `TextTrackList`.
     static ON_TRACKS_CHANGE: std::cell::RefCell<Option<Closure<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    /// The `ResizeObserver` on the `<video>` in `CUE_VIDEO` and its callback,
+    /// which lift the shown cues again for the player's new size.
+    static CUE_RESIZE: std::cell::RefCell<Option<CueResize>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A `ResizeObserver` and the callback it calls.
+type CueResize = (JsValue, Closure<dyn FnMut()>);
+
+/// Lifts the cues of each track the `<video>` `video_id` shows, for its
+/// size now.
+fn lift_shown_cues(video_id: &str) {
+    let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
+        return;
+    };
+    let cue_box = cue_box_for(video_id);
+    for i in 0..tracks.length() {
+        if let Some(t) = tracks.get(i) {
+            if t.mode() == web_sys::TextTrackMode::Showing {
+                lift_cues(
+                    &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
+                    cue_box,
+                );
+            }
+        }
+    }
+}
+
+/// Makes `video_id` the `<video>` whose cues are lifted, and lifts them
+/// again whenever it changes size (a window resize, full screen, the mini
+/// player), since a cue lifted for one width can wrap at another.
+/// `ResizeObserver` is reached through `js_sys::Reflect`, as web-sys keeps it
+/// behind a feature this crate does not enable.
+fn watch_cue_video(video_id: &str) {
+    let same = CUE_VIDEO.with(|v| *v.borrow() == video_id);
+    let watching = CUE_RESIZE.with(|r| r.borrow().is_some());
+    CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
+    if same && watching {
+        return;
+    }
+    CUE_RESIZE.with(|r| {
+        if let Some((observer, _)) = r.borrow_mut().take() {
+            if let Ok(disconnect) = js_sys::Reflect::get(&observer, &"disconnect".into()) {
+                if let Some(f) = disconnect.dyn_ref::<js_sys::Function>() {
+                    let _ = f.call0(&observer);
+                }
+            }
+        }
+    });
+    let (Some(window), Some(video)) = (web_sys::window(), video_element(video_id)) else {
+        return;
+    };
+    let Ok(ctor) = js_sys::Reflect::get(&window, &"ResizeObserver".into()) else {
+        return;
+    };
+    let Some(ctor) = ctor.dyn_ref::<js_sys::Function>() else {
+        return;
+    };
+    let id = video_id.to_owned();
+    let on_resize = Closure::<dyn FnMut()>::new(move || lift_shown_cues(&id));
+    let Ok(observer) = js_sys::Reflect::construct(ctor, &js_sys::Array::of1(on_resize.as_ref()))
+    else {
+        return;
+    };
+    if let Ok(observe) = js_sys::Reflect::get(&observer, &"observe".into()) {
+        if let Some(f) = observe.dyn_ref::<js_sys::Function>() {
+            let _ = f.call1(&observer, &video);
+        }
+    }
+    CUE_RESIZE.with(|r| *r.borrow_mut() = Some((observer, on_resize)));
 }
 
 /// Lifts the cues of each track the `<video>` `video_id` shows (V455), now
@@ -479,17 +550,14 @@ pub fn lift_cues_as_shown(video_id: &str) {
     let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
         return;
     };
-    CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
+    watch_cue_video(video_id);
     let id = video_id.to_owned();
     let list = tracks.clone();
     let lift = move || {
+        lift_shown_cues(&id);
         for i in 0..list.length() {
             if let Some(t) = list.get(i) {
                 if t.mode() == web_sys::TextTrackMode::Showing {
-                    lift_cues(
-                        &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
-                        cue_box_for(&id),
-                    );
                     ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
                 }
             }
@@ -508,7 +576,7 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
         return;
     };
-    CUE_VIDEO.with(|v| video_id.clone_into(&mut v.borrow_mut()));
+    watch_cue_video(video_id);
     for i in 0..tracks.length() {
         if let Some(t) = tracks.get(i) {
             let on = track_id.is_some_and(|id| t.id() == id);
@@ -571,16 +639,22 @@ fn cue_box_for(video_id: &str) -> CueBox {
         .and_then(|s| s.get_property_value("--pharos-subtitle-scale").ok())
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(1.0);
+    let mini = video
+        .closest(".pharos-stage.is-mini")
+        .ok()
+        .flatten()
+        .is_some();
     CueBox {
         width,
-        font: cue_font_px(container, height, scale),
+        font: cue_font_px(container, height, scale, mini),
     }
 }
 
 /// Set `line` on each horizontal cue in the `TextTrackCueList` `cues`
 /// still placed by the browser (`line` is `"auto"`) to what `lifted_line`
-/// gives for its text wrapped in `cue_box` (narrowed by the cue's own `size`,
-/// a percentage of the video's width), so its last rendered line sits one
+/// gives for its text wrapped in `cue_box` (narrowed to the share of the
+/// video's width its `size`, `position` and `positionAlign` allow,
+/// `cue_width_share`), so its last rendered line sits one
 /// line above the picture's bottom edge instead of on it (B545). `line` is
 /// the standard `VTTCue` setting, so Firefox honours it too, unlike the
 /// `::-webkit-media-text-track-*` pseudo-elements.
@@ -597,6 +671,10 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
     let cue_text = JsValue::from_str("text");
     let region = JsValue::from_str("region");
     let size_key = JsValue::from_str("size");
+    let position_key = JsValue::from_str("position");
+    let position_align_key = JsValue::from_str("positionAlign");
+    let align_key = JsValue::from_str("align");
+    let lifted_key = JsValue::from_str("pharosLifted");
     let text = |cue: &JsValue, key: &JsValue| {
         js_sys::Reflect::get(cue, key)
             .ok()
@@ -613,22 +691,34 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
         let in_region = js_sys::Reflect::get(&cue, &region)
             .ok()
             .is_some_and(|r| !r.is_null() && !r.is_undefined());
-        if text(&cue, &line).as_deref() == Some("auto")
+        // A cue Pharos lifted before is lifted again for the player's size
+        // now; one whose author set its `line` is left alone.
+        let ours = js_sys::Reflect::get(&cue, &lifted_key)
+            .ok()
+            .is_some_and(|v| v.is_truthy());
+        if (ours || text(&cue, &line).as_deref() == Some("auto"))
             && text(&cue, &vertical).as_deref() == Some("")
             && !in_region
         {
             let lines = text(&cue, &cue_text).unwrap_or_default();
-            let size = js_sys::Reflect::get(&cue, &size_key)
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(100.0)
-                .clamp(0.0, 100.0);
-            let chars_per_line = cue_chars_per_line(cue_box.width * size / 100.0, cue_box.font);
+            let number = |key: &JsValue| {
+                js_sys::Reflect::get(&cue, key)
+                    .ok()
+                    .and_then(|v| v.as_f64())
+            };
+            let share = cue_width_share(
+                number(&size_key).unwrap_or(100.0),
+                number(&position_key),
+                &text(&cue, &position_align_key).unwrap_or_default(),
+                &text(&cue, &align_key).unwrap_or_default(),
+            );
+            let chars_per_line = cue_chars_per_line(cue_box.width * share / 100.0, cue_box.font);
             let _ = js_sys::Reflect::set(
                 &cue,
                 &line,
                 &JsValue::from_f64(lifted_line(&lines, chars_per_line)),
             );
+            let _ = js_sys::Reflect::set(&cue, &lifted_key, &JsValue::TRUE);
         }
     }
 }
