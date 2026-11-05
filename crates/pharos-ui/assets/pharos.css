@@ -2011,6 +2011,9 @@ body:has(.pharos-stage.is-full) .pharos-error {
   margin: 0;
   font-size: 0.85rem;
   color: var(--px-color-fg-muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .pharos-audio {
   display: none;
