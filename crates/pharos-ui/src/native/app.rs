@@ -44,8 +44,8 @@ use super::together_view::{InviteView, TogetherView};
 use super::track_follow;
 use super::trail;
 use super::views::{
-    ErrorNote, FindView, Hits, HomeView, Loading, MarkPlayed, Nav, Shell, SignInView, StatusView,
-    TitleView,
+    ErrorNote, FindView, Hits, HomeView, Loading, MarkPlayed, Nav, PlayFromStart, Shell,
+    SignInView, StatusView, TitleView,
 };
 use super::watch_view::{
     text_track_id, Control, Controls, WatchView, OUTGOING_ID, PLAYER_ID, SEEK_ID, VIDEO_ID,
@@ -898,6 +898,11 @@ struct Editing {
 #[derive(Clone, Copy)]
 struct Replace(EventHandler<Route>);
 
+/// The item Play from start was pressed on: its next negotiation starts at
+/// 0 s, whatever position the server saved, and clears it.
+#[derive(Clone, Copy)]
+struct StartOver(Signal<Option<ItemRef>>);
+
 /// Who is signed in, as the account menu shows them; a screen that changes
 /// the avatar restarts it.
 #[derive(Clone, Copy)]
@@ -950,6 +955,14 @@ fn NativeApp(route: Route) -> Element {
         }))
     });
     let nav = use_context::<Nav>();
+    let mut start_over = use_signal(|| None::<ItemRef>);
+    use_context_provider(|| StartOver(start_over));
+    use_context_provider(|| {
+        PlayFromStart(EventHandler::new(move |id: ItemRef| {
+            start_over.set(Some(id));
+            nav.0.call(Route::Watch(id));
+        }))
+    });
     // Signing out ends the session, and the player with it; signing in
     // again on the watch route, which never changed, plays its item.
     let StageCtx(mut stage) = use_context::<StageCtx>();
@@ -1785,7 +1798,8 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 #[component]
 fn SeenTitle(detail: Detail, on_watch_together: EventHandler<ItemRef>) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
-    rsx! { TitleView { detail, on_watch_together, seen } }
+    let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
+    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen } }
 }
 
 #[component]
@@ -1952,6 +1966,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // rest of its album (B435/V375); once per song, as the screen remounts
     // per item.
     let queue = try_use_context::<QueueCtx>();
+    let start_over = try_use_context::<StartOver>();
+    // The item this screen was asked to start over, kept past the press so a
+    // renegotiation before the player reports a position still starts at zero.
+    let started_over = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
     let mix_ctx = try_use_context::<MixCtx>();
     let mut seeded = use_signal(|| false);
     use_effect(move || {
@@ -2008,10 +2026,26 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let grant_gen = *api_gen.peek();
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
+        let started_over = Rc::clone(&started_over);
         let asked = picks();
         let auto = auto_cap();
-        // A song Previous went back to starts over (B464/V406).
-        let from_start = queue.is_some_and(|QueueCtx(q)| q.peek().plays_from_start(id));
+        // A song Previous went back to starts over (B464/V406), as does an
+        // item Play from start was pressed on (B500). The press is spent only
+        // by a negotiation that runs, so a load before sign-in keeps it; this
+        // screen then remembers it until the player has a position.
+        let previous = queue.is_some_and(|QueueCtx(q)| q.peek().plays_from_start(id));
+        let pressed = api.is_some()
+            && start_over.is_some_and(|StartOver(mut asked)| {
+                let hit = *asked.peek() == Some(id);
+                if hit {
+                    asked.set(None);
+                    started_over.set(Some(id));
+                }
+                hit
+            });
+        let pressed = pressed || started_over.get() == Some(id);
+        let from_start = previous || pressed;
+        let reason = if pressed { "start_over" } else { "previous" };
         async move {
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
@@ -2047,7 +2081,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     let start_ms = match resume_from.get() {
                         0 if from_start => {
                             platform::info(&format!(
-                                "pharos: playback from_start item={id} reason=previous saved_ms={}",
+                                "pharos: playback from_start item={id} reason={reason} saved_ms={}",
                                 detail.item.position_ms
                             ));
                             0
