@@ -155,7 +155,7 @@ pub fn encoder_never_opened(stderr: &str) -> bool {
         .contains("could not open encoder before eof")
 }
 
-/// How long [`window_has_video`] waits for ffprobe.
+/// How long [`window_has_video`] waits for its ffprobe runs, both together.
 const WINDOW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Whether the source has a video packet inside the job's window, asked of
@@ -169,18 +169,24 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
     let tps = pharos_core::time::TICKS_PER_SECOND as f64;
     let dur = spec.opts.duration_ticks? as f64 / tps;
     let input = spec.input.to_str()?;
+    // One deadline for both probes: two of their own could add up past the
+    // scheduler's heartbeat.
+    let deadline = tokio::time::Instant::now() + WINDOW_PROBE_TIMEOUT;
     // The encoder's input `-ss` counts from the source's start time, but
     // `-read_intervals` and `pts_time` are absolute, so shift the window by
     // it (an MPEG-TS often starts at 10 s or more). Unknown counts as zero.
-    let origin = run_probe(&[
-        "-v",
-        "error",
-        "-show_entries",
-        "format=start_time",
-        "-of",
-        "csv=p=0",
-        input,
-    ])
+    let origin = run_probe(
+        deadline,
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "csv=p=0",
+            input,
+        ],
+    )
     .await?
     .trim()
     .parse::<f64>()
@@ -191,35 +197,38 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
     // An absolute end: ffprobe seeks to the keyframe before `start`, and a
     // `+dur` would count from there and stop short of the window's end.
     let window = format!("{start:.3}%{:.3}", start + dur);
-    let packets = run_probe(&[
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-read_intervals",
-        &window,
-        "-show_entries",
-        "packet=pts_time",
-        "-of",
-        "csv=p=0",
-        input,
-    ])
+    let packets = run_probe(
+        deadline,
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            &window,
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+            input,
+        ],
+    )
     .await?;
     Some(has_packet_in(&packets, start, start + dur))
 }
 
 /// Run ffprobe with `args` and return its stdout, or None when it could not
-/// run, failed or timed out. Bounded: the worker sends no progress while it
-/// probes, and a stalled read (a stale NFS handle, B218) must not outlast
-/// the scheduler's heartbeat. No answer keeps the device fault, the safe
-/// reading.
-async fn run_probe(args: &[&str]) -> Option<String> {
+/// run, failed or was still running at `deadline`. Bounded: the worker sends
+/// no progress while it probes, and a stalled read (a stale NFS handle, B218)
+/// must not outlast the scheduler's heartbeat. No answer keeps the device
+/// fault, the safe reading.
+async fn run_probe(deadline: tokio::time::Instant, args: &[&str]) -> Option<String> {
     let mut probe = tokio::process::Command::new(ffprobe_bin());
     probe
         .args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    let out = match tokio::time::timeout(WINDOW_PROBE_TIMEOUT, probe.output()).await {
+    let out = match tokio::time::timeout_at(deadline, probe.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "window video probe could not run");
