@@ -638,6 +638,28 @@ fn match_best_ranks_an_exact_name_over_a_prefix_match_with_a_better_year() {
     assert_eq!(m.id, "real");
 }
 
+/// From the live TVDB search for "One Piece": the 2023 live-action series
+/// lists "One Piece" among its aliases, the anime as its English title.
+#[test]
+fn match_best_prefers_an_exact_title_over_an_exact_alias() {
+    let cands = vec![
+        cand(
+            "392276",
+            "ONE PIECE (2023)",
+            Some(2023),
+            &["ONE PIECE (2023)", "ONE PIECE (US)", "One Piece"],
+        ),
+        cand(
+            "81797",
+            "ワンピース",
+            Some(1999),
+            &["One Piece", "One Piece (1998)"],
+        ),
+    ];
+    let m = match_best("One Piece", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "81797");
+}
+
 #[test]
 fn match_best_an_exact_name_under_the_floor_does_not_shut_out_a_prefix_match() {
     let cands = vec![
