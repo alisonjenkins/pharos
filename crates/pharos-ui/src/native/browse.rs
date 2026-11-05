@@ -202,6 +202,10 @@ pub struct Show {
     pub seasons: Vec<Item>,
     pub selected: Option<ItemRef>,
     pub episodes: Page,
+    /// The server's watched state for the shown season as a whole, read
+    /// from its detail when `episodes` is only part of it: a page cannot say
+    /// whether a longer season is all watched.
+    pub season_played: Option<bool>,
 }
 
 /// How a parent's children are fetched and laid out, decided from its
@@ -388,12 +392,25 @@ pub async fn load<A: PharosApi>(
                 Some(season) => list(season, None, INDEX_ORDER).await?,
                 None => list(id, None, INDEX_ORDER).await?,
             };
+            let season_played = match selected {
+                Some(season) if is_partial(&episodes) => match api.detail(info, season).await {
+                    Ok(d) => Some(d.item.played),
+                    Err(e) => {
+                        warn(format!(
+                            "pharos: browse {id}: season {season} watched state unavailable: {e}"
+                        ));
+                        None
+                    }
+                },
+                _ => None,
+            };
             Browse::Show(Show {
                 title,
                 series,
                 seasons,
                 selected,
                 episodes,
+                season_played,
             })
         }
         (
@@ -410,6 +427,7 @@ pub async fn load<A: PharosApi>(
                 list(id, None, INDEX_ORDER),
             )
             .await;
+            let season_played = season.as_ref().map(|s| s.item.played);
             let series = match series {
                 Ok(series) => Some(series),
                 Err(e) => {
@@ -433,6 +451,7 @@ pub async fn load<A: PharosApi>(
                 seasons: seasons?.items,
                 selected: Some(id),
                 episodes: episodes?,
+                season_played,
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
@@ -1060,7 +1079,7 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                     if let Some(season) = marked_season {
                         WatchedToggle {
                             id: season,
-                            played: all_played(&show.episodes),
+                            played: all_played(&show.episodes, show.season_played),
                             what: "season",
                         }
                     }
@@ -1100,13 +1119,20 @@ fn in_this_group(show: &Show, seen: &[MemberSeen]) -> Vec<(String, Vec<seen::See
     }
 }
 
-/// Whether every episode of a season is watched, as far as `page` shows:
-/// a season longer than one page reads as unwatched, which still offers to
-/// mark it.
-fn all_played(page: &Page) -> bool {
-    !page.items.is_empty()
-        && page.items.len() == page.total as usize
-        && page.items.iter().all(|e| e.played)
+/// Whether `page` holds fewer episodes than the season has.
+fn is_partial(page: &Page) -> bool {
+    page.items.len() < page.total as usize
+}
+
+/// Whether every episode of a season is watched. A whole season on `page`
+/// answers for itself; a longer one takes the server's `aggregate` for the
+/// season, and reads as unwatched without one, which still offers to mark
+/// it.
+fn all_played(page: &Page, aggregate: Option<bool>) -> bool {
+    if is_partial(page) {
+        return aggregate.unwrap_or(false);
+    }
+    !page.items.is_empty() && page.items.iter().all(|e| e.played)
 }
 
 /// A season's episodes as rows: still, number and name, runtime, watched
@@ -2066,6 +2092,7 @@ mod tests {
             ],
             selected: Some(S2),
             episodes: page(vec![ep]),
+            season_played: None,
         };
         let html = render(move || rsx! { ShowView { show: show.clone() } });
         assert!(
@@ -2093,6 +2120,7 @@ mod tests {
             seasons: vec![item(S1, ItemKind::Season, "Season 1")],
             selected: Some(S1),
             episodes: page(episodes),
+            season_played: None,
         };
 
         let part = show(vec![pilot.clone(), second.clone()]);
@@ -2120,10 +2148,17 @@ mod tests {
         let mut ep = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
         ep.played = true;
         let mut partial = page(vec![ep]);
-        assert!(all_played(&partial));
+        assert!(all_played(&partial, None));
         partial.total = 30;
-        assert!(!all_played(&partial));
-        assert!(!all_played(&page(vec![])));
+        assert!(!all_played(&partial, None));
+        assert!(!all_played(&page(vec![]), None));
+        // A fully watched season longer than its page can still be
+        // marked unwatched, from the server's season aggregate.
+        assert!(all_played(&partial, Some(true)));
+        assert!(!all_played(&partial, Some(false)));
+        // A whole page answers for itself, whatever the aggregate says.
+        partial.total = 1;
+        assert!(all_played(&partial, Some(false)));
     }
 
     fn render(body: impl Fn() -> Element + 'static) -> String {
@@ -2164,6 +2199,7 @@ mod tests {
             seasons: vec![item(S1, ItemKind::Season, "Season 1")],
             selected: Some(S1),
             episodes: page(vec![one, two]),
+            season_played: None,
         }
     }
 
