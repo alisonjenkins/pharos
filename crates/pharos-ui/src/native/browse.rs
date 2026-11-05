@@ -292,6 +292,29 @@ pub enum Browse {
     },
 }
 
+impl Browse {
+    /// The parent this page lists, for the tab title. `asked` is the item
+    /// the route names: a season route reads "<season> · <show>", so each
+    /// season's tab has its own title, while the series route (whose shown
+    /// season is only the default) reads the show alone.
+    pub fn name(&self, asked: ItemRef) -> String {
+        match self {
+            Browse::Grid { title, .. } | Browse::Music { title, .. } => title.clone(),
+            Browse::Show(show) => match show
+                .seasons
+                .iter()
+                .find(|season| season.id == asked && show.selected == Some(asked))
+            {
+                Some(season) => format!("{} · {}", season.name, show.title),
+                None => show.title.clone(),
+            },
+            Browse::Artist { detail, .. } | Browse::Album { detail, .. } => {
+                detail.item.name.clone()
+            }
+        }
+    }
+}
+
 /// A series page: its detail when it could be read, its seasons, the season
 /// shown and that season's episodes.
 #[derive(Debug, Clone, PartialEq)]
@@ -2304,6 +2327,25 @@ mod tests {
         assert!(html.contains("3:07"), "{html}");
         assert!(html.contains("3 tracks"), "{html}");
         assert!(html.contains("/ui/watch/1"), "{html}");
+    }
+
+    /// A season route's tab names the season and the show; the series route
+    /// names the show alone, whichever season it shows by default.
+    #[test]
+    fn a_season_page_is_named_with_its_season() {
+        let show = Browse::Show(Show {
+            title: "Show".into(),
+            series: None,
+            seasons: vec![
+                item(S1, ItemKind::Season, "Season 1"),
+                item(S2, ItemKind::Season, "Season 2"),
+            ],
+            selected: Some(S2),
+            episodes: page(Vec::new()),
+            season_played: None,
+        });
+        assert_eq!(show.name(S2), "Season 2 · Show");
+        assert_eq!(show.name(SERIES), "Show");
     }
 
     #[test]
