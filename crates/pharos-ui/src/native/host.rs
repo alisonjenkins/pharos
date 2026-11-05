@@ -126,6 +126,22 @@ pub fn lift_cues_as_shown(_video_id: &str) {}
 
 pub fn relift_cues(_video_id: &str) {}
 
+/// Loads the text track without drawing it; nothing to load on the host.
+pub fn hide_text_track(_video_id: &str, _track_id: &str) {}
+
+/// The Rust subtitle driver's handle; the host has no canvas.
+pub struct RustSubtitles;
+
+pub async fn rust_subtitles(
+    _video_id: &str,
+    _vtt_url: &str,
+    _report: std::rc::Rc<dyn Fn(super::subtitles::FallbackReason)>,
+) -> Result<RustSubtitles, super::subtitles::FallbackReason> {
+    Err(super::subtitles::FallbackReason::NoWebgl2)
+}
+
+pub fn set_subtitle_controls_visible(_visible: bool) {}
+
 pub struct StyledSubtitles;
 
 pub async fn styled_subtitles(

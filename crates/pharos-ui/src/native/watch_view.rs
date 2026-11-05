@@ -292,6 +292,12 @@ pub fn WatchView(
         (false, true) => "pharos-player is-idle",
         (false, false) => "pharos-player",
     };
+    // The Rust subtitle renderer lifts its text above the control bar while
+    // the bar shows (spec 026 US1 #3): paused, or awake and not idle.
+    let controls_shown = media.paused || !(idle() && !invite_open);
+    use_effect(use_reactive!(|controls_shown| {
+        platform::set_subtitle_controls_visible(controls_shown);
+    }));
     let shortcuts = use_shortcuts(media, c.previous, c.next, on_control);
     let on_key = move |evt: KeyboardEvent| {
         wake();
