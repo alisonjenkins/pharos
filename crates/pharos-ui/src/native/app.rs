@@ -2103,7 +2103,10 @@ fn TitleScreen(id: ItemRef) -> Element {
         let mut error = together.error;
         move || error.set(None)
     });
-    let detail = use_resource(move || {
+    // The screen stays mounted when one title page opens another (a search
+    // hit, a neighbour), so the load follows `id` instead of running once
+    // (B555).
+    let detail = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
         async move {
@@ -2113,7 +2116,7 @@ fn TitleScreen(id: ItemRef) -> Element {
                 api.detail(&call("title", "load"), id).await,
             ))
         }
-    });
+    }));
     // Start a group on this title from the start, then watch it as its member.
     let group_error = together.error;
     let on_watch_together = move |_| {

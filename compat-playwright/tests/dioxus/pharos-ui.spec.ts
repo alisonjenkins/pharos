@@ -21,34 +21,28 @@ type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
 /** Who a song is by: its album artist, or else its first track artist. */
 const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
 
-// Opens the first title the search finds for `term` (the bar replaced
-// the old Find page). Only a hit naming the term counts, so a list still
-// showing an earlier search is never clicked. Without `kind` it takes the
-// bar's own suggestions. With `kind` ("Film", "Song", …, as each hit's
-// detail line starts), Enter opens the palette's full list and the first
-// hit of that kind is taken: "Playwright" also matches the seeded book,
-// comic and manual, which rank above the films and fill the bar's few
-// suggestions. Returns once the page has moved to that hit.
-async function openFirstHit(page: Page, term: string, kind?: string): Promise<void> {
-  const bar = page.getByRole("combobox", { name: "Search all libraries" });
-  await bar.fill(term);
-  let options = page.getByRole("option").filter({ hasText: new RegExp(term, "i") });
-  if (kind) {
-    await expect(options.first()).toBeVisible({ timeout: 15_000 });
-    await bar.press("Enter");
-    const palette = page.getByRole("dialog", { name: "Go to or search" });
-    await expect(palette.getByRole("group", { name: "Titles" })).toBeVisible({ timeout: 15_000 });
-    options = palette
-      .getByRole("option")
-      .filter({ hasText: new RegExp(term, "i") })
-      .filter({ has: page.locator(".pharos-muted", { hasText: new RegExp(`^${kind}\\b`) }) });
-  }
-  const hit = options.first().getByRole("link");
+// Opens the first title the top bar's search suggests for `term`. The
+// suggestions are the first hits of the same search the palette runs, in
+// its order (the bar replaced the old Find page). Only a hit naming the
+// term counts, so a list still showing an earlier search is never clicked,
+// and the helper returns once the page has moved to that hit and shows it.
+async function openFirstHit(page: Page, term: string): Promise<void> {
+  await page.getByRole("combobox", { name: "Search all libraries" }).fill(term);
+  const hit = page
+    .getByRole("option")
+    .filter({ hasText: new RegExp(term, "i") })
+    .first()
+    .getByRole("link");
   await expect(hit).toBeVisible({ timeout: 15_000 });
   const href = await hit.getAttribute("href");
+  const name = (await hit.locator(".pharos-search-name").textContent())?.trim();
   await hit.click();
   if (href) {
     await expect(page).toHaveURL((url) => url.pathname === href, { timeout: 15_000 });
+  }
+  // The page shows the hit, not the title it was opened from (B555).
+  if (name) {
+    await expect(page.locator(".pharos-main")).toContainText(name, { timeout: 15_000 });
   }
 }
 
@@ -2761,7 +2755,7 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
 
     // A film from its title page: the page stays, the window plays it.
-    await openFirstHit(page, "Playwright", "Film");
+    await openFirstHit(page, "Playwright");
     await expect(page).toHaveURL(/\/ui\/title\//);
     const title = page.url();
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
@@ -2798,7 +2792,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await openFirstHit(page, "Playwright", "Film");
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2838,7 +2832,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await openFirstHit(page, "Playwright", "Film");
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2882,7 +2876,7 @@ test.describe("pharos Dioxus UI stage", () => {
     );
     test.skip(!supported, "this browser has no picture-in-picture");
 
-    await openFirstHit(page, "Playwright", "Film");
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2932,7 +2926,7 @@ test.describe("pharos Dioxus UI stage", () => {
       }),
     );
     await signIn(page);
-    await openFirstHit(page, "Playwright", "Film");
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
