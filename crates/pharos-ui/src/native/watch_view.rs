@@ -17,7 +17,7 @@ use super::playback::{
 };
 use super::seen::SeenRow;
 use super::together::Member;
-use super::together_view::{ActivityToast, MemberStrip};
+use super::together_view::{ActivityToast, InvitePanel, MemberStrip};
 use super::views::{ends_at, episode_label, use_ends_at_refresh};
 
 /// The `<video>` the playback engine attaches to.
@@ -29,6 +29,9 @@ pub const OUTGOING_ID: &str = "pharos-video-out";
 pub const PLAYER_ID: &str = "pharos-player";
 /// The seek bar, whose width turns a pointer offset into a position.
 pub const SEEK_ID: &str = "pharos-seek";
+
+/// Two people: watch together.
+const ICON_TOGETHER: &str = "M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-8 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13Zm8 0c-.3 0-.6 0-1 .1 1.2.8 2 2 2 3.4V19h6v-2.5c0-2.3-4.7-3.5-7-3.5Z";
 
 /// How far the arrow keys and skip buttons seek.
 pub(super) const SEEK_STEP_MS: u64 = 10_000;
@@ -180,6 +183,13 @@ pub enum Control {
     PlayNext,
     /// Hide "Up next" and stay on this episode to its end.
     CancelNext,
+    /// Start a group on this item at the current position, so others can
+    /// join (014).
+    StartTogether,
+    /// Open (`true`) or close the invite panel.
+    ShowInvite(bool),
+    /// Put the group's invite link on the clipboard.
+    CopyInvite,
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -222,6 +232,19 @@ pub fn WatchView(
     /// The activity line to show over the video now, if any.
     #[props(default)]
     toast: Option<String>,
+    /// Whether this item can start a group: the Watch together button shows
+    /// while not in one.
+    #[props(default)]
+    can_start_together: bool,
+    /// The group's invite link, once in a group that has one.
+    #[props(default)]
+    invite: Option<String>,
+    /// Whether the invite panel shows (with `invite`).
+    #[props(default)]
+    invite_open: bool,
+    /// What the last invite copy did, for the invite panel.
+    #[props(default)]
+    invite_note: Option<String>,
 ) -> Element {
     use_ends_at_refresh();
     let in_group = !members.is_empty();
@@ -262,7 +285,9 @@ pub fn WatchView(
         });
     };
     use_hook(wake);
-    let class = match (media.paused, idle()) {
+    // The open invite panel holds the chrome up.
+    let invite_open = invite_open && invite.is_some();
+    let class = match (media.paused, idle() && !invite_open) {
         (true, _) => "pharos-player is-paused",
         (false, true) => "pharos-player is-idle",
         (false, false) => "pharos-player",
@@ -273,6 +298,15 @@ pub fn WatchView(
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
         // a bare `k` toggles play, the chord must not.
         if chorded(&evt) {
+            return;
+        }
+        // The invite panel is a dialog: its keys are its own, and Escape
+        // closes it.
+        if invite_open {
+            if evt.key() == Key::Escape {
+                evt.prevent_default();
+                on_control.call(Control::ShowInvite(false));
+            }
             return;
         }
         // Shift+P / Shift+N are page-wide (B562), not the player's own.
@@ -384,6 +418,16 @@ pub fn WatchView(
                         "←"
                     }
                     h2 { class: "pharos-watch-title", "{title}" }
+                    if can_start_together && !in_group {
+                        button {
+                            class: "pharos-control pharos-together-start",
+                            r#type: "button",
+                            title: "Start a group here so others can join",
+                            onclick: move |_| on_control.call(Control::StartTogether),
+                            Icon { path: ICON_TOGETHER }
+                            span { class: "pharos-control-label", "Watch together" }
+                        }
+                    }
                     button {
                         class: "pharos-control pharos-shrink",
                         r#type: "button",
@@ -394,6 +438,24 @@ pub fn WatchView(
                     }
                     if !members.is_empty() {
                         MemberStrip { members, on_leave, seen, own_tracks: own_track_members, activity }
+                    }
+                    if in_group && invite.is_some() {
+                        button {
+                            class: "pharos-control pharos-invite-toggle",
+                            r#type: "button",
+                            aria_expanded: if invite_open { "true" } else { "false" },
+                            onclick: move |_| on_control.call(Control::ShowInvite(!invite_open)),
+                            Icon { path: ICON_TOGETHER }
+                            span { class: "pharos-control-label", "Invite" }
+                        }
+                    }
+                }
+                if invite_open {
+                    InvitePanel {
+                        url: invite.clone().unwrap_or_default(),
+                        note: invite_note,
+                        on_copy: move |_| on_control.call(Control::CopyInvite),
+                        on_close: move |_| on_control.call(Control::ShowInvite(false)),
                     }
                 }
                 ActivityToast { line: toast }
@@ -1179,6 +1241,100 @@ mod tests {
         };
         assert!(render_with(true).contains("autoplay"));
         assert!(!render_with(false).contains("autoplay"));
+    }
+
+    /// Renders the player alone or in a group, with Watch together offered
+    /// and an invite link when `invite`.
+    fn render_together(in_group: bool, invite: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            move |(in_group, invite): (bool, bool)| {
+                let members = if in_group {
+                    vec![Member {
+                        id: "a".into(),
+                        name: "Ada".into(),
+                        buffering: false,
+                        own_tracks: false,
+                    }]
+                } else {
+                    vec![]
+                };
+                rsx! {
+                    WatchView {
+                        title: "Pilot",
+                        controls: controls(),
+                        on_media: |_| {},
+                        on_control: |_| {},
+                        members,
+                        can_start_together: true,
+                        invite: invite.then(|| "http://h/ui/together/g1".to_owned()),
+                    }
+                }
+            },
+            (in_group, invite),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn render_together_open() -> String {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                WatchView {
+                    title: "Pilot",
+                    controls: controls(),
+                    on_media: |_| {},
+                    on_control: |_| {},
+                    members: vec![Member {
+                        id: "a".into(),
+                        name: "Ada".into(),
+                        buffering: false,
+                        own_tracks: false,
+                    }],
+                    invite: Some("http://h/ui/together/g1".to_owned()),
+                    invite_open: true,
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// V479: the player offers Watch together while alone, and Invite once
+    /// in a group.
+    #[test]
+    fn the_player_offers_watch_together_alone_and_invite_in_a_group() {
+        let alone = render_together(false, false);
+        assert!(alone.contains("pharos-together-start"), "{alone}");
+        assert!(alone.contains(">Watch together<"), "{alone}");
+        assert!(!alone.contains("pharos-invite-toggle"), "{alone}");
+        let grouped = render_together(true, true);
+        assert!(!grouped.contains("pharos-together-start"), "{grouped}");
+        assert!(grouped.contains("pharos-invite-toggle"), "{grouped}");
+        assert!(grouped.contains(r#"aria-expanded="false""#), "{grouped}");
+        // The panel shows only when asked for, never on a join by itself.
+        assert!(!grouped.contains("pharos-invite-link"), "{grouped}");
+        let open = render_together_open();
+        assert!(open.contains("pharos-invite-link"), "{open}");
+        assert!(open.contains(r#"aria-expanded="true""#), "{open}");
+        // No link yet (the group's id has not come): nothing to invite with.
+        assert!(!render_together(true, false).contains("pharos-invite-toggle"));
+    }
+
+    /// A song or a player that cannot start a group shows no button.
+    #[test]
+    fn watch_together_hides_when_the_player_cannot_start_a_group() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                WatchView {
+                    title: "Pilot",
+                    controls: controls(),
+                    on_media: |_| {},
+                    on_control: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        assert!(!dioxus_ssr::render(&dom).contains("pharos-together-start"));
     }
 
     fn render_group(in_group: bool, own_tracks: bool, toast: Option<String>) -> String {

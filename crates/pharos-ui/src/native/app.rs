@@ -44,8 +44,10 @@ use super::resume::{ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
-use super::together::{group_api, GroupClient as _, GroupError, GroupSummary, Groups};
-use super::together_view::{InviteView, TogetherView};
+use super::together::{
+    can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
+};
+use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::views::{
@@ -2932,6 +2934,11 @@ fn choice(index: Option<u32>) -> TrackChoice {
     index.map_or(TrackChoice::Off, TrackChoice::Index)
 }
 
+/// The link that joins group `id`: the invite route on this server.
+fn invite_url(origin: &str, id: &str) -> String {
+    format!("{origin}{}", Route::TogetherGroup(id.to_owned()).path())
+}
+
 /// Attaches the engine, draws the controls and reports progress: on play,
 /// pause and seek, every 10 s while playing, and one stop when the video
 /// ends, the player unmounts or the page is hidden. A track change the
@@ -2979,6 +2986,19 @@ fn Player(
         let together = together.clone();
         move || together.current()
     };
+    // A group start from this player is on its way; a second click waits.
+    let starting = use_hook(|| Rc::new(Cell::new(false)));
+    // The group whose invite panel is open: it opens by itself once a group
+    // started from here is up, and a group left or replaced closes it.
+    let invite_for = use_signal(|| None::<String>);
+    // What the last invite copy did, for the invite panel.
+    let invite_note = use_signal(|| None::<String>);
+    let invite_open = group.active && group.id.is_some() && *invite_for.read() == group.id;
+    let invite = group
+        .id
+        .as_ref()
+        .filter(|_| group.active)
+        .map(|id| invite_url(&platform::page_origin(), id));
     // Bumped when the toast's time is up, so the page draws without it.
     let toast_expired = use_signal(|| 0u32);
     let _ = toast_expired();
@@ -3525,6 +3545,9 @@ fn Player(
         let session = session.clone();
         let watch = watch.clone();
         let (retiring, fade_in_cancel) = (Rc::clone(&retiring), Rc::clone(&fade_in_cancel));
+        let (together, starting) = (together.clone(), Rc::clone(&starting));
+        let invite_link = invite.clone();
+        let group_id = group.id.clone().filter(|_| group.active);
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
         let resume = Rc::clone(&resume);
         move |control: Control| {
@@ -3595,6 +3618,68 @@ fn Player(
                 Control::CancelNext => {
                     up_next.write().cancel();
                     up_next_step.set(UpNextStep::Hidden);
+                }
+                // Start a group on what plays, where it is now: the video on
+                // the stage is the session's from the start, so it plays on.
+                Control::StartTogether => {
+                    let Some(api) = ctx.api.peek().clone() else {
+                        return;
+                    };
+                    if starting.replace(true) {
+                        return;
+                    }
+                    let id = p.detail.item.id;
+                    let session = together.session(&api);
+                    let from_ms = platform::position_ms(VIDEO_ID);
+                    let mut group_error = together.error;
+                    group_error.set(None);
+                    platform::info(&format!(
+                        "pharos: group create item={id} from_ms={from_ms} reason=player"
+                    ));
+                    let starting = Rc::clone(&starting);
+                    let (mut invite_for, mut note) = (invite_for, invite_note);
+                    spawn_forever(async move {
+                        match session.create(id, from_ms).await {
+                            Ok(made) => {
+                                note.set(None);
+                                invite_for.set(Some(made.id));
+                            }
+                            Err(e) => {
+                                platform::warn(&format!(
+                                    "pharos: group create failed item={id} reason=player error={}",
+                                    e.0
+                                ));
+                                group_error.set(Some(e.0));
+                            }
+                        }
+                        starting.set(false);
+                    });
+                }
+                Control::ShowInvite(open) => {
+                    let (mut invite_for, mut note) = (invite_for, invite_note);
+                    note.set(None);
+                    invite_for.set(if open { group_id.clone() } else { None });
+                }
+                Control::CopyInvite => {
+                    let Some(url) = invite_link.clone() else {
+                        return;
+                    };
+                    let mut note = invite_note;
+                    spawn(async move {
+                        let copied = platform::copy_text(&url).await;
+                        platform::info(&format!("pharos: invite copy copied={copied}"));
+                        if !copied {
+                            platform::select_field(INVITE_LINK_ID);
+                        }
+                        note.set(Some(
+                            if copied {
+                                "Link copied"
+                            } else {
+                                "Press Ctrl+C to copy the link"
+                            }
+                            .to_owned(),
+                        ));
+                    });
                 }
                 // History first, so a song from a mix or the queue goes back
                 // to what played; the album's previous track when there is none.
@@ -3854,6 +3939,9 @@ fn Player(
             if let Some(message) = group.ended.clone() {
                 ErrorNote { message }
             }
+            if let Some(message) = together.error.read().clone() {
+                ErrorNote { message }
+            }
         }
         if p.kind == ItemKind::Audio {
             ListenView {
@@ -3920,6 +4008,10 @@ fn Player(
                 seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
                 autoplay: !group.active,
+                can_start_together: can_watch_together(p.kind) && !compact,
+                invite,
+                invite_open,
+                invite_note: invite_note(),
             }
         }
     }
@@ -3930,6 +4022,18 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// An invite link is the invite route on this server, the group id as
+    /// the server minted it.
+    #[test]
+    fn an_invite_link_opens_the_groups_invite_page_here() {
+        let url = invite_url("https://pharos.example", "0a1b-2c");
+        assert_eq!(url, "https://pharos.example/ui/together/0a1b-2c");
+        assert_eq!(
+            Route::parse("/ui/together/0a1b-2c"),
+            Route::TogetherGroup("0a1b-2c".into())
+        );
+    }
 
     /// A subtitle size picked on this page load is what the picker reads back,
     /// even when storage keeps nothing (the host stub stores nothing), so the
