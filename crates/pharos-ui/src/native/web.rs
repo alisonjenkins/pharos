@@ -19,8 +19,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
     cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine,
-    FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget,
-    SubtitleSize,
+    FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery,
+    RecoveryBudget, SubtitleSize,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -2392,6 +2392,22 @@ pub fn apply_subtitle_size(size: SubtitleSize) {
     };
     if let Err(e) = root.set_attribute("data-subtitle-size", size.as_str()) {
         warn(&format!("pharos: subtitle_size apply failed error={e:?}"));
+    }
+}
+
+/// Set `data-library-transition` on `<html>` so a library's cards arrive
+/// with `fx`.
+pub fn apply_library_transition(fx: LibraryTransition) {
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    else {
+        return;
+    };
+    if let Err(e) = root.set_attribute("data-library-transition", fx.as_str()) {
+        warn(&format!(
+            "pharos: library_transition apply failed error={e:?}"
+        ));
     }
 }
 
