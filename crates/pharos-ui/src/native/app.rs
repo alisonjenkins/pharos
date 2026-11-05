@@ -32,7 +32,7 @@ use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
-    parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms,
+    parse_max_bitrate, parse_volume_setting, position_at, preview_set, rust_subtitle_url, start_ms,
     styled_subtitle_url, subtitle_switch, up_next_at, volume_setting, Engine, LibraryTransition,
     MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine, ReportClock,
     SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY, LIBRARY_TRANSITION_KEY,
@@ -44,6 +44,7 @@ use super::resume::{ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::stage::{Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, View, STAGE_ID};
+use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
@@ -3031,6 +3032,12 @@ fn Player(
     let styled = use_hook(|| Rc::new(RefCell::new(None::<platform::StyledSubtitles>)));
     let styled_for = use_hook(|| Rc::new(Cell::new(0_u64)));
     let mut styled_ready = use_signal(|| false);
+    // A plain text subtitle drawn by the Rust renderer (spec 026), and the
+    // pick it is for; its `<track>` stays loaded but hidden, and shows if the
+    // renderer fails.
+    let rust = use_hook(|| Rc::new(RefCell::new(None::<platform::RustSubtitles>)));
+    let rust_for = use_hook(|| Rc::new(Cell::new(0_u64)));
+    let mut rust_state = use_signal(|| RustState::Off);
     let StageCtx(stage) = use_context::<StageCtx>();
     // The view alone, so a drag (which moves the spot) does not redraw the
     // player.
@@ -3194,10 +3201,13 @@ fn Player(
     use_drop({
         let (engine, stop) = (Rc::clone(&engine), stop.clone());
         let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+        let (rust, rust_for) = (Rc::clone(&rust), Rc::clone(&rust_for));
         move || {
             // A renderer still loading must not attach once the player is gone.
             styled_for.set(styled_for.get().wrapping_add(1));
             styled.borrow_mut().take();
+            rust_for.set(rust_for.get().wrapping_add(1));
+            rust.borrow_mut().take();
             engine.borrow_mut().take();
             stop();
         }
@@ -3353,6 +3363,54 @@ fn Player(
             });
         }
     });
+    // The Rust renderer calls back outside the Dioxus runtime too.
+    let rust_events = use_coroutine({
+        let (rust, rust_for) = (Rc::clone(&rust), Rc::clone(&rust_for));
+        move |mut events: UnboundedReceiver<(u64, FallbackReason)>| {
+            let (rust, rust_for) = (Rc::clone(&rust), Rc::clone(&rust_for));
+            async move {
+                while let Some((pick, _reason)) = events.next().await {
+                    if pick == rust_for.get() {
+                        rust.borrow_mut().take();
+                        rust_state.set(RustState::Failed);
+                    }
+                }
+            }
+        }
+    });
+    use_effect({
+        let (p, rust, rust_for) = (Rc::clone(&p), Rc::clone(&rust), Rc::clone(&rust_for));
+        move || {
+            let shown = if burned { None } else { subtitle() };
+            let pick = rust_for.get().wrapping_add(1);
+            rust_for.set(pick);
+            rust.borrow_mut().take();
+            let url = shown
+                .and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i))
+                .and_then(rust_subtitle_url);
+            let Some(url) = url else {
+                rust_state.set(RustState::Off);
+                return;
+            };
+            rust_state.set(RustState::Starting);
+            let (rust, rust_for) = (Rc::clone(&rust), Rc::clone(&rust_for));
+            spawn(async move {
+                let report: Rc<dyn Fn(FallbackReason)> =
+                    Rc::new(move |reason| rust_events.send((pick, reason)));
+                let started = platform::rust_subtitles(VIDEO_ID, &url, report).await;
+                if rust_for.get() != pick {
+                    return;
+                }
+                match started {
+                    Ok(s) => {
+                        *rust.borrow_mut() = Some(s);
+                        rust_state.set(RustState::Active);
+                    }
+                    Err(_) => rust_state.set(RustState::Failed),
+                }
+            });
+        }
+    });
     use_effect(move || {
         let shown = if burned || styled_ready() {
             None
@@ -3360,7 +3418,10 @@ fn Player(
             subtitle()
         };
         let id = shown.map(text_track_id);
-        platform::show_text_track(VIDEO_ID, id.as_deref());
+        match (id, track_mode(rust_state())) {
+            (Some(id), TrackMode::Hidden) => platform::hide_text_track(VIDEO_ID, &id),
+            (id, _) => platform::show_text_track(VIDEO_ID, id.as_deref()),
+        }
     });
 
     // Finishing this episode for the next: every road to the next episode
@@ -3507,7 +3568,10 @@ fn Player(
                     *subtitle.peek()
                 };
                 let id = shown.map(text_track_id);
-                platform::show_text_track(VIDEO_ID, id.as_deref());
+                match (id, track_mode(*rust_state.peek())) {
+                    (Some(id), TrackMode::Hidden) => platform::hide_text_track(VIDEO_ID, &id),
+                    (id, _) => platform::show_text_track(VIDEO_ID, id.as_deref()),
+                }
             }
             let at = platform::position_ms(VIDEO_ID);
             if at > 0 {
