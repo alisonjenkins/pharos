@@ -978,8 +978,18 @@ test.describe("pharos Dioxus UI", () => {
         expect((await place()).at, how).toBe(left.at);
       };
 
+      // Opens the tile at `left.at` where it sits. Playwright's own click
+      // first scrolls a partly hidden link fully into view, which would
+      // move the place being kept (the tile's top to 0) before the click.
+      const open = async () =>
+        tiles
+          .nth(left.at)
+          .locator("a")
+          .first()
+          .evaluate((a: HTMLElement) => a.click());
+
       // Back from a title.
-      await tiles.nth(left.at).locator("a").first().click();
+      await open();
       await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
       await page.goBack();
       await backTo("back");
@@ -1017,7 +1027,7 @@ test.describe("pharos Dioxus UI", () => {
       await backTo("back inside the settle delay");
 
       // The breadcrumb's bare library link: the tab's last choice and place.
-      await tiles.nth(left.at).locator("a").first().click();
+      await open();
       await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
       await page.locator("nav.pharos-crumbs a", { hasText: /^Bulk$/ }).click();
       await backTo("breadcrumb");
