@@ -17,8 +17,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    is_loading, Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery,
-    RecoveryBudget, SubtitleSize,
+    is_loading, lifted_line, Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine,
+    Recovery, RecoveryBudget, SubtitleSize,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -498,6 +498,7 @@ fn lift_cues(cues: &JsValue) {
         .unwrap_or(0.0) as u32;
     let line = JsValue::from_str("line");
     let vertical = JsValue::from_str("vertical");
+    let cue_text = JsValue::from_str("text");
     let text = |cue: &JsValue, key: &JsValue| {
         js_sys::Reflect::get(cue, key)
             .ok()
@@ -512,7 +513,8 @@ fn lift_cues(cues: &JsValue) {
         if text(&cue, &line).as_deref() == Some("auto")
             && text(&cue, &vertical).as_deref() == Some("")
         {
-            let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(-2.0));
+            let lines = text(&cue, &cue_text).unwrap_or_default();
+            let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(lifted_line(&lines)));
         }
     }
 }
