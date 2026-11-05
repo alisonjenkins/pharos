@@ -61,13 +61,13 @@ pub fn ApproveDeviceView(
     }));
 
     rsx! {
-        section { class: "pharos-account-settings",
+        section { class: "pharos-settings-page pharos-account-settings",
             h2 { "Approve a device" }
-            p { class: "pharos-account-signed-in",
+            p { class: "pharos-settings-lede pharos-account-signed-in",
                 "Open Quick Connect on the device you want to sign in, then enter the code it shows. The device signs in as you."
             }
             form {
-                class: "pharos-password-form",
+                class: "pharos-settings-group pharos-password-form",
                 id: "approve-device",
                 onsubmit: move |evt: FormEvent| {
                     evt.prevent_default();

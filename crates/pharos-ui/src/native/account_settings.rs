@@ -206,14 +206,17 @@ pub fn AccountView(
         (None, None) => None,
     };
     rsx! {
-        section { class: "pharos-account-settings",
+        section { class: "pharos-settings-page pharos-account-settings",
             h2 { "Account" }
             if let Some(name) = &name {
-                p { class: "pharos-account-signed-in", "Signed in as {name}" }
+                p { class: "pharos-settings-lede pharos-account-signed-in", "Signed in as {name}" }
             }
-            div { class: "pharos-avatar-settings", id: "avatar-settings",
-                h3 { "Picture" }
+            div { class: "pharos-settings-group pharos-avatar-settings", id: "avatar-settings",
                 div { class: "pharos-avatar-large", Avatar { me: me.clone() } }
+                div { class: "pharos-setting-text",
+                    h3 { class: "pharos-setting-name", "Picture" }
+                    p { class: "pharos-setting-help", "Shown on your account button and to people you watch with." }
+                }
                 div { class: "pharos-avatar-actions",
                     button {
                         r#type: "button",
@@ -237,12 +240,17 @@ pub fn AccountView(
                     _ => rsx! {},
                 }
             }
-            div { class: "pharos-description-settings", id: "description-settings",
-                h3 { "Descriptions" }
-                label {
-                    "Show and episode descriptions in"
+            div { class: "pharos-settings-group pharos-description-settings", id: "description-settings",
+                div { class: "pharos-setting",
+                    div { class: "pharos-setting-text",
+                        h3 { class: "pharos-setting-name", id: "description-language-label", "Description language" }
+                        p { id: "description-language-help", class: "pharos-setting-help",
+                            "When a show has no description in this language, the English one is shown. Kept with your account, so every device and app uses it."
+                        }
+                    }
                     select {
                         id: "description-language",
+                        aria_labelledby: "description-language-label",
                         aria_describedby: "description-language-help",
                         onchange: move |e| on_description_language.call(e.value()),
                         for (value, label) in DESCRIPTION_LANGUAGES {
@@ -254,12 +262,9 @@ pub fn AccountView(
                         }
                     }
                 }
-                p { id: "description-language-help", class: "pharos-muted",
-                    "When a show has no description in this language, the English one is shown. Kept with your account, so every device and app uses it."
-                }
             }
             form {
-                class: "pharos-password-form",
+                class: "pharos-settings-group pharos-password-form",
                 id: "change-password",
                 onsubmit: move |evt: FormEvent| {
                     evt.prevent_default();
