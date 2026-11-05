@@ -155,22 +155,43 @@ pub const PLAYBACK_ALLOWLIST: &[AllowedRoute] = &[
     },
 ];
 
+/// The routes a media-scoped token may call (B542, V437): GET/HEAD on item
+/// images and video/audio streams, what a native client without a cookie
+/// needs to load posters and play. Deny by default: no item metadata, no
+/// playback reporting, no mutation.
+pub const MEDIA_ALLOWLIST: &[AllowedRoute] = &[
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/items/{id}/images/"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/videos/{id}/"),
+    },
+    AllowedRoute {
+        methods: GET,
+        pattern: PatternMatch::Prefix("/audio/{id}/"),
+    },
+];
+
 /// Whether a token of `scope` may call `method` on the route `pattern`
 /// matched. An unmatched route (`None`) is never permitted to a restricted
 /// scope.
 pub fn scope_permits(scope: TokenScope, method: &str, pattern: Option<&str>) -> bool {
-    match scope {
-        TokenScope::Full => true,
-        TokenScope::Playback => pattern.is_some_and(|pattern| {
-            PLAYBACK_ALLOWLIST.iter().any(|r| {
-                r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
-                    && match r.pattern {
-                        PatternMatch::Exact(p) => p == pattern,
-                        PatternMatch::Prefix(p) => pattern.starts_with(p),
-                    }
-            })
-        }),
-    }
+    let allowlist = match scope {
+        TokenScope::Full => return true,
+        TokenScope::Playback => PLAYBACK_ALLOWLIST,
+        TokenScope::Media => MEDIA_ALLOWLIST,
+    };
+    pattern.is_some_and(|pattern| {
+        allowlist.iter().any(|r| {
+            r.methods.iter().any(|m| m.eq_ignore_ascii_case(method))
+                && match r.pattern {
+                    PatternMatch::Exact(p) => p == pattern,
+                    PatternMatch::Prefix(p) => pattern.starts_with(p),
+                }
+        })
+    })
 }
 
 /// The 403 for a token whose scope does not permit the route, with the refusal
@@ -712,5 +733,45 @@ mod tests {
             .insert_header(("X-Emby-Token", "header-token"))
             .to_http_request();
         assert_eq!(extract_token(&req).as_deref(), Some("header-token"));
+    }
+
+    #[test]
+    fn media_scope_permits_only_image_and_stream_gets() {
+        // B542, V437: route patterns as actix reports them (`match_pattern`).
+        for (method, pattern) in [
+            ("GET", "/items/{id}/images/{image_type}"),
+            ("HEAD", "/items/{id}/images/{image_type}/{image_index}"),
+            ("GET", "/videos/{id}/stream"),
+            ("GET", "/videos/{id}/h264cmaf/main.m3u8"),
+            ("GET", "/audio/{id}/universal"),
+            // Everything a player needs under the stream prefixes, too.
+            (
+                "GET",
+                "/videos/{id}/{media_source_id}/subtitles/{index}/stream.vtt",
+            ),
+            ("GET", "/videos/{id}/trickplay/{width}/{index}.jpg"),
+            ("GET", "/audio/{id}/lyrics"),
+        ] {
+            assert!(
+                scope_permits(TokenScope::Media, method, Some(pattern)),
+                "{method} {pattern}"
+            );
+        }
+        for (method, pattern) in [
+            ("POST", "/videos/{id}/stream"),
+            ("DELETE", "/items/{id}/images/{image_type}"),
+            ("POST", "/items/{id}/images/{image_type}"),
+            ("GET", "/items/{id}"),
+            ("GET", "/items/{id}/playbackinfo"),
+            ("POST", "/sessions/playing"),
+            ("GET", "/users/me"),
+            ("GET", "/items"),
+        ] {
+            assert!(
+                !scope_permits(TokenScope::Media, method, Some(pattern)),
+                "{method} {pattern}"
+            );
+        }
+        assert!(!scope_permits(TokenScope::Media, "GET", None));
     }
 }

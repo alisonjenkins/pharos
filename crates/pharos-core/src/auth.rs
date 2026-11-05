@@ -256,6 +256,9 @@ pub enum TokenScope {
     /// Playback endpoints only: what a cast receiver needs to fetch and
     /// report on the media it was told to play.
     Playback,
+    /// Media and image GET/HEAD endpoints only: what a native client without
+    /// cookie support needs to load posters and media streams via `?api_key=`.
+    Media,
 }
 
 impl TokenScope {
@@ -264,6 +267,7 @@ impl TokenScope {
         match self {
             Self::Full => "full",
             Self::Playback => "playback",
+            Self::Media => "media",
         }
     }
 
@@ -272,7 +276,7 @@ impl TokenScope {
     pub fn to_stored(self) -> Option<&'static str> {
         match self {
             Self::Full => None,
-            Self::Playback => Some(self.label()),
+            Self::Playback | Self::Media => Some(self.label()),
         }
     }
 
@@ -282,6 +286,7 @@ impl TokenScope {
         match stored {
             None | Some("full") => Ok(Self::Full),
             Some("playback") => Ok(Self::Playback),
+            Some("media") => Ok(Self::Media),
             Some(other) => Err(AuthError::Backend(format!(
                 "unknown token scope {other:?} in auth_tokens.scope"
             ))),
@@ -438,5 +443,19 @@ mod tests {
         let user = rec.into_user();
         assert_eq!(user.name, "ali");
         assert!(user.policy.admin);
+    }
+
+    #[test]
+    fn token_scope_stored_roundtrip() {
+        for scope in [TokenScope::Full, TokenScope::Playback, TokenScope::Media] {
+            let stored = scope.to_stored();
+            let parsed = TokenScope::from_stored(stored).expect("roundtrip parse");
+            assert_eq!(parsed, scope);
+        }
+        assert_eq!(
+            TokenScope::from_stored(Some("full")).expect("parse full"),
+            TokenScope::Full
+        );
+        assert!(TokenScope::from_stored(Some("bogus")).is_err());
     }
 }
