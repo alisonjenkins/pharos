@@ -25,8 +25,8 @@ have the native player draw them over the direct-played video (spec 019).
   RGBA PNG, with a JSON manifest of events (start, end, rect on the subtitle
   canvas, forced flag) and the canvas size. Extraction is on demand only,
   behind the background-I/O gate, deduplicated per file and stream, cached on
-  disk with a version marker and a byte cap, and never run from a scan or warm
-  pass (B49/B52).
+  disk in a directory whose name carries the extraction version, and never
+  run from a scan or warm pass (B49/B52). The cache has no byte cap yet.
 - The manifest is served while extraction runs (`complete: false`,
   `through_ms`) so early cues show within seconds; the player polls it.
 - A native client opts in by listing the codecs it draws in
@@ -43,6 +43,9 @@ have the native player draw them over the direct-played video (spec 019).
   displayed content box, including letterboxing and anamorphic DVD aspect.
 - A viewer who resumes deep into a cold file waits until extraction reaches
   that point before cues appear (about the 30 s cold read in the worst case).
+- With no byte cap or eviction, the extracted images grow with the number
+  of image tracks actually watched, a few MB each for DVD (019 plan, known
+  gaps).
 - Reverting means restoring burn-in for the native player only: drop the
   capability from the client, and the server falls back without a migration.
 
