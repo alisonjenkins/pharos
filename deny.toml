@@ -92,6 +92,16 @@ ignore = [
     # code of its own into the shipped binary, so there is nothing reachable
     # at run time. Drop the entry when a lofty release no longer pulls it in.
     "RUSTSEC-2024-0436",
+    # RUSTSEC-2025-0057 (fxhash) and RUSTSEC-2024-0370 (proc-macro-error) are
+    # "no longer maintained", not vulnerable. Both reach the graph only
+    # through pharos-ui's `mobile` feature (025 Android TV): dioxus/mobile
+    # pulls in dioxus-desktop, whose wry/kuchikiki/selectors (fxhash) and
+    # tray-icon/gtk/glib-macros (proc-macro-error) never build for Android
+    # and are not in the server or web bundle. proc-macro-error is a
+    # proc-macro and ships no code. Drop both when dioxus-desktop moves off
+    # them.
+    "RUSTSEC-2025-0057",
+    "RUSTSEC-2024-0370",
 ]
 
 [licenses]
@@ -139,6 +149,13 @@ allow = ["WTFPL"]
 [[licenses.exceptions]]
 name = "ffmpeg-sys-the-third"
 allow = ["WTFPL"]
+
+# NCSA (OSI- and FSF-approved, permissive) on libFuzzer's sources. It reaches
+# the graph only via pharos-ui's `mobile` feature: dioxus-desktop enables
+# image's avif encoder (rav1e), which depends on libfuzzer-sys.
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["MIT", "Apache-2.0", "NCSA"]
 
 [[licenses.exceptions]]
 # 005-kindle-conversion — the MOBI/KF8 → EPUB converter is GPL-3.0-or-later.
