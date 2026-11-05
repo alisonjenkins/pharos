@@ -48,6 +48,8 @@ pub async fn get_text(_url: &str) -> Result<String, (Option<u16>, String)> {
 
 pub async fn sleep_ms(_ms: u32) {}
 
+pub fn set_title(_title: &str) {}
+
 pub fn current_path() -> String {
     "/".into()
 }
