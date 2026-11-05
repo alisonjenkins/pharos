@@ -969,7 +969,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
   width: 100%;
   height: 100%;
   outline: none;
-  /* Subtitles size against its width (`cqw` in `video::cue`). */
+  /* Subtitles size against its width (`cqw` in `.pharos-video::cue`). */
   container-type: inline-size;
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
 }
@@ -1247,13 +1247,15 @@ body:has(.pharos-stage.is-full) .pharos-error {
 :root[data-subtitle-size="extra-large"] {
   --pharos-subtitle-scale: 1.65;
 }
-video::cue {
+/* `.pharos-video::cue`, not `video::cue`: the outline rule above has that
+   specificity, and a plainer selector here would lose the backdrop to its
+   `transparent` (the halo is that rule's outline). */
+.pharos-video::cue {
   font-size: calc(var(--pharos-subtitle-scale) * min(2.8cqw, 5vh));
   background: rgb(0 0 0 / 0.4); /* not themed: subtitles sit on the video, whose colours no theme sets */
-  text-shadow: 0 0 0.1em rgb(0 0 0 / 0.8), 0 0 0.3em rgb(0 0 0 / 0.6); /* not themed: subtitles sit on the video, whose colours no theme sets */
 }
 @supports selector(::-webkit-media-text-track-display) {
-  video::cue {
+  .pharos-video::cue {
     background: transparent;
   }
   video::-webkit-media-text-track-display {
