@@ -147,6 +147,21 @@ pub fn cues_at(cues: &ImageCues, ms: u64) -> impl Iterator<Item = &ImageCue> {
         .filter(move |c| c.start_ms <= ms && ms < c.end_ms)
 }
 
+/// The `line` a horizontal cue whose `line` is `auto` is moved to (V455):
+/// one line clear of the picture's bottom edge. A snap-to-lines cue with a
+/// negative `line` puts its first line that many lines from the bottom, so a
+/// cue of `n` lines needs `-(n + 1)` to end one line up rather than on the
+/// edge. Lines come from the cue's own breaks; one that wraps on screen is
+/// not counted (the browser does not say where it wraps).
+pub fn lifted_line(cue_text: &str) -> f64 {
+    let lines = cue_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+        .max(1);
+    -(lines as f64 + 1.0)
+}
+
 /// `part` of `whole` in percent, for placing a cue on the canvas.
 pub fn share(part: u32, whole: u32) -> f64 {
     match whole {
@@ -801,6 +816,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Disarm check: with `lifted_line` returning -2 for every cue, the two-
+    /// and three-line cases fail.
+    #[test]
+    fn a_cue_is_lifted_one_line_above_its_last_line() {
+        assert_eq!(lifted_line("Hello"), -2.0);
+        assert_eq!(lifted_line(""), -2.0);
+        assert_eq!(lifted_line("Hello\nthere"), -3.0);
+        assert_eq!(lifted_line("one\ntwo\nthree"), -4.0);
+        assert_eq!(lifted_line("one\n\ntwo\n"), -3.0);
+    }
 
     #[test]
     fn max_bitrate_reads_only_the_offered_choices() {
