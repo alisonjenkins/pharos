@@ -1103,6 +1103,17 @@ impl MediaStore for SqliteStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if !rows.is_empty() {
+            // ADR-0062 rows of the swept items: reads skip them already, so
+            // a failure here only leaves dead rows and must not fail the
+            // sweep that has already deleted the items.
+            if let Err(e) = sqlx::query(crate::translations::DELETE_ORPHAN_ITEM_ROWS)
+                .execute(&self.pool)
+                .await
+            {
+                tracing::warn!(error = %e, scan_id, "could not clear swept items' translation rows");
+            }
+        }
         rows.into_iter()
             .map(|(id,)| {
                 u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
