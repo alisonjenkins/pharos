@@ -456,9 +456,7 @@ pub fn episode_title(stem: &str) -> Option<String> {
         .split_whitespace()
         // A spaced name can still carry a dotted release tail
         // (`720p.HDTV.x264-GRP [PublicHD]`): its first segment decides.
-        .take_while(|w| {
-            !is_release_word(w) && !w.split(['.', '_']).next().is_some_and(is_release_word)
-        })
+        .take_while(|w| !is_release_word(w) && !w.split(['.', '_']).any(is_release_word))
         .collect();
     let title = words.join(" ");
     let title = title.trim_matches(|c: char| c == '-' || c.is_whitespace());
@@ -472,12 +470,13 @@ pub fn episode_title(stem: &str) -> Option<String> {
 fn is_release_word(word: &str) -> bool {
     static RELEASE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|4k|uhd|[xh]26[45](?:-\w+)?|hevc)$",
+                r"(?i)^(?:(?:web-?dl|webrip|bluray|bdrip|brrip|hdtv|sdtv|dvdrip|hdrip|raw-hd)(?:-\d{3,4}[pi])?|\d{3,4}[pi]|4k|uhd|[xh]26[45](?:-\w+)?|hevc|avc|(?:bd)?remux|hdr(?:10)?|dovi|mvc|[hf]?sbs|[hf]tab|anaglyph)$",
             )
             .map_err(|e| tracing::error!(error = %e, "invalid release-word regex"))
             .ok()
     });
-    word == "WEB" || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
+    // `HOU`/`FOU` (3D over-under) count only in capitals: "Fou" is a word.
+    matches!(word, "WEB" | "HOU" | "FOU") || RELEASE.as_ref().is_some_and(|re| re.is_match(word))
 }
 
 /// Replace scene-release separators with spaces so token-splitting and the
@@ -779,6 +778,14 @@ mod tests {
             // episode marker that opens the stem.
             ("Show.S01E03.720p.HDTV.x264-GRP [PublicHD]", None),
             ("Show.S01E02.4K.WEB-DL", None),
+            // Remux, HDR and 3D tags end a title too; a dotted 3D tail in a
+            // spaced name is checked segment by segment. "3D" itself stays,
+            // since it is also a word ("3D Printing").
+            ("Show.S01E02.REMUX", None),
+            ("Show.S01E02.HDR10.HEVC", None),
+            ("Show.S01E02.3D.MVC.1080p", Some("3D")),
+            ("Show - S01E02 - 3D.HSBS", Some("3D")),
+            ("Show - S01E02 - Le Fou", Some("Le Fou")),
             ("Show - S01E02 - Pilot UHD", Some("Pilot")),
             ("E01 - Pilot", Some("Pilot")),
             ("EP02 - The Return", Some("The Return")),
