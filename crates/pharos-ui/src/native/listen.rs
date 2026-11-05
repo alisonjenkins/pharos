@@ -1151,6 +1151,7 @@ mod tests {
                 text: "Love, love is a verb".to_owned(),
                 words: Vec::new(),
             }],
+            words_pending: false,
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(words));
         assert!(html.contains(r#"aria-label="Lyrics""#), "{html}");
@@ -1168,6 +1169,7 @@ mod tests {
                 text: "Words".to_owned(),
                 words: Vec::new(),
             }],
+            words_pending: false,
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(plain));
         assert!(!html.contains("pharos-karaoke-toggle"), "{html}");
