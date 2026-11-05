@@ -971,7 +971,11 @@ test.describe("pharos Dioxus UI", () => {
         await expect(page.getByRole("button", { name: /^Sort direction/ })).toHaveText(
           "Z to A",
         );
-        await expect(tiles.nth(left.at)).toHaveText(name, { timeout: 15_000 });
+        // `name` came from `innerText`, so compare against the same.
+        await expect(tiles.nth(left.at)).toHaveText(name, {
+          timeout: 15_000,
+          useInnerText: true,
+        });
         await expect
           .poll(async () => (await place()).top, { message: how, timeout: 15_000 })
           .toBe(left.top);
