@@ -1105,6 +1105,28 @@
           program = "${pharos}/bin/pharos";
         };
 
+        # `nix run .#android-apk [-- --release]` builds the Android TV APK
+        # through `nix develop .#android`, then zipaligns and signs it with a
+        # keystore from PHAROS_ANDROID_* env vars. The keystore never enters
+        # the repo or the store. See specs/025-android-tv/spec.md.
+        apps.android-apk = {
+          type = "app";
+          program =
+            let
+              script = pkgs.writeShellApplication {
+                name = "pharos-android-apk";
+                runtimeInputs = [
+                  pkgs.coreutils
+                  pkgs.findutils
+                  pkgs.git
+                  pkgs.nix
+                ];
+                text = builtins.readFile ./scripts/android-apk.sh;
+              };
+            in
+            "${script}/bin/pharos-android-apk";
+        };
+
         # `nix run .#dev-stack` boots pharos + jellyfin-web as
         # distroless OCI containers built reproducibly via nix
         # dockerTools. On darwin the pharos image build dispatches to
