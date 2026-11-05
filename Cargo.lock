@@ -5274,11 +5274,14 @@ dependencies = [
  "pharos-test-metrics",
  "pharos-transcode",
  "proptest",
+ "read-fonts",
  "regex-lite",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "skera",
+ "skrifa",
  "socket2 0.6.5",
  "sonic-rs",
  "tempfile",
@@ -7088,6 +7091,20 @@ name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
+
+[[package]]
+name = "skera"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1304685b8b275337200c0c138d8ca1b0b19be6185e4eb4013aebc9a1c270d761"
+dependencies = [
+ "foldhash",
+ "hashbrown 0.17.1",
+ "read-fonts",
+ "skrifa",
+ "thiserror 2.0.21",
+ "write-fonts",
+]
 
 [[package]]
 name = "sketches-ddsketch"
@@ -9286,6 +9303,7 @@ dependencies = [
  "quick-xml",
  "rand 0.10.3",
  "rand 0.9.5",
+ "read-fonts",
  "regex",
  "regex-automata",
  "regex-syntax",
@@ -9324,6 +9342,17 @@ dependencies = [
  "zerofrom",
  "zip",
  "zlib-rs",
+]
+
+[[package]]
+name = "write-fonts"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e91ad74b39f48f456560ed1ccc75959efa19bf6f0817d1560751bb49db84f6c"
+dependencies = [
+ "font-types",
+ "log",
+ "read-fonts",
 ]
 
 [[package]]
