@@ -2087,7 +2087,7 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 
 /// A film or episode page with the group's marks on it.
 #[component]
-fn SeenTitle(detail: Detail, on_watch_together: EventHandler<ItemRef>) -> Element {
+fn SeenTitle(detail: Detail, on_watch_together: EventHandler<(ItemRef, u64)>) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
     rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen } }
@@ -2119,17 +2119,19 @@ fn TitleScreen(id: ItemRef) -> Element {
             ))
         }
     }));
-    // Start a group on this title from the start, then watch it as its member.
+    // Start a group on this title where the viewer chose, then watch it as
+    // its member.
     let group_error = together.error;
-    let on_watch_together = move |_| {
+    let on_watch_together = move |(id, from_ms): (ItemRef, u64)| {
         let Some(api) = ctx.api.peek().clone() else {
             return;
         };
         let session = together.session(&api);
         let mut group_error = group_error;
         group_error.set(None);
+        platform::info(&format!("pharos: group create item={id} from_ms={from_ms}"));
         spawn_forever(async move {
-            match session.create(id, 0).await {
+            match session.create(id, from_ms).await {
                 Ok(_) => nav.0.call(Route::Watch(id)),
                 Err(e) => group_error.set(Some(e.0)),
             }

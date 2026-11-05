@@ -144,7 +144,7 @@ test.describe("mixed pharos-ui + jellyfin-web watch together", () => {
             (await request.get(`${PHAROS_URL}/SyncPlay/List`, { headers: api })).json();
           const before = new Set((await listGroups()).map((g) => g.GroupId));
           await dx.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
-          await dx.page.getByRole("button", { name: "Watch together" }).click();
+          await dx.page.getByRole("button", { name: "Watch together", exact: true }).click();
           await onWatchPage();
           const fresh = (await listGroups()).filter((g) => !before.has(g.GroupId));
           expect(fresh, "the Dioxus group is listed").toHaveLength(1);
