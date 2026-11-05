@@ -336,6 +336,11 @@ pub struct AppState {
     /// The `artwork_epoch` the memo was built at. A mismatch means the memo
     /// predates artwork that has since landed.
     pub synth_image_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// The `library_generation` the memo's negatives were recorded at. A
+    /// negative recorded before an album was scanned would hide it until
+    /// artwork changed, so a library change drops the negatives; the
+    /// representatives stay valid.
+    pub synth_image_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Serialises the one-time synth-image-map warm (see
     /// `resolve_synth_image_item`). A library grid fires many poster requests
     /// at once for distinct synth ids; without this each would run its own
@@ -461,7 +466,8 @@ impl AppState {
     ///
     /// B155 — drops the whole memo first when artwork has landed since it was
     /// built, so a newly-covered album stops reporting the coverless
-    /// representative (or the negative) it was warmed with.
+    /// representative (or the negative) it was warmed with, and drops the
+    /// negatives when the library has changed since.
     pub fn synth_image_cached(&self, id: &str) -> Option<Option<u64>> {
         use std::sync::atomic::Ordering;
         let mut map = self
@@ -471,6 +477,14 @@ impl AppState {
         let now = self.artwork_epoch.load(Ordering::Relaxed);
         if self.synth_image_epoch.swap(now, Ordering::Relaxed) != now {
             map.clear();
+        }
+        let generation = self.library_generation.load(Ordering::Relaxed);
+        if self
+            .synth_image_generation
+            .swap(generation, Ordering::Relaxed)
+            != generation
+        {
+            map.retain(|_, item_id| item_id.is_some());
         }
         map.get(id).copied()
     }
@@ -713,6 +727,7 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            synth_image_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -831,6 +846,7 @@ impl AppState {
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            synth_image_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_warm: Arc::new(tokio::sync::Mutex::new(())),
             user_data_writes: Default::default(),
             playback_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
