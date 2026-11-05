@@ -16,8 +16,7 @@ use pharos_ui::client::{
     LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry, PluginEntry,
     QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
 };
-use pharos_ui::native::appearance::AppearanceView;
-use pharos_ui::native::playback::SubtitleSize;
+use pharos_ui::native::privacy::PrivacyView;
 use pharos_ui::views::{
     AdminTab, AdminView, GroupMember, GroupSessionPanel, GroupSnapshot, ItemDetailView,
     LibraryView, LiveTvStatus, LiveTvView, LoginForm, PlayerView, PrefsTab, PrefsView,
@@ -1377,48 +1376,30 @@ fn quick_connect_authorize_renders_input_and_submit() {
     assert!(html.contains(">Authorize<"), "{html}");
 }
 
-// ---- Appearance: diagnostics opt-in ------------------------------
+// ---- Privacy: diagnostics opt-in ---------------------------------
 
-fn appearance_page() -> Element {
-    appearance_page_with(false)
+fn privacy_page() -> Element {
+    privacy_page_with(false)
 }
 
-fn appearance_page_on() -> Element {
-    appearance_page_with(true)
+fn privacy_page_on() -> Element {
+    privacy_page_with(true)
 }
 
-fn appearance_page_with(diagnostics: bool) -> Element {
+fn privacy_page_with(diagnostics: bool) -> Element {
     rsx! {
-        AppearanceView {
-            themes: Vec::new(),
-            auto: false,
-            editor: None,
+        PrivacyView {
             notice: None,
             diagnostics,
             diagnostics_key: 0,
-            max_quality: 0,
-            on_max_quality: |_| {},
-            subtitle_size: SubtitleSize::Medium,
-            on_subtitle_size: |_| {},
             on_diagnostics: |_| {},
-            on_pick: |_| {},
-            on_auto: |_| {},
-            on_customise: |_| {},
-            on_edit_custom: |_| {},
-            on_delete: |_| {},
-            on_export: |_| {},
-            on_import_file: |_| {},
-            on_import_paste: |_| {},
-            on_edit: |_| {},
-            on_save: |_| {},
-            on_cancel: |_| {},
         }
     }
 }
 
 #[test]
-fn appearance_diagnostics_toggle_is_labelled_and_unchecked_by_default() {
-    let html = render_root(appearance_page);
+fn privacy_diagnostics_toggle_is_labelled_and_unchecked_by_default() {
+    let html = render_root(privacy_page);
     assert!(
         html.contains("Send diagnostics to this server"),
         "missing toggle label: {html}"
@@ -1439,9 +1420,9 @@ fn appearance_diagnostics_toggle_is_labelled_and_unchecked_by_default() {
 }
 
 #[test]
-fn appearance_diagnostics_toggle_shows_the_server_side_choice() {
-    let off = render_root(appearance_page);
-    let on = render_root(appearance_page_on);
+fn privacy_diagnostics_toggle_shows_the_server_side_choice() {
+    let off = render_root(privacy_page);
+    let on = render_root(privacy_page_on);
     assert!(
         off.contains("saved to your account"),
         "the choice is per account, not per browser: {off}"

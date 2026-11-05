@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::{LibraryTransition, OverlayEffect, SubtitleSize, MAX_BITRATE_CHOICES};
+use super::playback::{LibraryTransition, OverlayEffect};
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -77,13 +77,6 @@ pub fn AppearanceView(
     auto: bool,
     editor: Option<EditorView>,
     notice: Option<Notice>,
-    diagnostics: bool,
-    diagnostics_key: u32,
-    on_diagnostics: EventHandler<bool>,
-    max_quality: u64,
-    on_max_quality: EventHandler<u64>,
-    subtitle_size: SubtitleSize,
-    on_subtitle_size: EventHandler<SubtitleSize>,
     #[props(default)] library_transition: LibraryTransition,
     #[props(default)] on_library_transition: EventHandler<LibraryTransition>,
     #[props(default)] overlay_effect: OverlayEffect,
@@ -117,52 +110,6 @@ pub fn AppearanceView(
                 aria_pressed: if auto { "true" } else { "false" },
                 onclick: move |_| on_auto.call(()),
                 "Auto (follow the system)"
-            }
-            fieldset { class: "pharos-max-quality",
-                legend { "Maximum quality" }
-                label { r#for: "max-quality", "Limit video bitrate on this device" }
-                select {
-                    id: "max-quality",
-                    aria_describedby: "max-quality-help",
-                    onchange: move |ev| {
-                        if let Ok(bps) = ev.value().parse::<u64>() {
-                            on_max_quality.call(bps);
-                        }
-                    },
-                    for (bps , label) in MAX_BITRATE_CHOICES {
-                        option {
-                            key: "{bps}",
-                            value: "{bps}",
-                            selected: bps == max_quality,
-                            "{label}"
-                        }
-                    }
-                }
-                p { id: "max-quality-help",
-                    "Auto adapts to your connection: it lowers the video quality when playback keeps stalling and raises it again when the link allows. A limit you pick is a ceiling Auto never goes above."
-                }
-            }
-            fieldset { class: "pharos-subtitle-size",
-                legend { "Subtitle size" }
-                label { r#for: "subtitle-size", "Text size of subtitles on this device" }
-                select {
-                    id: "subtitle-size",
-                    aria_describedby: "subtitle-size-help",
-                    onchange: move |ev| {
-                        on_subtitle_size.call(SubtitleSize::parse(&ev.value()));
-                    },
-                    for size in SubtitleSize::ALL {
-                        option {
-                            key: "{size.as_str()}",
-                            value: "{size.as_str()}",
-                            selected: size == subtitle_size,
-                            "{size.label()}"
-                        }
-                    }
-                }
-                p { id: "subtitle-size-help",
-                    "Saved on this device."
-                }
             }
             fieldset { class: "pharos-library-transition",
                 legend { "Library transition" }
@@ -206,25 +153,6 @@ pub fn AppearanceView(
                 }
                 p { id: "overlay-effect-help",
                     "Saved on this device. A plain fade whenever the system asks for reduced motion."
-                }
-            }
-            fieldset { class: "pharos-diagnostics",
-                legend { "Diagnostics" }
-                label {
-                    // Keyed so a failed save rebuilds the box: the DOM keeps the
-                    // user's flip, and an unchanged `checked` never resets it.
-                    input {
-                        key: "{diagnostics_key}",
-                        r#type: "checkbox",
-                        id: "diagnostics-opt-in",
-                        checked: diagnostics,
-                        aria_describedby: "diagnostics-help",
-                        onchange: move |ev| on_diagnostics.call(ev.checked()),
-                    }
-                    "Send diagnostics to this server"
-                }
-                p { id: "diagnostics-help",
-                    "Off by default, and saved to your account on this server. When on, playback errors and theme fallbacks are sent to this server's logs. Stream URLs and credentials are never sent."
                 }
             }
             ul { class: "pharos-theme-gallery",
@@ -475,43 +403,6 @@ mod tests {
     }
 
     fn page(themes: Vec<ThemeCard>, editor: Option<EditorView>, notice: Option<Notice>) -> String {
-        page_with_diagnostics(themes, editor, notice, false)
-    }
-
-    fn page_with_diagnostics(
-        themes: Vec<ThemeCard>,
-        editor: Option<EditorView>,
-        notice: Option<Notice>,
-        diagnostics: bool,
-    ) -> String {
-        page_full(themes, editor, notice, diagnostics, 0)
-    }
-
-    fn page_full(
-        themes: Vec<ThemeCard>,
-        editor: Option<EditorView>,
-        notice: Option<Notice>,
-        diagnostics: bool,
-        max_quality: u64,
-    ) -> String {
-        page_with_subtitle_size(
-            themes,
-            editor,
-            notice,
-            diagnostics,
-            max_quality,
-            SubtitleSize::default(),
-        )
-    }
-
-    fn page_with_subtitle_size(
-        themes: Vec<ThemeCard>,
-        editor: Option<EditorView>,
-        notice: Option<Notice>,
-        diagnostics: bool,
-        max_quality: u64,
-        subtitle_size: SubtitleSize,
-    ) -> String {
         render(move || {
             rsx! {
                 AppearanceView {
@@ -519,13 +410,6 @@ mod tests {
                     auto: false,
                     editor: editor.clone(),
                     notice: notice.clone(),
-                    diagnostics,
-                    diagnostics_key: 0,
-                    max_quality,
-                    on_max_quality: |_| {},
-                    subtitle_size,
-                    on_subtitle_size: |_| {},
-                    on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
                     on_customise: |_| {},
@@ -542,106 +426,6 @@ mod tests {
         })
     }
 
-    fn diagnostics_box(html: &str) -> &str {
-        html.find("id=\"diagnostics-opt-in\"")
-            .and_then(|at| {
-                let start = html[..at].rfind('<')?;
-                let end = at + html[at..].find('>')?;
-                html.get(start..=end)
-            })
-            .unwrap_or("<toggle not rendered>")
-    }
-
-    #[test]
-    fn diagnostics_box_renders_the_server_value_it_is_given() {
-        let on = page_with_diagnostics(Vec::new(), None, None, true);
-        assert!(
-            diagnostics_box(&on).contains("checked"),
-            "a server value of on must render checked: {}",
-            diagnostics_box(&on)
-        );
-        let off = page_with_diagnostics(Vec::new(), None, None, false);
-        assert!(
-            !diagnostics_box(&off).contains("checked"),
-            "a server value of off must render unchecked: {}",
-            diagnostics_box(&off)
-        );
-    }
-
-    #[test]
-    fn max_quality_select_marks_only_the_stored_choice() {
-        let html = page_full(Vec::new(), None, None, false, 2_000_000);
-        let start = html.find("id=\"max-quality\"").unwrap_or(usize::MAX);
-        assert!(start != usize::MAX, "select missing: {html}");
-        let sel = &html[start
-            ..html[start..]
-                .find("</select>")
-                .map_or(html.len(), |e| start + e)];
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert!(
-            sel.contains("value=\"2000000\" selected") || sel.contains("selected=\"true\""),
-            "{sel}"
-        );
-        for (_, label) in MAX_BITRATE_CHOICES {
-            assert!(sel.contains(label), "{label} missing: {sel}");
-        }
-    }
-
-    #[test]
-    fn max_quality_defaults_to_auto_and_says_auto_adapts() {
-        let html = page_full(Vec::new(), None, None, false, 0);
-        let start = html.find("id=\"max-quality\"").unwrap_or(usize::MAX);
-        assert!(start != usize::MAX, "select missing: {html}");
-        let sel = &html[start
-            ..html[start..]
-                .find("</select>")
-                .map_or(html.len(), |e| start + e)];
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert!(sel.contains("value=\"0\" selected") || sel.contains("selected=\"true\""));
-        assert!(html.contains("adapts to your connection"), "{html}");
-        assert!(html.contains("never goes above"), "{html}");
-    }
-
-    #[test]
-    fn subtitle_size_select_marks_only_the_stored_choice() {
-        let html = page_with_subtitle_size(Vec::new(), None, None, false, 0, SubtitleSize::Large);
-        let start = html.find("id=\"subtitle-size\"").unwrap_or(usize::MAX);
-        assert!(start != usize::MAX, "select missing: {html}");
-        let sel = &html[start
-            ..html[start..]
-                .find("</select>")
-                .map_or(html.len(), |e| start + e)];
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert!(
-            sel.contains("value=\"large\" selected") || sel.contains("selected=\"true\""),
-            "{sel}"
-        );
-        for size in SubtitleSize::ALL {
-            assert!(
-                sel.contains(size.label()),
-                "{} missing: {sel}",
-                size.label()
-            );
-        }
-    }
-
-    #[test]
-    fn subtitle_size_defaults_to_medium() {
-        let html = page_full(Vec::new(), None, None, false, 0);
-        let start = html.find("id=\"subtitle-size\"").unwrap_or(usize::MAX);
-        assert!(start != usize::MAX, "select missing: {html}");
-        let sel = &html[start
-            ..html[start..]
-                .find("</select>")
-                .map_or(html.len(), |e| start + e)];
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert!(
-            sel.contains("value=\"medium\" selected") || sel.contains("selected=\"true\""),
-            "{sel}"
-        );
-        assert!(html.contains("Saved on this device."), "{html}");
-    }
-
     fn page_with_library_transition(fx: Option<LibraryTransition>) -> String {
         render(move || {
             rsx! {
@@ -650,15 +434,8 @@ mod tests {
                     auto: false,
                     editor: None,
                     notice: None,
-                    diagnostics: false,
-                    diagnostics_key: 0,
-                    max_quality: 0,
-                    on_max_quality: |_| {},
-                    subtitle_size: SubtitleSize::default(),
-                    on_subtitle_size: |_| {},
                     library_transition: fx.unwrap_or_default(),
                     on_library_transition: |_| {},
-                    on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
                     on_customise: |_| {},
@@ -718,15 +495,8 @@ mod tests {
                     auto: false,
                     editor: None,
                     notice: None,
-                    diagnostics: false,
-                    diagnostics_key: 0,
-                    max_quality: 0,
-                    on_max_quality: |_| {},
-                    subtitle_size: SubtitleSize::default(),
-                    on_subtitle_size: |_| {},
                     overlay_effect: fx.unwrap_or_default(),
                     on_overlay_effect: |_| {},
-                    on_diagnostics: |_| {},
                     on_pick: |_| {},
                     on_auto: |_| {},
                     on_customise: |_| {},
