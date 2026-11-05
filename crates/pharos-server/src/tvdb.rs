@@ -256,7 +256,10 @@ fn encode_query(q: &str) -> String {
 /// [`SearchCandidate`]s. Pure (no I/O) so the JSON shape is unit-tested
 /// without a live API key; malformed JSON or a missing `data` array yields
 /// an empty `Vec` rather than panicking (search is best-effort). TVDB
-/// carries `year` as a string, unlike TMDB's date strings.
+/// carries `year` as a string, unlike TMDB's date strings. `name` is the
+/// show's ORIGINAL-language title (`ドラゴンボール` for Dragon Ball), so the
+/// English `translations.eng` and the `aliases` ride along as the candidate's
+/// aliases for [`pharos_core::match_best`] (B557).
 pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
     let v: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -273,11 +276,26 @@ pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
                         .get("year")
                         .and_then(|y| y.as_str())
                         .and_then(|s| s.parse::<u32>().ok());
+                    let english = r
+                        .get("translations")
+                        .and_then(|t| t.get("eng"))
+                        .and_then(|e| e.as_str());
+                    let aliases = english
+                        .into_iter()
+                        .chain(
+                            r.get("aliases")
+                                .and_then(|a| a.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|a| a.as_str()),
+                        )
+                        .map(str::to_string)
+                        .collect();
                     Some(SearchCandidate {
                         id,
                         title,
                         year,
-                        aliases: Vec::new(),
+                        aliases,
                     })
                 })
                 .collect()
@@ -706,6 +724,28 @@ mod tests {
         assert_eq!(c[0].id, "121361");
         assert_eq!(c[0].title, "Game of Thrones");
         assert_eq!(c[0].year, Some(2011));
+    }
+
+    /// B557: trimmed from the live `/search?query=Dragon Ball&type=series`
+    /// response (2026-11-05). The real shows are named in Japanese; the fan
+    /// works ahead of them in TVDB's order are named in English.
+    const DRAGON_BALL_SEARCH: &str = r#"{"data":[
+      {"tvdb_id":"272910","name":"Dragon Ball Absalon","year":"2012","translations":{"eng":"Dragon Ball Absalon"},"aliases":[]},
+      {"tvdb_id":"248580","name":"Dragon Ball Z Abridged","year":"2008","translations":{"eng":"Dragon Ball Z Abridged"},"aliases":["Dragon Ball Z: Abridged","DBZ: Abridged"]},
+      {"tvdb_id":"374456","name":"Dragon Ball R&R","year":"2018","translations":{"eng":"Dragon Ball R&R"}},
+      {"tvdb_id":"76666","name":"ドラゴンボール","year":"1986","translations":{"eng":"Dragon Ball","jpn":"ドラゴンボール"},"aliases":["Dragonball"]},
+      {"tvdb_id":"347734","name":"スーパードラゴンボールヒーローズ","year":"2018","translations":{"eng":"Super Dragon Ball Heroes"}},
+      {"tvdb_id":"81472","name":"ドラゴンボールZ","year":"1989","translations":{"eng":"Dragon Ball Z"},"aliases":["Dragonball Z","Dragon Ball Z (1989)"]}
+    ]}"#;
+
+    #[test]
+    fn tvdb_series_search_matches_an_anime_by_its_english_translation() {
+        let cands = super::parse_series_search(DRAGON_BALL_SEARCH);
+        let real = cands.iter().find(|c| c.id == "76666").unwrap();
+        assert_eq!(real.aliases, ["Dragon Ball", "Dragonball"]);
+        let pick = |q| pharos_core::match_best(q, None, &cands, 0.7).unwrap().id;
+        assert_eq!(pick("Dragon Ball"), "76666");
+        assert_eq!(pick("Dragon Ball Z"), "81472");
     }
 
     #[test]
