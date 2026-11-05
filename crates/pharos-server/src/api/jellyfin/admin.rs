@@ -459,7 +459,14 @@ async fn create_user(
     }
     let password = match body.password {
         Some(p) if !p.is_empty() => SecretString::new(p),
-        _ => return Err(error::ErrorBadRequest("a password is required")),
+        _ => {
+            tracing::warn!(
+                admin = %user.0.id,
+                reason = "empty password",
+                "user create refused"
+            );
+            return Err(error::ErrorBadRequest("a password is required"));
+        }
     };
     let auth = BuiltinAuth::new(state.stores.clone());
     let hash = auth
@@ -643,23 +650,35 @@ async fn change_password(
     if !is_self && !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
     }
+    // V211: validate before the CurrentPw check so a malformed request
+    // does not spend a login-throttle attempt. Jellyfin's ResetPassword
+    // sets an empty password, which is never allowed, so it is refused.
+    let refusal = if body.reset_password {
+        Some((
+            "reset to empty",
+            "reset to an empty password is not supported; set a new password",
+        ))
+    } else if body.new_pw.is_empty() {
+        Some(("empty password", "a password is required"))
+    } else {
+        None
+    };
+    if let Some((reason, message)) = refusal {
+        tracing::warn!(
+            by = %user.0.id,
+            target = %target,
+            is_self,
+            reason,
+            "password change refused"
+        );
+        return Err(error::ErrorBadRequest(message));
+    }
     // V8: a stolen session token must NOT be enough to change a
     // user's password. Self-change requires CurrentPw to match the
-    // existing hash. Admin changing someone else's password (or
-    // resetting their own with ResetPassword=true) skips this — it
-    // matches Jellyfin's admin-reset flow.
-    // V211: validate before the CurrentPw check so a malformed request
-    // does not spend a login-throttle attempt.
-    if body.reset_password {
-        return Err(error::ErrorBadRequest(
-            "reset to an empty password is not supported; set a new password",
-        ));
-    }
-    if body.new_pw.is_empty() {
-        return Err(error::ErrorBadRequest("a password is required"));
-    }
+    // existing hash. An admin changing someone else's password skips
+    // this, as in Jellyfin's admin flow.
     let auth = BuiltinAuth::new(state.stores.clone());
-    let must_verify_current = is_self && !(user.0.policy.admin && body.reset_password);
+    let must_verify_current = is_self;
     if must_verify_current {
         // V174: a stolen bearer must not buy unthrottled guesses at the
         // account's password through this check.
