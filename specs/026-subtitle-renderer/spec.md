@@ -104,7 +104,7 @@ A viewer on the TCL G08 watches an episode whose ASS track animates signs and ka
 
 ### Server
 
-- **FR-010** The native API lists a media source's font attachments (index, filename, mime, family names from the font's `name` table) and serves each, subset to the glyphs the chosen subtitle track uses, at `/videos/{id}/subtitles/{index}/fonts/{n}` (`subsetter`, pure Rust), cached on disk like 019's extractions, behind item access.
+- **FR-010** The native API lists a media source's font attachments (index, filename, mime; family names are matched by the renderer from the font itself) and serves each, subset to the glyphs the chosen subtitle track uses, at `/videos/{id}/subtitles/{index}/fonts/{n}` (`skera`, the fontations subsetter, pure Rust; `subsetter` was rejected because its output is PDF-only and drops `cmap`), cached on disk like 019's extractions, behind item access.
 - **FR-011** Fallback fonts (Pharos default UI face, a CJK face, a symbol face) are served the same way, subset per track, so the client never downloads a full CJK font.
 - **FR-012** Sidecar `.ass`/`.ssa` are labelled with their real codec in the stream list; their original script is served at the existing `stream.ass` route.
 - **FR-013** Slice 5: the server can pre-render an ASS track with libass (the existing burn path's filter graph, output as alpha-mask PNGs plus a 019-style manifest) when a client asks for it, on demand, background-I/O gated and cached; delivery `image`.
