@@ -30,6 +30,7 @@ pub struct ImageCache {
     /// extract AND raced on the shared `.jpg.tmp` scratch path. String keys
     /// namespace the three fill sites (`fetch:`/`scale:`/`attach:`).
     locks: std::sync::Arc<crate::single_flight::KeyedLocks<String>>,
+    encodes: std::sync::Arc<Encodes>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,6 +186,250 @@ fn unique_scratch_name(prefix: &str) -> String {
     format!("{prefix}.{}.{n}.tmp", std::process::id())
 }
 
+/// Bump when the encode settings below change, so files encoded under the old
+/// settings are not served as the new ones.
+const ENCODE_VERSION: u32 = 1;
+
+/// The widths an encoded copy is made at. A requested width rounds up to the
+/// next one, so a client asking for 300 and one asking for 320 share a file.
+const ENCODE_WIDTHS: [u32; 6] = [240, 360, 480, 640, 960, 1280];
+
+/// Encodes run one at a time: each holds a core for up to a second, and the
+/// image route shares the node with transcodes.
+const ENCODE_SLOTS: usize = 1;
+
+/// Queued encodes beyond this drop the oldest; the next request for that
+/// image queues it again. Bounds memory when a whole library is browsed cold.
+const ENCODE_QUEUE_MAX: usize = 512;
+
+/// A still image that has not encoded by now is wedged; kill it.
+const ENCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A modern image format that artwork is re-encoded into from its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodedFormat {
+    Webp,
+    Avif,
+}
+
+impl EncodedFormat {
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Webp => "webp",
+            Self::Avif => "avif",
+        }
+    }
+
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Webp => "image/webp",
+            Self::Avif => "image/avif",
+        }
+    }
+
+    /// Settings from the 2026-11 benchmark (ADR-0063): the smallest files that
+    /// still score at least today's JPEG on SSIMULACRA2. AVIF needs 4:4:4 and
+    /// `tune=iq`; 4:2:0 lost the grain on dark posters.
+    #[rustfmt::skip]
+    fn codec_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Avif => &[
+                "-c:v", "libaom-av1", "-usage", "allintra", "-still-picture", "1",
+                "-cpu-used", "6", "-crf", "22", "-aom-params", "tune=iq", "-threads", "1",
+                "-f", "avif",
+            ],
+            Self::Webp => &[
+                "-c:v", "libwebp", "-quality", "85", "-compression_level", "4", "-f", "webp",
+            ],
+        }
+    }
+
+    fn pixel_format(self) -> &'static str {
+        match self {
+            Self::Avif => ",format=yuv444p",
+            Self::Webp => "",
+        }
+    }
+}
+
+/// What [`ImageCache::encoded_artwork`] has for a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Encoded {
+    /// The encoded file, ready to serve.
+    Ready(PathBuf),
+    /// Not yet; an encode is queued or running.
+    Pending,
+    /// Encoding this source failed and will not be retried until it changes.
+    Unavailable,
+}
+
+/// How an [`ImageCache::encoded_artwork`] lookup was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeLookup {
+    /// The encoded file was already on disk.
+    Hit,
+    /// A miss that queued a new encode.
+    Queued,
+    /// A miss whose encode is already queued or running.
+    Pending,
+    /// An earlier encode of this source failed.
+    Failed,
+}
+
+impl EncodeLookup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Queued => "queued",
+            Self::Pending => "pending",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EncodeJob {
+    key: String,
+    source: PathBuf,
+    width: u32,
+    format: EncodedFormat,
+    out: PathBuf,
+    span: tracing::Span,
+}
+
+/// Encodes waiting for a worker. Newest first: the tiles a viewer is looking
+/// at now matter more than the ones they scrolled past.
+#[derive(Debug, Default)]
+struct EncodeQueue {
+    jobs: Vec<EncodeJob>,
+    /// Keys queued or running, so repeat requests do not queue duplicates.
+    keys: std::collections::HashSet<String>,
+    workers: usize,
+}
+
+impl EncodeQueue {
+    /// Queue `job` unless its key is already queued or running. Returns the
+    /// oldest job when the queue overflows; it is dropped.
+    fn push(&mut self, job: EncodeJob) -> (EncodeLookup, Option<EncodeJob>) {
+        if !self.keys.insert(job.key.clone()) {
+            return (EncodeLookup::Pending, None);
+        }
+        self.jobs.push(job);
+        let dropped = (self.jobs.len() > ENCODE_QUEUE_MAX).then(|| self.jobs.remove(0));
+        if let Some(old) = &dropped {
+            self.keys.remove(&old.key);
+        }
+        (EncodeLookup::Queued, dropped)
+    }
+}
+
+/// The background encode queue shared by every clone of an [`ImageCache`].
+#[derive(Debug, Default)]
+struct Encodes {
+    queue: std::sync::Mutex<EncodeQueue>,
+}
+
+impl Encodes {
+    fn queue(&self) -> std::sync::MutexGuard<'_, EncodeQueue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Marks a source whose encode failed, so it is not re-run on every view.
+fn encode_failed_marker(out: &Path) -> PathBuf {
+    let mut name = out.as_os_str().to_owned();
+    name.push(".failed");
+    PathBuf::from(name)
+}
+
+/// Run queued encodes, newest first, until the queue is empty.
+async fn encode_worker(encodes: std::sync::Arc<Encodes>, ffmpeg: PathBuf) {
+    loop {
+        let job = {
+            let mut queue = encodes.queue();
+            match queue.jobs.pop() {
+                Some(job) => job,
+                None => {
+                    queue.workers -= 1;
+                    return;
+                }
+            }
+        };
+        metrics::gauge!("pharos_image_encode_queue_depth").decrement(1.0);
+        let span = job.span.clone();
+        run_encode(&ffmpeg, &job).instrument(span).await;
+        encodes.queue().keys.remove(&job.key);
+    }
+}
+
+async fn run_encode(ffmpeg: &Path, job: &EncodeJob) {
+    let format = job.format.ext();
+    // A lookup that raced the previous encode's rename can queue a finished key.
+    if tokio::fs::try_exists(&job.out).await.unwrap_or(false) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let result = encode_to(ffmpeg, &job.source, job.width, job.format, &job.out).await;
+    metrics::histogram!("pharos_image_encode_seconds", "format" => format)
+        .record(started.elapsed().as_secs_f64());
+    let outcome = match result {
+        Ok(()) => "encoded",
+        Err(e) => {
+            tracing::warn!(error = %e, source = %job.source.display(), "artwork encode failed");
+            let _ = tokio::fs::write(encode_failed_marker(&job.out), []).await;
+            "failed"
+        }
+    };
+    metrics::counter!("pharos_image_encode_total", "format" => format, "outcome" => outcome)
+        .increment(1);
+}
+
+fn encode_width(width: u32) -> u32 {
+    ENCODE_WIDTHS
+        .into_iter()
+        .find(|&w| w >= width)
+        .unwrap_or(ENCODE_WIDTHS[ENCODE_WIDTHS.len() - 1])
+}
+
+/// Encode `source` into `out` at `width` (never upscaling), atomically.
+async fn encode_to(
+    ffmpeg: &Path,
+    source: &Path,
+    width: u32,
+    format: EncodedFormat,
+    out: &Path,
+) -> Result<(), ImageCacheError> {
+    if let Some(dir) = out.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let tmp = out.with_extension(format!("{}.tmp", format.ext()));
+    let filter = format!(
+        "scale='min({width},iw)':-1:flags=lanczos{}",
+        format.pixel_format()
+    );
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(source)
+        .args(["-vf", &filter, "-frames:v", "1"])
+        .args(format.codec_args())
+        .arg("-y")
+        .arg(&tmp)
+        .kill_on_drop(true);
+    let result = match tokio::time::timeout(ENCODE_TIMEOUT, cmd.output()).await {
+        Err(_) => Err(ImageCacheError::Ffmpeg(None, "encode timed out".into())),
+        Ok(Err(e)) => Err(ImageCacheError::Ffmpeg(None, format!("spawn: {e}"))),
+        Ok(Ok(o)) if !o.status.success() => Err(ImageCacheError::Ffmpeg(
+            o.status.code(),
+            String::from_utf8_lossy(&o.stderr).trim().to_owned(),
+        )),
+        Ok(Ok(_)) => tokio::fs::rename(&tmp, out).await.map_err(Into::into),
+    };
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
 impl ImageCache {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -194,6 +439,7 @@ impl ImageCache {
             #[cfg(all(unix, feature = "ffmpeg-lib"))]
             pool: None,
             locks: std::sync::Arc::new(crate::single_flight::KeyedLocks::new()),
+            encodes: std::sync::Arc::new(Encodes::default()),
         }
     }
 
@@ -583,6 +829,89 @@ impl ImageCache {
             ));
         }
         Ok(())
+    }
+
+    /// The AVIF/WebP copy of `source` at `width`, if it has been encoded.
+    ///
+    /// Never waits on an encode. An AVIF still costs 0.1-1 s of a core, longer
+    /// than serving the JPEG outright, so a miss queues one background encode
+    /// and answers [`Encoded::Pending`]; the caller serves its JPEG this time
+    /// and the encoded copy from a later request. Encoding reads `source`
+    /// itself, not the scaled JPEG, so the copy carries no second round of
+    /// JPEG loss.
+    ///
+    /// `width` snaps up to [`ENCODE_WIDTHS`] so arbitrary client widths cannot
+    /// multiply encodes, and never scales up a narrower source.
+    pub async fn encoded_artwork(
+        &self,
+        source: &Path,
+        width: u32,
+        format: EncodedFormat,
+    ) -> Encoded {
+        let Ok(meta) = tokio::fs::metadata(source).await else {
+            return Encoded::Unavailable;
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let width = encode_width(width);
+        use xxhash_rust::xxh3::Xxh3;
+        let mut h = Xxh3::new();
+        h.update(source.as_os_str().as_encoded_bytes());
+        h.update(&mtime.to_le_bytes());
+        h.update(&ENCODE_VERSION.to_le_bytes());
+        let key = format!("{:016x}-w{width}.{}", h.digest(), format.ext());
+        let out = self.root.join("encoded").join(&key);
+        let (lookup, answer) = if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+            (EncodeLookup::Hit, Encoded::Ready(out))
+        } else if tokio::fs::try_exists(encode_failed_marker(&out))
+            .await
+            .unwrap_or(false)
+        {
+            (EncodeLookup::Failed, Encoded::Unavailable)
+        } else {
+            let job = EncodeJob {
+                key,
+                source: source.to_path_buf(),
+                width,
+                format,
+                out,
+                // Its own trace: the encode outlives the request that queued it.
+                span: tracing::info_span!(parent: None, "image.encode", format = format.ext(), width),
+            };
+            job.span.follows_from(tracing::Span::current());
+            (self.queue_encode(job), Encoded::Pending)
+        };
+        metrics::counter!(
+            "pharos_image_encode_lookup_total",
+            "format" => format.ext(),
+            "outcome" => lookup.label()
+        )
+        .increment(1);
+        answer
+    }
+
+    fn queue_encode(&self, job: EncodeJob) -> EncodeLookup {
+        let format = job.format.ext();
+        let mut queue = self.encodes.queue();
+        let (lookup, dropped) = queue.push(job);
+        if lookup != EncodeLookup::Queued {
+            return lookup;
+        }
+        match dropped {
+            Some(_) => {
+                metrics::counter!("pharos_image_encode_total", "format" => format, "outcome" => "dropped")
+                    .increment(1);
+            }
+            None => metrics::gauge!("pharos_image_encode_queue_depth").increment(1.0),
+        }
+        if queue.workers < ENCODE_SLOTS {
+            queue.workers += 1;
+            tokio::spawn(encode_worker(self.encodes.clone(), self.ffmpeg_bin.clone()));
+        }
+        lookup
     }
 
     /// Extract embedded attachment stream `stream_index` (a font) from
@@ -1335,6 +1664,162 @@ mod tests {
                 spans.names()
             );
         }
+    }
+
+    #[test]
+    fn encode_widths_round_up_to_a_bucket_and_cap_at_the_largest() {
+        assert_eq!(encode_width(1), 240);
+        assert_eq!(encode_width(240), 240);
+        assert_eq!(encode_width(300), 360);
+        assert_eq!(encode_width(481), 640);
+        assert_eq!(encode_width(4000), 1280);
+    }
+
+    #[test]
+    fn encode_lookup_labels_are_distinct() {
+        let all = [
+            EncodeLookup::Hit,
+            EncodeLookup::Queued,
+            EncodeLookup::Pending,
+            EncodeLookup::Failed,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(|l| l.label()).collect();
+        assert_eq!(labels.len(), all.len());
+    }
+
+    /// A wide test-card JPEG made by the real ffmpeg, as a poster sidecar.
+    async fn wide_poster(dir: &Path) -> PathBuf {
+        let src = dir.join("poster.jpg");
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .args(["testsrc=s=800x1200", "-frames:v", "1", "-y"])
+            .arg(&src)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+        src
+    }
+
+    #[test]
+    fn a_missed_encode_is_queued_once_and_then_served_as_avif() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache"));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, second, last) = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let src = wide_poster(dir.path()).await;
+                let first = cache.encoded_artwork(&src, 300, EncodedFormat::Avif).await;
+                let second = cache.encoded_artwork(&src, 300, EncodedFormat::Avif).await;
+                let mut last = Encoded::Pending;
+                for _ in 0..200 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    last = cache.encoded_artwork(&src, 300, EncodedFormat::Avif).await;
+                    if last != Encoded::Pending {
+                        break;
+                    }
+                }
+                (first, second, last)
+            })
+        });
+        assert_eq!(
+            (first, second),
+            (Encoded::Pending, Encoded::Pending),
+            "a miss never waits on the encode"
+        );
+        let Encoded::Ready(out) = last else {
+            panic!("the queued encode never landed: {last:?}");
+        };
+        assert!(
+            out.to_string_lossy().ends_with("-w360.avif"),
+            "300 px rounds up to the 360 bucket: {}",
+            out.display()
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[4..12], b"ftypavif");
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let count = |name: &str, value: &str| {
+            snapshot
+                .iter()
+                .find(|(k, ..)| {
+                    k.key().name() == name
+                        && k.key()
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == value)
+                })
+                .map_or(0, |(.., v)| match v {
+                    DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+        };
+        assert_eq!(count("pharos_image_encode_lookup_total", "queued"), 1);
+        assert_eq!(count("pharos_image_encode_lookup_total", "hit"), 1);
+        assert!(count("pharos_image_encode_lookup_total", "pending") >= 1);
+        assert_eq!(count("pharos_image_encode_total", "encoded"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_encode_is_remembered_rather_than_re_run_on_every_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ImageCache::new(dir.path().join("cache")).with_ffmpeg("/no/such/ffmpeg");
+        let src = dir.path().join("poster.jpg");
+        tokio::fs::write(&src, b"not an image").await.unwrap();
+        let ask = || cache.encoded_artwork(&src, 480, EncodedFormat::Avif);
+        assert_eq!(ask().await, Encoded::Pending);
+        let mut last = Encoded::Pending;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            last = ask().await;
+            if last != Encoded::Pending {
+                break;
+            }
+        }
+        assert_eq!(last, Encoded::Unavailable);
+        assert!(cache.encodes.queue().keys.is_empty(), "nothing re-queued");
+
+        // A changed source is a new key, so it is tried again.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        tokio::fs::write(&src, b"replaced").await.unwrap();
+        assert_eq!(ask().await, Encoded::Pending);
+    }
+
+    fn job(key: &str) -> EncodeJob {
+        EncodeJob {
+            key: key.into(),
+            source: PathBuf::from(key),
+            width: 480,
+            format: EncodedFormat::Avif,
+            out: PathBuf::from(key),
+            span: tracing::Span::none(),
+        }
+    }
+
+    #[test]
+    fn the_queue_runs_the_newest_request_first_and_drops_the_oldest_when_full() {
+        let mut queue = EncodeQueue::default();
+        for i in 0..ENCODE_QUEUE_MAX {
+            assert_eq!(queue.push(job(&i.to_string())).0, EncodeLookup::Queued);
+        }
+        assert_eq!(
+            queue.push(job("7")).0,
+            EncodeLookup::Pending,
+            "no duplicates"
+        );
+        let (lookup, dropped) = queue.push(job("newest"));
+        assert_eq!(lookup, EncodeLookup::Queued);
+        assert_eq!(dropped.map(|j| j.key).as_deref(), Some("0"));
+        assert!(
+            !queue.keys.contains("0"),
+            "a dropped key can be queued again"
+        );
+        assert_eq!(queue.jobs.pop().map(|j| j.key).as_deref(), Some("newest"));
     }
 
     #[tokio::test]
