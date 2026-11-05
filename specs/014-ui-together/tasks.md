@@ -116,3 +116,6 @@ runs before each push (CLAUDE.md).
   video; buffering shown per member.
 - [x] T042 [US7][US8] Two-browser Playwright: B sees "A paused"; A picks a
   subtitle and B follows; B ticks "Just me", A changes again, B stays.
+- [x] T043 [US1] UI: start a group from the player mid-watch at the video's
+  position, with an Invite button and panel for the group's link; V479.
+  Two-browser Playwright: A watches, starts the group, B joins by the link.
