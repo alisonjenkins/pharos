@@ -2870,8 +2870,23 @@ fn wake_tap(media: &web_sys::HtmlMediaElement) {
         info(&format!(
             "pharos: resume context was not running state={state}"
         ));
-        if let Err(e) = context.resume() {
-            warn(&format!("pharos: resume context resume() refused: {e:?}"));
+        match context.resume() {
+            Err(e) => warn(&format!("pharos: resume context resume() refused: {e:?}")),
+            // The promise settles after the play; its outcome is logged on
+            // its own, as the report (`context_resumed`) only says a wake
+            // was asked for.
+            Ok(promise) => wasm_bindgen_futures::spawn_local(async move {
+                match wasm_bindgen_futures::JsFuture::from(promise).await {
+                    Ok(_) => info(&format!(
+                        "pharos: resume context resumed state={}",
+                        context_state(&context)
+                    )),
+                    Err(e) => warn(&format!(
+                        "pharos: resume context resume() rejected: {e:?} state={}",
+                        context_state(&context)
+                    )),
+                }
+            }),
         }
     }
 }
