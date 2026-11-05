@@ -149,9 +149,40 @@ pub fn cues_at(cues: &ImageCues, ms: u64) -> impl Iterator<Item = &ImageCue> {
 
 /// The font size in px pharos.css gives a cue in a player `width_px` wide
 /// in a viewport `viewport_h_px` tall at size `scale` (V455): `scale x
-/// max(14px, min(2.8cqw, 5vh))`.
-pub fn cue_font_px(width_px: f64, viewport_h_px: f64, scale: f64) -> f64 {
-    scale * (width_px * 0.028).min(viewport_h_px * 0.05).max(14.0)
+/// max(14px, min(2.8cqw, 5vh))`, without the 14px floor in the `mini` player.
+pub fn cue_font_px(width_px: f64, viewport_h_px: f64, scale: f64, mini: bool) -> f64 {
+    let fluid = (width_px * 0.028).min(viewport_h_px * 0.05);
+    scale * if mini { fluid } else { fluid.max(14.0) }
+}
+
+/// The share of the picture's width, in percent, a horizontal cue's text may
+/// span: its `size`, narrowed by its `position` (`None` for `auto`) and
+/// `position_align`, which place the box so it never crosses the picture's
+/// edge (WebVTT: a centred cue at 10% spans at most 20%). `align` decides
+/// `auto` for both.
+pub fn cue_width_share(size: f64, position: Option<f64>, position_align: &str, align: &str) -> f64 {
+    let anchor = match position_align {
+        "line-left" => "line-left",
+        "line-right" => "line-right",
+        "center" => "center",
+        _ => match align {
+            "left" | "start" => "line-left",
+            "right" | "end" => "line-right",
+            _ => "center",
+        },
+    };
+    let position = position.unwrap_or(match align {
+        "left" | "start" => 0.0,
+        "right" | "end" => 100.0,
+        _ => 50.0,
+    });
+    let position = position.clamp(0.0, 100.0);
+    let room = match anchor {
+        "line-left" => 100.0 - position,
+        "line-right" => position,
+        _ => 2.0 * position.min(100.0 - position),
+    };
+    size.clamp(0.0, 100.0).min(room)
 }
 
 /// About how many characters fit on one rendered cue line in a cue box
@@ -885,14 +916,38 @@ mod tests {
         assert_eq!(lifted_line("<c.yellow>x</c>", 1), -2.0);
     }
 
+    /// Disarm check: returning `size` alone, the positioned cases read 100.
+    #[test]
+    fn a_cue_box_never_crosses_the_pictures_edge() {
+        assert_eq!(cue_width_share(100.0, None, "auto", "center"), 100.0);
+        assert_eq!(cue_width_share(40.0, None, "auto", "center"), 40.0);
+        // Centred at 10%: 10% either side.
+        assert_eq!(cue_width_share(100.0, Some(10.0), "auto", "center"), 20.0);
+        assert_eq!(cue_width_share(100.0, Some(90.0), "center", "start"), 20.0);
+        assert_eq!(
+            cue_width_share(100.0, Some(30.0), "line-left", "center"),
+            70.0
+        );
+        assert_eq!(
+            cue_width_share(100.0, Some(30.0), "line-right", "center"),
+            30.0
+        );
+        // `auto` follows the text alignment.
+        assert_eq!(cue_width_share(100.0, None, "auto", "start"), 100.0);
+        assert_eq!(cue_width_share(100.0, Some(25.0), "auto", "end"), 25.0);
+        assert_eq!(cue_width_share(30.0, Some(50.0), "auto", "center"), 30.0);
+    }
+
     #[test]
     fn cue_size_follows_the_player_and_its_floor() {
         // 1000px wide, tall viewport: 2.8cqw = 28px.
-        assert_eq!(cue_font_px(1000.0, 2000.0, 1.0), 28.0);
+        assert_eq!(cue_font_px(1000.0, 2000.0, 1.0, false), 28.0);
         // Short viewport: 5vh = 20px wins.
-        assert_eq!(cue_font_px(1000.0, 400.0, 1.0), 20.0);
+        assert_eq!(cue_font_px(1000.0, 400.0, 1.0, false), 20.0);
         // Narrow: the 14px floor, then the scale.
-        assert_eq!(cue_font_px(300.0, 800.0, 0.8), 14.0 * 0.8);
+        assert_eq!(cue_font_px(300.0, 800.0, 0.8, false), 14.0 * 0.8);
+        // The 7rem mini player has no floor.
+        assert!((cue_font_px(112.0, 800.0, 1.0, true) - 3.136).abs() < 1e-9);
         assert_eq!(cue_chars_per_line(1000.0, 28.0), 53);
         assert_eq!(cue_chars_per_line(360.0, 14.0 * 1.65), 23);
         assert_eq!(cue_chars_per_line(0.0, 14.0), usize::MAX);
