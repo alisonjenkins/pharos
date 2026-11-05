@@ -644,6 +644,34 @@ fn SubtitleDemo(size: SubtitleSize) -> Element {
 /// Tiles in the transition demo: two rows of the widest grid.
 const DEMO_TILES: usize = 8;
 
+/// Columns in the transition demo's grid (the sheet's
+/// `.pharos-whats-new-demo`).
+const DEMO_COLUMNS: usize = 4;
+
+/// The position variables a library's tile gets from `stage_arrival`, for
+/// demo tile `at` in its fixed grid, so every effect moves as it does in a
+/// library (V492): row, column and their sum for the waves, a scatter for
+/// Pop and the rain, and the warp's pull from the grid's middle. The pull is
+/// in percent of the tile, which `translate` reads against the tile itself;
+/// a tile is 2:3, so a row is 1.5 tile widths.
+fn demo_tile_style(at: usize) -> String {
+    let (row, col) = (at / DEMO_COLUMNS, at % DEMO_COLUMNS);
+    let rows = DEMO_TILES.div_ceil(DEMO_COLUMNS);
+    let mid_col = (DEMO_COLUMNS as f64 - 1.0) / 2.0;
+    let mid_row = (rows as f64 - 1.0) / 2.0;
+    let (dx, dy) = (mid_col - col as f64, mid_row - row as f64);
+    let corner = (mid_col + 0.5).hypot((mid_row + 0.5) * 1.5);
+    let share = dx.hypot(dy * 1.5) / corner;
+    format!(
+        "--fx-row: {row}; --fx-col: {col}; --fx-wave: {}; --fx-r: {}; \
+         --fx-dx: {:.0}%; --fx-dy: {:.0}%; --fx-d: {share:.3}",
+        row + col,
+        (at * 7) % 11,
+        dx * 100.0,
+        dy * 100.0,
+    )
+}
+
 /// A row of stand-in cards that arrive with `fx`, the way a library's do.
 /// The cards carry `.pharos-arrive` inside `.pharos-whats-new-demo`, which
 /// the sheet's transition rules include, and the demo's own
@@ -661,7 +689,7 @@ fn TransitionDemo(fx: LibraryTransition, replay: u32) -> Element {
                 li {
                     key: "{at}",
                     class: "pharos-arrive pharos-whats-new-tile",
-                    style: format!("--fx-i: {at}; --fx-r: {}", (at * 7) % 11),
+                    style: demo_tile_style(at),
                 }
             }
         }
@@ -996,6 +1024,31 @@ mod tests {
             html.contains("aria-checked=\"true\" data-choice=\"warp\""),
             "{html}"
         );
+    }
+
+    #[test]
+    fn each_demo_tile_is_placed_like_a_library_tile() {
+        let first = demo_tile_style(0);
+        assert!(
+            first.contains("--fx-row: 0; --fx-col: 0; --fx-wave: 0;"),
+            "{first}"
+        );
+        assert!(first.contains("--fx-dx: 150%; --fx-dy: 50%;"), "{first}");
+        let last = demo_tile_style(DEMO_TILES - 1);
+        assert!(
+            last.contains("--fx-row: 1; --fx-col: 3; --fx-wave: 4;"),
+            "{last}"
+        );
+        assert!(last.contains("--fx-dx: -150%; --fx-dy: -50%;"), "{last}");
+        for at in 0..DEMO_TILES {
+            let style = demo_tile_style(at);
+            let d: f64 = style
+                .rsplit("--fx-d: ")
+                .next()
+                .and_then(|v| v.parse().ok())
+                .expect("a pull share");
+            assert!((0.0..=1.0).contains(&d), "{style}");
+        }
     }
 
     #[test]
