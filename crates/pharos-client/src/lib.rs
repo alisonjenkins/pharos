@@ -42,7 +42,7 @@ impl CallInfo {
 /// A failed call: the transport broke, or the server answered an `Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("rpc: {0}")]
+    #[error("{}", rpc_message(.0))]
     Rpc(#[from] capnp::Error),
     #[error("{kind}: {reason}")]
     Api {
@@ -51,6 +51,17 @@ pub enum ClientError {
         reason: String,
         trace_id: String,
     },
+}
+
+/// capnp's own text for an unknown enum value names it twice, and a value
+/// newer than the client means the page is older than the server.
+fn rpc_message(e: &capnp::Error) -> String {
+    match e.kind {
+        capnp::ErrorKind::EnumValueOrUnionDiscriminantNotPresent(capnp::NotInSchema(value)) => {
+            format!("the server sent a value this version of Pharos does not know ({value}); reload the page to update")
+        }
+        _ => format!("rpc: {e}"),
+    }
 }
 
 impl ClientError {
@@ -225,5 +236,20 @@ mod tests {
         .is_unimplemented());
         assert!(!ClientError::from(capnp::Error::failed("boom".into())).is_unimplemented());
         assert!(!api("unavailable").is_unimplemented());
+    }
+
+    /// An enum value newer than the client is named once, with what to do,
+    /// not capnp's twice-nested sentence; other transport failures keep it.
+    #[test]
+    fn an_unknown_enum_value_says_to_reload_once() {
+        let text = ClientError::from(capnp::Error::from(capnp::NotInSchema(2))).to_string();
+        assert_eq!(
+            text,
+            "the server sent a value this version of Pharos does not know (2); reload the page to update"
+        );
+        assert_eq!(
+            ClientError::from(capnp::Error::failed("boom".into())).to_string(),
+            "rpc: Failed: boom"
+        );
     }
 }
