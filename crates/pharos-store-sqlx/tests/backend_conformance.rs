@@ -12,12 +12,13 @@
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
     CollectionStore, DetectedSegment, ExternalRatings, GenreStore, LibraryKind, LibraryStore,
-    MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind,
-    MediaSegmentStore, MediaStore, PersistedSyncGroup, PersistedTranscodeSession, PersonKind,
-    PersonRef, PersonStore, PlaylistStore, PreferenceStore, RatingsStore, RatingsTarget,
-    SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore, StudioStore, SyncGroupStore,
-    TagStore, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy,
-    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    LocalizedText, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery,
+    MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore, PersistedSyncGroup,
+    PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
+    RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
+    StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, TranslationOwner,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore,
+    SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -73,6 +74,7 @@ where
         + pharos_core::SyncGroupStore
         + pharos_core::SeriesMetadataStore
         + pharos_core::RatingsStore
+        + pharos_core::MetadataTranslationStore
         + pharos_core::MediaSegmentStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
@@ -1681,6 +1683,166 @@ where
     RatingsStore::set_ratings(&store, &RatingsTarget::Item(424_242), scores, 1_000)
         .await
         .unwrap();
+
+    // -----------------------------------------------------------------
+    // MetadataTranslationStore (ADR-0062, B564): a matched show and episode
+    // are gaps until a row for the language exists; a recorded miss closes
+    // the gap until it ages past the cutoff; reads return the asked-for
+    // language plus the original.
+    // -----------------------------------------------------------------
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        SeriesMetadata {
+            series_key: show_key.clone(),
+            series_name: "Conformance Show".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("76666".into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(1_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    MediaStore::set_item_match(
+        &store,
+        9_100_001,
+        "tvdb",
+        "76666",
+        "search",
+        Some(0.9),
+        1_000,
+    )
+    .await
+    .unwrap();
+    let gaps = MetadataTranslationStore::translation_gaps(&store, "tvdb", "eng", 0, 100)
+        .await
+        .unwrap();
+    let show_owner = TranslationOwner::Series(show_key.clone());
+    let ep_owner = TranslationOwner::Item(9_100_001);
+    let show_gap = gaps
+        .iter()
+        .find(|g| g.owner == show_owner)
+        .expect("a matched show with no row is a gap");
+    assert_eq!(show_gap.series_external_id, "76666");
+    let ep_gap = gaps
+        .iter()
+        .find(|g| g.owner == ep_owner)
+        .expect("a matched episode with no row is a gap");
+    assert_eq!((ep_gap.season, ep_gap.episode), (Some(1), Some(1)));
+    assert!(
+        gaps.iter().position(|g| g.owner == show_owner)
+            < gaps.iter().position(|g| g.owner == ep_owner),
+        "shows come before episodes"
+    );
+
+    let eng = LocalizedText {
+        language: "eng".into(),
+        title: Some("Dragon Ball".into()),
+        overview: Some("Goku sets out.".into()),
+        is_original: false,
+    };
+    let jpn = LocalizedText {
+        language: "jpn".into(),
+        title: Some("ドラゴンボール".into()),
+        overview: Some("悟空".into()),
+        is_original: true,
+    };
+    let fra_missing = LocalizedText {
+        language: "fra".into(),
+        ..Default::default()
+    };
+    MetadataTranslationStore::upsert_translations(
+        &store,
+        &show_owner,
+        &[eng.clone(), jpn.clone(), fra_missing.clone()],
+        2_000,
+    )
+    .await
+    .unwrap();
+    MetadataTranslationStore::upsert_translations(
+        &store,
+        &ep_owner,
+        std::slice::from_ref(&fra_missing),
+        2_000,
+    )
+    .await
+    .unwrap();
+    // Upsert replaces in place.
+    let eng2 = LocalizedText {
+        overview: Some("Goku sets out again.".into()),
+        ..eng.clone()
+    };
+    MetadataTranslationStore::upsert_translations(
+        &store,
+        &show_owner,
+        std::slice::from_ref(&eng2),
+        2_500,
+    )
+    .await
+    .unwrap();
+
+    let gaps = MetadataTranslationStore::translation_gaps(&store, "tvdb", "eng", 0, 100)
+        .await
+        .unwrap();
+    assert!(
+        !gaps.iter().any(|g| g.owner == show_owner),
+        "eng row closes the show's gap"
+    );
+    assert!(
+        gaps.iter().any(|g| g.owner == ep_owner),
+        "episode still has no eng row"
+    );
+    let fra = MetadataTranslationStore::translation_gaps(&store, "tvdb", "fra", 1_000, 100)
+        .await
+        .unwrap();
+    assert!(
+        !fra.iter()
+            .any(|g| g.owner == ep_owner || g.owner == show_owner),
+        "a recent miss is not asked again"
+    );
+    let fra = MetadataTranslationStore::translation_gaps(&store, "tvdb", "fra", 3_000, 100)
+        .await
+        .unwrap();
+    assert!(
+        fra.iter().any(|g| g.owner == ep_owner),
+        "a miss older than the cutoff is asked again"
+    );
+
+    let mut rows = MetadataTranslationStore::translations_for(
+        &store,
+        &[show_owner.clone(), ep_owner.clone()],
+        &["eng".to_string()],
+        true,
+    )
+    .await
+    .unwrap();
+    rows.sort_by(|a, b| a.1.language.cmp(&b.1.language));
+    assert_eq!(
+        rows,
+        vec![(show_owner.clone(), eng2), (show_owner.clone(), jpn)],
+        "the asked-for language and the original, nothing else"
+    );
+    let none = MetadataTranslationStore::translations_for(
+        &store,
+        &[ep_owner],
+        &["deu".to_string()],
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(none.is_empty());
+    // More owners than either engine binds in one query: read in chunks, so
+    // a whole-library episode list still finds its rows.
+    let mut many: Vec<TranslationOwner> = (0..40_000u64)
+        .map(|i| TranslationOwner::Series(format!("absent-{i}")))
+        .collect();
+    many.push(show_owner.clone());
+    let found = MetadataTranslationStore::translations_for(&store, &many, &[], true)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "40k owners: {found:?}");
+    assert_eq!(found[0].0, show_owner);
 
     // -----------------------------------------------------------------
     // SortKey::ParentalRating: the CASE ranking must order identically on

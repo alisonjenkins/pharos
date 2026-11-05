@@ -538,6 +538,54 @@ impl GenreStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// MetadataTranslationStore
+// ---------------------------------------------------------------------
+impl pharos_core::MetadataTranslationStore for AnyStore {
+    async fn upsert_translations(
+        &self,
+        owner: &pharos_core::TranslationOwner,
+        texts: &[pharos_core::LocalizedText],
+        fetched_at: i64,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.upsert_translations(owner, texts, fetched_at).await,
+            AnyStore::Postgres(p) => p.upsert_translations(owner, texts, fetched_at).await,
+        }
+    }
+
+    async fn translations_for(
+        &self,
+        owners: &[pharos_core::TranslationOwner],
+        languages: &[String],
+        with_original: bool,
+    ) -> DomainResult<Vec<(pharos_core::TranslationOwner, pharos_core::LocalizedText)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.translations_for(owners, languages, with_original).await,
+            AnyStore::Postgres(p) => p.translations_for(owners, languages, with_original).await,
+        }
+    }
+
+    async fn translation_gaps(
+        &self,
+        provider: &str,
+        language: &str,
+        missing_cutoff: i64,
+        limit: i64,
+    ) -> DomainResult<Vec<pharos_core::TranslationGap>> {
+        match self {
+            AnyStore::Sqlite(s) => {
+                s.translation_gaps(provider, language, missing_cutoff, limit)
+                    .await
+            }
+            AnyStore::Postgres(p) => {
+                p.translation_gaps(provider, language, missing_cutoff, limit)
+                    .await
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // RatingsStore
 // ---------------------------------------------------------------------
 impl pharos_core::RatingsStore for AnyStore {
