@@ -463,3 +463,165 @@ async fn nested_set_name_form_parses_into_collections() {
     assert!(r.people.iter().any(|pe| pe.name == "Keanu Reeves"));
     assert!(!r.collections.iter().any(|c| c == "Keanu Reeves"));
 }
+
+/// B558 — trimmed from the deployed library: Jellyfin identified the
+/// `TV/Dragon Ball` folder as Super Dragon Ball Heroes and wrote that show's
+/// NFOs and stills into it.
+const FOREIGN_TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<tvshow>
+  <plot>Trunks returns from the future to train with Goku and Vegeta.</plot>
+  <title>Super Dragon Ball Heroes</title>
+  <originaltitle>スーパードラゴンボールヒーローズ</originaltitle>
+  <tmdbid>80020</tmdbid>
+  <tvdbid>347734</tvdbid>
+  <art>
+    <poster>/media/TV/Dragon Ball/folder.jpg</poster>
+    <fanart>/media/TV/Dragon Ball/fanart.jpg</fanart>
+  </art>
+  <id>347734</id>
+</tvshow>
+"#;
+
+const FOREIGN_EPISODE_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<episodedetails>
+  <plot>Goku and Vegeta's training with Whis and Beerus is interrupted.</plot>
+  <title>Goku vs. Goku! A Super Battle Begins on Prison Planet!</title>
+  <imdbid>tt8594374</imdbid>
+  <tvdbid>6692765</tvdbid>
+  <art>
+    <poster>/media/TV/Dragon Ball/Season 01/Dragon Ball - S01E01 - Secret of the Dragon Balls-thumb.jpg</poster>
+  </art>
+  <showtitle>Super Dragon Ball Heroes</showtitle>
+  <episode>1</episode>
+  <season>1</season>
+</episodedetails>
+"#;
+
+/// A show folder holding `tvshow.nfo` and a `Season 01` with one episode, its
+/// NFO and its `-thumb.jpg`. Returns (tempdir, episode path, series info).
+fn dragon_ball(show_nfo: &str, episode_nfo: &str) -> (tempfile::TempDir, PathBuf, SeriesInfo) {
+    let dir = tempdir().unwrap();
+    let season = dir.path().join("Season 01");
+    std::fs::create_dir(&season).unwrap();
+    let stem = "Dragon Ball - S01E01 - Secret of the Dragon Balls";
+    let media = season.join(format!("{stem}.mkv"));
+    std::fs::write(&media, b"").unwrap();
+    std::fs::write(season.join(format!("{stem}.nfo")), episode_nfo).unwrap();
+    std::fs::write(season.join(format!("{stem}-thumb.jpg")), b"jpg").unwrap();
+    std::fs::write(dir.path().join("tvshow.nfo"), show_nfo).unwrap();
+    std::fs::write(dir.path().join("folder.jpg"), b"jpg").unwrap();
+    std::fs::write(dir.path().join("logo.png"), b"png").unwrap();
+    let series = SeriesInfo {
+        series_name: "Dragon Ball".into(),
+        season_number: Some(1),
+        episode_number: Some(1),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    (dir, media, series)
+}
+
+#[tokio::test]
+async fn nfos_naming_another_show_are_ignored_with_their_art() {
+    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Episode,
+        probe: &p,
+        series: Some(&series),
+    };
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(r.title, None);
+    assert_eq!(r.overview, None);
+    assert_eq!(r.provider_ids, ProviderIds::default());
+
+    let foreign = identity::foreign_nfos(&req);
+    assert!(foreign.show && foreign.episode);
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    assert!(art.is_empty(), "the other show's images were kept: {art:?}");
+}
+
+#[tokio::test]
+async fn nfos_naming_the_show_are_kept_with_their_art() {
+    let show = FOREIGN_TVSHOW_NFO
+        .replace("Super Dragon Ball Heroes", "Dragon Ball")
+        .replace("スーパードラゴンボールヒーローズ", "ドラゴンボール");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
+    let (_dir, media, series) = dragon_ball(&show, &episode);
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Episode,
+        probe: &p,
+        series: Some(&series),
+    };
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("6692765"));
+    assert_eq!(
+        identity::foreign_nfos(&req),
+        identity::ForeignNfos::default()
+    );
+    let art = crate::metadata::sidecar::detect_artwork(&req);
+    let local = |suffix: &str| {
+        art.iter().any(|a| {
+            matches!(&a.source, ArtworkSource::LocalFile(p)
+            if p.to_string_lossy().ends_with(suffix))
+        })
+    };
+    assert!(
+        local("-thumb.jpg") && local("folder.jpg") && local("logo.png"),
+        "{art:?}"
+    );
+}
+
+/// The show names the deployed library's `tvshow.nfo` files carry for folders
+/// whose name differs from them (2026-11-05). Every one but the last two names
+/// the folder's show; those two are scraper misidentifications.
+#[test]
+fn the_show_name_check_passes_the_librarys_legitimate_variants() {
+    let pairs = [
+        ("Alien - Earth", "Alien: Earth"),
+        ("Cagney & Lacey", "Cagney & Lacey"),
+        ("Code Geass", "Code Geass: Lelouch of the Rebellion"),
+        ("DARK MOON - THE BLOOD ALTAR", "DARK MOON: THE BLOOD ALTAR"),
+        ("Fullmetal Alchemist", "Fullmetal Alchemist: Brotherhood"),
+        (
+            "KonoSuba – God’s blessing on this wonderful world!!",
+            "KONOSUBA - God's blessing on this wonderful world!",
+        ),
+        ("Lie to me", "Lie to Me"),
+        (
+            "Marvel's Agents of S.H.I.E.L.D",
+            "Marvel's Agents of S.H.I.E.L.D.",
+        ),
+        ("Mrs Browns Boys", "Mrs Brown's Boys"),
+        ("One Piece.old", "One Piece old"),
+        ("PLUR1BUS", "Pluribus"),
+        (
+            "Star Trek The Next Generation",
+            "Star Trek: The Next Generation",
+        ),
+        (
+            "Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE",
+            "Person of Interest",
+        ),
+    ];
+    for (folder, nfo) in pairs {
+        assert!(
+            !identity::names_another_show(folder, [&nfo.to_string()]),
+            "{folder:?} should accept {nfo:?}"
+        );
+    }
+    for (folder, nfo) in [
+        ("Dragon Ball", "Super Dragon Ball Heroes"),
+        ("Forever (US)", "Us Forever"),
+    ] {
+        assert!(
+            identity::names_another_show(folder, [&nfo.to_string()]),
+            "{folder:?} should reject {nfo:?}"
+        );
+    }
+}
