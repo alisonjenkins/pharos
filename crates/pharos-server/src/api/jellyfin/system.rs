@@ -596,7 +596,7 @@ async fn write_user_configuration(
     state: &AppState,
     user: &AuthUser,
     target_str: String,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
 ) -> Result<HttpResponse, actix_web::Error> {
     let bearer = user.0.id.0.simple().to_string();
     let target = if target_str == bearer {
@@ -607,6 +607,7 @@ async fn write_user_configuration(
             .map_err(|_| error::ErrorBadRequest("invalid user id"))?;
         pharos_core::UserId(parsed)
     };
+    keep_stored_description_language(state, target, &mut body).await?;
     let json = serde_json::to_string(&body).map_err(|e| error::ErrorBadRequest(e.to_string()))?;
     state
         .stores
@@ -614,6 +615,38 @@ async fn write_user_configuration(
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+/// `DescriptionLanguagePreference` is a pharos key (V474) that stock Jellyfin
+/// clients do not know. A client that round-trips the configuration through
+/// a typed model drops it, and the save replaces the whole document, so the
+/// user's description language would silently reset to English. Carry the
+/// stored value over when the body omits the key; an explicit value (even
+/// `""`) still wins.
+async fn keep_stored_description_language(
+    state: &AppState,
+    target: pharos_core::UserId,
+    body: &mut serde_json::Value,
+) -> Result<(), actix_web::Error> {
+    const KEY: &str = "DescriptionLanguagePreference";
+    let Some(obj) = body.as_object_mut() else {
+        return Ok(());
+    };
+    if obj.contains_key(KEY) {
+        return Ok(());
+    }
+    let stored = state
+        .stores
+        .get_user_configuration(target)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if let Some(value) = stored
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|cfg| cfg.get(KEY).cloned())
+    {
+        obj.insert(KEY.into(), value);
+    }
+    Ok(())
 }
 
 /// We advertise a Jellyfin schema version >= jellyfin-web's
