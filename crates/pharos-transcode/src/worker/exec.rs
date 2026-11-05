@@ -167,29 +167,56 @@ const WINDOW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// follows the container duration, so the tail windows hold no picture.
 pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
     let tps = pharos_core::time::TICKS_PER_SECOND as f64;
-    let start = spec.opts.start_position_ticks as f64 / tps;
     let dur = spec.opts.duration_ticks? as f64 / tps;
     let input = spec.input.to_str()?;
+    // The encoder's input `-ss` counts from the source's start time, but
+    // `-read_intervals` and `pts_time` are absolute, so shift the window by
+    // it (an MPEG-TS often starts at 10 s or more). Unknown counts as zero.
+    let origin = run_probe(&[
+        "-v",
+        "error",
+        "-show_entries",
+        "format=start_time",
+        "-of",
+        "csv=p=0",
+        input,
+    ])
+    .await?
+    .trim()
+    .parse::<f64>()
+    .ok()
+    .filter(|t| t.is_finite())
+    .unwrap_or(0.0);
+    let start = origin + spec.opts.start_position_ticks as f64 / tps;
+    let window = format!("{start:.3}%+{dur:.3}");
+    let packets = run_probe(&[
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        &window,
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "csv=p=0",
+        input,
+    ])
+    .await?;
+    Some(has_packet_in(&packets, start, start + dur))
+}
+
+/// Run ffprobe with `args` and return its stdout, or None when it could not
+/// run, failed or timed out. Bounded: the worker sends no progress while it
+/// probes, and a stalled read (a stale NFS handle, B218) must not outlast
+/// the scheduler's heartbeat. No answer keeps the device fault, the safe
+/// reading.
+async fn run_probe(args: &[&str]) -> Option<String> {
     let mut probe = tokio::process::Command::new(ffprobe_bin());
     probe
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-read_intervals",
-            &format!("{start:.3}%+{dur:.3}"),
-            "-show_entries",
-            "packet=pts_time",
-            "-of",
-            "csv=p=0",
-            input,
-        ])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    // Bounded: the worker sends no progress while it probes, and a stalled
-    // read (a stale NFS handle, B218) must not outlast the scheduler's
-    // heartbeat. No answer keeps the device fault, the safe reading.
     let out = match tokio::time::timeout(WINDOW_PROBE_TIMEOUT, probe.output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -205,13 +232,14 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
         }
     };
     if !out.status.success() {
+        tracing::warn!(
+            status = %out.status,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "window video probe failed"
+        );
         return None;
     }
-    Some(has_packet_in(
-        &String::from_utf8_lossy(&out.stdout),
-        start,
-        start + dur,
-    ))
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Whether any ffprobe `pts_time` line falls in `[start, end)`. The read
@@ -597,5 +625,24 @@ mod tests {
         assert_eq!(window_has_video(&spec).await, Some(false));
         spec.opts.duration_ticks = None;
         assert_eq!(window_has_video(&spec).await, None);
+
+        // A source whose timestamps start at 10 s (common in MPEG-TS): the
+        // window counts from the start, as the encoder's `-ss` does.
+        let ts = dir.path().join("offset.ts");
+        let status = tokio::process::Command::new(ffmpeg_bin())
+            .args(["-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=64x48:rate=24:duration=2")
+            .args(["-c:v", "mpeg4", "-f", "mpegts", "-output_ts_offset", "10"])
+            .arg(&ts)
+            .status()
+            .await
+            .expect("ffmpeg must be on PATH inside the devShell (see CLAUDE.md)");
+        assert!(status.success());
+        spec.input = ts;
+        spec.opts.duration_ticks = Some(tps);
+        spec.opts.start_position_ticks = 0;
+        assert_eq!(window_has_video(&spec).await, Some(true));
+        spec.opts.start_position_ticks = 4 * tps;
+        assert_eq!(window_has_video(&spec).await, Some(false));
     }
 }
