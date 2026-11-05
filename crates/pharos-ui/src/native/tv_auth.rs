@@ -212,7 +212,53 @@ pub fn rpc_url(base: &str) -> Result<String, String> {
             "{bad:?} in the host of server {base:?}: give only https://host[:port]"
         ));
     }
+    check_authority(host).map_err(|why| format!("{why} in server {base:?}"))?;
     Ok(format!("wss://{host}/pharos/rpc"))
+}
+
+/// `host[:port]` or `[v6][:port]`, with at most one port separator and a
+/// port of 1..=65535. A malformed authority is a permanent error, so it is
+/// caught here instead of failing every reconnect attempt.
+fn check_authority(authority: &str) -> Result<(), String> {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((v6, after)) = rest.split_once(']') else {
+            return Err(format!("unclosed '[' in host {authority:?}"));
+        };
+        if v6.is_empty()
+            || !v6
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+        {
+            return Err(format!("bad IPv6 address {v6:?}"));
+        }
+        match after {
+            "" => (v6, None),
+            _ => match after.strip_prefix(':') {
+                Some(port) => (v6, Some(port)),
+                None => return Err(format!("{after:?} after the IPv6 address")),
+            },
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err(format!("no host in {authority:?}"));
+    }
+    if !authority.starts_with('[') && host.contains(['[', ']']) {
+        return Err(format!("stray bracket in host {host:?}"));
+    }
+    if let Some(port) = port {
+        let valid = !port.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|p| p != 0);
+        if !valid {
+            return Err(format!("bad port {port:?} (want 1..=65535)"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,6 +282,10 @@ mod tests {
             rpc_url("https://tv.example.com:8443").as_deref(),
             Ok("wss://tv.example.com:8443/pharos/rpc")
         );
+        assert_eq!(
+            rpc_url("https://[::1]:8443").as_deref(),
+            Ok("wss://[::1]:8443/pharos/rpc")
+        );
         for bad in [
             "http://tv.example.com",
             "ws://tv.example.com",
@@ -247,6 +297,15 @@ mod tests {
             "https://tv.example.com?x=1",
             "https://tv.example.com#frag",
             "https://tv.example.com/jellyfin",
+            "https://tv.example.com:8443:443",
+            "https://tv.example.com:",
+            "https://tv.example.com:0",
+            "https://tv.example.com:65536",
+            "https://tv.example.com:84a3",
+            "https://:8443",
+            "https://[::1",
+            "https://[::1]x",
+            "https://tv]example.com",
         ] {
             assert!(rpc_url(bad).is_err(), "{bad} must be refused");
         }
