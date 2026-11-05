@@ -29,9 +29,10 @@ platforms = [
 # drops it from the unified set AND stops `manage-deps` from re-adding the
 # workspace-hack dependency to it (keeping `hakari-check` green in CI).
 # pharos-api and pharos-client are excluded for the same wasm reason
-# (017 FR-001).
+# (017 FR-001). pharos-subs is excluded so the renderer builds for
+# wasm32-unknown-unknown (spec 026 FR-001).
 [final-excludes]
-workspace-members = ["pharos-api", "pharos-client", "pharos-ui", "quire", "quire-web"]
+workspace-members = ["pharos-api", "pharos-client", "pharos-subs", "pharos-ui", "quire", "quire-web"]
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
