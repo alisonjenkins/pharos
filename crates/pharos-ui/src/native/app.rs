@@ -51,8 +51,8 @@ use super::views::{
     SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
-    text_track_id, total_ms, Control, Controls, UpNextCard, WatchView, OUTGOING_ID, PLAYER_ID,
-    SEEK_ID, VIDEO_ID,
+    text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
+    PLAYER_ID, SEEK_ID, VIDEO_ID,
 };
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
@@ -83,6 +83,30 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
+    // Shift+P / Shift+N and the media keys skip tracks from anywhere in
+    // the page, for whichever player is on show (B562).
+    let skips = use_context_provider(TrackSkipCtx::default);
+    use_hook(move || {
+        Rc::new(platform::on_track_skip(move |skip, source| {
+            // Out of the cell while it runs, so a redraw it causes can set
+            // the next one.
+            let owner = skips.0.borrow().owner;
+            let Some(mut on_skip) = skips.0.borrow_mut().on_skip.take() else {
+                platform::info(&format!(
+                    "pharos: track skip dir={} source={source} to=none reason=no_player",
+                    skip.label()
+                ));
+                return false;
+            };
+            let taken = on_skip(skip, source);
+            // Back unless its player let go meanwhile.
+            let mut target = skips.0.borrow_mut();
+            if target.owner == owner {
+                target.on_skip.get_or_insert(on_skip);
+            }
+            taken
+        }))
+    });
     use_effect(move || {
         let at = route();
         let mut next = stage.peek().clone();
@@ -939,6 +963,34 @@ struct Editing {
 /// Navigation that replaces the current history entry, for redirects.
 #[derive(Clone, Copy)]
 struct Replace(EventHandler<Route>);
+
+/// Who answers a page-wide track skip (B562): the player on show. A player
+/// takes it over with its own `owner` number, so a song handing over cannot
+/// clear what the next song set when it unmounts.
+#[derive(Clone, Default)]
+struct TrackSkipCtx(Rc<RefCell<SkipTarget>>);
+
+type OnSkip = Box<dyn FnMut(Skip, &'static str) -> bool>;
+
+#[derive(Default)]
+struct SkipTarget {
+    /// The last owner number handed out.
+    issued: u64,
+    /// The player answering skips; 0 for none.
+    owner: u64,
+    on_skip: Option<OnSkip>,
+}
+
+/// Let go of the track skips, if player `owner` still holds them.
+fn release_track_skips(skips: &TrackSkipCtx, owner: u64) {
+    let mut target = skips.0.borrow_mut();
+    if target.owner == owner {
+        target.owner = 0;
+        target.on_skip = None;
+        drop(target);
+        platform::offer_track_skips(false, false);
+    }
+}
 
 /// The item Play from start was pressed on: its next negotiation starts at
 /// 0 s, whatever position the server saved, and clears it.
@@ -3347,6 +3399,50 @@ fn Player(
         }
     };
 
+    // The player on show answers track skips from anywhere in the page
+    // (B562): a song's previous goes through `Control::Previous` like its
+    // button, an episode's to the one before, and next is what the button
+    // plays.
+    let skips = use_context::<TrackSkipCtx>();
+    let skip_owner = use_hook(|| {
+        let mut target = skips.0.borrow_mut();
+        target.issued += 1;
+        target.issued
+    });
+    if !slot.hidden() {
+        let previous = near.previous;
+        let mut on_control = on_control.clone();
+        let on_skip = move |skip: Skip, source: &'static str| {
+            let control = match skip {
+                Skip::Previous if audio => Some(Control::Previous),
+                Skip::Previous => previous.map(Control::Play),
+                Skip::Next => next.map(Control::Play),
+            };
+            let to = match control {
+                Some(Control::Play(id)) => id.to_string(),
+                Some(_) => "song_previous".to_owned(),
+                None => "none".to_owned(),
+            };
+            platform::info(&format!(
+                "pharos: track skip dir={} source={source} item={playing_id} to={to}",
+                skip.label()
+            ));
+            control.map(&mut on_control).is_some()
+        };
+        {
+            let mut target = skips.0.borrow_mut();
+            target.owner = skip_owner;
+            target.on_skip = Some(Box::new(on_skip));
+        }
+        platform::offer_track_skips(audio || previous.is_some(), next.is_some());
+    } else {
+        // Handing over or waiting: this player no longer answers.
+        release_track_skips(&skips, skip_owner);
+    }
+    use_drop({
+        let skips = skips.clone();
+        move || release_track_skips(&skips, skip_owner)
+    });
     let controls = Controls {
         media: MediaState {
             loading: media().loading && failed().is_none(),

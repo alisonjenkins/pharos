@@ -230,11 +230,8 @@ pub fn ListenView(
         if chorded(&evt) {
             return;
         }
-        let key = evt.key();
-        let control = shortcuts
-            .key(&key, evt.modifiers().shift())
-            .or_else(|| transport_key(&key, &media));
-        if let Some(control) = control {
+        // Shift+P / Shift+N are page-wide (B562), not the player's own.
+        if let Some(control) = transport_key(&evt.key(), &media) {
             evt.prevent_default();
             on_control.call(control);
         }
