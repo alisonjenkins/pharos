@@ -174,7 +174,7 @@ async function startGroup(
 
   // A starts a group on the title and lands on the watch page as its member.
   await a.page.goto(`${PHAROS_URL}/ui/title/${nativeId}`);
-  await a.page.getByRole("button", { name: "Watch together", exact: true }).click();
+  await a.page.getByRole("button", { name: /^Watch together( from start)?$/ }).click();
   await expect(a.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
   await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
 
