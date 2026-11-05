@@ -1,6 +1,6 @@
 # ADR-0064: Pharos clients draw text subtitles with their own pure-Rust renderer
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-05T21:30:00Z
 - **Deciders:** Alison Jenkins
 
