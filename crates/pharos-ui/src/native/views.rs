@@ -721,31 +721,15 @@ pub fn TitleView(
                         }
                     }
                     if can_watch_together(item.kind) {
-                        {
-                            // A part-watched title starts its group where the
-                            // viewer left off, or over (B556/V466).
-                            let id = item.id;
-                            let from = start_ms(item.position_ms, item.played);
-                            rsx! {
-                                if resume {
+                        for (label, from, class) in together_starts(item) {
+                            {
+                                let id = item.id;
+                                rsx! {
                                     button {
-                                        class: "pharos-button",
+                                        class: "{class}",
                                         r#type: "button",
                                         onclick: move |_| on_watch_together.call((id, from)),
-                                        "Resume together"
-                                    }
-                                    button {
-                                        class: "pharos-button pharos-button-secondary",
-                                        r#type: "button",
-                                        onclick: move |_| on_watch_together.call((id, 0)),
-                                        "Watch together from start"
-                                    }
-                                } else {
-                                    button {
-                                        class: "pharos-button",
-                                        r#type: "button",
-                                        onclick: move |_| on_watch_together.call((id, 0)),
-                                        "Watch together"
+                                        "{label}"
                                     }
                                 }
                             }
@@ -959,6 +943,28 @@ pub fn ends_at(left: Option<Left>) -> Option<String> {
 }
 
 /// How far into an unfinished item the user is, 1–99.
+/// The title page's ways to start a group on `item`: label, start position
+/// and button class. A part-watched title starts where the viewer left off,
+/// or over (B556/V466).
+fn together_starts(item: &Item) -> Vec<(&'static str, u64, &'static str)> {
+    if progress_percent(item).is_some() {
+        vec![
+            (
+                "Resume together",
+                start_ms(item.position_ms, item.played),
+                "pharos-button",
+            ),
+            (
+                "Watch together from start",
+                0,
+                "pharos-button pharos-button-secondary",
+            ),
+        ]
+    } else {
+        vec![("Watch together", 0, "pharos-button")]
+    }
+}
+
 pub fn progress_percent(item: &Item) -> Option<u64> {
     if item.played || item.position_ms == 0 || item.runtime_ms == 0 {
         return None;
@@ -1591,6 +1597,30 @@ mod tests {
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Mark unwatched<"), "{html}");
+    }
+
+    /// V466: Resume together starts the group at the saved position, the
+    /// other choices at 0. Disarm check: with Resume together starting at 0,
+    /// this fails.
+    #[test]
+    fn a_group_starts_where_the_viewer_chose() {
+        let mut film = item(ItemKind::Movie);
+        film.runtime_ms = 100 * 60_000;
+        let starts = |i: &Item| {
+            together_starts(i)
+                .into_iter()
+                .map(|(label, from, _)| (label, from))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(&film), vec![("Watch together", 0)]);
+        film.position_ms = 60_000;
+        assert_eq!(
+            starts(&film),
+            vec![
+                ("Resume together", 60_000),
+                ("Watch together from start", 0)
+            ]
+        );
     }
 
     #[test]
