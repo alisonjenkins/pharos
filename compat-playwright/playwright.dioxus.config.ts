@@ -29,6 +29,17 @@ export default defineConfig({
 
   use: {
     baseURL: PHAROS_URL,
+    // What's new (spec 027) would greet every fresh test account after
+    // sign-in; it is turned off on this device. The what's-new cases clear it.
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: new URL(PHAROS_URL).origin,
+          localStorage: [{ name: "pharos.whats_new", value: "off" }],
+        },
+      ],
+    },
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",
