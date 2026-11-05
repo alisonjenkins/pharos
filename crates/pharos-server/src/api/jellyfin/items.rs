@@ -4088,6 +4088,132 @@ pub(crate) fn canonical_wire_id(pid: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// How long a [`SynthParents`] memo answers "no such synth id" before a miss
+/// rebuilds it. The library generation only moves on the replica that ran the
+/// scan, so a follower relies on this to learn about a show added elsewhere.
+const SYNTH_PARENTS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Every synth series/season/artist/album wire id mapped to the filter it
+/// names, built from one pass over the store's distinct keys.
+pub(crate) struct SynthParents {
+    generation: u64,
+    built_at: std::time::Instant,
+    filters: std::collections::HashMap<String, pharos_core::ParentFilter>,
+}
+
+/// What [`synth_parent_filter`] did, for `pharos_synth_parent_lookup_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SynthParentLookup {
+    /// The current memo named the id.
+    Hit,
+    /// The current memo does not know the id: not a synth parent.
+    Miss,
+    /// The memo was absent, stale or behind the library, so it was rebuilt.
+    Rebuilt,
+}
+
+impl SynthParentLookup {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SynthParentLookup::Hit => "hit",
+            SynthParentLookup::Miss => "miss",
+            SynthParentLookup::Rebuilt => "rebuilt",
+        }
+    }
+}
+
+/// The parent filter a synth series/season/artist/album wire id names, if any.
+///
+/// Answers from the memo while it is as new as the library generation; an id
+/// it does not know also needs the memo to be under [`SYNTH_PARENTS_MAX_AGE`].
+/// Otherwise one caller rebuilds it while the rest wait for that build, so a
+/// genre or person id costs at most one scan a minute or per library change.
+/// A show deleted on another replica keeps resolving to its (now empty)
+/// filter on this one until the generation moves.
+async fn synth_parent_filter(
+    state: &AppState,
+    pid: &str,
+) -> Result<Option<pharos_core::ParentFilter>, pharos_core::DomainError> {
+    let current = |m: &SynthParents, generation: u64| {
+        m.generation >= generation
+            && (m.filters.contains_key(pid) || m.built_at.elapsed() < SYNTH_PARENTS_MAX_AGE)
+    };
+    let generation = || {
+        state
+            .library_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let mut memo = state.synth_parents_memo();
+    let mut outcome = SynthParentLookup::Hit;
+    if !memo.as_deref().is_some_and(|m| current(m, generation())) {
+        let _build = state.synth_parents_build.lock().await;
+        memo = state.synth_parents_memo();
+        if !memo.as_deref().is_some_and(|m| current(m, generation())) {
+            let built = std::sync::Arc::new(build_synth_parents(state, generation()).await?);
+            *state
+                .synth_parents
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built.clone());
+            memo = Some(built);
+            outcome = SynthParentLookup::Rebuilt;
+        }
+    }
+    let found = memo.as_deref().and_then(|m| m.filters.get(pid).cloned());
+    if found.is_none() && outcome == SynthParentLookup::Hit {
+        outcome = SynthParentLookup::Miss;
+    }
+    metrics::counter!("pharos_synth_parent_lookup_total", "outcome" => outcome.label())
+        .increment(1);
+    Ok(found)
+}
+
+/// Hash every distinct series, season, artist and album key. The first kind
+/// to claim an id keeps it, in the order the per-request lookup used to try.
+#[tracing::instrument(skip(state))]
+async fn build_synth_parents(
+    state: &AppState,
+    generation: u64,
+) -> Result<SynthParents, pharos_core::DomainError> {
+    use crate::api::jellyfin::dto::{
+        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
+    };
+    use pharos_core::ParentFilter;
+    let mut filters = std::collections::HashMap::new();
+    for (folder, name) in state.stores.distinct_series_keys().await? {
+        let id = series_id_for_key(folder.as_deref(), &name);
+        filters
+            .entry(id)
+            .or_insert(ParentFilter::Series { folder, name });
+    }
+    for (folder, name, season) in state.stores.distinct_season_keys().await? {
+        let Ok(season) = u32::try_from(season) else {
+            continue;
+        };
+        let id = season_id_for_key(folder.as_deref(), &name, season);
+        filters.entry(id).or_insert(ParentFilter::Season {
+            folder,
+            name,
+            season,
+        });
+    }
+    for name in state.stores.distinct_artist_names().await? {
+        filters
+            .entry(artist_id_for(&name))
+            .or_insert(ParentFilter::Artist { name });
+    }
+    for name in state.stores.distinct_album_names().await? {
+        filters
+            .entry(album_id_for(&name))
+            .or_insert(ParentFilter::Album { name });
+    }
+    tracing::debug!(ids = filters.len(), generation, "synth parent memo built");
+    Ok(SynthParents {
+        generation,
+        built_at: std::time::Instant::now(),
+        filters,
+    })
+}
+
 /// LIB-B2 — resolve a `?ParentId=` to a [`ParentResolution`] WITHOUT loading
 /// the item set. Mirrors the branch order of the legacy `restrict_to_parent`:
 /// library → series → season → artist → album → genre → person → studio →
@@ -4098,9 +4224,6 @@ pub(crate) async fn resolve_parent_filter(
     state: &AppState,
     parent_id: Option<&str>,
 ) -> Result<ParentResolution, pharos_core::DomainError> {
-    use crate::api::jellyfin::dto::{
-        album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
-    };
     use pharos_core::{
         CollectionStore, GenreStore, LibraryStore, ParentFilter, PersonStore, StudioStore, TagStore,
     };
@@ -4142,46 +4265,9 @@ pub(crate) async fn resolve_parent_filter(
         ));
     }
 
-    // 2) Series synth id → recover (folder, name) by hashing distinct keys.
-    let series_keys = state.stores.distinct_series_keys().await?;
-    for (folder, name) in &series_keys {
-        if series_id_for_key(folder.as_deref(), name) == pid {
-            return Ok(ParentResolution::Filter(ParentFilter::Series {
-                folder: folder.clone(),
-                name: name.clone(),
-            }));
-        }
-    }
-    // 3) Season synth id → recover (folder, name, season).
-    let season_keys = state.stores.distinct_season_keys().await?;
-    for (folder, name, season) in &season_keys {
-        if let Ok(season_u32) = u32::try_from(*season) {
-            if season_id_for_key(folder.as_deref(), name, season_u32) == pid {
-                return Ok(ParentResolution::Filter(ParentFilter::Season {
-                    folder: folder.clone(),
-                    name: name.clone(),
-                    season: season_u32,
-                }));
-            }
-        }
-    }
-    // 4) Artist synth id → recover the name.
-    let artists = state.stores.distinct_artist_names().await?;
-    for name in &artists {
-        if artist_id_for(name) == pid {
-            return Ok(ParentResolution::Filter(ParentFilter::Artist {
-                name: name.clone(),
-            }));
-        }
-    }
-    // 5) Album synth id → recover the name.
-    let albums = state.stores.distinct_album_names().await?;
-    for name in &albums {
-        if album_id_for(name) == pid {
-            return Ok(ParentResolution::Filter(ParentFilter::Album {
-                name: name.clone(),
-            }));
-        }
+    // 2-5) Series / season / artist / album synth ids.
+    if let Some(filter) = synth_parent_filter(state, pid).await? {
+        return Ok(ParentResolution::Filter(filter));
     }
 
     // 6-10) Entity wire-id pivots — the wire id IS the filter param, but we
@@ -8011,5 +8097,131 @@ mod filed_artist_tests {
         ];
         assert_eq!(filed_artist_names(&tracks), ["ABBA", "Foo"]);
         assert!(on_artist_page(&tracks[2], "foo"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod synth_parent_tests {
+    use super::{resolve_parent_filter, ParentResolution};
+    use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
+    use pharos_core::{MediaItem, MediaKind, MediaStore, ParentFilter, SeriesInfo};
+
+    async fn state_with(shows: &[(u64, &str)]) -> crate::state::AppState {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(stores, "t".into());
+        for (id, show) in shows {
+            put_episode(&state, *id, show).await;
+        }
+        state
+    }
+
+    async fn put_episode(state: &crate::state::AppState, id: u64, show: &str) {
+        state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/tv/{show}/S01E01.mkv").into(),
+                title: "Pilot".into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: show.into(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    series_folder: Some(format!("/tv/{show}")),
+                    series_year: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Lookups by outcome since the last call: a snapshot drains the counters.
+    fn lookups(
+        rec: &metrics_util::debugging::DebuggingRecorder,
+    ) -> std::collections::HashMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        pharos_test_metrics::snapshotter(rec)
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, _, _, _)| ck.key().name() == "pharos_synth_parent_lookup_total")
+            .filter_map(|(ck, _, _, v)| {
+                let outcome = ck.key().labels().find(|l| l.key() == "outcome")?;
+                match v {
+                    DebugValue::Counter(n) => Some((outcome.value().to_string(), n)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn count(seen: &std::collections::HashMap<String, u64>, outcome: &str) -> u64 {
+        seen.get(outcome).copied().unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_known_synth_parent_resolves_from_the_memo_without_a_rescan() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let state = state_with(&[(1, "Buffy")]).await;
+        let series = series_id_for_key(Some("/tv/Buffy"), "Buffy");
+        let season = season_id_for_key(Some("/tv/Buffy"), "Buffy", 1);
+
+        for _ in 0..3 {
+            let got = resolve_parent_filter(&state, Some(&series)).await.unwrap();
+            assert!(matches!(
+                got,
+                ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Buffy"
+            ));
+        }
+        let got = resolve_parent_filter(&state, Some(&season)).await.unwrap();
+        assert!(matches!(
+            got,
+            ParentResolution::Filter(ParentFilter::Season { season: 1, .. })
+        ));
+        let seen = lookups(&rec);
+        assert_eq!(count(&seen, "rebuilt"), 1, "one scan builds the memo");
+        assert_eq!(count(&seen, "hit"), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_id_does_not_rescan_until_the_library_changes() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let state = state_with(&[(1, "Buffy")]).await;
+        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+
+        for _ in 0..2 {
+            let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+            assert!(matches!(got, ParentResolution::Empty));
+        }
+        let seen = lookups(&rec);
+        assert_eq!(count(&seen, "rebuilt"), 1);
+        assert_eq!(count(&seen, "miss"), 1, "a current memo answers no");
+
+        put_episode(&state, 2, "Angel").await;
+        state.notify_library_changed();
+        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        assert!(matches!(
+            got,
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+        ));
+        assert_eq!(
+            count(&lookups(&rec), "rebuilt"),
+            1,
+            "a newer library rebuilds"
+        );
+    }
+
+    #[test]
+    fn lookup_labels_are_distinct() {
+        use super::SynthParentLookup::{Hit, Miss, Rebuilt};
+        let labels: std::collections::HashSet<_> =
+            [Hit, Miss, Rebuilt].iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), 3);
     }
 }
