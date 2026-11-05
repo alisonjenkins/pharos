@@ -1032,6 +1032,7 @@ mod tests {
             subtitle_tracks: Vec::new(),
             trickplay: Vec::new(),
             segments: Vec::new(),
+            fonts: Vec::new(),
         };
         let answer = vec![
             MemberSeen {
@@ -1569,6 +1570,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            fonts: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -1599,6 +1601,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            fonts: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -1617,6 +1620,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            fonts: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Mark unwatched<"), "{html}");
@@ -1664,6 +1668,7 @@ mod tests {
                 subtitle_tracks: vec![],
                 trickplay: vec![],
                 segments: vec![],
+                fonts: Vec::new(),
             };
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
@@ -1685,6 +1690,7 @@ mod tests {
                 subtitle_tracks: vec![],
                 trickplay: vec![],
                 segments,
+                fonts: vec![],
             }
         };
         let outro = Segment {
@@ -1719,6 +1725,7 @@ mod tests {
             subtitle_tracks: vec![],
             trickplay: vec![],
             segments: vec![],
+            fonts: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(

@@ -75,3 +75,87 @@ async fn sidecar_scripts_are_listed_as_ass_and_ssa_and_the_rest_as_webvtt() {
         "V489: a sidecar script is not labelled webvtt"
     );
 }
+
+/// 026 FR-010 (B572, V488): the detail lists the file's fonts, with the URL
+/// template the client fills the subtitle index into, and leaves out
+/// attachments that are not fonts.
+#[actix_web::test]
+async fn detail_lists_the_embedded_fonts_and_not_other_attachments() {
+    use pharos_core::MediaAttachment;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut item = MediaItem {
+        id: 302,
+        path: "/libA/Fonted.mkv".into(),
+        title: "Fonted".into(),
+        kind: MediaKind::Movie,
+        ..MediaItem::default()
+    };
+    item.probe.attachments = vec![
+        MediaAttachment {
+            stream_index: 4,
+            filename: Some("Arial.ttf".into()),
+            mime_type: Some("application/x-truetype-font".into()),
+            codec: Some("ttf".into()),
+        },
+        MediaAttachment {
+            stream_index: 5,
+            filename: Some("cover.jpg".into()),
+            mime_type: Some("image/jpeg".into()),
+            codec: None,
+        },
+        MediaAttachment {
+            stream_index: 6,
+            filename: Some("Mincho.OTF".into()),
+            mime_type: Some("application/octet-stream".into()),
+            codec: None,
+        },
+    ];
+    fx.state.stores.put(item).await.unwrap();
+
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.detail_request();
+    req.get().init_ctx();
+    req.get().init_id().set_real(302);
+    let reply = req.send().promise.await.expect("detail");
+    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("detail refused");
+    };
+    let text = |t: capnp::Result<capnp::text::Reader<'_>>| t.unwrap().to_str().unwrap().to_owned();
+    let fonts: Vec<(u32, String, String, String)> = d
+        .unwrap()
+        .get_fonts()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f.get_index(),
+                text(f.get_filename()),
+                text(f.get_mime()),
+                text(f.get_url()),
+            )
+        })
+        .collect();
+    let id = pharos_jellyfin_api::dto::wire_item_id(302);
+    assert_eq!(
+        fonts,
+        [
+            (
+                4,
+                "Arial.ttf".to_owned(),
+                "application/x-truetype-font".to_owned(),
+                format!("/videos/{id}/subtitles/{{subtitle}}/fonts/4"),
+            ),
+            (
+                6,
+                "Mincho.OTF".to_owned(),
+                "font/otf".to_owned(),
+                format!("/videos/{id}/subtitles/{{subtitle}}/fonts/6"),
+            ),
+        ],
+        "V488: the detail does not list the file's fonts"
+    );
+}

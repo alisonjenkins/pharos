@@ -453,6 +453,15 @@ impl server::library::Handler for Library {
             w.set_grid(t.grid);
             w.set_tile_url(t.tile_url.as_str());
         }
+        let fonts = watch::fonts(&item);
+        let mut list = out.reborrow().init_fonts(len(&fonts));
+        for (i, f) in (0..).zip(&fonts) {
+            let mut w = list.reborrow().get(i);
+            w.set_index(f.index);
+            w.set_filename(f.filename.as_str());
+            w.set_mime(f.mime.as_str());
+            w.set_url(f.url.as_str());
+        }
         let segments: Vec<_> = segments::for_item(state, &item)
             .await
             .into_iter()
