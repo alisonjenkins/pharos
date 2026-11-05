@@ -52,6 +52,10 @@ pub fn current_path() -> String {
     "/".into()
 }
 
+pub fn current_search() -> String {
+    String::new()
+}
+
 pub fn push(_path: &str) {}
 
 pub fn reload() {}
