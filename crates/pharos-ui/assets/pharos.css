@@ -629,6 +629,99 @@ input:focus-visible {
   scroll-margin-top: 1rem;
 }
 
+/* A browse grid's cards arrive with the viewer's chosen transition when it
+   mounts: a library opening or the viewer switching to another (V476). Only the first
+   tiles carry `.pharos-arrive` (browse.rs `arrival`), staggered by their
+   place `--fx-i`; the rain scatters them by `--fx-r` instead. Every effect
+   animates `transform` and `opacity` alone, so it stays on the compositor on
+   TV and headset GPUs. */
+.pharos-browse .pharos-arrive {
+  animation: 380ms cubic-bezier(0.2, 0.7, 0.2, 1) calc(var(--fx-i, 0) * 25ms) backwards pharos-arrive-fade;
+}
+:root[data-library-transition="none"] .pharos-browse .pharos-arrive {
+  animation: none;
+}
+:root[data-library-transition="pop"] .pharos-browse .pharos-arrive {
+  animation-name: pharos-arrive-pop;
+  animation-duration: 420ms;
+  animation-timing-function: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+:root[data-library-transition="flip"] .pharos-browse .pharos-arrive {
+  animation-name: pharos-arrive-flip;
+  animation-duration: 520ms;
+}
+:root[data-library-transition="warp"] .pharos-browse .pharos-arrive {
+  animation-name: pharos-arrive-warp;
+  animation-duration: 600ms;
+}
+:root[data-library-transition="matrix"] .pharos-browse .pharos-arrive {
+  position: relative;
+  animation-name: pharos-arrive-rain;
+  animation-duration: 520ms;
+  animation-timing-function: cubic-bezier(0.5, 0, 0.3, 1);
+  animation-delay: calc(var(--fx-r, 0) * 55ms);
+}
+/* The rain's trail: an accent wash over the falling card that fades out. */
+:root[data-library-transition="matrix"] .pharos-browse .pharos-arrive::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  background: linear-gradient(to bottom, transparent, var(--px-color-accent));
+  animation: 700ms ease-out calc(var(--fx-r, 0) * 55ms) both pharos-arrive-trail;
+}
+@keyframes pharos-arrive-fade {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+}
+@keyframes pharos-arrive-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+}
+@keyframes pharos-arrive-flip {
+  from {
+    opacity: 0;
+    transform: perspective(60rem) rotateY(-90deg);
+  }
+}
+@keyframes pharos-arrive-warp {
+  from {
+    opacity: 0;
+    transform: perspective(60rem) translateZ(-40rem) rotateX(30deg);
+  }
+}
+@keyframes pharos-arrive-rain {
+  from {
+    opacity: 0;
+    transform: translateY(-120%);
+  }
+  60% {
+    opacity: 1;
+  }
+}
+@keyframes pharos-arrive-trail {
+  from {
+    opacity: 0.7;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pharos-browse .pharos-arrive,
+  .pharos-browse .pharos-arrive::after {
+    animation: none !important;
+  }
+  .pharos-browse .pharos-arrive::after {
+    content: none !important;
+  }
+}
+
 /* A library's sort and filter bar (V252). */
 .pharos-filters {
   display: flex;
