@@ -2755,7 +2755,17 @@ test.describe("pharos Dioxus UI stage", () => {
     const title = page.url();
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     const video = page.locator(".pharos-stage.is-floating .pharos-watch video");
-    await expect(video).toBeVisible({ timeout: 15_000 });
+    // On a miss, say what the stage became and what the page logged.
+    await expect(video, "the floating stage plays the film")
+      .toBeVisible({ timeout: 15_000 })
+      .catch(async (e) => {
+        const stage = await page
+          .locator(".pharos-stage")
+          .evaluateAll((els) => els.map((el) => `${el.className}: ${el.innerHTML.slice(0, 600)}`));
+        throw new Error(
+          `${e}\nurl=${page.url()}\nstage=${JSON.stringify(stage)}\nlog:\n${lines.slice(-40).join("\n")}`,
+        );
+      });
     await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.2);
     expect(page.url(), "the title page stays").toBe(title);
     expect(plays(lines)).toBe(2);
