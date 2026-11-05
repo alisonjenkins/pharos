@@ -214,7 +214,7 @@ pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
         ],
     )
     .await?;
-    Some(has_packet_in(&packets, start, start + dur))
+    has_packet_in(&packets, start, start + dur)
 }
 
 /// Run ffprobe with `args` and return its stdout, or None when it could not
@@ -255,11 +255,22 @@ async fn run_probe(deadline: tokio::time::Instant, args: &[&str]) -> Option<Stri
 
 /// Whether any ffprobe `pts_time` line falls in `[start, end)`. The read
 /// starts at the keyframe before `start`, so earlier packets are expected
-/// and do not count.
-fn has_packet_in(csv: &str, start: f64, end: f64) -> bool {
-    csv.lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
-        .any(|t| t >= start - 0.001 && t < end)
+/// and do not count. `None` when a packet has no usable time (`N/A`) and
+/// none of the timed ones is inside: that packet could be, so it is not
+/// proof of an empty window.
+fn has_packet_in(csv: &str, start: f64, end: f64) -> Option<bool> {
+    let mut untimed = false;
+    for line in csv.lines().map(|l| l.trim().trim_end_matches(',')) {
+        if line.is_empty() {
+            continue;
+        }
+        match line.parse::<f64>() {
+            Ok(t) if t >= start - 0.001 && t < end => return Some(true),
+            Ok(_) => {}
+            Err(_) => untimed = true,
+        }
+    }
+    (!untimed).then_some(false)
 }
 
 /// ffprobe beside the ffmpeg the worker runs, so a pinned `PHAROS_FFMPEG`
@@ -579,10 +590,12 @@ mod tests {
     fn only_packets_inside_the_window_count_as_video() {
         // ffprobe reads from the keyframe before the start.
         let csv = "1237.319000\n1240.000000,\n1243.909000\n";
-        assert!(!has_packet_in(csv, 1289.976, 1295.982));
-        assert!(has_packet_in(csv, 1239.0, 1245.0));
-        assert!(!has_packet_in("", 0.0, 6.0));
-        assert!(!has_packet_in("N/A\n", 0.0, 6.0));
+        assert_eq!(has_packet_in(csv, 1289.976, 1295.982), Some(false));
+        assert_eq!(has_packet_in(csv, 1239.0, 1245.0), Some(true));
+        assert_eq!(has_packet_in("", 0.0, 6.0), Some(false));
+        // An untimed packet may be inside the window: unknown, not empty.
+        assert_eq!(has_packet_in("N/A\n", 0.0, 6.0), None);
+        assert_eq!(has_packet_in("N/A\n3.0\n", 0.0, 6.0), Some(true));
     }
 
     #[tokio::test]
