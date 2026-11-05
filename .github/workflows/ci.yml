@@ -197,6 +197,7 @@ jobs:
         run: |
           nix build .#oci            --no-link --print-out-paths
           nix build .#jellyfinWebOci --no-link --print-out-paths
+          nix build .#alignerOci     --no-link --print-out-paths
 
   publish:
     name: publish images (ghcr)
@@ -260,6 +261,27 @@ jobs:
           }
           publish oci            ghcr.io/alisonjenkins/pharos
           publish jellyfinWebOci ghcr.io/alisonjenkins/pharos-jellyfin-web
+
+          # pharos-aligner (ADR-0066) is 3-4 GB and changes rarely, so it is
+          # tagged by its script's store hash and streamed only when that tag
+          # is missing; the chart pins the tag (aligner.image.tag).
+          aligner_script="$(nix build .#alignerOci --no-link --print-out-paths)"
+          aligner_tag="$(basename "$aligner_script" | cut -d- -f1)"
+          if nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+               "docker://ghcr.io/alisonjenkins/pharos-aligner:${aligner_tag}" >/dev/null 2>&1; then
+            echo "publish: pharos-aligner:${aligner_tag} already published"
+          else
+            stage="$(mktemp -d)/img"
+            "$aligner_script" | nix develop --command skopeo --insecure-policy copy \
+              docker-archive:/dev/stdin "oci:${stage}:img"
+            for tag in latest "$aligner_tag"; do
+              nix develop --command skopeo --insecure-policy copy \
+                --dest-creds "$GHCR_CREDS" \
+                "oci:${stage}:img" "docker://ghcr.io/alisonjenkins/pharos-aligner:${tag}"
+            done
+            rm -rf "$(dirname "$stage")"
+            echo "publish: pharos-aligner:${aligner_tag} pushed"
+          fi
 
   compat-playwright:
     name: jellyfin-web crawl
