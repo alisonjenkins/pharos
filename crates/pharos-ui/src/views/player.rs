@@ -176,6 +176,8 @@ pub fn PlayerView(
             } else {
                 video {
                     id: "{media_dom_id}",
+                    // Subtitle size + backdrop from pharos.css (V455).
+                    class: "pharos-cues",
                     controls: true,
                     autoplay: true,
                     playsinline: true,
