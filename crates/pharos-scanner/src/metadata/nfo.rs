@@ -48,6 +48,8 @@ use pharos_core::{
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+pub(crate) mod identity;
+
 /// Merge priority for the NFO source — the highest local source. A
 /// user-authored `<title>`/`<plot>`/`<rating>` beats the filename provider
 /// (priority 10) and any future online provider, so local curation wins.
@@ -90,12 +92,17 @@ impl MetadataProvider for NfoProvider {
         // *this provider* with Err (resolver logs + skips, V6); an absent
         // file is simply skipped (no-op).
         let mut result = MetadataResult::default();
+        let foreign = identity::foreign_nfos(req);
 
         for candidate in nfo_candidates(req) {
+            let show_nfo = req.kind == MediaKind::Episode && is_show_nfo(req, &candidate);
+            if (show_nfo && foreign.show) || (!show_nfo && foreign.episode) {
+                continue;
+            }
             match std::fs::read(&candidate) {
                 Ok(bytes) => {
                     let mut parsed = parse_nfo(&bytes, &candidate)?;
-                    if req.kind == MediaKind::Episode && is_show_nfo(req, &candidate) {
+                    if show_nfo {
                         drop_episode_fields(&mut parsed);
                     }
                     fold_under(&mut result, parsed);
@@ -353,15 +360,8 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
                 // `0`). Unknown named entities are dropped (V6 tolerance).
                 if let Ok(Some(c)) = r.resolve_char_ref() {
                     cur_text.push(c);
-                } else {
-                    match r.as_ref() {
-                        "amp" => cur_text.push('&'),
-                        "lt" => cur_text.push('<'),
-                        "gt" => cur_text.push('>'),
-                        "quot" => cur_text.push('"'),
-                        "apos" => cur_text.push('\''),
-                        _ => {}
-                    }
+                } else if let Some(c) = predefined_entity(r.as_ref()) {
+                    cur_text.push(c);
                 }
             }
             Ok(Event::End(e)) => {
@@ -415,6 +415,18 @@ fn parse_nfo(bytes: &[u8], path: &Path) -> DomainResult<MetadataResult> {
     }
 
     Ok(result)
+}
+
+/// The character one of XML's five predefined entities stands for.
+fn predefined_entity(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => None,
+    }
 }
 
 /// Route a text run keyed by the element it sits inside.
