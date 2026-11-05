@@ -131,6 +131,7 @@ pub struct StyledSubtitles;
 pub async fn styled_subtitles(
     _video_id: &str,
     _url: &str,
+    _fonts: &[String],
     _report: std::rc::Rc<dyn Fn(Result<(), String>)>,
 ) -> Result<StyledSubtitles, String> {
     Err("no renderer on the host".into())
