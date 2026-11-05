@@ -832,10 +832,15 @@ pub(crate) async fn resolve_synth_image_item(
             None => None,
         };
     }
+    let all = state.list_items_cached().await.ok()?;
+    build_synth_image_map(state, &all);
+    if let Some(Some(item_id)) = state.synth_image_cached(id_str) {
+        return all.iter().find(|it| it.id == item_id).cloned();
+    }
+    // The cached list can be a minute behind a new album, and the negative
+    // below lasts until artwork changes, so confirm it against the store.
     let all = state.stores.list().await.ok()?;
     build_synth_image_map(state, &all);
-    // The requested id is now memoised if it names a real group; otherwise
-    // record a negative so we don't rescan for it.
     match state.synth_image_cached(id_str) {
         Some(Some(item_id)) => all.into_iter().find(|it| it.id == item_id),
         _ => {
