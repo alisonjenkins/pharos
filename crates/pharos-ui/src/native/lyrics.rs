@@ -282,6 +282,7 @@ mod tests {
                 .map(|(i, &start_ms)| LyricLine {
                     start_ms,
                     text: format!("line {i}"),
+                    words: Vec::new(),
                 })
                 .collect(),
         }
@@ -295,6 +296,7 @@ mod tests {
                 .map(|&(start_ms, text)| LyricLine {
                     start_ms,
                     text: text.to_owned(),
+                    words: Vec::new(),
                 })
                 .collect(),
         }
@@ -418,6 +420,7 @@ mod tests {
             .map(|t| LyricLine {
                 start_ms: 0,
                 text: (*t).to_owned(),
+                words: Vec::new(),
             })
             .collect();
         let html = render(
