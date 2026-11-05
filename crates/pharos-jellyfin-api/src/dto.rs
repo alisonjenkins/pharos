@@ -215,6 +215,11 @@ pub struct UserConfigurationDto {
     pub remember_subtitle_selections: bool,
     pub enable_next_episode_auto_play: bool,
     pub cast_receiver_id: String,
+    /// pharos: the language show and episode descriptions are shown in, a
+    /// three-letter code (`jpn`) or `OriginalLanguage` (ADR-0062). Not a
+    /// Jellyfin field; carried here so the GET that jellyfin-web saves back
+    /// does not drop it. Empty = the server default, English.
+    pub description_language_preference: String,
 }
 
 impl Default for UserConfigurationDto {
@@ -236,6 +241,7 @@ impl Default for UserConfigurationDto {
             remember_subtitle_selections: true,
             enable_next_episode_auto_play: true,
             cast_receiver_id: "F007D354".into(),
+            description_language_preference: String::new(),
         }
     }
 }
@@ -2881,6 +2887,22 @@ pub fn build_media_attachments(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// ADR-0062 — jellyfin-web saves back the configuration it read, so the
+    /// description language must survive the typed GET or the next save of
+    /// any other setting wipes it.
+    #[test]
+    fn user_configuration_round_trips_the_description_language() {
+        let cfg: UserConfigurationDto = serde_json::from_str(
+            r#"{"AudioLanguagePreference":"jpn","DescriptionLanguagePreference":"fra"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.description_language_preference, "fra");
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(back["DescriptionLanguagePreference"], "fra");
+        let unset: UserConfigurationDto = serde_json::from_str("{}").unwrap();
+        assert_eq!(unset.description_language_preference, "");
+    }
     use pharos_core::MediaProbe;
 
     #[test]
