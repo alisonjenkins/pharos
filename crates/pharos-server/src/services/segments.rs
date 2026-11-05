@@ -116,13 +116,14 @@ pub async fn any(state: &AppState, item: &MediaItem) -> bool {
 /// segment.
 pub fn classify_chapter_title(title: &str) -> Option<&'static str> {
     let lc = title.to_ascii_lowercase();
-    if lc.contains("intro") || lc.contains("opening") {
+    let song = theme_song(&lc);
+    if lc.contains("intro") || lc.contains("opening") || song == Some("op") {
         return Some("Intro");
     }
     if lc.contains("outro")
-        || lc.contains("end credits")
+        || lc.contains("credits")
         || lc.contains("closing")
-        || lc.starts_with("credits")
+        || matches!(song, Some("ed" | "ending"))
     {
         return Some("Outro");
     }
@@ -138,6 +139,20 @@ pub fn classify_chapter_title(title: &str) -> Option<&'static str> {
     None
 }
 
+/// The theme-song word of an anime rip's chapter title ("OP", "[ED 2]",
+/// "Ending Theme"): its first word, when the rest is only a number or
+/// "theme"/"song". `None` for any other title, so "The Ending" and "Ed meets
+/// the king" stay ordinary chapters.
+fn theme_song(lc: &str) -> Option<&str> {
+    let mut words = lc
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty());
+    let first = words.next()?.trim_end_matches(|c: char| c.is_ascii_digit());
+    words
+        .all(|w| w.bytes().all(|b| b.is_ascii_digit()) || w == "theme" || w == "song")
+        .then_some(first)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -149,6 +164,21 @@ mod tests {
         assert_eq!(classify_chapter_title("Intro 1"), Some("Intro"));
         assert_eq!(classify_chapter_title("End credits"), Some("Outro"));
         assert_eq!(classify_chapter_title("Credits"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Rolling credits"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Opening Credits"), Some("Intro"));
+        assert_eq!(classify_chapter_title("OP"), Some("Intro"));
+        assert_eq!(classify_chapter_title("ED"), Some("Outro"));
+        assert_eq!(classify_chapter_title("ED 2"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Ending"), Some("Outro"));
+        assert_eq!(classify_chapter_title("Ending Theme"), Some("Outro"));
+        assert_eq!(classify_chapter_title("[ED]"), Some("Outro"));
+        assert_eq!(classify_chapter_title("OP1"), Some("Intro"));
+        assert_eq!(classify_chapter_title("The Ending"), None);
+        assert_eq!(classify_chapter_title("Ed meets the king"), None);
+        assert_eq!(classify_chapter_title("Ending the feud"), None);
+        assert_eq!(classify_chapter_title("Pending"), None);
+        assert_eq!(classify_chapter_title("Edward"), None);
+        assert_eq!(classify_chapter_title("Operation"), None);
         assert_eq!(classify_chapter_title("Previously on"), Some("Recap"));
         assert_eq!(classify_chapter_title("Recap"), Some("Recap"));
         assert_eq!(classify_chapter_title("Next on"), Some("Preview"));
