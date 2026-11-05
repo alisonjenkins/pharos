@@ -996,18 +996,25 @@ fn PagedGrid(
         let state = pager.read();
         let loaded = u32::try_from(state.items().len()).unwrap_or(u32::MAX);
         if target < loaded {
-            let placed = match land.take() {
+            let kept = land.take();
+            let placed = match kept {
                 Some(top) => platform::scroll_tile_to(target, top),
                 None => platform::scroll_to_tile(target),
             };
             if !placed {
+                // A kept place that cannot be reached opens at the top (V470).
+                if kept.is_some() {
+                    platform::scroll_to_top();
+                }
                 platform::warn(&format!(
                     "pharos: grid tile {target} not in the page to scroll to"
                 ));
             }
             jump.set(None);
         } else if state.failed() || !state.has_more() {
-            land.set(None);
+            if land.take().is_some() {
+                platform::scroll_to_top();
+            }
             jump.set(None);
         } else if !state.in_flight() {
             requests.send(Ask::Through(target));
