@@ -2333,6 +2333,7 @@ mod tests {
             &self,
             _: &CallInfo,
             _: ItemRef,
+            _: bool,
         ) -> Result<pharos_client::api::Lyrics, ClientError> {
             Ok(Default::default())
         }

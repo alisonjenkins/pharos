@@ -84,7 +84,7 @@ async fn native_lyrics_serve_sidecars_and_answer_nothing_without_them() {
     );
     let api = NativeApi::new(&session);
     assert_eq!(
-        api.lyrics(&CallInfo::default(), ItemRef::Real(403))
+        api.lyrics(&CallInfo::default(), ItemRef::Real(403), false)
             .await
             .unwrap(),
         Lyrics {
@@ -107,6 +107,7 @@ async fn native_lyrics_serve_sidecars_and_answer_nothing_without_them() {
                     },
                 ],
             }],
+            words_pending: false,
         }
     );
     let (synced, source, lines) = wire_lyrics(&session, 401).await;

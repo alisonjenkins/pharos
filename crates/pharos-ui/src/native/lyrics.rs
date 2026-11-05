@@ -342,6 +342,7 @@ mod tests {
                     words: Vec::new(),
                 })
                 .collect(),
+            words_pending: false,
         }
     }
 
@@ -356,6 +357,7 @@ mod tests {
                     words: Vec::new(),
                 })
                 .collect(),
+            words_pending: false,
         }
     }
 
@@ -460,6 +462,7 @@ mod tests {
                     words: Vec::new(),
                 },
             ],
+            words_pending: false,
         };
         assert!((line_progress(&l, 0, 900) - 0.0).abs() < f64::EPSILON);
         assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
@@ -487,6 +490,7 @@ mod tests {
                     words: Vec::new(),
                 },
             ],
+            words_pending: false,
         };
         // No stamp at 0, so (1000, 0) -> (1500, 6); "world" (1 syllable = 700 ms) ends at 2200.
         assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
@@ -506,6 +510,7 @@ mod tests {
                     start_ms: 6_000,
                 }],
             }],
+            words_pending: false,
         };
         assert!((line_progress(&l, 0, 5_500) - 0.0).abs() < f64::EPSILON);
     }
@@ -563,6 +568,7 @@ mod tests {
             Lyrics {
                 synced: false,
                 lines,
+                words_pending: false,
             },
             0,
         );
