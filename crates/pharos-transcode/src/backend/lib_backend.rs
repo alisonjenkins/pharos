@@ -65,15 +65,6 @@ impl FfmpegBackend for LibBackend {
         Box::pin(async { Err(BackendError::NotImplemented) })
     }
 
-    fn transcode_image<'a>(
-        &'a self,
-        _src: &'a Path,
-        _target_ext: &'a str,
-        _out: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'a>> {
-        Box::pin(async { Err(BackendError::NotImplemented) })
-    }
-
     fn waveform_rms<'a>(
         &'a self,
         _src: &'a Path,
