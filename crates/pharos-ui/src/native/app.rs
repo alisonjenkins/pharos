@@ -214,6 +214,11 @@ fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
     taken
 }
 
+/// How often, and how many times, to ask again for word times the aligner is
+/// still working out (B499): a song takes it a minute or three on a CPU.
+const ALIGN_ASK_MS: u32 = 20_000;
+const ALIGN_ASKS: u32 = 15;
+
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
 const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
 const IMPORT_ACCEPT: &str = ".toml,application/toml";
@@ -3454,7 +3459,10 @@ fn Player(
                     return Err(());
                 };
                 // A failed lookup is not "no lyrics": the chip says which.
-                match api.lyrics(&call("watch", "lyrics"), id, false).await {
+                // Karaoke asks for word times (B499, ADR-0066), as the
+                // listener left it when the song started.
+                let want_words = super::listen::karaoke_on();
+                match api.lyrics(&call("watch", "lyrics"), id, want_words).await {
                     Ok(lyrics) => {
                         platform::info(&format!(
                             "pharos: lyrics lines={} synced={}",
@@ -3469,6 +3477,47 @@ fn Player(
                     }
                 }
             }
+        }
+    });
+
+    // Word times the aligner was still working out (B499) arrive on a later
+    // ask; the lyrics shown meanwhile keep their estimate. Kept with the
+    // song they are for, so they never outlive it on screen.
+    let mut aligned = use_signal(|| None::<(ItemRef, pharos_client::api::Lyrics)>);
+    use_effect({
+        let id = p.detail.item.id;
+        move || {
+            let pending = matches!(&*lyrics.read(), Some(Ok(Some(l))) if l.words_pending);
+            if !pending {
+                return;
+            }
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            spawn(async move {
+                for _ in 0..ALIGN_ASKS {
+                    platform::sleep_ms(ALIGN_ASK_MS).await;
+                    match api.lyrics(&call("watch", "lyrics"), id, true).await {
+                        Ok(next) if next.words_pending => {}
+                        // The aligner failed or found no words: keep the
+                        // estimate already on screen.
+                        Ok(next) if next.lines.iter().all(|l| l.words.is_empty()) => {
+                            platform::info("pharos: lyrics word times not found");
+                            return;
+                        }
+                        Ok(next) => {
+                            platform::info("pharos: lyrics word times arrived");
+                            aligned.set(Some((id, next)));
+                            return;
+                        }
+                        Err(e) => {
+                            platform::warn(&format!("pharos: lyrics word times unavailable: {e}"));
+                            return;
+                        }
+                    }
+                }
+                platform::info("pharos: lyrics word times still pending, gave up");
+            });
         }
     });
 
@@ -4386,7 +4435,10 @@ fn Player(
                 media: media(),
                 previous: near.previous,
                 next,
-                lyrics: lyrics.read().clone().and_then(Result::ok).flatten(),
+                lyrics: aligned()
+                    .filter(|(for_id, _)| *for_id == p.detail.item.id)
+                    .map(|(_, l)| l)
+                    .or_else(|| lyrics.read().clone().and_then(Result::ok).flatten()),
                 lyrics_loading: lyrics.read().is_none(),
                 lyrics_failed: matches!(*lyrics.read(), Some(Err(()))),
                 playing: queued.then_some(playing_id),
