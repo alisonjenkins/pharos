@@ -114,8 +114,8 @@ If `Agent isolation: "worktree"` errors with "not in a git repository", restart 
 Dioxus UI lives in `crates/pharos-ui` and compiles to WASM via the
 `dx` CLI shipped in the devShell.
 
-- Dev loop: `nix develop --command dx serve --package pharos-ui` (hot reload).
-- Release bundle: `nix develop --command dx build --package pharos-ui --release`.
+- Dev loop: `nix develop --command dx serve --package pharos-ui --bin pharos-ui-web` (hot reload).
+- Release bundle: `nix develop --command dx build --package pharos-ui --bin pharos-ui-web --release`.
 - Output lands under `target/dx/pharos-ui/release/web/public/`.
 - Point the server at it via `[server].ui_dir` in `config.toml`; pharos serves the bundle at `/ui/` (ADR-0038). The OCI image carries the release bundle at `/share/pharos-ui`.
 - WASM target is pinned in `rust-toolchain.toml`; `cargo build --target wasm32-unknown-unknown` works without extra setup inside the devShell.
