@@ -210,6 +210,7 @@ pub struct Detail {
 pub struct Lyrics {
     pub synced: bool,
     pub lines: Vec<LyricLine>,
+    pub words_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,7 +381,12 @@ pub trait PharosApi {
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
-    async fn lyrics(&self, call: &CallInfo, id: ItemRef) -> Result<Lyrics, ClientError>;
+    async fn lyrics(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        want_words: bool,
+    ) -> Result<Lyrics, ClientError>;
     /// The next `count` songs for `spec`, given what was heard or queued
     /// (`recent`, oldest first). Short with `exhausted` when it runs out.
     async fn mix(
@@ -854,12 +860,18 @@ impl PharosApi for NativeApi {
         }
     }
 
-    async fn lyrics(&self, call: &CallInfo, id: ItemRef) -> Result<Lyrics, ClientError> {
+    async fn lyrics(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        want_words: bool,
+    ) -> Result<Lyrics, ClientError> {
         let mut req = self.library.lyrics_request();
         {
             let mut p = req.get();
             call.write(p.reborrow().init_ctx());
-            set_item_ref(p.init_id(), id);
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_want_words(want_words);
         }
         let reply = req.send().promise.await?;
         match reply
@@ -890,6 +902,7 @@ impl PharosApi for NativeApi {
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,
+                    words_pending: l.get_words_pending(),
                 })
             }
             lyrics_result::Error(e) => Err(ClientError::from_api(e?)),

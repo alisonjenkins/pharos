@@ -2345,7 +2345,7 @@ fn Player(
                     return Err(());
                 };
                 // A failed lookup is not "no lyrics": the chip says which.
-                match api.lyrics(&call("watch", "lyrics"), id).await {
+                match api.lyrics(&call("watch", "lyrics"), id, false).await {
                     Ok(lyrics) => {
                         platform::info(&format!(
                             "pharos: lyrics lines={} synced={}",
