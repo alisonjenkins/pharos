@@ -628,12 +628,49 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
 /// The `<option>` value of "every genre" and "watched or not".
 const ANY: &str = "";
 
+/// The `sessionStorage` key of the last filter bar choice for `library`.
+fn choice_key(library: ItemRef) -> String {
+    format!("pharos.library.{library}.choice")
+}
+
+/// The choice a library opens on (B560): the one its URL names, so Back
+/// and Forward bring it back; else the one last made for it in this tab, so
+/// a breadcrumb or library button does too; else the default.
+fn opening_choice(library: ItemRef) -> Narrow {
+    let search = platform::current_search();
+    if Route::parse(&platform::current_path()) == Route::Browse(library) && !search.is_empty() {
+        return Narrow::from_query(&search);
+    }
+    match platform::session_get(&choice_key(library)) {
+        Ok(Some(query)) => Narrow::from_query(&query),
+        Ok(None) => Narrow::default(),
+        Err(e) => {
+            platform::warn(&format!("pharos: library {library} filters not read: {e}"));
+            Narrow::default()
+        }
+    }
+}
+
 /// A library's grid under its filter bar (B312/V252): the bar's choice is
 /// the listing, and a new choice starts the grid afresh from its first page.
+/// The choice is kept in the URL and for the tab (B560).
 #[component]
 fn LibraryGrid(first: Page, base: Listing) -> Element {
     let ctx = use_context::<Ctx>();
-    let narrow = use_signal(Narrow::default);
+    let library = base.parent;
+    let opened = use_hook(|| opening_choice(library));
+    let narrow = use_signal(|| opened.clone());
+    use_effect(move || {
+        let query = narrow.read().to_query();
+        if let Err(e) = platform::session_set(&choice_key(library), &query) {
+            platform::warn(&format!("pharos: library {library} filters not kept: {e}"));
+        }
+        let path = format!("{}{query}", Route::Browse(library).path());
+        let here = Route::parse(&platform::current_path()) == Route::Browse(library);
+        if here && platform::current_search() != query {
+            platform::replace(&path);
+        }
+    });
     let genres = use_signal(Vec::<String>::new);
     let opening = base.clone();
     // The library opened on its default listing; any other is fetched here.
