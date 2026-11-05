@@ -173,6 +173,6 @@ async fn lyrics_follow_the_users_folder_policy() {
         enabled_folders: vec![fx.lib_a_wire.clone()],
         ..user.policy
     };
-    let hidden = lyrics::for_item(&fx.state, &user, fx.other_item_id).await;
+    let hidden = lyrics::for_item(&fx.state, &user, fx.other_item_id, false).await;
     assert!(matches!(hidden, Err(DetailError::Hidden(_))), "{hidden:?}");
 }
