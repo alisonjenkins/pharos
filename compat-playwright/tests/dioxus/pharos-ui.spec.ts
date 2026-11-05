@@ -962,8 +962,8 @@ test.describe("pharos Dioxus UI", () => {
       await expect.poll(async () => (await place()).at).toBeGreaterThan(100);
       // Past the settle delay, so the place is kept.
       await page.waitForTimeout(500);
-      const left = await place();
-      const name = (await tiles.nth(left.at).innerText()).trim();
+      let left = await place();
+      let name = (await tiles.nth(left.at).innerText()).trim();
 
       const backTo = async (how: string) => {
         await expect(page).toHaveURL(/\?dir=desc&watched=unwatched$/, { timeout: 15_000 });
@@ -983,6 +983,18 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
       await page.goBack();
       await backTo("back");
+
+      // A title opened straight after scrolling, inside the settle delay,
+      // still comes back to that scroll.
+      await page.mouse.move(400, 400);
+      await page.mouse.wheel(0, 120);
+      await expect.poll(async () => (await place()).top).not.toBe(left.top);
+      left = await place();
+      name = (await tiles.nth(left.at).innerText()).trim();
+      await tiles.nth(left.at).locator("a").first().click();
+      await expect(page.locator("article.pharos-title")).toBeVisible({ timeout: 15_000 });
+      await page.goBack();
+      await backTo("back inside the settle delay");
 
       // The breadcrumb's bare library link: the tab's last choice and place.
       await tiles.nth(left.at).locator("a").first().click();
