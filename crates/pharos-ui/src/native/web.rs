@@ -408,6 +408,7 @@ pub fn toggle_play(video_id: &str) {
         return;
     };
     if v.paused() {
+        wake_tap(&v);
         if let Err(e) = v.play() {
             warn(&format!("pharos: play() refused: {e:?}"));
         }
@@ -419,6 +420,7 @@ pub fn toggle_play(video_id: &str) {
 /// Start the `<video>`. A refused `play()` (autoplay policy) leaves it paused.
 pub fn play(video_id: &str) {
     if let Some(v) = video_element(video_id) {
+        wake_tap(&v);
         if let Err(e) = v.play() {
             warn(&format!("pharos: play() refused: {e:?}"));
         }
@@ -2316,6 +2318,30 @@ fn seconds_prop_ms(target: &JsValue, name: &str) -> Option<f64> {
         .map(|s| s * 1000.0)
 }
 
+fn context_state(context: &web_sys::AudioContext) -> String {
+    js_sys::Reflect::get(context, &JsValue::from_str("state"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// A routed element plays into a suspended `AudioContext` in silence, so
+/// wake the context of `media`'s tap before it plays.
+fn wake_tap(media: &web_sys::HtmlMediaElement) {
+    let Some(context) = with_tap(media, |t| t.context.clone()) else {
+        return;
+    };
+    let state = context_state(&context);
+    if super::resume::wakes_context(&state) {
+        info(&format!(
+            "pharos: resume context was suspended state={state}"
+        ));
+        if let Err(e) = context.resume() {
+            warn(&format!("pharos: resume context resume() refused: {e:?}"));
+        }
+    }
+}
+
 /// The media element `id` and its audio path as a resume finds them.
 pub fn resume_context(id: &str) -> super::resume::ResumeContext {
     use super::resume::{AudioPath, ResumeContext};
@@ -2337,10 +2363,7 @@ pub fn resume_context(id: &str) -> super::resume::ResumeContext {
         "direct"
     };
     let audio = with_tap(&media, |t| AudioPath {
-        context_state: js_sys::Reflect::get(&t.context, &JsValue::from_str("state"))
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_else(|| "unknown".to_owned()),
+        context_state: context_state(&t.context),
         base_latency_ms: seconds_prop_ms(&t.context, "baseLatency"),
         output_latency_ms: seconds_prop_ms(&t.context, "outputLatency"),
     });
