@@ -1,6 +1,6 @@
 # ADR-0058: Native clients fetch media with a Media-scoped token
 
-- **Status:** Accepted
+- **Status:** Accepted; its revocation consequence is superseded by ADR-0059
 - **Date:** 2026-11-04T23:30:00Z
 - **Deciders:** Alison Jenkins
 
@@ -36,13 +36,9 @@ count in `pharos_token_scope_refused_total{scope="media"}`.
 ## Consequences
 
 - The Full device token never appears in a URL.
-- A leaked media token reads that user's media for up to the TTL, unless the
-  session ends first. It is issued as a child of the session's device token
-  (`auth_tokens.parent_hash`, `ON DELETE CASCADE`), so signing out, revoking
-  the device or the other sessions, revoking by id and deleting the user all
-  remove it in the same statement; a disabled user is refused on every
-  lookup. The TTL, capped at a day, bounds only a leak while the session
-  lives (B543, V438).
+- A leaked media token reads that user's media for up to the TTL. It is not
+  revoked with the device token or by signing out in this slice (follow-up);
+  the TTL, capped at a day, is the bound.
 - The stream prefixes admit everything under `/videos/{id}/` and
   `/audio/{id}/`, including subtitles, trickplay tiles, attachments and
   lyrics, which a native player also needs.
