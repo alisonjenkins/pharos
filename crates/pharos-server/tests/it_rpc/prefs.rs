@@ -189,3 +189,43 @@ async fn prefs_calls_are_counted_under_their_interface() {
         );
     }
 }
+
+/// `description.language` is the user's Jellyfin `DescriptionLanguagePreference`
+/// (ADR-0062), not a pref row: a set shows in the configuration blob next to
+/// the fields already there, reads back, and a value that is not a language
+/// is refused. Disarm check: with the `DESCRIPTION_LANGUAGE` branch in
+/// `Prefs::write` removed, the value lands in `user_prefs` and the blob
+/// assertion fails.
+#[actix_web::test]
+async fn the_description_language_is_kept_in_the_user_configuration() {
+    use pharos_core::PreferenceStore;
+    let fx = seed_rich().await;
+    let stores = fx.state.stores.clone();
+    stores
+        .set_user_configuration(fx.user_id, r#"{"AudioLanguagePreference":"jpn"}"#)
+        .await
+        .unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            const LANG: &str = "description.language";
+            assert_eq!(get(&prefs, LANG).await, Got::NotSet);
+            set(&prefs, LANG, b"fra").await.expect("stored");
+            assert_eq!(get(&prefs, LANG).await, Got::Value(b"fra".to_vec()));
+            let raw: serde_json::Value = serde_json::from_str(
+                &stores
+                    .get_user_configuration(fx.user_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(raw["DescriptionLanguagePreference"], "fra");
+            assert_eq!(raw["AudioLanguagePreference"], "jpn");
+            assert!(set(&prefs, LANG, b"not a language").await.is_err());
+            assert_eq!(get(&prefs, LANG).await, Got::Value(b"fra".to_vec()));
+            set(&prefs, LANG, b"").await.expect("cleared");
+            assert_eq!(get(&prefs, LANG).await, Got::NotSet);
+        })
+        .await;
+}
