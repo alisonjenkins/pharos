@@ -163,6 +163,7 @@ pub async fn latest(
             .then(b.id.cmp(&a.id))
     });
     typed.truncate(limit.unwrap_or(LATEST_MAX).min(LATEST_MAX) as usize);
+    crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
     let ids: Vec<u64> = typed.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -218,11 +219,12 @@ pub async fn resume(
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     let start = start.min(total);
     let end = limit.map_or(total, |n| start.saturating_add(n)).min(total);
-    let page: Vec<MediaItem> = items
+    let mut page: Vec<MediaItem> = items
         .into_iter()
         .skip(start as usize)
         .take((end - start) as usize)
         .collect();
+    crate::services::metadata_text::localize_items(state, user.id, page.iter_mut()).await;
     let ids: Vec<u64> = page.iter().map(|i| i.id).collect();
     let user_data = state
         .stores
@@ -333,16 +335,23 @@ pub async fn next_up(
     });
     picks.truncate(limit.unwrap_or(NEXT_UP_DEFAULT).max(1) as usize);
     let total = u32::try_from(picks.len()).unwrap_or(u32::MAX);
+    let mut items: Vec<(MediaItem, UserItemData)> = picks
+        .into_iter()
+        .map(|(idx, item)| {
+            (
+                item.clone(),
+                user_data.get(idx).copied().unwrap_or_default(),
+            )
+        })
+        .collect();
+    crate::services::metadata_text::localize_items(
+        state,
+        user.id,
+        items.iter_mut().map(|(i, _)| i),
+    )
+    .await;
     Ok(ListPage {
-        items: picks
-            .into_iter()
-            .map(|(idx, item)| {
-                (
-                    item.clone(),
-                    user_data.get(idx).copied().unwrap_or_default(),
-                )
-            })
-            .collect(),
+        items,
         total,
         start: 0,
     })
@@ -660,7 +669,22 @@ pub struct QueryPage {
 /// `SortBy=Random` cannot be a stable SQL order: the filtered set is fetched
 /// unpaged, shuffled with a seed (the query's, else one from the user id, so
 /// paging does not reshuffle), then tag- and play-state-filtered and paged.
+///
+/// Descriptions are in the user's language (ADR-0062).
 pub async fn query(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<QueryPage, DomainError> {
+    let mut page = query_unlocalized(state, user, parent_id, q).await?;
+    crate::services::metadata_text::localize_items(state, user.id, page.items.iter_mut()).await;
+    Ok(page)
+}
+
+/// [`query`] with the stored descriptions, for a caller that reads no
+/// overview: it skips the configuration read and translation lookup.
+async fn query_unlocalized(
     state: &AppState,
     user: &User,
     parent_id: Option<&str>,
@@ -699,8 +723,9 @@ pub async fn query(
     let total = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
     let start = q.start_index as usize;
     let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    let items: Vec<MediaItem> = filtered.into_iter().skip(start).take(take).collect();
     Ok(QueryPage {
-        items: filtered.into_iter().skip(start).take(take).collect(),
+        items,
         total,
         start: q.start_index,
     })
@@ -932,7 +957,8 @@ pub async fn index(
         return Ok(ListIndex { letters, genres });
     }
     let store = |e: DomainError| GroupError::Store(e.to_string());
-    let listed = query(state, user, parent_id, &unpaged)
+    // Titles and dates only: no description to localize.
+    let listed = query_unlocalized(state, user, parent_id, &unpaged)
         .await
         .map_err(store)?;
     let parent = resolve_parent_filter(state, parent_id)
@@ -1011,10 +1037,13 @@ pub async fn detail(
     crate::services::access::check_item(state, user, id, "item")
         .await
         .map_err(DetailError::Hidden)?;
-    let item = state.stores.get(id).await.map_err(|e| match e {
+    let mut item = state.stores.get(id).await.map_err(|e| match e {
         DomainError::NotFound(_) => DetailError::NotFound,
         other => DetailError::Store(other),
     })?;
+    // ADR-0062 — the description in the language `user` picked.
+    crate::services::metadata_text::localize_items(state, user.id, std::iter::once(&mut item))
+        .await;
     let user_data = state
         .stores
         .get_user_data(user.id, id)
