@@ -17,7 +17,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery, RecoveryBudget,
+    is_loading, Engine, FragmentLoad, MediaState, OnFatal, OnFragment, PlaybackEngine, Recovery,
+    RecoveryBudget,
 };
 use super::seen::MemberSeen;
 use super::together::{self, ClockReply, GroupClient, GroupError, GroupSink, GroupSummary, Member};
@@ -344,6 +345,7 @@ pub fn media_state(video_id: &str) -> MediaState {
         paused: v.paused(),
         volume: v.volume(),
         muted: v.muted(),
+        loading: is_loading(v.seeking(), v.ready_state(), v.paused(), v.ended()),
     })
 }
 

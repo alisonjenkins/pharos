@@ -2814,7 +2814,10 @@ fn Player(
     };
 
     let controls = Controls {
-        media: media(),
+        media: MediaState {
+            loading: media().loading && failed().is_none(),
+            ..media()
+        },
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
         segments: p.detail.segments.clone(),
