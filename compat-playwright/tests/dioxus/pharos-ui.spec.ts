@@ -23,12 +23,22 @@ const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
 
 // Opens the first title the top bar's search suggests for `term`. The
 // suggestions are the first hits of the same search the palette runs, in
-// its order (the bar replaced the old Find page).
+// its order (the bar replaced the old Find page). Only a hit naming the
+// term counts, so a list still showing an earlier search is never clicked,
+// and the helper returns once the page has moved to that hit.
 async function openFirstHit(page: Page, term: string): Promise<void> {
   await page.getByRole("combobox", { name: "Search all libraries" }).fill(term);
-  const hit = page.getByRole("option").first().getByRole("link");
+  const hit = page
+    .getByRole("option")
+    .filter({ hasText: new RegExp(term, "i") })
+    .first()
+    .getByRole("link");
   await expect(hit).toBeVisible({ timeout: 15_000 });
+  const href = await hit.getAttribute("href");
   await hit.click();
+  if (href) {
+    await expect(page).toHaveURL((url) => url.pathname === href, { timeout: 15_000 });
+  }
 }
 
 // Signs in on a small window and answers a home rail that overflows
