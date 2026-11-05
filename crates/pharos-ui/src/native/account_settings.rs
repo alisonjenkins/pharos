@@ -100,6 +100,35 @@ pub const DESCRIPTION_LANGUAGES: [(&str, &str); 10] = [
     ("OriginalLanguage", "Original language"),
 ];
 
+/// The selector value for a stored description language. jellyfin-web saves
+/// the field unchecked, so it may hold an alias the server accepts (`fr`,
+/// `fre`, `en`) that names no option; this maps those onto the option, and
+/// leaves anything else as it is.
+pub fn description_language_option(stored: &str) -> &str {
+    let trimmed = stored.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let code = match lower.as_str() {
+        "" | "en" | "eng" => "",
+        "ja" => "jpn",
+        "fr" | "fre" => "fra",
+        "de" | "ger" => "deu",
+        "es" => "spa",
+        "it" => "ita",
+        "pt" => "por",
+        "ko" => "kor",
+        "zh" | "chi" => "zho",
+        "originallanguage" => "OriginalLanguage",
+        _ => {
+            return DESCRIPTION_LANGUAGES
+                .iter()
+                .map(|(v, _)| *v)
+                .find(|v| v.eq_ignore_ascii_case(trimmed))
+                .unwrap_or(stored)
+        }
+    };
+    code
+}
+
 /// How the last change went: `Ok` shows the confirmation, `Err` the message.
 pub type Outcome = Result<(), String>;
 
@@ -326,6 +355,21 @@ pub fn AccountView(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An alias jellyfin-web stored selects its option.
+    #[test]
+    fn a_stored_alias_selects_its_description_language_option() {
+        assert_eq!(description_language_option("fr"), "fra");
+        assert_eq!(description_language_option("fre"), "fra");
+        assert_eq!(description_language_option("en"), "");
+        assert_eq!(description_language_option("JPN"), "jpn");
+        assert_eq!(
+            description_language_option("originallanguage"),
+            "OriginalLanguage"
+        );
+        assert_eq!(description_language_option("deu"), "deu");
+        assert_eq!(description_language_option("xx"), "xx");
+    }
 
     /// V474: two quick picks write one after the other, and the server
     /// ends on the newer one, whichever order the answers would have come in.

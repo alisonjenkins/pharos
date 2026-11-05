@@ -275,7 +275,12 @@ fn render_languages(
     let d = draft.read().clone();
     let audio_value = d.audio_language_preference.clone();
     let subtitle_value = d.subtitle_language_preference.clone();
-    let description_value = d.description_language_preference.clone();
+    // The selected option; an alias stored by jellyfin-web (`fr`) selects
+    // its option (`fra`) without the draft changing until the viewer picks.
+    let description_value = crate::native::account_settings::description_language_option(
+        &d.description_language_preference,
+    )
+    .to_string();
     let cultures_for_audio = cultures.clone();
     let cultures_for_subtitle = cultures;
     rsx! {
@@ -405,6 +410,21 @@ mod tests {
         assert!(html.contains("id=\"prefs-description-language\""), "{html}");
         assert!(html.contains("<option value=\"jpn\" selected"), "{html}");
         assert!(html.contains("Original language"), "{html}");
+    }
+
+    /// An alias the Jellyfin save stored unchecked selects its option.
+    #[test]
+    fn languages_select_the_option_for_a_stored_alias() {
+        let mut dom = VirtualDom::new(|| {
+            let draft = use_signal(|| UserConfiguration {
+                description_language_preference: "fr".into(),
+                ..Default::default()
+            });
+            render_languages(draft, Vec::new())
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("<option value=\"fra\" selected"), "{html}");
     }
 
     #[test]
