@@ -577,6 +577,7 @@ impl crate::ServerConfigStore for PostgresStore {
 
     /// LIB-B2 — distinct `(series_folder, series_name)` keys (see the sqlite
     /// twin). Used by the API to resolve a `?ParentId=<series synth id>`.
+    #[tracing::instrument(skip(self))]
     async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String)>(
             "SELECT DISTINCT series_folder, series_name FROM media_items \
@@ -588,6 +589,7 @@ impl crate::ServerConfigStore for PostgresStore {
     }
 
     /// LIB-B2 — distinct `(series_folder, series_name, season_number)` keys.
+    #[tracing::instrument(skip(self))]
     async fn distinct_season_keys(&self) -> Result<Vec<(Option<String>, String, i64)>, StoreError> {
         // season_number is INTEGER (INT4) in the postgres schema — decoding
         // it as i64 aborts the whole query ("mismatched types … INT4"),
@@ -606,6 +608,7 @@ impl crate::ServerConfigStore for PostgresStore {
     }
 
     /// LIB-B2 — distinct non-empty artist + album_artist names.
+    #[tracing::instrument(skip(self))]
     async fn distinct_artist_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT artist AS n FROM media_items WHERE artist IS NOT NULL AND artist <> '' \
@@ -618,6 +621,7 @@ impl crate::ServerConfigStore for PostgresStore {
     }
 
     /// LIB-B2 — distinct non-empty album names.
+    #[tracing::instrument(skip(self))]
     async fn distinct_album_names(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT album FROM media_items WHERE album IS NOT NULL AND album <> ''",
@@ -629,6 +633,7 @@ impl crate::ServerConfigStore for PostgresStore {
 
     /// LIB-B2 — distinct raw `genre` probe strings (legacy ParentId=genre
     /// fallback; see the sqlite twin).
+    #[tracing::instrument(skip(self))]
     async fn distinct_genre_fields(&self) -> Result<Vec<String>, StoreError> {
         let rows = sqlx::query_as::<_, (String,)>(
             "SELECT DISTINCT genre FROM media_items WHERE genre IS NOT NULL AND genre <> ''",
