@@ -1080,11 +1080,17 @@ impl Drop for KeyListener {
 
 /// Call `on_key` with every key pressed anywhere in the page (its key, and
 /// whether Ctrl and the meta key are held); when it answers true the press
-/// is taken, so the browser does not act on it too.
+/// is taken, so the browser does not act on it too. A held key's repeats
+/// are not passed on, but a taken press keeps its repeats from the browser
+/// as well: a held Ctrl+K must not open Firefox's web search.
 pub fn on_key(mut on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> KeyListener {
+    let mut taken = false;
     let listener =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            if !e.repeat() && on_key(&e.key(), e.ctrl_key(), e.meta_key()) {
+            if !e.repeat() {
+                taken = on_key(&e.key(), e.ctrl_key(), e.meta_key());
+            }
+            if taken {
                 e.prevent_default();
             }
         });
