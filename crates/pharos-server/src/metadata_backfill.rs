@@ -490,7 +490,12 @@ where
     // Provider by kind: Episode prefers TVDB (fallback TMDB when TVDB isn't
     // configured); Movie is TMDB. When the kind's providers are all absent,
     // skip the item (leaves it eligible for a later pass with a key present).
-    item.metadata.provider_ids = trusted_provider_ids(&item);
+    // A cleared id must reach the store on every path, not only a Hit's
+    // `put`: a NoMatch stamps `none`, after which the old search id would
+    // pass `trusted_provider_ids` and be fetched as if an NFO named it.
+    let trusted = trusted_provider_ids(&item);
+    let ids_cleared = trusted != item.metadata.provider_ids;
+    item.metadata.provider_ids = trusted;
     let provider_ids = item.metadata.provider_ids.clone();
     let (matched_provider, resolved) = match item.kind {
         MediaKind::Movie => match tmdb {
@@ -581,6 +586,9 @@ where
                 );
             } else {
                 record_enrich(item.kind, EnrichOutcome::NoMatch);
+                if ids_cleared {
+                    store.put(item.clone()).await?;
+                }
                 store
                     .set_item_match(item.id, matched_provider, "", "none", None, now)
                     .await?;
@@ -619,6 +627,9 @@ where
                     episode,
                     "T9 metadata backfill: detail fetch returned nothing — id resolved but no record; stamped, retried at TTL"
                 );
+                if ids_cleared {
+                    store.put(item.clone()).await?;
+                }
                 store
                     .set_item_match(
                         item.id,
@@ -2954,6 +2965,42 @@ mod tests {
         assert_eq!(got.match_source.as_deref(), Some("search"));
         assert_eq!(got.match_external_id.as_deref(), Some("76666"));
         assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("76666"));
+    }
+
+    /// A re-admitted episode whose new search finds nothing loses the id its
+    /// old search stamped too. Otherwise the `none` stamp makes that id look
+    /// trusted, and the next pass fetches it as if an NFO named it.
+    /// Disarm check: dropping the NoMatch `put` fails this.
+    #[tokio::test]
+    async fn a_re_admitted_episodes_old_id_is_dropped_when_its_search_finds_nothing() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
+            .await
+            .unwrap();
+        readmit_stale_tv_matches(&s).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_search(vec![]);
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("none"));
+        assert_eq!(got.metadata.provider_ids.tvdb, None);
     }
 
     #[test]
