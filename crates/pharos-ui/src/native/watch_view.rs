@@ -121,6 +121,13 @@ pub(super) fn total_ms(media: &MediaState, runtime_ms: u64) -> u64 {
     }
 }
 
+/// Whether Ctrl or Cmd is held: such a key is a shortcut of the browser or
+/// the palette, never a transport key.
+pub(super) fn chorded(evt: &KeyboardEvent) -> bool {
+    let m = evt.modifiers();
+    m.ctrl() || m.meta()
+}
+
 /// What a key does to the transport, on the video and music pages alike:
 /// space or k plays and pauses, the arrows seek and set the volume, m mutes.
 pub(super) fn transport_key(key: &Key, media: &MediaState) -> Option<Control> {
@@ -262,6 +269,11 @@ pub fn WatchView(
     let shortcuts = use_shortcuts(media, c.previous, c.next, on_control);
     let on_key = move |evt: KeyboardEvent| {
         wake();
+        // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
+        // a bare `k` toggles play, the chord must not.
+        if chorded(&evt) {
+            return;
+        }
         let key = evt.key();
         let control = shortcuts
             .key(&key, evt.modifiers().shift())

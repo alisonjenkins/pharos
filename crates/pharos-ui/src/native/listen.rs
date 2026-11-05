@@ -15,7 +15,7 @@ use super::queue::{Entry, QueueAction, Source};
 use super::style_picker::StylePicker;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
-    total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
+    chorded, total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
 };
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef, Lyrics};
 
@@ -226,6 +226,10 @@ pub fn ListenView(
     };
     let meta = meta_line(year, &genres);
     let on_key = move |evt: KeyboardEvent| {
+        // Ctrl+K opens the palette; it must not also toggle play.
+        if chorded(&evt) {
+            return;
+        }
         let key = evt.key();
         let control = shortcuts
             .key(&key, evt.modifiers().shift())
