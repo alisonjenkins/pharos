@@ -484,8 +484,8 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     }
 }
 
-/// Set `line = -2` on each cue in the `TextTrackCueList` `cues` still placed
-/// by the browser (`line` is `"auto"`), so its last line sits one line above
+/// Set `line = -2` on each horizontal cue in the `TextTrackCueList` `cues`
+/// still placed by the browser (`line` is `"auto"`), so its last line sits one line above
 /// the picture's bottom edge instead of on it (B545). `line` is the standard
 /// `VTTCue` setting, so Firefox honours it too, unlike the
 /// `::-webkit-media-text-track-*` pseudo-elements.
@@ -498,15 +498,20 @@ fn lift_cues(cues: &JsValue) {
         .and_then(|n| n.as_f64())
         .unwrap_or(0.0) as u32;
     let line = JsValue::from_str("line");
+    let vertical = JsValue::from_str("vertical");
+    let text = |cue: &JsValue, key: &JsValue| {
+        js_sys::Reflect::get(cue, key)
+            .ok()
+            .and_then(|v| v.as_string())
+    };
     for i in 0..length {
         let Ok(cue) = js_sys::Reflect::get_u32(cues, i) else {
             continue;
         };
-        if js_sys::Reflect::get(&cue, &line)
-            .ok()
-            .and_then(|v| v.as_string())
-            .as_deref()
-            == Some("auto")
+        // Only horizontal cues: for `vertical:rl`/`lr` a numeric line moves
+        // the cue sideways, not up.
+        if text(&cue, &line).as_deref() == Some("auto")
+            && text(&cue, &vertical).as_deref() == Some("")
         {
             let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(-2.0));
         }
