@@ -196,9 +196,9 @@ pub fn Crumbs(trail: Vec<Item>) -> Element {
                 for (i, item) in trail.into_iter().enumerate() {
                     li { key: "{item.id}",
                         if i == last {
-                            span { "aria-current": "page", "{item.name}" }
+                            span { "aria-current": "page", {display_name(&item)} }
                         } else {
-                            Link { to: open_route(&item), "{item.name}" }
+                            Link { to: open_route(&item), {display_name(&item)} }
                         }
                     }
                 }
@@ -508,7 +508,7 @@ pub fn TitleView(
                 if let Some(series) = &item.series_name {
                     p { class: "pharos-muted", "{series}" }
                 }
-                h2 { "{item.name}" }
+                h2 { {display_name(item)} }
                 if !facts.is_empty() {
                     p { class: "pharos-muted", "{facts}" }
                 }
