@@ -1357,6 +1357,45 @@ mod tests {
         assert_eq!(read_kind(Ok(Kind::Movie)), ItemKind::Movie);
     }
 
+    /// B559 / V469: a track whose delivery is newer than this build reads
+    /// whole, with neither URL, instead of failing the detail it is in.
+    /// Disarm check: with `read_tracks` using `t.get_delivery()?`, the read
+    /// fails with `NotInSchema(9)`.
+    #[test]
+    fn a_track_with_an_unknown_delivery_reads_with_no_subtitle_url() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let root: capnp::any_pointer::Builder<'_> = message.init_root();
+            let mut list = root.initn_as::<capnp::struct_list::Builder<'_, track::Owned>>(1);
+            let mut t = list.reborrow().get(0);
+            t.set_index(7);
+            t.set_url("/subtitles/7");
+            t.set_delivery(SubtitleDelivery::Image);
+        }
+        let mut bytes = capnp::serialize::write_message_to_words(&message);
+        // Segment table (8 bytes), list pointer, composite tag word, then the
+        // element's data section: `delivery` is the u16 at data offset 3.
+        let at = 8 + 8 + 8 + 3 * 2;
+        assert_eq!(bytes[at..at + 2], [SubtitleDelivery::Image as u8, 0]);
+        bytes[at] = 9;
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut bytes.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let root: capnp::any_pointer::Reader<'_> = reader.get_root().unwrap();
+        let tracks = read_tracks(root.get_as().unwrap()).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].index, 7);
+        assert_eq!(
+            (
+                tracks[0].vtt_url.as_deref(),
+                tracks[0].images_url.as_deref()
+            ),
+            (None, None)
+        );
+    }
+
     #[test]
     fn a_subtitle_delivery_newer_than_the_client_reads_as_burn() {
         assert_eq!(
