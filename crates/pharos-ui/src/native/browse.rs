@@ -1036,8 +1036,9 @@ fn PagedGrid(
             platform::warn(&format!("pharos: grid place not kept: {e}"));
         }
     };
-    // Kept once scrolling settles, never as the grid goes: by then the
-    // router has scrolled the page to the top for the next view (V470).
+    // Kept once scrolling settles, or on a click inside the settle delay
+    // (following a tile's link), never as the grid goes: by then the next
+    // view has moved the page (V470).
     use_hook(move || {
         place.map(|key| std::rc::Rc::new(platform::on_scroll_settled(move || keep_place(&key))))
     });
