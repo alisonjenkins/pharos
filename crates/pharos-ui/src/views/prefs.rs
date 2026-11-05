@@ -275,6 +275,7 @@ fn render_languages(
     let d = draft.read().clone();
     let audio_value = d.audio_language_preference.clone();
     let subtitle_value = d.subtitle_language_preference.clone();
+    let description_value = d.description_language_preference.clone();
     let cultures_for_audio = cultures.clone();
     let cultures_for_subtitle = cultures;
     rsx! {
@@ -323,6 +324,27 @@ fn render_languages(
                     }
                 }
             }
+            label {
+                class: "pharos-prefs-row",
+                "Show descriptions in: "
+                select {
+                    id: "prefs-description-language",
+                    value: "{description_value}",
+                    onchange: move |ev| {
+                        let mut c = draft.read().clone();
+                        c.description_language_preference = ev.value();
+                        draft.set(c);
+                    },
+                    for (value, label) in crate::native::account_settings::DESCRIPTION_LANGUAGES {
+                        option {
+                            key: "{value}",
+                            value: "{value}",
+                            selected: value == description_value,
+                            "{label}"
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -365,6 +387,24 @@ mod tests {
         assert_eq!(tabs[2], PrefsTab::Home);
         assert_eq!(tabs[3].label(), "Languages");
         assert_eq!(tabs[3].class_suffix(), "languages");
+    }
+
+    /// The legacy page saves the whole configuration, so it has to carry the
+    /// description language or a save would clear it.
+    #[test]
+    fn languages_offer_the_stored_description_language() {
+        let mut dom = VirtualDom::new(|| {
+            let draft = use_signal(|| UserConfiguration {
+                description_language_preference: "jpn".into(),
+                ..Default::default()
+            });
+            render_languages(draft, Vec::new())
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("id=\"prefs-description-language\""), "{html}");
+        assert!(html.contains("<option value=\"jpn\" selected"), "{html}");
+        assert!(html.contains("Original language"), "{html}");
     }
 
     #[test]
