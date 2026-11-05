@@ -84,15 +84,29 @@ impl MetadataProvider for SidecarArtworkProvider {
 /// ordering.
 pub(crate) fn detect_artwork(req: &MetadataRequest<'_>) -> Vec<ArtworkRef> {
     let mut out: Vec<ArtworkRef> = Vec::new();
+    // B558 — a scraper that wrote NFOs for another show also saved that
+    // show's images: `<episode>-thumb.jpg` beside the episode, and folder.jpg,
+    // fanart.jpg, logo.png in the show folder. Neither set is used then.
+    let foreign = super::nfo::identity::foreign_nfos(req);
+    let series_folder = req
+        .series
+        .filter(|_| req.kind == MediaKind::Episode)
+        .and_then(|s| s.series_folder.as_deref())
+        .map(Path::new);
+    let item_dir = req.path.parent();
+    let item_dir_is_show = item_dir.is_some() && item_dir == series_folder;
 
-    let stem = req
-        .path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    let stem = if foreign.episode {
+        ""
+    } else {
+        req.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+    };
 
     // Item-level: the directory holding the media file.
-    if let Some(dir) = req.path.parent() {
+    if let Some(dir) = item_dir.filter(|_| !(item_dir_is_show && foreign.show)) {
         detect_in_dir(dir, stem, &mut out);
     }
 
@@ -100,15 +114,9 @@ pub(crate) fn detect_artwork(req: &MetadataRequest<'_>) -> Vec<ArtworkRef> {
     // fanart.jpg / banner.jpg / logo.png that apply to every episode. Skip
     // when the series folder equals the item's own directory (avoids a
     // redundant second probe of the same dir).
-    if req.kind == MediaKind::Episode {
-        if let Some(folder) = req.series.and_then(|s| s.series_folder.as_deref()) {
-            let folder = Path::new(folder);
-            let same_as_item = req.path.parent() == Some(folder);
-            if !same_as_item {
-                // No per-file stem at the series level (folder-wide art).
-                detect_in_dir(folder, "", &mut out);
-            }
-        }
+    if let Some(folder) = series_folder.filter(|_| !item_dir_is_show && !foreign.show) {
+        // No per-file stem at the series level (folder-wide art).
+        detect_in_dir(folder, "", &mut out);
     }
 
     out
