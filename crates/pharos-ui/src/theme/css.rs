@@ -410,6 +410,28 @@ mod tests {
         assert!(!rule(SHEET, ".pharos-seek-played::after").contains("animation"));
     }
 
+    /// V483: every controls effect but Fade (the plain idle rule) has rules
+    /// of its own, and reduced motion strips their motion back to a fade.
+    #[test]
+    fn every_controls_effect_has_rules_and_reduced_motion_flattens_them() {
+        use crate::native::playback::OverlayEffect;
+        for fx in OverlayEffect::ALL {
+            if fx == OverlayEffect::Fade {
+                continue;
+            }
+            let sel = format!(":root[data-overlay-fx=\"{}\"]", fx.as_str());
+            assert!(SHEET.contains(&sel), "no rule for {sel}");
+        }
+        let reduced = reduced_motion_blocks(SHEET);
+        for stop in [
+            "transform: none !important",
+            "animation: none !important",
+            "mask: none !important",
+        ] {
+            assert!(reduced.contains(stop), "{stop} missing: {reduced}");
+        }
+    }
+
     #[test]
     fn the_sheet_uses_no_pre_010_variable() {
         const OLD_VARS: &[&str] = &[
