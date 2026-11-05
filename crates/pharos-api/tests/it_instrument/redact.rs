@@ -22,6 +22,7 @@ const NEW_PASSWORD: &str = "correct-horse-new-secret";
 const DEVICE_TOKEN: &str = "devtok-0123456789-secret";
 const QC_SECRET: &str = "qc-poll-secret-abcdef";
 const FIELD_SECRET: &str = "clientfield-secret-xyz";
+const MEDIA_TOKEN: &str = "mediatok-9876543210-secret";
 
 /// Echoes secrets back in its results so both directions are exercised.
 struct Boot;
@@ -33,7 +34,8 @@ struct TelemetryBoot;
 /// Answers `PlaybackGrant.decision` with an error, so the call completes.
 struct GrantBoot;
 
-/// Answers `Session.changePassword` ok, so the call's payload is logged.
+/// Answers `Session.changePassword` ok and `Session.mediaToken` with a
+/// token, so both calls' payloads are logged.
 struct SessionBoot;
 
 impl server::session::Handler for SessionBoot {
@@ -43,6 +45,17 @@ impl server::session::Handler for SessionBoot {
         results: &mut session::ChangePasswordResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> {
         results.get().init_result().set_ok(());
+        std::future::ready(Ok(()))
+    }
+
+    fn media_token(
+        self: Rc<Self>,
+        _params: session::MediaTokenParams,
+        results: &mut session::MediaTokenResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        let mut token = results.get().init_result().init_token();
+        token.set_token(MEDIA_TOKEN);
+        token.set_expires_at_ms(1);
         std::future::ready(Ok(()))
     }
 }
@@ -191,6 +204,10 @@ fn call_all() -> Observed {
             r.get().set_current(PASSWORD);
             r.get().set_new(NEW_PASSWORD);
             r.send().promise.await.unwrap();
+
+            let mut r = sess.media_token_request();
+            fill_ctx(r.get().init_ctx());
+            r.send().promise.await.unwrap();
         });
     });
     o
@@ -198,7 +215,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 8] = [
+const COVERED: [(&str, &str); 9] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -207,6 +224,7 @@ const COVERED: [(&str, &str); 8] = [
     ("telemetry", "submit"),
     ("playback_grant", "decision"),
     ("session", "change_password"),
+    ("session", "media_token"),
 ];
 
 #[test]
@@ -225,6 +243,7 @@ fn secrets_never_reach_logs_or_spans() {
         DEVICE_TOKEN,
         QC_SECRET,
         FIELD_SECRET,
+        MEDIA_TOKEN,
     ] {
         assert!(
             !o.logs.contains(secret),
@@ -241,7 +260,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        16,
+        18,
         "a request and a response per call:\n{}",
         o.logs
     );
