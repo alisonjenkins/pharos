@@ -204,6 +204,10 @@ pub struct Detail {
     pub segments: Vec<Segment>,
     /// The fonts the file embeds, for drawing an ASS subtitle (026).
     pub fonts: Vec<Font>,
+    /// A song's track artists, in display order; empty for anything else.
+    pub artists: Vec<String>,
+    /// A song's album name.
+    pub album: Option<String>,
 }
 
 /// A font the file embeds. `url` holds `{subtitle}`, the index of the
@@ -952,6 +956,12 @@ impl PharosApi for NativeApi {
                             })
                         })
                         .collect::<Result<_, capnp::Error>>()?,
+                    artists: d
+                        .get_artists()?
+                        .iter()
+                        .map(text)
+                        .collect::<Result<_, capnp::Error>>()?,
+                    album: Some(text(d.get_album())?).filter(|a| !a.is_empty()),
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),

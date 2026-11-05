@@ -159,3 +159,53 @@ async fn detail_lists_the_embedded_fonts_and_not_other_attachments() {
         "V488: the detail does not list the file's fonts"
     );
 }
+
+/// B591 (V509): a song's detail names its track artists and album, for the
+/// now-playing screen; a film's names neither.
+#[actix_web::test]
+async fn a_songs_detail_names_its_artists_and_album() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut song = MediaItem {
+        id: 303,
+        path: "/libA/Teardrop.flac".into(),
+        title: "Teardrop".into(),
+        kind: MediaKind::Audio,
+        ..MediaItem::default()
+    };
+    song.probe.artist = Some("Massive Attack".into());
+    song.probe.album = Some("Mezzanine".into());
+    fx.state.stores.put(song).await.unwrap();
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: 304,
+            path: "/libA/Plain.mkv".into(),
+            title: "Plain".into(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+
+    let library = session.library_request().send().pipeline.get_library();
+    let text = |t: capnp::Result<capnp::text::Reader<'_>>| t.unwrap().to_str().unwrap().to_owned();
+    for (id, artists, album) in [
+        (303, vec!["Massive Attack"], "Mezzanine"),
+        (304, vec![], ""),
+    ] {
+        let mut req = library.detail_request();
+        req.get().init_ctx();
+        req.get().init_id().set_real(id);
+        let reply = req.send().promise.await.expect("detail");
+        let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+        else {
+            panic!("detail refused");
+        };
+        let d = d.unwrap();
+        let got: Vec<String> = d.get_artists().unwrap().iter().map(text).collect();
+        assert_eq!(got, artists, "V509: item {id} artists");
+        assert_eq!(text(d.get_album()), album, "V509: item {id} album");
+    }
+}

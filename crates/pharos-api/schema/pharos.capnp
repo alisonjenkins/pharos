@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 19;
+const schemaVersion :UInt32 = 20;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -202,6 +202,8 @@ struct ItemDetail {
   trickplay @6 :List(Trickplay);    # one per width the server renders; empty when off or unprobed
   segments @7 :List(Segment);
   fonts @8 :List(Font);             # empty when the file embeds none; an older client ignores it
+  artists @9 :List(Text);           # a song's track artists, in display order; empty for anything else
+  album @10 :Text;                  # a song's album name; empty when it has none
 }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
 # url holds `{subtitle}`, the index of the subtitle track the font is fetched

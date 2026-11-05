@@ -112,6 +112,8 @@ mod tests {
                 trickplay: Vec::new(),
                 segments: Vec::new(),
                 fonts: Vec::new(),
+                artists: Vec::new(),
+                album: None,
             })
         }
         async fn lyrics(
