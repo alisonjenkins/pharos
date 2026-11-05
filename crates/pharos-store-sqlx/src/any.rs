@@ -580,6 +580,13 @@ impl SeriesMetadataStore for AnyStore {
         }
     }
 
+    async fn readmit_searched_tv(&self) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.readmit_searched_tv().await,
+            AnyStore::Postgres(p) => p.readmit_searched_tv().await,
+        }
+    }
+
     async fn upsert_series_metadata(&self, meta: SeriesMetadata) -> DomainResult<()> {
         match self {
             AnyStore::Sqlite(s) => s.upsert_series_metadata(meta).await,

@@ -239,6 +239,13 @@ where
             had_work: false,
         });
     }
+    if tvdb.is_some() || tmdb.is_some() {
+        // Non-fatal: a config store that cannot be read or written must not
+        // stop enrichment. The next pass tries again.
+        if let Err(e) = readmit_stale_tv_matches(store).await {
+            tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
+        }
+    }
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -483,6 +490,7 @@ where
     // Provider by kind: Episode prefers TVDB (fallback TMDB when TVDB isn't
     // configured); Movie is TMDB. When the kind's providers are all absent,
     // skip the item (leaves it eligible for a later pass with a key present).
+    item.metadata.provider_ids = trusted_provider_ids(&item);
     let provider_ids = item.metadata.provider_ids.clone();
     let (matched_provider, resolved) = match item.kind {
         MediaKind::Movie => match tmdb {
@@ -891,6 +899,28 @@ where
     Ok(())
 }
 
+/// `item`'s provider ids without the one an earlier search stamped. That id
+/// is only the old matcher's answer; fed back to [`resolve`] it would skip the
+/// search, keep the show a re-match exists to replace, and be recorded as an
+/// NFO id that no later re-admission reaches. An id that differs from the
+/// stamped match came from local data and is kept.
+fn trusted_provider_ids(item: &MediaItem) -> ProviderIds {
+    let mut ids = item.metadata.provider_ids.clone();
+    if item.match_source.as_deref() != Some("search") {
+        return ids;
+    }
+    let stamped = item.match_external_id.as_deref();
+    let slot = match item.match_provider.as_deref() {
+        Some("tmdb") => &mut ids.tmdb,
+        Some("tvdb") => &mut ids.tvdb,
+        _ => return ids,
+    };
+    if slot.as_deref() == stamped {
+        *slot = None;
+    }
+    ids
+}
+
 /// Resolve one item against a single provider: determine the external id
 /// (NFO id if this provider's slot is set, else search + `match_best`), then
 /// fetch the full record. Generic over the concrete enricher (RPITIT → no
@@ -963,6 +993,51 @@ fn upsert_art(
     } else {
         chosen.push((provider, art.clone()));
     }
+}
+
+/// Version of the show matcher ([`pharos_core::match_best`] over the TVDB and
+/// TMDB series searches). Bump it when a change would choose a different show
+/// for a search already answered, so the stored answers are re-asked.
+///
+/// 1 (B557): TVDB hits scored by their English translation and aliases, an
+/// exact name ahead of a prefix match, a franchise name to the original.
+pub(crate) const TV_MATCH_VERSION: u32 = 1;
+
+/// Key under which the [`TV_MATCH_VERSION`] that produced the stored show and
+/// episode search matches is recorded.
+const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
+
+/// Re-admit every searched show and episode once the matcher that chose them
+/// has changed. Unlike album art, an ABSENT record is stale too: every search
+/// match made before this key existed came from the matcher B557 replaced,
+/// which handed 29 of the deployed library's shows to a fan work, an abridged
+/// parody or the wrong entry of a franchise. A fresh install has no searched
+/// rows, so re-admitting there costs nothing. NFO and manual matches are not
+/// touched. One config read per pass once the versions agree.
+async fn readmit_stale_tv_matches<S>(store: &S) -> DomainResult<()>
+where
+    S: SeriesMetadataStore + pharos_store_sqlx::ServerConfigStore,
+{
+    let want = TV_MATCH_VERSION.to_string();
+    let have = store
+        .load_named_config(TV_MATCH_VERSION_KEY)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    if have.as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    let readmitted = store.readmit_searched_tv().await?;
+    tracing::info!(
+        readmitted,
+        from = have.as_deref().unwrap_or("none"),
+        to = want.as_str(),
+        "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+    );
+    store
+        .set_named_config(TV_MATCH_VERSION_KEY, &want)
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+    Ok(())
 }
 
 /// Key under which the album-art matcher version that produced the CURRENT
@@ -2785,5 +2860,116 @@ mod tests {
             need.is_empty(),
             "a none-matched show stays out of the eligible set until the TTL cutoff"
         );
+    }
+
+    /// B557 — the show matcher changed, so every show and episode it had
+    /// answered by search is asked again at once, not when the TTL expires.
+    /// NFO-sourced matches are the user's own and stay put.
+    #[tokio::test]
+    async fn a_new_show_matcher_re_admits_searched_shows_and_episodes_once() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 2, "Dragon Ball", "/tv/Dragon Ball").await;
+        s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
+            .await
+            .unwrap();
+        s.set_item_match(2, "tvdb", "76666", "nfo_id", None, NOW)
+            .await
+            .unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Dragon Ball".into(),
+            series_name: "Dragon Ball".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("374456".into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
+
+        readmit_stale_tv_matches(&s).await.unwrap();
+
+        let shows = s.series_needing_match(10, NOW - 1).await.unwrap();
+        assert_eq!(shows.len(), 1, "the searched show is eligible again");
+        let items: Vec<_> = s
+            .items_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(items, [1], "only the searched episode, not the NFO one");
+
+        // Recorded: the next pass re-admits nothing.
+        s.set_item_match(1, "tvdb", "76666", "search", Some(0.85), NOW)
+            .await
+            .unwrap();
+        readmit_stale_tv_matches(&s).await.unwrap();
+        assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
+    }
+
+    /// B557 — a re-admitted episode is searched again. The id its old search
+    /// stamped into `provider_ids` must not pass for an NFO id, or the episode
+    /// keeps the wrong show and is recorded as `nfo_id`, out of reach of any
+    /// later re-admission.
+    #[tokio::test]
+    async fn a_re_admitted_episode_is_searched_again_not_resolved_by_its_old_id() {
+        let s = store().await;
+        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
+            .await
+            .unwrap();
+        readmit_stale_tv_matches(&s).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
+            .with_detail(enriched_overview("Goku's adventures"));
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.match_source.as_deref(), Some("search"));
+        assert_eq!(got.match_external_id.as_deref(), Some("76666"));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("76666"));
+    }
+
+    #[test]
+    fn a_provider_id_from_local_data_outlives_a_search_match() {
+        let mut item = MediaItem {
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("374456".into()),
+            match_source: Some("search".into()),
+            ..MediaItem::default()
+        };
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb, None);
+
+        item.metadata.provider_ids.tvdb = Some("76666".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("76666"));
+
+        item.match_source = Some("nfo_id".into());
+        item.metadata.provider_ids.tvdb = Some("374456".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("374456"));
     }
 }

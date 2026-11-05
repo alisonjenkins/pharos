@@ -1372,6 +1372,13 @@ pub trait SeriesMetadataStore: Send + Sync {
     ) -> impl std::future::Future<
         Output = DomainResult<std::collections::HashMap<String, SeriesMetadata>>,
     > + Send;
+
+    /// Make every show and episode whose match came from a search, or that a
+    /// search found nothing for, eligible again at once, regardless of the
+    /// TTL. Used when the matcher that chose them has changed (B557). NFO and
+    /// manual matches are left alone. Returns the rows re-admitted (shows +
+    /// episodes).
+    fn readmit_searched_tv(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
 /// What a ratings lookup is for: a stored film, or a show by its
