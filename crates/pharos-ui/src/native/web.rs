@@ -1124,8 +1124,11 @@ impl Drop for TrackSkips {
         SKIP_ACTIONS.set(None);
         SKIPS_OFFERED.set(None);
         if let Some(window) = web_sys::window() {
-            let _ = window
-                .remove_event_listener_with_callback("keydown", self.keys.as_ref().unchecked_ref());
+            let _ = window.remove_event_listener_with_callback_and_bool(
+                "keydown",
+                self.keys.as_ref().unchecked_ref(),
+                true,
+            );
         }
     }
 }
@@ -1201,8 +1204,14 @@ pub fn on_track_skip(on_skip: impl FnMut(Skip, &'static str) -> bool + 'static) 
             .each_ref()
             .map(|a| a.as_ref().unchecked_ref::<js_sys::Function>().clone()),
     ));
+    // Capture phase: a slider's own keydown handler stops propagation, and
+    // Shift+P / Shift+N still skip with the focus on the seek or volume bar.
     if let Some(window) = web_sys::window() {
-        let _ = window.add_event_listener_with_callback("keydown", keys.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback_and_bool(
+            "keydown",
+            keys.as_ref().unchecked_ref(),
+            true,
+        );
     }
     TrackSkips {
         keys,
