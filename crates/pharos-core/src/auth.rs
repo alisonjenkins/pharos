@@ -243,6 +243,9 @@ pub struct TokenId(pub String);
 pub struct IssuedToken {
     pub id: TokenId,
     pub secret: AuthToken,
+    /// When the token stops working, unix seconds: the requested lifetime,
+    /// cut short to the parent's expiry for a child token.
+    pub expires_at: i64,
 }
 
 /// What a stored token may do. A closed set: a new scope is a deliberate
@@ -301,6 +304,18 @@ pub struct ResolvedToken {
     pub scope: TokenScope,
 }
 
+/// Which of a user's tokens a revoke is about to remove; the argument of
+/// [`TokenStore::count_live_children`], mirroring the revoke methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSelector<'a> {
+    /// The one token with this secret ([`TokenStore::revoke`]).
+    Token(&'a str),
+    /// Every token of this device ([`TokenStore::revoke_tokens_by_device`]).
+    Device(&'a str),
+    /// Every session token but this one ([`TokenStore::revoke_sessions_except`]).
+    AllExcept(Option<&'a str>),
+}
+
 /// Persistence of session tokens.
 pub trait TokenStore: Send + Sync {
     /// Like [`TokenStore::issue`] but with a caller-chosen lifetime in
@@ -312,6 +327,30 @@ pub trait TokenStore: Send + Sync {
         ttl_secs: i64,
         scope: TokenScope,
     ) -> impl std::future::Future<Output = AuthResult<IssuedToken>> + Send;
+
+    /// Like [`TokenStore::issue_with_ttl`], for a token issued on the strength
+    /// of `parent`: revoking `parent` by any path, or deleting its user,
+    /// removes this token too, in the same statement (B543, V438). It never
+    /// outlives `parent`: its expiry is the earlier of the two. Fails with
+    /// [`AuthError::InvalidToken`] when `parent` is missing or expired.
+    fn issue_child_with_ttl(
+        &self,
+        user_id: UserId,
+        device_id: &str,
+        ttl_secs: i64,
+        scope: TokenScope,
+        parent: &TokenId,
+    ) -> impl std::future::Future<Output = AuthResult<IssuedToken>> + Send;
+
+    /// How many live child tokens the tokens named by `selector` (all of
+    /// `user`'s) have: what a revoke of that selection is about to take with
+    /// it. Read-only and only for the revoke metric and log; the removal
+    /// itself is the database cascade, which does not depend on this count.
+    fn count_live_children(
+        &self,
+        user: UserId,
+        selector: TokenSelector<'_>,
+    ) -> impl std::future::Future<Output = AuthResult<u64>> + Send;
 
     /// Revoke by [`TokenId`]. Idempotent: an unknown id is `Ok`.
     fn revoke_by_id(
