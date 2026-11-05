@@ -8,10 +8,10 @@ use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
     avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
-    item_query, item_summary, items_result, library, lyrics_result, me_result, negotiate_result,
-    opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session, stream_choice,
-    telemetry, track, user_data, user_state_result, Kind, LibraryKind as WireLibraryKind,
-    SegmentKind as WireSegmentKind, SubtitleDelivery,
+    item_query, item_summary, items_result, library, lyrics_result, me_result, media_token_result,
+    negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session,
+    stream_choice, telemetry, track, user_data, user_state_result, Kind,
+    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -409,6 +409,24 @@ pub trait PlaybackGrant {
     async fn stop(&self, call: &CallInfo, position_ms: u64) -> Result<(), ClientError>;
 }
 
+/// A token from [`NativeApi::media_token`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaToken {
+    /// The secret. Never log it.
+    pub token: String,
+    /// When the token stops working, in ms since the Unix epoch.
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for MediaToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaToken")
+            .field("token", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
 /// [`PharosApi`] over a signed-in native session.
 #[derive(Clone)]
 pub struct NativeApi {
@@ -584,6 +602,31 @@ impl NativeApi {
         {
             avatar_result::Tag(tag) => Ok(text(tag)?),
             avatar_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// A narrow token for loading images and media in a player that cannot
+    /// send the device token or a cookie (ADR-0058): put it in the URL as
+    /// `api_key`. It reaches only item images and streams, and stops working
+    /// at `expires_at_ms`; ask again before then.
+    pub async fn media_token(&self, call: &CallInfo) -> Result<MediaToken, ClientError> {
+        let mut req = self.session.media_token_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            media_token_result::Token(t) => {
+                let t = t?;
+                Ok(MediaToken {
+                    token: text(t.get_token())?,
+                    expires_at_ms: t.get_expires_at_ms(),
+                })
+            }
+            media_token_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
