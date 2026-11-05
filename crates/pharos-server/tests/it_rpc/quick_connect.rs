@@ -415,7 +415,8 @@ async fn start_with_auth_deadline(
     (server, fx)
 }
 
-/// How many auth deadline extensions `snapshotter` has seen.
+/// How many `quick_connect_pending` auth deadline extensions `snapshotter`
+/// has seen.
 fn extended_count(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> u64 {
     counter(
         snapshotter,

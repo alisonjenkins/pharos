@@ -209,6 +209,7 @@ impl ConnectionCtx {
     /// deadline again to sign in or be closed.
     pub(crate) fn end_token(&self, token: &str) {
         let mut resumed = self.resumed.borrow_mut();
+        let was_signed_in = !resumed.is_empty();
         resumed.retain(|(t, _)| t != token);
         let mut ended = self.ended.borrow_mut();
         if !ended.iter().any(|t| t == token) {
@@ -216,7 +217,12 @@ impl ConnectionCtx {
         }
         if resumed.is_empty() {
             self.limits.sign_out(&mut self.slot.borrow_mut());
-            self.signed_out.notify_one();
+            // Only the sign-out itself re-arms the deadline: a repeat logout
+            // on a connection already signed out must not keep resetting
+            // `max_unauthenticated_secs` (B541).
+            if was_signed_in {
+                self.signed_out.notify_one();
+            }
         }
     }
 
@@ -389,6 +395,37 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     use super::*;
+
+    /// A logout re-arms the auth deadline only when it signs the connection
+    /// out: a repeat on a connection already signed out wakes nothing, so it
+    /// cannot keep the unauthenticated cap from running (B541).
+    /// Disarm check: notifying on every empty `resumed` leaves a permit
+    /// after the second `end_token`.
+    #[test]
+    fn only_the_sign_out_itself_rearms_the_auth_deadline() {
+        use futures_util::FutureExt as _;
+        let limits = limits::ConnectionLimits::default();
+        let Ok(ctx) = ConnectionCtx::admit(None, std::net::Ipv4Addr::LOCALHOST.into(), &limits, 4)
+        else {
+            panic!("a first connection is admitted");
+        };
+        ctx.end_token("never-resumed");
+        assert!(
+            ctx.signed_out.notified().now_or_never().is_none(),
+            "a connection never signed in is not signed out"
+        );
+        ctx.remember_token("t".to_owned(), UserId(uuid::Uuid::nil()));
+        ctx.end_token("t");
+        assert!(
+            ctx.signed_out.notified().now_or_never().is_some(),
+            "the last session ending signs the connection out"
+        );
+        ctx.end_token("t");
+        assert!(
+            ctx.signed_out.notified().now_or_never().is_none(),
+            "a repeat logout does not re-arm the deadline"
+        );
+    }
 
     #[test]
     fn direction_labels_are_distinct() {
