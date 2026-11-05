@@ -432,6 +432,35 @@ mod tests {
         }
     }
 
+    /// B581: every block the sheet opens it closes, so no rule after an
+    /// unclosed `@media` lands inside it (the admin Duplicates rules did,
+    /// and only applied in a narrow window).
+    #[test]
+    fn the_sheet_closes_every_block() {
+        let mut depth = 0_i32;
+        let mut rest = SHEET;
+        while let Some(c) = rest.chars().next() {
+            if let Some(after) = rest.strip_prefix("/*") {
+                rest = after
+                    .find("*/")
+                    .map_or("", |e| after.get(e + 2..).expect("valid slice"));
+                continue;
+            }
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            assert!(
+                depth >= 0,
+                "a block closed twice before: {}",
+                &rest[..rest.len().min(80)]
+            );
+            rest = rest.get(c.len_utf8()..).expect("valid slice");
+        }
+        assert_eq!(depth, 0, "blocks left open at the end of the sheet");
+    }
+
     #[test]
     fn the_sheet_uses_no_pre_010_variable() {
         const OLD_VARS: &[&str] = &[
