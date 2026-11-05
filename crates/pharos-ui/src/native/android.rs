@@ -77,7 +77,13 @@ pub async fn connect(base: &str) -> Result<(bootstrap::Client, RpcSystem, Closed
     .map_err(|e| format!("connect {url}: {e}"))?;
     let (mut sink, stream) = ws.split();
     let chunks = stream
-        .take_while(|m| futures_util::future::ready(m.is_ok()))
+        .take_while(|m| {
+            // Log the error that ends the stream, as `pump` logs a failed send.
+            if let Err(e) = m {
+                log::warn!("ws receive: {e}");
+            }
+            futures_util::future::ready(m.is_ok())
+        })
         .filter_map(|m| {
             futures_util::future::ready(match m {
                 Ok(tokio_tungstenite::tungstenite::Message::Binary(b)) => Some(b.to_vec()),
@@ -363,6 +369,10 @@ pub async fn quick_connect_sign_in(
                         token,
                     };
                 }
+                // `on_poll` finishes only on `Approved`; if that ever changes,
+                // say so and keep polling rather than spin.
+                log::warn!("quickconnect: finished without an approval; polling again");
+                tokio::time::sleep(tv_auth::POLL_INTERVAL).await;
             }
             Action::PollAfter(wait) => {
                 if let Polled::Failed(e) = &polled {
