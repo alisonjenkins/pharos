@@ -63,6 +63,8 @@ class DioxusMember implements Probeable {
 
 async function dioxusSignIn(browser: Browser) {
   const context = await browser.newContext();
+  // A context of its own skips any config storage: keep what's new off.
+  await context.addInitScript(() => localStorage.setItem("pharos.whats_new", "off"));
   const page = await context.newPage();
   const lines: string[] = [];
   page.on("console", (m) => lines.push(`[pharos-ui] ${m.text()}`));
