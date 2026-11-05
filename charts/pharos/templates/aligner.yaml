@@ -1,0 +1,90 @@
+{{- if .Values.aligner.enabled }}
+# pharos-aligner (ADR-0066): word times for karaoke by forced alignment. The
+# server sends it a song's path under the media mount, so both pods mount the
+# same media at the same path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pharos.fullname" . }}-aligner
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aligner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pharos.aligner.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pharos.aligner.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: aligner
+          image: "{{ .Values.aligner.image.repository }}:{{ required "aligner.image.tag is required when aligner.enabled" .Values.aligner.image.tag }}"
+          imagePullPolicy: {{ .Values.aligner.image.pullPolicy }}
+          env:
+            - name: PHAROS_ALIGNER_MEDIA_ROOT
+              value: /var/lib/pharos/media
+            - name: PHAROS_ALIGNER_LISTEN
+              value: "0.0.0.0:{{ .Values.aligner.port }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.aligner.port }}
+              protocol: TCP
+          # The model loads at start; /healthz answers once it is serving.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.aligner.resources | nindent 12 }}
+          volumeMounts:
+            - name: media
+              mountPath: /var/lib/pharos/media
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: media
+          {{- include "pharos.mediaVolume" . | trim | nindent 10 }}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pharos.fullname" . }}-aligner
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: aligner
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "pharos.aligner.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.aligner.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

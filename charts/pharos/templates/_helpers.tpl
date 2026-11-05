@@ -192,3 +192,8 @@ nfs:
 emptyDir: {}
 {{- end }}
 {{- end -}}
+
+{{- define "pharos.aligner.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "pharos.name" . }}-aligner
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
