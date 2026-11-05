@@ -63,6 +63,7 @@ use super::watch_view::{
     text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
     PLAYER_ID, SEEK_ID, VIDEO_ID,
 };
+use super::whats_new::{self, Close, Gate, GateInputs, Pick, Unseen, WhatsNewBadge, WhatsNewView};
 use crate::theme::editor::{Draft, EffectField};
 use crate::theme::resolve::PaletteRole;
 use crate::theme::signal::{self, Source};
@@ -1247,6 +1248,8 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| search);
     let mut palette = Palette(use_signal(|| false));
     use_context_provider(|| palette);
+    let whats_new_state = use_whats_new_state();
+    use_context_provider(|| whats_new_state);
     use_hook(move || {
         Rc::new(platform::on_key(move |key, ctrl, meta| {
             // Signed out there is no palette to open: leave the key alone
@@ -1389,6 +1392,7 @@ fn NativeApp(route: Route) -> Element {
                 libraries: libraries(),
                 trail: trail.read().clone().unwrap_or_default(),
                 account: rsx! {
+                    WhatsNewButton {}
                     AccountMenu {
                         me,
                         on_sign_out: move |_| {
@@ -1413,8 +1417,9 @@ fn NativeApp(route: Route) -> Element {
                 if let Some(message) = notice {
                     ErrorNote { message }
                 }
-                Screen { route }
+                Screen { route: route.clone() }
                 StageView {}
+                WhatsNew { route }
                 if (palette.0)() {
                     PaletteScreen {}
                 }
@@ -2364,6 +2369,244 @@ fn PrivacyScreen() -> Element {
                         diagnostics_gen.with_mut(|g| *g = g.wrapping_add(1));
                     }
                     diagnostics.set(diagnostics::shown_after_save(saved, server_before));
+                });
+            },
+        }
+    }
+}
+
+/// What's new (spec 027), shared by the top bar's badge and the dialog.
+#[derive(Clone, Copy)]
+struct WhatsNewState {
+    /// `None` until read for this sign-in; then the newest id seen, if any.
+    seen: Signal<Option<Option<u32>>>,
+    open: Signal<bool>,
+    /// Closed with Done on this page: the badge goes.
+    done: Signal<bool>,
+    /// Turned off on this device.
+    off: bool,
+}
+
+fn use_whats_new_state() -> WhatsNewState {
+    let seen = use_signal(|| None);
+    let open = use_signal(|| false);
+    let done = use_signal(|| false);
+    let off = use_hook(|| {
+        platform::stored_theme(whats_new::DEVICE_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim() == whats_new::OFF)
+    });
+    WhatsNewState {
+        seen,
+        open,
+        done,
+        off,
+    }
+}
+
+/// The top bar's what's-new button: shown while something is unseen and
+/// the dialog did not splash, or was put off with Remind me later.
+#[component]
+fn WhatsNewButton() -> Element {
+    let mut state = use_context::<WhatsNewState>();
+    let seen = *state.seen.read();
+    if !whats_new::badge(seen, state.off, *state.done.read()) {
+        return rsx! {};
+    }
+    let unseen = Unseen::since(seen.flatten());
+    rsx! {
+        WhatsNewBadge {
+            flow: unseen.flow,
+            count: unseen.count(),
+            on_open: move |()| {
+                platform::info("pharos: whats_new opened from=badge");
+                state.open.set(true);
+            },
+        }
+    }
+}
+
+/// The what's-new dialog (spec 027): reads the newest entry this viewer has
+/// been shown once per sign-in. Right after the page loads or the viewer
+/// signs in it opens by itself, unless something plays or the watch page is
+/// open; then, and after Remind me later, the badge opens it (V495).
+#[component]
+fn WhatsNew(route: Route) -> Element {
+    let ctx = use_context::<Ctx>();
+    let StageCtx(stage) = use_context::<StageCtx>();
+    let state = use_context::<WhatsNewState>();
+    let WhatsNewState {
+        mut seen,
+        mut open,
+        mut done,
+        off,
+    } = state;
+    let mut asked = use_signal(|| false);
+    let mut splash_decided = use_signal(|| false);
+    let mut page = use_signal(|| 0_usize);
+    let mut replay = use_signal(|| 0_u32);
+    let mut library_transition = use_signal(stored_library_transition);
+    let mut subtitle_size = use_signal(stored_subtitle_size);
+    let themes = use_context::<Themes>();
+    // Mounted afresh for each sign-in: the last user's state goes.
+    use_hook(move || {
+        seen.set(None);
+        open.set(false);
+        done.set(false);
+    });
+    use_effect(move || {
+        let Some(api) = ctx.api.read().clone() else {
+            return;
+        };
+        if off || *asked.peek() {
+            return;
+        }
+        asked.set(true);
+        spawn(async move {
+            match api
+                .pref(&call("whats_new", "seen_read"), whats_new::SEEN_PREF)
+                .await
+            {
+                Ok(stored) => seen.set(Some(whats_new::parse_seen(stored.as_deref()))),
+                Err(e) => {
+                    // Unknown is not "never seen": a failed read shows nothing
+                    // rather than the whole list on every flaky connect.
+                    platform::warn(&format!("pharos: whats_new seen read failed error={e}"));
+                    seen.set(Some(Some(whats_new::current())));
+                }
+            }
+        });
+    });
+    let watch_route = matches!(route, Route::Watch(_));
+    use_effect(move || {
+        let loaded = *seen.read();
+        if *splash_decided.peek() || (loaded.is_none() && !off) {
+            return;
+        }
+        splash_decided.set(true);
+        let verdict = whats_new::gate(GateInputs {
+            seen: loaded,
+            off,
+            playing: stage.peek().item.is_some(),
+            watch_route,
+        });
+        let seen_label = loaded
+            .flatten()
+            .map_or("none".to_owned(), |s| s.to_string());
+        let flow = Unseen::since(loaded.flatten()).flow;
+        platform::info(&format!(
+            "pharos: whats_new splash={} flow={} seen={seen_label} current={}",
+            verdict.label(),
+            flow.label(),
+            whats_new::current()
+        ));
+        if verdict == Gate::Open {
+            open.set(true);
+        }
+    });
+    let shown = *open.read() && !off;
+    use_effect(use_reactive!(|(shown,)| {
+        if shown {
+            page.set(0);
+            platform::focus_by_id(whats_new::FIRST_BUTTON_ID);
+        }
+    }));
+    if !shown {
+        return rsx! {};
+    }
+    let unseen = Unseen::since(seen.read().flatten());
+    let applied = themes.applied.read().clone();
+    let mut cards = theme_cards(&themes.catalogue.read());
+    for card in cards.iter_mut() {
+        card.active = card.name == applied;
+    }
+    let choices = whats_new::Choices {
+        themes: cards,
+        theme_auto: *themes.active.read() == device::AUTO,
+        subtitle_size: subtitle_size(),
+        library_transition: library_transition(),
+    };
+    rsx! {
+        WhatsNewView {
+            unseen,
+            choices,
+            page: page(),
+            replay: replay(),
+            on_page: move |to: usize| {
+                page.set(to);
+                platform::focus_by_id(whats_new::FIRST_BUTTON_ID);
+            },
+            on_pick: move |pick: Pick| {
+                match pick {
+                    Pick::Theme(name) => {
+                        platform::info(&format!("pharos: theme set={name} from=whats_new"));
+                        themes.choose(name);
+                    }
+                    Pick::ThemeAuto => {
+                        platform::info("pharos: theme set=auto from=whats_new");
+                        themes.choose(device::AUTO.to_owned());
+                    }
+                    Pick::SubtitleSize(size) => {
+                        if let Err(e) = store_subtitle_size(size) {
+                            platform::warn(&format!(
+                                "pharos: whats_new subtitle_size not kept error={e}"
+                            ));
+                        }
+                        platform::apply_subtitle_size(size);
+                        subtitle_size.set(size);
+                        platform::info(&format!(
+                            "pharos: subtitle_size set={} from=whats_new",
+                            size.as_str()
+                        ));
+                    }
+                    Pick::LibraryTransition(fx) => {
+                        if let Err(e) = store_library_transition(fx) {
+                            platform::warn(&format!(
+                                "pharos: whats_new library_transition not kept error={e}"
+                            ));
+                        }
+                        platform::apply_library_transition(fx);
+                        library_transition.set(fx);
+                        platform::info(&format!(
+                            "pharos: library_transition set={} from=whats_new",
+                            fx.as_str()
+                        ));
+                    }
+                }
+                replay.with_mut(|r| *r = r.wrapping_add(1));
+            },
+            on_close: move |how: Close| {
+                open.set(false);
+                let current = whats_new::current();
+                platform::info(&format!(
+                    "pharos: whats_new closed how={} current={current}",
+                    match how {
+                        Close::Later => "later",
+                        Close::Done => "done",
+                    }
+                ));
+                if how == Close::Later {
+                    return;
+                }
+                done.set(true);
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                spawn(async move {
+                    let value = current.to_string();
+                    let result = api
+                        .set_pref(
+                            &call("whats_new", "seen_write"),
+                            whats_new::SEEN_PREF,
+                            value.as_bytes(),
+                        )
+                        .await;
+                    if let Err(e) = result {
+                        platform::warn(&format!(
+                            "pharos: whats_new seen write failed seen={current} error={e}"
+                        ));
+                    }
                 });
             },
         }
