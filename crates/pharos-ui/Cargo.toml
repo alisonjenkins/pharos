@@ -129,7 +129,7 @@ thiserror.workspace = true
 pharos-api = { path = "../pharos-api" }
 capnp = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures = "0.3"
 android_logger = "0.15"
