@@ -474,6 +474,74 @@ impl SubtitleSize {
     }
 }
 
+/// Where the viewer's library card transition is kept; absent or unknown is
+/// [`LibraryTransition::Fade`].
+pub const LIBRARY_TRANSITION_KEY: &str = "pharos.library.transition";
+
+/// How a library's cards arrive when the viewer opens or switches to it
+/// (V476). Each is a CSS animation of `transform` and `opacity` only, so the
+/// compositor runs it on a TV or headset GPU without repainting the posters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryTransition {
+    None,
+    #[default]
+    Fade,
+    Pop,
+    Flip,
+    Warp,
+    Matrix,
+}
+
+impl LibraryTransition {
+    /// Every transition offered, in the Appearance picker's order.
+    pub const ALL: [LibraryTransition; 6] = [
+        LibraryTransition::None,
+        LibraryTransition::Fade,
+        LibraryTransition::Pop,
+        LibraryTransition::Flip,
+        LibraryTransition::Warp,
+        LibraryTransition::Matrix,
+    ];
+
+    /// The transition a stored [`LIBRARY_TRANSITION_KEY`] value holds;
+    /// anything unknown is [`LibraryTransition::Fade`].
+    pub fn parse(stored: &str) -> LibraryTransition {
+        match stored.trim() {
+            "none" => LibraryTransition::None,
+            "pop" => LibraryTransition::Pop,
+            "flip" => LibraryTransition::Flip,
+            "warp" => LibraryTransition::Warp,
+            "matrix" => LibraryTransition::Matrix,
+            _ => LibraryTransition::Fade,
+        }
+    }
+
+    /// Both the stored value and the `data-library-transition` attribute on
+    /// `<html>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LibraryTransition::None => "none",
+            LibraryTransition::Fade => "fade",
+            LibraryTransition::Pop => "pop",
+            LibraryTransition::Flip => "flip",
+            LibraryTransition::Warp => "warp",
+            LibraryTransition::Matrix => "matrix",
+        }
+    }
+
+    /// The option text shown in the Appearance picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            LibraryTransition::None => "None",
+            LibraryTransition::Fade => "Fade",
+            LibraryTransition::Pop => "Pop",
+            LibraryTransition::Flip => "Flip",
+            LibraryTransition::Warp => "Warp",
+            LibraryTransition::Matrix => "Matrix rain",
+        }
+    }
+}
+
 /// The fade between this song and the next, in ms, for a crossfade of
 /// `seconds` on a song `duration_ms` long: never more than a third of the
 /// song, so a short song is still mostly heard on its own. `None` when off
@@ -1060,6 +1128,24 @@ mod tests {
         assert_eq!(parse_max_bitrate(""), 0);
         assert_eq!(max_bitrate_label(0), "auto");
         assert_eq!(max_bitrate_label(2_000_000), "2000000");
+    }
+
+    #[test]
+    fn library_transition_round_trips_and_falls_back_to_fade() {
+        for fx in LibraryTransition::ALL {
+            assert_eq!(LibraryTransition::parse(fx.as_str()), fx);
+            assert_eq!(LibraryTransition::parse(&format!(" {} ", fx.as_str())), fx);
+        }
+        assert_eq!(LibraryTransition::parse(""), LibraryTransition::Fade);
+        assert_eq!(LibraryTransition::parse("spin"), LibraryTransition::Fade);
+        assert_eq!(LibraryTransition::parse("None"), LibraryTransition::Fade);
+        assert_eq!(LibraryTransition::default(), LibraryTransition::Fade);
+        let mut names = LibraryTransition::ALL
+            .map(LibraryTransition::as_str)
+            .to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), LibraryTransition::ALL.len());
     }
 
     #[test]
