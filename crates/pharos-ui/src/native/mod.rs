@@ -4,6 +4,9 @@
 pub mod account;
 pub mod account_settings;
 pub mod activity;
+// 025: socket, token file and QuickConnect loop for the Android TV app.
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod app;
 pub mod appearance;
 pub mod approve_device;
