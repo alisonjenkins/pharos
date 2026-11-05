@@ -57,6 +57,16 @@ pub struct GroupView {
     /// Counts the group's moves to another item. What members have seen
     /// changes with these and with the roster, not with every update.
     pub item_changes: u64,
+    /// What the group plays; `None` until it has said.
+    pub item: Option<ItemRef>,
+}
+
+impl GroupView {
+    /// Whether the group drives a player showing `item`: a member who opens
+    /// something else plays it on their own (B590).
+    pub fn drives(&self, item: ItemRef) -> bool {
+        self.active && self.item.map_or(true, |on| on == item)
+    }
 }
 
 /// What the store asks the screens to do.
@@ -159,6 +169,8 @@ pub struct GroupState {
     item_changes: u64,
     /// The item the watch page shows.
     watching: Option<ItemRef>,
+    /// What the group plays.
+    item: Option<ItemRef>,
     clock: ClockEstimator,
     anchor: Option<Anchor>,
     last_command_ms: Option<i64>,
@@ -203,6 +215,14 @@ impl GroupState {
 
     pub fn set_watching(&mut self, item: Option<ItemRef>) {
         self.watching = item;
+    }
+
+    /// The stage shows what the group plays, or one of them is not known yet.
+    fn drives_stage(&self) -> bool {
+        match (self.item, self.watching) {
+            (Some(on), Some(shown)) => on == shown,
+            _ => true,
+        }
     }
 
     /// Server time now, once the clock has a sample.
@@ -406,6 +426,7 @@ impl GroupState {
                     self.tracks = GroupTracksView::default();
                 }
                 self.playlist_item_id = playlist_item_id;
+                self.item = Some(item);
                 self.item_changes = self.item_changes.wrapping_add(1);
                 self.owes_ready = true;
                 self.last_command_ms = Some(now_ms);
@@ -502,6 +523,7 @@ impl GroupState {
             ended: self.ended.clone(),
             activity: self.activity,
             item_changes: self.item_changes,
+            item: self.item,
         }
     }
 }
@@ -545,6 +567,12 @@ struct Inner {
 }
 
 impl Inner {
+    /// The player the group may move: none while the stage shows something
+    /// other than what the group plays.
+    fn driven(&self) -> Option<Rc<dyn GroupPlayer>> {
+        self.player.clone().filter(|_| self.state.drives_stage())
+    }
+
     fn within_self_seek_grace(&self, now: i64) -> bool {
         let grace = i64::try_from(SELF_SEEK_GRACE_MS).unwrap_or(i64::MAX);
         self.self_seek_ms
@@ -587,6 +615,13 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// Whether a membership is active.
     pub fn active(&self) -> bool {
         self.inner.borrow().active
+    }
+
+    /// Whether the group drives the stage's player: in a group, and the
+    /// stage shows what the group plays.
+    pub fn drives(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.active && inner.state.drives_stage()
     }
 
     /// What each member has seen of `ids`; empty when not in a group.
@@ -750,11 +785,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if !inner.active {
                 return;
             }
-            (
-                inner.player.clone(),
-                inner.state.own_tracks,
-                inner.state.tracks,
-            )
+            (inner.driven(), inner.state.own_tracks, inner.state.tracks)
         };
         let Some(player) = player else {
             return;
@@ -794,7 +825,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let (active, own, playlist_item_id, epoch) = {
             let inner = self.inner.borrow();
             (
-                inner.active,
+                inner.active && inner.state.drives_stage(),
                 inner.state.own_tracks,
                 inner.state.playlist_item_id.clone(),
                 inner.epoch,
@@ -861,7 +892,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 );
             }
             inner.state.activity = inner.state.activity.wrapping_add(1);
-            inner.player.clone()
+            inner.driven()
         };
         self.env.warn(&format!(
             "pharos: group refused the track pick, applied here audio={:?} subtitle={:?}",
@@ -919,7 +950,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let (player, expected) = {
             let inner = self.inner.borrow();
             (
-                inner.player.clone(),
+                inner.driven(),
                 inner
                     .active
                     .then(|| inner.state.expected(self.env.now_ms()))
@@ -1025,7 +1056,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 if inner.epoch != epoch {
                     return;
                 }
-                inner.player.clone()
+                inner.driven()
             };
             let Some(player) = player else {
                 return;
@@ -1125,7 +1156,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let now = self.env.now_ms();
         let (player, expected, since, nudged_before) = {
             let inner = self.inner.borrow();
-            let Some(player) = inner.player.clone() else {
+            let Some(player) = inner.driven() else {
                 return;
             };
             let Some((expected, true)) = inner.state.expected(now) else {
@@ -1198,12 +1229,12 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     // ---- local controls ----------------------------------------------------
 
     /// Play or pause as the viewer asked: a group command, not the player.
-    /// `false` when not in a group (the player acts on its own).
+    /// `false` when the group does not drive the stage (the player acts on its own).
     pub fn toggle_play(&self) -> bool {
         let (active, paused) = {
             let inner = self.inner.borrow();
             (
-                inner.active,
+                inner.active && inner.state.drives_stage(),
                 inner.player.as_ref().map_or(true, |p| p.paused()),
             )
         };
@@ -1222,9 +1253,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         true
     }
 
-    /// Seek as the viewer asked: a group command. `false` when not in a group.
+    /// Seek as the viewer asked: a group command. `false` when the group does
+    /// not drive the stage.
     pub fn seek(&self, position_ms: u64) -> bool {
-        if !self.active() {
+        if !self.drives() {
             return false;
         }
         let client = self.client.clone();
@@ -1317,7 +1349,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             {
                 return;
             }
-            let Some(player) = inner.player.clone() else {
+            let Some(player) = inner.driven() else {
                 return;
             };
             let line = format!(
@@ -1356,7 +1388,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if !inner.active {
                 return;
             }
-            let Some(player) = inner.player.clone() else {
+            let Some(player) = inner.driven() else {
                 return;
             };
             let owes = inner.state.owes_ready;
@@ -1949,6 +1981,46 @@ mod tests {
         assert!(!session.toggle_play());
         assert!(!session.seek(1_000));
         assert!(groups.calls().is_empty());
+    }
+
+    #[test]
+    fn a_group_does_not_drive_a_player_showing_another_item() {
+        let rig = rig();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.session.deliver(item_update(26_000, true));
+        rig.env.settle();
+        assert!(rig.session.drives());
+        // The member opens a song while the group stays on its film.
+        rig.session.set_watching(Some(ItemRef::Real(9)));
+        let view = rig.session.view();
+        assert!(view.active, "still a member");
+        assert!(view.drives(ItemRef::Real(7)) && !view.drives(ItemRef::Real(9)));
+        assert!(!rig.session.drives());
+        let before = calls(&rig).len();
+        rig.player.log.borrow_mut().clear();
+        assert!(!rig.session.toggle_play());
+        assert!(!rig.session.seek(1_000));
+        rig.session.deliver(GroupUpdate::Play {
+            at_server_ms: 100_000,
+            position_ms: 5_000,
+            by: None,
+        });
+        rig.env.settle();
+        assert_eq!(calls(&rig).len(), before, "nothing went to the group");
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "the group's play does not move the song"
+        );
+    }
+
+    #[test]
+    fn a_group_that_has_not_named_its_item_drives_the_player() {
+        let rig = rig();
+        assert!(rig.session.drives());
+        assert!(rig.session.view().drives(ItemRef::Real(9)));
+        let mut solo = rig.session.view();
+        solo.active = false;
+        assert!(!solo.drives(ItemRef::Real(7)));
     }
 
     #[test]
