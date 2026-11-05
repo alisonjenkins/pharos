@@ -542,6 +542,78 @@ impl LibraryTransition {
     }
 }
 
+/// Where the viewer's controls effect is kept; absent or unknown is
+/// [`OverlayEffect::Fade`].
+pub const OVERLAY_EFFECT_KEY: &str = "pharos.overlay.effect";
+
+/// How the video player's controls hide when they go idle during playback and
+/// come back on a wake (V491). Every effect runs on the overlay (top strip,
+/// control bar, skip button) alone, never the video, and ends within 300 ms.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayEffect {
+    None,
+    #[default]
+    Fade,
+    Glide,
+    Zoom,
+    Wobble,
+    Dissolve,
+    Burn,
+}
+
+impl OverlayEffect {
+    /// Every effect offered, in the Appearance picker's order.
+    pub const ALL: [OverlayEffect; 7] = [
+        OverlayEffect::None,
+        OverlayEffect::Fade,
+        OverlayEffect::Glide,
+        OverlayEffect::Zoom,
+        OverlayEffect::Wobble,
+        OverlayEffect::Dissolve,
+        OverlayEffect::Burn,
+    ];
+
+    /// The effect a stored [`OVERLAY_EFFECT_KEY`] value holds; anything
+    /// unknown is [`OverlayEffect::Fade`].
+    pub fn parse(stored: &str) -> OverlayEffect {
+        match stored.trim() {
+            "none" => OverlayEffect::None,
+            "glide" => OverlayEffect::Glide,
+            "zoom" => OverlayEffect::Zoom,
+            "wobble" => OverlayEffect::Wobble,
+            "dissolve" => OverlayEffect::Dissolve,
+            "burn" => OverlayEffect::Burn,
+            _ => OverlayEffect::Fade,
+        }
+    }
+
+    /// Both the stored value and the `data-overlay-fx` attribute on `<html>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverlayEffect::None => "none",
+            OverlayEffect::Fade => "fade",
+            OverlayEffect::Glide => "glide",
+            OverlayEffect::Zoom => "zoom",
+            OverlayEffect::Wobble => "wobble",
+            OverlayEffect::Dissolve => "dissolve",
+            OverlayEffect::Burn => "burn",
+        }
+    }
+
+    /// The option text shown in the Appearance picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            OverlayEffect::None => "None",
+            OverlayEffect::Fade => "Fade",
+            OverlayEffect::Glide => "Glide",
+            OverlayEffect::Zoom => "Zoom",
+            OverlayEffect::Wobble => "Wobble",
+            OverlayEffect::Dissolve => "Dissolve",
+            OverlayEffect::Burn => "Burn",
+        }
+    }
+}
+
 /// The fade between this song and the next, in ms, for a crossfade of
 /// `seconds` on a song `duration_ms` long: never more than a third of the
 /// song, so a short song is still mostly heard on its own. `None` when off
@@ -1146,6 +1218,22 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), LibraryTransition::ALL.len());
+    }
+
+    #[test]
+    fn overlay_effect_round_trips_and_falls_back_to_fade() {
+        for fx in OverlayEffect::ALL {
+            assert_eq!(OverlayEffect::parse(fx.as_str()), fx);
+            assert_eq!(OverlayEffect::parse(&format!(" {} ", fx.as_str())), fx);
+        }
+        assert_eq!(OverlayEffect::parse(""), OverlayEffect::Fade);
+        assert_eq!(OverlayEffect::parse("spin"), OverlayEffect::Fade);
+        assert_eq!(OverlayEffect::parse("None"), OverlayEffect::Fade);
+        assert_eq!(OverlayEffect::default(), OverlayEffect::Fade);
+        let mut names = OverlayEffect::ALL.map(OverlayEffect::as_str).to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), OverlayEffect::ALL.len());
     }
 
     #[test]

@@ -34,9 +34,9 @@ use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, start_ms,
     styled_subtitle_url, subtitle_switch, up_next_at, volume_setting, Engine, LibraryTransition,
-    MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, PlaybackEngine, ReportClock,
-    SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY, LIBRARY_TRANSITION_KEY,
-    MAX_BITRATE_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
+    MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine,
+    ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -284,6 +284,7 @@ struct Boot {
 fn boot_theme() -> Boot {
     platform::apply_subtitle_size(stored_subtitle_size());
     platform::apply_library_transition(stored_library_transition());
+    platform::apply_overlay_effect(stored_overlay_effect());
     let mut catalogue = theme::shipped();
     log_lines(&device::load_custom(
         &mut catalogue,
@@ -531,6 +532,42 @@ fn store_library_transition(fx: LibraryTransition) -> Result<(), String> {
     platform::store_theme(LIBRARY_TRANSITION_KEY, fx.as_str()).inspect_err(|e| {
         platform::warn(&format!(
             "pharos: library_transition storage write failed error={e}"
+        ));
+    })
+}
+
+thread_local! {
+    /// The controls effect chosen on this page load; it outranks storage as
+    /// [`SESSION_SUBTITLE_SIZE`] does.
+    static SESSION_OVERLAY_EFFECT: Cell<Option<OverlayEffect>> = const { Cell::new(None) };
+}
+
+/// The viewer's controls effect: this page load's choice, else the stored
+/// one, else Fade.
+fn stored_overlay_effect() -> OverlayEffect {
+    if let Some(fx) = SESSION_OVERLAY_EFFECT.with(Cell::get) {
+        return fx;
+    }
+    match platform::stored_theme(OVERLAY_EFFECT_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or(OverlayEffect::default(), OverlayEffect::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: overlay_effect storage read failed error={e}"
+            ));
+            OverlayEffect::default()
+        }
+    }
+}
+
+/// Keep `fx` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_overlay_effect(fx: OverlayEffect) -> Result<(), String> {
+    SESSION_OVERLAY_EFFECT.with(|s| s.set(Some(fx)));
+    platform::store_theme(OVERLAY_EFFECT_KEY, fx.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: overlay_effect storage write failed error={e}"
         ));
     })
 }
@@ -2139,6 +2176,7 @@ fn AppearanceScreen() -> Element {
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut library_transition = use_signal(stored_library_transition);
+    let mut overlay_effect = use_signal(stored_overlay_effect);
     // Bumped when a save fails: the box is keyed on it, so the browser's
     // flipped checkbox is rebuilt from the server value.
     let mut diagnostics_gen = use_signal(|| 0_u32);
@@ -2174,6 +2212,7 @@ fn AppearanceScreen() -> Element {
     let max_quality_now = *max_quality.read();
     let subtitle_size_now = *subtitle_size.read();
     let library_transition_now = *library_transition.read();
+    let overlay_effect_now = *overlay_effect.read();
     let diagnostics_key = *diagnostics_gen.read();
 
     rsx! {
@@ -2220,6 +2259,21 @@ fn AppearanceScreen() -> Element {
                 platform::apply_library_transition(fx);
                 library_transition.set(fx);
                 platform::info(&format!("pharos: library_transition set={}", fx.as_str()));
+            },
+            overlay_effect: overlay_effect_now,
+            on_overlay_effect: move |fx: OverlayEffect| {
+                if let Err(e) = store_overlay_effect(fx) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the controls effect on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                platform::apply_overlay_effect(fx);
+                overlay_effect.set(fx);
+                platform::info(&format!("pharos: overlay_effect set={}", fx.as_str()));
             },
             on_diagnostics: move |on: bool| {
                 let api = ctx.api.peek().clone();
@@ -4033,6 +4087,13 @@ mod tests {
             Route::parse("/ui/together/0a1b-2c"),
             Route::TogetherGroup("0a1b-2c".into())
         );
+    }
+
+    #[test]
+    fn a_chosen_overlay_effect_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_overlay_effect(), OverlayEffect::Fade);
+        store_overlay_effect(OverlayEffect::Burn).unwrap();
+        assert_eq!(stored_overlay_effect(), OverlayEffect::Burn);
     }
 
     /// A subtitle size picked on this page load is what the picker reads back,

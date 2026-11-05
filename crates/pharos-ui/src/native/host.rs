@@ -8,7 +8,9 @@ use pharos_client::api::{Capabilities, ClientEvent, NativeApi};
 use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
-use super::playback::{Engine, LibraryTransition, MediaState, PlaybackEngine, SubtitleSize};
+use super::playback::{
+    Engine, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine, SubtitleSize,
+};
 
 const NO_BROWSER: &str = "the native app needs a browser";
 
@@ -331,6 +333,8 @@ pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
 pub fn apply_subtitle_size(_size: SubtitleSize) {}
 
 pub fn apply_library_transition(_fx: LibraryTransition) {}
+
+pub fn apply_overlay_effect(_fx: OverlayEffect) {}
 
 pub fn prefers(_query: &str) -> bool {
     false
