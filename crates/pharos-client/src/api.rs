@@ -904,20 +904,23 @@ impl PharosApi for NativeApi {
                     segments: d
                         .get_segments()?
                         .iter()
-                        .map(|s| {
-                            Ok(Segment {
-                                kind: match s.get_kind()? {
-                                    WireSegmentKind::Intro => SegmentKind::Intro,
-                                    WireSegmentKind::Outro => SegmentKind::Outro,
-                                    WireSegmentKind::Recap => SegmentKind::Recap,
-                                    WireSegmentKind::Preview => SegmentKind::Preview,
-                                    WireSegmentKind::Commercial => SegmentKind::Commercial,
-                                },
+                        .filter_map(|s| {
+                            // A segment kind newer than this build has no skip
+                            // button to offer, so it is left out.
+                            let kind = match s.get_kind().ok()? {
+                                WireSegmentKind::Intro => SegmentKind::Intro,
+                                WireSegmentKind::Outro => SegmentKind::Outro,
+                                WireSegmentKind::Recap => SegmentKind::Recap,
+                                WireSegmentKind::Preview => SegmentKind::Preview,
+                                WireSegmentKind::Commercial => SegmentKind::Commercial,
+                            };
+                            Some(Segment {
+                                kind,
                                 start_ms: s.get_start_ms(),
                                 end_ms: s.get_end_ms(),
                             })
                         })
-                        .collect::<Result<_, capnp::Error>>()?,
+                        .collect(),
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -1123,11 +1126,11 @@ fn read_tracks(
                 is_default: t.get_is_default(),
                 is_forced: t.get_is_forced(),
                 is_hearing_impaired: t.get_is_hearing_impaired(),
-                vtt_url: match t.get_delivery()? {
+                vtt_url: match read_delivery(t.get_delivery()) {
                     SubtitleDelivery::External => Some(text(t.get_url())?),
                     SubtitleDelivery::Burn | SubtitleDelivery::Image => None,
                 },
-                images_url: match t.get_delivery()? {
+                images_url: match read_delivery(t.get_delivery()) {
                     SubtitleDelivery::Image => Some(text(t.get_url())?),
                     SubtitleDelivery::External | SubtitleDelivery::Burn => None,
                 },
@@ -1186,6 +1189,12 @@ fn wire_kind(kind: ItemKind) -> Option<Kind> {
         ItemKind::Library => Kind::Library,
         ItemKind::Other => return None,
     })
+}
+
+/// A delivery newer than this build is one it cannot draw, so it reads as
+/// `burn`, the server-drawn fallback, rather than failing the whole detail.
+fn read_delivery(delivery: Result<SubtitleDelivery, capnp::NotInSchema>) -> SubtitleDelivery {
+    delivery.unwrap_or(SubtitleDelivery::Burn)
 }
 
 fn read_library_kind(kind: Result<WireLibraryKind, capnp::NotInSchema>) -> LibraryKind {
@@ -1346,5 +1355,17 @@ mod tests {
     fn a_kind_newer_than_the_client_reads_as_other() {
         assert_eq!(read_kind(Err(capnp::NotInSchema(99))), ItemKind::Other);
         assert_eq!(read_kind(Ok(Kind::Movie)), ItemKind::Movie);
+    }
+
+    #[test]
+    fn a_subtitle_delivery_newer_than_the_client_reads_as_burn() {
+        assert_eq!(
+            read_delivery(Err(capnp::NotInSchema(9))),
+            SubtitleDelivery::Burn
+        );
+        assert_eq!(
+            read_delivery(Ok(SubtitleDelivery::Image)),
+            SubtitleDelivery::Image
+        );
     }
 }
