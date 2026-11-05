@@ -306,6 +306,25 @@ jellyfinWeb:
   service:
     type: ClusterIP
 
+# pharos-aligner (ADR-0066): forced alignment of lyric lines to the audio, so
+# karaoke fills word by word. Off by default; the image is 3-4 GB (torch and
+# the MMS_FA weights). When enabled the server is pointed at it
+# (PHAROS_LYRICS_ALIGNER_URL) and it mounts the media volume read-only.
+aligner:
+  enabled: false
+  image:
+    repository: ghcr.io/alisonjenkins/pharos-aligner
+    # CI tags it by its nix store hash; set the one to run.
+    tag: ""
+    pullPolicy: IfNotPresent
+  port: 8790
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 6Gi
+
 # pharos-ui sidecar: the old angie image serving the bundle under /ui/.
 # Superseded by ADR-0033 (pharos serves the UI itself via config.server.uiDir);
 # its image is not published.
