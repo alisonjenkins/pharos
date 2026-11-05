@@ -354,6 +354,9 @@ pub fn group_api(api: &NativeApi) -> Groups {
 /// The [`GroupClient`] this build talks to.
 pub use super::platform::Groups;
 
+/// A held `buffering` call: whether it may go, and who to wake when it may.
+type BufferingGate = Rc<(Cell<bool>, RefCell<Option<std::task::Waker>>)>;
+
 /// An in-memory [`GroupClient`] for tests and the pre-network screens. It
 /// keeps its groups and a log of the calls it received.
 #[derive(Clone, Default)]
@@ -366,7 +369,7 @@ pub struct FakeGroups {
     refuse_follow: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
-    buffering_gates: Rc<RefCell<Vec<Rc<Cell<bool>>>>>,
+    buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
 }
 
 impl FakeGroups {
@@ -380,7 +383,10 @@ impl FakeGroups {
     /// calls started); a call that has not started yet is ignored.
     pub fn release_buffering(&self, n: usize) {
         if let Some(gate) = self.buffering_gates.borrow().get(n) {
-            gate.set(true);
+            gate.0.set(true);
+            if let Some(waker) = gate.1.borrow_mut().take() {
+                waker.wake();
+            }
         }
     }
 
@@ -528,12 +534,13 @@ impl GroupClient for FakeGroups {
         buffering: bool,
     ) -> Result<(), GroupError> {
         if self.hold_buffering.get() {
-            let gate = Rc::new(Cell::new(false));
+            let gate: BufferingGate = Rc::new((Cell::new(false), RefCell::new(None)));
             self.buffering_gates.borrow_mut().push(gate.clone());
-            std::future::poll_fn(|_| {
-                if gate.get() {
+            std::future::poll_fn(|cx| {
+                if gate.0.get() {
                     std::task::Poll::Ready(())
                 } else {
+                    *gate.1.borrow_mut() = Some(cx.waker().clone());
                     std::task::Poll::Pending
                 }
             })

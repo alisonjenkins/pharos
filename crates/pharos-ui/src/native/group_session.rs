@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
-use futures_util::future::LocalBoxFuture;
+use futures_util::future::{select, Either, LocalBoxFuture};
 use futures_util::FutureExt as _;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef};
 
@@ -27,6 +27,10 @@ use super::track_follow::{
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
+
+/// A group command whose RPC has not answered after this long is given up on,
+/// so one that never answers cannot hold back every later one.
+pub const COMMAND_TIMEOUT_MS: u32 = 10_000;
 /// Clock re-sync cadence, and the `groupDrift` sample cadence.
 pub const SAMPLE_EVERY_S: u64 = 10;
 
@@ -520,9 +524,11 @@ struct Inner {
     held_waiting: bool,
     /// Group commands not yet sent; one task sends them one at a time, so the
     /// server sees them in the order the viewer caused them.
-    commands: VecDeque<LocalBoxFuture<'static, Result<(), GroupError>>>,
+    commands: VecDeque<(String, LocalBoxFuture<'static, Result<(), GroupError>>)>,
     /// A task is working through `commands`.
     draining: bool,
+    /// That task has a command's RPC out and unanswered.
+    in_flight: bool,
 }
 
 impl Inner {
@@ -640,10 +646,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let epoch = inner.epoch;
         let player = inner.player.take();
         let shown = inner.state.watching;
+        // The drain task outlives a membership; its queue must too, or a
+        // second task would start beside it and the order would be lost.
+        let commands = std::mem::take(&mut inner.commands);
+        let (draining, in_flight) = (inner.draining, inner.in_flight);
         *inner = Inner {
             epoch,
             player,
             rate: 1.0,
+            commands,
+            draining,
+            in_flight,
             ..Inner::default()
         };
         inner.state.watching = watching.or(shown);
@@ -1206,8 +1219,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// Sends a group command after every earlier one has been answered: two
     /// RPCs in flight can reach the server, and the group, in reverse order
     /// (buffering end before its start leaves a member buffering for good).
-    /// `kind` names the command and its key argument, `queued` how many wait
-    /// ahead of it, for the diagnostics.
+    /// `kind` names the command and its key argument, `queued` how many commands
+    /// (the one in flight included) are ahead of it, for the diagnostics.
     fn command(
         &self,
         kind: String,
@@ -1218,8 +1231,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         };
         let (queued, start) = {
             let mut inner = self.inner.borrow_mut();
-            let queued = inner.commands.len();
-            inner.commands.push_back(fut.boxed_local());
+            let queued = inner.commands.len() + usize::from(inner.in_flight);
+            inner.commands.push_back((kind.clone(), fut.boxed_local()));
             let start = !inner.draining;
             inner.draining = true;
             (queued, start)
@@ -1237,17 +1250,23 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 let next = {
                     let mut inner = me.inner.borrow_mut();
                     let next = inner.commands.pop_front();
+                    inner.in_flight = next.is_some();
                     if next.is_none() {
                         inner.draining = false;
                     }
                     next
                 };
-                let Some(next) = next else {
+                let Some((kind, next)) = next else {
                     return;
                 };
-                if let Err(e) = next.await {
-                    me.env
-                        .warn(&format!("pharos: group command failed: {}", e.0));
+                match select(next, me.env.sleep(COMMAND_TIMEOUT_MS)).await {
+                    Either::Left((Err(e), _)) => me
+                        .env
+                        .warn(&format!("pharos: group command failed: {}", e.0)),
+                    Either::Left((Ok(()), _)) => {}
+                    Either::Right(_) => me.env.warn(&format!(
+                        "pharos: group command timed out kind={kind} after_ms={COMMAND_TIMEOUT_MS}"
+                    )),
                 }
             }
         }));
@@ -1489,6 +1508,9 @@ mod tests {
         ui: Rc<RefCell<Vec<Ui>>>,
         tasks: Rc<RefCell<Vec<LocalBoxFuture<'static, ()>>>>,
         logs: Rc<RefCell<Vec<String>>>,
+        /// Whether the command timeout has run out; it never does until a
+        /// test says so, so a held RPC stays held.
+        timeout_elapsed: Rc<Cell<bool>>,
     }
 
     impl Env for TestEnv {
@@ -1500,6 +1522,16 @@ mod tests {
         fn sleep(&self, ms: u32) -> LocalBoxFuture<'static, ()> {
             if ms == 1_000 {
                 std::future::pending().boxed_local()
+            } else if ms == COMMAND_TIMEOUT_MS {
+                let elapsed = self.timeout_elapsed.clone();
+                std::future::poll_fn(move |_| {
+                    if elapsed.get() {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .boxed_local()
             } else {
                 std::future::ready(()).boxed_local()
             }
@@ -1516,7 +1548,9 @@ mod tests {
         fn info(&self, message: &str) {
             self.logs.borrow_mut().push(message.to_owned());
         }
-        fn warn(&self, _message: &str) {}
+        fn warn(&self, message: &str) {
+            self.logs.borrow_mut().push(message.to_owned());
+        }
     }
 
     impl TestEnv {
@@ -1918,12 +1952,13 @@ mod tests {
         rig.session.on_media(MediaEvent::CanPlay);
         let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
         pump(&rig.env, &mut live);
-        // The later call answers first, if it was already on the wire.
+        // Releasing the second call first simulates a server that answers out
+        // of order. Under the fix the second is not on the wire yet, so this
+        // is a no-op; the first goes through, then the second may start.
         rig.groups.release_buffering(1);
         pump(&rig.env, &mut live);
         rig.groups.release_buffering(0);
         pump(&rig.env, &mut live);
-        // Once the first is through, the second may start.
         rig.groups.release_buffering(1);
         pump(&rig.env, &mut live);
         assert_eq!(
@@ -1938,6 +1973,42 @@ mod tests {
                 "pharos: group command sent kind=buffering(false) queued=1",
             ]
         );
+    }
+
+    /// An RPC that never answers is given up on, so it cannot hold back the
+    /// commands after it.
+    #[test]
+    fn a_command_that_never_answers_does_not_block_the_next() {
+        let rig = rig();
+        rig.groups.hold_buffering();
+        rig.session.on_media(MediaEvent::Waiting);
+        assert!(rig.session.seek(5_000));
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        assert!(calls_with(&rig, "seek").is_empty(), "held behind buffering");
+        rig.env.timeout_elapsed.set(true);
+        pump(&rig.env, &mut live);
+        assert_eq!(calls_with(&rig, "seek"), ["seek(5000)"]);
+        assert_eq!(
+            rig.env
+                .logged("pharos: group command timed out kind=buffering(true)"),
+            ["pharos: group command timed out kind=buffering(true) after_ms=10000"]
+        );
+    }
+
+    /// Joining again resets the membership, not the queue a running drain
+    /// task works through.
+    #[test]
+    fn a_new_membership_keeps_the_command_queue_and_its_drain() {
+        let rig = rig();
+        rig.groups.hold_buffering();
+        rig.session.on_media(MediaEvent::Waiting);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        assert!(rig.session.inner.borrow().in_flight);
+        let _ = rig.session.join("g1").now_or_never();
+        let inner = rig.session.inner.borrow();
+        assert!(inner.draining && inner.in_flight);
     }
 
     /// Polls the tasks the session spawned, keeping the parked ones, until a
