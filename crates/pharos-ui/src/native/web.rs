@@ -150,13 +150,6 @@ pub fn current_path() -> String {
         .unwrap_or_else(|| "/".into())
 }
 
-/// The query of the page's URL, `?` included, or empty.
-pub fn current_search() -> String {
-    web_sys::window()
-        .and_then(|w| w.location().search().ok())
-        .unwrap_or_default()
-}
-
 /// The `history.state` of every entry the app pushes, which tells an entry
 /// with an app page before it from one opened from outside.
 const IN_APP: &str = "pharos";
@@ -1169,6 +1162,110 @@ pub fn scroll_to_tile(at: u32) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Scrolls the page back to its top.
+pub fn scroll_to_top() {
+    if let Some(window) = web_sys::window() {
+        window.scroll_to_with_x_and_y(0.0, 0.0);
+    }
+}
+
+/// How far the top of the browse tile at `at` is below the top of the
+/// viewport, in CSS px; negative when it is scrolled partly out above.
+pub fn tile_top(at: u32) -> Option<f64> {
+    Some(grid_tiles()?.item(at)?.get_bounding_client_rect().top())
+}
+
+/// Scrolls the page so the browse tile at `at` sits `top` px below the
+/// top of the viewport; `false` when it is not in the page yet.
+pub fn scroll_tile_to(at: u32, top: f64) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    match tile_top(at) {
+        Some(now) => {
+            window.scroll_by_with_x_and_y(0.0, now - top);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The query of the page's URL, `?` included, or empty.
+pub fn current_search() -> String {
+    web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .unwrap_or_default()
+}
+
+/// How long the page must stay still before a scroll counts as settled:
+/// long enough that a fling reports once, short enough that a click on a
+/// tile straight after scrolling still finds it recorded.
+const SCROLL_SETTLE_MS: i32 = 150;
+
+/// A window `scroll` listener and its pending settle timer; both go on drop,
+/// so a timer cannot fire for a page that has been left.
+pub struct ScrollWatch {
+    listener: Closure<dyn FnMut(web_sys::Event)>,
+    pending: Rc<Cell<Option<i32>>>,
+    _settled: Rc<Closure<dyn FnMut()>>,
+}
+
+impl Drop for ScrollWatch {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window.remove_event_listener_with_callback(
+                "scroll",
+                self.listener.as_ref().unchecked_ref(),
+            );
+            if let Some(timer) = self.pending.take() {
+                window.clear_timeout_with_handle(timer);
+            }
+        }
+    }
+}
+
+/// Call `on_settled` once the page has stopped scrolling.
+pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch {
+    let pending = Rc::new(Cell::new(None::<i32>));
+    let fired = pending.clone();
+    let settled = Rc::new(Closure::<dyn FnMut()>::new(move || {
+        fired.set(None);
+        on_settled();
+    }));
+    let timer = pending.clone();
+    let callback = settled.clone();
+    let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        if let Some(old) = timer.take() {
+            window.clear_timeout_with_handle(old);
+        }
+        timer.set(
+            window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    (*callback).as_ref().unchecked_ref(),
+                    SCROLL_SETTLE_MS,
+                )
+                .ok(),
+        );
+    });
+    if let Some(window) = web_sys::window() {
+        let options = web_sys::AddEventListenerOptions::new();
+        options.set_passive(true);
+        let _ = window.add_event_listener_with_callback_and_add_event_listener_options(
+            "scroll",
+            listener.as_ref().unchecked_ref(),
+            &options,
+        );
+    }
+    ScrollWatch {
+        listener,
+        pending,
+        _settled: settled,
     }
 }
 
