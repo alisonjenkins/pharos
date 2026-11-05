@@ -20,7 +20,9 @@
 
 use crate::{bg_io::BgPermit, state::AppState};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
-use pharos_cache::subtitle_cache::{mtime_secs, ImageSubs, SubtitleKind, IMAGE_SUB_GEN_VERSION};
+use pharos_cache::subtitle_cache::{
+    mtime_nanos, mtime_secs, ImageSubs, SubtitleKind, IMAGE_SUB_GEN_VERSION,
+};
 use serde::Serialize;
 use tokio::process::Command;
 
@@ -193,6 +195,8 @@ async fn image_subtitle_png(
 struct ImageTrack<'a> {
     subs: &'a pharos_cache::subtitle_cache::SubtitleCache,
     path: std::path::PathBuf,
+    /// The source's mtime in nanoseconds ([`mtime_nanos`]): it names the
+    /// cache directory and versions the PNG URLs.
     mtime: i64,
     rel_idx: u32,
     duration_ms: u64,
@@ -225,7 +229,7 @@ async fn image_subtitle_track<'a>(
     };
     Ok(ImageTrack {
         subs,
-        mtime: mtime_secs(&item.path).await,
+        mtime: mtime_nanos(&item.path).await,
         path: item.path,
         rel_idx: rel_idx as u32,
         duration_ms: item.probe.duration_ms.unwrap_or(0),

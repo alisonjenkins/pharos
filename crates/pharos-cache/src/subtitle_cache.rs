@@ -386,7 +386,8 @@ impl SubtitleCache {
 
     /// Where the `rel_idx`-th subtitle stream's images are, without starting
     /// or checking an extraction:
-    /// `{root}/subtitles/{hash(path)}-{mtime}-{idx}-i{IMAGE_SUB_GEN_VERSION}/`.
+    /// `{root}/subtitles/{hash(path)}-{mtime}-{idx}-i{IMAGE_SUB_GEN_VERSION}/`,
+    /// where `mtime` is [`mtime_nanos`].
     /// `None` without a disk root.
     pub fn image_dir(&self, path: &Path, mtime_secs: i64, rel_idx: u32) -> Option<PathBuf> {
         let file = self.disk_path(&Key {
@@ -686,10 +687,41 @@ pub async fn mtime_secs(path: &std::path::Path) -> i64 {
         .unwrap_or(0)
 }
 
+/// The source path's mtime in nanoseconds since epoch, for the image
+/// subtitle cache: its directory and its PNG URLs carry it, and the whole
+/// second of [`mtime_secs`] would let a file replaced within that second
+/// keep the previous file's images. `0` when stat fails, as there.
+pub async fn mtime_nanos(path: &std::path::Path) -> i64 {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return 0;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mtime_nanos_keeps_the_second_mtime_secs_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let at = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        assert_eq!(mtime_secs(&file).await, 1_700_000_000);
+        assert_eq!(mtime_nanos(&file).await, 1_700_000_000_123_456_789);
+        assert_eq!(mtime_nanos(&dir.path().join("missing")).await, 0);
+    }
     use std::path::Path;
 
     #[tokio::test]
