@@ -1108,6 +1108,7 @@ fn NativeApp(route: Route) -> Element {
                 if api.peek().is_some() {
                     api.set(None);
                     platform::forget_opt_in();
+                    search.clear();
                 }
             }
         }
@@ -1371,12 +1372,13 @@ struct Search {
 
 impl Search {
     /// Each edit starts a debounced search, and only the reply to the newest
-    /// edit is kept.
+    /// edit is kept. The previous term's matches are dropped at once, so a
+    /// pick during the debounce cannot open a match for other text.
     fn edit(mut self, ctx: Ctx, value: String) {
         let generation = self.find.write().edit(&value);
         self.text.set(value);
+        self.hits.set(Hits::Idle);
         let Some(generation) = generation else {
-            self.hits.set(Hits::Idle);
             return;
         };
         spawn(async move {
@@ -1399,6 +1401,14 @@ impl Search {
                 Err(message) => self.hits.set(Hits::Failed(message)),
             }
         });
+    }
+
+    /// Forgets the term and its matches, and outdates any search in flight:
+    /// a session's results must not reach whoever signs in next.
+    fn clear(mut self) {
+        let _ = self.find.write().edit("");
+        self.text.set(String::new());
+        self.hits.set(Hits::Idle);
     }
 }
 
@@ -2288,23 +2298,6 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             q.shuffled()
         ));
     });
-    // The next episode's name and still, for the "Up next" card.
-    let upcoming = use_resource(move || {
-        let api = ctx.api.read().clone();
-        let next = near
-            .read()
-            .as_ref()
-            .and_then(|n| n.as_ref())
-            .and_then(|(n, _)| n.next);
-        async move {
-            let (api, next) = (api?, next?);
-            api.detail(&call("watch", "up next"), next)
-                .await
-                .map(|d| d.item)
-                .map_err(|e| platform::warn(&format!("pharos: up next unavailable: {e}")))
-                .ok()
-        }
-    });
     // A reconnect replaces the API but must not renegotiate: that would mount
     // a new player mid-song. Only gaining or losing the API does.
     let connected = use_memo(move || ctx.api.read().is_some());
@@ -2408,6 +2401,30 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     })))
                 }),
             )
+        }
+    });
+    // The next episode's name and still, for the "Up next" card. Only an
+    // episode shows one: a song's next track would cost a detail call for
+    // nothing.
+    let upcoming = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let episode = matches!(
+            playing.read().as_ref(),
+            Some(Some(Ok(p))) if p.0.kind == ItemKind::Episode
+        );
+        let next = near
+            .read()
+            .as_ref()
+            .and_then(|n| n.as_ref())
+            .and_then(|(n, _)| n.next)
+            .filter(|_| episode);
+        async move {
+            let (api, next) = (api?, next?);
+            api.detail(&call("watch", "up next"), next)
+                .await
+                .map(|d| d.item)
+                .map_err(|e| platform::warn(&format!("pharos: up next unavailable: {e}")))
+                .ok()
         }
     });
     // When the grant is from an older API (a reconnect, even one during the
@@ -3026,7 +3043,11 @@ fn Player(
     // The next episode often arrives after the player mounts, and the media
     // handlers can outlive the render that made them, so they read it here.
     let up_next_to = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
-    up_next_to.set(near.next.filter(|_| p.kind == ItemKind::Episode));
+    // In a group the group decides what plays next, as for a song's queue.
+    up_next_to.set(
+        near.next
+            .filter(|_| p.kind == ItemKind::Episode && !group.active),
+    );
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
