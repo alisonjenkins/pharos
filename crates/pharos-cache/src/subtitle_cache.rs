@@ -400,6 +400,29 @@ impl SubtitleCache {
         Some(file.with_file_name(format!("{stem}{IMAGE_SUB_GEN_VERSION}")))
     }
 
+    /// Where the fonts subset for the subtitle at `stream_index` are cached, one
+    /// file per attachment: `{root}/subtitles/{hash(path)}-{mtime}-{idx}-a-f{script_mtime}-v{version}/`.
+    /// The font set follows the script (its glyphs), so the script's mtime is
+    /// in the name beside the source's, and `version` is the subsetter's
+    /// output version. `None` without a disk root.
+    pub fn font_dir(
+        &self,
+        path: &Path,
+        mtime_secs: i64,
+        stream_index: u32,
+        script_mtime_secs: i64,
+        version: u32,
+    ) -> Option<PathBuf> {
+        let file = self.disk_path(&Key {
+            path: path.to_path_buf(),
+            mtime_secs,
+            stream_index,
+            kind: SubtitleKind::EmbeddedAss,
+        })?;
+        let stem = file.file_stem()?.to_str()?.to_owned();
+        Some(file.with_file_name(format!("{stem}-f{script_mtime_secs}-v{version}")))
+    }
+
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     fn spawn_image_extraction(&self, key: Key, duration_ms: u64, dir: PathBuf) {
         let Some(pool) = self.pool.clone() else {
@@ -946,6 +969,28 @@ mod tests {
             .get(Path::new("/m/x.mkv"), 8, 3, SubtitleKind::EmbeddedAss)
             .await
             .is_none());
+    }
+
+    /// B572 / V488: a subset font is never read back after the script it was
+    /// cut for, the source, the track or the subsetter changed.
+    #[test]
+    fn font_dir_names_every_input_of_a_subset() {
+        let mem = SubtitleCache::new(1_024, 64);
+        let m = Path::new("/m/x.mkv");
+        assert_eq!(mem.font_dir(m, 7, 3, 9, 1), None);
+        let disk = SubtitleCache::new(1_024, 64).with_disk("/cache");
+        let base = disk.font_dir(m, 7, 3, 9, 1).unwrap();
+        assert_eq!(base, disk.font_dir(m, 7, 3, 9, 1).unwrap());
+        assert!(base.starts_with("/cache/subtitles"));
+        for other in [
+            disk.font_dir(Path::new("/m/y.mkv"), 7, 3, 9, 1),
+            disk.font_dir(m, 8, 3, 9, 1),
+            disk.font_dir(m, 7, 4, 9, 1),
+            disk.font_dir(m, 7, 3, 10, 1),
+            disk.font_dir(m, 7, 3, 9, 2),
+        ] {
+            assert_ne!(Some(&base), other.as_ref());
+        }
     }
 
     #[tokio::test]
