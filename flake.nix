@@ -740,7 +740,8 @@
             export HOME=$TMPDIR
             # dx keeps DWARF by default, and binaryen aborts re-emitting it
             # (wasm-opt SIGABRT), which ships the wasm unoptimised.
-            dx build --package pharos-ui --release --debug-symbols false
+            # Name the bin: with pharos-tv beside it, dx no longer picks one.
+            dx build --package pharos-ui --bin pharos-ui-web --release --debug-symbols false
             runHook postBuild
           '';
           installPhase = ''
