@@ -229,3 +229,32 @@ async fn the_description_language_is_kept_in_the_user_configuration() {
         })
         .await;
 }
+
+/// `whats_new.seen` keeps the newest what's-new entry a user was shown
+/// (spec 027, V495): a number reads back, and anything else is refused with
+/// a WARN while the stored number stays. Disarm check: with the
+/// `is_whats_new_entry` test in `Prefs::write` removed, `b"soon"` is stored
+/// and the read-back assertion fails.
+#[actix_web::test]
+async fn whats_new_seen_holds_only_an_entry_number() {
+    let fx = seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            const SEEN: &str = "whats_new.seen";
+            assert_eq!(get(&prefs, SEEN).await, Got::NotSet);
+            set(&prefs, SEEN, b"3").await.expect("stored");
+            for bad in [&b"soon"[..], b"", b"-1", b"1234567890"] {
+                assert!(set(&prefs, SEEN, bad).await.is_err(), "{bad:?}");
+            }
+            assert_eq!(get(&prefs, SEEN).await, Got::Value(b"3".to_vec()));
+        })
+        .await;
+    let text = logs.text();
+    assert!(
+        text.contains("pref refused: not an entry number") && text.contains("whats_new.seen"),
+        "{text}"
+    );
+}

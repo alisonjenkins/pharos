@@ -22,8 +22,16 @@ pub(super) const DIAGNOSTICS_OPT_IN: &str = "diagnostics.opt_in";
 /// same thing.
 pub(super) const DESCRIPTION_LANGUAGE: &str = "description.language";
 
+/// The newest "what's new" entry this user has been shown (spec 027,
+/// ADR-0065): a decimal number of at most [`MAX_WHATS_NEW_DIGITS`] digits.
+/// Absent means the user has seen none.
+pub(super) const WHATS_NEW_SEEN: &str = "whats_new.seen";
+
+/// Digits a [`WHATS_NEW_SEEN`] value may hold: room for a u32 counter.
+const MAX_WHATS_NEW_DIGITS: usize = 9;
+
 /// Keys a client may read and write; any other key is refused.
-const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN, DESCRIPTION_LANGUAGE];
+const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN, DESCRIPTION_LANGUAGE, WHATS_NEW_SEEN];
 
 /// Largest value one pref may hold: a toggle or a small settings document,
 /// never a blob, and a bound on what one user can make the database keep.
@@ -156,6 +164,10 @@ impl Prefs {
                     SetLanguageError::Store(e) => store_denial("set", key, &e),
                 });
         }
+        if key == WHATS_NEW_SEEN && !is_whats_new_entry(value) {
+            tracing::warn!(key, size = value.len(), "pref refused: not an entry number");
+            return Err(Denial::Invalid { field: "value" });
+        }
         self.session
             .state
             .stores
@@ -167,4 +179,9 @@ impl Prefs {
         }
         Ok(())
     }
+}
+
+/// Whether `value` is a [`WHATS_NEW_SEEN`] number: ASCII digits only.
+fn is_whats_new_entry(value: &[u8]) -> bool {
+    (1..=MAX_WHATS_NEW_DIGITS).contains(&value.len()) && value.iter().all(u8::is_ascii_digit)
 }
