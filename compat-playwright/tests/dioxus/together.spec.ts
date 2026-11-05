@@ -112,14 +112,8 @@ async function signIn(browser: Browser, label: string) {
   return { context, page, lines };
 }
 
-/** Two signed-in browsers in one group on the seeded movie `file`. */
-async function startGroup(
-  browser: Browser,
-  request: APIRequestContext,
-  open: { context: BrowserContext; page: Page }[],
-  file: string,
-  opts: { subtitled?: boolean } = {},
-) {
+/** The seeded movie `file`: its native id, and an API token for the user. */
+async function seededMovie(request: APIRequestContext, file: string) {
   const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
     headers: { Accept: "application/json" },
   });
@@ -146,6 +140,18 @@ async function startGroup(
   const movie = movies.Items?.find((i: { Path?: string }) => i.Path?.endsWith(file));
   test.skip(!movie, `pharos has no seeded ${file}`);
   const nativeId = BigInt(`0x${movie.Id}`).toString();
+  return { api, movie, nativeId };
+}
+
+/** Two signed-in browsers in one group on the seeded movie `file`. */
+async function startGroup(
+  browser: Browser,
+  request: APIRequestContext,
+  open: { context: BrowserContext; page: Page }[],
+  file: string,
+  opts: { subtitled?: boolean } = {},
+) {
+  const { api, movie, nativeId } = await seededMovie(request, file);
   if (opts.subtitled) {
     // The startup rescan probes the fixture; its streams appear once it has.
     await expect
@@ -285,6 +291,79 @@ test.describe("pharos Dioxus UI watch together", () => {
         .toBeGreaterThan(5);
       const target = (await people[0].probe()).currentTime * 1000;
       await assertSeekConverged(people, target);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
+
+  // V479: A is already watching when they start the group from the player.
+  // The group starts where A's video is and A's video plays on; the invite
+  // link the player shows brings B in at the group's place.
+  test("a group started mid-watch keeps A's place and its invite link brings B in", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(150_000);
+    const { nativeId } = await seededMovie(request, "/fixture-1.webm");
+    const a = await signIn(browser, "A");
+    open.push(a);
+    const b = await signIn(browser, "B");
+    open.push(b);
+    const logs = () => [...a.lines, ...b.lines].join("\n");
+    const byA = new Member("A", a.page);
+    const byB = new Member("B", b.page);
+    try {
+      // A watches alone for a few seconds.
+      await a.page.goto(`${PHAROS_URL}/ui/watch/${nativeId}`);
+      await a.page.evaluate(() => {
+        const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+        if (v) v.muted = true;
+      });
+      await expect
+        .poll(() => byA.probe().then((p) => (p.paused ? 0 : p.currentTime)), {
+          message: "A's video plays",
+          timeout: 30_000,
+        })
+        .toBeGreaterThan(3);
+      const before = (await byA.probe()).currentTime;
+      await expect(a.page.locator(".pharos-members")).toHaveCount(0);
+
+      // A starts the group from the player's top bar.
+      await a.page.mouse.move(200, 200);
+      await a.page.getByRole("button", { name: "Watch together" }).click();
+      await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+      await expect(a.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
+      await expect(a.page.getByRole("button", { name: "Watch together" })).toHaveCount(0);
+
+      // The invite panel opens with the group's link.
+      const link = a.page.getByRole("textbox", { name: "Invite link" });
+      await expect(link).toBeVisible({ timeout: 10_000 });
+      const url = await link.inputValue();
+      expect(url).toMatch(new RegExp(`^${PHAROS_URL}/ui/together/[A-Za-z0-9_-]+$`));
+      await a.page.getByRole("button", { name: "Copy link" }).click();
+      await expect(a.page.locator(".pharos-invite-note")).toHaveText(
+        /^(Link copied|Press Ctrl\+C to copy the link)$/,
+      );
+
+      // A's video stayed where it was and plays on in the group.
+      await expect
+        .poll(() => byA.probe().then((p) => (p.paused ? 0 : p.currentTime)), {
+          message: "A plays on from where they were",
+          timeout: 15_000,
+        })
+        .toBeGreaterThan(before);
+      await a.page.getByRole("button", { name: "Done" }).click();
+      await expect(link).toHaveCount(0);
+
+      // B follows the link and joins at the group's place.
+      await b.page.goto(url);
+      await b.page.getByRole("button", { name: "Join" }).click();
+      await expect(b.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
+      for (const p of [a.page, b.page]) {
+        await expect(p.locator(".pharos-member-list li")).toHaveCount(2, { timeout: 15_000 });
+      }
+      await waitUntilInSync([byA, byB]);
+      expect((await byB.probe()).currentTime).toBeGreaterThan(before);
     } catch (e) {
       throw await failure(e, a, b, logs);
     }
