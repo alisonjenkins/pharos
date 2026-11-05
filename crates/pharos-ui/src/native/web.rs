@@ -460,10 +460,10 @@ thread_local! {
     static ON_CUE_CHANGE: Closure<dyn FnMut(web_sys::Event)> =
         Closure::new(|e: web_sys::Event| {
             if let Some(track) = e.target() {
-                let per_line = CUE_VIDEO.with(|v| cue_chars_for(&v.borrow()));
+                let cue_box = CUE_VIDEO.with(|v| cue_box_for(&v.borrow()));
                 lift_cues(
                     &js_sys::Reflect::get(&track, &"activeCues".into()).unwrap_or_default(),
-                    per_line,
+                    cue_box,
                 );
             }
         });
@@ -488,7 +488,7 @@ pub fn lift_cues_as_shown(video_id: &str) {
                 if t.mode() == web_sys::TextTrackMode::Showing {
                     lift_cues(
                         &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
-                        cue_chars_for(&id),
+                        cue_box_for(&id),
                     );
                     ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
                 }
@@ -520,7 +520,7 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
             if on {
                 lift_cues(
                     &js_sys::Reflect::get(&t, &"cues".into()).unwrap_or_default(),
-                    cue_chars_for(video_id),
+                    cue_box_for(video_id),
                 );
                 ON_CUE_CHANGE.with(|f| t.set_oncuechange(Some(f.as_ref().unchecked_ref())));
             }
@@ -528,14 +528,37 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
     }
 }
 
-/// About how many characters fit on a cue line in the `<video>` `video_id`
-/// now (`cue_chars_per_line`), from its width, the viewport's height and the
+/// Where the `<video>` `video_id`'s cues are laid out now: the width a cue
+/// of `size` 100 spans (the video's) and the cue font size (`cue_font_px`)
+/// from the width CSS resolves `cqw` against (the enclosing
+/// `.pharos-player`, else the video), the viewport's height and the
 /// `--pharos-subtitle-scale` the Subtitle size choice sets.
-fn cue_chars_for(video_id: &str) -> usize {
-    let Some(window) = web_sys::window() else {
-        return usize::MAX;
+#[derive(Clone, Copy)]
+struct CueBox {
+    width: f64,
+    font: f64,
+}
+
+fn cue_box_for(video_id: &str) -> CueBox {
+    let none = CueBox {
+        width: 0.0,
+        font: 0.0,
     };
-    let width = element_width(video_id);
+    let Some(window) = web_sys::window() else {
+        return none;
+    };
+    let Some(video) = window
+        .document()
+        .and_then(|d| d.get_element_by_id(video_id))
+    else {
+        return none;
+    };
+    let width = video.get_bounding_client_rect().width();
+    let container = video
+        .closest(".pharos-player")
+        .ok()
+        .flatten()
+        .map_or(width, |p| p.get_bounding_client_rect().width());
     let height = window
         .inner_height()
         .ok()
@@ -548,16 +571,20 @@ fn cue_chars_for(video_id: &str) -> usize {
         .and_then(|s| s.get_property_value("--pharos-subtitle-scale").ok())
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(1.0);
-    cue_chars_per_line(width, cue_font_px(width, height, scale))
+    CueBox {
+        width,
+        font: cue_font_px(container, height, scale),
+    }
 }
 
 /// Set `line` on each horizontal cue in the `TextTrackCueList` `cues`
 /// still placed by the browser (`line` is `"auto"`) to what `lifted_line`
-/// gives for its text at `chars_per_line`, so its last rendered line sits one
+/// gives for its text wrapped in `cue_box` (narrowed by the cue's own `size`,
+/// a percentage of the video's width), so its last rendered line sits one
 /// line above the picture's bottom edge instead of on it (B545). `line` is
 /// the standard `VTTCue` setting, so Firefox honours it too, unlike the
 /// `::-webkit-media-text-track-*` pseudo-elements.
-fn lift_cues(cues: &JsValue, chars_per_line: usize) {
+fn lift_cues(cues: &JsValue, cue_box: CueBox) {
     if cues.is_null() || cues.is_undefined() {
         return;
     }
@@ -569,6 +596,7 @@ fn lift_cues(cues: &JsValue, chars_per_line: usize) {
     let vertical = JsValue::from_str("vertical");
     let cue_text = JsValue::from_str("text");
     let region = JsValue::from_str("region");
+    let size_key = JsValue::from_str("size");
     let text = |cue: &JsValue, key: &JsValue| {
         js_sys::Reflect::get(cue, key)
             .ok()
@@ -590,6 +618,12 @@ fn lift_cues(cues: &JsValue, chars_per_line: usize) {
             && !in_region
         {
             let lines = text(&cue, &cue_text).unwrap_or_default();
+            let size = js_sys::Reflect::get(&cue, &size_key)
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(100.0)
+                .clamp(0.0, 100.0);
+            let chars_per_line = cue_chars_per_line(cue_box.width * size / 100.0, cue_box.font);
             let _ = js_sys::Reflect::set(
                 &cue,
                 &line,
