@@ -461,6 +461,36 @@ mod tests {
         assert_eq!(depth, 0, "blocks left open at the end of the sheet");
     }
 
+    /// V496: the what's-new demo plays every library transition from its own
+    /// `data-library-transition`, not the page's, and holds still under
+    /// reduced motion like a library's cards.
+    #[test]
+    fn the_whats_new_demo_plays_each_transition_from_its_own_attribute() {
+        use crate::native::playback::LibraryTransition;
+        for fx in LibraryTransition::ALL {
+            if fx == LibraryTransition::Fade {
+                continue;
+            }
+            let own = format!(
+                ".pharos-whats-new-demo[data-library-transition=\"{}\"] .pharos-arrive {{",
+                fx.as_str()
+            );
+            assert!(SHEET.contains(&own), "no demo rule for {}", fx.as_str());
+        }
+        assert!(SHEET.contains(
+            ":is(.pharos-browse, .pharos-artist, .pharos-whats-new-demo) .pharos-arrive {"
+        ));
+        let reduced = reduced_motion_blocks(SHEET);
+        assert!(
+            rule(
+                &reduced,
+                ":is(.pharos-browse, .pharos-artist, .pharos-whats-new-demo) .pharos-arrive::after"
+            )
+            .contains("animation: none !important"),
+            "{reduced}"
+        );
+    }
+
     #[test]
     fn the_sheet_uses_no_pre_010_variable() {
         const OLD_VARS: &[&str] = &[
