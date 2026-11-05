@@ -464,11 +464,7 @@ pub(super) async fn upgrade(
         .aggregate_continuations()
         .max_continuation_size(MAX_FRAME);
     // R2: the RpcSystem is !Send, so it stays on this worker.
-    let timing = Timing {
-        revalidate: Duration::from_secs(u64::from(cfg.revalidate_secs.get())),
-        auth_deadline: Duration::from_secs(u64::from(cfg.auth_deadline_secs.get())),
-        max_unauthenticated: Duration::from_secs(u64::from(cfg.max_unauthenticated_secs.get())),
-    };
+    let timing = Timing::of(&cfg);
     actix_web::rt::spawn(run(state, ctx, session, stream, peer, timing));
     Ok(response)
 }
@@ -484,6 +480,22 @@ struct Timing {
     /// How long a connection may stay unauthenticated however many pending
     /// polls extend its deadline (B541, V436).
     max_unauthenticated: Duration,
+}
+
+impl Timing {
+    /// The timers `cfg` asks for. The auth deadline never runs past
+    /// `max_unauthenticated_secs`, so a connection that never polls is held
+    /// no longer than one that does.
+    fn of(cfg: &NativeApiConfig) -> Self {
+        let max_unauthenticated =
+            Duration::from_secs(u64::from(cfg.max_unauthenticated_secs.get()));
+        Timing {
+            revalidate: Duration::from_secs(u64::from(cfg.revalidate_secs.get())),
+            auth_deadline: Duration::from_secs(u64::from(cfg.auth_deadline_secs.get()))
+                .min(max_unauthenticated),
+            max_unauthenticated,
+        }
+    }
 }
 
 async fn run<S>(
@@ -755,6 +767,21 @@ mod tests {
             AuthDeadlineExtension::QuickConnectPending.label(),
             "quick_connect_pending"
         );
+    }
+
+    /// A cap below the auth deadline also caps the first deadline, so a
+    /// silent connection cannot outlast `max_unauthenticated_secs`.
+    #[test]
+    fn the_auth_deadline_never_outlasts_the_unauthenticated_cap() {
+        let mut cfg = NativeApiConfig::default();
+        let t = Timing::of(&cfg);
+        assert_eq!(t.auth_deadline, Duration::from_secs(30));
+        assert_eq!(t.max_unauthenticated, Duration::from_secs(300));
+        cfg.auth_deadline_secs = std::num::NonZeroU32::MIN.saturating_add(29);
+        cfg.max_unauthenticated_secs = std::num::NonZeroU32::MIN.saturating_add(2);
+        let t = Timing::of(&cfg);
+        assert_eq!(t.auth_deadline, Duration::from_secs(3));
+        assert_eq!(t.max_unauthenticated, Duration::from_secs(3));
     }
 
     #[test]
