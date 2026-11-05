@@ -12,7 +12,7 @@ use pharos_api::pharos_capnp::{
 use pharos_api::{server, Denial};
 use pharos_jellyfin_api::dto::WireId;
 
-use super::library::{item_denial, read_item_id};
+use super::library::{item_denial, read_item_id, IMAGE_DELIVERY_SCHEMA_VERSION};
 use super::session::Session;
 use crate::services::access::ItemHidden;
 use crate::services::play_state::{self, Report};
@@ -39,7 +39,11 @@ impl server::playback::Handler for Playback {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let id = read_item_id(params.get_id()?)?;
-        let capabilities = read_capabilities(params.get_caps()?)?;
+        // A client older than image delivery is sent `burn` for an image
+        // track by `Library.detail`, so it must not be granted one to draw.
+        let knows_image_delivery =
+            params.get_ctx()?.get_schema_version() >= IMAGE_DELIVERY_SCHEMA_VERSION;
+        let capabilities = read_capabilities(params.get_caps()?, knows_image_delivery)?;
         // Negotiation always plays an audio track; "none" is refused rather
         // than read as the default.
         let audio_stream_index = match params.get_audio()?.which()? {
@@ -266,7 +270,10 @@ impl Drop for Grant {
     }
 }
 
-fn read_capabilities(caps: capabilities::Reader<'_>) -> Result<Capabilities, capnp::Error> {
+fn read_capabilities(
+    caps: capabilities::Reader<'_>,
+    knows_image_delivery: bool,
+) -> Result<Capabilities, capnp::Error> {
     let texts = |list: capnp::text_list::Reader<'_>| -> Result<Vec<String>, capnp::Error> {
         list.iter().map(|t| Ok(t?.to_str()?.to_owned())).collect()
     };
@@ -275,7 +282,11 @@ fn read_capabilities(caps: capabilities::Reader<'_>) -> Result<Capabilities, cap
         audio_codecs: texts(caps.get_audio_codecs()?)?,
         containers: texts(caps.get_containers()?)?,
         max_bitrate: caps.get_max_bitrate(),
-        image_subtitles: texts(caps.get_image_subtitles()?)?,
+        image_subtitles: if knows_image_delivery {
+            texts(caps.get_image_subtitles()?)?
+        } else {
+            Vec::new()
+        },
     })
 }
 

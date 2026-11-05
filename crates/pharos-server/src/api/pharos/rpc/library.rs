@@ -1318,8 +1318,9 @@ fn len<T>(v: &[T]) -> u32 {
 }
 
 /// The first schemaVersion with `SubtitleDelivery.image`. An older client
-/// fails to read the whole detail on that value, so it is sent `burn`.
-const IMAGE_DELIVERY_SCHEMA_VERSION: u32 = 16;
+/// fails to read the whole detail on that value, so it is sent `burn`, and
+/// `Playback.negotiate` ignores the image codecs it declares.
+pub(super) const IMAGE_DELIVERY_SCHEMA_VERSION: u32 = 16;
 
 fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: &[watch::Track]) {
     for (i, t) in (0..).zip(tracks) {

@@ -127,10 +127,30 @@ async fn negotiate(
     audio: Choice,
     subtitle: Choice,
 ) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate_at(
+        pharos_api::pharos_capnp::SCHEMA_VERSION,
+        session,
+        id,
+        caps,
+        audio,
+        subtitle,
+    )
+    .await
+}
+
+/// `negotiate` from a client built against `schema_version`.
+async fn negotiate_at(
+    schema_version: u32,
+    session: &session::Client,
+    id: WireId,
+    caps: &Capabilities,
+    audio: Choice,
+    subtitle: Choice,
+) -> Result<(playback_grant::Client, Decided), String> {
     let playback = session.playback_request().send().pipeline.get_playback();
     let mut req = playback.negotiate_request();
     let mut p = req.get();
-    p.reborrow().init_ctx();
+    p.reborrow().init_ctx().set_schema_version(schema_version);
     {
         let mut out = p.reborrow().init_id();
         match id {
@@ -767,5 +787,41 @@ async fn an_image_subtitle_burns_unless_both_sides_can_draw_it() {
         .unwrap();
         assert_eq!(decided.downgrade, "subtitle_burn", "{case}: {decided:?}");
         assert_eq!(decided.subtitle, Some(3), "{case}");
+    }
+}
+
+/// B559 / V469: a client older than image delivery (schemaVersion 15) is
+/// sent `burn` for an image track by `Library.detail`, so negotiation burns
+/// it too even when that client declares an image codec; on schema 16 the
+/// same declaration direct plays.
+/// Disarm check: with `read_capabilities` keeping `image_subtitles` for every
+/// schema, the schema 15 negotiation direct plays.
+#[cfg(feature = "ffmpeg-lib")]
+#[actix_web::test]
+async fn an_image_subtitle_burns_for_a_client_older_than_image_delivery() {
+    let cache = tempfile::tempdir().unwrap();
+    let (server, fx) = crate::revocation::start_drawing_images(cache.path()).await;
+    seed_image_subtitle(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut draws = caps(&["h264"], &["aac"], &["mp4"]);
+    draws.image_subtitles = vec!["dvd_subtitle".into()];
+
+    for (schema_version, downgrade) in [(15, "subtitle_burn"), (16, "none")] {
+        let (_grant, decided) = negotiate_at(
+            schema_version,
+            &session,
+            WireId::Real(MOVIE),
+            &draws,
+            Choice::Default,
+            Choice::Index(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decided.downgrade, downgrade,
+            "schema {schema_version}: {decided:?}"
+        );
+        assert_eq!(decided.subtitle, Some(3), "schema {schema_version}");
     }
 }
