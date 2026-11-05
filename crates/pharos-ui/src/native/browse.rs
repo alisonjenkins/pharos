@@ -1193,6 +1193,35 @@ fn PosterGrid(page: Page, square: Option<bool>) -> Element {
     }
 }
 
+/// How many of a grid's first tiles play the library transition (V476):
+/// more than a TV or desktop screen shows at once, so no tile in view sits
+/// still while the ones before it arrive, and later pages land without one.
+const ARRIVING_TILES: usize = 60;
+
+/// The last place in the arrival wave: tiles past it arrive with it, so the
+/// wave is over in about 0.6 s however many tiles are in view.
+const ARRIVAL_WAVE: usize = 24;
+
+/// The class and stagger of the tile at `at`: the first [`ARRIVING_TILES`]
+/// carry `pharos-arrive` with their place in the wave (`--fx-i`) and a
+/// scattered one for the rain (`--fx-r`, 0 to 10); later tiles carry none.
+fn arrival(at: usize, album: bool) -> (Option<&'static str>, Option<String>) {
+    let album_class = album.then_some("pharos-album-tile");
+    if at >= ARRIVING_TILES {
+        return (album_class, None);
+    }
+    let class = if album {
+        "pharos-album-tile pharos-arrive"
+    } else {
+        "pharos-arrive"
+    };
+    let wave = at.min(ARRIVAL_WAVE);
+    (
+        Some(class),
+        Some(format!("--fx-i: {wave}; --fx-r: {}", (at * 7) % 11)),
+    )
+}
+
 /// The tiles of a page; the one at `sentinel` carries [`SENTINEL_ID`].
 #[component]
 fn PosterList(page: Page, square: Option<bool>, sentinel: Option<usize>) -> Element {
@@ -1200,16 +1229,22 @@ fn PosterList(page: Page, square: Option<bool>, sentinel: Option<usize>) -> Elem
         Some(true) => "pharos-grid pharos-grid-square",
         _ => "pharos-grid",
     };
+    let tiles = page
+        .items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| (at, item, arrival(at, item.kind == ItemKind::Album)));
     rsx! {
         if page.items.is_empty() {
             p { class: "pharos-empty", "Nothing in here yet." }
         }
         ul { class,
-            for (at, item) in page.items.iter().enumerate() {
+            for (at , item , (tile_class , stagger)) in tiles {
                 li {
                     key: "{item.id}",
                     id: if sentinel == Some(at) { SENTINEL_ID },
-                    class: if item.kind == ItemKind::Album { "pharos-album-tile" },
+                    class: tile_class,
+                    style: stagger,
                     PosterTile { item: item.clone() }
                     if item.kind == ItemKind::Album {
                         QueueButtons {
@@ -1983,6 +2018,47 @@ mod tests {
     /// B490: switching libraries from the top bar keeps the same `GridView`
     /// mounted with new props, so the grid must start afresh for the new
     /// library rather than keep showing the one it opened on.
+    #[test]
+    fn only_the_first_tiles_arrive_and_each_has_its_place() {
+        assert_eq!(
+            arrival(0, false),
+            (
+                Some("pharos-arrive"),
+                Some("--fx-i: 0; --fx-r: 0".to_owned())
+            )
+        );
+        assert_eq!(
+            arrival(3, true),
+            (
+                Some("pharos-album-tile pharos-arrive"),
+                Some("--fx-i: 3; --fx-r: 10".to_owned())
+            )
+        );
+        assert_eq!(
+            arrival(ARRIVING_TILES - 1, false).1,
+            Some(format!(
+                "--fx-i: {ARRIVAL_WAVE}; --fx-r: {}",
+                ((ARRIVING_TILES - 1) * 7) % 11
+            ))
+        );
+        assert_eq!(arrival(ARRIVING_TILES, false), (None, None));
+        assert_eq!(
+            arrival(ARRIVING_TILES, true),
+            (Some("pharos-album-tile"), None)
+        );
+        let scatter: Vec<usize> = (0..ARRIVING_TILES)
+            .map(|at| {
+                let style = arrival(at, false).1.unwrap_or_default();
+                style
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|r| r.parse().ok())
+                    .unwrap_or(99)
+            })
+            .collect();
+        assert!(scatter.iter().all(|r| *r <= 10), "{scatter:?}");
+    }
+
     #[test]
     fn a_switch_to_another_library_shows_that_library() {
         use futures_util::FutureExt as _;
