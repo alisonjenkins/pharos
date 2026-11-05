@@ -842,6 +842,56 @@ body:has(.pharos-stage.is-full) .pharos-error {
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
   pointer-events: none;
 }
+/* Centred over the video and outside the chrome that fades on idle, so a seek
+   or mid-play stall shows work is happening after the controls hide (B551).
+   The 300 ms fade-in keeps quick seeks inside the buffer from flashing it; the
+   caption appears after ~8 s of waiting. */
+.pharos-watch-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  pointer-events: none;
+  opacity: 0;
+  animation: pharos-fade-in 180ms ease 300ms forwards;
+}
+.pharos-watch-spinner {
+  width: 3.5rem;
+  height: 3.5rem;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 4px solid color-mix(in srgb, var(--px-color-fg) 25%, transparent);
+  border-top-color: var(--px-color-fg);
+  animation: pharos-spin 0.9s linear infinite;
+}
+.pharos-watch-loading-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.pharos-watch-loading-caption {
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--px-radius);
+  background: color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+  color: var(--px-color-fg);
+  font-size: var(--px-type-step--1);
+  opacity: 0;
+  animation: pharos-fade-in 250ms ease 8s forwards;
+}
+@keyframes pharos-fade-in {
+  to {
+    opacity: 1;
+  }
+}
 /* Watch together, US6: what each member has seen. On the member strip the
    mark shows on hover or focus; on a detail page it is a plain list; on an
    episode row it is a dot per member. Colours are the accent for seen, a
@@ -1614,6 +1664,9 @@ button.pharos-lyrics-line:focus-visible {
   .pharos-listen-disc {
     animation: none;
     transition: none;
+  }
+  .pharos-watch-spinner {
+    animation: none;
   }
   .pharos-lyrics {
     scroll-behavior: auto;
