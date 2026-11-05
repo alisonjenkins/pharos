@@ -826,8 +826,11 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
 /// it, whatever the years: otherwise "Dragon Ball R&R" beats "Dragon Ball" when
 /// the real show's year is a year off (B557). An exact name whose year is far
 /// off falls under the floor and so cannot shut out a good prefix match
-/// ("Doctor Who" 1963 vs "Doctor Who (2005)"). Ties resolve to the earliest
-/// candidate.
+/// ("Doctor Who" 1963 vs "Doctor Who (2005)"). When several candidates match
+/// exactly, the one matching by an earlier name wins: a provider lists a
+/// show's own title and translation before its aliases, and an alias is how
+/// the 2023 live-action ONE PIECE also answers to "One Piece". Remaining ties
+/// resolve to the earliest candidate.
 pub fn match_best(
     query_title: &str,
     query_year: Option<u32>,
@@ -835,31 +838,35 @@ pub fn match_best(
     min_confidence: f32,
 ) -> Option<MatchOutcome> {
     let query = normalize_title(query_title);
-    let mut best: Option<(bool, MatchOutcome)> = None;
+    // (index of the first name that equals the query, score, candidate)
+    let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
     for c in candidates {
-        let names = std::iter::once(&c.title).chain(&c.aliases);
-        let exact = names.clone().any(|n| normalize_title(n) == query);
-        let similarity = names
+        let names = || std::iter::once(&c.title).chain(&c.aliases);
+        let exact_at = names().position(|n| normalize_title(n) == query);
+        let similarity = names()
             .map(|n| title_similarity(query_title, n))
             .fold(0.0_f32, f32::max);
         let score = similarity * year_factor(query_year, c.year);
         if score < min_confidence {
             continue;
         }
-        let beats = best
-            .as_ref()
-            .is_none_or(|(best_exact, b)| (exact, score) > (*best_exact, b.confidence));
+        let beats = match &best {
+            None => true,
+            Some((best_at, best_score, _)) => match (exact_at, best_at) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(at), Some(best_at)) if at != *best_at => at < *best_at,
+                _ => score > *best_score,
+            },
+        };
         if beats {
-            best = Some((
-                exact,
-                MatchOutcome {
-                    id: c.id.clone(),
-                    confidence: score,
-                },
-            ));
+            best = Some((exact_at, score, c));
         }
     }
-    best.map(|(_, b)| b)
+    best.map(|(_, confidence, c)| MatchOutcome {
+        id: c.id.clone(),
+        confidence,
+    })
 }
 
 /// Parse a bare `YYYY-MM-DD` date (TMDB/TVDB style) to unix seconds at UTC
