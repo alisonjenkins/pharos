@@ -2750,7 +2750,7 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
 
     // A film from its title page: the page stays, the window plays it.
-    await openFirstHit(page, "Playwright");
+    await openFirstHit(page, "Playwright Title 1");
     await expect(page).toHaveURL(/\/ui\/title\//);
     const title = page.url();
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
@@ -2787,7 +2787,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await openFirstHit(page, "Playwright");
+    await openFirstHit(page, "Playwright Title 1");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2827,7 +2827,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await openFirstHit(page, "Playwright");
+    await openFirstHit(page, "Playwright Title 1");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2871,7 +2871,7 @@ test.describe("pharos Dioxus UI stage", () => {
     );
     test.skip(!supported, "this browser has no picture-in-picture");
 
-    await openFirstHit(page, "Playwright");
+    await openFirstHit(page, "Playwright Title 1");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2921,7 +2921,7 @@ test.describe("pharos Dioxus UI stage", () => {
       }),
     );
     await signIn(page);
-    await openFirstHit(page, "Playwright");
+    await openFirstHit(page, "Playwright Title 1");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
