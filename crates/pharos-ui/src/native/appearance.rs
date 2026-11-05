@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::{LibraryTransition, SubtitleSize, MAX_BITRATE_CHOICES};
+use super::playback::{LibraryTransition, OverlayEffect, SubtitleSize, MAX_BITRATE_CHOICES};
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -86,6 +86,8 @@ pub fn AppearanceView(
     on_subtitle_size: EventHandler<SubtitleSize>,
     #[props(default)] library_transition: LibraryTransition,
     #[props(default)] on_library_transition: EventHandler<LibraryTransition>,
+    #[props(default)] overlay_effect: OverlayEffect,
+    #[props(default)] on_overlay_effect: EventHandler<OverlayEffect>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -182,6 +184,28 @@ pub fn AppearanceView(
                 }
                 p { id: "library-transition-help",
                     "Saved on this device. Off whenever the system asks for reduced motion."
+                }
+            }
+            fieldset { class: "pharos-overlay-effect",
+                legend { "Controls effect" }
+                label { r#for: "overlay-effect", "How the player's controls hide and return during playback" }
+                select {
+                    id: "overlay-effect",
+                    aria_describedby: "overlay-effect-help",
+                    onchange: move |ev| {
+                        on_overlay_effect.call(OverlayEffect::parse(&ev.value()));
+                    },
+                    for fx in OverlayEffect::ALL {
+                        option {
+                            key: "{fx.as_str()}",
+                            value: "{fx.as_str()}",
+                            selected: fx == overlay_effect,
+                            "{fx.label()}"
+                        }
+                    }
+                }
+                p { id: "overlay-effect-help",
+                    "Saved on this device. A plain fade whenever the system asks for reduced motion."
                 }
             }
             fieldset { class: "pharos-diagnostics",
@@ -684,6 +708,76 @@ mod tests {
             start_tag(sel, "value=\"fade\"").contains("selected"),
             "{sel}"
         );
+    }
+
+    fn page_with_overlay_effect(fx: Option<OverlayEffect>) -> String {
+        render(move || {
+            rsx! {
+                AppearanceView {
+                    themes: Vec::new(),
+                    auto: false,
+                    editor: None,
+                    notice: None,
+                    diagnostics: false,
+                    diagnostics_key: 0,
+                    max_quality: 0,
+                    on_max_quality: |_| {},
+                    subtitle_size: SubtitleSize::default(),
+                    on_subtitle_size: |_| {},
+                    overlay_effect: fx.unwrap_or_default(),
+                    on_overlay_effect: |_| {},
+                    on_diagnostics: |_| {},
+                    on_pick: |_| {},
+                    on_auto: |_| {},
+                    on_customise: |_| {},
+                    on_edit_custom: |_| {},
+                    on_delete: |_| {},
+                    on_export: |_| {},
+                    on_import_file: |_| {},
+                    on_import_paste: |_| {},
+                    on_edit: |_| {},
+                    on_save: |_| {},
+                    on_cancel: |_| {},
+                }
+            }
+        })
+    }
+
+    fn overlay_effect_select(html: &str) -> &str {
+        let start = html.find("id=\"overlay-effect\"").unwrap_or(html.len());
+        let end = html[start..]
+            .find("</select>")
+            .map_or(html.len(), |e| start + e);
+        &html[start..end]
+    }
+
+    /// The `value` of the one option `sel` marks selected.
+    fn selected_value(sel: &str) -> &str {
+        let at = sel.find("selected").unwrap_or(0);
+        let start = sel[..at].rfind("value=\"").map_or(0, |v| v + 7);
+        let end = sel[start..].find('"').map_or(start, |e| start + e);
+        &sel[start..end]
+    }
+
+    #[test]
+    fn overlay_effect_select_marks_only_the_stored_choice() {
+        let html = page_with_overlay_effect(Some(OverlayEffect::Burn));
+        let sel = overlay_effect_select(&html);
+        assert!(!sel.is_empty(), "select missing: {html}");
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert_eq!(selected_value(sel), "burn", "{sel}");
+        for fx in OverlayEffect::ALL {
+            assert!(sel.contains(fx.label()), "{} missing: {sel}", fx.label());
+        }
+        assert!(html.contains("reduced motion"), "{html}");
+    }
+
+    #[test]
+    fn overlay_effect_defaults_to_fade() {
+        let sel_html = page_with_overlay_effect(None);
+        let sel = overlay_effect_select(&sel_html);
+        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        assert_eq!(selected_value(sel), "fade", "{sel}");
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {
