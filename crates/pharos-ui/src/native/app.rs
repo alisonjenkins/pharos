@@ -3481,7 +3481,9 @@ fn Player(
         previous: near.previous,
         next,
         up_next: match (up_next_step(), upcoming.as_ref()) {
-            (UpNextStep::Counting { left_ms }, next) => Some(UpNextCard::of(next, left_ms)),
+            (UpNextStep::Counting { left_ms, of_ms }, next) => {
+                Some(UpNextCard::of(next, left_ms, of_ms))
+            }
             _ => None,
         },
     };

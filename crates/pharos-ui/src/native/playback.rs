@@ -756,34 +756,58 @@ pub fn ends_at_label(time: &str, before_credits: bool) -> String {
     }
 }
 
-/// How long the "Up next" card counts down before the next episode plays.
+/// How long the "Up next" card counts down from where the credits start.
 pub const UP_NEXT_COUNTDOWN_MS: u64 = 15_000;
-/// Without detected credits, how long before the end the card shows.
-pub const UP_NEXT_LEAD_MS: u64 = 20_000;
+/// Without detected credits, the card shows this share of the runtime before
+/// the end (1/20: 66 s of a 22-minute episode), where most credits start ...
+pub const UP_NEXT_LEAD_SHARE: u64 = 20;
+/// ... but no less than this before the end ...
+pub const UP_NEXT_MIN_LEAD_MS: u64 = 20_000;
+/// ... and no more, so an hour-long drama's last scene is not covered.
+pub const UP_NEXT_MAX_LEAD_MS: u64 = 90_000;
+
+/// Where the "Up next" card shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpNextFrom {
+    pub at_ms: u64,
+    /// The server detected the credits there. Otherwise `at_ms` is a guess,
+    /// and the card waits for the end rather than cut a scene short.
+    pub credits: bool,
+}
 
 /// Where the "Up next" card shows: where the credits start, when the server
-/// detected them in the second half, else [`UP_NEXT_LEAD_MS`] before the end.
-/// `None` while the length is unknown.
-pub fn up_next_at(segments: &[Segment], total_ms: u64) -> Option<u64> {
+/// detected them in the second half, else a share of the runtime before the
+/// end, between [`UP_NEXT_MIN_LEAD_MS`] and [`UP_NEXT_MAX_LEAD_MS`] but
+/// never in the first half, which wins for a clip under 40 s. `None` while
+/// the length is unknown.
+pub fn up_next_at(segments: &[Segment], total_ms: u64) -> Option<UpNextFrom> {
     if total_ms == 0 {
         return None;
     }
-    let credits = segments
-        .iter()
-        .filter(|s| s.kind == SegmentKind::Outro && s.start_ms >= total_ms / 2)
-        .filter(|s| s.start_ms < total_ms)
-        .map(|s| s.start_ms)
-        .max();
-    Some(credits.unwrap_or_else(|| total_ms.saturating_sub(UP_NEXT_LEAD_MS)))
+    if let Some(at_ms) = credits_start(segments, total_ms) {
+        return Some(UpNextFrom {
+            at_ms,
+            credits: true,
+        });
+    }
+    let lead = (total_ms / UP_NEXT_LEAD_SHARE)
+        .clamp(UP_NEXT_MIN_LEAD_MS, UP_NEXT_MAX_LEAD_MS)
+        .min(total_ms / 2);
+    Some(UpNextFrom {
+        at_ms: total_ms - lead,
+        credits: false,
+    })
 }
 
 /// What the "Up next" card does at a position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpNextStep {
     Hidden,
-    /// Shown, with this long until the next episode plays.
+    /// Shown, with `left_ms` of a countdown `of_ms` long until the next
+    /// episode plays.
     Counting {
         left_ms: u64,
+        of_ms: u64,
     },
     /// Play the next episode now.
     Go,
@@ -799,22 +823,29 @@ pub struct UpNext {
 }
 
 impl UpNext {
-    /// The card's state at `at_ms`, when it shows from `from_ms` in a video
-    /// `total_ms` long.
-    pub fn step(&mut self, at_ms: u64, from_ms: Option<u64>, total_ms: u64) -> UpNextStep {
-        let Some(from) = from_ms.filter(|_| !self.cancelled) else {
+    /// The card's state at `at_ms`, when it shows from `from` in a video
+    /// `total_ms` long. Over detected credits it counts
+    /// [`UP_NEXT_COUNTDOWN_MS`]; from a guess it counts to the end.
+    pub fn step(&mut self, at_ms: u64, from: Option<UpNextFrom>, total_ms: u64) -> UpNextStep {
+        let Some(from) = from.filter(|_| !self.cancelled) else {
             return UpNextStep::Hidden;
         };
-        if at_ms < from {
+        if at_ms < from.at_ms {
             self.shown_at = None;
             return UpNextStep::Hidden;
         }
         let shown = *self.shown_at.get_or_insert(at_ms);
-        let due = shown
-            .saturating_add(UP_NEXT_COUNTDOWN_MS)
-            .min(total_ms.max(shown));
+        let end = total_ms.max(shown);
+        let due = if from.credits {
+            shown.saturating_add(UP_NEXT_COUNTDOWN_MS).min(end)
+        } else {
+            end
+        };
         match due.checked_sub(at_ms) {
-            Some(left_ms) if left_ms > 0 => UpNextStep::Counting { left_ms },
+            Some(left_ms) if left_ms > 0 => UpNextStep::Counting {
+                left_ms,
+                of_ms: due - shown,
+            },
             _ => UpNextStep::Go,
         }
     }
@@ -1264,18 +1295,30 @@ mod tests {
     }
 
     #[test]
-    fn up_next_shows_at_the_credits_or_twenty_seconds_from_the_end() {
+    fn up_next_shows_at_the_credits_or_a_share_of_the_runtime_from_the_end() {
         let at = |kind, start_ms| Segment {
             kind,
             start_ms,
             end_ms: start_ms + 60_000,
         };
+        let credits = |at_ms| {
+            Some(UpNextFrom {
+                at_ms,
+                credits: true,
+            })
+        };
+        let guess = |at_ms| {
+            Some(UpNextFrom {
+                at_ms,
+                credits: false,
+            })
+        };
         let total = 1_200_000;
-        assert_eq!(up_next_at(&[], total), Some(1_180_000));
+        assert_eq!(up_next_at(&[], total), guess(1_140_000));
         assert_eq!(up_next_at(&[], 0), None);
         assert_eq!(
             up_next_at(&[at(SegmentKind::Outro, 1_100_000)], total),
-            Some(1_100_000)
+            credits(1_100_000)
         );
         // An intro, or credits in the first half (a cold open's), are not the end.
         assert_eq!(
@@ -1286,39 +1329,71 @@ mod tests {
                 ],
                 total
             ),
-            Some(1_180_000)
+            guess(1_140_000)
         );
-        assert_eq!(up_next_at(&[], 5_000), Some(0));
+        // A 22-minute episode's last 66 s; never more than 90 s or less
+        // than 20 s, and never the first half of a short clip.
+        assert_eq!(up_next_at(&[], 1_320_000), guess(1_254_000));
+        assert_eq!(up_next_at(&[], 3_600_000), guess(3_510_000));
+        assert_eq!(up_next_at(&[], 300_000), guess(280_000));
+        assert_eq!(up_next_at(&[], 5_000), guess(2_500));
     }
 
     #[test]
     fn up_next_counts_down_from_where_it_showed_and_then_goes() {
         let mut up = UpNext::default();
-        let (from, total) = (Some(100_000), 400_000);
+        let from = Some(UpNextFrom {
+            at_ms: 100_000,
+            credits: true,
+        });
+        let total = 400_000;
+        let counting = |left_ms| UpNextStep::Counting {
+            left_ms,
+            of_ms: 15_000,
+        };
         assert_eq!(up.step(99_999, from, total), UpNextStep::Hidden);
-        assert_eq!(
-            up.step(100_000, from, total),
-            UpNextStep::Counting { left_ms: 15_000 }
-        );
-        assert_eq!(
-            up.step(110_000, from, total),
-            UpNextStep::Counting { left_ms: 5_000 }
-        );
+        assert_eq!(up.step(100_000, from, total), counting(15_000));
+        assert_eq!(up.step(110_000, from, total), counting(5_000));
         assert_eq!(up.step(115_000, from, total), UpNextStep::Go);
         // Seeking back hides it; coming back starts the count again.
         assert_eq!(up.step(50_000, from, total), UpNextStep::Hidden);
-        assert_eq!(
-            up.step(200_000, from, total),
-            UpNextStep::Counting { left_ms: 15_000 }
-        );
+        assert_eq!(up.step(200_000, from, total), counting(15_000));
         up.cancel();
         assert_eq!(up.step(210_000, from, total), UpNextStep::Hidden);
     }
 
     #[test]
+    fn up_next_from_a_guess_counts_to_the_end() {
+        let mut up = UpNext::default();
+        let from = Some(UpNextFrom {
+            at_ms: 1_140_000,
+            credits: false,
+        });
+        let total = 1_200_000;
+        assert_eq!(
+            up.step(1_140_000, from, total),
+            UpNextStep::Counting {
+                left_ms: 60_000,
+                of_ms: 60_000
+            }
+        );
+        assert_eq!(
+            up.step(1_170_000, from, total),
+            UpNextStep::Counting {
+                left_ms: 30_000,
+                of_ms: 60_000
+            }
+        );
+        assert_eq!(up.step(1_200_000, from, total), UpNextStep::Go);
+    }
+
+    #[test]
     fn up_next_moves_on_at_the_count_or_the_end_unless_cancelled() {
         let mut up = UpNext::default();
-        let counting = UpNextStep::Counting { left_ms: 3_000 };
+        let counting = UpNextStep::Counting {
+            left_ms: 3_000,
+            of_ms: 15_000,
+        };
         assert_eq!(
             up.moves_on(UpNextStep::Go, MediaEvent::TimeUpdate),
             Some("countdown")
@@ -1336,11 +1411,18 @@ mod tests {
     #[test]
     fn up_next_never_counts_past_the_end() {
         let mut up = UpNext::default();
+        let from = Some(UpNextFrom {
+            at_ms: 390_000,
+            credits: true,
+        });
         assert_eq!(
-            up.step(395_000, Some(390_000), 400_000),
-            UpNextStep::Counting { left_ms: 5_000 }
+            up.step(395_000, from, 400_000),
+            UpNextStep::Counting {
+                left_ms: 5_000,
+                of_ms: 5_000
+            }
         );
-        assert_eq!(up.step(400_000, Some(390_000), 400_000), UpNextStep::Go);
+        assert_eq!(up.step(400_000, from, 400_000), UpNextStep::Go);
         assert_eq!(UpNext::default().step(0, None, 0), UpNextStep::Hidden);
     }
 
