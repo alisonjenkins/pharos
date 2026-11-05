@@ -82,6 +82,7 @@ fn sylt(tag: &Id3v2Tag) -> Option<Lyrics> {
             .map(|(at, text)| LyricLine {
                 start_ms: Some(u64::from(at)),
                 text: text.trim_matches(['\n', '\r']).trim().to_owned(),
+                words: Vec::new(),
             })
             .collect();
         lines.sort_by_key(|l| l.start_ms);
