@@ -8,7 +8,8 @@ use actix_web::web;
 use pharos_api::pharos_capnp::session as wire;
 use pharos_api::{server, Connection, Denial};
 use pharos_core::{
-    AuthError, DomainResult, SecretString, TokenScope, TokenStore, User, UserId, UserPrefStore,
+    AuthError, DomainResult, SecretString, TokenId, TokenScope, TokenStore, User, UserId,
+    UserPrefStore,
 };
 
 use super::bootstrap::{qc_denial, token_denial};
@@ -280,7 +281,8 @@ impl server::session::Handler for Session {
     /// attachments, lyrics), expires after
     /// `[server.native_api].media_token_ttl_secs`, and is bound to the
     /// device `pharos-native:media`. A revoked or ended session is refused
-    /// like any other call.
+    /// like any other call, and revoking the session's token (sign-out, device
+    /// or session revoke) removes the media token with it.
     async fn media_token(
         self: Rc<Self>,
         _params: wire::MediaTokenParams,
@@ -304,17 +306,18 @@ impl server::session::Handler for Session {
             }
         };
         let ttl_secs = self.ctx.media_token_ttl_secs();
-        // Read before the store fixes the token's expiry, so the client is
-        // never told a later time than the server enforces.
-        let expires_at = expires_at_ms(ttl_secs);
+        // Issued as a child of this session's own token, so ending the session
+        // by any path ends the media token with it (B543, V438).
+        let parent = TokenId(self.state.stores.token_id(&self.token));
         let issued = self
             .state
             .stores
-            .issue_with_ttl(
+            .issue_child_with_ttl(
                 user.id,
                 MEDIA_TOKEN_DEVICE_ID,
                 i64::from(ttl_secs),
                 TokenScope::Media,
+                &parent,
             )
             .await;
         let result = results.get().init_result();
@@ -332,7 +335,12 @@ impl server::session::Handler for Session {
                 );
                 let mut out = result.init_token();
                 out.set_token(secret);
-                out.set_expires_at_ms(expires_at);
+                // The store's own expiry: cut to the session token's when that ends sooner.
+                out.set_expires_at_ms(
+                    u64::try_from(issued.expires_at)
+                        .unwrap_or(0)
+                        .saturating_mul(1000),
+                );
             }
             Err(e) => {
                 let outcome = match e {
@@ -535,16 +543,6 @@ impl server::session::Handler for Session {
 /// id is not kept past sign-in, so every native media token shares one.
 const MEDIA_TOKEN_DEVICE_ID: &str = "pharos-native:media";
 
-/// Milliseconds since the Unix epoch at which a token issued now with
-/// `ttl_secs` expires.
-fn expires_at_ms(ttl_secs: u32) -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    (now + Duration::from_secs(u64::from(ttl_secs))).as_millis() as u64
-}
-
-/// How a `Session.mediaToken` call ended: the `outcome` label of
 /// `pharos_media_token_issued_total`. A dashboard contract: bounded, stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaTokenOutcome {

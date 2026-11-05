@@ -1,7 +1,7 @@
 //! Token to [`User`]: the decision every authenticated call on either API
 //! makes, implemented once (V172).
 
-use pharos_core::{AuthError, TokenScope, TokenStore, User, UserId, UserStore};
+use pharos_core::{AuthError, TokenScope, TokenSelector, TokenStore, User, UserId, UserStore};
 use tokio::sync::broadcast;
 
 use crate::state::{AppState, Stores};
@@ -175,6 +175,44 @@ impl Revocations {
     }
 }
 
+/// How many Media tokens a revoke of `selector` is about to take with its
+/// parents. Only feeds the metric and log: the database cascade removes them
+/// whether or not this runs, so a failed count is `0`, never a failed revoke.
+async fn count_children(
+    state: &AppState,
+    user: UserId,
+    selector: TokenSelector<'_>,
+    cause: RevokeCause,
+) -> u64 {
+    match state.stores.count_live_children(user, selector).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                user_id = %user.0,
+                cause = cause.label(),
+                error = %e,
+                "auth: could not count child tokens before revoke"
+            );
+            0
+        }
+    }
+}
+
+/// Counts and logs the Media tokens that went with their parents
+/// (`pharos_media_token_revoked_total{cause}`, B543).
+fn record_children_revoked(user: UserId, cause: RevokeCause, children: u64) {
+    metrics::counter!("pharos_media_token_revoked_total", "cause" => cause.label())
+        .increment(children);
+    if children > 0 {
+        tracing::info!(
+            user_id = %user.0,
+            cause = cause.label(),
+            children,
+            "auth: media tokens revoked with their parent"
+        );
+    }
+}
+
 /// Revokes `user`'s `token` (idempotent) and announces the user.
 pub async fn revoke_token(
     state: &AppState,
@@ -182,7 +220,9 @@ pub async fn revoke_token(
     token: &str,
     cause: RevokeCause,
 ) -> Result<(), AuthError> {
+    let children = count_children(state, user, TokenSelector::Token(token), cause).await;
     state.stores.revoke(token).await?;
+    record_children_revoked(user, cause, children);
     state.revocations.announce(user, cause);
     Ok(())
 }
@@ -195,10 +235,12 @@ pub async fn revoke_device(
     device_id: &str,
     cause: RevokeCause,
 ) -> Result<u64, AuthError> {
+    let children = count_children(state, user, TokenSelector::Device(device_id), cause).await;
     let dropped = state
         .stores
         .revoke_tokens_by_device(user, device_id)
         .await?;
+    record_children_revoked(user, cause, children);
     if dropped > 0 {
         state.revocations.announce(user, cause);
     }
@@ -405,10 +447,12 @@ pub async fn revoke_other_tokens(
     keep_token: Option<&str>,
     cause: RevokeCause,
 ) -> Result<u64, AuthError> {
+    let children = count_children(state, user, TokenSelector::AllExcept(keep_token), cause).await;
     let revoked = state
         .stores
         .revoke_sessions_except(user, keep_token)
         .await?;
+    record_children_revoked(user, cause, children);
     tracing::info!(
         user_id = %user.0,
         cause = cause.label(),
