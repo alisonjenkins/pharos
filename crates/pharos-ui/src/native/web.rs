@@ -365,7 +365,7 @@ pub fn capabilities() -> Capabilities {
     super::playback::capabilities(|mime| (has_mse() && mse(mime)) || can_play(mime), can_play)
 }
 
-fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
+pub(super) fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
     web_sys::window()?
         .document()?
         .get_element_by_id(id)?
@@ -626,6 +626,28 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
         }
     }
 }
+
+/// Loads the text track `track_id` without drawing it: the Rust subtitle
+/// renderer draws its cues, and the track stays in the page so its words
+/// survive a renderer failure (spec 026 US1). Every other track is off.
+pub fn hide_text_track(video_id: &str, track_id: &str) {
+    let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
+        return;
+    };
+    for i in 0..tracks.length() {
+        if let Some(t) = tracks.get(i) {
+            t.set_mode(if t.id() == track_id {
+                web_sys::TextTrackMode::Hidden
+            } else {
+                web_sys::TextTrackMode::Disabled
+            });
+        }
+    }
+}
+
+pub use super::subs_web::{
+    rust_subtitles, set_controls_visible as set_subtitle_controls_visible, RustSubtitles,
+};
 
 /// Where the `<video>` `video_id`'s cues are laid out now: the width a cue
 /// of `size` 100 spans (the picture's: `.pharos-video` is `object-fit:
@@ -2628,6 +2650,7 @@ pub fn store_theme(key: &str, value: &str) -> Result<(), String> {
 
 /// Set `data-subtitle-size` on `<html>` so `video::cue` scales to `size`.
 pub fn apply_subtitle_size(size: SubtitleSize) {
+    super::subs_web::set_size(size);
     let Some(root) = web_sys::window()
         .and_then(|w| w.document())
         .and_then(|d| d.document_element())

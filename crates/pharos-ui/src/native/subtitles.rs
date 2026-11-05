@@ -151,16 +151,19 @@ pub enum FallbackReason {
     Gpu,
     /// Fonts, track and GPU were not ready within the first-subtitle budget.
     Slow,
+    /// The `<video>` was gone before the renderer could attach.
+    NoVideo,
 }
 
 impl FallbackReason {
-    pub const ALL: [FallbackReason; 6] = [
+    pub const ALL: [FallbackReason; 7] = [
         FallbackReason::Font,
         FallbackReason::FontFetch,
         FallbackReason::TrackFetch,
         FallbackReason::NoWebgl2,
         FallbackReason::Gpu,
         FallbackReason::Slow,
+        FallbackReason::NoVideo,
     ];
 
     pub fn label(self) -> &'static str {
@@ -171,6 +174,7 @@ impl FallbackReason {
             FallbackReason::NoWebgl2 => "no_webgl2",
             FallbackReason::Gpu => "gpu",
             FallbackReason::Slow => "slow",
+            FallbackReason::NoVideo => "no_video",
         }
     }
 }

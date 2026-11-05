@@ -45,6 +45,8 @@ pub mod seen;
 pub mod settings;
 pub mod stage;
 pub mod style_picker;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod subs_web;
 pub mod subtitles;
 pub mod together;
 pub mod together_view;
