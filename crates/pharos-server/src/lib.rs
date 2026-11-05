@@ -23,6 +23,7 @@ pub mod integrity_backfill;
 pub mod integrity_memo;
 pub mod library_watch;
 pub mod metadata_backfill;
+pub mod metadata_language;
 pub mod middleware;
 pub mod musicbrainz;
 pub mod obs;
