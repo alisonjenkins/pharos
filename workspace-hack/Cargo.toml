@@ -31,7 +31,6 @@ crypto-common = { version = "0.1", default-features = false, features = ["std"] 
 derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
-dioxus-core = { version = "0.7", default-features = false, features = ["serialize"] }
 either = { version = "1", features = ["serde", "use_std"] }
 fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
@@ -45,12 +44,10 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 indexmap = { version = "2" }
 itertools = { version = "0.13" }
-js-sys = { version = "0.3" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.23", default-features = false, features = ["encoder", "optimization", "std"] }
@@ -86,12 +83,9 @@ thiserror = { version = "2" }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-util = { version = "0.7", features = ["codec", "compat", "io", "rt"] }
-toml = { version = "1" }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
-wasm-bindgen = { version = "0.2" }
-web-sys = { version = "0.3", features = ["AbortSignal", "AddEventListenerOptions", "AnalyserNode", "AnimationEvent", "AudioContext", "AudioDestinationNode", "BlobPropertyBag", "CanvasRenderingContext2d", "ClipboardEvent", "CloseEvent", "Comment", "CompositionEvent", "Crypto", "CssStyleDeclaration", "CustomEvent", "DataTransfer", "DataTransferItem", "DataTransferItemList", "Document", "DomRect", "DomRectList", "DomTokenList", "DragEvent", "File", "FileList", "FileReader", "FocusEvent", "FormData", "Headers", "History", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlCollection", "HtmlFormElement", "HtmlHeadElement", "HtmlImageElement", "HtmlInputElement", "HtmlMediaElement", "HtmlScriptElement", "HtmlSelectElement", "HtmlStyleElement", "HtmlTextAreaElement", "ImageBitmap", "InputEvent", "IntersectionObserver", "IntersectionObserverEntry", "KeyboardEvent", "Location", "MediaElementAudioSourceNode", "MediaError", "MediaQueryList", "MediaSource", "Navigator", "NodeList", "ObserverCallback", "Performance", "PointerEvent", "QueuingStrategy", "Range", "ReadableByteStreamController", "ReadableStream", "ReadableStreamByobReader", "ReadableStreamByobRequest", "ReadableStreamDefaultController", "ReadableStreamDefaultReader", "ReadableStreamGetReaderOptions", "ReadableStreamReadResult", "ReadableStreamReaderMode", "ReadableStreamType", "ReadableWritablePair", "ReferrerPolicy", "Request", "RequestCache", "RequestCredentials", "RequestInit", "RequestMode", "RequestRedirect", "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize", "Response", "ResponseInit", "ResponseType", "ScrollBehavior", "ScrollRestoration", "ScrollToOptions", "Selection", "ShadowRoot", "ShadowRootInit", "ShadowRootMode", "Storage", "StreamPipeOptions", "Text", "TextTrack", "TextTrackList", "TextTrackMode", "Touch", "TouchEvent", "TouchList", "TransformStream", "TransformStreamDefaultController", "Transformer", "TransitionEvent", "UnderlyingSink", "UnderlyingSource", "Url", "UrlSearchParams", "WebGl2RenderingContext", "WebGlBuffer", "WebGlProgram", "WebGlShader", "WebGlTexture", "WebGlUniformLocation", "WebGlVertexArrayObject", "WebglLoseContext", "WheelEvent", "Window", "WritableStream", "WritableStreamDefaultController", "WritableStreamDefaultWriter", "console"] }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
@@ -120,7 +114,6 @@ futures-executor = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 indexmap = { version = "2" }
@@ -133,7 +126,6 @@ mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
-proc-macro2 = { version = "1", features = ["span-locations"] }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
@@ -167,7 +159,6 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl", "system"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
@@ -186,7 +177,6 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl", "system"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
@@ -205,7 +195,6 @@ futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
@@ -224,7 +213,6 @@ futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
