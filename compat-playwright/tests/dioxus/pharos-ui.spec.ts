@@ -21,6 +21,16 @@ type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
 /** Who a song is by: its album artist, or else its first track artist. */
 const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
 
+// Opens the first title the top bar's search suggests for `term`. The
+// suggestions are the first hits of the same search the palette runs, in
+// its order (the bar replaced the old Find page).
+async function openFirstHit(page: Page, term: string): Promise<void> {
+  await page.getByRole("combobox", { name: "Search all libraries" }).fill(term);
+  const hit = page.getByRole("option").first().getByRole("link");
+  await expect(hit).toBeVisible({ timeout: 15_000 });
+  await hit.click();
+}
+
 // Signs in on a small window and answers a home rail that overflows
 // sideways, skipping when the server has no native API or seeded user.
 async function overflowingRail(page: Page, request: APIRequestContext): Promise<Locator> {
@@ -2108,11 +2118,7 @@ test.describe("pharos Dioxus UI now playing survives remounts", () => {
     await expect(page.locator(".pharos-shell-bar")).toBeVisible({
       timeout: 15_000,
     });
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    const tile = page.locator(".pharos-poster").first();
-    await expect(tile).toBeVisible({ timeout: 15_000 });
-    await tile.click();
+    await openFirstHit(page, "carefree");
     await play();
 
     await page.getByLabel("Volume").fill("0.3");
@@ -2252,11 +2258,7 @@ test.describe("pharos Dioxus UI now playing survives a reconnect", () => {
     await expect(page.locator(".pharos-shell-bar")).toBeVisible({
       timeout: 15_000,
     });
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    const tile = page.locator(".pharos-poster").first();
-    await expect(tile).toBeVisible({ timeout: 15_000 });
-    await tile.click();
+    await openFirstHit(page, "carefree");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-listen")).toBeVisible({
       timeout: 15_000,
@@ -2340,11 +2342,7 @@ test.describe("pharos Dioxus UI lyrics", () => {
     await expect(page.locator(".pharos-shell-bar")).toBeVisible({
       timeout: 15_000,
     });
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    const tile = page.locator(".pharos-poster").first();
-    await expect(tile).toBeVisible({ timeout: 15_000 });
-    await tile.click();
+    await openFirstHit(page, "carefree");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
 
     const panel = page.getByRole("region", { name: "Lyrics" });
@@ -2565,11 +2563,7 @@ test.describe("pharos Dioxus UI stage", () => {
     await page.setViewportSize({ width: 1200, height: 800 });
     await signIn(page);
 
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    const tile = page.locator(".pharos-poster").first();
-    await expect(tile).toBeVisible({ timeout: 15_000 });
-    await tile.click();
+    await openFirstHit(page, "carefree");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
       timeout: 15_000,
@@ -2584,12 +2578,13 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-listen")).toBeHidden();
 
     let last = await at(page);
-    const stops = ["Find", "Together"];
     for (let i = 0; i < 20; i++) {
       if (i % 3 === 0) {
         await page.locator(".pharos-brand").click();
+      } else if (i % 3 === 1) {
+        await page.locator(".pharos-library-tab").first().click();
       } else {
-        await page.getByRole("link", { name: stops[i % 3 - 1] }).first().click();
+        await page.getByRole("link", { name: "Together" }).first().click();
       }
     }
     await expect.poll(() => at(page), { timeout: 10_000 }).toBeGreaterThan(last);
@@ -2738,18 +2733,14 @@ test.describe("pharos Dioxus UI stage", () => {
     page.on("console", (m) => lines.push(m.text()));
     await signIn(page);
 
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("carefree");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "carefree");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect.poll(() => at(page), { timeout: 30_000 }).toBeGreaterThan(0.5);
     await page.locator(".pharos-listen").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
 
     // A film from its title page: the page stays, the window plays it.
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("Playwright");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "Playwright");
     await expect(page).toHaveURL(/\/ui\/title\//);
     const title = page.url();
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
@@ -2776,9 +2767,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("Playwright");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2818,9 +2807,7 @@ test.describe("pharos Dioxus UI stage", () => {
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
     await signIn(page);
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("Playwright");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2864,9 +2851,7 @@ test.describe("pharos Dioxus UI stage", () => {
     );
     test.skip(!supported, "this browser has no picture-in-picture");
 
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("Playwright");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
@@ -2916,9 +2901,7 @@ test.describe("pharos Dioxus UI stage", () => {
       }),
     );
     await signIn(page);
-    await page.getByRole("link", { name: "Find" }).click();
-    await page.getByLabel("Search").fill("Playwright");
-    await page.locator(".pharos-poster").first().click();
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
