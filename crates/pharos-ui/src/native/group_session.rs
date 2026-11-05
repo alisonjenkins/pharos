@@ -1138,9 +1138,12 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 (inner.rate - 1.0).abs() > f64::EPSILON,
             )
         };
-        // Still loading after a seek of ours: another seek would restart the
-        // load and push back the grace that reports a real stall.
-        if player.paused() || self.inner.borrow().held_waiting {
+        // Still loading: another seek would restart the load, push back the
+        // grace that reports a real stall, and land on data not yet fetched.
+        if player.paused() || {
+            let inner = self.inner.borrow();
+            inner.held_waiting || inner.buffering_sent
+        } {
             return;
         }
         let actual = player.position_ms();
@@ -2246,6 +2249,29 @@ mod tests {
                 .logged("pharos: group buffering ended reason=playhead_moved from_ms=26761 position_ms=27261")
                 .len(),
             1
+        );
+    }
+
+    /// A member reported as buffering is left to load where it is: a drift
+    /// seek moves it onto segments it has not fetched and it falls further
+    /// behind.
+    #[test]
+    fn a_buffering_member_is_not_drift_seeked() {
+        let rig = playing_rig();
+        rig.env.now.set(200_000);
+        rig.player.position.set(100_000);
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        rig.env.now.set(210_000);
+        rig.session.check_drift();
+        assert!(
+            !rig.player
+                .log
+                .borrow()
+                .iter()
+                .any(|l| l.starts_with("seek(")),
+            "got {:?}",
+            rig.player.log.borrow()
         );
     }
 
