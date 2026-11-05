@@ -1005,6 +1005,7 @@ fn PagedGrid(
         }
         saved
     });
+    let arrive_from = saved.map_or(0, |(tile, _)| usize::try_from(tile).unwrap_or(usize::MAX));
     let mut jump = use_signal(|| saved.map(|(tile, _)| tile));
     let mut land = use_signal(|| saved.map(|(_, top)| top));
     let mut cursor = use_signal(|| None::<u32>);
@@ -1025,6 +1026,11 @@ fn PagedGrid(
                 Some(top) => platform::scroll_tile_to(target, top),
                 None => platform::scroll_to_tile(target),
             };
+            // The arriving tiles were placed before the page scrolled them
+            // into view.
+            if placed && kept.is_some() {
+                platform::stage_arrival(true);
+            }
             if !placed {
                 // A kept place that cannot be reached opens at the top (V470).
                 if kept.is_some() {
@@ -1170,7 +1176,7 @@ fn PagedGrid(
                 }
             }
         }
-        PosterList { page, sentinel: state.sentinel() }
+        PosterList { page, sentinel: state.sentinel(), arrive_from }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
             p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
@@ -1194,21 +1200,27 @@ fn PosterGrid(page: Page, square: Option<bool>) -> Element {
     }
 }
 
-/// How many of a grid's first tiles play the library transition (V476):
-/// more than a TV or desktop screen shows at once, so no tile in view sits
-/// still while the ones before it arrive, and later pages land without one.
+/// How many tiles play the library transition (V476), from the first one
+/// in view: more than a TV or desktop screen shows at once, so no tile in
+/// view sits still while the ones before it arrive, and later pages land
+/// without one.
 const ARRIVING_TILES: usize = 60;
 
-/// The last place in the arrival wave: tiles past it arrive with it, so the
-/// wave is over in about 0.6 s however many tiles are in view.
-const ARRIVAL_WAVE: usize = 24;
+/// How many tiles before the one a grid reopens at also arrive (B579): a
+/// place near the end of a library cannot be scrolled to the top of the
+/// screen, so up to a screen of tiles above it stays in view.
+const ARRIVING_LEAD: usize = 30;
 
-/// The class and stagger of the tile at `at`: the first [`ARRIVING_TILES`]
-/// carry `pharos-arrive` with their place in the wave (`--fx-i`) and a
-/// scattered one for the rain (`--fx-r`, 0 to 10); later tiles carry none.
-fn arrival(at: usize, album: bool) -> (Option<&'static str>, Option<String>) {
+/// The class and stagger of the tile at `at` in a grid that opens with the
+/// tile at `from` at the top of the screen: the [`ARRIVING_LEAD`] tiles
+/// before it and the [`ARRIVING_TILES`] from it carry `pharos-arrive`, and a
+/// scattered place for the rain (`--fx-r`, 0 to 10); the rest carry none.
+/// Each one's place in the wave comes from where it sits on screen
+/// (web.rs `stage_arrival`, B578).
+fn arrival(at: usize, from: usize, album: bool) -> (Option<&'static str>, Option<String>) {
     let album_class = album.then_some("pharos-album-tile");
-    if at >= ARRIVING_TILES {
+    let first = from.saturating_sub(ARRIVING_LEAD);
+    if at < first || at >= from + ARRIVING_TILES {
         return (album_class, None);
     }
     let class = if album {
@@ -1216,25 +1228,65 @@ fn arrival(at: usize, album: bool) -> (Option<&'static str>, Option<String>) {
     } else {
         "pharos-arrive"
     };
-    let wave = at.min(ARRIVAL_WAVE);
-    (
-        Some(class),
-        Some(format!("--fx-i: {wave}; --fx-r: {}", (at * 7) % 11)),
-    )
+    (Some(class), Some(format!("--fx-r: {}", (at * 7) % 11)))
+}
+
+/// The row and column on screen of each arriving tile, given each one's
+/// top and height in page px in grid order and the page px at the top of
+/// the viewport: the wave runs corner to corner by row plus column (B578),
+/// whatever the grid's width. Rows
+/// count from the first that reaches into view, so a grid reopened part way
+/// down starts its wave on screen (B579); rows above it are all row 0.
+pub fn arrival_cells(tiles: &[(f64, f64)], view_top: f64) -> Vec<(usize, usize)> {
+    // A tile starts a new row once its top is clearly below the row's.
+    const SAME_ROW_PX: f64 = 1.0;
+    let mut cells = Vec::with_capacity(tiles.len());
+    let (mut row, mut col) = (0_usize, 0_usize);
+    let mut row_top = tiles.first().map(|(top, _)| *top).unwrap_or_default();
+    let mut first_in_view = None;
+    for (at, (top, height)) in tiles.iter().enumerate() {
+        if at > 0 && *top > row_top + SAME_ROW_PX {
+            row += 1;
+            col = 0;
+            row_top = *top;
+        } else if at > 0 {
+            col += 1;
+        }
+        if first_in_view.is_none() && top + height > view_top {
+            first_in_view = Some(row);
+        }
+        cells.push((row, col));
+    }
+    let skip = first_in_view.unwrap_or_default();
+    cells
+        .into_iter()
+        .map(|(row, col)| (row.saturating_sub(skip), col))
+        .collect()
 }
 
 /// The tiles of a page; the one at `sentinel` carries [`SENTINEL_ID`].
 #[component]
-fn PosterList(page: Page, square: Option<bool>, sentinel: Option<usize>) -> Element {
+fn PosterList(
+    page: Page,
+    square: Option<bool>,
+    sentinel: Option<usize>,
+    #[props(default)] arrive_from: usize,
+) -> Element {
+    // Each tile that arrives is placed in the wave by where it sits on
+    // screen, once it is in the page.
+    let count = page.items.len();
+    use_effect(use_reactive!(|count| {
+        let _ = count;
+        platform::stage_arrival(false);
+    }));
     let class = match square {
         Some(true) => "pharos-grid pharos-grid-square",
         _ => "pharos-grid",
     };
-    let tiles = page
-        .items
-        .iter()
-        .enumerate()
-        .map(|(at, item)| (at, item, arrival(at, item.kind == ItemKind::Album)));
+    let tiles = page.items.iter().enumerate().map(|(at, item)| {
+        let arrive = arrival(at, arrive_from, item.kind == ItemKind::Album);
+        (at, item, arrive)
+    });
     rsx! {
         if page.items.is_empty() {
             p { class: "pharos-empty", "Nothing in here yet." }
@@ -2016,40 +2068,44 @@ mod tests {
         }
     }
 
-    /// B490: switching libraries from the top bar keeps the same `GridView`
-    /// mounted with new props, so the grid must start afresh for the new
-    /// library rather than keep showing the one it opened on.
     #[test]
-    fn only_the_first_tiles_arrive_and_each_has_its_place() {
+    fn the_tiles_from_the_first_in_view_arrive_and_each_has_its_place() {
         assert_eq!(
-            arrival(0, false),
-            (
-                Some("pharos-arrive"),
-                Some("--fx-i: 0; --fx-r: 0".to_owned())
-            )
+            arrival(0, 0, false),
+            (Some("pharos-arrive"), Some("--fx-r: 0".to_owned()))
         );
         assert_eq!(
-            arrival(3, true),
+            arrival(3, 0, true),
             (
                 Some("pharos-album-tile pharos-arrive"),
-                Some("--fx-i: 3; --fx-r: 10".to_owned())
+                Some("--fx-r: 10".to_owned())
             )
         );
         assert_eq!(
-            arrival(ARRIVING_TILES - 1, false).1,
-            Some(format!(
-                "--fx-i: {ARRIVAL_WAVE}; --fx-r: {}",
-                ((ARRIVING_TILES - 1) * 7) % 11
-            ))
+            arrival(ARRIVING_TILES - 1, 0, false).0,
+            Some("pharos-arrive")
         );
-        assert_eq!(arrival(ARRIVING_TILES, false), (None, None));
+        assert_eq!(arrival(ARRIVING_TILES, 0, false), (None, None));
         assert_eq!(
-            arrival(ARRIVING_TILES, true),
+            arrival(ARRIVING_TILES, 0, true),
             (Some("pharos-album-tile"), None)
         );
+        // B579: a grid that comes back scrolled to tile 150 animates the
+        // tiles from a screen above there, not the ones far above it.
+        let first = 150 - ARRIVING_LEAD;
+        assert_eq!(arrival(first - 1, 150, false), (None, None));
+        assert_eq!(
+            arrival(first, 150, false).1,
+            Some(format!("--fx-r: {}", (first * 7) % 11))
+        );
+        assert_eq!(
+            arrival(150 + ARRIVING_TILES - 1, 150, false).0,
+            Some("pharos-arrive")
+        );
+        assert_eq!(arrival(150 + ARRIVING_TILES, 150, false), (None, None));
         let scatter: Vec<usize> = (0..ARRIVING_TILES)
             .map(|at| {
-                let style = arrival(at, false).1.unwrap_or_default();
+                let style = arrival(at, 0, false).1.unwrap_or_default();
                 style
                     .rsplit(' ')
                     .next()
@@ -2060,6 +2116,28 @@ mod tests {
         assert!(scatter.iter().all(|r| *r <= 10), "{scatter:?}");
     }
 
+    #[test]
+    fn arriving_tiles_know_their_row_and_column_on_screen() {
+        // Three columns, rows 300 px apart, the last row short.
+        let tiles: Vec<(f64, f64)> = [10.0, 10.0, 10.5, 310.0, 310.0, 310.0, 610.0]
+            .iter()
+            .map(|top| (*top, 280.0))
+            .collect();
+        assert_eq!(
+            arrival_cells(&tiles, 0.0),
+            vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0)]
+        );
+        // Scrolled so the first row is out of view: the second row leads.
+        assert_eq!(
+            arrival_cells(&tiles, 300.0),
+            vec![(0, 0), (0, 1), (0, 2), (0, 0), (0, 1), (0, 2), (1, 0)]
+        );
+        assert!(arrival_cells(&[], 0.0).is_empty());
+    }
+
+    /// B490: switching libraries from the top bar keeps the same `GridView`
+    /// mounted with new props, so the grid must start afresh for the new
+    /// library rather than keep showing the one it opened on.
     #[test]
     fn a_switch_to_another_library_shows_that_library() {
         use futures_util::FutureExt as _;
