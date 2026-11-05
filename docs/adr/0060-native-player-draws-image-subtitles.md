@@ -1,4 +1,4 @@
-# ADR-0058: The native player draws image subtitles; the server extracts them
+# ADR-0060: The native player draws image subtitles; the server extracts them
 
 - **Status:** Accepted
 - **Date:** 2026-11-03T19:00:00Z

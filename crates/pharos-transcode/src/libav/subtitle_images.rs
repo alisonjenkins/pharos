@@ -1,5 +1,5 @@
 //! In-process image-subtitle extraction for the native player (spec 019,
-//! ADR-0058).
+//! ADR-0060).
 //!
 //! Decodes every event of one bitmap subtitle stream (DVD `dvd_subtitle`,
 //! Blu-ray `hdmv_pgs_subtitle`, DVB `dvb_subtitle`), applies each rect's
