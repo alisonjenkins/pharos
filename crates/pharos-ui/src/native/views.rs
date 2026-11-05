@@ -14,6 +14,7 @@ use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
+use super::stage::{fullscreen_for_play, StageCtx};
 use super::together::can_watch_together;
 use super::together_view::InThisGroup;
 
@@ -60,9 +61,14 @@ pub fn Link(
     to: Route,
     class: Option<String>,
     #[props(default)] current: bool,
+    /// What the link plays, for a play link: a film or an episode opens in
+    /// fullscreen.
+    #[props(default)]
+    plays: Option<ItemKind>,
     children: Element,
 ) -> Element {
     let nav = use_context::<Nav>();
+    let stage = try_use_context::<StageCtx>();
     let href = to.path();
     rsx! {
         a {
@@ -72,6 +78,9 @@ pub fn Link(
             onclick: move |evt: MouseEvent| {
                 if evt.modifiers().is_empty() {
                     evt.prevent_default();
+                    if let Some(kind) = plays {
+                        fullscreen_for_play(kind, stage);
+                    }
                     nav.0.call(to.clone());
                 }
             },
@@ -669,6 +678,7 @@ pub fn TitleView(
     seen: Vec<MemberSeen>,
 ) -> Element {
     use_ends_at_refresh();
+    let stage = try_use_context::<StageCtx>();
     let item = &detail.item;
     let in_group = if seen.is_empty() {
         Vec::new()
@@ -704,18 +714,22 @@ pub fn TitleView(
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 div { class: "pharos-actions",
                     if item.kind.playable() {
-                        Link { to: Route::Watch(item.id), class: "pharos-button",
+                        Link { to: Route::Watch(item.id), class: "pharos-button", plays: item.kind,
                             if resume { "Resume" } else { "Play" }
                         }
                     }
                     if item.kind.playable() && resume {
                         {
                             let id = item.id;
+                            let kind = item.kind;
                             rsx! {
                                 button {
                                     class: "pharos-button pharos-button-secondary",
                                     r#type: "button",
-                                    onclick: move |_| on_play_from_start.call(id),
+                                    onclick: move |_| {
+                                        fullscreen_for_play(kind, stage);
+                                        on_play_from_start.call(id);
+                                    },
                                     "Play from start"
                                 }
                             }

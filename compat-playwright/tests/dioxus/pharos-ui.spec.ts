@@ -3020,6 +3020,69 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
 
+  // A play click asks for fullscreen itself (B582): the browser only grants
+  // it inside the click, and the player mounts after. The whole page goes
+  // fullscreen, so the next episode's new player keeps it.
+  test("a film or episode opens fullscreen, but not into the floating window or for a song", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const fullscreen = () =>
+      page.evaluate(() => document.fullscreenElement === document.documentElement);
+    await signIn(page);
+
+    await openFirstHit(page, "Playwright");
+    await expect(page).toHaveURL(/\/ui\/title\//);
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(fullscreen, { message: "a film opens fullscreen" }).toBe(true);
+
+    // Shrinking to the floating window leaves fullscreen.
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
+    await expect.poll(fullscreen, { message: "the floating window is not fullscreen" }).toBe(false);
+
+    // A play into the floating window stays there, out of fullscreen.
+    await openFirstHit(page, "Playwright");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-floating .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    expect(await fullscreen(), "a play into the floating window").toBe(false);
+    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+    await expect(page.locator(".pharos-stage")).toHaveCount(0);
+
+    // An episode's Play on its show page; Back leaves fullscreen.
+    await page.locator(".pharos-brand").click();
+    await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
+    await page.locator("ul.pharos-grid .pharos-poster-name", { hasText: "Playwright Show" }).click();
+    await page.locator("ol.pharos-episodes li a.pharos-episode-play").first().click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect.poll(fullscreen, { message: "an episode opens fullscreen" }).toBe(true);
+    await page.mouse.move(20, 20);
+    await page.locator(".pharos-watch-top").getByRole("button", { name: "Back", exact: true }).click();
+    await expect.poll(fullscreen, { message: "Back leaves fullscreen" }).toBe(false);
+    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+
+    // A song opens its own screen, never fullscreen.
+    await openFirstHit(page, "carefree");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+    expect(await fullscreen(), "a song").toBe(false);
+  });
+
   test("the compact player keeps every control in view at 320px", async ({ page, request }) => {
     test.setTimeout(120_000);
     const probe = await request.get(`${PHAROS_URL}/pharos/session`, {

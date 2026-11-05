@@ -1472,7 +1472,7 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 }
             }
             EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
-            Link { to: Route::Watch(episode.id), class: "pharos-button pharos-episode-play",
+            Link { to: Route::Watch(episode.id), class: "pharos-button pharos-episode-play", plays: ItemKind::Episode,
                 if progress.is_some() { "Resume" } else { "Play" }
             }
         }
