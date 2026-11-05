@@ -5,6 +5,7 @@
 use dioxus::prelude::*;
 
 use super::playback::{LibraryTransition, OverlayEffect};
+use super::settings::Choices;
 use crate::theme::slug;
 use crate::theme::value::{
     Bounds, Density, FontStack, EFFECTS_BLUR_PX, EFFECTS_GLOW, EFFECTS_GRAIN, EFFECTS_VIGNETTE,
@@ -94,9 +95,25 @@ pub fn AppearanceView(
     on_cancel: EventHandler<()>,
 ) -> Element {
     let mut paste = use_signal(String::new);
+    let applied = themes
+        .iter()
+        .find(|card| card.active)
+        .map(|card| card.name.clone());
+    // Turning Follow the system off keeps the theme it resolved to, or the
+    // first card when that one is not listed.
+    let off_to = applied.or_else(|| themes.first().map(|card| card.name.clone()));
+    let transitions = LibraryTransition::ALL
+        .iter()
+        .map(|fx| (fx.as_str().to_owned(), fx.label().to_owned()))
+        .collect::<Vec<_>>();
+    let effects = OverlayEffect::ALL
+        .iter()
+        .map(|fx| (fx.as_str().to_owned(), fx.label().to_owned()))
+        .collect::<Vec<_>>();
     rsx! {
-        section { class: "pharos-appearance",
+        section { class: "pharos-settings-page pharos-appearance",
             h2 { "Appearance" }
+            p { class: "pharos-settings-lede", "Themes and motion on this device." }
             if let Some(notice) = &notice {
                 p {
                     class: "pharos-notice",
@@ -104,151 +121,126 @@ pub fn AppearanceView(
                     "{notice.text}"
                 }
             }
-            button {
-                r#type: "button",
-                id: "theme-auto",
-                aria_pressed: if auto { "true" } else { "false" },
-                onclick: move |_| on_auto.call(()),
-                "Auto (follow the system)"
-            }
-            fieldset { class: "pharos-library-transition",
-                legend { "Library transition" }
-                label { r#for: "library-transition", "How cards arrive when you open or switch libraries" }
-                select {
-                    id: "library-transition",
-                    aria_describedby: "library-transition-help",
-                    onchange: move |ev| {
-                        on_library_transition.call(LibraryTransition::parse(&ev.value()));
-                    },
-                    for fx in LibraryTransition::ALL {
-                        option {
-                            key: "{fx.as_str()}",
-                            value: "{fx.as_str()}",
-                            selected: fx == library_transition,
-                            "{fx.label()}"
+            div { class: "pharos-settings-group",
+                div { class: "pharos-setting",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "theme-auto-label", "Follow the system" }
+                        p { class: "pharos-setting-help",
+                            "Switch between your light and dark theme with the system's setting. Picking a theme below turns this off."
                         }
                     }
-                }
-                p { id: "library-transition-help",
-                    "Saved on this device. Off whenever the system asks for reduced motion."
-                }
-            }
-            fieldset { class: "pharos-overlay-effect",
-                legend { "Controls effect" }
-                label { r#for: "overlay-effect", "How the player's controls hide and return during playback" }
-                select {
-                    id: "overlay-effect",
-                    aria_describedby: "overlay-effect-help",
-                    onchange: move |ev| {
-                        on_overlay_effect.call(OverlayEffect::parse(&ev.value()));
-                    },
-                    for fx in OverlayEffect::ALL {
-                        option {
-                            key: "{fx.as_str()}",
-                            value: "{fx.as_str()}",
-                            selected: fx == overlay_effect,
-                            "{fx.label()}"
-                        }
+                    button {
+                        r#type: "button",
+                        id: "theme-auto",
+                        class: "pharos-switch",
+                        role: "switch",
+                        aria_checked: if auto { "true" } else { "false" },
+                        aria_labelledby: "theme-auto-label",
+                        onclick: move |_| match (auto, off_to.clone()) {
+                            (true, Some(name)) => on_pick.call(name),
+                            (true, None) => {}
+                            (false, _) => on_auto.call(()),
+                        },
                     }
                 }
-                p { id: "overlay-effect-help",
-                    "Saved on this device. A plain fade whenever the system asks for reduced motion."
-                }
-            }
-            ul { class: "pharos-theme-gallery",
-                for card in themes.iter() {
-                    {
-                        let id = slug(&card.name);
-                        let name = card.name.clone();
-                        rsx! {
-                            li {
-                                key: "{id}",
-                                class: "pharos-theme-card",
-                                "data-theme": "{id}",
-                                aria_current: card.active.then_some("true"),
-                                div { class: "pharos-swatches",
-                                    for colour in card.swatches.iter() {
-                                        span {
-                                            class: "pharos-swatch",
-                                            style: "background: {colour}",
-                                            aria_hidden: "true",
-                                        }
-                                    }
-                                }
-                                p { class: "pharos-theme-name", "{card.name}" }
-                                div { class: "pharos-theme-actions",
+                ul { class: "pharos-theme-gallery",
+                    for card in themes.iter() {
+                        {
+                            let id = slug(&card.name);
+                            let name = card.name.clone();
+                            let colour = |i: usize| card.swatches.get(i).cloned().unwrap_or_default();
+                            let preview = format!(
+                                "--theme-bg: {}; --theme-surface: {}; --theme-accent: {}; --theme-fg: {}",
+                                colour(0),
+                                colour(1),
+                                colour(2),
+                                colour(3),
+                            );
+                            rsx! {
+                                li {
+                                    key: "{id}",
+                                    class: "pharos-theme-card",
+                                    "data-theme": "{id}",
+                                    aria_current: card.active.then_some("true"),
                                     button {
                                         r#type: "button",
+                                        class: "pharos-theme-preview",
                                         id: "theme-apply-{id}",
+                                        aria_label: "Apply {card.name}",
+                                        style: "{preview}",
                                         onclick: {
                                             let name = name.clone();
                                             move |_| on_pick.call(name.clone())
                                         },
-                                        "Apply"
+                                        span { class: "pharos-theme-mock", "aria-hidden": "true",
+                                            span { class: "pharos-theme-mock-bar" }
+                                            span { class: "pharos-theme-mock-tiles",
+                                                span {}
+                                                span {}
+                                                span {}
+                                            }
+                                            span { class: "pharos-theme-mock-button" }
+                                        }
                                     }
-                                    button {
-                                        r#type: "button",
-                                        id: "theme-customise-{id}",
-                                        onclick: {
-                                            let name = name.clone();
-                                            move |_| on_customise.call(name.clone())
-                                        },
-                                        "Customise"
+                                    div { class: "pharos-theme-label",
+                                        p { class: "pharos-theme-name", "{card.name}" }
+                                        if card.active {
+                                            span { class: "pharos-theme-in-use", "In use" }
+                                        }
+                                        div { class: "pharos-swatches",
+                                            for colour in card.swatches.iter() {
+                                                span {
+                                                    class: "pharos-swatch",
+                                                    style: "background: {colour}",
+                                                    aria_hidden: "true",
+                                                }
+                                            }
+                                        }
                                     }
-                                    if !card.shipped {
+                                    div { class: "pharos-theme-actions",
                                         button {
                                             r#type: "button",
-                                            id: "theme-edit-{id}",
+                                            id: "theme-customise-{id}",
                                             onclick: {
                                                 let name = name.clone();
-                                                move |_| on_edit_custom.call(name.clone())
+                                                move |_| on_customise.call(name.clone())
                                             },
-                                            "Edit"
+                                            "Customise"
+                                        }
+                                        if !card.shipped {
+                                            button {
+                                                r#type: "button",
+                                                id: "theme-edit-{id}",
+                                                onclick: {
+                                                    let name = name.clone();
+                                                    move |_| on_edit_custom.call(name.clone())
+                                                },
+                                                "Edit"
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                id: "theme-delete-{id}",
+                                                onclick: {
+                                                    let name = name.clone();
+                                                    move |_| on_delete.call(name.clone())
+                                                },
+                                                "Delete"
+                                            }
                                         }
                                         button {
                                             r#type: "button",
-                                            id: "theme-delete-{id}",
+                                            id: "theme-export-{id}",
                                             onclick: {
                                                 let name = name.clone();
-                                                move |_| on_delete.call(name.clone())
+                                                move |_| on_export.call(name.clone())
                                             },
-                                            "Delete"
+                                            "Export"
                                         }
-                                    }
-                                    button {
-                                        r#type: "button",
-                                        id: "theme-export-{id}",
-                                        onclick: {
-                                            let name = name.clone();
-                                            move |_| on_export.call(name.clone())
-                                        },
-                                        "Export"
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
-            div { class: "pharos-import",
-                h3 { "Import a theme" }
-                button {
-                    r#type: "button",
-                    id: "theme-import-file",
-                    onclick: move |_| on_import_file.call(()),
-                    "Choose a theme file"
-                }
-                label { r#for: "theme-import-paste", "Paste a theme file" }
-                textarea {
-                    id: "theme-import-paste",
-                    value: "{paste}",
-                    oninput: move |e| paste.set(e.value()),
-                }
-                button {
-                    r#type: "button",
-                    id: "theme-import-paste-go",
-                    onclick: move |_| on_import_paste.call(paste.read().clone()),
-                    "Import pasted theme"
                 }
             }
             if let Some(editor) = editor {
@@ -386,6 +378,71 @@ pub fn AppearanceView(
                     }
                 }
             }
+            div { class: "pharos-settings-group",
+                div { class: "pharos-setting pharos-library-transition",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "library-transition-label", "Library transition" }
+                        p { id: "library-transition-help", class: "pharos-setting-help",
+                            "How cards arrive when you open or switch libraries. Saved on this device. Off whenever the system asks for reduced motion."
+                        }
+                    }
+                    Choices {
+                        id: "library-transition",
+                        labelled_by: "library-transition-label",
+                        described_by: "library-transition-help".to_owned(),
+                        options: transitions,
+                        selected: library_transition.as_str().to_owned(),
+                        on_pick: move |value: String| on_library_transition.call(LibraryTransition::parse(&value)),
+                    }
+                }
+                div { class: "pharos-setting pharos-overlay-effect",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "overlay-effect-label", "Controls effect" }
+                        p { id: "overlay-effect-help", class: "pharos-setting-help",
+                            "How the player's controls hide and return during playback. Saved on this device. A plain fade whenever the system asks for reduced motion."
+                        }
+                    }
+                    Choices {
+                        id: "overlay-effect",
+                        labelled_by: "overlay-effect-label",
+                        described_by: "overlay-effect-help".to_owned(),
+                        options: effects,
+                        selected: overlay_effect.as_str().to_owned(),
+                        on_pick: move |value: String| on_overlay_effect.call(OverlayEffect::parse(&value)),
+                    }
+                }
+            }
+            div { class: "pharos-settings-group pharos-import",
+                div { class: "pharos-setting",
+                    div { class: "pharos-setting-text",
+                        h3 { class: "pharos-setting-name", "Import a theme" }
+                        p { class: "pharos-setting-help",
+                            "A theme file exported from Pharos on another device, or pasted below."
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        id: "theme-import-file",
+                        onclick: move |_| on_import_file.call(()),
+                        "Choose a theme file"
+                    }
+                }
+                div { class: "pharos-setting pharos-import-paste",
+                    label { class: "pharos-setting-name", r#for: "theme-import-paste", "Paste a theme file" }
+                    textarea {
+                        id: "theme-import-paste",
+                        rows: "4",
+                        value: "{paste}",
+                        oninput: move |e| paste.set(e.value()),
+                    }
+                    button {
+                        r#type: "button",
+                        id: "theme-import-paste-go",
+                        onclick: move |_| on_import_paste.call(paste.read().clone()),
+                        "Import pasted theme"
+                    }
+                }
+            }
         }
     }
 }
@@ -403,11 +460,20 @@ mod tests {
     }
 
     fn page(themes: Vec<ThemeCard>, editor: Option<EditorView>, notice: Option<Notice>) -> String {
+        page_auto(themes, editor, notice, false)
+    }
+
+    fn page_auto(
+        themes: Vec<ThemeCard>,
+        editor: Option<EditorView>,
+        notice: Option<Notice>,
+        auto: bool,
+    ) -> String {
         render(move || {
             rsx! {
                 AppearanceView {
                     themes: themes.clone(),
-                    auto: false,
+                    auto,
                     editor: editor.clone(),
                     notice: notice.clone(),
                     on_pick: |_| {},
@@ -452,38 +518,42 @@ mod tests {
         })
     }
 
-    fn library_transition_select(html: &str) -> &str {
+    fn library_transition_group(html: &str) -> &str {
         let start = html.find("id=\"library-transition\"").unwrap_or(html.len());
         let end = html[start..]
-            .find("</select>")
+            .find("</div>")
             .map_or(html.len(), |e| start + e);
         &html[start..end]
     }
 
     #[test]
-    fn library_transition_select_marks_only_the_stored_choice() {
+    fn library_transition_presses_only_the_stored_choice() {
         let html = page_with_library_transition(Some(LibraryTransition::Matrix));
-        let sel = library_transition_select(&html);
-        assert!(!sel.is_empty(), "select missing: {html}");
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        let group = library_transition_group(&html);
+        assert!(!group.is_empty(), "choices missing: {html}");
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
         assert!(
-            start_tag(sel, "value=\"matrix\"").contains("selected"),
-            "{sel}"
+            start_tag(group, "id=\"library-transition-matrix\"").contains("aria-pressed=\"true\""),
+            "{group}"
         );
         for fx in LibraryTransition::ALL {
-            assert!(sel.contains(fx.label()), "{} missing: {sel}", fx.label());
+            assert!(
+                group.contains(fx.label()),
+                "{} missing: {group}",
+                fx.label()
+            );
         }
         assert!(html.contains("reduced motion"), "{html}");
     }
 
     #[test]
     fn library_transition_defaults_to_fade() {
-        let sel_html = page_with_library_transition(None);
-        let sel = library_transition_select(&sel_html);
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
+        let html = page_with_library_transition(None);
+        let group = library_transition_group(&html);
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
         assert!(
-            start_tag(sel, "value=\"fade\"").contains("selected"),
-            "{sel}"
+            start_tag(group, "id=\"library-transition-fade\"").contains("aria-pressed=\"true\""),
+            "{group}"
         );
     }
 
@@ -513,41 +583,65 @@ mod tests {
         })
     }
 
-    fn overlay_effect_select(html: &str) -> &str {
+    fn overlay_effect_group(html: &str) -> &str {
         let start = html.find("id=\"overlay-effect\"").unwrap_or(html.len());
         let end = html[start..]
-            .find("</select>")
+            .find("</div>")
             .map_or(html.len(), |e| start + e);
         &html[start..end]
     }
 
-    /// The `value` of the one option `sel` marks selected.
-    fn selected_value(sel: &str) -> &str {
-        let at = sel.find("selected").unwrap_or(0);
-        let start = sel[..at].rfind("value=\"").map_or(0, |v| v + 7);
-        let end = sel[start..].find('"').map_or(start, |e| start + e);
-        &sel[start..end]
-    }
-
     #[test]
-    fn overlay_effect_select_marks_only_the_stored_choice() {
+    fn overlay_effect_presses_only_the_stored_choice() {
         let html = page_with_overlay_effect(Some(OverlayEffect::Burn));
-        let sel = overlay_effect_select(&html);
-        assert!(!sel.is_empty(), "select missing: {html}");
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert_eq!(selected_value(sel), "burn", "{sel}");
+        let group = overlay_effect_group(&html);
+        assert!(!group.is_empty(), "choices missing: {html}");
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
+        assert!(
+            start_tag(group, "id=\"overlay-effect-burn\"").contains("aria-pressed=\"true\""),
+            "{group}"
+        );
         for fx in OverlayEffect::ALL {
-            assert!(sel.contains(fx.label()), "{} missing: {sel}", fx.label());
+            assert!(
+                group.contains(fx.label()),
+                "{} missing: {group}",
+                fx.label()
+            );
         }
         assert!(html.contains("reduced motion"), "{html}");
     }
 
     #[test]
     fn overlay_effect_defaults_to_fade() {
-        let sel_html = page_with_overlay_effect(None);
-        let sel = overlay_effect_select(&sel_html);
-        assert_eq!(sel.matches("selected").count(), 1, "{sel}");
-        assert_eq!(selected_value(sel), "fade", "{sel}");
+        let html = page_with_overlay_effect(None);
+        let group = overlay_effect_group(&html);
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
+        assert!(
+            start_tag(group, "id=\"overlay-effect-fade\"").contains("aria-pressed=\"true\""),
+            "{group}"
+        );
+    }
+
+    #[test]
+    fn follow_the_system_is_a_switch_showing_auto() {
+        let html = page(seven_cards(), None, None);
+        let switch = start_tag(&html, "id=\"theme-auto\"");
+        assert!(html.contains("role=\"switch\""), "{html}");
+        assert!(switch.contains("aria-checked=\"false\""), "{switch}");
+        let on = page_auto(seven_cards(), None, None, true);
+        let switch = start_tag(&on, "id=\"theme-auto\"");
+        assert!(switch.contains("aria-checked=\"true\""), "{switch}");
+    }
+
+    #[test]
+    fn each_card_previews_its_own_colours() {
+        let html = page(vec![card("Pharos Night", true, true)], None, None);
+        assert!(
+            html.contains("--theme-bg: #0e1116; --theme-surface: #1a2030; --theme-accent: #4cb4ff; --theme-fg: #e6e8eb"),
+            "{html}"
+        );
+        assert!(html.contains("aria-label=\"Apply Pharos Night\""), "{html}");
+        assert!(html.contains("In use"), "{html}");
     }
 
     fn card(name: &str, shipped: bool, active: bool) -> ThemeCard {
