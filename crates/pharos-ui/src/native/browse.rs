@@ -1021,23 +1021,31 @@ fn PagedGrid(
         }
     });
     // Not while a jump is under way: its pages are still landing.
+    let keep_place = move |key: &str| {
+        if jump.peek().is_some() {
+            return;
+        }
+        let Some(at) = platform::first_visible_tile() else {
+            return;
+        };
+        let Some(top) = platform::tile_top(at) else {
+            return;
+        };
+        if let Err(e) = platform::session_set(key, &format!("{at} {top}")) {
+            platform::warn(&format!("pharos: grid place not kept: {e}"));
+        }
+    };
+    let settled_place = place.clone();
     use_hook(move || {
-        place.map(|key| {
-            std::rc::Rc::new(platform::on_scroll_settled(move || {
-                if jump.peek().is_some() {
-                    return;
-                }
-                let Some(at) = platform::first_visible_tile() else {
-                    return;
-                };
-                let Some(top) = platform::tile_top(at) else {
-                    return;
-                };
-                if let Err(e) = platform::session_set(&key, &format!("{at} {top}")) {
-                    platform::warn(&format!("pharos: grid place not kept: {e}"));
-                }
-            }))
-        })
+        settled_place
+            .map(|key| std::rc::Rc::new(platform::on_scroll_settled(move || keep_place(&key))))
+    });
+    // Leaving for a title inside the settle delay drops the timer with the
+    // grid, so the place is kept once more as the grid goes (V470).
+    use_drop(move || {
+        if let Some(key) = &place {
+            keep_place(key);
+        }
     });
     let mut go = move |target: u32| {
         land.set(None);
