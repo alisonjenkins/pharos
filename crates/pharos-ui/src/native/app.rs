@@ -420,7 +420,19 @@ fn store_bitrate(key: &str, bps: u64) {
     }
 }
 
+thread_local! {
+    /// The subtitle size chosen on this page load. It outranks storage, so a
+    /// choice the browser refused to keep still shows and applies until a
+    /// reload.
+    static SESSION_SUBTITLE_SIZE: Cell<Option<SubtitleSize>> = const { Cell::new(None) };
+}
+
+/// The viewer's subtitle size: this page load's choice, else the stored one,
+/// else Medium.
 fn stored_subtitle_size() -> SubtitleSize {
+    if let Some(size) = SESSION_SUBTITLE_SIZE.with(Cell::get) {
+        return size;
+    }
     match platform::stored_theme(SUBTITLE_SIZE_KEY) {
         Ok(stored) => stored
             .as_deref()
@@ -434,12 +446,15 @@ fn stored_subtitle_size() -> SubtitleSize {
     }
 }
 
-fn store_subtitle_size(size: SubtitleSize) {
-    if let Err(e) = platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()) {
+/// Keep `size` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_subtitle_size(size: SubtitleSize) -> Result<(), String> {
+    SESSION_SUBTITLE_SIZE.with(|s| s.set(Some(size)));
+    platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()).inspect_err(|e| {
         platform::warn(&format!(
             "pharos: subtitle_size storage write failed error={e}"
         ));
-    }
+    })
 }
 
 /// `caps` with the bitrate to negotiate `kind` with, from the viewer's
@@ -1631,7 +1646,15 @@ fn AppearanceScreen() -> Element {
             },
             subtitle_size: subtitle_size_now,
             on_subtitle_size: move |size: SubtitleSize| {
-                store_subtitle_size(size);
+                if let Err(e) = store_subtitle_size(size) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the subtitle size on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
                 platform::apply_subtitle_size(size);
                 subtitle_size.set(size);
                 platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
@@ -3040,6 +3063,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A subtitle size picked on this page load is what the picker reads back,
+    /// even when storage keeps nothing (the host stub stores nothing), so the
+    /// picker never falls back to an older value while the new one applies.
+    #[test]
+    fn a_chosen_subtitle_size_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_subtitle_size(), SubtitleSize::Medium);
+        store_subtitle_size(SubtitleSize::Large).unwrap();
+        assert_eq!(stored_subtitle_size(), SubtitleSize::Large);
+    }
 
     /// The maximum-quality choice caps video and leaves a song as stored
     /// (B477/V420).
