@@ -14,6 +14,7 @@
 //! next play. Online answers, hits and misses alike, are remembered per item,
 //! in memory and, when a cache directory is set, on disk (B361/V301).
 
+pub mod align;
 pub mod cache;
 pub mod embedded;
 pub mod lrc;
@@ -164,6 +165,7 @@ pub struct LyricsFinder {
     memo: Mutex<HashMap<u64, Remembered>>,
     down_until: Mutex<Option<Instant>>,
     disk: Option<Arc<cache::DiskCache>>,
+    aligner: Option<Arc<align::Aligner>>,
 }
 
 /// An online answer held in memory: what was asked, so a retagged song is
@@ -183,12 +185,19 @@ impl LyricsFinder {
             memo: Mutex::default(),
             down_until: Mutex::default(),
             disk: None,
+            aligner: None,
         }
     }
 
     /// Keep online answers under `dir` as well, so they outlive the process.
     pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
         self.disk = Some(Arc::new(cache::DiskCache::new(dir)));
+        self
+    }
+
+    /// Ask an aligner service for word timestamps when requested.
+    pub fn with_aligner(mut self, a: Arc<align::Aligner>) -> Self {
+        self.aligner = Some(a);
         self
     }
 
@@ -363,12 +372,14 @@ fn local(path: &std::path::Path) -> Option<Lyrics> {
 }
 
 /// A signed-in user's view of an item's lyrics. `Ok(None)` means the item has
-/// none, or is not a song.
+/// none, or is not a song. When `want_words` is true, word timestamps are
+/// filled in from an aligner when ready or flagged as pending.
 pub async fn for_item(
     state: &AppState,
     user: &User,
     id: u64,
-) -> Result<Option<Lyrics>, DetailError> {
+    want_words: bool,
+) -> Result<Option<(Lyrics, bool)>, DetailError> {
     crate::services::access::check_item(state, user, id, "item")
         .await
         .map_err(DetailError::Hidden)?;
@@ -379,7 +390,33 @@ pub async fn for_item(
     if item.kind != MediaKind::Audio {
         return Ok(None);
     }
-    Ok(state.lyrics.find(&item).await)
+    let Some(mut lyrics) = state.lyrics.find(&item).await else {
+        return Ok(None);
+    };
+    let mut words_pending = false;
+    if want_words {
+        if let Some(aligner) = state.lyrics.aligner.clone() {
+            // words_for stats the file and reads the disk cache.
+            let asked = lyrics.clone();
+            let lookup = tokio::task::spawn_blocking(move || aligner.words_for(&item, &asked))
+                .await
+                .unwrap_or(align::Lookup::Unavailable);
+            match lookup {
+                align::Lookup::Ready(aligned) => {
+                    for (line, new_words) in lyrics.lines.iter_mut().zip(aligned) {
+                        if line.words.is_empty() {
+                            line.words = new_words;
+                        }
+                    }
+                }
+                align::Lookup::Pending => {
+                    words_pending = true;
+                }
+                align::Lookup::Unavailable => {}
+            }
+        }
+    }
+    Ok(Some((lyrics, words_pending)))
 }
 
 #[cfg(test)]

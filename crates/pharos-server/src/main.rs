@@ -1461,7 +1461,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // built-in US default) backing per-user MaxParentalRating enforcement.
     state.parental_ratings =
         pharos_server::parental::ParentalRatingMap::from_config(&cfg.parental.ratings);
-    if cfg.lyrics.online {
+    if cfg.lyrics.online || cfg.lyrics.aligner_url.is_some() {
         // Same "explicit dir, else a sibling of an existing cache dir" rule
         // the subtitle and book caches use (B361).
         let cache_dir = cfg.lyrics.cache_dir.clone().or_else(|| {
@@ -1475,16 +1475,38 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .flatten()
             .find_map(|d| d.parent().map(|p| p.join("lyrics")))
         });
-        tracing::info!(
-            provider = "lrclib",
-            cache_dir = cache_dir.as_ref().map(|d| d.display().to_string()),
-            "lyrics: online lookup on"
-        );
-        let mut finder = pharos_server::services::lyrics::LyricsFinder::with_online(
-            std::sync::Arc::new(pharos_server::services::lyrics::lrclib::LrcLib::new()),
-        );
-        if let Some(dir) = cache_dir {
-            finder = finder.with_cache(dir);
+        let mut finder = if cfg.lyrics.online {
+            tracing::info!(
+                provider = "lrclib",
+                cache_dir = cache_dir.as_ref().map(|d| d.display().to_string()),
+                "lyrics: online lookup on"
+            );
+            pharos_server::services::lyrics::LyricsFinder::with_online(std::sync::Arc::new(
+                pharos_server::services::lyrics::lrclib::LrcLib::new(),
+            ))
+        } else {
+            pharos_server::services::lyrics::LyricsFinder::default()
+        };
+        if let Some(dir) = cache_dir.as_ref() {
+            finder = finder.with_cache(dir.clone());
+        }
+        if let Some(url) = &cfg.lyrics.aligner_url {
+            let media_root = cfg
+                .lyrics
+                .aligner_media_root
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/pharos/media"));
+            tracing::info!(
+                url = %url,
+                media_root = %media_root.display(),
+                "lyrics: alignment on"
+            );
+            let aligner = pharos_server::services::lyrics::align::Aligner::start(
+                url.clone(),
+                media_root,
+                cache_dir,
+            );
+            finder = finder.with_aligner(aligner);
         }
         state = state.with_lyrics(finder);
     }
