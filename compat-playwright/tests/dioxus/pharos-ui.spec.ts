@@ -3101,6 +3101,17 @@ test.describe("pharos Dioxus UI song handover", () => {
       ).previoustrack(),
     );
     await expect.poll(() => skips.at(-1)).toBe("dir=previous source=media_session");
+
+    // With the focus on a slider, whose own keydown stops propagating, the
+    // key still skips, and only once.
+    const seek = page.getByRole("slider", { name: "Seek" });
+    await expect(seek).toBeEnabled({ timeout: 15_000 });
+    await seek.focus();
+    const before = skips.length;
+    await page.keyboard.press("Shift+P");
+    await expect.poll(() => skips.at(-1)).toBe("dir=previous source=keyboard");
+    await page.waitForTimeout(500);
+    expect(skips.slice(before)).toEqual(["dir=previous source=keyboard"]);
   });
 
   test("a crossfade plays the next song under the end of this one", async ({ page, request }) => {
