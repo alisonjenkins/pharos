@@ -2238,12 +2238,15 @@ impl Drop for StyledSubtitles {
     }
 }
 
-/// Starts drawing the script at `url` over `<video id=video_id>`. While it
-/// is not dropped, `report` hears `Ok` once the renderer is ready, or why it
-/// failed or did not get ready in time.
+/// Starts drawing the script at `url` over `<video id=video_id>`, with the
+/// fonts at `fonts` (the file's embedded ones) loaded up front so libass finds
+/// a style's `Fontname` among them. While it is not dropped, `report` hears
+/// `Ok` once the renderer is ready, or why it failed or did not get ready in
+/// time.
 pub async fn styled_subtitles(
     video_id: &str,
     url: &str,
+    fonts: &[String],
     report: Rc<dyn Fn(Result<(), String>)>,
 ) -> Result<StyledSubtitles, String> {
     let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
@@ -2251,9 +2254,9 @@ pub async fn styled_subtitles(
     let set = |o: &js_sys::Object, k: &str, v: &JsValue| {
         js_sys::Reflect::set(o, &JsValue::from_str(k), v).map_err(|e| format!("{e:?}"))
     };
-    let fonts = js_sys::Object::new();
+    let available = js_sys::Object::new();
     set(
-        &fonts,
+        &available,
         "liberation sans",
         &JsValue::from_str(&format!("{JASSUB_DIR}/default.woff2")),
     )?;
@@ -2271,7 +2274,18 @@ pub async fn styled_subtitles(
             &JsValue::from_str(&format!("{JASSUB_DIR}/{file}")),
         )?;
     }
-    set(&options, "availableFonts", &fonts)?;
+    set(&options, "availableFonts", &available)?;
+    // The file's own fonts, handed to libass before the first frame so it
+    // matches `Fontname` against their names; each is the few kilobytes the
+    // track draws (026 FR-010), not a whole CJK font.
+    set(
+        &options,
+        "fonts",
+        &fonts
+            .iter()
+            .map(|u| JsValue::from_str(u))
+            .collect::<js_sys::Array>(),
+    )?;
     set(
         &options,
         "defaultFont",
