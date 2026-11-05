@@ -611,7 +611,7 @@ fn the_show_name_check_passes_the_librarys_legitimate_variants() {
     ];
     for (folder, nfo) in pairs {
         assert!(
-            !identity::names_another_show(folder, [&nfo.to_string()]),
+            !identity::names_another_show(folder, None, [&nfo.to_string()]),
             "{folder:?} should accept {nfo:?}"
         );
     }
@@ -620,8 +620,42 @@ fn the_show_name_check_passes_the_librarys_legitimate_variants() {
         ("Forever (US)", "Us Forever"),
     ] {
         assert!(
-            identity::names_another_show(folder, [&nfo.to_string()]),
+            identity::names_another_show(folder, None, [&nfo.to_string()]),
             "{folder:?} should reject {nfo:?}"
+        );
+    }
+}
+
+#[test]
+fn the_show_name_check_rejects_a_conflicting_region_or_year() {
+    // (series name, series year, NFO show name, names another show)
+    let cases = [
+        ("The Office (US)", None, "The Office (UK)", true),
+        ("The Office (US)", None, "The Office (us)", false),
+        ("The Office (US)", None, "The Office", false),
+        ("The Office", None, "The Office (UK)", false),
+        ("Doctor Who", Some(2005), "Doctor Who (1963)", true),
+        ("Doctor Who", Some(2005), "Doctor Who (2005)", false),
+        ("Doctor Who", Some(2005), "Doctor Who", false),
+        ("Doctor Who", None, "Doctor Who (1963)", false),
+        (
+            "Battlestar Galactica",
+            Some(2003),
+            "Battlestar Galactica",
+            false,
+        ),
+        (
+            "Party Political Broadcast",
+            Some(2006),
+            "Party Political Broadcast (2006)",
+            false,
+        ),
+    ];
+    for (series, year, nfo, foreign) in cases {
+        assert_eq!(
+            identity::names_another_show(series, year, [&nfo.to_string()]),
+            foreign,
+            "{series:?} ({year:?}) against {nfo:?}"
         );
     }
 }
