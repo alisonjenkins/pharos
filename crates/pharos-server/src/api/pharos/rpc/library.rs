@@ -358,7 +358,10 @@ impl server::library::Handler for Library {
         params: wire::DetailParams,
         results: &mut wire::DetailResults,
     ) -> Result<(), capnp::Error> {
-        let id = read_item_id(params.get()?.get_id()?)?;
+        let params = params.get()?;
+        let id = read_item_id(params.get_id()?)?;
+        let knows_image_delivery =
+            params.get_ctx()?.get_schema_version() >= IMAGE_DELIVERY_SCHEMA_VERSION;
         let user = match self.session.current_user().await {
             Ok(user) => user,
             Err(denial) => {
@@ -422,7 +425,8 @@ impl server::library::Handler for Library {
             c.set_name(chapter.name.as_str());
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
-        let tracks = watch::tracks(&item, watch::extracts_image_subtitles(state)).await;
+        let draws_images = knows_image_delivery && watch::extracts_image_subtitles(state);
+        let tracks = watch::tracks(&item, draws_images).await;
         write_tracks(
             out.reborrow().init_audio_tracks(len(&tracks.audio)),
             &tracks.audio,
@@ -1312,6 +1316,10 @@ fn wire_library_kind(kind: LibraryKind) -> WireKind {
 fn len<T>(v: &[T]) -> u32 {
     u32::try_from(v.len()).unwrap_or(u32::MAX)
 }
+
+/// The first schemaVersion with `SubtitleDelivery.image`. An older client
+/// fails to read the whole detail on that value, so it is sent `burn`.
+const IMAGE_DELIVERY_SCHEMA_VERSION: u32 = 16;
 
 fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: &[watch::Track]) {
     for (i, t) in (0..).zip(tracks) {
