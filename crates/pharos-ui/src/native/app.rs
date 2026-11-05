@@ -45,6 +45,7 @@ use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::resume::{ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
+use super::settings::{Section, SettingsLayout};
 use super::stage::{
     Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View, STAGE_ID,
 };
@@ -1527,11 +1528,17 @@ fn Screen(route: Route) -> Element {
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         // `Root` mounts the older panes for this route.
         Route::Manage => rsx! { Redirect { to: Route::Manage } },
-        Route::Appearance => rsx! { AppearanceScreen {} },
-        Route::Account => rsx! { AccountScreen {} },
-        Route::ApproveDevice => rsx! { ApproveDeviceScreen {} },
-        Route::Playback => rsx! { PlaybackScreen {} },
-        Route::Privacy => rsx! { PrivacyScreen {} },
+        Route::Appearance => {
+            rsx! { SettingsLayout { current: Section::Appearance, AppearanceScreen {} } }
+        }
+        Route::Account => rsx! { SettingsLayout { current: Section::Account, AccountScreen {} } },
+        Route::ApproveDevice => {
+            rsx! { SettingsLayout { current: Section::Devices, ApproveDeviceScreen {} } }
+        }
+        Route::Playback => {
+            rsx! { SettingsLayout { current: Section::Playback, PlaybackScreen {} } }
+        }
+        Route::Privacy => rsx! { SettingsLayout { current: Section::Privacy, PrivacyScreen {} } },
         Route::Find => rsx! { FindRedirect {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
