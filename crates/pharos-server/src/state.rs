@@ -384,12 +384,18 @@ pub struct AppState {
     /// Single-flight cache of the whole `media_items` list. Home-screen +
     /// synth-id endpoints each did a full ~13k-row `store.list()` (1-4s) per
     /// request, and browsing fired several at once. Holds
-    /// `(generation, built_at, items)` — a hit requires the generation to
-    /// still match AND the entry to be under `LIST_CACHE_MAX_AGE` (a backstop
+    /// `((generation, artwork_epoch), built_at, items)` — a hit requires both
+    /// to still match AND the entry to be under `LIST_CACHE_MAX_AGE` (a backstop
     /// so a missed invalidation self-heals). See `list_items_cached`.
     #[allow(clippy::type_complexity)]
     pub item_list_cache: Arc<
-        tokio::sync::Mutex<Option<(u64, std::time::Instant, Arc<Vec<pharos_core::MediaItem>>)>>,
+        tokio::sync::Mutex<
+            Option<(
+                (u64, u64),
+                std::time::Instant,
+                Arc<Vec<pharos_core::MediaItem>>,
+            )>,
+        >,
     >,
     /// T73 — recent activity entries (logins, etc.) for the dashboard's
     /// Activity panel, newest-first. In-memory ring buffer (session-scoped, not
@@ -1092,9 +1098,14 @@ impl AppState {
         /// Backstop: even if some mutation path forgets to bump the generation,
         /// the cache refreshes at least this often.
         const LIST_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-        let gen = self
-            .library_generation
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Artwork counts too: `has_primary_art` picks synth poster
+        // representatives, and the backfill records art without a rescan.
+        let gen = (
+            self.library_generation
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.artwork_epoch
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         let mut guard = self.item_list_cache.lock().await;
         if let Some((cached_gen, at, items)) = guard.as_ref() {
             if *cached_gen == gen && at.elapsed() < LIST_CACHE_MAX_AGE {
