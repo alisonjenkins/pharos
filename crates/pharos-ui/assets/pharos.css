@@ -939,6 +939,41 @@ body:has(.pharos-stage.is-full) .pharos-error {
 .pharos-player.is-idle:focus-visible {
   box-shadow: none;
 }
+/* Subtitles (browser-native <track>): a soft rounded backdrop that hugs the
+   text instead of the UA's near-opaque square per-line bars. `::cue` cannot
+   take a radius, so Chromium/WebKit's per-cue box carries the backdrop and
+   the cue text keeps a halo for engines without that box. */
+:root {
+  --pharos-subtitle-scale: 100%;
+}
+:root[data-subtitle-size="small"] {
+  --pharos-subtitle-scale: 75%;
+}
+:root[data-subtitle-size="large"] {
+  --pharos-subtitle-scale: 125%;
+}
+:root[data-subtitle-size="extra-large"] {
+  --pharos-subtitle-scale: 150%;
+}
+video::cue {
+  font-size: var(--pharos-subtitle-scale);
+  background: transparent;
+  text-shadow: 0 0 0.1em rgb(0 0 0 / 0.8), 0 0 0.3em rgb(0 0 0 / 0.6); /* not themed: subtitles sit on the video, whose colours no theme sets */
+}
+video::-webkit-media-text-track-display {
+  background: rgb(0 0 0 / 0.4); /* not themed: subtitles sit on the video, whose colours no theme sets */
+  border-radius: 0.45em;
+  padding: 0.05em 0.45em !important;
+  width: fit-content !important;
+  left: 0 !important;
+  right: 0 !important;
+  margin-inline: auto;
+}
+/* The UA snaps the last line to the picture's bottom edge, which would cut
+   off the backdrop's lower corners. */
+video::-webkit-media-text-track-container {
+  transform: translateY(-4%);
+}
 .pharos-control-row {
   display: flex;
   align-items: center;
