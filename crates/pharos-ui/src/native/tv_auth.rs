@@ -184,9 +184,49 @@ pub fn package_from_cmdline(raw: &str) -> Result<String, String> {
     Ok(name.to_owned())
 }
 
+/// The native API socket URL for a server `base`. Only `https://` is
+/// accepted: the socket carries the QuickConnect secret and the device token
+/// it buys, so a cleartext `http://` base is refused, never quietly turned
+/// into `ws://`. A trailing `/` on `base` is dropped.
+pub fn rpc_url(base: &str) -> Result<String, String> {
+    let Some(host) = base.strip_prefix("https://") else {
+        return Err(format!(
+            "refusing server {base:?}: the TV app only connects over https://"
+        ));
+    };
+    let host = host.trim_end_matches('/');
+    if host.is_empty() {
+        return Err(format!("no host in server {base:?}"));
+    }
+    Ok(format!("wss://{host}/pharos/rpc"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The socket carries the QuickConnect secret and the device token, so a
+    /// cleartext base is refused. Disarm check: mapping `http://` to `ws://`
+    /// again fails this.
+    #[test]
+    fn the_rpc_url_is_wss_and_a_cleartext_base_is_refused() {
+        assert_eq!(
+            rpc_url("https://tv.example.com").as_deref(),
+            Ok("wss://tv.example.com/pharos/rpc")
+        );
+        assert_eq!(
+            rpc_url("https://tv.example.com/").as_deref(),
+            Ok("wss://tv.example.com/pharos/rpc")
+        );
+        for bad in [
+            "http://tv.example.com",
+            "ws://tv.example.com",
+            "tv.example.com",
+            "https://",
+        ] {
+            assert!(rpc_url(bad).is_err(), "{bad} must be refused");
+        }
+    }
 
     fn secs(s: u64) -> Duration {
         Duration::from_secs(s)

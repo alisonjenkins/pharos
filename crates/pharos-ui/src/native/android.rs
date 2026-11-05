@@ -63,11 +63,7 @@ async fn bounded<T>(
 /// the connection has ended.
 pub async fn connect(base: &str) -> Result<(bootstrap::Client, RpcSystem, Closed), String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let url = format!(
-        "{}/pharos/rpc",
-        base.replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1)
-    );
+    let url = tv_auth::rpc_url(base)?;
     let (ws, _) = tokio::time::timeout(
         tv_auth::CALL_TIMEOUT,
         tokio_tungstenite::connect_async(url.as_str()),
