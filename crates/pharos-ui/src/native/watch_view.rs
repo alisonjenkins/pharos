@@ -12,7 +12,7 @@ use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
     clock, cues_at, left_to_watch, percent, segment_at, share, skip_label, thumb_at, track_label,
-    ImageCues, MediaEvent, MediaState, UP_NEXT_COUNTDOWN_MS,
+    ImageCues, MediaEvent, MediaState,
 };
 use super::seen::SeenRow;
 use super::together::Member;
@@ -93,15 +93,15 @@ pub struct UpNextCard {
 
 impl UpNextCard {
     /// The card for `next`, or a plain one while it is unknown, with
-    /// `left_ms` of the countdown to run.
-    pub fn of(next: Option<&Item>, left_ms: u64) -> Self {
-        let run = UP_NEXT_COUNTDOWN_MS.saturating_sub(left_ms.min(UP_NEXT_COUNTDOWN_MS));
+    /// `left_ms` of a countdown `of_ms` long to run.
+    pub fn of(next: Option<&Item>, left_ms: u64, of_ms: u64) -> Self {
+        let run = of_ms.saturating_sub(left_ms.min(of_ms));
         Self {
             name: next.map_or_else(|| "Next episode".to_owned(), |n| n.name.clone()),
             number: next.and_then(episode_label),
             image: next.and_then(|n| n.image.clone()),
             seconds: left_ms.div_ceil(1_000),
-            elapsed_pct: percent(run, UP_NEXT_COUNTDOWN_MS),
+            elapsed_pct: percent(run, of_ms),
         }
     }
 }
@@ -1384,7 +1384,7 @@ mod tests {
             critic_rating: None,
         };
         let mut c = controls();
-        c.up_next = Some(UpNextCard::of(Some(&next), 7_200));
+        c.up_next = Some(UpNextCard::of(Some(&next), 7_200, 15_000));
         let html = render(c);
         assert!(html.contains("Up next"), "{html}");
         assert!(html.contains("The Return"), "{html}");
@@ -1397,9 +1397,12 @@ mod tests {
         assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
         assert!(!html.contains("Skip intro"), "{html}");
 
-        let plain = UpNextCard::of(None, 1_000);
+        let plain = UpNextCard::of(None, 1_000, 15_000);
         assert_eq!((plain.name.as_str(), plain.seconds), ("Next episode", 1));
         assert_eq!(plain.image, None);
+        // From a guess it counts to the end, and its bar fills over that.
+        let long = UpNextCard::of(None, 45_000, 90_000);
+        assert_eq!((long.seconds, long.elapsed_pct), (45, 50.0));
     }
 
     #[test]
