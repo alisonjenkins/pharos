@@ -4,8 +4,11 @@
 //! the page keeps its CSS look; the reason is returned for the log.
 
 pub mod catalogue;
+pub mod subtitles;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod webgl;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod webgl_subs;
 
 pub use catalogue::Program;
 
@@ -139,6 +142,21 @@ pub fn open(
     #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
     {
         let _ = (canvas_id, program);
+        Err(Fallback::NoWebgl2)
+    }
+}
+
+/// A compositor for subtitle masks on the canvas `canvas_id` (spec 026),
+/// or why there is none. Not subject to reduced motion: static text is not
+/// motion.
+pub fn open_subtitles(canvas_id: &str) -> Result<Box<dyn subtitles::SubtitleCompositor>, Fallback> {
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    {
+        webgl_subs::open(canvas_id)
+    }
+    #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+    {
+        let _ = canvas_id;
         Err(Fallback::NoWebgl2)
     }
 }

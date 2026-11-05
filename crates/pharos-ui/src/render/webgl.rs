@@ -153,7 +153,7 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
 
 /// Compile `program` and make its vertex array and data texture.
 fn build(gl: &Gl, program: Program) -> Result<Resources, Fallback> {
-    let handle = link(gl, &fragment_source(program))?;
+    let handle = link(gl, VERTEX, &fragment_source(program))?;
     let uniform = |name: &str| gl.get_uniform_location(&handle, name);
     let uniforms = Uniforms {
         time: uniform("u_time"),
@@ -206,12 +206,12 @@ fn silence() -> Vec<u8> {
     data
 }
 
-fn link(gl: &Gl, fragment: &str) -> Result<WebGlProgram, Fallback> {
+pub(super) fn link(gl: &Gl, vertex: &str, fragment: &str) -> Result<WebGlProgram, Fallback> {
     let program = gl
         .create_program()
         .ok_or_else(|| Fallback::Shader("create program".to_owned()))?;
     let mut shaders = Vec::with_capacity(2);
-    let linked = compile_and_link(gl, &program, fragment, &mut shaders);
+    let linked = compile_and_link(gl, &program, vertex, fragment, &mut shaders);
     for shader in &shaders {
         gl.detach_shader(&program, shader);
         gl.delete_shader(Some(shader));
@@ -227,10 +227,11 @@ fn link(gl: &Gl, fragment: &str) -> Result<WebGlProgram, Fallback> {
 fn compile_and_link(
     gl: &Gl,
     program: &WebGlProgram,
+    vertex: &str,
     fragment: &str,
     shaders: &mut Vec<WebGlShader>,
 ) -> Result<(), Fallback> {
-    for (kind, source) in [(Gl::VERTEX_SHADER, VERTEX), (Gl::FRAGMENT_SHADER, fragment)] {
+    for (kind, source) in [(Gl::VERTEX_SHADER, vertex), (Gl::FRAGMENT_SHADER, fragment)] {
         let shader = gl
             .create_shader(kind)
             .ok_or_else(|| Fallback::Shader("create shader".to_owned()))?;
