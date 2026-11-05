@@ -426,13 +426,20 @@ async fn deliver_ass(
     )
     .await?;
 
-    let ass_body = |bytes: Vec<u8>| {
-        HttpResponse::Ok()
-            .content_type("text/x-ssa; charset=utf-8")
-            .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
-            .body(bytes)
-    };
+    let bytes = ass_script(state, &item, stream_index).await?;
+    Ok(HttpResponse::Ok()
+        .content_type("text/x-ssa; charset=utf-8")
+        .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
+        .body(bytes))
+}
 
+/// The raw ASS/SSA script of the subtitle at `stream_index`: a sidecar's file
+/// as it is, an embedded stream extracted once and cached.
+pub(crate) async fn ass_script(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+) -> Result<Vec<u8>, actix_web::Error> {
     // Sidecar → raw passthrough (it's already an .ass/.ssa file on disk).
     let sidecar_base = sidecar_base_index(&item.probe);
     if stream_index >= sidecar_base {
@@ -441,10 +448,9 @@ async fn deliver_ass(
         let Some((sidecar_path, _)) = sidecars.into_iter().nth(offset) else {
             return Err(error::ErrorNotFound("no sidecar at that index"));
         };
-        let bytes = tokio::fs::read(&sidecar_path)
+        return tokio::fs::read(&sidecar_path)
             .await
-            .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
-        return Ok(ass_body(bytes));
+            .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")));
     }
 
     let input = item
@@ -457,7 +463,7 @@ async fn deliver_ass(
             .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
             .await
         {
-            return Ok(ass_body((*bytes).clone()));
+            return Ok((*bytes).clone());
         }
         let lock = cache
             .lock(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
@@ -467,7 +473,7 @@ async fn deliver_ass(
             .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
             .await
         {
-            return Ok(ass_body((*bytes).clone()));
+            return Ok((*bytes).clone());
         }
         let out =
             run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await?;
@@ -480,10 +486,9 @@ async fn deliver_ass(
                 out,
             )
             .await;
-        return Ok(ass_body((*stored).clone()));
+        return Ok((*stored).clone());
     }
-    let out = run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await?;
-    Ok(ass_body(out))
+    run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await
 }
 
 /// Pre-extract every text subtitle track of `item` into the subtitle cache so
