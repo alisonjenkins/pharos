@@ -1033,6 +1033,8 @@ mod tests {
             trickplay: Vec::new(),
             segments: Vec::new(),
             fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
         };
         let answer = vec![
             MemberSeen {
@@ -1571,6 +1573,8 @@ mod tests {
             trickplay: vec![],
             segments: vec![],
             fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -1602,6 +1606,8 @@ mod tests {
             trickplay: vec![],
             segments: vec![],
             fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -1621,6 +1627,8 @@ mod tests {
             trickplay: vec![],
             segments: vec![],
             fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Mark unwatched<"), "{html}");
@@ -1669,6 +1677,8 @@ mod tests {
                 trickplay: vec![],
                 segments: vec![],
                 fonts: Vec::new(),
+                artists: Vec::new(),
+                album: None,
             };
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
@@ -1691,6 +1701,8 @@ mod tests {
                 trickplay: vec![],
                 segments,
                 fonts: vec![],
+                artists: Vec::new(),
+                album: None,
             }
         };
         let outro = Segment {
@@ -1726,6 +1738,8 @@ mod tests {
             trickplay: vec![],
             segments: vec![],
             fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(

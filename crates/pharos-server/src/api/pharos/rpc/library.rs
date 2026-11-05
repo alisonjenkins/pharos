@@ -422,6 +422,11 @@ impl server::library::Handler for Library {
             }
         }
         out.set_overview(dto.overview.as_deref().unwrap_or_default());
+        let mut artists = out.reborrow().init_artists(len(&dto.artists));
+        for (i, artist) in (0..).zip(&dto.artists) {
+            artists.set(i, artist.as_str());
+        }
+        out.set_album(dto.album.as_deref().unwrap_or_default());
         let count = u32::try_from(dto.genres.len()).unwrap_or(u32::MAX);
         let mut genres = out.reborrow().init_genres(count);
         for (i, genre) in (0..count).zip(&dto.genres) {
