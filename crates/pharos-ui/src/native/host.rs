@@ -17,6 +17,7 @@ pub struct Connection;
 pub struct Open {
     pub conn: Connection,
     pub api: NativeApi,
+    pub server_schema: Option<u32>,
 }
 
 pub enum OpenError {
@@ -52,6 +53,8 @@ pub fn current_path() -> String {
 }
 
 pub fn push(_path: &str) {}
+
+pub fn reload() {}
 
 pub fn replace(_path: &str) {}
 
