@@ -111,16 +111,37 @@ pub async fn any(state: &AppState, item: &MediaItem) -> bool {
     matches!(state.stores.media_segments_for(item.id).await, Ok(s) if !s.is_empty())
 }
 
+/// Whether the lower-cased chapter title `lc` names a scene placed around
+/// the credits ("Post-Credits Scene", "Mid-credits", "After the Credits")
+/// rather than the credits themselves. Spaces, hyphens and dashes are
+/// ignored, so "Post Credits", "Post-Credits", "Post–Credits" and
+/// "Postcredits" all count.
+fn after_credits(lc: &str) -> bool {
+    let joined: String = lc
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '-' | '\u{2013}' | '\u{2014}'))
+        .collect();
+    ["postcredit", "midcredit", "aftercredit", "afterthecredit"]
+        .iter()
+        .any(|p| joined.contains(p))
+}
+
 /// Map a free-text chapter title to a Jellyfin MediaSegmentType.
 /// Returns None when the title doesn't look like an actionable
 /// segment.
 pub fn classify_chapter_title(title: &str) -> Option<&'static str> {
     let lc = title.to_ascii_lowercase();
+    // A scene around the credits is a scene to watch, whatever else its
+    // title says ("Post-Credits Scene: Closing").
+    if after_credits(&lc) {
+        return None;
+    }
     let song = theme_song(&lc);
     if lc.contains("intro") || lc.contains("opening") || song == Some("op") {
         return Some("Intro");
     }
     if lc.contains("outro")
+        // A numbered "Scene 12: End Credits" still is the credits.
         || lc.contains("credits")
         || lc.contains("closing")
         || matches!(song, Some("ed" | "ending"))
@@ -191,6 +212,18 @@ mod tests {
         // A word in another script stays part of the title, not a break
         // after "ED".
         assert_eq!(classify_chapter_title("ED後のシーン"), None);
+        assert_eq!(classify_chapter_title("Post-Credits Scene"), None);
+        assert_eq!(classify_chapter_title("Mid-credits scene"), None);
+        assert_eq!(classify_chapter_title("Post\u{2013}Credits Scene"), None);
+        assert_eq!(classify_chapter_title("Post\u{2014}credits"), None);
+        assert_eq!(classify_chapter_title("Postcredits Scene"), None);
+        assert_eq!(classify_chapter_title("Post-Credits Scene: Closing"), None);
+        assert_eq!(classify_chapter_title("Mid-credits Opening"), None);
+        assert_eq!(classify_chapter_title("After the Credits"), None);
+        assert_eq!(
+            classify_chapter_title("Scene 12: End Credits"),
+            Some("Outro")
+        );
     }
 
     #[actix_web::test]
