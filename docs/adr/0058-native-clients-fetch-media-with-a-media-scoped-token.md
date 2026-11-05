@@ -36,6 +36,11 @@ count in `pharos_token_scope_refused_total{scope="media"}`.
 ## Consequences
 
 - The Full device token never appears in a URL.
+- The Media token does: it is sent as `?api_key=` in image and stream URLs,
+  including the child URIs of an HLS playlist, so it can reach proxy and
+  access logs, browser history and saved playlists. The TTL (six hours by
+  default, a day at most) and the GET/HEAD-only `MEDIA_ALLOWLIST` bound what a
+  copy found there can do.
 - A leaked media token reads that user's media for up to the TTL. It is not
   revoked with the device token or by signing out in this slice (follow-up);
   the TTL, capped at a day, is the bound.
