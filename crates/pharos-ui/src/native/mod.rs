@@ -40,6 +40,7 @@ pub mod rails;
 pub mod resume;
 pub mod route;
 pub mod seen;
+pub mod settings;
 pub mod stage;
 pub mod style_picker;
 pub mod together;
