@@ -1629,6 +1629,10 @@ impl<P: Prober> FsScanner<P> {
                 // Promote video-kind items to Episode when the path
                 // looks like a TV layout. Audio stays as classified.
                 let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_path(&path) {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "scanner: video promoted to an episode by its name or season folder"
+                    );
                     MediaKind::Episode
                 } else {
                     info.kind
@@ -2290,7 +2294,7 @@ pub(crate) fn resolve_item_3d_format(
 
 pub fn is_episode_path(path: &Path) -> bool {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if has_sxxeyy_token(name) {
+    if has_sxxeyy_token(name) || has_nxnn_token(name) {
         return true;
     }
     for component in path.components() {
@@ -2298,6 +2302,44 @@ pub fn is_episode_path(path: &Path) -> bool {
         if looks_like_season_dir(&comp) {
             return true;
         }
+    }
+    false
+}
+
+/// B587 — whether `name` holds a Kodi `1x16` episode token: one or two
+/// season digits, `x`, then two or three episode digits, standing alone
+/// (`- 1x16 -`, `.1x01x02.`). Fewer season digits than a frame size keeps
+/// `1920x1080` out, and two episode digits keep a title's `2x4` out. A
+/// two-digit season must be followed by ` - ` as in `Show - 10x05 - Title`,
+/// so a film named `Ocean 10x10` stays a film. `parse_series_info` already
+/// reads the numbers from this form; without this, a file holding it
+/// outside a season folder was stored as a movie.
+pub fn has_nxnn_token(name: &str) -> bool {
+    let b = name.as_bytes();
+    let digits = |from: usize| b[from..].iter().take_while(|c| c.is_ascii_digit()).count();
+    // A non-ASCII byte is part of a letter, so it is no word boundary.
+    let separator = |c: &u8| c.is_ascii() && !c.is_ascii_alphanumeric();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() && (i == 0 || separator(&b[i - 1])) {
+            let season = digits(i);
+            let x = i + season;
+            if (1..=2).contains(&season) && b.get(x).is_some_and(|c| c.eq_ignore_ascii_case(&b'x'))
+            {
+                let episode = digits(x + 1);
+                let end = x + 1 + episode;
+                let stands_alone = b
+                    .get(end)
+                    .map_or(true, |c| separator(c) || c.eq_ignore_ascii_case(&b'x'));
+                let titled = season == 1 || b[end..].starts_with(b" - ");
+                if (2..=3).contains(&episode) && stands_alone && titled {
+                    return true;
+                }
+            }
+            i += season;
+            continue;
+        }
+        i += 1;
     }
     false
 }
@@ -5644,6 +5686,39 @@ mod tests {
         assert!(has_sxxeyy_token("Series_S12E07_HDTV.mkv"));
         assert!(!has_sxxeyy_token("classS5English.mp4")); // mid-word "S5" rejected
         assert!(!has_sxxeyy_token("Movie 2024.mkv"));
+    }
+
+    /// B587 — Kodi's `1x16` names an episode; a frame size, a title's `2x4`
+    /// or a film's `10x10` does not.
+    #[test]
+    fn an_nxnn_token_names_an_episode() {
+        assert!(has_nxnn_token(
+            "Star Trek The Next Generation - 1x16 - Too Short a Season.avi"
+        ));
+        assert!(has_nxnn_token(
+            "Star Trek The Next Generation - 1x01x02 - Encounter at Farpoint.avi"
+        ));
+        assert!(has_nxnn_token("show.1x105.mkv"));
+        assert!(!has_nxnn_token("Movie 1920x1080.mkv"));
+        assert!(!has_nxnn_token("The 2x4 Club (2001).mkv"));
+        assert!(!has_nxnn_token("Movie 1x16mm.mkv"));
+        assert!(!has_nxnn_token("Box1x16.mkv"));
+        assert!(!has_nxnn_token("Movie (2024).mkv"));
+        assert!(!has_nxnn_token("Ocean 10x10.mkv"));
+        assert!(has_nxnn_token("Long Show - 10x05 - Title.mkv"));
+        assert!(!has_nxnn_token("Zé1x16.mkv"));
+        assert!(is_episode_path(Path::new(
+            "/media/TV/Star Trek The Next Generation/Star Trek The Next Generation - 1x16 - Too Short a Season.avi"
+        )));
+        let info = parse_series_info(Path::new(
+            "/media/TV/Star Trek The Next Generation/Star Trek The Next Generation - 1x16 - Too Short a Season.avi",
+        ))
+        .expect("series info");
+        assert_eq!(info.series_name, "Star Trek The Next Generation");
+        assert_eq!(
+            (info.season_number, info.episode_number),
+            (Some(1), Some(16))
+        );
     }
 
     #[test]
