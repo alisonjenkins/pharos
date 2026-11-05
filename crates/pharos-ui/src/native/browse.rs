@@ -801,6 +801,14 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                     option { value: "watched", selected: played == "watched", "Watched" }
                 }
             }
+            if now != Narrow::default() {
+                button {
+                    class: "pharos-button pharos-button-secondary pharos-filter-reset",
+                    r#type: "button",
+                    onclick: move |_| narrow.set(Narrow::default()),
+                    "Reset filters"
+                }
+            }
         }
     }
 }
