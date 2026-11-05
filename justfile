@@ -300,7 +300,7 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     df -h /nix/store 2>&1 | tail -1 | sed 's/^/  df: /' || true
     if [[ -r /proc/self/mountinfo ]]; then grep -E ' /nix(/| )' /proc/self/mountinfo | sed 's/^/  mount: /' || true; fi
     # The shell writes its own PID, then execs pharos, so the PID file names pharos.
-    nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec target/debug/pharos --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
+    nix develop --command bash -c "echo \$\$ > '$TMP/pharos.pid'; exec '${CARGO_TARGET_DIR:-$PWD/target}/debug/pharos' --config '$PHAROS_CONFIG' serve" > "$TMP/pharos.log" 2>&1 &
     SERVE_JOB=$!
     for _ in $(seq 1 120); do
       if curl -fsS -o /dev/null http://127.0.0.1:{{ port }}/ui/ 2>/dev/null; then ready=1; break; fi
