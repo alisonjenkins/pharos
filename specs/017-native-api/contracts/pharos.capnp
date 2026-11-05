@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 14;
+const schemaVersion :UInt32 = 15;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -131,12 +131,26 @@ interface Session {
   # Approves a pending Quick Connect code shown on another device, which then
   # signs in as this user; an unknown or expired code answers notFound.
   quickConnectAuthorize @13 (ctx :CallContext, code :Text) -> (result :Done);
+  # Mint a narrow token for native image loaders and media players that
+  # cannot send the session cookie (025, ADR 0058). Valid only on GET/HEAD
+  # media and image endpoints; expires within server-configured TTL.
+  mediaToken @14 (ctx :CallContext) -> (result :MediaTokenResult);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
 }
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
 struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
+struct MediaToken {
+  token       @0 :Text $secret;
+  expiresAtMs @1 :UInt64;
+}
+struct MediaTokenResult {
+  union {
+    token @0 :MediaToken;
+    error @1 :Error;
+  }
+}
 
 # ---- library --------------------------------------------------------------
 # `kinds` naming exactly one kind pharos only synthesises (series, season,
