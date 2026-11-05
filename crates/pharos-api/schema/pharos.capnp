@@ -213,7 +213,8 @@ struct Track {
 # `external`: the player renders the WebVTT at Track.url itself. `burn`: an
 # image subtitle the server draws into the video, so choosing it renegotiates.
 # `image`: an image subtitle the player draws from the timed PNG manifest at
-# Track.url (spec 019), when it declared the codec in imageSubtitles.
+# Track.url (spec 019). Library.detail sends it only to a client whose
+# CallContext.schemaVersion is 16 or later; an older one gets `burn`.
 enum SubtitleDelivery { external @0; burn @1; image @2; }
 # A trickplay sprite set: tiles of grid × grid thumbnails, one every intervalMs.
 # tileUrl holds `{tile}`, the 0-based tile number. A tile the server has not

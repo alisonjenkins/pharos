@@ -2877,9 +2877,12 @@ async fn omdb_scores_reach_films_and_shows() {
 
 /// Spec 019: on a server that extracts image subtitles, the detail offers an
 /// image subtitle as the PNG manifest the player draws, and a text one still
-/// as WebVTT.
+/// as WebVTT. A client built before schemaVersion 16 cannot read
+/// `SubtitleDelivery.image`, so it, and one that sends no version, gets
+/// `burn` as before.
 /// Disarm check: with `write_tracks` writing `Drawn::Images` as `burn`, or
-/// `detail` passing `draws_images: false`, the PGS track reads `burn`.
+/// `detail` passing `draws_images: false`, the v16 PGS track reads `burn`;
+/// with the schemaVersion gate dropped, the v15 one reads `image`.
 #[cfg(feature = "ffmpeg-lib")]
 #[actix_web::test]
 async fn native_detail_offers_image_subtitles_to_draw_when_the_server_extracts_them() {
@@ -2914,41 +2917,49 @@ async fn native_detail_offers_image_subtitles_to_draw_when_the_server_extracts_t
     fx.state.stores.put(item).await.unwrap();
 
     let library = session.library_request().send().pipeline.get_library();
-    let mut req = library.detail_request();
-    req.get().init_ctx();
-    req.get().init_id().set_real(104);
-    let reply = req.send().promise.await.expect("detail");
-    let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
-    else {
-        panic!("detail refused");
-    };
-    let subtitles: Vec<(u32, SubtitleDelivery, String)> = d
-        .unwrap()
-        .get_subtitle_tracks()
-        .unwrap()
-        .iter()
-        .map(|t| {
-            (
-                t.get_index(),
-                t.get_delivery().unwrap(),
-                t.get_url().unwrap().to_str().unwrap().to_owned(),
-            )
-        })
-        .collect();
     let id = WireId::Real(104);
-    assert_eq!(
-        subtitles,
-        vec![
-            (
-                3,
-                SubtitleDelivery::External,
-                format!("/videos/{id}/subtitles/3/stream.vtt")
-            ),
+    let vtt = (
+        3,
+        SubtitleDelivery::External,
+        format!("/videos/{id}/subtitles/3/stream.vtt"),
+    );
+    for (schema_version, pgs) in [
+        (
+            16,
             (
                 4,
                 SubtitleDelivery::Image,
-                format!("/videos/{id}/subtitles/4/images.json")
+                format!("/videos/{id}/subtitles/4/images.json"),
             ),
-        ]
-    );
+        ),
+        (15, (4, SubtitleDelivery::Burn, String::new())),
+        (0, (4, SubtitleDelivery::Burn, String::new())),
+    ] {
+        let mut req = library.detail_request();
+        req.get().init_ctx().set_schema_version(schema_version);
+        req.get().init_id().set_real(104);
+        let reply = req.send().promise.await.expect("detail");
+        let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+        else {
+            panic!("detail refused");
+        };
+        let subtitles: Vec<(u32, SubtitleDelivery, String)> = d
+            .unwrap()
+            .get_subtitle_tracks()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t.get_index(),
+                    t.get_delivery().unwrap(),
+                    t.get_url().unwrap().to_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            subtitles,
+            vec![vtt.clone(), pgs],
+            "schemaVersion {schema_version}"
+        );
+    }
 }
