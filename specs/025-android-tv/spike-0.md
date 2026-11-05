@@ -90,7 +90,10 @@ CSS viewport is 960x540 at devicePixelRatio 2.
 
 ## Carry into slice 1
 
-- Media auth: the spike puts the device token in `?api_key=` on every image
+- Media auth (superseded: ADR-0058 gives native clients a short-lived
+  `TokenScope::Media` token for `?api_key=`, so the full device token stays
+  out of URLs, and ADR-0059 revokes it with its session; no token-free route
+  is needed). As spiked: the device token went in `?api_key=` on every image
   and stream URL (the WebView origin `https://dioxus.index.html` has no
   cookie). Slice 1 needs a token-free route (wry custom-protocol proxy or a
   cookie set through JNI) so the token stays out of URLs and logs.

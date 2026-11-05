@@ -116,7 +116,7 @@ Dioxus UI lives in `crates/pharos-ui` and compiles to WASM via the
 
 - Dev loop: `nix develop --command dx serve --package pharos-ui --bin pharos-ui-web` (hot reload).
 - Release bundle: `nix develop --command dx build --package pharos-ui --bin pharos-ui-web --release`.
-- Output lands under `target/dx/pharos-ui/release/web/public/`.
+- Output lands under `target/dx/pharos-ui-web/release/web/public/`.
 - Point the server at it via `[server].ui_dir` in `config.toml`; pharos serves the bundle at `/ui/` (ADR-0038). The OCI image carries the release bundle at `/share/pharos-ui`.
 - WASM target is pinned in `rust-toolchain.toml`; `cargo build --target wasm32-unknown-unknown` works without extra setup inside the devShell.
 
