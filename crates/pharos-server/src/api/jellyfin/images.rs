@@ -829,7 +829,7 @@ pub(crate) async fn resolve_synth_image_item(
     // Cold miss: warm the ENTIRE synth-id → representative map in one scan,
     // serialised so a grid's burst of concurrent poster requests doesn't each
     // run its own multi-second `list()`. Peers wait here, then hit the memo.
-    let _guard = state.synth_image_warm.lock().await;
+    let mut confirmed_at = state.synth_image_warm.lock().await;
     if let Some(cached) = state.synth_image_cached(id_str) {
         return match cached {
             Some(item_id) => state.stores.get(item_id).await.ok(),
@@ -842,8 +842,15 @@ pub(crate) async fn resolve_synth_image_item(
         return all.iter().find(|it| it.id == item_id).cloned();
     }
     // The cached list can be a minute behind a new album, and the negative
-    // below lasts until artwork changes, so confirm it against the store.
+    // below lasts until artwork changes, so confirm it against the store,
+    // once per generation: a page of unknown ids must not scan per id.
+    let generation = state.list_generation();
+    if *confirmed_at == Some(generation) {
+        state.synth_image_remember(id_str, None);
+        return None;
+    }
     let all = state.stores.list().await.ok()?;
+    *confirmed_at = Some(generation);
     build_synth_image_map(state, &all);
     match state.synth_image_cached(id_str) {
         Some(Some(item_id)) => all.into_iter().find(|it| it.id == item_id),
@@ -1814,6 +1821,44 @@ mod tests {
             .await
             .expect("an album artist whose track has a cover must advertise Primary");
         assert_eq!(tags.get("Primary").map(String::as_str), Some("7"));
+    }
+
+    #[actix_web::test]
+    async fn unknown_synth_ids_confirm_against_the_store_once_per_generation() {
+        // Each unknown id used to read the whole store to confirm its
+        // negative; a page of them paid one full scan each.
+        use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        let track = |id: u64, album: &str| MediaItem {
+            id,
+            path: format!("/m/{id}.flac").into(),
+            title: "T".into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                album: Some(album.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let album = crate::api::jellyfin::dto::album_id_for;
+        state.stores.put(track(1, "Old")).await.unwrap();
+        assert!(resolve_synth_image_item(&state, &album("Gone"))
+            .await
+            .is_none());
+
+        // Stored without a generation bump: only a fresh store read finds it.
+        state.stores.put(track(2, "New")).await.unwrap();
+        assert!(
+            resolve_synth_image_item(&state, &album("New"))
+                .await
+                .is_none(),
+            "a second miss at the same generation must not rescan the store"
+        );
+
+        state.notify_library_changed();
+        let found = resolve_synth_image_item(&state, &album("New")).await;
+        assert_eq!(found.map(|it| it.id), Some(2));
     }
 
     #[actix_web::test]
