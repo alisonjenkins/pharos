@@ -1226,11 +1226,13 @@ pub fn current_search() -> String {
 const SCROLL_SETTLE_MS: i32 = 150;
 
 /// A window `scroll` listener and its pending settle timer; both go on drop,
-/// so a timer cannot fire for a page that has been left.
+/// so a timer cannot fire for a page that has been left. A settle still
+/// pending then runs at once instead: the scroll it waited on is the last
+/// one this page saw, and leaving inside the delay must not lose it.
 pub struct ScrollWatch {
     listener: Closure<dyn FnMut(web_sys::Event)>,
     pending: Rc<Cell<Option<i32>>>,
-    _settled: Rc<Closure<dyn FnMut()>>,
+    settled: Rc<Closure<dyn FnMut()>>,
 }
 
 impl Drop for ScrollWatch {
@@ -1242,6 +1244,8 @@ impl Drop for ScrollWatch {
             );
             if let Some(timer) = self.pending.take() {
                 window.clear_timeout_with_handle(timer);
+                let settled: &js_sys::Function = (*self.settled).as_ref().unchecked_ref();
+                let _ = settled.call0(&JsValue::NULL);
             }
         }
     }
@@ -1285,7 +1289,7 @@ pub fn on_scroll_settled(mut on_settled: impl FnMut() + 'static) -> ScrollWatch 
     ScrollWatch {
         listener,
         pending,
-        _settled: settled,
+        settled,
     }
 }
 
