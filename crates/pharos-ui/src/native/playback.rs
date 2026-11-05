@@ -154,8 +154,9 @@ pub fn cue_font_px(width_px: f64, viewport_h_px: f64, scale: f64) -> f64 {
     scale * (width_px * 0.028).min(viewport_h_px * 0.05).max(14.0)
 }
 
-/// About how many characters fit on one rendered cue line in a player
-/// `width_px` wide at `font_px`, erring low: the browser does not say where
+/// About how many characters fit on one rendered cue line in a cue box
+/// `width_px` wide (the picture's width times the cue's `size`) at `font_px`,
+/// erring low: the browser does not say where
 /// it wraps, and a cue lifted a line too far is better than one on the edge.
 /// A cue box spans at most the picture, less its padding, and 0.6em is wider
 /// than the average subtitle glyph.
@@ -896,6 +897,12 @@ mod tests {
         assert_eq!(cue_chars_per_line(360.0, 14.0 * 1.65), 23);
         assert_eq!(cue_chars_per_line(0.0, 14.0), usize::MAX);
         assert_eq!(cue_chars_per_line(10.0, 100.0), 1);
+        // A cue of `size:20%` wraps in a fifth of the picture.
+        assert_eq!(cue_chars_per_line(1000.0 * 0.2, 28.0), 10);
+        assert_eq!(
+            lifted_line("short words", cue_chars_per_line(1000.0 * 0.2, 28.0)),
+            -3.0
+        );
     }
 
     #[test]
