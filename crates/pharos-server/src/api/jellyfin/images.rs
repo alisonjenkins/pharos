@@ -910,6 +910,14 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
         if let Some(a) = it.probe.artist.as_deref() {
             consider(artist_id_for(a), it.id, track_key.clone());
         }
+        // The artist listing files a track under its album artist, so an
+        // album-artist-only name ("Various Artists") needs an entry too, or
+        // every lookup of it misses the map and rescans the store.
+        if let Some(a) = crate::api::jellyfin::items::filed_artist(it)
+            .filter(|a| Some(*a) != it.probe.artist.as_deref())
+        {
+            consider(artist_id_for(a), it.id, track_key.clone());
+        }
         if let Some(a) = it.probe.album.as_deref() {
             consider(album_id_for(a), it.id, track_key);
         }
@@ -1765,6 +1773,47 @@ mod tests {
             Some("2"),
             "the representative must be the track that actually has the cover"
         );
+    }
+
+    #[actix_web::test]
+    async fn an_album_artist_with_no_track_of_its_own_resolves_from_the_map() {
+        // The artist listing files tracks under their album artist, but the
+        // map only knew track artists: each "Various Artists" tile missed it
+        // and read the whole store, five full scans per music artist page.
+        use pharos_core::{MediaItem, MediaKind, MediaProbe, MediaStore};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        state
+            .stores
+            .put(MediaItem {
+                id: 7,
+                path: "/m/7.flac".into(),
+                title: "Chop Suey!".into(),
+                kind: MediaKind::Audio,
+                probe: MediaProbe {
+                    artist: Some("System of a Down".into()),
+                    album_artist: Some("Various Artists".into()),
+                    album: Some("Hits".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        state
+            .stores
+            .set_artwork(7, "Primary", "musicbrainz", "/cache/hits.jpg")
+            .await
+            .unwrap();
+
+        let all = state.list_items_cached().await.unwrap();
+        build_synth_image_map(&state, &all);
+        let various = crate::api::jellyfin::dto::artist_id_for("Various Artists");
+        assert_eq!(state.synth_image_cached(&various), Some(Some(7)));
+        let tags = synth_primary_tag(&state, &various)
+            .await
+            .expect("an album artist whose track has a cover must advertise Primary");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("7"));
     }
 
     #[actix_web::test]
