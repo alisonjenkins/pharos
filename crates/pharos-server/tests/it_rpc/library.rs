@@ -2963,3 +2963,126 @@ async fn native_detail_offers_image_subtitles_to_draw_when_the_server_extracts_t
         );
     }
 }
+
+/// ADR-0062 / B564: a show's and an episode's description follow the
+/// signed-in user's description language, through the native detail and the
+/// Jellyfin item, episode-list and series routes alike; a user on the
+/// default sees the default columns.
+/// Disarm check: with `localize_items_in` / `localize_series_in` returning
+/// early, the Japanese user sees the English text everywhere.
+#[actix_web::test]
+async fn descriptions_follow_the_users_language() {
+    use actix_web::test;
+    use pharos_core::{
+        LocalizedText, MediaStore as _, MetadataTranslationStore as _, PreferenceStore as _,
+        SeriesMetadata, SeriesMetadataStore as _, TranslationOwner,
+    };
+    use pharos_jellyfin_api::dto::{series_id_for_key, WireId};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    seed_tv_library(&fx).await;
+    let stores = &fx.state.stores;
+    let mut ep = pharos_core::MediaStore::get(stores, 601).await.unwrap();
+    ep.metadata.overview = Some("Bulma meets Goku.".into());
+    stores.put(ep).await.unwrap();
+    stores
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: "/libTV/Show".into(),
+            series_name: "Show".into(),
+            overview: Some("Goku sets out.".into()),
+            ..SeriesMetadata::default()
+        })
+        .await
+        .unwrap();
+    let jpn = |overview: &str| LocalizedText {
+        language: "jpn".into(),
+        title: None,
+        overview: Some(overview.into()),
+        is_original: true,
+    };
+    stores
+        .upsert_translations(&TranslationOwner::Item(601), &[jpn("ブルマが…")], 1)
+        .await
+        .unwrap();
+    stores
+        .upsert_translations(
+            &TranslationOwner::Series("/libTV/Show".into()),
+            &[jpn("悟空の冒険。")],
+            1,
+        )
+        .await
+        .unwrap();
+
+    let uid = fx.user_id.0.simple().to_string();
+    let series = series_id_for_key(Some("/libTV/Show"), "Show");
+    let series_wire = WireId::parse(&series).unwrap();
+    let jellyfin = |uri: String| {
+        test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request()
+    };
+    let item = format!("/Users/{uid}/Items/{}", WireId::Real(601));
+    let episodes = format!("/Shows/{series}/Episodes?UserId={uid}&Season=1");
+    let show = format!("/Users/{uid}/Items/{series}");
+
+    macro_rules! seen {
+        () => {{
+            let native_ep = wire_detail(&session, WireId::Real(601)).await.unwrap();
+            let native_show = wire_detail(&session, series_wire).await.unwrap();
+            let jf_ep: serde_json::Value =
+                test::call_and_read_body_json(&app, jellyfin(item.clone())).await;
+            let jf_list: serde_json::Value =
+                test::call_and_read_body_json(&app, jellyfin(episodes.clone())).await;
+            let jf_show: serde_json::Value =
+                test::call_and_read_body_json(&app, jellyfin(show.clone())).await;
+            let listed = jf_list["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["Id"] == WireId::Real(601).to_string())
+                .unwrap()["Overview"]
+                .clone();
+            [
+                native_ep["Overview"].clone(),
+                jf_ep["Overview"].clone(),
+                listed,
+                native_show["Overview"].clone(),
+                jf_show["Overview"].clone(),
+            ]
+        }};
+    }
+
+    let default = seen!();
+    assert_eq!(
+        default,
+        [
+            "Bulma meets Goku.",
+            "Bulma meets Goku.",
+            "Bulma meets Goku.",
+            "Goku sets out.",
+            "Goku sets out."
+        ]
+        .map(serde_json::Value::from)
+    );
+
+    stores
+        .set_user_configuration(fx.user_id, r#"{"DescriptionLanguagePreference":"jpn"}"#)
+        .await
+        .unwrap();
+    let japanese = seen!();
+    assert_eq!(
+        japanese,
+        [
+            "ブルマが…",
+            "ブルマが…",
+            "ブルマが…",
+            "悟空の冒険。",
+            "悟空の冒険。"
+        ]
+        .map(serde_json::Value::from)
+    );
+}
