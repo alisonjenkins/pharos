@@ -555,9 +555,14 @@ fn watch_cue_video(video_id: &str) {
 
 /// Lifts the shown cues of the `<video>` `video_id` again for the font size
 /// the Subtitle size choice just set, since a larger size can wrap a cue onto
-/// more lines.
+/// more lines. The `<video>` whose cues were last lifted (the non-native player's
+/// `pharos-media-…`) is lifted too when it is not `video_id`.
 pub fn relift_cues(video_id: &str) {
     lift_shown_cues(video_id);
+    let watched = CUE_VIDEO.with(|v| v.borrow().clone());
+    if !watched.is_empty() && watched != video_id {
+        lift_shown_cues(&watched);
+    }
 }
 
 /// Lifts the cues of each track the `<video>` `video_id` shows (V455), now
@@ -756,11 +761,15 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
                 &text(&cue, &align_key).unwrap_or_default(),
             );
             let chars_per_line = cue_chars_per_line(cue_box.width * share / 100.0, cue_box.font);
-            let _ = js_sys::Reflect::set(
-                &cue,
-                &line,
-                &JsValue::from_f64(lifted_line(&lines, chars_per_line)),
-            );
+            // Written only when it moves: a resize relifts every cue of the
+            // track, and most keep their line.
+            let lifted = lifted_line(&lines, chars_per_line);
+            let current = js_sys::Reflect::get(&cue, &line)
+                .ok()
+                .and_then(|v| v.as_f64());
+            if current != Some(lifted) {
+                let _ = js_sys::Reflect::set(&cue, &line, &JsValue::from_f64(lifted));
+            }
             let _ = js_sys::Reflect::set(&cue, &lifted_key, &JsValue::TRUE);
         }
     }
