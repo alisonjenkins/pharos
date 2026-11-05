@@ -388,6 +388,8 @@ async fn wrong_codes_are_throttled() {
     }
 }
 
+/// A test server whose native API uses the given deadlines, recording
+/// metrics into `recorder` when one is given.
 async fn start_with_auth_deadline(
     auth_deadline_secs: NonZeroU32,
     max_unauthenticated_secs: NonZeroU32,
@@ -413,6 +415,7 @@ async fn start_with_auth_deadline(
     (server, fx)
 }
 
+/// How many auth deadline extensions `snapshotter` has seen.
 fn extended_count(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> u64 {
     counter(
         snapshotter,
@@ -421,6 +424,8 @@ fn extended_count(snapshotter: &pharos_test_metrics::CumulativeSnapshotter) -> u
     )
 }
 
+/// The summed value of counter `name` with label `reason` in `snapshotter`
+/// (0 when it was never recorded).
 fn counter(
     snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
     name: &str,

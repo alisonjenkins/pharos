@@ -224,10 +224,12 @@ impl Recheck {
 /// `pharos_rpc_auth_deadline_extended_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthDeadlineExtension {
+    /// A `quickConnectPoll` answered pending: the user has yet to approve.
     QuickConnectPending,
 }
 
 impl AuthDeadlineExtension {
+    /// The stable `reason` label value (a dashboard contract).
     pub const fn label(self) -> &'static str {
         match self {
             Self::QuickConnectPending => "quick_connect_pending",
@@ -259,6 +261,7 @@ pub enum AuthDeadlineRefusal {
 }
 
 impl AuthDeadlineRefusal {
+    /// The stable `reason` label value (a dashboard contract).
     pub const fn label(self) -> &'static str {
         match self {
             Self::MaxUnauthenticated => "max_unauthenticated",
