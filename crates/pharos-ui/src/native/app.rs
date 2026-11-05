@@ -1845,6 +1845,12 @@ fn AccountScreen() -> Element {
     let mut avatar_busy = use_signal(|| false);
     let mut avatar_outcome = use_signal(|| None::<account_settings::Outcome>);
     let mut crossfade = use_signal(crossfade_seconds);
+    let mut description_language = use_signal(String::new);
+    // Set once the viewer picks a language, so the mount read, if it answers
+    // later, does not put the stored (older) value back on screen.
+    let mut description_language_picked = use_signal(|| false);
+    // Saves run one at a time, so quick picks can't land out of order.
+    let mut description_language_saves = use_signal(|| None::<account_settings::SerialPref>);
     let me = account.0.read().clone().flatten();
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
@@ -1853,6 +1859,26 @@ fn AccountScreen() -> Element {
         }
         platform::warn(&format!("account: {what} failed: {e}"));
     };
+    use_hook(move || {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        spawn(async move {
+            let key = account_settings::DESCRIPTION_LANGUAGE_PREF;
+            match api
+                .pref(&call("account", "description_language_read"), key)
+                .await
+            {
+                Ok(_) if *description_language_picked.peek() => {}
+                Ok(value) => description_language.set(
+                    value
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                        .unwrap_or_default(),
+                ),
+                Err(e) => report(&e, "read description language"),
+            }
+        });
+    });
     rsx! {
         account_settings::AccountView {
             me,
@@ -1938,6 +1964,50 @@ fn AccountScreen() -> Element {
             on_crossfade: move |seconds| {
                 set_crossfade_seconds(seconds);
                 crossfade.set(seconds);
+            },
+            description_language: description_language(),
+            on_description_language: move |value: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                description_language_picked.set(true);
+                let before = description_language.peek().clone();
+                description_language.set(value.clone());
+                let Some(mut next) = description_language_saves
+                    .write()
+                    .get_or_insert_with(|| account_settings::SerialPref::new(before))
+                    .pick(value)
+                else {
+                    return;
+                };
+                spawn(async move {
+                    let key = account_settings::DESCRIPTION_LANGUAGE_PREF;
+                    loop {
+                        let ok = match api.set_pref(&call("account", "description_language_set"), key, next.as_bytes()).await {
+                            Ok(()) => {
+                                platform::info(&format!("account: description language set value={next}"));
+                                true
+                            }
+                            Err(e) => {
+                                report(&e, "set description language");
+                                false
+                            }
+                        };
+                        let mut saves = description_language_saves.write();
+                        let Some(saves) = saves.as_mut() else { return };
+                        match saves.finished(next, ok) {
+                            Some(queued) => next = queued,
+                            None => {
+                                // Settled: show what the server holds.
+                                let saved = saves.saved().to_string();
+                                if *description_language.peek() != saved {
+                                    description_language.set(saved);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                });
             },
         }
     }
