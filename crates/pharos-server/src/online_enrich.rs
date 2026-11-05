@@ -209,7 +209,11 @@ fn is_placeholder_episode_title(item: &pharos_core::MediaItem, raw: &str) -> boo
     title.is_empty()
         || title == stem
         || (!show.is_empty() && title == show)
-        || pharos_scanner::fs::has_sxxeyy_token(raw)
+        // A scene name with no title words after its token (a renamed file's
+        // old stem). A token followed by real words, as an NFO title like
+        // "S03E07 - The Enemy (Director's Cut)" has, is the episode's own.
+        || (pharos_scanner::fs::has_sxxeyy_token(raw)
+            && pharos_scanner::metadata::filename::episode_title(raw).is_none())
 }
 
 /// The [`pharos_cache::image_cache::ImageRole`] that corresponds to an
@@ -327,6 +331,11 @@ mod tests {
         let mut kept = episode("The Enemy (Director's Cut)");
         apply_enrichment(&mut kept, counts(), &named("The Enemy"));
         assert_eq!(kept.title, "The Enemy (Director's Cut)");
+
+        // An NFO title that carries its token and a title of its own is kept.
+        let mut tokened = episode("S03E07 - The Enemy (Director's Cut)");
+        apply_enrichment(&mut tokened, counts(), &named("The Enemy"));
+        assert_eq!(tokened.title, "S03E07 - The Enemy (Director's Cut)");
 
         let mut stem = episode("Star Trek - S03E07 - WEBRip-1080p");
         apply_enrichment(
