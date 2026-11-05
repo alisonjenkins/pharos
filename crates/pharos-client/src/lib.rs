@@ -15,7 +15,7 @@ pub mod mix;
 
 use capnp_rpc::{rpc_twoparty_capnp::Side, twoparty, RpcSystem};
 use futures::io::{AsyncRead, AsyncWrite};
-use pharos_api::pharos_capnp::{bootstrap, call_context, done, error, session};
+use pharos_api::pharos_capnp::{bootstrap, call_context, done, error, server_info_result, session};
 
 /// What the client stamps on every call (`CallContext`).
 #[derive(Debug, Clone, Default)]
@@ -157,6 +157,32 @@ pub async fn resume(
     Ok(result.get_session()?)
 }
 
+/// `Bootstrap.serverInfo`'s schemaVersion: the schema the server was built
+/// against.
+pub async fn server_schema_version(
+    bootstrap: &bootstrap::Client,
+    info: &CallInfo,
+) -> Result<u32, ClientError> {
+    let mut req = bootstrap.server_info_request();
+    info.write(req.get().init_ctx());
+    let reply = req.send().promise.await?;
+    match reply
+        .get()?
+        .get_result()?
+        .which()
+        .map_err(capnp::Error::from)?
+    {
+        server_info_result::Info(i) => Ok(i?.get_schema_version()),
+        server_info_result::Error(e) => Err(ClientError::from_api(e?)),
+    }
+}
+
+/// Whether a server on `server_schema` is newer than this build, as it is when
+/// a page loaded before a deploy reconnects after it: the page should reload.
+pub fn is_outdated_by(server_schema: u32) -> bool {
+    server_schema > pharos_api::pharos_capnp::SCHEMA_VERSION
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -251,5 +277,15 @@ mod tests {
             ClientError::from(capnp::Error::failed("boom".into())).to_string(),
             "rpc: Failed: boom"
         );
+    }
+
+    /// Only a server built against a newer schema outdates the page; the
+    /// same schema, or an older server, does not.
+    #[test]
+    fn only_a_newer_server_schema_outdates_the_page() {
+        let ours = pharos_api::pharos_capnp::SCHEMA_VERSION;
+        assert!(is_outdated_by(ours + 1));
+        assert!(!is_outdated_by(ours));
+        assert!(!is_outdated_by(ours - 1));
     }
 }
