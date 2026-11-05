@@ -299,6 +299,16 @@ pub struct LyricsConfig {
     /// length to that service. Env: `PHAROS_LYRICS_ONLINE`.
     #[serde(default)]
     pub online: bool,
+    /// Base URL of a pharos-aligner service, ADR-0066; unset means no alignment.
+    /// Env: `PHAROS_LYRICS_ALIGNER_URL`.
+    #[serde(default)]
+    pub aligner_url: Option<String>,
+    /// The media directory as the aligner sees it, the same mount as the
+    /// server's; item paths under it are sent relative to it, others are not
+    /// aligned. Default `/var/lib/pharos/media`. Env:
+    /// `PHAROS_LYRICS_ALIGNER_MEDIA_ROOT`.
+    #[serde(default)]
+    pub aligner_media_root: Option<PathBuf>,
     /// Directory to keep online answers under, so each song is asked about
     /// once rather than once per start (B361). When unset, pharos derives a
     /// `lyrics` sibling of `transcode_cache_dir` / `image_cache_dir` if either
@@ -1508,6 +1518,18 @@ impl Config {
                 None => {}
             }
         }
+        if let Ok(v) = std::env::var("PHAROS_LYRICS_ALIGNER_URL") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.lyrics.aligner_url = Some(v.to_string());
+            }
+        }
+        if let Ok(v) = std::env::var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.lyrics.aligner_media_root = Some(PathBuf::from(v));
+            }
+        }
         // 008 — the feature switch is env-overridable so a deployment can turn
         // URL-backed sources on without a chart edit, and the binary path
         // follows the `PHAROS_FFMPEG` precedent for the same reason it exists
@@ -1914,6 +1936,63 @@ mod tests {
         let cfg = cfg.apply_env();
         assert_eq!(cfg.tvdb.api_key.as_deref(), Some("abc123"));
         std::env::remove_var("PHAROS_TVDB_API_KEY");
+    }
+
+    #[test]
+    fn lyrics_defaults_and_env_overrides() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+        "#;
+        let cfg = Config::from_toml_str(s).unwrap();
+        assert!(!cfg.lyrics.online);
+        assert_eq!(cfg.lyrics.aligner_url, None);
+        assert_eq!(cfg.lyrics.aligner_media_root, None);
+
+        std::env::set_var("PHAROS_LYRICS_ONLINE", "true");
+        std::env::set_var("PHAROS_LYRICS_ALIGNER_URL", "  http://aligner.lan:8790  ");
+        std::env::set_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT", "  /srv/media  ");
+
+        let cfg = cfg.apply_env();
+        assert!(cfg.lyrics.online);
+        assert_eq!(
+            cfg.lyrics.aligner_url.as_deref(),
+            Some("http://aligner.lan:8790")
+        );
+        assert_eq!(
+            cfg.lyrics.aligner_media_root.as_deref(),
+            Some(Path::new("/srv/media"))
+        );
+
+        std::env::remove_var("PHAROS_LYRICS_ONLINE");
+        std::env::remove_var("PHAROS_LYRICS_ALIGNER_URL");
+        std::env::remove_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT");
+    }
+
+    #[test]
+    fn lyrics_config_parses_aligner_fields() {
+        let s = r#"
+            [server]
+            bind = "127.0.0.1:0"
+            [obs]
+            [media]
+            [lyrics]
+            online = true
+            aligner_url = "http://localhost:8790"
+            aligner_media_root = "/var/media"
+        "#;
+        let cfg = Config::from_toml_str(s).unwrap();
+        assert!(cfg.lyrics.online);
+        assert_eq!(
+            cfg.lyrics.aligner_url.as_deref(),
+            Some("http://localhost:8790")
+        );
+        assert_eq!(
+            cfg.lyrics.aligner_media_root.as_deref(),
+            Some(Path::new("/var/media"))
+        );
     }
 
     #[test]
