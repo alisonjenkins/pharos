@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit reviews feature PRs only. A batch/ PR is a stack of feature PRs
+# that were already reviewed, and every supersede of a batch is a new PR that
+# CodeRabbit reviewed from scratch, finding a fresh round each time. Batch AA
+# was green from 18:22 on 2026-11-05 but was re-cut six times (aa3 to aa8) to
+# chase those rounds. Findings on a batch go into the next batch instead of
+# blocking it, so the batch is not reviewed at all.
+reviews:
+  auto_review:
+    enabled: true
+    # Title match is a substring check: every merge-queue PR is titled
+    # "Batch <letter>: ...".
+    ignore_title_keywords:
+      - "Batch "

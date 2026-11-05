@@ -1,0 +1,45 @@
+name: cancel closed PR runs
+
+# When the merge queue supersedes a batch it opens a NEW branch (-aa2, -w7,
+# ...) and closes the old PR. `ci`'s concurrency group is per ref, so the old
+# branch's run was never cancelled: it kept four home runner slots busy for up
+# to 90 minutes after its PR closed (w6 #797, closed 12:13, ran to 13:37 on
+# 2026-11-05), queueing every live batch behind it. The cloud sessions that
+# run the queue cannot cancel runs themselves, so this does it on close.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    name: cancel runs of a closed PR
+    runs-on: ubuntu-latest
+    # A merged PR's runs have already finished (the merge waits for them);
+    # a fork PR's token cannot cancel anyway.
+    if: >-
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Cancel queued and in-progress runs for the head branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          cancelled=0
+          for status in queued in_progress waiting pending requested; do
+            ids=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/runs" \
+              -f branch="$HEAD_REF" -f status="$status" -f per_page=100 \
+              --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | .id")
+            for id in $ids; do
+              echo "cancelling run $id ($status) on $HEAD_REF"
+              gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" \
+                || echo "::warning::could not cancel run $id"
+              cancelled=$((cancelled + 1))
+            done
+          done
+          echo "cancelled=$cancelled branch=$HEAD_REF sha=$HEAD_SHA"
