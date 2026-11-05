@@ -422,3 +422,111 @@ async fn live_tv_stream_never_logs_the_provider_url() {
         "provider credentials in the log:\n{captured}"
     );
 }
+
+/// B542: a Media token travels in `?api_key=` on every image and stream URL,
+/// so neither issuing it (`Session.mediaToken`) nor using it may put the
+/// secret in a log; only the token id prefix names it.
+/// Disarm check: logging the issued secret in "native media token issued"
+/// puts it in the captured line.
+#[actix_web::test]
+async fn a_media_token_never_reaches_the_logs() {
+    use actix_web::test;
+    use pharos_api::pharos_capnp::media_token_result;
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _};
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(VecWriter(buf.clone()))
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+    );
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempfile::tempdir().unwrap();
+    let movie = dir.path().join("movie.webm");
+    std::fs::write(&movie, b"MOVIE").unwrap();
+    let stores = Stores::connect("sqlite::memory:").await.unwrap();
+    let hash = BuiltinAuth::new(stores.clone())
+        .hash_password(&SecretString::new("hunter2"))
+        .unwrap();
+    stores
+        .create(UserRecord {
+            id: UserId::new(),
+            name: "ali".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    stores
+        .put(MediaItem {
+            id: 7,
+            path: movie,
+            title: "M".into(),
+            kind: MediaKind::Movie,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let state = web::Data::new(AppState::new(stores, "pharos-redact".into()));
+
+    let conn = std::rc::Rc::new(pharos_api::Connection::new());
+    let ctx = pharos_server::api::pharos::rpc::ConnectionCtx::admit(
+        None,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        &pharos_server::api::pharos::rpc::limits::ConnectionLimits::default(),
+        16,
+    )
+    .unwrap();
+    let client = pharos_server::api::pharos::rpc::bootstrap_client(state.clone(), ctx, &conn);
+    let mut login = client.login_request();
+    login.get().init_ctx();
+    login.get().set_name("ali");
+    login.get().set_password("hunter2");
+    let reply = login.send().promise.await.unwrap();
+    let pharos_api::pharos_capnp::login_result::Ok(ok) =
+        reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("login refused");
+    };
+    let session = ok.unwrap().get_session().unwrap();
+    let mut req = session.media_token_request();
+    req.get().init_ctx();
+    let reply = req.send().promise.await.unwrap();
+    let media_token_result::Token(token) =
+        reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("mediaToken refused");
+    };
+    let secret = token.unwrap().get_token().unwrap().to_string().unwrap();
+    assert!(!secret.is_empty());
+
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(tracing_actix_web::TracingLogger::<
+                pharos_server::obs::StatusRootSpanBuilder,
+            >::new())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    for uri in [
+        format!("/Items/7/Images/Primary?api_key={secret}"),
+        format!("/Videos/7/stream?static=true&api_key={secret}"),
+        // Refused routes log the refusal; that line must not carry it either.
+        format!("/Items?api_key={secret}"),
+    ] {
+        test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+    }
+
+    let captured = String::from_utf8_lossy(&buf.lock().unwrap().clone()).into_owned();
+    assert!(
+        captured.contains("native media token issued"),
+        "no issue line captured:\n{captured}"
+    );
+    assert!(
+        !captured.contains(&secret),
+        "media token in the log:\n{captured}"
+    );
+}
