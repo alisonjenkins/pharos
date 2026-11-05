@@ -633,6 +633,12 @@ fn choice_key(library: ItemRef) -> String {
     format!("pharos.library.{library}.choice")
 }
 
+/// The `sessionStorage` key of where the viewer was in `library`'s grid
+/// under the choice `query` names.
+fn place_key(library: ItemRef, query: &str) -> String {
+    format!("pharos.library.{library}.place{query}")
+}
+
 /// The choice a library opens on (B560): the one its URL names, so Back
 /// and Forward bring it back; else the one last made for it in this tab, so
 /// a breadcrumb or library button does too; else the default.
@@ -651,9 +657,19 @@ fn opening_choice(library: ItemRef) -> Narrow {
     }
 }
 
+/// Where the viewer was in a grid: the first tile in view, and how far its
+/// top sat below the top of the viewport.
+fn read_place(key: &str) -> Option<(u32, f64)> {
+    let saved = platform::session_get(key).ok().flatten()?;
+    let (tile, top) = saved.split_once(' ')?;
+    let top: f64 = top.parse().ok()?;
+    top.is_finite().then_some((tile.parse().ok()?, top))
+}
+
 /// A library's grid under its filter bar (B312/V252): the bar's choice is
 /// the listing, and a new choice starts the grid afresh from its first page.
-/// The choice is kept in the URL and for the tab (B560).
+/// The choice is kept in the URL and for the tab, and the grid comes back
+/// where it was left while the choice it opened on stands (B560).
 #[component]
 fn LibraryGrid(first: Page, base: Listing) -> Element {
     let ctx = use_context::<Ctx>();
@@ -671,16 +687,24 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
             platform::replace(&path);
         }
     });
+    // A new choice starts at the top, even if it later returns to the one
+    // the grid opened on.
+    let changed = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    if *narrow.read() != opened {
+        changed.set(true);
+    }
+    let restore = !changed.get();
     let genres = use_signal(Vec::<String>::new);
     let opening = base.clone();
     // The library opened on its default listing; any other is fetched here.
     let listed = use_resource(move || {
         let listing = narrow.read().apply(&opening);
+        let place = place_key(library, &narrow.read().to_query());
         let first = first.clone();
         let fresh = *narrow.read() != Narrow::default();
         async move {
             if !fresh {
-                return Ok((listing, first));
+                return Ok((place, listing, first));
             }
             let Some(api) = ctx.api.peek().clone() else {
                 return Err("not signed in".to_owned());
@@ -695,7 +719,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
                 platform::report_event,
             )
             .await
-            .map(|page| (listing, page))
+            .map(|page| (place, listing, page))
             .map_err(|e| e.to_string())
         }
     });
@@ -705,7 +729,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
-            Some(Ok((listing, page))) => remount_on(
+            Some(Ok((place, listing, page))) => remount_on(
                 &format!("{listing:?}"),
                 rsx! {
                     PagedGrid {
@@ -713,6 +737,8 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
                         source: listing.clone(),
                         rail: Some(rail),
                         genres,
+                        place: place.clone(),
+                        restore,
                     }
                 },
             ),
@@ -837,13 +863,16 @@ enum Ask {
 /// A library's grid also jumps by section, letters in name order (V252) and
 /// years in a date order (B317/V256): the rail on the right goes straight to
 /// one, and Shift+wheel steps to the next or previous, reading ahead through
-/// the pages in between.
+/// the pages in between. Given a `place`, a `sessionStorage` key, it keeps
+/// there where the viewer is and, to `restore`, opens there again (B560).
 #[component]
 fn PagedGrid(
     first: Page,
     source: Listing,
     rail: Option<Rail>,
     genres: Option<Signal<Vec<String>>>,
+    place: Option<String>,
+    #[props(default)] restore: bool,
 ) -> Element {
     let ctx = use_context::<Ctx>();
     let mut pager = use_signal(|| Pager::new(first.clone()));
@@ -941,24 +970,70 @@ fn PagedGrid(
 
     // A jump: the tile to bring to the top, once its page is in, and the
     // tile last jumped to, which Shift+wheel steps on from while in view.
-    let mut jump = use_signal(|| None::<u32>);
+    // Coming back to the grid is a jump to where the viewer was, its tile
+    // set back as far below the top as it was (`land`).
+    // A kept grid with nowhere to come back to opens at the top, not
+    // wherever the page it replaced was scrolled to.
+    let saved = use_hook(|| {
+        let saved = place.as_deref().filter(|_| restore).and_then(read_place);
+        if place.is_some() && saved.is_none() {
+            platform::scroll_to_top();
+        }
+        saved
+    });
+    let mut jump = use_signal(|| saved.map(|(tile, _)| tile));
+    let mut land = use_signal(|| saved.map(|(_, top)| top));
     let mut cursor = use_signal(|| None::<u32>);
     use_effect(move || {
         let Some(target) = jump() else {
             return;
         };
+        // The rail takes room from the grid when it appears, which moves
+        // the rows; a place to come back to waits for it.
+        if rail.is_some() && land.peek().is_some() && index.read().is_none() {
+            return;
+        }
         let state = pager.read();
         let loaded = u32::try_from(state.items().len()).unwrap_or(u32::MAX);
         if target < loaded {
-            platform::scroll_to_tile(target);
+            let placed = match land.take() {
+                Some(top) => platform::scroll_tile_to(target, top),
+                None => platform::scroll_to_tile(target),
+            };
+            if !placed {
+                platform::warn(&format!(
+                    "pharos: grid tile {target} not in the page to scroll to"
+                ));
+            }
             jump.set(None);
         } else if state.failed() || !state.has_more() {
+            land.set(None);
             jump.set(None);
         } else if !state.in_flight() {
             requests.send(Ask::Through(target));
         }
     });
+    // Not while a jump is under way: its pages are still landing.
+    use_hook(move || {
+        place.map(|key| {
+            std::rc::Rc::new(platform::on_scroll_settled(move || {
+                if jump.peek().is_some() {
+                    return;
+                }
+                let Some(at) = platform::first_visible_tile() else {
+                    return;
+                };
+                let Some(top) = platform::tile_top(at) else {
+                    return;
+                };
+                if let Err(e) = platform::session_set(&key, &format!("{at} {top}")) {
+                    platform::warn(&format!("pharos: grid place not kept: {e}"));
+                }
+            }))
+        })
+    });
     let mut go = move |target: u32| {
+        land.set(None);
         cursor.set(Some(target));
         jump.set(Some(target));
     };
