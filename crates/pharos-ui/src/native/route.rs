@@ -22,6 +22,10 @@ pub enum Route {
     Account,
     /// Approving a Quick Connect code shown on another device, under `/settings`.
     ApproveDevice,
+    /// This device's playback choices (quality, subtitles, crossfade), under `/settings`.
+    Playback,
+    /// What this account shares with the server (diagnostics), under `/settings`.
+    Privacy,
     /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// Watch together (014): the groups to join, `/together`.
@@ -58,11 +62,13 @@ impl Route {
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
             ["find"] => Route::Find,
-            ["settings", "appearance"] => Route::Appearance,
+            ["settings"] | ["settings", "appearance"] => Route::Appearance,
             ["together"] => Route::Together,
             ["together", g] if is_group_id(g) => Route::TogetherGroup((*g).to_owned()),
             ["settings", "account"] => Route::Account,
             ["settings", "approve-device"] => Route::ApproveDevice,
+            ["settings", "playback"] => Route::Playback,
+            ["settings", "privacy"] => Route::Privacy,
             _ => not_found(path),
         }
     }
@@ -79,6 +85,8 @@ impl Route {
             Route::Appearance => format!("{MOUNT}/settings/appearance"),
             Route::Account => format!("{MOUNT}/settings/account"),
             Route::ApproveDevice => format!("{MOUNT}/settings/approve-device"),
+            Route::Playback => format!("{MOUNT}/settings/playback"),
+            Route::Privacy => format!("{MOUNT}/settings/privacy"),
             Route::Find => format!("{MOUNT}/find"),
             Route::Together => format!("{MOUNT}/together"),
             Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
@@ -104,6 +112,8 @@ impl Route {
             Route::Appearance => Some("Appearance"),
             Route::Account => Some("Account"),
             Route::ApproveDevice => Some("Approve a device"),
+            Route::Playback => Some("Playback"),
+            Route::Privacy => Some("Privacy"),
             Route::Find => Some("Search"),
             Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
             Route::NotFound(_) => Some("Not found"),
@@ -126,6 +136,8 @@ impl Route {
             Route::Appearance => "appearance",
             Route::Account => "account",
             Route::ApproveDevice => "approve_device",
+            Route::Playback => "playback",
+            Route::Privacy => "privacy",
             Route::Find => "find",
             Route::Together => "together",
             Route::TogetherGroup(_) => "together_group",
@@ -162,6 +174,8 @@ mod tests {
             Route::Appearance,
             Route::Account,
             Route::ApproveDevice,
+            Route::Playback,
+            Route::Privacy,
             Route::Find,
             Route::Together,
             Route::TogetherGroup("0a1b-2c_3d".into()),
@@ -199,6 +213,14 @@ mod tests {
         assert_eq!(Route::Home.path(), "/ui/");
         assert_eq!(Route::Title(ItemRef::Real(3)).path(), "/ui/title/3");
         assert_eq!(Route::Appearance.path(), "/ui/settings/appearance");
+        assert_eq!(Route::Playback.path(), "/ui/settings/playback");
+        assert_eq!(Route::Privacy.path(), "/ui/settings/privacy");
+    }
+
+    #[test]
+    fn bare_settings_opens_appearance() {
+        assert_eq!(Route::parse("/ui/settings"), Route::Appearance);
+        assert_eq!(Route::parse("/ui/settings/"), Route::Appearance);
     }
 
     #[test]
