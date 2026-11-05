@@ -4124,6 +4124,7 @@ mod tests {
                 as fn() -> WorkerRunResult,
             || WorkerRunResult::Failed(WorkerError::Io("disk full".into())),
             || WorkerRunResult::Failed(WorkerError::UnsupportedCodec("x".into())),
+            || WorkerRunResult::Failed(WorkerError::NoFrames("received no packets".into())),
         ] {
             let r = run_on_vaapi(true, Some(fail), None);
             assert_eq!(r.pipelines, [crate::VaapiPipeline::Resident]);
@@ -7762,6 +7763,57 @@ mod tests {
                 .iter()
                 .any(|(k, _, _, _)| k.key().name() == "pharos_transcode_device_cooldown_total"),
             "an undecodable source must not take the card out of service"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_frames_failure_does_not_cool_the_device() {
+        let gpu = DeviceId::hw(HwAccel::Vaapi, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_w = calls.clone();
+        let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+            let n = calls_w.fetch_add(1, Ordering::SeqCst);
+            if n == 0 && spec.device == gpu {
+                WorkerRunResult::Failed(WorkerError::NoFrames(
+                    "Could not open encoder before EOF".into(),
+                ))
+            } else {
+                WorkerRunResult::Done { out_bytes: 1 }
+            }
+        });
+        let s = TranscodeScheduler::spawn(
+            DeviceTable::from_probe(&[(gpu, 1)], 2),
+            spawner,
+            SchedConfig::default(),
+        );
+        let first = s
+            .submit(
+                PathBuf::from("/m/past-video-end.mkv"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+                JobHint::default(),
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SchedError::Failed(WorkerError::NoFrames(_)))),
+            "NoFrames must fail immediately without retrying on CPU: got {first:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let second = s
+            .submit(
+                PathBuf::from("/m/other-title.mkv"),
+                h264(),
+                file_sink(),
+                JobClass::Interactive,
+                JobHint::default(),
+            )
+            .await
+            .expect("following job must succeed");
+        assert_eq!(
+            second.device, gpu,
+            "the hardware device must not be in cooldown after NoFrames"
         );
     }
 

@@ -397,6 +397,9 @@ pub enum WorkerError {
     /// that when the upstream capability answer is wrong, the cost is one
     /// rendition rather than the device.
     DecodeFailed(String),
+    /// Non-recoverable: the encoder never received a frame because the segment
+    /// window holds no source frames. Carries the ffmpeg reason.
+    NoFrames(String),
     /// Non-recoverable: target codec not encodable by this build. Carries
     /// the underlying reason (which codec / why) so the log is actionable.
     UnsupportedCodec(String),
@@ -421,6 +424,7 @@ impl WorkerError {
         match self {
             Self::DeviceBusy(_) => "device_unusable",
             Self::DecodeFailed(_) => "decode_failed",
+            Self::NoFrames(_) => "no_frames",
             Self::UnsupportedCodec(_) => "unsupported_codec",
             Self::BadInput(_) => "bad_input",
             Self::Io(_) => "io",
@@ -439,6 +443,7 @@ impl std::fmt::Display for WorkerError {
         match self {
             WorkerError::DeviceBusy(why) => write!(f, "hardware device unusable: {why}"),
             WorkerError::DecodeFailed(why) => write!(f, "source decode failed: {why}"),
+            WorkerError::NoFrames(why) => write!(f, "no source frames in the window: {why}"),
             WorkerError::UnsupportedCodec(s) => write!(f, "unsupported codec: {s}"),
             WorkerError::BadInput(s) => write!(f, "bad input: {s}"),
             WorkerError::Io(s) => write!(f, "io: {s}"),
@@ -604,6 +609,10 @@ mod tests {
                 job_id: JobId(2),
                 error: WorkerError::DeviceBusy("out of sessions".into()),
             },
+            WorkerEvent::Failed {
+                job_id: JobId(3),
+                error: WorkerError::NoFrames("Could not open encoder before EOF".into()),
+            },
         ];
         for e in &events {
             write_frame(&mut a, e).await.unwrap();
@@ -637,6 +646,7 @@ mod tests {
     #[test]
     fn transient_classification() {
         assert!(WorkerError::DeviceBusy("out of sessions".into()).is_transient());
+        assert!(!WorkerError::NoFrames(String::new()).is_transient());
         assert!(!WorkerError::UnsupportedCodec(String::new()).is_transient());
         assert!(!WorkerError::BadInput(String::new()).is_transient());
     }
