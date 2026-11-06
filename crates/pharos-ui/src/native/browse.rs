@@ -1394,6 +1394,13 @@ fn Hero(
 /// season shown is in the URL), and the season's episodes.
 #[component]
 pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element {
+    // A show opens at its top, not wherever the grid it came from was
+    // scrolled to (B599); a season tab keeps the series, and the scroll.
+    let series = show.series.as_ref().map(|d| d.item.id);
+    use_effect(use_reactive!(|series| {
+        let _ = series;
+        platform::scroll_to_top();
+    }));
     let in_group = in_this_group(&show, &seen);
     let facts: Vec<String> = [
         show.series
