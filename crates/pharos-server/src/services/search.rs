@@ -134,10 +134,6 @@ impl Hit {
     }
 }
 
-fn dto_name(dto: &serde_json::Value) -> &str {
-    dto.get("Name").and_then(|n| n.as_str()).unwrap_or_default()
-}
-
 /// What `text` names that `user` may see, at most `limit` rows (0 is
 /// [`library::SEARCH_DEFAULT`]): for a name of [`GROUP_MIN_CHARS`] or more,
 /// the shows it names, or with a season or episode asked for that season or
@@ -188,39 +184,54 @@ pub async fn search(
 }
 
 /// The shows named by `term`, best named first; or, when it asks for one,
-/// that season or episode of each.
+/// that season or episode of each. Only the shows kept are built into
+/// tiles: a common word such as "the" names a hundred or more.
 async fn show_hits(state: &AppState, user: &User, term: &Term) -> Vec<Hit> {
-    let q = ItemQuery {
-        search_term: Some(term.name.clone()),
-        ..ItemQuery::default()
-    };
-    let shows = match library::grouped(state, user, None, Grouping::Series, &q).await {
-        Ok(page) => page.items,
+    use pharos_jellyfin_api::dto::series_id_for_key;
+    let shows = match crate::api::jellyfin::items::shows_matching(state, user, &term.name).await {
+        Ok(shows) => shows,
         Err(error) => {
-            tracing::warn!(?error, "search: shows unavailable");
+            tracing::warn!(%error, "search: shows unavailable");
             return Vec::new();
         }
     };
     // The store matched episode titles as well; only a show's own name counts.
     let mut shows: Vec<_> = shows
         .into_iter()
-        .filter_map(|dto| Some((name_match(dto_name(&dto), &term.name)?, dto)))
+        .filter_map(|(folder, name)| Some((name_match(&name, &term.name)?, name, folder)))
         .collect();
-    shows.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| dto_name(x).cmp(dto_name(y))));
+    shows.sort();
     shows.truncate(GROUP_LIMIT);
     let mut hits = Vec::new();
-    for (_, show) in shows {
-        let Some(Hit::Group(id, show)) = Hit::group(show) else {
+    for (_, name, folder) in shows {
+        let Some(id) = WireId::parse(&series_id_for_key(folder.as_deref(), &name)) else {
             continue;
         };
         let hit = match (term.season, term.episode) {
-            (None, _) => Some(Hit::Group(id, show)),
+            (None, _) => show_tile(state, user, id, &name).await,
             (Some(season), None) => season_of(state, user, id, season).await,
             (Some(season), Some(episode)) => episode_of(state, user, id, season, episode).await,
         };
         hits.extend(hit);
     }
     hits
+}
+
+/// Show `id`'s tile, as the TV library lists it.
+async fn show_tile(state: &AppState, user: &User, id: WireId, name: &str) -> Option<Hit> {
+    let q = ItemQuery {
+        search_term: Some(name.to_owned()),
+        ..ItemQuery::default()
+    };
+    let shows = library::grouped(state, user, None, Grouping::Series, &q)
+        .await
+        .inspect_err(|error| tracing::warn!(?error, name, "search: show unavailable"))
+        .ok()?;
+    shows
+        .items
+        .into_iter()
+        .filter_map(Hit::group)
+        .find(|hit| matches!(hit, Hit::Group(found, _) if *found == id))
 }
 
 async fn season_of(state: &AppState, user: &User, show: WireId, season: u32) -> Option<Hit> {
