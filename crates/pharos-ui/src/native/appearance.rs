@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::{LibraryTransition, OverlayEffect};
+use super::playback::{EffectsLevel, LibraryTransition, OverlayEffect};
 use super::settings::Choices;
 use crate::theme::slug;
 use crate::theme::value::{
@@ -82,6 +82,8 @@ pub fn AppearanceView(
     #[props(default)] on_library_transition: EventHandler<LibraryTransition>,
     #[props(default)] overlay_effect: OverlayEffect,
     #[props(default)] on_overlay_effect: EventHandler<OverlayEffect>,
+    #[props(default)] effects_level: EffectsLevel,
+    #[props(default)] on_effects_level: EventHandler<EffectsLevel>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -109,6 +111,10 @@ pub fn AppearanceView(
     let effects = OverlayEffect::ALL
         .iter()
         .map(|fx| (fx.as_str().to_owned(), fx.label().to_owned()))
+        .collect::<Vec<_>>();
+    let levels = EffectsLevel::ALL
+        .iter()
+        .map(|level| (level.as_str().to_owned(), level.label().to_owned()))
         .collect::<Vec<_>>();
     rsx! {
         section { class: "pharos-settings-page pharos-appearance",
@@ -411,6 +417,22 @@ pub fn AppearanceView(
                         on_pick: move |value: String| on_overlay_effect.call(OverlayEffect::parse(&value)),
                     }
                 }
+                div { class: "pharos-setting pharos-effects-level",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "effects-level-label", "Effects" }
+                        p { id: "effects-level-help", class: "pharos-setting-help",
+                            "How much motion styled subtitles carry. Off keeps the plain subtitles. Saved on this device. Static whenever the system asks for reduced motion."
+                        }
+                    }
+                    Choices {
+                        id: "effects-level",
+                        labelled_by: "effects-level-label",
+                        described_by: "effects-level-help".to_owned(),
+                        options: levels,
+                        selected: effects_level.as_str().to_owned(),
+                        on_pick: move |value: String| on_effects_level.call(EffectsLevel::parse(&value)),
+                    }
+                }
             }
             div { class: "pharos-settings-group pharos-import",
                 div { class: "pharos-setting",
@@ -618,6 +640,71 @@ mod tests {
         assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
         assert!(
             start_tag(group, "id=\"overlay-effect-fade\"").contains("aria-pressed=\"true\""),
+            "{group}"
+        );
+    }
+
+    fn page_with_effects_level(level: Option<EffectsLevel>) -> String {
+        render(move || {
+            rsx! {
+                AppearanceView {
+                    themes: Vec::new(),
+                    auto: false,
+                    editor: None,
+                    notice: None,
+                    effects_level: level.unwrap_or_default(),
+                    on_effects_level: |_| {},
+                    on_pick: |_| {},
+                    on_auto: |_| {},
+                    on_customise: |_| {},
+                    on_edit_custom: |_| {},
+                    on_delete: |_| {},
+                    on_export: |_| {},
+                    on_import_file: |_| {},
+                    on_import_paste: |_| {},
+                    on_edit: |_| {},
+                    on_save: |_| {},
+                    on_cancel: |_| {},
+                }
+            }
+        })
+    }
+
+    fn effects_level_group(html: &str) -> &str {
+        let start = html.find("id=\"effects-level\"").unwrap_or(html.len());
+        let end = html[start..]
+            .find("</div>")
+            .map_or(html.len(), |e| start + e);
+        &html[start..end]
+    }
+
+    #[test]
+    fn effects_level_presses_only_the_stored_choice() {
+        let html = page_with_effects_level(Some(EffectsLevel::Full));
+        let group = effects_level_group(&html);
+        assert!(!group.is_empty(), "choices missing: {html}");
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
+        assert!(
+            start_tag(group, "id=\"effects-level-full\"").contains("aria-pressed=\"true\""),
+            "{group}"
+        );
+        for level in EffectsLevel::ALL {
+            assert!(
+                group.contains(level.label()),
+                "{} missing: {group}",
+                level.label()
+            );
+        }
+        assert!(html.contains("Effects"), "{html}");
+    }
+
+    #[test]
+    fn effects_level_defaults_to_subtle() {
+        let html = page_with_effects_level(None);
+        let group = effects_level_group(&html);
+        assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
+        assert!(
+            start_tag(group, "id=\"effects-level-subtle\"").contains("aria-pressed=\"true\""),
             "{group}"
         );
     }
