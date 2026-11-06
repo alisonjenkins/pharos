@@ -1,6 +1,6 @@
 # Spec 029: keyboard modes
 
-Status: Draft (2026-11-06)
+Status: Accepted (2026-11-06)
 
 ## Goal
 
@@ -26,8 +26,11 @@ Neither needs turning on.
   activate anything, so moving is always safe.
 - Focus is always visible (`:focus-visible` ring) on every control a key
   can reach.
-- A page opened from the keyboard (palette, search, Enter on a tile) puts
-  the focus on its main action, without scrolling the page.
+- A page that opens puts the focus on its main action (Play, Resume, or
+  on a show page the next episode's Play), without scrolling the page,
+  unless the focus is already on a control in the page body. So a page
+  reached from the search box, the palette or a tile is one Enter from
+  playing.
 
 ## Shared keys
 
@@ -44,8 +47,9 @@ Neither needs turning on.
 
 ### Global while something plays (any mode)
 
-Bare arrows are taken by movement outside the player, so the transport
-is reached with Shift there. Inside the player the bare keys still work.
+Bound by the music work (not yet in `BINDINGS`). Bare arrows are taken
+by movement outside the player, so the transport is reached with Shift
+there. Inside the player the bare keys still work.
 
 | Action | Key |
 |---|---|
@@ -149,21 +153,37 @@ bound in the player, since volume has Up/Down and `+`/`-`.
 
 ## Code
 
-- `crates/pharos-ui/src/native/keymap.rs`: the pure tables:
-  `nav_key` (movement), `transport_key` (player), `detail_key` (detail
-  page), and `pick` (the spatial choice of the next control). Unit-tested.
-- `web.rs` `install_key_nav`: one window `keydown` listener. It moves the
-  focus inside the nearest ancestor of the focused element marked
-  `data-keys`, when no nearer handler took the key.
-- `keymap::BINDINGS`: every binding as `Binding { keys, label, group,
-  modes, action }`, `keys` a sequence such as `["g", "h"]`; `keymap::Mode`
-  names the modes. The help panel and the dispatcher both read this one
-  table, so a key cannot be bound without a description. A unit test
-  asserts no two bindings in the same mode share a sequence, and that no
-  binding is a prefix of another in the same mode unless the shorter one
-  is a declared group.
-- `keymap::Chord` (the keys typed so far) and `keymap::resolve(mode,
-  &chord) -> Resolved { Action(a), Prefix(group), None }`: pure, tested.
-- `keymap::KeyHelp`: the which-key panel component.
-- `keymap::use_arrival_focus(key, id)`: focuses element `id` without
-  scrolling when `key` changes and the focus is on nothing.
+- `crates/pharos-ui/src/native/keymap.rs` (pure, unit-tested):
+  - `BINDINGS`: every binding as `Binding { keys, label, group, modes,
+    action }`, `keys` a sequence such as `&["g", "h"]`; `Mode` names the
+    modes, `PREFIXES` the keys that start a sequence. The dispatcher and
+    the help both read this one table, so a key cannot be bound without a
+    description. A test asserts that within a mode no two bindings share a
+    sequence and none hides another, and that every sequence starts with a
+    declared prefix (V510).
+  - `resolve(mode, &keys) -> Resolved::{Run(action), Pending(prefix),
+    Unbound}`; `transport(mode, key)` for a player's own key handler;
+    `help(mode, after)` for the panel's rows; `pick(dir, from, rects)` for
+    the spatial choice of the next control.
+- `crates/pharos-ui/src/native/keys.rs`:
+  - `KeyLayer`: mounted once by the app; runs the current mode's bindings
+    from a page-wide `keydown` listener (`web.rs` `on_mode_key`, which
+    skips text fields, Ctrl/Alt/Cmd chords, repeats and keys a nearer
+    handler took) and draws `KeyHelp`, the which-key panel.
+  - `use_key_mode(mode)`: puts the keys in `mode` while the calling page
+    is shown; the watch route is always Player, any other page without a
+    mode is Browse.
+  - `use_arrival_focus(key, id)`: focuses element `id` without scrolling
+    when `key` changes, unless the focus is on a control inside `main`.
+- Markup hooks the layer reads:
+  - `data-keys`: an area the movement keys move in (the app shell is one).
+  - `data-keys-list`: where First and Last stay (a show's episode list).
+  - `data-key-row`: a row whose own control a page key presses first.
+  - `data-key-action="play|restart|together|together-start|watched"`:
+    the control a page key presses.
+  - `data-key-tabs`: the strip `[` and `]` step along; the current tab
+    carries `aria-current`.
+- A music page adds its modes' rows to `BINDINGS`, calls
+  `use_key_mode(Mode::Music)` or `Mode::Queue`, and marks its lists with
+  the hooks above; `listen.rs` reads its transport keys with
+  `keymap::transport(Mode::Music, key)`.
