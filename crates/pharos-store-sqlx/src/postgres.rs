@@ -135,6 +135,60 @@ fn now_unix_secs() -> i64 {
 }
 
 impl PostgresStore {
+    /// `MediaStore::query`, selecting `columns`.
+    async fn query_selecting(
+        &self,
+        q: &MediaQuery,
+        columns: &str,
+    ) -> DomainResult<(Vec<MediaItem>, u64)> {
+        use crate::media_query::{self, Param};
+        let user = media_query::user_data_user(q);
+        let join_active = media_query::needs_user_data_join(q);
+        // Postgres uses `$N`. When the user-data join is present its user id
+        // binds as `$1`, so every builder placeholder is offset by one.
+        let offset = usize::from(join_active);
+        let built = media_query::build(q, |n| format!("${}", n + offset), "ALL");
+        let join = if join_active {
+            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
+        } else {
+            ""
+        };
+        let where_clause = if built.where_sql.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", built.where_sql)
+        };
+        let limit_clause = built.limit_sql;
+        let sql = format!(
+            "SELECT {columns}, COUNT(*) OVER () AS total_count \
+             FROM media_items {join} {where_clause} ORDER BY {} {limit_clause}",
+            built.order_sql,
+        );
+        let mut query = sqlx::query_as::<_, QueryRow>(sqlx::AssertSqlSafe(sql));
+        if let Some(uid) = user {
+            query = query.bind(uid.0.as_bytes().to_vec());
+        }
+        for p in &built.params {
+            query = match p {
+                Param::Text(s) => query.bind(s.clone()),
+                Param::Int(i) => query.bind(*i),
+            };
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let total = match rows.first() {
+            Some(r) => u64::try_from(r.total_count.max(0)).unwrap_or(0),
+            None => self.query_count(q).await?,
+        };
+        let items = rows
+            .into_iter()
+            .map(|r| r.media.into_domain())
+            .collect::<DomainResult<Vec<_>>>()?;
+        Ok((items, total))
+    }
+
     /// Open a pool and run migrations to latest; see [`PostgresStore::connect`]
     /// for the variant that also starts the `sort_name` backfill.
     pub async fn connect_without_backfill(url: &str) -> Result<Self, StoreError> {
@@ -723,52 +777,14 @@ impl MediaStore for PostgresStore {
 
     #[tracing::instrument(skip(self, q))]
     async fn query(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
-        use crate::media_query::{self, Param};
-        let user = media_query::user_data_user(q);
-        let join_active = media_query::needs_user_data_join(q);
-        // Postgres uses `$N`. When the user-data join is present its user id
-        // binds as `$1`, so every builder placeholder is offset by one.
-        let offset = usize::from(join_active);
-        let built = media_query::build(q, |n| format!("${}", n + offset), "ALL");
-        let join = if join_active {
-            "LEFT JOIN user_data ud ON ud.item_id = media_items.id AND ud.user_id = $1"
-        } else {
-            ""
-        };
-        let where_clause = if built.where_sql.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", built.where_sql)
-        };
-        let limit_clause = built.limit_sql;
-        let sql = format!(
-            "SELECT {MEDIA_COLUMNS}, COUNT(*) OVER () AS total_count \
-             FROM media_items {join} {where_clause} ORDER BY {} {limit_clause}",
-            built.order_sql,
-        );
-        let mut query = sqlx::query_as::<_, QueryRow>(sqlx::AssertSqlSafe(sql));
-        if let Some(uid) = user {
-            query = query.bind(uid.0.as_bytes().to_vec());
-        }
-        for p in &built.params {
-            query = match p {
-                Param::Text(s) => query.bind(s.clone()),
-                Param::Int(i) => query.bind(*i),
-            };
-        }
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        let total = match rows.first() {
-            Some(r) => u64::try_from(r.total_count.max(0)).unwrap_or(0),
-            None => self.query_count(q).await?,
-        };
-        let items = rows
-            .into_iter()
-            .map(|r| r.media.into_domain())
-            .collect::<DomainResult<Vec<_>>>()?;
-        Ok((items, total))
+        self.query_selecting(q, MEDIA_COLUMNS).await
+    }
+
+    #[tracing::instrument(skip(self, q))]
+    async fn query_shallow(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        static COLUMNS: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| crate::shallow_columns(MEDIA_COLUMNS));
+        self.query_selecting(q, &COLUMNS).await
     }
 
     #[tracing::instrument(skip(self, q))]
