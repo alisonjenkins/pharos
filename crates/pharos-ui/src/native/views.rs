@@ -9,6 +9,8 @@ use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, Librar
 use super::art::{Art, POSTER_SIZES};
 use super::depth;
 use super::find::SUGGEST_LIMIT;
+use super::keymap::Mode;
+use super::keys::{use_arrival_focus, use_key_mode};
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
@@ -47,6 +49,7 @@ pub fn WatchedToggle(id: ItemRef, played: bool, what: Option<String>) -> Element
         button {
             r#type: "button",
             class: "pharos-button pharos-button-secondary",
+            "data-key-action": "watched",
             onclick: move |_| mark.0.call((id, !played)),
             "{text}"
         }
@@ -65,6 +68,10 @@ pub fn Link(
     /// fullscreen.
     #[props(default)]
     plays: Option<ItemKind>,
+    #[props(default)] id: Option<String>,
+    /// The key action that presses this link (spec 029), such as `play`.
+    #[props(default)]
+    key_action: Option<&'static str>,
     children: Element,
 ) -> Element {
     let nav = use_context::<Nav>();
@@ -74,6 +81,8 @@ pub fn Link(
         a {
             href: "{href}",
             class,
+            id,
+            "data-key-action": key_action,
             "aria-current": if current { "page" },
             onclick: move |evt: MouseEvent| {
                 if evt.modifiers().is_empty() {
@@ -675,6 +684,9 @@ pub fn PosterTile(item: Item) -> Element {
     }
 }
 
+/// The id of a page's main action, focused when the page opens.
+pub const MAIN_ACTION: &str = "pharos-main-action";
+
 #[component]
 pub fn TitleView(
     detail: Detail,
@@ -689,6 +701,8 @@ pub fn TitleView(
     seen: Vec<MemberSeen>,
 ) -> Element {
     use_ends_at_refresh();
+    use_key_mode(Mode::Detail);
+    use_arrival_focus(detail.item.id, MAIN_ACTION);
     let stage = try_use_context::<StageCtx>();
     let item = &detail.item;
     let in_group = if seen.is_empty() {
@@ -725,7 +739,12 @@ pub fn TitleView(
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 div { class: "pharos-actions",
                     if item.kind.playable() {
-                        Link { to: Route::Watch(item.id), class: "pharos-button", plays: item.kind,
+                        Link {
+                            to: Route::Watch(item.id),
+                            class: "pharos-button",
+                            plays: item.kind,
+                            id: MAIN_ACTION,
+                            key_action: "play",
                             if resume { "Resume" } else { "Play" }
                         }
                     }
@@ -737,6 +756,7 @@ pub fn TitleView(
                                 button {
                                     class: "pharos-button pharos-button-secondary",
                                     r#type: "button",
+                                    "data-key-action": "restart",
                                     onclick: move |_| {
                                         fullscreen_for_play(kind, stage);
                                         on_play_from_start.call(id);
@@ -747,13 +767,14 @@ pub fn TitleView(
                         }
                     }
                     if can_watch_together(item.kind) {
-                        for (label, from, class) in together_starts(item) {
+                        for (label, from, class, key_action) in together_starts(item) {
                             {
                                 let id = item.id;
                                 rsx! {
                                     button {
                                         class: "{class}",
                                         r#type: "button",
+                                        "data-key-action": key_action,
                                         onclick: move |_| on_watch_together.call((id, from)),
                                         "{label}"
                                     }
@@ -979,22 +1000,24 @@ pub fn ends_at(left: Option<Left>) -> Option<String> {
 /// The title page's ways to start a group on `item`: label, start position
 /// and button class. A part-watched title starts where the viewer left off,
 /// or over (B556/V466).
-fn together_starts(item: &Item) -> Vec<(&'static str, u64, &'static str)> {
+fn together_starts(item: &Item) -> Vec<(&'static str, u64, &'static str, &'static str)> {
     if progress_percent(item).is_some() {
         vec![
             (
                 "Resume together",
                 start_ms(item.position_ms, item.played),
                 "pharos-button",
+                "together",
             ),
             (
                 "Watch together from start",
                 0,
                 "pharos-button pharos-button-secondary",
+                "together-start",
             ),
         ]
     } else {
-        vec![("Watch together", 0, "pharos-button")]
+        vec![("Watch together", 0, "pharos-button", "together")]
     }
 }
 
@@ -1655,7 +1678,7 @@ mod tests {
         let starts = |i: &Item| {
             together_starts(i)
                 .into_iter()
-                .map(|(label, from, _)| (label, from))
+                .map(|(label, from, _, _)| (label, from))
                 .collect::<Vec<_>>()
         };
         assert_eq!(starts(&film), vec![("Watch together", 0)]);
