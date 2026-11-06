@@ -16,7 +16,8 @@ use super::queue::{Entry, QueueAction, Source};
 use super::style_picker::StylePicker;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
-    not_transport, total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
+    not_transport, slider_key, total_ms, transport_key, use_shortcuts, Control, Volume,
+    SEEK_STEP_MS, VIDEO_ID,
 };
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef, Lyrics};
 
@@ -391,7 +392,7 @@ pub fn ListenView(
                             aria_valuetext: "{clock(at)}",
                             disabled: total == 0,
                             style: "--pharos-fill: {played:.2}%",
-                            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+                            onkeydown: slider_key,
                             oninput: move |evt: FormEvent| {
                                 if let Ok(ms) = evt.value().parse::<f64>() {
                                     scrub.set(Some(Scrub { ms: ms as u64, released: false }));
