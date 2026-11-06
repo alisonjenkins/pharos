@@ -2954,6 +2954,19 @@ impl LibraryStore for PostgresStore {
         Ok(rows.into_iter().map(|(id,)| id as MediaId).collect())
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn library_has_items(&self, wire_id: &str) -> DomainResult<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM media_items m \
+             JOIN libraries l ON l.id = m.library_id \
+             WHERE l.wire_id = $1)",
+        )
+        .bind(wire_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))
+    }
+
     async fn library_wire_id_of(&self, item: MediaId) -> DomainResult<Option<String>> {
         sqlx::query_scalar::<_, String>(
             "SELECT l.wire_id FROM media_items m \

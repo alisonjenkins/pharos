@@ -1025,6 +1025,13 @@ impl LibraryStore for AnyStore {
         }
     }
 
+    async fn library_has_items(&self, wire_id: &str) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.library_has_items(wire_id).await,
+            AnyStore::Postgres(p) => p.library_has_items(wire_id).await,
+        }
+    }
+
     async fn library_wire_id_of(&self, item: MediaId) -> DomainResult<Option<String>> {
         match self {
             AnyStore::Sqlite(s) => s.library_wire_id_of(item).await,
