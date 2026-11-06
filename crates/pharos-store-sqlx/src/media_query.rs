@@ -146,8 +146,10 @@ pub(crate) fn build(
         let trimmed = term.trim();
         if !trimmed.is_empty() {
             let mut words = pharos_core::search_tokens(trimmed);
-            if words.is_empty() {
-                words.push(trimmed.to_lowercase());
+            // No words (all punctuation), or more than a search can mean
+            // (each word costs a clause per column): match the term whole.
+            if words.is_empty() || words.len() > pharos_core::fuzzy::MAX_WORDS {
+                words = vec![trimmed.to_lowercase()];
             }
             let cols = [
                 "COALESCE(title_fold, LOWER(title))",
@@ -156,14 +158,19 @@ pub(crate) fn build(
                 "LOWER(COALESCE(album, ''))",
             ];
             for word in &words {
-                let needles = if q.search_loose {
+                let needles: Vec<String> = if q.search_loose {
                     pharos_core::fuzzy::loose_needles(word)
+                        .iter()
+                        .map(|n| {
+                            let gap = "_".repeat(n.gap);
+                            format!("%{}{gap}{}%", like_escape(&n.head), like_escape(&n.tail))
+                        })
+                        .collect()
                 } else {
-                    vec![word.clone()]
+                    vec![format!("%{}%", like_escape(word))]
                 };
                 let mut ors = Vec::with_capacity(cols.len() * needles.len());
                 for needle in &needles {
-                    let needle = format!("%{}%", like_escape(needle));
                     // Each column needs its own positional placeholder.
                     for col in cols {
                         params.push(Param::Text(needle.clone()));

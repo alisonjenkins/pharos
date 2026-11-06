@@ -5,6 +5,11 @@
 
 use crate::search_tokens;
 
+/// The most words a search term is matched by one at a time; a longer term
+/// (pasted text, say) is matched whole, so a term never grows the query
+/// past a few dozen clauses.
+pub const MAX_WORDS: usize = 12;
+
 /// The shortest search word that may carry a typo: a one-letter slip in
 /// "go" or "the" matches far too much to be a correction.
 pub const TYPO_MIN_CHARS: usize = 4;
@@ -182,24 +187,62 @@ pub fn score(names: &[&str], term: &str) -> Option<Score> {
     })
 }
 
-/// The SQL `LIKE` needles (lowercase, unescaped) a word may be found by in
-/// the loose pass that looks for typos: for a word of [`TYPO_MIN_CHARS`] or
-/// more, its first and last letters (two of them below six letters, three
-/// from six), one of which survives any single edit; otherwise the word.
-pub fn loose_needles(word: &str) -> Vec<String> {
+/// A `LIKE` needle of the loose pass: `head`, then `gap` letters of any
+/// kind, then `tail` (lowercase, unescaped; the caller escapes each part).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Needle {
+    pub head: String,
+    pub gap: usize,
+    pub tail: String,
+}
+
+impl Needle {
+    fn plain(text: String) -> Self {
+        Needle {
+            head: text,
+            gap: 0,
+            tail: String::new(),
+        }
+    }
+
+    /// Whether `text` holds this needle, as `LIKE '%needle%'` would.
+    pub fn found_in(&self, text: &str) -> bool {
+        let hay: Vec<char> = text.chars().collect();
+        let head: Vec<char> = self.head.chars().collect();
+        let tail: Vec<char> = self.tail.chars().collect();
+        let len = head.len() + self.gap + tail.len();
+        hay.windows(len.max(1))
+            .any(|w| w.len() == len && w.starts_with(&head) && w.ends_with(&tail))
+    }
+}
+
+/// The needles a word may be found by in the loose pass that looks for
+/// typos: for a word of [`TYPO_MIN_CHARS`] or more, its first and last
+/// letters (two of them below six letters, three from six) and, when those
+/// two meet in the middle (four or six letters), the same with its two middle
+/// letters free, so one of them survives any single edit or swap of two
+/// neighbouring letters; otherwise the word.
+pub fn loose_needles(word: &str) -> Vec<Needle> {
     let chars: Vec<char> = word.chars().collect();
     let n = chars.len();
     if n < TYPO_MIN_CHARS {
-        return vec![word.to_owned()];
+        return vec![Needle::plain(word.to_owned())];
     }
     let k = if n < 6 { 2 } else { 3 };
     let head: String = chars[..k].iter().collect();
     let tail: String = chars[n - k..].iter().collect();
-    if head == tail {
-        vec![head]
-    } else {
-        vec![head, tail]
+    let mut needles = vec![Needle::plain(head)];
+    if !needles.iter().any(|x| x.head == tail) {
+        needles.push(Needle::plain(tail));
     }
+    if 2 * k == n {
+        needles.push(Needle {
+            head: chars[..k - 1].iter().collect(),
+            gap: 2,
+            tail: chars[k + 1..].iter().collect(),
+        });
+    }
+    needles
 }
 
 #[cfg(test)]
@@ -256,13 +299,17 @@ mod tests {
             ("moby", "mob"),
             ("porcelain", "porcxlain"),
             ("porcelain", "porcelaix"),
+            ("moby", "mboy"),
+            ("moby", "omby"),
+            ("moby", "moyb"),
+            ("abcdef", "abdcef"),
+            ("abcde", "acbde"),
+            ("abcde", "abdce"),
         ] {
-            let found = loose_needles(typo)
-                .iter()
-                .any(|n| word.contains(n.as_str()));
+            let found = loose_needles(typo).iter().any(|n| n.found_in(word));
             assert!(found, "{typo} -> {word}");
         }
-        assert_eq!(loose_needles("go"), ["go"]);
+        assert_eq!(loose_needles("go"), [Needle::plain("go".into())]);
     }
 
     #[test]
