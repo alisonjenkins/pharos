@@ -3273,6 +3273,16 @@ body::before {
 .pharos-poster:focus-visible .pharos-poster-art::after {
   opacity: 1;
 }
+/* A grid that has just arrived holds the hover lift until the pointer
+   moves (web.rs `hold_lift`, B615), so a tile landing under a pointer at
+   rest does not jump as its transition ends. Focus still lifts. */
+.pharos-grid[data-lift-held] .pharos-poster:hover:not(:focus-visible) .pharos-poster-art {
+  transform: translateZ(0);
+}
+.pharos-grid[data-lift-held] .pharos-poster:hover:not(:focus-visible) .pharos-poster-art::before,
+.pharos-grid[data-lift-held] .pharos-poster:hover:not(:focus-visible) .pharos-poster-art::after {
+  opacity: 0;
+}
 
 /* The ring sits on the art, which is what moves; the link's own outline
    would stay behind on the flat box. */

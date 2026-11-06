@@ -491,6 +491,16 @@ mod tests {
         );
     }
 
+    /// V550: a grid that has just arrived holds the hover lift, art and
+    /// glow both, until the pointer moves, and never holds the focus lift.
+    #[test]
+    fn an_arrived_grid_holds_the_hover_lift_but_not_focus() {
+        let held = ".pharos-grid[data-lift-held] .pharos-poster:hover:not(:focus-visible) .pharos-poster-art";
+        assert!(rule(SHEET, held).contains("transform: translateZ(0)"));
+        assert!(SHEET.contains(&format!("{held}::before,\n{held}::after {{")));
+        assert!(rule(SHEET, &format!("{held}::after")).contains("opacity: 0"));
+    }
+
     #[test]
     fn the_subtitle_demo_scales_like_the_player() {
         use crate::native::playback::SubtitleSize;
