@@ -164,6 +164,8 @@ const VIDEO: Modes = Modes::Only(&[Mode::Player]);
 /// The music player's size keys mean nothing on the video page, which has
 /// no mini bar or floating window.
 const NOT_VIDEO: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Music, Mode::Queue]);
+/// Where the music player is the mini bar or floating window, if anything.
+const SMALL_PLAYER: Modes = Modes::Only(&[Mode::Browse, Mode::Detail]);
 
 const fn bind(
     keys: &'static [&'static str],
@@ -458,8 +460,16 @@ pub const BINDINGS: &[Binding] = &[
         &["M"],
         "Mini bar or floating player",
         G::Play,
-        NOT_VIDEO,
+        SMALL_PLAYER,
         A::Press("player-size"),
+    ),
+    // In the full player the same key makes it small again.
+    bind(
+        &["M"],
+        "Shrink to the mini bar or floating player",
+        G::Play,
+        LISTENING,
+        A::Press("shrink"),
     ),
     bind(
         &["Escape"],
@@ -770,6 +780,16 @@ mod tests {
             _ => None,
         };
         assert_eq!(run(Mode::Music, &["Escape"]), Some(Action::Press("shrink")));
+        for mode in [Mode::Music, Mode::Queue] {
+            assert_eq!(run(mode, &["M"]), Some(Action::Press("shrink")), "{mode:?}");
+        }
+        for mode in [Mode::Browse, Mode::Detail] {
+            assert_eq!(
+                run(mode, &["M"]),
+                Some(Action::Press("player-size")),
+                "{mode:?}"
+            );
+        }
         assert_eq!(run(Mode::Queue, &["Escape"]), Some(Action::Native));
         assert_eq!(run(Mode::Music, &["q"]), Some(Action::Focus("queue")));
         assert_eq!(
