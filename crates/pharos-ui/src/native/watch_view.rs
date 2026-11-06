@@ -786,6 +786,16 @@ pub(super) fn slider_key(evt: KeyboardEvent) {
     }
 }
 
+/// A key pressed on a track menu: the keys that open it and move along
+/// it are the menu's; every other key goes on to the player, so `m` still
+/// mutes when the menu was opened and left without a pick (B621).
+fn menu_key(evt: KeyboardEvent) {
+    let key = evt.key();
+    if moves_a_control(&key) || matches!(key, Key::Enter) || key.to_string() == " " {
+        evt.stop_propagation();
+    }
+}
+
 fn moves_a_control(key: &Key) -> bool {
     matches!(
         key,
@@ -811,7 +821,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
             class: "pharos-track-picker pharos-track-mode",
             aria_label: "Tracks",
             title: "Tracks",
-            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            onkeydown: menu_key,
             onchange: move |evt: FormEvent| {
                 on_change.call(evt.value() == "me");
                 platform::focus_by_id(PLAYER_ID);
@@ -914,10 +924,10 @@ fn TrackPicker(
             class: "pharos-track-picker",
             aria_label: label,
             title: label,
-            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            onkeydown: menu_key,
             onchange: move |evt: FormEvent| {
                 on_pick.call(evt.value().parse::<u32>().ok());
-                // The picker swallows keys; once picked, they go to the shortcuts again.
+                // Once picked, the keys that move the picker go to the player again.
                 platform::focus_by_id(PLAYER_ID);
             },
             if offer_off {
