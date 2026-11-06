@@ -8,6 +8,8 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 
+use super::keymap::{self, Mode, Transport};
+
 use super::art::Art;
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
@@ -132,25 +134,62 @@ pub(super) fn chorded(evt: &KeyboardEvent) -> bool {
     m.ctrl() || m.meta()
 }
 
-/// What a key does to the transport, on the video and music pages alike:
-/// space or k plays and pauses, the arrows seek and set the volume, m mutes.
+/// What a key does to the transport, on the video and music pages alike
+/// (spec 029's Player keys): Space or k plays and pauses, the arrows or
+/// h / l seek, the arrows or + / - set the volume, m mutes, a digit seeks
+/// to that tenth of the way in.
 pub(super) fn transport_key(key: &Key, media: &MediaState) -> Option<Control> {
+    transport_control(keymap::transport(Mode::Player, &key.to_string())?, media)
+}
+
+/// The control for a transport key that needs nothing but the media; the
+/// video's own keys (fullscreen, tracks) are its page's to answer.
+pub(super) fn transport_control(t: Transport, media: &MediaState) -> Option<Control> {
     let volume = |v: f64| Control::Volume {
         volume: v.clamp(0.0, 1.0),
         muted: false,
     };
-    Some(match key {
-        Key::Character(k) if k == " " || k == "k" => Control::TogglePlay,
-        Key::Character(k) if k == "m" => Control::Volume {
+    Some(match t {
+        Transport::TogglePlay => Control::TogglePlay,
+        Transport::Mute => Control::Volume {
             volume: media.volume,
             muted: !media.muted,
         },
-        Key::ArrowLeft => Control::Seek(media.position_ms.saturating_sub(SEEK_STEP_MS)),
-        Key::ArrowRight => Control::Seek(media.position_ms.saturating_add(SEEK_STEP_MS)),
-        Key::ArrowUp => volume(media.volume + VOLUME_STEP),
-        Key::ArrowDown => volume(media.volume - VOLUME_STEP),
-        _ => return None,
+        Transport::SeekBack => Control::Seek(media.position_ms.saturating_sub(SEEK_STEP_MS)),
+        Transport::SeekForward => Control::Seek(media.position_ms.saturating_add(SEEK_STEP_MS)),
+        Transport::VolumeUp => volume(media.volume + VOLUME_STEP),
+        Transport::VolumeDown => volume(media.volume - VOLUME_STEP),
+        Transport::SeekTenths(n) if media.duration_ms > 0 => {
+            Control::Seek(media.duration_ms / 10 * u64::from(n))
+        }
+        Transport::SeekTenths(_)
+        | Transport::Fullscreen
+        | Transport::NextSubtitle
+        | Transport::NextAudio => return None,
     })
+}
+
+/// The subtitle after `pick` in `tracks`, then off, then the first again.
+pub(super) fn next_subtitle(tracks: &[Track], pick: Option<u32>) -> Option<Control> {
+    if tracks.is_empty() {
+        return None;
+    }
+    let at = pick.and_then(|p| tracks.iter().position(|t| t.index == p));
+    let next = match at {
+        None => tracks.first(),
+        Some(i) => tracks.get(i + 1),
+    };
+    Some(Control::Subtitle(next.map(|t| t.index)))
+}
+
+/// The audio track after `pick` in `tracks`, round to the first.
+pub(super) fn next_audio(tracks: &[Track], pick: Option<u32>) -> Option<Control> {
+    if tracks.len() < 2 {
+        return None;
+    }
+    let at = pick.and_then(|p| tracks.iter().position(|t| t.index == p));
+    let next = at.and_then(|i| tracks.get(i + 1)).or(tracks.first())?;
+    Some(Control::Audio(next.index))
 }
 
 /// What the viewer asked for.
@@ -299,6 +338,12 @@ pub fn WatchView(
         platform::set_subtitle_controls_visible(controls_shown);
     }));
     let shortcuts = use_shortcuts(media, c.previous, c.next, on_control);
+    let tracks = (
+        c.subtitles.clone(),
+        c.subtitle_pick,
+        c.audio.clone(),
+        c.audio_pick,
+    );
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
@@ -316,9 +361,12 @@ pub fn WatchView(
             return;
         }
         // Shift+P / Shift+N are page-wide (B562), not the player's own.
-        let control = match evt.key() {
-            Key::Character(k) if k == "f" => Some(Control::Fullscreen),
-            key => transport_key(&key, &media),
+        let control = match keymap::transport(Mode::Player, &evt.key().to_string()) {
+            Some(Transport::Fullscreen) => Some(Control::Fullscreen),
+            Some(Transport::NextSubtitle) => next_subtitle(&tracks.0, tracks.1),
+            Some(Transport::NextAudio) => next_audio(&tracks.2, tracks.3),
+            Some(t) => transport_control(t, &media),
+            None => None,
         };
         let Some(control) = control else {
             return;
@@ -1205,6 +1253,73 @@ mod tests {
             transport_key(&Key::ArrowLeft, &start),
             Some(Control::Seek(0))
         );
+    }
+
+    /// Spec 029: the Vim keys mirror the arrows, and a digit seeks to that
+    /// tenth of the way in once the duration is known.
+    #[test]
+    fn vim_and_digit_keys_drive_the_transport() {
+        let media = MediaState {
+            position_ms: 30_000,
+            duration_ms: 100_000,
+            volume: 0.5,
+            ..MediaState::default()
+        };
+        let ch = |c: &str| transport_key(&Key::Character(c.into()), &media);
+        assert_eq!(ch("h"), Some(Control::Seek(20_000)));
+        assert_eq!(ch("l"), Some(Control::Seek(40_000)));
+        assert_eq!(
+            ch("-"),
+            Some(Control::Volume {
+                volume: 0.4,
+                muted: false
+            })
+        );
+        assert_eq!(
+            ch("+"),
+            Some(Control::Volume {
+                volume: 0.6,
+                muted: false
+            })
+        );
+        assert_eq!(ch("0"), Some(Control::Seek(0)));
+        assert_eq!(ch("7"), Some(Control::Seek(70_000)));
+        let unknown = MediaState::default();
+        assert_eq!(transport_key(&Key::Character("5".into()), &unknown), None);
+        // The video's own keys are its page's, not the shared transport's.
+        assert_eq!(ch("c"), None);
+        assert_eq!(ch("a"), None);
+    }
+
+    fn tracks(indexes: &[u32]) -> Vec<Track> {
+        indexes
+            .iter()
+            .map(|&index| Track {
+                index,
+                ..Track::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn c_steps_through_the_subtitles_and_off() {
+        let subs = tracks(&[3, 5]);
+        assert_eq!(next_subtitle(&subs, None), Some(Control::Subtitle(Some(3))));
+        assert_eq!(
+            next_subtitle(&subs, Some(3)),
+            Some(Control::Subtitle(Some(5)))
+        );
+        assert_eq!(next_subtitle(&subs, Some(5)), Some(Control::Subtitle(None)));
+        assert_eq!(next_subtitle(&[], None), None);
+    }
+
+    #[test]
+    fn a_steps_round_the_audio_tracks() {
+        let audio = tracks(&[1, 2]);
+        assert_eq!(next_audio(&audio, Some(1)), Some(Control::Audio(2)));
+        assert_eq!(next_audio(&audio, Some(2)), Some(Control::Audio(1)));
+        assert_eq!(next_audio(&audio, None), Some(Control::Audio(1)));
+        assert_eq!(next_audio(&audio[..1], Some(1)), None);
     }
 
     #[test]
