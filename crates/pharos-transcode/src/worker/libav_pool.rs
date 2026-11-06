@@ -54,6 +54,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::Integrity { .. } => "integrity",
         TinyOp::Fingerprint { .. } => "fingerprint",
         TinyOp::FingerprintMulti { .. } => "fingerprint_multi",
+        TinyOp::SubtitleSignals { .. } => "subtitle_signals",
         _ => "other",
     }
 }
@@ -74,6 +75,9 @@ fn is_heavy_op(op: &TinyOp) -> bool {
             | TinyOp::Integrity { .. }
             | TinyOp::Fingerprint { .. }
             | TinyOp::FingerprintMulti { .. }
+            // One demux of the whole file for the keyframes, plus the audio
+            // decode up to the last line.
+            | TinyOp::SubtitleSignals { .. }
     )
 }
 
@@ -353,6 +357,29 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Loudness, pitch and high-band share of each line's span, and the
+    /// video keyframes and likely cuts, from one pass over the file (spec
+    /// 028). `windows` are the lines' `(start_ms, end_ms)`; the result's
+    /// `lines` match them one to one.
+    pub async fn subtitle_signals(
+        &self,
+        input: impl Into<PathBuf>,
+        audio_stream: Option<u32>,
+        windows: Vec<(u64, u64)>,
+    ) -> Result<crate::subtitle_signals::SubtitleSignals, PoolError> {
+        let ev = self
+            .run(TinyOp::SubtitleSignals {
+                input: input.into(),
+                audio_stream,
+                windows,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::SubtitleSignalsResult { signals, .. } => Ok(signals),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Subtitle event windows — merged `(start_ms, end_ms)` intervals of
     /// the `stream_rel_idx`-th subtitle stream. Demux-only whole-file scan.
     pub async fn subtitle_windows(
@@ -489,6 +516,11 @@ impl LibavWorkerPool {
                     ..
                 } => (*thumb_count as u64).saturating_mul(*interval_ms) / 1000,
                 TinyOp::SubtitleImages { duration_ms, .. } => duration_ms / 1000,
+                // The last line ends near the end of the episode, so it
+                // stands in for the duration.
+                TinyOp::SubtitleSignals { windows, .. } => {
+                    windows.iter().map(|&(s, e)| s.max(e)).max().unwrap_or(0) / 1000
+                }
                 _ => 0,
             };
             self.inner
@@ -570,6 +602,7 @@ impl LibavWorkerPool {
                 | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
                 | WorkerEvent::FingerprintMultiResult { job_id: j, .. }
+                | WorkerEvent::SubtitleSignalsResult { job_id: j, .. }
                 | WorkerEvent::Done { job_id: j, .. }
                 | WorkerEvent::Failed { job_id: j, .. } => {
                     if *j != job_id {

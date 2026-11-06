@@ -477,6 +477,14 @@ fn handle_tiny(
             Ok(features) => WorkerEvent::AudioFeaturesResult { job_id, features },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::SubtitleSignals {
+            input,
+            audio_stream,
+            windows,
+        } => match libav::subtitle_signals::subtitle_signals(&input, audio_stream, &windows) {
+            Ok(signals) => WorkerEvent::SubtitleSignalsResult { job_id, signals },
+            Err(e) => frame_err(job_id, e),
+        },
         TinyOp::SubtitleWindows {
             input,
             stream_rel_idx,

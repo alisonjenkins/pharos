@@ -9,4 +9,5 @@ mod libav_frames;
 mod libav_integrity;
 mod libav_pool;
 mod libav_probe;
+mod libav_subtitle_signals;
 mod worker_ipc;

@@ -347,7 +347,8 @@ impl Worker for ProcWorker {
                         | WorkerEvent::SubtitleWindowsResult { .. }
                         | WorkerEvent::IntegrityResult { .. }
                         | WorkerEvent::FingerprintResult { .. }
-                        | WorkerEvent::FingerprintMultiResult { .. } => continue,
+                        | WorkerEvent::FingerprintMultiResult { .. }
+                        | WorkerEvent::SubtitleSignalsResult { .. } => continue,
                     },
                 }
             }
