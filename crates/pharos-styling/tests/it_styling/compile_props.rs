@@ -18,7 +18,7 @@ use pharos_styling::{compile, DIRECTOR_VERSION};
 use proptest::prelude::*;
 
 /// `PROPTEST_CASES` override (V533 runs 512 in `just test-thorough`).
-fn cfg() -> ProptestConfig {
+pub fn cfg() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|s| s.parse().ok())
