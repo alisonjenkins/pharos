@@ -6,6 +6,8 @@
 //! The same inputs always give the same bytes.
 
 pub mod plan;
+pub mod source;
+mod tags;
 pub mod version;
 
 pub use plan::{EffectPlan, EffectsLevel, Intent, Karaoke, LineEffect, Placement, Tier};
