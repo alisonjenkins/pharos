@@ -7,16 +7,20 @@
 //! Desktop spends at most four `\t` and one `\move` per event and at most
 //! four events per line. The designs are Pharos's own.
 
+mod aside;
+mod burst;
+mod caption;
 mod echo;
 mod hush;
 mod impact;
 mod inner_voice;
+mod karaoke;
 mod memory;
 mod tremor;
 mod wire;
 
 use crate::event::Event;
-use crate::plan::{Intent, LineEffect, Placement, Tier};
+use crate::plan::{Intent, Karaoke, LineEffect, Placement, Tier};
 use crate::source::SourceLine;
 use crate::theme::Theme;
 
@@ -76,7 +80,13 @@ pub(crate) fn events(
     theme: &Theme,
     tier: Tier,
 ) -> Option<Vec<Event>> {
+    if fx.karaoke != Karaoke::None && line.karaoke.is_some() {
+        return Some(karaoke::events(line, fx, theme, tier));
+    }
     match fx.intent {
+        Intent::Narration => Some(caption::events(line, fx, theme, tier)),
+        Intent::OffScreen => Some(aside::events(line, fx, theme, tier)),
+        Intent::Sfx => Some(burst::events(line, fx, theme, tier)),
         Intent::AttackCall => Some(echo::events(line, fx, theme, tier)),
         Intent::Phone => Some(wire::events(line, fx, theme, tier)),
         Intent::Flashback => Some(memory::events(line, fx, theme, tier)),
@@ -84,9 +94,7 @@ pub(crate) fn events(
         Intent::Shout if fx.intensity >= 3 => Some(tremor::events(line, fx, theme, tier)),
         Intent::Shout => Some(impact::events(line, fx, theme, tier)),
         Intent::Whisper => Some(hush::events(line, fx, theme, tier)),
-        Intent::Plain | Intent::Sarcasm | Intent::Narration | Intent::OffScreen | Intent::Sfx => {
-            None
-        }
+        Intent::Plain | Intent::Sarcasm => None,
     }
 }
 
