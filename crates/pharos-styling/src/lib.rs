@@ -6,10 +6,16 @@
 //! The same inputs always give the same bytes.
 
 pub mod budget;
+pub mod compile;
+mod effects;
+pub mod event;
 pub mod plan;
 pub mod source;
 mod tags;
+mod text;
+pub mod theme;
 pub mod version;
 
+pub use compile::compile;
 pub use plan::{EffectPlan, EffectsLevel, Intent, Karaoke, LineEffect, Placement, Tier};
 pub use version::{COMPILER_VERSION, DIRECTOR_VERSION};

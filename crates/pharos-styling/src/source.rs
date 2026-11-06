@@ -32,6 +32,8 @@ pub struct SourceLine {
     pub format: SourceFormat,
     /// ASS style name, `"Default"` for SRT and VTT.
     pub style: String,
+    /// ASS layer, 0 for SRT and VTT.
+    pub layer: i32,
     /// All visible text is italic (`<i>`, `{\i1}`).
     pub italic: bool,
     /// An ASS event that carries its own typesetting: `\pos`, `\move`, `\an`
@@ -180,6 +182,7 @@ fn read_cues(script: &str, format: SourceFormat) -> Source {
                 body.join("\n"),
                 format,
                 "Default".to_owned(),
+                0,
             )),
             None => skipped += 1,
         }
@@ -355,6 +358,7 @@ fn read_ass(script: &str) -> Source {
                 e.text.to_owned(),
                 SourceFormat::Ass,
                 e.style.to_owned(),
+                e.layer,
             );
             l.style_def = scan.styles.get(e.style).cloned();
             l
@@ -380,6 +384,7 @@ fn build_line(
     raw: String,
     format: SourceFormat,
     style: String,
+    layer: i32,
 ) -> SourceLine {
     let p = parse_text(&raw, format);
     let text = join(&p.runs);
@@ -396,6 +401,7 @@ fn build_line(
         raw,
         format,
         style,
+        layer,
         italic,
         typeset: p.typeset,
         karaoke: p.karaoke,
@@ -411,6 +417,19 @@ fn join(runs: &[Run]) -> String {
         .join("\n")
         .trim()
         .to_owned()
+}
+
+/// The visible runs of a line, outer whitespace trimmed, for the compiler.
+pub(crate) fn runs(line: &SourceLine) -> Vec<Run> {
+    let mut runs = parse_text(&line.raw, line.format).runs;
+    if let Some(first) = runs.first_mut() {
+        first.text = first.text.trim_start().to_owned();
+    }
+    if let Some(last) = runs.last_mut() {
+        last.text = last.text.trim_end().to_owned();
+    }
+    runs.retain(|r| !r.text.is_empty());
+    runs
 }
 
 #[derive(Default)]
