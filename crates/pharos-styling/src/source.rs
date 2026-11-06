@@ -335,7 +335,6 @@ fn parse_dialogue<'a>(
 
 /// The `Dialogue:` lines of the file, or the first one that cannot be read.
 /// Used on our own output, where any unreadable line is a bug.
-#[allow(dead_code)] // Read by `budget::check`, which lands next.
 pub(crate) fn ass_events(script: &str) -> Result<Vec<AssEvent<'_>>, SourceError> {
     let scan = scan_ass(script);
     match scan.first_error {
