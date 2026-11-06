@@ -1635,6 +1635,17 @@ test.describe("pharos Dioxus UI", () => {
       await box.press("Enter");
       await expect(page).toHaveURL(/\/ui\/title\//);
 
+      // Ctrl+K opens empty, offering the searches made, newest first; picking
+      // one searches it again in place (V551).
+      await page.keyboard.press("Control+k");
+      await expect(box).toHaveValue("");
+      const again = palette.getByRole("group", { name: "Recent searches" }).getByRole("option");
+      await expect(again.first()).toHaveText(/playwright show s01e2/);
+      await again.nth(1).click();
+      await expect(box).toHaveValue("playwright show s1");
+      await expect(titles.first()).toContainText("Season 1", { timeout: 15_000 });
+      await box.press("Escape");
+
       // The Bulk titles overflow the list; walking down keeps the pick shown.
       await open("bulk");
       await expect(titles.nth(20)).toBeAttached({ timeout: 15_000 });
