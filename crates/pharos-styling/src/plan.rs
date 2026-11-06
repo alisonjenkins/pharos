@@ -93,6 +93,10 @@ pub struct LineEffect {
     /// The rule and inputs that chose this, for logs.
     #[serde(default)]
     pub reason: String,
+    /// The line crosses a scene cut: keep the intent but draw the Low (still)
+    /// form, so no animation runs across the cut (FR-011).
+    #[serde(default)]
+    pub static_only: bool,
 }
 
 /// A directed track: one entry per line that is not left alone.
@@ -208,6 +212,7 @@ mod tests {
                     placement: Placement::Free { x: 960, y: 200 },
                     karaoke: Karaoke::None,
                     reason: "loud".into(),
+                    static_only: false,
                 },
                 LineEffect {
                     line: 4,
@@ -216,6 +221,7 @@ mod tests {
                     placement: Placement::Top,
                     karaoke: Karaoke::Ember,
                     reason: String::new(),
+                    static_only: false,
                 },
             ],
         };
