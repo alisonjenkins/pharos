@@ -134,6 +134,11 @@ season shown and names it ("Resume S2 · E3").
 | Next audio track, cycling (video) | `a` | |
 | Shrink to the library (music) | Escape, Backspace | |
 
+The player's keys work with the focus anywhere on the page: the key
+layer sends one pressed outside the player on to it (B618). After a
+prefix the next key is the prefix's, so `g h` goes home from the player
+rather than seeking back (B617).
+
 The Vim keys mirror the arrows in the player too: `k` and `j` set the
 volume like Up and Down (Alison, 2026-11-06), so `k` no longer plays and
 pauses; Space does.
