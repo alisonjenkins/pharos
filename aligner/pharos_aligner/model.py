@@ -6,6 +6,9 @@ from typing import Any
 import torch
 import torchaudio
 
+# MMS_FA's wildcard label, matching any audio that is not the transcript.
+STAR = "*"
+
 
 class Aligner:
     """Lazy-loaded multilingual forced aligner using torchaudio MMS_FA."""
@@ -44,12 +47,16 @@ class Aligner:
             if num_frames == 0:
                 return []
 
-            tokenized = self._tokenizer(tokens)
+            # A star token either side soaks up the music before the first
+            # word and after the last; without them CTC must spend every frame
+            # of the window on the lyrics, smearing the words across an
+            # instrumental break up to the next line.
+            tokenized = self._tokenizer([STAR, *tokens, STAR])
             # CTC needs a frame a character: a window too short for its text
             # cannot be aligned, and the aligner would raise.
             if sum(len(t) for t in tokenized) > num_frames:
                 return []
-            spans = self._aligner(emission[0], tokenized)
+            spans = self._aligner(emission[0], tokenized)[1:-1]
 
         ratio = (n_samples / num_frames / 16000.0) * 1000.0
         result: list[tuple[int, int]] = []
