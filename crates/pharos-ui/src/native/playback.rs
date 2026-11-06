@@ -556,7 +556,17 @@ impl Tier {
             Tier::Desktop => "desktop",
         }
     }
+
+    /// The tier a stored [`TIER_DROP_KEY`] value names; anything unknown is
+    /// `None`, as if nothing had been dropped to.
+    pub fn parse(stored: &str) -> Option<Tier> {
+        Tier::ALL.into_iter().find(|t| t.label() == stored.trim())
+    }
 }
+
+/// Where the tier this device last dropped to is kept; absent or unknown
+/// means no cap.
+pub const TIER_DROP_KEY: &str = "pharos.subtitles.tier_drop";
 
 /// What kind of screen the page runs on, for choosing a [`Tier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,6 +769,59 @@ impl TierDrop {
             window_ms,
         })
     }
+}
+
+/// The log line for a tier drop and the numbers behind it.
+pub fn tier_drop_line(drop: &TierDropEvent) -> String {
+    format!(
+        "pharos: subtitle tier drop from={} to={} reason=dropped_frames dropped={} presented={} window_ms={}",
+        drop.from.label(),
+        drop.to.label(),
+        drop.dropped,
+        drop.presented,
+        drop.window_ms,
+    )
+}
+
+/// The `rendererMode` client event for a tier drop, drawn by `renderer`.
+pub fn tier_drop_report(renderer: &str, drop: &TierDropEvent) -> ClientEvent {
+    ClientEvent {
+        kind: ClientEventKind::RendererMode,
+        level: ClientLevel::Info,
+        route: String::new(),
+        fields: vec![
+            ("renderer", renderer.to_owned()),
+            ("from", drop.from.label().to_owned()),
+            ("to", drop.to.label().to_owned()),
+            ("reason", "dropped_frames".to_owned()),
+            ("dropped", drop.dropped.to_string()),
+            ("presented", drop.presented.to_string()),
+            ("window_ms", drop.window_ms.to_string()),
+        ],
+    }
+}
+
+/// How long a remembered tier cap lasts, so a device that has since been
+/// fixed or replaced climbs back.
+pub const TIER_DROP_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+
+/// The stored form of a cap: the tier and when it was set, `tv@<unix_ms>`.
+pub fn format_tier_drop(tier: Tier, set_at_ms: u64) -> String {
+    format!("{}@{set_at_ms}", tier.label())
+}
+
+/// The cap a stored [`TIER_DROP_KEY`] value holds at `now_ms`: none once it
+/// is older than [`TIER_DROP_TTL_MS`] or unreadable. A bare tier, from before
+/// caps carried a time, still counts.
+pub fn parse_tier_drop(stored: &str, now_ms: u64) -> Option<Tier> {
+    let Some((tier, set_at)) = stored.split_once('@') else {
+        return Tier::parse(stored);
+    };
+    let set_at: u64 = set_at.trim().parse().ok()?;
+    if now_ms.saturating_sub(set_at) > TIER_DROP_TTL_MS {
+        return None;
+    }
+    Tier::parse(tier)
 }
 
 /// Where the viewer's library card transition is kept; absent or unknown is
@@ -2628,5 +2691,69 @@ mod tests {
         assert_eq!(run(Tier::Desktop, &totals).len(), 1);
         let totals: Vec<_> = (0..=10).map(|_| (0, 0)).collect();
         assert!(run(Tier::Desktop, &totals).is_empty());
+    }
+
+    #[test]
+    fn a_stored_tier_reads_back_and_unknown_is_none() {
+        assert_eq!(TIER_DROP_KEY, "pharos.subtitles.tier_drop");
+        for tier in Tier::ALL {
+            assert_eq!(Tier::parse(tier.label()), Some(tier));
+        }
+        assert_eq!(Tier::parse(" tv \n"), Some(Tier::Tv));
+        for unknown in ["", "ultra", "TV", "none"] {
+            assert_eq!(Tier::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    fn drop_event() -> TierDropEvent {
+        TierDropEvent {
+            from: Tier::Desktop,
+            to: Tier::Tv,
+            dropped: 120,
+            presented: 600,
+            window_ms: 10_000,
+        }
+    }
+
+    #[test]
+    fn the_tier_drop_log_line_names_the_measurement() {
+        assert_eq!(
+            tier_drop_line(&drop_event()),
+            "pharos: subtitle tier drop from=desktop to=tv reason=dropped_frames dropped=120 presented=600 window_ms=10000"
+        );
+    }
+
+    #[test]
+    fn the_tier_drop_report_is_a_renderer_mode_event_with_the_measurement() {
+        let event = tier_drop_report("jassub", &drop_event());
+        assert_eq!(event.kind, ClientEventKind::RendererMode);
+        assert_eq!(event.level, ClientLevel::Info);
+        assert_eq!(
+            event.fields,
+            [
+                ("renderer", "jassub".to_owned()),
+                ("from", "desktop".to_owned()),
+                ("to", "tv".to_owned()),
+                ("reason", "dropped_frames".to_owned()),
+                ("dropped", "120".to_owned()),
+                ("presented", "600".to_owned()),
+                ("window_ms", "10000".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stored_cap_lasts_fourteen_days_and_a_bare_tier_still_counts() {
+        let set = 1_000_000_000_000;
+        assert_eq!(format_tier_drop(Tier::Tv, set), "tv@1000000000000");
+        let at = |age| parse_tier_drop("tv@1000000000000", set + age);
+        assert_eq!(at(0), Some(Tier::Tv));
+        assert_eq!(at(TIER_DROP_TTL_MS), Some(Tier::Tv));
+        assert_eq!(at(TIER_DROP_TTL_MS + 1), None);
+        assert_eq!(parse_tier_drop("tv@1000000000000", set - 5), Some(Tier::Tv));
+        assert_eq!(parse_tier_drop("low", set), Some(Tier::Low));
+        for bad in ["tv@", "tv@soon", "ultra@1000000000000", "@5", ""] {
+            assert_eq!(parse_tier_drop(bad, set), None, "{bad:?}");
+        }
     }
 }
