@@ -34,10 +34,10 @@ use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, rust_subtitle_url, start_ms,
     styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls, subtitle_switch, up_next_at,
-    volume_setting, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment,
-    Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, UpNext,
-    UpNextStep, CROSSFADE_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY,
-    SUBTITLE_SIZE_KEY, VOLUME_KEY,
+    volume_setting, EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal,
+    OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch,
+    UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
+    OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -595,6 +595,42 @@ fn store_overlay_effect(fx: OverlayEffect) -> Result<(), String> {
     platform::store_theme(OVERLAY_EFFECT_KEY, fx.as_str()).inspect_err(|e| {
         platform::warn(&format!(
             "pharos: overlay_effect storage write failed error={e}"
+        ));
+    })
+}
+
+thread_local! {
+    /// The subtitle effects level chosen on this page load; it outranks
+    /// storage as [`SESSION_SUBTITLE_SIZE`] does.
+    static SESSION_EFFECTS_LEVEL: Cell<Option<EffectsLevel>> = const { Cell::new(None) };
+}
+
+/// The viewer's subtitle effects level: this page load's choice, else the
+/// stored one, else Subtle.
+fn stored_effects_level() -> EffectsLevel {
+    if let Some(level) = SESSION_EFFECTS_LEVEL.with(Cell::get) {
+        return level;
+    }
+    match platform::stored_theme(EFFECTS_LEVEL_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or(EffectsLevel::default(), EffectsLevel::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: effects_level storage read failed error={e}"
+            ));
+            EffectsLevel::default()
+        }
+    }
+}
+
+/// Keep `level` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_effects_level(level: EffectsLevel) -> Result<(), String> {
+    SESSION_EFFECTS_LEVEL.with(|s| s.set(Some(level)));
+    platform::store_theme(EFFECTS_LEVEL_KEY, level.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: effects_level storage write failed error={e}"
         ));
     })
 }
@@ -2219,6 +2255,7 @@ fn AppearanceScreen() -> Element {
     let notice = use_signal(|| None::<Notice>);
     let mut library_transition = use_signal(stored_library_transition);
     let mut overlay_effect = use_signal(stored_overlay_effect);
+    let mut effects_level = use_signal(stored_effects_level);
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -2240,6 +2277,7 @@ fn AppearanceScreen() -> Element {
     let notice_now = notice.read().clone();
     let library_transition_now = *library_transition.read();
     let overlay_effect_now = *overlay_effect.read();
+    let effects_level_now = *effects_level.read();
 
     rsx! {
         AppearanceView {
@@ -2276,6 +2314,20 @@ fn AppearanceScreen() -> Element {
                 platform::apply_overlay_effect(fx);
                 overlay_effect.set(fx);
                 platform::info(&format!("pharos: overlay_effect set={}", fx.as_str()));
+            },
+            effects_level: effects_level_now,
+            on_effects_level: move |level: EffectsLevel| {
+                if let Err(e) = store_effects_level(level) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the subtitle effects on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                effects_level.set(level);
+                platform::info(&format!("pharos: effects_level set={}", level.as_str()));
             },
             on_pick: move |name: String| {
                 editing.set(None);
@@ -4546,6 +4598,13 @@ mod tests {
         assert_eq!(stored_library_transition(), LibraryTransition::Fade);
         store_library_transition(LibraryTransition::Warp).unwrap();
         assert_eq!(stored_library_transition(), LibraryTransition::Warp);
+    }
+
+    #[test]
+    fn a_chosen_effects_level_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_effects_level(), EffectsLevel::Subtle);
+        store_effects_level(EffectsLevel::Full).unwrap();
+        assert_eq!(stored_effects_level(), EffectsLevel::Full);
     }
 
     #[test]
