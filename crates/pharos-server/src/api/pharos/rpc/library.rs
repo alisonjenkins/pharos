@@ -17,6 +17,7 @@ use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::services::search::Hit;
 use crate::services::{lyrics, mix, segments, watch};
 use crate::state::AppState;
 
@@ -336,29 +337,49 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
-        let listed = match library::search(state, &user, text, params.get_limit()).await {
-            Ok(items) => {
-                let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                library::with_user_data(
-                    state,
-                    &user,
-                    QueryPage {
-                        items,
-                        total,
-                        start: 0,
-                    },
-                )
-                .await
+        let out = results.get().init_result();
+        let hits =
+            match crate::services::search::search(state, &user, text, params.get_limit()).await {
+                Ok(hits) => hits,
+                Err(e) => {
+                    write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                    return Ok(());
+                }
+            };
+        let stored: Vec<MediaItem> = hits
+            .iter()
+            .filter_map(|hit| match hit {
+                Hit::Stored(item) => Some(item.as_ref().clone()),
+                Hit::Group(..) => None,
+            })
+            .collect();
+        let page = QueryPage {
+            items: stored,
+            total: 0,
+            start: 0,
+        };
+        let mut played = match library::with_user_data(state, &user, page).await {
+            Ok(listed) => listed.items.into_iter().map(|(_, data)| data),
+            Err(e) => {
+                write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                return Ok(());
             }
-            Err(e) => Err(e),
+        };
+        let mut page = out.init_page();
+        page.set_total(len_u32(&hits));
+        page.set_start(0);
+        let mut items = page.init_items(len_u32(&hits));
+        for (i, hit) in (0..items.len()).zip(&hits) {
+            match hit {
+                Hit::Group(id, dto) => write_synth_summary(items.reborrow().get(i), *id, dto),
+                Hit::Stored(item) => write_item(
+                    items.reborrow().get(i),
+                    item,
+                    played.next().unwrap_or_default(),
+                    &state.server_id,
+                ),
+            }
         }
-        .map_err(ListError::Store);
-        write_listing(
-            results.get().init_result(),
-            listed,
-            "search",
-            &state.server_id,
-        );
         Ok(())
     }
 
