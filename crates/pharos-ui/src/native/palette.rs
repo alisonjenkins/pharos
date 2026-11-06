@@ -9,6 +9,12 @@ use super::views::open_route;
 /// How many items to resume the palette offers before anything is typed.
 pub const RECENT_LIMIT: usize = 5;
 
+/// How many past searches the palette offers before anything is typed.
+pub const SEARCH_LIMIT: usize = 5;
+
+/// Where the past searches are kept, newest first, one per line.
+pub const SEARCHES_KEY: &str = "pharos.search.recent";
+
 /// A screen the palette can go to without searching.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Place {
@@ -21,6 +27,8 @@ pub struct Place {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     Place(Place),
+    /// A term searched for before; picking it searches again.
+    Search(String),
     /// Something the user was part way through.
     Recent(Item),
     /// A `Library.search` match.
@@ -28,16 +36,19 @@ pub enum Row {
 }
 
 impl Row {
-    pub fn route(&self) -> Route {
+    /// Where picking the row goes; a past search goes nowhere, it searches.
+    pub fn route(&self) -> Option<Route> {
         match self {
-            Row::Place(place) => place.route.clone(),
-            Row::Recent(item) | Row::Title(item) => open_route(item),
+            Row::Place(place) => Some(place.route.clone()),
+            Row::Search(_) => None,
+            Row::Recent(item) | Row::Title(item) => Some(open_route(item)),
         }
     }
 
     pub fn group(&self) -> &'static str {
         match self {
             Row::Place(_) => "Go to",
+            Row::Search(_) => "Recent searches",
             Row::Recent(_) => "Continue",
             Row::Title(_) => "Titles",
         }
@@ -74,16 +85,24 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
         .collect()
 }
 
-/// The rows for `term`: every place and what to resume while it is blank;
-/// once typed, the places whose name holds it (any case) and then the search
-/// matches, which are `None` until the first reply lands.
-pub fn rows(places: &[Place], recent: &[Item], term: &str, hits: Option<&Page>) -> Vec<Row> {
+/// The rows for `term`: past searches, every place and what to resume while
+/// it is blank; once typed, the places whose name holds it (any case) and
+/// then the search matches, which are `None` until the first reply lands.
+pub fn rows(
+    searches: &[String],
+    places: &[Place],
+    recent: &[Item],
+    term: &str,
+    hits: Option<&Page>,
+) -> Vec<Row> {
     let term = term.trim().to_lowercase();
     if term.is_empty() {
-        return places
+        return searches
             .iter()
+            .take(SEARCH_LIMIT)
             .cloned()
-            .map(Row::Place)
+            .map(Row::Search)
+            .chain(places.iter().cloned().map(Row::Place))
             .chain(recent.iter().take(RECENT_LIMIT).cloned().map(Row::Recent))
             .collect();
     }
@@ -97,6 +116,31 @@ pub fn rows(places: &[Place], recent: &[Item], term: &str, hits: Option<&Page>) 
                 .flat_map(|page| page.items.iter().cloned().map(Row::Title)),
         )
         .collect()
+}
+
+/// The past searches kept as `stored`, newest first.
+pub fn searches(stored: &str) -> Vec<String> {
+    stored
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .take(SEARCH_LIMIT)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `stored` with `term` put first (once, any case), as it is kept.
+pub fn remember(stored: &str, term: &str) -> String {
+    let term = term.split_whitespace().collect::<Vec<_>>().join(" ");
+    std::iter::once(term.clone())
+        .chain(
+            searches(stored)
+                .into_iter()
+                .filter(|t| !t.eq_ignore_ascii_case(&term)),
+        )
+        .take(SEARCH_LIMIT)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether a key press opens or closes the palette: K with Ctrl, or with
@@ -135,6 +179,7 @@ mod tests {
         rows.iter()
             .map(|row| match row {
                 Row::Place(place) => place.label.clone(),
+                Row::Search(term) => term.clone(),
                 Row::Recent(item) | Row::Title(item) => item.name.clone(),
             })
             .collect()
@@ -158,7 +203,7 @@ mod tests {
         let recent: Vec<_> = (1..=8)
             .map(|n| item(n, ItemKind::Movie, &format!("R{n}")))
             .collect();
-        let rows = rows(&places, &recent, "  ", None);
+        let rows = rows(&[], &places, &recent, "  ", None);
         assert_eq!(rows.len(), places.len() + RECENT_LIMIT);
         assert!(matches!(rows.last(), Some(Row::Recent(_))));
     }
@@ -172,16 +217,40 @@ mod tests {
             total: 1,
             start: 0,
         };
-        let rows = rows(&places, &recent, "MUS", Some(&hits));
+        let rows = rows(&[], &places, &recent, "MUS", Some(&hits));
         assert_eq!(labels(&rows), ["Music", "Music Box"]);
-        assert_eq!(rows[1].route(), Route::Title(ItemRef::Real(7)));
+        assert_eq!(rows[1].route(), Some(Route::Title(ItemRef::Real(7))));
         assert_eq!(rows[1].group(), "Titles");
     }
 
     #[test]
     fn before_the_first_reply_only_places_are_listed() {
         let places = places(&[]);
-        assert_eq!(labels(&rows(&places, &[], "app", None)), ["Appearance"]);
+        assert_eq!(
+            labels(&rows(&[], &places, &[], "app", None)),
+            ["Appearance"]
+        );
+    }
+
+    #[test]
+    fn a_blank_term_lists_past_searches_first_and_they_go_nowhere() {
+        let places = places(&[]);
+        let searches = searches(&remember(&remember("", "moby"), "dragon ball"));
+        let blank = rows(&searches, &places, &[], "", None);
+        assert_eq!(labels(&blank[..3]), ["dragon ball", "moby", "Home"]);
+        assert_eq!(blank[0].group(), "Recent searches");
+        assert_eq!(blank[0].route(), None);
+        assert!(rows(&searches, &places, &[], "mo", None)
+            .iter()
+            .all(|row| !matches!(row, Row::Search(_))));
+    }
+
+    #[test]
+    fn a_search_is_remembered_once_newest_first_and_only_the_last_few() {
+        let kept = remember("Moby\nsignify", "  moby  ");
+        assert_eq!(searches(&kept), ["moby", "signify"]);
+        let kept = (0..9).fold(String::new(), |kept, n| remember(&kept, &format!("t{n}")));
+        assert_eq!(searches(&kept), ["t8", "t7", "t6", "t5", "t4"]);
     }
 
     #[test]

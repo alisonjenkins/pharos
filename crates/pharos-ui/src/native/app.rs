@@ -1382,8 +1382,11 @@ fn NativeApp(route: Route) -> Element {
             // rather than open one that pops up right after sign-in.
             let toggle = palette::is_toggle(key, ctrl, meta) && api.peek().is_some();
             if toggle {
-                let shut = !*palette.0.peek();
-                palette.0.set(shut);
+                let opening = !*palette.0.peek();
+                if opening {
+                    search.clear();
+                }
+                palette.0.set(opening);
             }
             toggle
         }))
@@ -1545,7 +1548,10 @@ fn NativeApp(route: Route) -> Element {
                 }
                 Screen { route: route.clone() }
                 StageView {}
-                super::keys::KeyLayer { route: route.clone(), on_palette: move |_| palette.0.set(true) }
+                super::keys::KeyLayer { route: route.clone(), on_palette: move |_| {
+                    search.clear();
+                    palette.0.set(true);
+                } }
                 WhatsNew { route }
                 if (palette.0)() {
                     PaletteScreen {}
@@ -1851,6 +1857,28 @@ fn PaletteScreen() -> Element {
         })
     });
     use_effect(|| platform::focus(PALETTE_INPUT));
+    let kept = move || {
+        platform::stored_theme(palette::SEARCHES_KEY)
+            .unwrap_or_else(|e| {
+                platform::warn(&format!("palette: past searches unreadable: {e}"));
+                None
+            })
+            .unwrap_or_default()
+    };
+    let searches = use_signal(move || palette::searches(&kept()));
+    // A match opened from a term keeps the term, as a past search to pick.
+    let remember = move || {
+        let term = search.text.peek().trim().to_owned();
+        let matched = matches!(&*search.hits.peek(), Hits::Found(page) if !page.items.is_empty());
+        if term.is_empty() || !matched {
+            return;
+        }
+        if let Err(e) =
+            platform::store_theme(palette::SEARCHES_KEY, &palette::remember(&kept(), &term))
+        {
+            platform::warn(&format!("palette: search not kept: {e}"));
+        }
+    };
     let rows = use_memo(move || {
         let home = home.read();
         let libraries: Vec<_> = home.rails.iter().map(|rail| rail.library.clone()).collect();
@@ -1861,6 +1889,7 @@ fn PaletteScreen() -> Element {
             _ => None,
         };
         palette::rows(
+            &searches.read(),
             &palette::places(&libraries),
             &recent,
             &search.text.read(),
@@ -1901,12 +1930,20 @@ fn PaletteScreen() -> Element {
         }
         Key::Enter => {
             evt.prevent_default();
-            let picked = active
-                .peek()
-                .and_then(|at| rows.peek().get(at).map(Row::route));
-            if let Some(route) = picked {
-                close();
-                nav.0.call(route);
+            let picked = active.peek().and_then(|at| rows.peek().get(at).cloned());
+            match picked {
+                Some(Row::Search(term)) => {
+                    active.set(Some(0));
+                    search.edit(ctx, term);
+                }
+                Some(row) => {
+                    if let Some(route) = row.route() {
+                        remember();
+                        close();
+                        nav.0.call(route);
+                    }
+                }
+                None => {}
             }
         }
         // Closes rather than letting the search input clear itself.
@@ -1927,6 +1964,10 @@ fn PaletteScreen() -> Element {
                 search.edit(ctx, value);
             },
             on_key,
+            on_pick: move |_| {
+                remember();
+                close();
+            },
             on_close: move |_| close(),
         }
     }
