@@ -129,6 +129,7 @@ pub(crate) mod testutil {
             placement: Placement::Default,
             karaoke: Karaoke::None,
             reason: String::new(),
+            static_only: false,
         }
     }
 
