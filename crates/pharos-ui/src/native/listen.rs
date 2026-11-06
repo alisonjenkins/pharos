@@ -336,7 +336,11 @@ pub fn ListenView(
                     p { class: "pharos-muted pharos-listen-note", "{note}" }
                 }
             }
-            if let (Some(lyrics), true) = (lyrics.clone(), show_lyrics()) {
+            // Not drawn while the screen is out of sight (B624/V558): a hidden
+            // panel cannot scroll, so one kept from the mini bar opened at
+            // the top with the sung line out of view until the next line.
+            // Drawn fresh, it centres the line being sung as it appears.
+            if let (Some(lyrics), true, false) = (lyrics.clone(), show_lyrics(), compact) {
                 LyricsPanel {
                     lyrics,
                     position_ms: media.position_ms,
@@ -993,6 +997,16 @@ mod tests {
         media: MediaState,
         lyrics: Option<Lyrics>,
     ) -> String {
+        render_sized(title, image, media, lyrics, false)
+    }
+
+    fn render_sized(
+        title: &str,
+        image: Option<&str>,
+        media: MediaState,
+        lyrics: Option<Lyrics>,
+        compact: bool,
+    ) -> String {
         let (title, image) = (title.to_owned(), image.map(str::to_owned));
         let mut dom = VirtualDom::new_with_props(
             move |()| {
@@ -1010,6 +1024,7 @@ mod tests {
                         lyrics: lyrics.clone(),
                         on_media: |_| {},
                         on_control: |_| {},
+                        compact,
                     }
                 }
             },
@@ -1017,6 +1032,32 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_lyrics_panel_is_drawn_only_while_the_screen_is_in_sight() {
+        use pharos_client::api::LyricLine;
+        // B624/V558: a panel kept hidden behind the mini bar cannot scroll to
+        // the sung line, so it is drawn when the full player opens instead.
+        let words = Lyrics {
+            synced: true,
+            lines: vec![LyricLine {
+                start_ms: 1_000,
+                text: "Love, love is a verb".to_owned(),
+                words: Vec::new(),
+            }],
+            words_pending: false,
+        };
+        let mini = render_sized(
+            "Teardrop",
+            None,
+            MediaState::default(),
+            Some(words.clone()),
+            true,
+        );
+        assert!(!mini.contains(r#"id="pharos-lyrics""#), "{mini}");
+        let full = render_sized("Teardrop", None, MediaState::default(), Some(words), false);
+        assert!(full.contains(r#"id="pharos-lyrics""#), "{full}");
     }
 
     #[test]
