@@ -18,6 +18,11 @@ use tokio::sync::mpsc;
 
 use super::{Lyrics, WordStamp};
 
+/// Bumped when the aligner's answers change for the same song and lines, so
+/// word times cached from an older aligner are asked for again.
+/// 2: star tokens stop words smearing across instrumental breaks.
+const ALIGN_VERSION: u32 = 2;
+
 /// Time alignment of a whole song can take on CPU; a worker may run up to this
 /// long before timing out.
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -339,9 +344,14 @@ impl Aligner {
             Err(_) => (0, 0),
         };
 
-        let json_bytes =
-            serde_json::to_vec(&serde_json::json!([&rel_path, size, mtime, &job_lines,]))
-                .unwrap_or_default();
+        let json_bytes = serde_json::to_vec(&serde_json::json!([
+            ALIGN_VERSION,
+            &rel_path,
+            size,
+            mtime,
+            &job_lines,
+        ]))
+        .unwrap_or_default();
 
         let mut hasher = Sha256::new();
         hasher.update(&json_bytes);
