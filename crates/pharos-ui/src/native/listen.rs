@@ -303,7 +303,8 @@ pub fn ListenView(
                         disabled: lyrics.is_none(),
                         title: lyrics_title(lyrics.is_some(), lyrics_loading, lyrics_failed),
                         aria_pressed: if lyrics.is_some() && show_lyrics() { "true" } else { "false" },
-                        aria_controls: (lyrics.is_some() && show_lyrics()).then_some(super::lyrics::PANEL_ID),
+                        // Only while the panel is drawn (B625/V559): not in the mini bar.
+                        aria_controls: (lyrics.is_some() && show_lyrics() && !compact).then_some(super::lyrics::PANEL_ID),
                         onclick: move |_| toggle_lyrics(),
                         {lyrics_label(lyrics.is_some(), lyrics_loading, lyrics_failed)}
                     }
@@ -1056,6 +1057,8 @@ mod tests {
             true,
         );
         assert!(!mini.contains(r#"id="pharos-lyrics""#), "{mini}");
+        // The chip points at no panel that is not drawn.
+        assert!(!mini.contains(r#"aria-controls="pharos-lyrics""#), "{mini}");
         let full = render_sized("Teardrop", None, MediaState::default(), Some(words), false);
         assert!(full.contains(r#"id="pharos-lyrics""#), "{full}");
     }
