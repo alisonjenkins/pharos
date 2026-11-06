@@ -132,6 +132,11 @@ fn make_media_with_subs(dir: &Path) -> PathBuf {
 /// subrip (2), ass (3) and image/PGS (4) subtitle track. Returns the wired
 /// `AppState` (no subtitle cache → handlers spawn ffmpeg directly).
 async fn seed(fixture: &Path) -> web::Data<AppState> {
+    seed_with_token(fixture).await.0
+}
+
+/// [`seed`], also handing back the user's token for the routes that need one.
+async fn seed_with_token(fixture: &Path) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -145,7 +150,7 @@ async fn seed(fixture: &Path) -> web::Data<AppState> {
         })
         .await
         .unwrap();
-    let _token = stores.issue(uid, "t").await.unwrap();
+    let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
             id: 7,
@@ -196,7 +201,10 @@ async fn seed(fixture: &Path) -> web::Data<AppState> {
         })
         .await
         .unwrap();
-    web::Data::new(AppState::new(stores, "t".into()))
+    (
+        web::Data::new(AppState::new(stores, "t".into())),
+        token.0.expose().to_string(),
+    )
 }
 
 macro_rules! app {
@@ -346,4 +354,138 @@ async fn image_subtitle_refused_on_text_routes() {
     assert_eq!(status, 415, "PGS vtt should be Unsupported Media Type");
     let (status, _ct, _body) = get!(app, "/Videos/7/7/Subtitles/4/Stream.js");
     assert_eq!(status, 415, "PGS js should be Unsupported Media Type");
+}
+
+/// B590: every text subtitle delivery is counted with its form, source and
+/// codec class, failures included. Needs no ffmpeg: the item's file is empty
+/// and the ASS track is a sidecar beside it, served as-is. Disarm check: with
+/// `record_delivery`'s counter removed, every assertion here reads 0.
+#[actix_web::test]
+async fn subtitle_deliveries_are_counted_by_form_and_class() {
+    let dir = TempDir::new().unwrap();
+    let media = dir.path().join("m.mkv");
+    std::fs::write(&media, b"").unwrap();
+    std::fs::write(
+        dir.path().join("m.en.ass"),
+        format!(
+            "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Start, End, Style, Text\nDialogue: 0,0:00:00.50,0:00:02.50,Default,{ASS_TEXT}\n"
+        ),
+    )
+    .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let logs = Captured::default();
+    let _logs = tracing::subscriber::set_default(subscriber(&logs));
+    let (state, token) = seed_with_token(&media).await;
+    let app = app!(state);
+    let get = |uri: &str| {
+        test::TestRequest::get()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token.clone()))
+            .to_request()
+    };
+
+    // Embedded tracks top out at index 4, so the sidecar is index 5.
+    let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/5/Stream.ass")).await;
+    assert_eq!(resp.status(), 200);
+    let body = test::read_body(resp).await;
+    assert!(String::from_utf8_lossy(&body).contains(ASS_TEXT));
+    // An image track refused on the WebVTT route.
+    let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/4/Stream.vtt")).await;
+    assert_eq!(resp.status(), 415);
+    // A sidecar index past the last sidecar: the failure path is counted too.
+    let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/6/Stream.ass")).await;
+    assert_eq!(resp.status(), 404);
+
+    let count = |labels: &[(&str, &str)]| -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| {
+                let key = k.key();
+                key.name() == "pharos_subtitle_delivery_total"
+                    && labels
+                        .iter()
+                        .all(|(lk, lv)| key.labels().any(|l| l.key() == *lk && l.value() == *lv))
+            })
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    };
+    let row = |format, source, class, outcome| {
+        [
+            ("format", format),
+            ("source", source),
+            ("codec_class", class),
+            ("outcome", outcome),
+        ]
+    };
+    assert_eq!(count(&row("ass", "sidecar", "styled", "served")), 1);
+    assert_eq!(count(&row("vtt", "embedded", "image", "refused")), 1);
+    assert_eq!(count(&row("ass", "sidecar", "unknown", "refused")), 1);
+
+    // One log line per delivery; the failure carries the same fields.
+    let text = logs.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("subtitle delivery"))
+        .collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert!(
+        lines[0].contains("outcome=\"served\"") || lines[0].contains("outcome=served"),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("codec=ass"), "{}", lines[0]);
+    assert!(lines[0].contains("styling kept"), "{}", lines[0]);
+    assert!(lines[2].contains("refused"), "{}", lines[2]);
+    assert!(
+        lines[2].contains("no sidecar at that index"),
+        "{}",
+        lines[2]
+    );
+    assert!(lines[2].contains("track not identified"), "{}", lines[2]);
+}
+
+/// Every log line the test thread emits, as text.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
+/// A capturing subscriber for `set_default`. The second dispatcher keeps a
+/// callsite first hit on another thread from being switched off for this
+/// one (B426).
+fn subscriber(logs: &Captured) -> impl tracing::Subscriber + Send + Sync {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish()
 }
