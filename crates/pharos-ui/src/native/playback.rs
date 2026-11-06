@@ -1110,6 +1110,23 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
+/// The fonts Pharos ships for the subtitles it styles itself (spec 028), as
+/// (lowercased family name, file under `/ui/assets/fonts/`). The ASS renderer
+/// gets them as `availableFonts`, which it fetches only when a style names
+/// one, so a device downloads a font only for a track that uses it. Each key
+/// is the font's own family name: libass matches `Fontname` against the
+/// name table, so a key that differs falls back to the default face (V508).
+pub const SUBTITLE_FONT_PACK: [(&str, &str); 4] = [
+    // Shouts, attack calls and sound effects.
+    ("bangers", "Bangers-Regular.ttf"),
+    // Signs, captions and narration.
+    ("anton", "Anton-Regular.ttf"),
+    // Inner voice and thoughts.
+    ("patrick hand", "PatrickHand-Regular.ttf"),
+    // Phone calls, radio and messages.
+    ("courier prime", "CourierPrime-Regular.ttf"),
+];
+
 /// The URLs of the file's embedded fonts, each cut to the glyphs the subtitle
 /// at `subtitle` draws, for the ASS renderer to load up front (026 FR-010):
 /// libass then matches a style's `Fontname` against the fonts' own names.
@@ -1137,6 +1154,27 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// V508: each pack font is registered under the family name in its own
+    /// name table, the name a style's `Fontname` has to match.
+    #[test]
+    fn each_pack_font_is_keyed_by_its_own_family_name() {
+        use skrifa::raw::TableProvider;
+        use skrifa::MetadataProvider;
+        for (key, file) in SUBTITLE_FONT_PACK {
+            let path = format!("{}/assets/fonts/{file}", env!("CARGO_MANIFEST_DIR"));
+            let bytes = std::fs::read(&path).unwrap();
+            let font = skrifa::FontRef::new(&bytes).unwrap();
+            let family = font
+                .localized_strings(skrifa::string::StringId::FAMILY_NAME)
+                .english_or_first()
+                .unwrap()
+                .to_string()
+                .to_lowercase();
+            assert_eq!(key, family, "{file}");
+            assert!(font.name().is_ok(), "{file} keeps its name table");
+        }
+    }
 
     /// V488 (B572): every embedded font is fetched for the track being drawn.
     #[test]

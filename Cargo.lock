@@ -5427,6 +5427,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "skrifa",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
