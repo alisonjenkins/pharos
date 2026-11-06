@@ -103,6 +103,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "ScrollBehavior",
     "DomTokenList",
     "KeyboardEvent",
+    "KeyboardEventInit",
     "MouseEvent",
     "HtmlCollection",
     "IntersectionObserverEntry",

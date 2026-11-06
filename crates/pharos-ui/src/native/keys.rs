@@ -165,6 +165,13 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
             let typed: Vec<&str> = keys.iter().map(String::as_str).collect();
             generation += 1;
             match keymap::resolve(focus_mode(*mode.peek()), &typed) {
+                // A player's keys are its own handler's, which hears only
+                // keys pressed inside it: one pressed with the focus
+                // elsewhere on the page is sent on to it (B618).
+                Resolved::Run(Action::Transport(_)) => {
+                    reset();
+                    platform::forward_to_player(key)
+                }
                 Resolved::Run(action) => {
                     reset();
                     run(action)
