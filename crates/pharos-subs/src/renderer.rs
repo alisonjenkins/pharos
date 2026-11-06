@@ -10,7 +10,7 @@ use crate::fonts::{FontDb, FontError, FontId};
 use crate::frame::{Config, Frame, Mask, MaskKind, RenderStats, SubtitleStyle, Viewport};
 use crate::layout::{self, Line, RunFmt, Scratch};
 use crate::model::{Event, Rgba, Script, Style};
-use crate::morph::{dilate, rounded_rect};
+use crate::morph::{dilate, rounded_union};
 use crate::raster::{Bitmap, LinePath};
 
 /// Raster cap (spec: render at min(display, 1080p), upscale on the GPU).
@@ -419,7 +419,7 @@ impl Engine {
         }
 
         // Vertical stacking. Plain lines are separated by their backdrop
-        // padding so the translucent boxes tile instead of overlapping.
+        // padding so the line boxes touch and merge into one bubble.
         let gap = 2.0 * pad_y;
         let heights: Vec<f32> = lines.iter().map(|l| l.ascent + l.descent).collect();
         let block_h: f32 =
@@ -439,7 +439,7 @@ impl Engine {
         let area_left = geo.cx as f32 + ml;
 
         let mut placed: Vec<Placement> = Vec::new();
-        let mut backdrops: Vec<(Bitmap, i32, i32)> = Vec::new();
+        let mut line_boxes: Vec<(i32, i32, u32, u32)> = Vec::new();
         let mut top = block_top + pad_y;
         for (line, h) in lines.iter().zip(&heights) {
             let x0 = match col {
@@ -454,13 +454,13 @@ impl Engine {
                 let by = (top - pad_y).round() as i32;
                 let bw = (line.width + 2.0 * pad_x).round().max(1.0) as u32;
                 let bh = (h + 2.0 * pad_y).round().max(1.0) as u32;
-                let r = (sub.corner_radius_em * lead_size).round() as u32;
-                backdrops.push((rounded_rect(bw, bh, r), bx, by));
+                line_boxes.push((bx, by, bw, bh));
             }
             top += h + gap;
         }
 
-        for (bm, x, y) in backdrops {
+        let r = (sub.corner_radius_em * lead_size).round() as u32;
+        if let Some((bm, x, y)) = rounded_union(&line_boxes, r) {
             let m = self.mask_from(bm, x, y, sub.backdrop, MaskKind::Backdrop);
             out.masks.push(m);
         }
