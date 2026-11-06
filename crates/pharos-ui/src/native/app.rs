@@ -31,13 +31,13 @@ use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
+    choose_engine, crossfade_ms, device_class, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, rust_subtitle_url, start_ms,
-    styled_subtitle_url, subtitle_font_urls, subtitle_switch, up_next_at, volume_setting,
-    EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing,
-    OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep,
-    CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY,
-    SUBTITLE_SIZE_KEY, VOLUME_KEY,
+    starting_tier, starting_tier_line, styled_subtitle_url, subtitle_font_urls, subtitle_switch,
+    up_next_at, volume_setting, EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState,
+    OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize,
+    SubtitleSwitch, Tier, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -628,6 +628,32 @@ fn store_effects_level(level: EffectsLevel) -> Result<(), String> {
             "pharos: effects_level storage write failed error={e}"
         ));
     })
+}
+
+/// `(max-width)` below which a coarse-pointer device counts as a phone.
+const NARROW_SCREEN: &str = "(max-width: 600px)";
+
+/// The tier a styled subtitle track is first fetched at on this device, and
+/// the log line saying why. The remembered dropped tier is not stored yet.
+// The player takes this once the server serves the styled track (T028-19).
+#[allow(dead_code)]
+fn current_starting_tier() -> Tier {
+    let device = device_class(
+        &platform::user_agent(),
+        platform::prefers("(pointer: coarse)"),
+        platform::prefers(NARROW_SCREEN),
+        platform::android_shell(),
+    );
+    let reduced_motion = platform::prefers("(prefers-reduced-motion: reduce)");
+    let remembered = None;
+    let tier = starting_tier(device, reduced_motion, remembered);
+    platform::info(&starting_tier_line(
+        tier,
+        device,
+        reduced_motion,
+        remembered,
+    ));
+    tier
 }
 
 /// `caps` with the bitrate to negotiate `kind` with, from the viewer's
@@ -4534,6 +4560,12 @@ mod tests {
         assert_eq!(stored_library_transition(), LibraryTransition::Fade);
         store_library_transition(LibraryTransition::Warp).unwrap();
         assert_eq!(stored_library_transition(), LibraryTransition::Warp);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn the_host_starts_on_the_desktop_tier() {
+        assert_eq!(current_starting_tier(), Tier::Desktop);
     }
 
     #[test]

@@ -1729,6 +1729,18 @@ fn in_text_field(e: &web_sys::KeyboardEvent) -> bool {
         .is_some()
 }
 
+/// The browser's user agent string; empty when it will not say.
+pub fn user_agent() -> String {
+    web_sys::window()
+        .and_then(|w| w.navigator().user_agent().ok())
+        .unwrap_or_default()
+}
+
+/// The web build is never the Android app's shell; that one is the host build.
+pub fn android_shell() -> bool {
+    false
+}
+
 /// How the palette's shortcut is written on this device: Cmd on Apple's.
 pub fn palette_keys() -> &'static str {
     let apple = web_sys::window()
