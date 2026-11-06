@@ -124,9 +124,9 @@ season shown and names it ("Resume S2 · E3").
 
 | Action | Standard | Vim |
 |---|---|---|
-| Play / pause | Space | `k` |
+| Play / pause | Space | Space |
 | Seek back / forward 10 s | Left / Right | h / l |
-| Volume up / down | Up / Down, `+` / `-` | |
+| Volume up / down | Up / Down, `+` / `-` | k / j |
 | Mute | `m` | |
 | Seek to 0 %, 10 % … 90 % | `0` … `9` | |
 | Fullscreen (video) | `f` | |
@@ -134,8 +134,9 @@ season shown and names it ("Resume S2 · E3").
 | Next audio track, cycling (video) | `a` | |
 | Shrink to the library (music) | Escape, Backspace | |
 
-`k` keeps play/pause (shipped, and the common video-site key); j is not
-bound in the player, since volume has Up/Down and `+`/`-`.
+The Vim keys mirror the arrows in the player too: `k` and `j` set the
+volume like Up and Down (Alison, 2026-11-06), so `k` no longer plays and
+pauses; Space does.
 
 ### Queue: the music full player's queue
 
