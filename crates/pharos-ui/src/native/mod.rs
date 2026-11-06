@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod find;
 pub mod group_app;
 pub mod group_session;
+pub mod keymap;
 pub mod letters;
 pub mod listen;
 pub mod lyrics;
