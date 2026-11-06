@@ -6093,7 +6093,7 @@ pub(crate) async fn virtual_shows_page(
     let genre = q.genre.as_deref().filter(|g| !g.is_empty());
     let (episodes, _total) = state
         .stores
-        .query(&mq)
+        .query_shallow(&mq)
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
 
