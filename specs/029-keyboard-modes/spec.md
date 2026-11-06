@@ -77,6 +77,11 @@ the UI can teach itself:
   grouped (Move, Play, Go to, Mode keys), standard and Vim side by side.
 - The panel names the mode it is in ("Show page", "Player"), so a
   learner sees why the keys differ between pages.
+- The panel lists only keys that do something on the page shown: a key
+  that presses a control, steps the season tabs or focuses an area is
+  left out while the page has no such control, tabs or area (a film has
+  no season keys; with nothing playing there is no `F`, `M` or `g q`)
+  (B620).
 
 ### `g`: go to
 
