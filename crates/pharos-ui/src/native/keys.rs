@@ -195,9 +195,12 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     let (title, rows) = match &shown {
         Help::After(p) => (
             format!("{} · {}", p.label, mode.label()),
-            keymap::help(mode, Some(p.key)),
+            keymap::help(mode, Some(p.key), offered),
         ),
-        Help::All => (format!("Keys · {}", mode.label()), keymap::help(mode, None)),
+        Help::All => (
+            format!("Keys · {}", mode.label()),
+            keymap::help(mode, None, offered),
+        ),
     };
     let prefix = match &shown {
         Help::After(p) => Some(keymap::key_name(p.key).to_owned()),
@@ -216,6 +219,19 @@ fn focus_mode(mode: Mode) -> Mode {
         Mode::Music | Mode::Queue if platform::focus_in_area("queue") => Mode::Queue,
         Mode::Queue => Mode::Music,
         m => m,
+    }
+}
+
+/// Whether the page shows what `action` acts on, so the help lists only
+/// keys that do something here: a film has no season tabs, and nothing
+/// playing has no mini bar.
+fn offered(action: Action) -> bool {
+    let shown = platform::key_action_shown;
+    match action {
+        Action::Press(name) => shown(name) || fallback(name).is_some_and(shown),
+        Action::Season(_) => platform::key_tabs_shown(),
+        Action::Focus(name) => platform::key_area_shown(name) || shown(name),
+        _ => true,
     }
 }
 

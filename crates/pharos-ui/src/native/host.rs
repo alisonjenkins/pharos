@@ -245,6 +245,18 @@ pub fn focus_key_area(_name: &str) -> bool {
     false
 }
 
+pub fn key_action_shown(_name: &str) -> bool {
+    true
+}
+
+pub fn key_tabs_shown() -> bool {
+    true
+}
+
+pub fn key_area_shown(_name: &str) -> bool {
+    true
+}
+
 pub fn focus_in_area(_name: &str) -> bool {
     false
 }

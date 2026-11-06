@@ -1729,6 +1729,28 @@ pub fn press_key_action(name: &str) -> bool {
     found.is_some_and(|el| click(&el))
 }
 
+fn shown_in_page(selector: &str) -> bool {
+    document()
+        .and_then(|d| d.query_selector(selector).ok().flatten())
+        .is_some()
+}
+
+/// Whether the page has a control a key presses as `name`, where
+/// [`press_key_action`] looks for one.
+pub fn key_action_shown(name: &str) -> bool {
+    shown_in_page(&format!("main [data-key-action='{name}']"))
+}
+
+/// Whether the page has tabs `[` and `]` step along.
+pub fn key_tabs_shown() -> bool {
+    shown_in_page("[data-key-tabs]")
+}
+
+/// Whether the page has the `data-key-area="<name>"` area.
+pub fn key_area_shown(name: &str) -> bool {
+    shown_in_page(&format!("[data-key-area='{name}']"))
+}
+
 /// Whether the focus is inside the `data-key-area="<name>"` area.
 pub fn focus_in_area(name: &str) -> bool {
     focused()
