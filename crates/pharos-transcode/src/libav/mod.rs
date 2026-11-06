@@ -57,6 +57,8 @@ pub mod subtitle;
 #[cfg(feature = "backend-lib")]
 pub mod subtitle_images;
 #[cfg(feature = "backend-lib")]
+pub mod subtitle_signals;
+#[cfg(feature = "backend-lib")]
 pub mod subtitle_windows;
 #[cfg(feature = "backend-lib")]
 pub mod trickplay;
