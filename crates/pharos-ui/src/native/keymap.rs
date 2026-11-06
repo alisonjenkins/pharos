@@ -614,10 +614,15 @@ pub struct HelpRow {
 }
 
 /// The help for `mode`: after a prefix, the keys that can follow it;
-/// without one, every key of the mode. Rows sharing a label are joined.
-pub fn help(mode: Mode, after: Option<&str>) -> Vec<HelpRow> {
+/// without one, every key of the mode whose action `offered` says the page
+/// can do now, so a film's page lists no season keys. Rows sharing a label
+/// are joined.
+pub fn help(mode: Mode, after: Option<&str>, offered: impl Fn(Action) -> bool) -> Vec<HelpRow> {
     let mut rows: Vec<HelpRow> = Vec::new();
-    for b in BINDINGS.iter().filter(|b| b.modes.has(mode)) {
+    for b in BINDINGS
+        .iter()
+        .filter(|b| b.modes.has(mode) && offered(b.action))
+    {
         let shown: Vec<&str> = match after {
             Some(p) => match b.keys.split_first() {
                 Some((first, rest)) if *first == p && !rest.is_empty() => rest.to_vec(),
@@ -797,7 +802,10 @@ mod tests {
         for keys in [&["F"][..], &["M"], &["g", "q"]] {
             assert_eq!(resolve(Mode::Player, keys), Resolved::Unbound, "{keys:?}");
         }
-        let labels: Vec<&str> = help(Mode::Player, None).iter().map(|r| r.label).collect();
+        let labels: Vec<&str> = help(Mode::Player, None, |_| true)
+            .iter()
+            .map(|r| r.label)
+            .collect();
         for gone in [
             "Open the full player",
             "Mini bar or floating player",
@@ -812,8 +820,39 @@ mod tests {
     }
 
     #[test]
+    fn the_help_lists_only_what_the_page_offers() {
+        // A film's page: no season tabs, no group to watch with.
+        let film = |a: Action| {
+            !matches!(
+                a,
+                Action::Season(_) | Action::Press("together" | "together-start")
+            )
+        };
+        let labels: Vec<&str> = help(Mode::Detail, None, film)
+            .iter()
+            .filter(|r| r.group == Group::Page)
+            .map(|r| r.label)
+            .collect();
+        assert!(labels.contains(&"Play or resume"));
+        for gone in [
+            "Previous season",
+            "Next season",
+            "Watch together",
+            "Watch together from the start",
+        ] {
+            assert!(!labels.contains(&gone), "{gone}");
+        }
+        // Go to's Watch together is a place, always offered.
+        let after_g: Vec<&str> = help(Mode::Detail, Some("g"), film)
+            .iter()
+            .map(|r| r.label)
+            .collect();
+        assert!(after_g.contains(&"Watch together"));
+    }
+
+    #[test]
     fn the_seek_to_a_tenth_keys_show_as_one_run() {
-        let row = help(Mode::Player, None)
+        let row = help(Mode::Player, None, |_| true)
             .into_iter()
             .find(|r| r.keys.iter().any(|k| k.contains('–')))
             .expect("a run of digits");
@@ -914,7 +953,7 @@ mod tests {
 
     #[test]
     fn help_after_g_lists_only_what_follows_it() {
-        let rows = help(Mode::Detail, Some("g"));
+        let rows = help(Mode::Detail, Some("g"), |_| true);
         let labels: Vec<_> = rows.iter().map(|r| r.label).collect();
         assert_eq!(
             labels,
@@ -925,7 +964,7 @@ mod tests {
 
     #[test]
     fn help_joins_standard_and_vim_keys_on_one_row() {
-        let rows = help(Mode::Browse, None);
+        let rows = help(Mode::Browse, None, |_| true);
         let up = rows.iter().find(|r| r.label == "Up").unwrap();
         assert_eq!(up.keys, ["↑", "k"]);
         let first = rows.iter().find(|r| r.label == "First").unwrap();
