@@ -219,6 +219,28 @@ pub fn on_key(_on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> KeyLis
     KeyListener
 }
 
+pub fn on_mode_key(_on_key: impl FnMut(&str) -> bool + 'static) -> KeyListener {
+    KeyListener
+}
+
+pub fn move_focus(_dir: super::keymap::Dir) -> bool {
+    false
+}
+
+pub fn activate_focused() -> bool {
+    false
+}
+
+pub fn press_key_action(_name: &str) -> bool {
+    false
+}
+
+pub fn step_tab(_step: i8) -> bool {
+    false
+}
+
+pub fn focus_arrival(_id: &str) {}
+
 pub struct TrackSkips;
 
 pub fn on_track_skip(

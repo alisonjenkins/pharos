@@ -1255,6 +1255,7 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| search);
     let mut palette = Palette(use_signal(|| false));
     use_context_provider(|| palette);
+    super::keys::provide_key_mode();
     let whats_new_state = use_whats_new_state();
     use_context_provider(|| whats_new_state);
     use_hook(move || {
@@ -1426,6 +1427,7 @@ fn NativeApp(route: Route) -> Element {
                 }
                 Screen { route: route.clone() }
                 StageView {}
+                super::keys::KeyLayer { route: route.clone(), on_palette: move |_| palette.0.set(true) }
                 WhatsNew { route }
                 if (palette.0)() {
                     PaletteScreen {}

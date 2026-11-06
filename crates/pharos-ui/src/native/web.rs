@@ -1577,6 +1577,193 @@ pub fn on_key(mut on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> Key
     KeyListener(listener)
 }
 
+/// Call `on_key` with each plain key pressed outside a text field that no
+/// handler nearer the focus took (spec 029): no Ctrl, Alt or Cmd, not a
+/// held key's repeat. When it answers true the browser does not act too.
+pub fn on_mode_key(mut on_key: impl FnMut(&str) -> bool + 'static) -> KeyListener {
+    let listener =
+        Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+            if e.ctrl_key()
+                || e.alt_key()
+                || e.meta_key()
+                || e.repeat()
+                || e.default_prevented()
+                || in_text_field(&e)
+            {
+                return;
+            }
+            if on_key(&e.key()) {
+                e.prevent_default();
+            }
+        });
+    if let Some(window) = web_sys::window() {
+        let _ =
+            window.add_event_listener_with_callback("keydown", listener.as_ref().unchecked_ref());
+    }
+    KeyListener(listener)
+}
+
+/// What a key can move the focus to: enabled buttons and links. Text and
+/// choice fields are left out, since their keys type: `/` reaches search.
+const KEY_TARGETS: &str = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
+
+fn document() -> Option<web_sys::Document> {
+    web_sys::window().and_then(|w| w.document())
+}
+
+/// The focused element, unless the focus is on nothing (the body).
+fn focused() -> Option<web_sys::Element> {
+    let doc = document()?;
+    let el = doc.active_element()?;
+    let body: Option<web_sys::Element> = doc.body().map(Into::into);
+    (Some(&el) != body.as_ref()).then_some(el)
+}
+
+/// Focus `el` without scrolling the page when `scroll` is false.
+fn focus_element(el: &web_sys::Element, scroll: bool) -> bool {
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("preventScroll"),
+        &JsValue::from_bool(!scroll),
+    );
+    let focus = js_sys::Reflect::get(el, &JsValue::from_str("focus"))
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+    match focus.map(|f| f.call1(el, &options)) {
+        Some(Ok(_)) => true,
+        Some(Err(e)) => {
+            warn(&format!("pharos: keys: focus refused: {e:?}"));
+            false
+        }
+        None => false,
+    }
+}
+
+fn shown_targets(scope: &web_sys::Element) -> Vec<(web_sys::Element, super::keymap::Rect)> {
+    let Ok(list) = scope.query_selector_all(KEY_TARGETS) else {
+        return Vec::new();
+    };
+    (0..list.length())
+        .filter_map(|i| list.item(i)?.dyn_into::<web_sys::Element>().ok())
+        .filter_map(|el| {
+            let r = el.get_bounding_client_rect();
+            let shown = r.width() > 0.0 && r.height() > 0.0;
+            shown.then(|| (el, (r.left(), r.top(), r.width(), r.height())))
+        })
+        .collect()
+}
+
+/// Move the focus in `dir` among the controls of the nearest `data-keys`
+/// area around it; First and Last stay inside its `data-keys-list`, when
+/// it is in one. With the focus on nothing, focus the area's first
+/// control in view. False when there was nowhere to go.
+pub fn move_focus(dir: super::keymap::Dir) -> bool {
+    use super::keymap::Dir;
+    let Some(doc) = document() else {
+        return false;
+    };
+    let Some(from) = focused() else {
+        let Some(area) = doc.query_selector("[data-keys]").ok().flatten() else {
+            return false;
+        };
+        let (_, view_h) = viewport();
+        let first = shown_targets(&area)
+            .into_iter()
+            .find(|(_, r)| r.1 + r.3 > 0.0 && r.1 < view_h);
+        return first.is_some_and(|(el, _)| focus_element(&el, true));
+    };
+    let near = |selector: &str| from.closest(selector).ok().flatten();
+    let scope = match dir {
+        Dir::First | Dir::Last => near("[data-keys-list]").or_else(|| near("[data-keys]")),
+        _ => near("[data-keys]"),
+    };
+    let Some(scope) = scope else {
+        return false;
+    };
+    let targets = shown_targets(&scope);
+    let r = from.get_bounding_client_rect();
+    let rects: Vec<_> = targets.iter().map(|(_, r)| *r).collect();
+    match super::keymap::pick(dir, (r.left(), r.top(), r.width(), r.height()), &rects)
+        .and_then(|i| targets.get(i))
+    {
+        Some((el, _)) if *el != from => {
+            let moved = focus_element(el, true);
+            if moved {
+                el.scroll_into_view_with_bool(false);
+            }
+            moved
+        }
+        _ => false,
+    }
+}
+
+fn click(el: &web_sys::Element) -> bool {
+    match el.dyn_ref::<web_sys::HtmlElement>() {
+        Some(html) => {
+            html.click();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Click the focused control, as Enter would.
+pub fn activate_focused() -> bool {
+    focused().is_some_and(|el| click(&el))
+}
+
+/// Click the control marked `data-key-action="<name>"`: the one in the
+/// focused `data-key-row` when there is one, else the page's first.
+pub fn press_key_action(name: &str) -> bool {
+    let selector = format!("[data-key-action='{name}']");
+    let in_row = focused()
+        .and_then(|el| el.closest("[data-key-row]").ok().flatten())
+        .and_then(|row| row.query_selector(&selector).ok().flatten());
+    let found = in_row.or_else(|| {
+        document()?
+            .query_selector(&format!("main {selector}"))
+            .ok()
+            .flatten()
+    });
+    found.is_some_and(|el| click(&el))
+}
+
+/// Open the tab `step` places from the current one in the page's
+/// `data-key-tabs` strip, and focus it.
+pub fn step_tab(step: i8) -> bool {
+    let Some(strip) = document().and_then(|d| d.query_selector("[data-key-tabs]").ok().flatten())
+    else {
+        return false;
+    };
+    let tabs = strip.children();
+    let current = (0..tabs.length()).find(|&i| {
+        tabs.item(i)
+            .is_some_and(|t| t.get_attribute("aria-current").is_some())
+    });
+    let next = current.and_then(|i| i.checked_add_signed(i32::from(step)));
+    match next.and_then(|i| tabs.item(i)) {
+        Some(tab) => {
+            focus_element(&tab, true);
+            click(&tab)
+        }
+        None => false,
+    }
+}
+
+/// Focus the element `id` without scrolling, unless the focus is already
+/// on something in the page body: a page opened from the keyboard (the
+/// search box, a tile, the palette) puts it on its main action, and one
+/// opened by Back keeps its scroll.
+pub fn focus_arrival(id: &str) {
+    if focused().is_some_and(|el| el.closest("main").ok().flatten().is_some()) {
+        return;
+    }
+    if let Some(el) = document().and_then(|d| d.get_element_by_id(id)) {
+        focus_element(&el, false);
+    }
+}
+
 /// The page-wide track skips, removed on drop: a window `keydown`
 /// listener and the media session's `previoustrack` / `nexttrack` actions.
 pub struct TrackSkips {
