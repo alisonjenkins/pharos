@@ -3417,6 +3417,19 @@ pub trait MediaStore: Send + Sync {
         }
     }
 
+    /// [`query`](Self::query) without the per-stream and long-text fields:
+    /// subtitle, audio and attachment tracks, chapters, alternate sources,
+    /// trailers, production locations, provider ids, overview, tagline and
+    /// synopsis come back empty. For a caller that folds many rows by their
+    /// series, album or dates and never reads those. The default reads full
+    /// rows.
+    fn query_shallow(
+        &self,
+        q: &MediaQuery,
+    ) -> impl std::future::Future<Output = DomainResult<(Vec<MediaItem>, u64)>> + Send {
+        self.query(q)
+    }
+
     /// LIB-B4 — full-text search over `title` + `overview` via the
     /// backend's native FTS (SQLite fts5 external-content vtable; postgres
     /// a GENERATED `tsvector` + GIN). Returns up to `limit` items ranked

@@ -55,6 +55,23 @@ fn user_record(name: &str) -> UserRecord {
     }
 }
 
+/// `item` as `MediaStore::query_shallow` returns it: its stream and long
+/// text fields empty.
+fn shallow_of(mut item: MediaItem) -> MediaItem {
+    item.probe.subtitle_tracks = Default::default();
+    item.probe.audio_tracks = Default::default();
+    item.probe.attachments = Default::default();
+    item.probe.chapters = Default::default();
+    item.probe.alternate_sources = Default::default();
+    item.probe.synopsis = None;
+    item.metadata.overview = None;
+    item.metadata.tagline = None;
+    item.metadata.provider_ids = Default::default();
+    item.metadata.production_locations = Vec::new();
+    item.metadata.trailers = Vec::new();
+    item
+}
+
 async fn run_conformance<S>(store: S)
 where
     S: pharos_core::MediaStore
@@ -1988,6 +2005,14 @@ where
                 MediaStore::query_ids(&store, q).await.unwrap(),
                 rows.iter().map(|i| i.id).collect::<Vec<_>>(),
                 "query_ids {scope:?}"
+            );
+            let (shallow, shallow_total) = MediaStore::query_shallow(&store, q).await.unwrap();
+            let (_, total) = MediaStore::query(&store, q).await.unwrap();
+            assert_eq!(shallow_total, total, "query_shallow total {scope:?}");
+            assert_eq!(
+                shallow,
+                rows.iter().cloned().map(shallow_of).collect::<Vec<_>>(),
+                "query_shallow {scope:?}"
             );
         }
         let mut got: Vec<MediaId> = items

@@ -104,6 +104,41 @@ pub mod string_list_json;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) mod media_query;
 
+/// The columns `MediaStore::query_shallow` leaves empty: per-stream JSON
+/// and long text, the bulk of a row's bytes and decode time.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+const SHALLOW_OMITTED: &[&str] = &[
+    "subtitle_tracks_json",
+    "attachments_json",
+    "chapters_json",
+    "audio_tracks_json",
+    "alternate_sources_json",
+    "trailers_json",
+    "production_locations_json",
+    "provider_ids",
+    "overview",
+    "tagline",
+    "synopsis",
+];
+
+/// `columns`, a comma list of media columns, with each of
+/// [`SHALLOW_OMITTED`] selected as `NULL` under its own name.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn shallow_columns(columns: &str) -> String {
+    columns
+        .split(',')
+        .map(str::trim)
+        .map(|c| {
+            if SHALLOW_OMITTED.contains(&c) {
+                format!("NULL AS {c}")
+            } else {
+                c.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A `transcode_sessions` row as both backends select it.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) type TranscodeSessionRow = (i64, String, String, String, Option<String>, Option<String>);
