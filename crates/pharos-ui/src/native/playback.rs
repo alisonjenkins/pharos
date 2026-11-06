@@ -485,6 +485,54 @@ impl SubtitleSize {
     }
 }
 
+/// Where the viewer's subtitle effects choice is kept; absent or unknown is
+/// [`EffectsLevel::Subtle`].
+pub const EFFECTS_LEVEL_KEY: &str = "pharos.subtitles.effects";
+
+/// How much motion the styled subtitle track may carry on this device
+/// (spec 028 FR-018).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum EffectsLevel {
+    Off,
+    #[default]
+    Subtle,
+    Full,
+}
+
+impl EffectsLevel {
+    /// Every level offered, calmest first.
+    pub const ALL: [EffectsLevel; 3] =
+        [EffectsLevel::Off, EffectsLevel::Subtle, EffectsLevel::Full];
+
+    /// The level a stored [`EFFECTS_LEVEL_KEY`] value holds; anything unknown
+    /// is [`EffectsLevel::Subtle`].
+    pub fn parse(stored: &str) -> EffectsLevel {
+        match stored.trim() {
+            "off" => EffectsLevel::Off,
+            "full" => EffectsLevel::Full,
+            _ => EffectsLevel::Subtle,
+        }
+    }
+
+    /// The stored value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectsLevel::Off => "off",
+            EffectsLevel::Subtle => "subtle",
+            EffectsLevel::Full => "full",
+        }
+    }
+
+    /// The option text shown in the Appearance picker.
+    pub fn label(self) -> &'static str {
+        match self {
+            EffectsLevel::Off => "Off",
+            EffectsLevel::Subtle => "Subtle",
+            EffectsLevel::Full => "Full",
+        }
+    }
+}
+
 /// Where the viewer's library card transition is kept; absent or unknown is
 /// [`LibraryTransition::Fade`].
 pub const LIBRARY_TRANSITION_KEY: &str = "pharos.library.transition";
@@ -1318,6 +1366,23 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), OverlayEffect::ALL.len());
+    }
+
+    #[test]
+    fn effects_level_round_trips_and_falls_back_to_subtle() {
+        for level in EffectsLevel::ALL {
+            assert_eq!(EffectsLevel::parse(level.as_str()), level);
+            assert_eq!(EffectsLevel::parse(&format!(" {} ", level.as_str())), level);
+        }
+        assert_eq!(EffectsLevel::parse(""), EffectsLevel::Subtle);
+        assert_eq!(EffectsLevel::parse("loud"), EffectsLevel::Subtle);
+        assert_eq!(EffectsLevel::parse("Full"), EffectsLevel::Subtle);
+        assert_eq!(EffectsLevel::default(), EffectsLevel::Subtle);
+        assert_eq!(
+            EffectsLevel::ALL.map(EffectsLevel::label),
+            ["Off", "Subtle", "Full"]
+        );
+        assert_eq!(EFFECTS_LEVEL_KEY, "pharos.subtitles.effects");
     }
 
     #[test]
