@@ -2891,6 +2891,102 @@ test.describe("pharos Dioxus UI play queue", () => {
     await toggle.click();
     await expect(panel).toBeHidden();
   });
+
+  // Spec 029 (V512): the album page, the music player and its queue work
+  // from the keyboard alone.
+  test("an album plays, queues and shrinks from the keyboard", async ({ page, request }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(
+      probe.status() !== 405,
+      `native API is not enabled (status ${probe.status()}); skipping native test`,
+    );
+    const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-keys-${Date.now()}", Version="0"`,
+      },
+      data: { Username: TEST_USER, Pw: TEST_PASS },
+    });
+    test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+    const { AccessToken: token, User: user } = await auth.json();
+    const api = { "X-Emby-Token": token };
+    const json = async (path: string) =>
+      (await request.get(`${PHAROS_URL}${path}`, { headers: api })).json();
+    const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
+    const tracks = await json(
+      `/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
+    );
+    const track = tracks.Items?.find((t: Song) => t.Album && songBy(t));
+    test.skip(!track, "the seed has no track tagged with an album and artist");
+    const artists = await json(`/Artists`);
+    const artist = artists.Items?.find((a: { Name: string }) => a.Name === songBy(track));
+    expect(artist, "the track's artist is listed").toBeTruthy();
+
+    await page.goto("/ui/");
+    await page.evaluate(() => localStorage.removeItem("pharos.listen.queue"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await page.goto(`/ui/browse/${nativeSynth(artist.Id)}`);
+    const card = page
+      .locator("section.pharos-artist ul.pharos-grid li", { hasText: track.Album })
+      .first();
+    await expect(card).toBeVisible({ timeout: 15_000 });
+    const albumPath = await card.locator("a").first().getAttribute("href");
+    await page.goto(albumPath ?? "");
+
+    // Opened fresh, the first track holds the focus, so Enter plays it.
+    const first = page.locator("#pharos-first-track a.pharos-track");
+    await expect(first).toBeFocused({ timeout: 15_000 });
+    for (let i = 0; i < 3; i++) {
+      await page.keyboard.press("a");
+      await expect(page.locator("#pharos-first-track .pharos-queue-note")).toHaveText(
+        /added to the queue/,
+      );
+    }
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // q opens the queue and puts the focus in it; G, k and d work its rows.
+    const panel = page.getByRole("complementary", { name: "Queue" });
+    const entries = panel.locator("li.pharos-queue-entry");
+    await page.locator("body").focus();
+    await page.keyboard.press("q");
+    await expect(panel).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Shuffle" })).toBeFocused();
+    await page.keyboard.press("s");
+    await expect(panel.getByRole("button", { name: "Shuffle" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect.poll(() => entries.count()).toBeGreaterThanOrEqual(2);
+    const count = await entries.count();
+    await page.keyboard.press("G");
+    const focusedRow = panel.locator("li.pharos-queue-entry:has(:focus)");
+    await expect(focusedRow).toHaveCount(1);
+    await expect(focusedRow).toHaveAttribute("data-key", (await entries.last().getAttribute("data-key")) ?? "");
+    await page.keyboard.press("k");
+    await expect(focusedRow).toHaveCount(1);
+    await page.keyboard.press("d");
+    await expect(entries).toHaveCount(count - 1);
+
+    // Out of the queue, Escape takes the song to the small player and
+    // Shift+F brings the full player back.
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-full")).toHaveCount(0);
+    await expect(page.locator(".pharos-stage")).toBeVisible();
+    await page.keyboard.press("Shift+F");
+    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+      timeout: 15_000,
+    });
+  });
 });
 
 // Spec 020: one player for the session. A song keeps playing through 20
