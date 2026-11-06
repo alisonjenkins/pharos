@@ -536,6 +536,118 @@ impl EffectsLevel {
     }
 }
 
+/// How much animation a styled subtitle track may carry (spec 028 FR-006),
+/// cheapest first so a cap is `min`. `label` is the server's `?tier=` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    Low,
+    Tv,
+    Desktop,
+}
+
+impl Tier {
+    /// Every tier, cheapest first.
+    pub const ALL: [Tier; 3] = [Tier::Low, Tier::Tv, Tier::Desktop];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Low => "low",
+            Tier::Tv => "tv",
+            Tier::Desktop => "desktop",
+        }
+    }
+}
+
+/// What kind of screen the page runs on, for choosing a [`Tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Tv,
+    Phone,
+    Desktop,
+}
+
+impl DeviceClass {
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceClass::Tv => "tv",
+            DeviceClass::Phone => "phone",
+            DeviceClass::Desktop => "desktop",
+        }
+    }
+}
+
+/// User agent tokens that mark a TV browser (spec 028 plan, Client tier choice).
+const TV_AGENT_TOKENS: [&str; 6] = [
+    "Android TV",
+    "GoogleTV",
+    "AFT",
+    "BRAVIA",
+    "SMART-TV",
+    "Tizen",
+];
+
+/// The device class: a TV user agent or the Android shell is a TV, a coarse
+/// pointer on a narrow screen is a phone, anything else a desktop.
+pub fn device_class(
+    user_agent: &str,
+    coarse_pointer: bool,
+    narrow_screen: bool,
+    android_shell: bool,
+) -> DeviceClass {
+    if android_shell
+        || TV_AGENT_TOKENS
+            .iter()
+            .any(|t| has_word_start(user_agent, t))
+    {
+        DeviceClass::Tv
+    } else if coarse_pointer && narrow_screen {
+        DeviceClass::Phone
+    } else {
+        DeviceClass::Desktop
+    }
+}
+
+/// Whether `token` occurs in `text` at the start of a word, so the short
+/// `AFT` (Fire TV models: AFTMM, AFTS) does not match inside another word.
+fn has_word_start(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(at, _)| {
+        text[..at]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_ascii_alphanumeric())
+    })
+}
+
+/// The tier a styled track is first fetched at: Low under reduced motion,
+/// else Tv for TVs and phones and Desktop for desktops, capped at the tier
+/// this device last dropped to.
+pub fn starting_tier(device: DeviceClass, reduced_motion: bool, remembered: Option<Tier>) -> Tier {
+    let by_device = if reduced_motion {
+        Tier::Low
+    } else {
+        match device {
+            DeviceClass::Tv | DeviceClass::Phone => Tier::Tv,
+            DeviceClass::Desktop => Tier::Desktop,
+        }
+    };
+    remembered.map_or(by_device, |cap| by_device.min(cap))
+}
+
+/// The log line that records why a starting tier was chosen.
+pub fn starting_tier_line(
+    tier: Tier,
+    device: DeviceClass,
+    reduced_motion: bool,
+    remembered: Option<Tier>,
+) -> String {
+    format!(
+        "pharos: subtitle tier={} device={} reduced_motion={reduced_motion} remembered={}",
+        tier.label(),
+        device.label(),
+        remembered.map_or("none", Tier::label),
+    )
+}
+
 /// Where the viewer's library card transition is kept; absent or unknown is
 /// [`LibraryTransition::Fade`].
 pub const LIBRARY_TRANSITION_KEY: &str = "pharos.library.transition";
@@ -1474,6 +1586,130 @@ mod tests {
             ["Off", "Subtle", "Full"]
         );
         assert_eq!(EFFECTS_LEVEL_KEY, "pharos.subtitles.effects");
+    }
+
+    #[test]
+    fn tier_labels_are_the_servers_tier_query_values() {
+        assert_eq!(Tier::ALL.map(Tier::label), ["low", "tv", "desktop"]);
+        assert!(Tier::Low < Tier::Tv && Tier::Tv < Tier::Desktop);
+    }
+
+    #[test]
+    fn device_class_follows_the_user_agent_pointer_and_shell() {
+        let chrome = "Mozilla/5.0 (X11; Linux x86_64) Chrome/130 Safari/537.36";
+        let cases = [
+            (chrome, false, false, false, DeviceClass::Desktop),
+            (chrome, true, false, false, DeviceClass::Desktop),
+            (chrome, false, true, false, DeviceClass::Desktop),
+            (chrome, true, true, false, DeviceClass::Phone),
+            (chrome, false, false, true, DeviceClass::Tv),
+            (
+                "Mozilla/5.0 (Linux; Android 12; Android TV) Chrome/110",
+                true,
+                true,
+                false,
+                DeviceClass::Tv,
+            ),
+            (
+                "Mozilla/5.0 (Linux; GoogleTV 5.0) Chrome/90",
+                false,
+                false,
+                false,
+                DeviceClass::Tv,
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 9; AFTMM) Chrome/90",
+                false,
+                false,
+                false,
+                DeviceClass::Tv,
+            ),
+            // A token only counts at the start of a word.
+            (
+                "Mozilla/5.0 (X11; Linux x86_64) Chrome/130 XAFTER/1.0",
+                false,
+                false,
+                false,
+                DeviceClass::Desktop,
+            ),
+            (
+                "Mozilla/5.0 (Linux; BRAVIA 4K) Chrome/90",
+                false,
+                false,
+                false,
+                DeviceClass::Tv,
+            ),
+            (
+                "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit",
+                false,
+                false,
+                false,
+                DeviceClass::Tv,
+            ),
+            (
+                "Mozilla/5.0 (Linux; Tizen 5.5) AppleWebKit",
+                false,
+                false,
+                false,
+                DeviceClass::Tv,
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/130 Mobile",
+                true,
+                true,
+                false,
+                DeviceClass::Phone,
+            ),
+            ("", false, false, false, DeviceClass::Desktop),
+        ];
+        for (agent, coarse, narrow, shell, want) in cases {
+            assert_eq!(
+                device_class(agent, coarse, narrow, shell),
+                want,
+                "{agent} {coarse} {narrow} {shell}"
+            );
+        }
+        assert_eq!(
+            [DeviceClass::Tv, DeviceClass::Phone, DeviceClass::Desktop].map(DeviceClass::label),
+            ["tv", "phone", "desktop"]
+        );
+    }
+
+    #[test]
+    fn starting_tier_follows_device_motion_and_the_remembered_drop() {
+        use DeviceClass::{Desktop, Phone, Tv};
+        let cases = [
+            (Desktop, false, None, Tier::Desktop),
+            (Tv, false, None, Tier::Tv),
+            (Phone, false, None, Tier::Tv),
+            (Desktop, true, None, Tier::Low),
+            (Tv, true, None, Tier::Low),
+            (Desktop, false, Some(Tier::Tv), Tier::Tv),
+            (Desktop, false, Some(Tier::Low), Tier::Low),
+            (Desktop, false, Some(Tier::Desktop), Tier::Desktop),
+            (Tv, false, Some(Tier::Desktop), Tier::Tv),
+            (Phone, false, Some(Tier::Low), Tier::Low),
+            (Desktop, true, Some(Tier::Desktop), Tier::Low),
+        ];
+        for (device, reduced, remembered, want) in cases {
+            assert_eq!(
+                starting_tier(device, reduced, remembered),
+                want,
+                "{device:?} {reduced} {remembered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_starting_tier_log_line_names_every_input() {
+        assert_eq!(
+            starting_tier_line(Tier::Low, DeviceClass::Tv, true, Some(Tier::Tv)),
+            "pharos: subtitle tier=low device=tv reduced_motion=true remembered=tv"
+        );
+        assert_eq!(
+            starting_tier_line(Tier::Desktop, DeviceClass::Desktop, false, None),
+            "pharos: subtitle tier=desktop device=desktop reduced_motion=false remembered=none"
+        );
     }
 
     #[test]
