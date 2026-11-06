@@ -512,6 +512,7 @@ pub fn PaletteView(
     failed: Option<String>,
     on_input: EventHandler<String>,
     on_key: EventHandler<KeyboardEvent>,
+    on_pick: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
     let active_id = active.map(|at| option_id("palette", at));
@@ -543,7 +544,7 @@ pub fn PaletteView(
                     class: "pharos-palette-list",
                     role: "listbox",
                     "aria-label": "Places and matches",
-                    onclick: move |_| on_close.call(()),
+                    onclick: move |_| on_pick.call(()),
                     for (group, members) in groups(&rows) {
                         ul { key: "{group}", role: "group", "aria-label": group,
                             li { class: "pharos-palette-group", role: "presentation", "{group}" }
@@ -562,6 +563,24 @@ pub fn PaletteView(
                                                 }
                                             }
                                         },
+                                        Row::Search(term) => {
+                                            let again = term.clone();
+                                            rsx! {
+                                                // Searches again in place, so the list's click must not close it.
+                                                button {
+                                                    class: "pharos-search-hit pharos-palette-again",
+                                                    r#type: "button",
+                                                    onclick: move |evt: MouseEvent| {
+                                                        evt.stop_propagation();
+                                                        on_input.call(again.clone());
+                                                    },
+                                                    span { class: "pharos-search-text",
+                                                        span { class: "pharos-search-name", "{term}" }
+                                                        span { class: "pharos-muted", "Search" }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         Row::Recent(item) | Row::Title(item) => rsx! { SearchHit { item: item.clone() } },
                                     }
                                 }
@@ -1382,6 +1401,7 @@ mod tests {
                     failed: None,
                     on_input: |_| {},
                     on_key: |_| {},
+                    on_pick: |_| {},
                     on_close: |_| {},
                 }
             }
@@ -1412,6 +1432,7 @@ mod tests {
                         failed: failed.clone(),
                         on_input: |_| {},
                         on_key: |_| {},
+                        on_pick: |_| {},
                         on_close: |_| {},
                     }
                 }
