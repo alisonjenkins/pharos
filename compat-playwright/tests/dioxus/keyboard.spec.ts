@@ -140,6 +140,44 @@ test.describe("keyboard modes (spec 029)", () => {
     await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show");
   });
 
+  test("? lists only the keys the page can use", async ({ page, request }) => {
+    await signIn(page, request);
+    const help = page.locator(".pharos-key-help");
+    // Nothing is playing, so there is no player to open or resize.
+    await page.keyboard.press("?");
+    await expect(help).toBeVisible();
+    await expect(help).not.toContainText("Open the full player");
+    await expect(help).not.toContainText("Mini bar or floating player");
+    await expect(help).not.toContainText("Now playing");
+    await page.keyboard.press("Escape");
+
+    // A show lists the season keys exactly when it has season tabs (the
+    // seeded show has one season, so none).
+    await openShow(page);
+    await page.keyboard.press("?");
+    await expect(help).toContainText("Mark watched or unwatched");
+    if ((await page.locator("[data-key-tabs]").count()) > 0) {
+      await expect(help).toContainText("Next season");
+    } else {
+      await expect(help).not.toContainText("Next season");
+    }
+    await page.keyboard.press("Escape");
+
+    // A film has none.
+    const search = page.locator(".pharos-search input[type=search]");
+    await search.fill("AA Bulk 026");
+    await expect(page.locator(".pharos-search [role=listbox] [role=option]").first()).toBeVisible({
+      timeout: 15_000,
+    });
+    await search.press("ArrowDown");
+    await search.press("Enter");
+    await expect(page.locator("#pharos-main-action")).toBeFocused({ timeout: 15_000 });
+    await page.keyboard.press("?");
+    await expect(help).toContainText("Play or resume");
+    await expect(help).not.toContainText("Next season");
+    await expect(help).not.toContainText("Previous season");
+  });
+
   test("typing in the search box is never taken by the keys", async ({ page, request }) => {
     await signIn(page, request);
     await openShow(page);
