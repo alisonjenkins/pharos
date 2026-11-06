@@ -26,11 +26,17 @@ const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
 // its order (the bar replaced the old Find page). Only a hit naming the
 // term counts, so a list still showing an earlier search is never clicked,
 // and the helper returns once the page has moved to that hit and shows it.
+// The shows, seasons, artists and albums listed ahead of titles (V518) are
+// passed over.
 async function openFirstHit(page: Page, term: string): Promise<void> {
   await page.getByRole("combobox", { name: "Search all libraries" }).fill(term);
+  const group = page.locator(".pharos-muted", {
+    hasText: /^(Series|Season|Album|Artist)( ·|$)/,
+  });
   const hit = page
     .getByRole("option")
     .filter({ hasText: new RegExp(term, "i") })
+    .filter({ hasNot: group })
     .first()
     .getByRole("link");
   await expect(hit).toBeVisible({ timeout: 15_000 });
