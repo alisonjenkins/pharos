@@ -487,6 +487,11 @@ fn option_id(list: &str, at: usize) -> String {
 pub const PALETTE_INPUT: &str = "palette-input";
 const PALETTE_LIST: &str = "palette-list";
 
+/// Scrolls the palette's list so its row `at` is in sight.
+pub fn reveal_palette_row(at: usize) {
+    platform::reveal(PALETTE_LIST, &option_id("palette", at));
+}
+
 /// The Ctrl+K / Cmd+K palette: a box over the page that goes anywhere,
 /// listing `rows` under their group headings. `active` is the row Enter
 /// opens; `failed` is a search that did not answer.
