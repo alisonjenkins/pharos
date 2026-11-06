@@ -1527,6 +1527,12 @@ test.describe("pharos Dioxus UI", () => {
       const box = palette.getByRole("combobox");
       await expect(box).toHaveValue("Playwright");
       await expect(box).toBeFocused();
+      // The term it opens on is selected, so typing replaces it (B622).
+      await expect
+        .poll(() =>
+          box.evaluate((el: HTMLInputElement) => [el.selectionStart, el.selectionEnd]),
+        )
+        .toEqual([0, "Playwright".length]);
       await expect(palette.getByRole("group", { name: "Titles" })).toBeVisible({
         timeout: 15_000,
       });
