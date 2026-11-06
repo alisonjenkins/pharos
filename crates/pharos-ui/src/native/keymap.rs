@@ -161,6 +161,9 @@ const NOT_MUSIC: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Player,
 const DETAIL: Modes = Modes::Only(&[Mode::Detail]);
 const PLAYERS: Modes = Modes::Only(&[Mode::Player, Mode::Music]);
 const VIDEO: Modes = Modes::Only(&[Mode::Player]);
+/// The music player's size keys mean nothing on the video page, which has
+/// no mini bar or floating window.
+const NOT_VIDEO: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Music, Mode::Queue]);
 
 const fn bind(
     keys: &'static [&'static str],
@@ -448,14 +451,14 @@ pub const BINDINGS: &[Binding] = &[
         &["F"],
         "Open the full player",
         G::Play,
-        Modes::All,
+        NOT_VIDEO,
         A::Press("full-player"),
     ),
     bind(
         &["M"],
         "Mini bar or floating player",
         G::Play,
-        Modes::All,
+        NOT_VIDEO,
         A::Press("player-size"),
     ),
     bind(
@@ -528,7 +531,7 @@ pub const BINDINGS: &[Binding] = &[
         &["g", "q"],
         "Now playing",
         G::GoTo,
-        Modes::All,
+        NOT_VIDEO,
         A::Press("full-player"),
     ),
     bind(
@@ -639,8 +642,31 @@ pub fn help(mode: Mode, after: Option<&str>) -> Vec<HelpRow> {
             }),
         }
     }
+    for row in &mut rows {
+        if let Some(run) = digit_run(&row.keys) {
+            row.keys = vec![run];
+        }
+    }
     rows.sort_by_key(|r| r.group);
     rows
+}
+
+/// `0–9` for the keys `0` to `9` in order, so the panel shows one key,
+/// not ten, for the seek-to-a-tenth row.
+fn digit_run(keys: &[String]) -> Option<String> {
+    let digits: Vec<u32> = keys
+        .iter()
+        .map(|k| {
+            let mut c = k.chars();
+            match (c.next(), c.next()) {
+                (Some(d), None) => d.to_digit(10),
+                _ => None,
+            }
+        })
+        .collect::<Option<_>>()?;
+    let (first, last) = (*digits.first()?, *digits.last()?);
+    let contiguous = digits.windows(2).all(|w| w[1] == w[0] + 1);
+    (contiguous && digits.len() > 2).then(|| format!("{first}–{last}"))
 }
 
 /// A control's box on screen: left, top, width, height.
@@ -764,6 +790,34 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_video_player_lists_no_music_player_keys() {
+        for keys in [&["F"][..], &["M"], &["g", "q"]] {
+            assert_eq!(resolve(Mode::Player, keys), Resolved::Unbound, "{keys:?}");
+        }
+        let labels: Vec<&str> = help(Mode::Player, None).iter().map(|r| r.label).collect();
+        for gone in [
+            "Open the full player",
+            "Mini bar or floating player",
+            "Now playing",
+        ] {
+            assert!(!labels.contains(&gone), "{gone}");
+        }
+        assert_eq!(
+            resolve(Mode::Browse, &["F"]),
+            Resolved::Run(Action::Press("full-player"))
+        );
+    }
+
+    #[test]
+    fn the_seek_to_a_tenth_keys_show_as_one_run() {
+        let row = help(Mode::Player, None)
+            .into_iter()
+            .find(|r| r.keys.iter().any(|k| k.contains('–')))
+            .expect("a run of digits");
+        assert_eq!(row.keys, vec!["0–9".to_owned()]);
     }
 
     #[test]
