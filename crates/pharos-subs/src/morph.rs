@@ -1,6 +1,6 @@
 //! Mask-space operations: border dilation and the rounded backdrop.
 
-use crate::raster::{isqrt, Bitmap, FP};
+use crate::raster::{isqrt, Bitmap};
 
 /// Grows coverage by a disc of radius `r` pixels (`\bord`). The output is
 /// `2r` larger in each dimension; the source sits at offset (`r`, `r`).
@@ -66,40 +66,106 @@ pub(crate) fn dilate(src: &Bitmap, r: u32) -> Bitmap {
     out
 }
 
-/// Rounded-rectangle coverage, `w` x `h`, corner radius `r` px. Integer
-/// distance to the corner circle at pixel centres (24.8).
-pub(crate) fn rounded_rect(w: u32, h: u32, r: u32) -> Bitmap {
+/// One backdrop for a stacked block of lines: `rects` are each line's
+/// padded box `(x, y, w, h)` in px, top to bottom, touching vertically.
+/// Each box is shrunk by `r`, the distance fields are merged with a
+/// polynomial smooth-min (`k = 2r`) and offset back out by `r`, so outer
+/// corners round at `r`, the seams between lines close with no notch, and
+/// the inner corners where line widths differ get a smooth fillet. Returns
+/// the coverage and its top-left in px. Cost is one pass over the block's
+/// bounding box per line; it runs only when a cue changes.
+pub(crate) fn rounded_union(rects: &[(i32, i32, u32, u32)], r: u32) -> Option<(Bitmap, i32, i32)> {
+    let x0 = rects.iter().map(|b| b.0).min()?;
+    let y0 = rects.iter().map(|b| b.1).min()?;
+    let x1 = rects.iter().map(|b| b.0 + b.2 as i32).max()?;
+    let y1 = rects.iter().map(|b| b.1 + b.3 as i32).max()?;
+    let (w, h) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+    let min_side = rects.iter().map(|b| b.2.min(b.3)).min()?;
+    let r = r.min(min_side / 2) as f32;
+    let k = 2.0 * r;
+    // (centre x, centre y, half width, half height) of each shrunk box.
+    let boxes: Vec<[f32; 4]> = rects
+        .iter()
+        .map(|&(bx, by, bw, bh)| {
+            let (hw, hh) = (bw as f32 / 2.0, bh as f32 / 2.0);
+            [
+                (bx - x0) as f32 + hw,
+                (by - y0) as f32 + hh,
+                (hw - r).max(0.0),
+                (hh - r).max(0.0),
+            ]
+        })
+        .collect();
+    // Only pixels near a corner, a seam or a fillet need the full field.
+    // Per row, each box's straight band (within `r - 0.5` of the shrunk
+    // box) is solid and is filled with a memset; beyond what the smooth-min
+    // can pull (`k / 4`) is empty; the field is evaluated only in between,
+    // a few radii at each end of each row.
+    let solid = r - 0.5;
+    let empty = r + 0.5 + k / 4.0;
     let mut bm = Bitmap::new(w, h);
-    bm.data.fill(255);
-    let r = r.min(w / 2).min(h / 2);
-    if r == 0 {
-        return bm;
-    }
-    let fp = i64::from(FP);
-    let rf = i64::from(r) * fp;
-    for cy in 0..r {
-        for cx in 0..r {
-            let dx = rf - (i64::from(cx) * fp + fp / 2);
-            let dy = rf - (i64::from(cy) * fp + fp / 2);
-            let dist = isqrt((dx * dx + dy * dy) as u64) as i64;
-            let cov = ((rf - dist + fp / 2).clamp(0, fp) * 255 / fp) as u8;
-            for (x, y) in [
-                (cx, cy),
-                (w - 1 - cx, cy),
-                (cx, h - 1 - cy),
-                (w - 1 - cx, h - 1 - cy),
-            ] {
-                if let Some(p) = bm.data.get_mut(y as usize * w as usize + x as usize) {
-                    *p = cov;
+    let wi = w as i32;
+    for py in 0..h {
+        let fy = py as f32 + 0.5;
+        let row = &mut bm.data[(py * w) as usize..((py + 1) * w) as usize];
+        let mut edges: Vec<(i32, i32)> = Vec::with_capacity(2 * boxes.len());
+        for &[cx, cy, hw, hh] in &boxes {
+            let qy = (fy - cy).abs() - hh;
+            if qy >= empty {
+                continue;
+            }
+            let ext = if qy <= 0.0 {
+                hw + solid
+            } else if qy <= solid {
+                hw
+            } else {
+                -1.0
+            };
+            let (lo, hi) = if ext >= 0.0 {
+                let lo = ((cx - ext - 0.5).ceil() as i32).clamp(0, wi);
+                let hi = ((cx + ext - 0.5).floor() as i32 + 1).clamp(0, wi);
+                row[lo as usize..hi.max(lo) as usize].fill(255);
+                (lo, hi.max(lo))
+            } else {
+                let mid = (cx.round() as i32).clamp(0, wi);
+                (mid, mid)
+            };
+            let reach = hw + empty;
+            let elo = ((cx - reach).floor() as i32).clamp(0, wi);
+            let ehi = ((cx + reach).ceil() as i32).clamp(0, wi);
+            edges.push((elo, lo));
+            edges.push((hi, ehi));
+        }
+        for (from, to) in edges {
+            for px in from..to {
+                if row[px as usize] == 255 {
+                    continue;
                 }
+                let fx = px as f32 + 0.5;
+                let mut d = f32::INFINITY;
+                for &[cx, cy, hw, hh] in &boxes {
+                    let qx = (fx - cx).abs() - hw;
+                    let qy = (fy - cy).abs() - hh;
+                    let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+                    let di = (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0);
+                    d = if d.is_infinite() || k <= 0.0 {
+                        d.min(di)
+                    } else {
+                        let t = (k - (d - di).abs()).max(0.0) / k;
+                        d.min(di) - t * t * k / 4.0
+                    };
+                }
+                let cov = (r - d + 0.5).clamp(0.0, 1.0);
+                row[px as usize] = (cov * 255.0).round() as u8;
             }
         }
     }
-    bm
+    Some((bm, x0, y0))
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     #[test]
@@ -119,14 +185,34 @@ mod tests {
     }
 
     #[test]
-    fn rounded_rect_corners_cut_middle_solid() {
-        let rr = rounded_rect(40, 20, 8);
-        let at = |x: usize, y: usize| rr.data[y * 40 + x];
+    fn rounded_union_is_one_bubble_without_a_notch_between_lines() {
+        // A wide line over a narrow one, touching at y = 30.
+        let (bm, x0, y0) =
+            rounded_union(&[(0, 0, 200, 30), (50, 30, 100, 30)], 10).expect("non-empty");
+        assert_eq!((x0, y0, bm.w, bm.h), (0, 0, 200, 60));
+        let at = |x: u32, y: u32| bm.data[(y * bm.w + x) as usize];
+        // Outer corners rounded.
         assert_eq!(at(0, 0), 0);
-        assert_eq!(at(20, 10), 255);
-        assert_eq!(at(0, 10), 255);
-        assert_eq!(at(20, 0), 255);
-        assert_eq!(at(1, 0), at(38, 0));
-        assert_eq!(at(0, 1), at(0, 18));
+        assert_eq!(at(100, 15), 255);
+        // The seam is solid across the narrow line's full width, edges included.
+        for x in 52..148 {
+            assert_eq!(at(x, 29), 255, "seam x={x}");
+            assert_eq!(at(x, 30), 255, "seam x={x}");
+        }
+        // The inner corner where the narrow line starts is filleted:
+        // filled just outside the narrow box, below the wide one.
+        assert!(at(48, 31) > 0);
+        // Far outside the narrow line stays empty.
+        assert_eq!(at(10, 50), 0);
+    }
+
+    #[test]
+    fn rounded_union_of_equal_lines_has_straight_sides_across_the_seam() {
+        let (bm, ..) = rounded_union(&[(0, 0, 120, 30), (0, 30, 120, 30)], 10).expect("non-empty");
+        let at = |x: u32, y: u32| bm.data[(y * bm.w + x) as usize];
+        for y in 20..40 {
+            assert_eq!(at(0, y), 255, "left edge y={y}");
+            assert_eq!(at(119, y), 255, "right edge y={y}");
+        }
     }
 }

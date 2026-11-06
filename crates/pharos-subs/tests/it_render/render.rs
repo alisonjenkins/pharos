@@ -6,36 +6,41 @@ fn count(f: &pharos_subs::Frame, k: MaskKind) -> usize {
 }
 
 #[test]
-fn plain_two_line_cue_gets_hugging_backdrops_and_fill() {
+fn plain_two_line_cue_gets_one_hugging_backdrop_and_fill() {
     let mut r = renderer_with(TWO_LINE_SRT);
     let f = r.frame(2000, &vp());
     assert!(f.changed);
     assert_eq!(f.render_size, (1920, 1080));
-    assert_eq!(count(&f, MaskKind::Backdrop), 2);
+    // One bubble for the whole cue, not one per line.
+    assert_eq!(count(&f, MaskKind::Backdrop), 1);
     assert_eq!(count(&f, MaskKind::Fill), 1);
     assert_eq!(count(&f, MaskKind::Border), 0);
-    let b: Vec<_> = f
+    let b = f
         .masks
         .iter()
-        .filter(|m| m.kind == MaskKind::Backdrop)
-        .collect();
-    // Text-width, not full-width; second line is longer than the first.
-    assert!(b[0].w < 900 && b[1].w < 900, "{} {}", b[0].w, b[1].w);
-    assert!(b[0].w < b[1].w);
+        .find(|m| m.kind == MaskKind::Backdrop)
+        .unwrap();
+    // Text-width, not full-width.
+    assert!(b.w < 900, "{}", b.w);
     // Default backdrop is black at 55%.
-    assert_eq!(b[0].tint, [0, 0, 0, 140]);
-    // Lines are centred and the box stays above the bottom margin (6%).
-    let cx = |m: &pharos_subs::Mask| m.x + m.w as i32 / 2;
-    assert!((cx(b[0]) - 960).abs() <= 1 && (cx(b[1]) - 960).abs() <= 1);
-    let bottom = b.iter().map(|m| m.y + m.h as i32).max().unwrap();
+    assert_eq!(b.tint, [0, 0, 0, 140]);
+    // Centred, and the box stays above the bottom margin (6%).
+    assert!((b.x + b.w as i32 / 2 - 960).abs() <= 1);
+    let bottom = b.y + b.h as i32;
     assert!(bottom <= 1080 - 64, "bottom {bottom}");
     assert!(bottom >= 1080 - 70, "bottom {bottom}");
-    // Backdrop corners are rounded: top-left coverage is zero, centre solid.
-    assert_eq!(b[0].coverage[0], 0);
-    assert_eq!(
-        b[0].coverage[(b[0].h / 2 * b[0].stride + b[0].w / 2) as usize],
-        255
-    );
+    let at = |x: u32, y: u32| b.coverage[(y * b.stride + x) as usize];
+    // Rounded corners; solid down the whole centre column (no gap between
+    // the lines).
+    assert_eq!(at(0, 0), 0);
+    assert!((0..b.h)
+        .skip(2)
+        .take(b.h as usize - 4)
+        .all(|y| at(b.w / 2, y) == 255));
+    // Hugs each line: the first line is shorter than the second, so the
+    // top row band is narrower than the bottom one.
+    let solid = |y: u32| (0..b.w).filter(|&x| at(x, y) == 255).count();
+    assert!(solid(b.h / 4) < solid(b.h * 3 / 4));
     // Fill has ink and uses the text colour.
     let fill = f.masks.iter().find(|m| m.kind == MaskKind::Fill).unwrap();
     assert_eq!(fill.tint, [255, 255, 255, 255]);
@@ -149,18 +154,21 @@ fn long_text_wraps_to_ninety_percent_width() {
     let srt = format!("1\n00:00:00,000 --> 00:00:09,000\n{long}\n");
     let mut r = renderer_with(&srt);
     let f = r.frame(1000, &vp());
-    let boxes: Vec<_> = f
+    let b = f
         .masks
         .iter()
-        .filter(|m| m.kind == MaskKind::Backdrop)
-        .collect();
-    assert!(boxes.len() >= 2, "{}", boxes.len());
-    assert!(boxes.iter().all(|m| m.w as f32 <= 1920.0 * 0.9 + 1.0));
-    // Smart wrap keeps lines similar in width (no stub last line).
-    let (min, max) = boxes
-        .iter()
-        .fold((u32::MAX, 0), |(a, b), m| (a.min(m.w), b.max(m.w)));
-    assert!(min * 10 >= max * 6, "{min} vs {max}");
+        .find(|m| m.kind == MaskKind::Backdrop)
+        .unwrap();
+    assert!(b.w as f32 <= 1920.0 * 0.9 + 1.0);
+    // Smart wrap keeps lines similar in width (no stub last line): the
+    // bubble is about as wide at its top as at its bottom.
+    let solid = |y: u32| {
+        (0..b.w)
+            .filter(|&x| b.coverage[(y * b.stride + x) as usize] == 255)
+            .count()
+    };
+    let (top, bot) = (solid(b.h / 5), solid(b.h * 4 / 5));
+    assert!(top.min(bot) * 10 >= top.max(bot) * 6, "{top} vs {bot}");
 }
 
 #[test]
