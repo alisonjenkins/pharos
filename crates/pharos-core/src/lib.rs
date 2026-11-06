@@ -1803,6 +1803,13 @@ pub trait LibraryStore: Send + Sync {
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
 
+    /// Whether any item belongs to the library whose `wire_id` matches:
+    /// [`Self::item_ids_for_library`] is non-empty, without reading the ids.
+    fn library_has_items(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
     /// The `wire_id` of the library `item` belongs to. `None` when the item
     /// is in no library or does not exist.
     fn library_wire_id_of(
