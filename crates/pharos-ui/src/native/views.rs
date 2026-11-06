@@ -154,7 +154,7 @@ pub fn Shell(
         .filter(|item| item.kind == ItemKind::Library)
         .map(|library| library.id);
     rsx! {
-        div { class: "pharos-app",
+        div { class: "pharos-app", "data-keys": "page",
             header { class: "pharos-banner pharos-shell",
                 div { class: "pharos-shell-bar",
                     Link { to: Route::Home, class: "pharos-brand", Brand {} }
