@@ -2052,6 +2052,32 @@ pub fn center_child(id: &str, at: u32) -> bool {
     true
 }
 
+/// Scrolls the element `list` the least it takes to show its descendant
+/// `id` whole; nothing when either is not in the page.
+pub fn reveal(list: &str, id: &str) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let (Some(list), Some(row)) = (
+        document.get_element_by_id(list),
+        document.get_element_by_id(id),
+    ) else {
+        return;
+    };
+    let (outer, inner) = (
+        list.get_bounding_client_rect(),
+        row.get_bounding_client_rect(),
+    );
+    let shift = if inner.top() < outer.top() {
+        inner.top() - outer.top()
+    } else if inner.bottom() > outer.bottom() {
+        inner.bottom() - outer.bottom()
+    } else {
+        return;
+    };
+    list.set_scroll_top(list.scroll_top() + shift.round() as i32);
+}
+
 /// A `pagehide` listener; removed on drop.
 pub struct PageHide(Closure<dyn FnMut(web_sys::Event)>);
 

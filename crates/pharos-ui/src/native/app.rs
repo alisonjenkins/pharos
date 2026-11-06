@@ -57,8 +57,8 @@ use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::views::{
-    open_route, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav, PaletteView, PlayFromStart,
-    SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
+    open_route, reveal_palette_row, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav,
+    PaletteView, PlayFromStart, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
@@ -1753,6 +1753,12 @@ fn PaletteScreen() -> Element {
         };
         if kept != now {
             active.set(kept);
+        }
+    });
+    // The arrows can walk past the list's bottom edge; keep the pick in sight.
+    use_effect(move || {
+        if let Some(at) = active() {
+            reveal_palette_row(at);
         }
     });
     let failed = match &*search.hits.read() {
