@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// What kind of speech a line is. Sarcasm is never picked by the phase 1
 /// director (it needs a model) but the type and compiler carry it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
     Plain,
