@@ -1210,6 +1210,15 @@ where
         .await
         .unwrap();
     assert!(lib_item_ids.contains(&item_id));
+    assert!(LibraryStore::library_has_items(&store, lib_wire_id)
+        .await
+        .unwrap());
+    assert!(
+        !LibraryStore::library_has_items(&store, "0123456789abcdef0123456789abcdef")
+            .await
+            .unwrap(),
+        "an unknown library has no items"
+    );
     assert_eq!(
         LibraryStore::library_wire_id_of(&store, item_id)
             .await
