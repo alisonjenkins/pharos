@@ -273,6 +273,19 @@ pub enum TinyOp {
         duration_ms: u64,
         out_dir: PathBuf,
     },
+    /// Loudness, pitch, high-band share of each subtitle line's span, plus
+    /// the video keyframe times, in one demux pass →
+    /// `WorkerEvent::SubtitleSignalsResult` (spec 028). Whole-file demux, so a
+    /// heavy op; its timeout scales with the last window's end. Last, so
+    /// bincode's variant indices of the older ops stay the same.
+    SubtitleSignals {
+        input: PathBuf,
+        /// Container stream index of the audio to analyse; `None` picks the
+        /// default-flagged audio stream, else the first.
+        audio_stream: Option<u32>,
+        /// The lines' `(start_ms, end_ms)`, one result per entry, in order.
+        windows: Vec<(u64, u64)>,
+    },
 }
 
 /// Scheduler → worker.
@@ -356,6 +369,11 @@ pub enum WorkerEvent {
     FingerprintMultiResult {
         job_id: JobId,
         points: Vec<Vec<u32>>,
+    },
+    /// Reply to `TinyOp::SubtitleSignals`. Last, for the same reason.
+    SubtitleSignalsResult {
+        job_id: JobId,
+        signals: crate::subtitle_signals::SubtitleSignals,
     },
 }
 
