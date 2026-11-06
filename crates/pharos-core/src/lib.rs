@@ -2,6 +2,7 @@
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
 pub mod auth;
+pub mod fuzzy;
 pub mod language;
 pub mod origin;
 pub mod parental_rank;
@@ -3069,10 +3070,15 @@ pub struct MediaQuery {
     /// API. `None` = no parent restriction (the whole library / a view
     /// root).
     pub parent: Option<ParentFilter>,
-    /// Case-insensitive substring match on `title` (the `?SearchTerm=` /
-    /// `NameStartsWith` family is layered by the API; this is the raw
-    /// substring). `None` = no search.
+    /// Every word of the term (split by [`search_tokens`]) found, any case,
+    /// as a substring of the title, show, artist or album, in any order
+    /// (B624/V558). The `?SearchTerm=` / `NameStartsWith` family is layered
+    /// by the API. `None` = no search.
     pub search_term: Option<String>,
+    /// Look for `search_term` with typos: each word of four or more letters
+    /// is found by its first or last letters ([`fuzzy::loose_needles`]), a
+    /// superset the caller narrows with [`fuzzy::score`].
+    pub search_loose: bool,
     /// Items linked to the genre row carrying this `wire_id` (an `EXISTS`
     /// on `item_genres`). Distinct from a [`ParentFilter::Genre`] pivot so a
     /// `?Genres=` filter can stack on top of a different parent.

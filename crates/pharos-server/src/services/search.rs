@@ -1,7 +1,11 @@
 //! The native `Library.search`: the shows, artists and albums a term names
 //! ahead of the stored rows that match it, and a trailing `s01` or `s01e02`
 //! read as a season or an episode of the show named before it (B597/V518).
+//! A name is found word by word, in any order and across a show's, an
+//! artist's or an album's names, best named first; and when nothing is
+//! found, again allowing a typo in each word (B624/V558).
 
+use pharos_core::fuzzy::{score, Score};
 use pharos_core::{MediaItem, MediaKind, User};
 use pharos_jellyfin_api::dto::WireId;
 
@@ -15,47 +19,6 @@ pub const GROUP_MIN_CHARS: usize = 3;
 
 /// The most shows, artists or albums one search lists of each.
 pub const GROUP_LIMIT: usize = 5;
-
-/// How well a name holds a search term, best first: the whole name, its
-/// start, the start of a later word, anywhere. Shorter names come first
-/// within a tier, so "Dragon Ball" leads "Dragon Ball GT".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct NameMatch {
-    tier: u8,
-    len: usize,
-}
-
-impl NameMatch {
-    pub fn is_exact(self) -> bool {
-        self.tier == 0
-    }
-}
-
-/// How `name` holds `term` (any case), or `None` when it does not.
-pub fn name_match(name: &str, term: &str) -> Option<NameMatch> {
-    let name = name.to_lowercase();
-    let term = term.trim().to_lowercase();
-    if term.is_empty() {
-        return None;
-    }
-    let at = name.find(&term)?;
-    let tier = if name == term {
-        0
-    } else if at == 0 {
-        1
-    } else if name
-        .match_indices(&term)
-        .any(|(at, _)| !name[..at].ends_with(char::is_alphanumeric))
-    {
-        2
-    } else {
-        3
-    };
-    Some(NameMatch {
-        tier,
-        len: name.chars().count(),
-    })
-}
 
 /// A search term split into the name it searches for and, when it ends in
 /// one, the season (`s1`, `s01`) or episode (`s01e02`, `s1 e2`) it asks for.
@@ -134,12 +97,31 @@ impl Hit {
     }
 }
 
+/// Which pass of a search answered: words as typed, or with typos. The
+/// `pass` label of `pharos_search_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    Strict,
+    Loose,
+}
+
+impl Pass {
+    pub fn label(self) -> &'static str {
+        match self {
+            Pass::Strict => "strict",
+            Pass::Loose => "loose",
+        }
+    }
+}
+
 /// What `text` names that `user` may see, at most `limit` rows (0 is
 /// [`library::SEARCH_DEFAULT`]): for a name of [`GROUP_MIN_CHARS`] or more,
-/// the shows it names, or with a season or episode asked for that season or
-/// episode of each; then the artists and albums it names; then the stored
-/// rows `text` matches. A lookup that fails is logged and left out, so the
-/// stored rows still answer.
+/// the shows, artists and albums holding every word of it, best named first
+/// (or, with a season or episode asked for, that season or episode of each
+/// show); then the stored rows `text` matches. When that finds nothing, the
+/// shows, artists and albums are looked for again allowing a typo in each
+/// word. A lookup that fails is logged and left out, so the stored rows
+/// still answer.
 pub async fn search(
     state: &AppState,
     user: &User,
@@ -151,26 +133,29 @@ pub async fn search(
         n => n.min(library::QUERY_MAX),
     } as usize;
     let term = Term::parse(text);
-    let mut hits = Vec::new();
-    if term.name.chars().count() >= GROUP_MIN_CHARS {
-        hits.extend(show_hits(state, user, &term).await);
-        if term.season.is_none() {
-            match crate::api::jellyfin::items::music_groups_named(
-                state,
-                user,
-                &term.name,
-                GROUP_LIMIT,
-            )
-            .await
-            {
-                Ok((artists, albums)) => {
-                    hits.extend(artists.into_iter().chain(albums).filter_map(Hit::group))
-                }
-                Err(error) => tracing::warn!(%error, "search: artists and albums unavailable"),
-            }
-        }
-    }
+    let mut hits = group_hits(state, user, &term, Pass::Strict).await;
     let stored = library::search(state, user, text, limit as u32).await?;
+    let mut pass = Pass::Strict;
+    if hits.is_empty() && stored.is_empty() {
+        pass = Pass::Loose;
+        hits = group_hits(state, user, &term, Pass::Loose).await;
+    }
+    let outcome = if hits.is_empty() && stored.is_empty() {
+        "empty"
+    } else {
+        "found"
+    };
+    metrics::counter!("pharos_search_total", "pass" => pass.label(), "outcome" => outcome)
+        .increment(1);
+    tracing::debug!(
+        user.id = %user.id,
+        pass = pass.label(),
+        outcome,
+        words = pharos_core::search_tokens(&term.name).len(),
+        groups = hits.len(),
+        stored = stored.len(),
+        "search: answered"
+    );
     for item in stored {
         let listed = hits
             .iter()
@@ -183,27 +168,61 @@ pub async fn search(
     Ok(hits)
 }
 
+/// The shows, artists and albums `term` names, best named first; a show
+/// leads an artist, and an artist an album, named as well. Nothing for a
+/// name shorter than [`GROUP_MIN_CHARS`].
+async fn group_hits(state: &AppState, user: &User, term: &Term, pass: Pass) -> Vec<Hit> {
+    if term.name.chars().count() < GROUP_MIN_CHARS {
+        return Vec::new();
+    }
+    let loose = pass == Pass::Loose;
+    let mut named: Vec<(Score, Hit)> = show_hits(state, user, term, loose).await;
+    if term.season.is_none() {
+        match crate::api::jellyfin::items::music_groups_named(
+            state,
+            user,
+            &term.name,
+            GROUP_LIMIT,
+            loose,
+        )
+        .await
+        {
+            Ok((artists, albums)) => named.extend(
+                artists
+                    .into_iter()
+                    .chain(albums)
+                    .filter_map(|(rank, dto)| Some((rank, Hit::group(dto)?))),
+            ),
+            Err(error) => tracing::warn!(%error, "search: artists and albums unavailable"),
+        }
+    }
+    // Stable: on a tie a show keeps its place ahead of an artist or album.
+    named.sort_by_key(|(rank, _)| *rank);
+    named.into_iter().map(|(_, hit)| hit).collect()
+}
+
 /// The shows named by `term`, best named first; or, when it asks for one,
 /// that season or episode of each. Only the shows kept are built into
 /// tiles: a common word such as "the" names a hundred or more.
-async fn show_hits(state: &AppState, user: &User, term: &Term) -> Vec<Hit> {
+async fn show_hits(state: &AppState, user: &User, term: &Term, loose: bool) -> Vec<(Score, Hit)> {
     use pharos_jellyfin_api::dto::series_id_for_key;
-    let shows = match crate::api::jellyfin::items::shows_matching(state, user, &term.name).await {
-        Ok(shows) => shows,
-        Err(error) => {
-            tracing::warn!(%error, "search: shows unavailable");
-            return Vec::new();
-        }
-    };
+    let shows =
+        match crate::api::jellyfin::items::shows_matching(state, user, &term.name, loose).await {
+            Ok(shows) => shows,
+            Err(error) => {
+                tracing::warn!(%error, "search: shows unavailable");
+                return Vec::new();
+            }
+        };
     // The store matched episode titles as well; only a show's own name counts.
     let mut shows: Vec<_> = shows
         .into_iter()
-        .filter_map(|(folder, name)| Some((name_match(&name, &term.name)?, name, folder)))
+        .filter_map(|(folder, name)| Some((score(&[name.as_str()], &term.name)?, name, folder)))
         .collect();
     shows.sort();
     shows.truncate(GROUP_LIMIT);
     let mut hits = Vec::new();
-    for (_, name, folder) in shows {
+    for (rank, name, folder) in shows {
         let Some(id) = WireId::parse(&series_id_for_key(folder.as_deref(), &name)) else {
             continue;
         };
@@ -212,7 +231,7 @@ async fn show_hits(state: &AppState, user: &User, term: &Term) -> Vec<Hit> {
             (Some(season), None) => season_of(state, user, id, season).await,
             (Some(season), Some(episode)) => episode_of(state, user, id, season, episode).await,
         };
-        hits.extend(hit);
+        hits.extend(hit.map(|hit| (rank, hit)));
     }
     hits
 }
@@ -335,12 +354,17 @@ mod tests {
 
     #[test]
     fn names_rank_whole_then_start_then_word_then_anywhere_then_shorter() {
-        let rank = |name| name_match(name, "Dragon Ball");
+        let rank = |name| score(&[name], "Dragon Ball");
         assert!(rank("Dragon Ball").unwrap().is_exact());
         assert!(rank("Dragon Ball").unwrap() < rank("Dragon Ball GT").unwrap());
         assert!(rank("Dragon Ball GT").unwrap() < rank("Dragon Ball Super").unwrap());
         assert!(rank("Dragon Ball Super").unwrap() < rank("Super Dragon Ball Heroes").unwrap());
         assert!(rank("Super Dragon Ball Heroes").unwrap() < rank("SuperDragon Balls").unwrap());
         assert_eq!(rank("Bleach"), None);
+    }
+
+    #[test]
+    fn pass_labels_are_distinct() {
+        assert_ne!(Pass::Strict.label(), Pass::Loose.label());
     }
 }

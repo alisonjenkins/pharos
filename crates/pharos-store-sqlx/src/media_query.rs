@@ -133,31 +133,46 @@ pub(crate) fn build(
         push_parent_clause(parent, &mut clauses, &mut params, &mut ph);
     }
 
-    // --- search term (Unicode-case-insensitive substring on title) ---
-    // Match against the Rust-folded `title_fold` (full Unicode lowercase),
-    // falling back to ASCII `LOWER(title)` for rows scanned before the
-    // 0028 column. The needle is lowercased in Rust to the same fold.
+    // --- search term (B624/V558) ---
+    // Every word of the term must be a substring of the title, the SERIES
+    // name (so searching a show name like "Code Geass" finds its episodes),
+    // the artist or the album, any word in any column, in any order: "go
+    // moby" finds the tracks of "Go: The Very Best of Moby". Matched against
+    // the Rust-folded `title_fold` (full Unicode lowercase), falling back to
+    // ASCII `LOWER(title)` for rows scanned before the 0028 column; the
+    // needles are lowercased in Rust to the same fold. A term with no words
+    // (all punctuation) is matched whole, as before.
     if let Some(term) = q.search_term.as_deref() {
         let trimmed = term.trim();
         if !trimmed.is_empty() {
-            let needle = format!("%{}%", like_escape(&trimmed.to_lowercase()));
-            // Match the item title, the SERIES name (so searching a show name
-            // like "Code Geass" finds its episodes — episode titles rarely
-            // contain the series name), and artist/album for music. Each
-            // column needs its own positional placeholder (`ph` is `?`).
+            let mut words = pharos_core::search_tokens(trimmed);
+            if words.is_empty() {
+                words.push(trimmed.to_lowercase());
+            }
             let cols = [
                 "COALESCE(title_fold, LOWER(title))",
                 "LOWER(COALESCE(series_name, ''))",
                 "LOWER(COALESCE(artist, ''))",
                 "LOWER(COALESCE(album, ''))",
             ];
-            let mut ors = Vec::with_capacity(cols.len());
-            for col in cols {
-                params.push(Param::Text(needle.clone()));
-                let p = ph(params.len());
-                ors.push(format!("{col} LIKE {p} ESCAPE '\\'"));
+            for word in &words {
+                let needles = if q.search_loose {
+                    pharos_core::fuzzy::loose_needles(word)
+                } else {
+                    vec![word.clone()]
+                };
+                let mut ors = Vec::with_capacity(cols.len() * needles.len());
+                for needle in &needles {
+                    let needle = format!("%{}%", like_escape(needle));
+                    // Each column needs its own positional placeholder.
+                    for col in cols {
+                        params.push(Param::Text(needle.clone()));
+                        let p = ph(params.len());
+                        ors.push(format!("{col} LIKE {p} ESCAPE '\\'"));
+                    }
+                }
+                clauses.push(format!("({})", ors.join(" OR ")));
             }
-            clauses.push(format!("({})", ors.join(" OR ")));
         }
     }
 
