@@ -2101,15 +2101,41 @@ pub fn stage_arrival(again: bool) {
         let tiles: Vec<web_sys::HtmlElement> = (0..found.length())
             .filter_map(|at| found.item(at)?.dyn_into().ok())
             .collect();
-        if !tiles.is_empty() {
-            stage_grid(&window, &tiles, again);
+        if !tiles.is_empty() && stage_grid(&window, &tiles, again) {
+            hold_lift(&window, &grid);
         }
     }
 }
 
+/// Holds the hover lift off `grid` until the pointer next moves (B615): a
+/// tile arriving under a pointer at rest, as when the viewer comes back to
+/// a library, would otherwise lift as it lands, a jump left and up at the
+/// end of the transition.
+fn hold_lift(window: &web_sys::Window, grid: &web_sys::Element) {
+    if let Err(e) = grid.set_attribute("data-lift-held", "") {
+        warn(&format!("pharos: lift hold failed error={e:?}"));
+        return;
+    }
+    let held = grid.clone();
+    let release = Closure::once_into_js(move || {
+        let _ = held.remove_attribute("data-lift-held");
+    });
+    let once = web_sys::AddEventListenerOptions::new();
+    once.set_once(true);
+    once.set_passive(true);
+    if let Err(e) = window.add_event_listener_with_callback_and_add_event_listener_options(
+        "pointermove",
+        release.unchecked_ref(),
+        &once,
+    ) {
+        let _ = grid.remove_attribute("data-lift-held");
+        warn(&format!("pharos: lift hold listener failed error={e:?}"));
+    }
+}
+
 /// [`stage_arrival`] for one grid's arriving `tiles`, so each grid's wave
-/// counts its own rows.
-fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: bool) {
+/// counts its own rows; `true` when it placed any tile.
+fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: bool) -> bool {
     let offsets: Vec<(f64, f64)> = tiles.iter().map(|t| page_offset(t.clone())).collect();
     let scroll = (
         window.scroll_x().unwrap_or(0.0),
@@ -2123,10 +2149,12 @@ fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: b
     let cells = super::browse::arrival_cells(&boxes, scroll.1);
     let px = |v: Result<JsValue, JsValue>| v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
     let view = (px(window.inner_width()), px(window.inner_height()));
+    let mut placed = false;
     for ((tile, (left, top)), (row, col)) in tiles.iter().zip(offsets).zip(cells) {
         if !again && tile.has_attribute("data-fx") {
             continue;
         }
+        placed = true;
         let place = (
             left - scroll.0,
             top - scroll.1,
@@ -2153,6 +2181,7 @@ fn stage_grid(window: &web_sys::Window, tiles: &[web_sys::HtmlElement], again: b
             ));
         }
     }
+    placed
 }
 
 /// Scrolls the page so the browse tile at `at` sits `top` px below the
