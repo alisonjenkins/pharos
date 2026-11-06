@@ -147,6 +147,8 @@ log = "0.4"
 # button text, expected error branches) without a browser. Lives at
 # the same major version as the main `dioxus` workspace dep.
 dioxus-ssr = "0.7"
+# V530: reads the shipped subtitle fonts' family names in a test.
+skrifa = "0.49"
 
 [lints]
 workspace = true

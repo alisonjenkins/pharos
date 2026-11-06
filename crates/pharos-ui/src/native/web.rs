@@ -2282,6 +2282,13 @@ pub async fn styled_subtitles(
         "liberation sans",
         &JsValue::from_str(&format!("{JASSUB_DIR}/default.woff2")),
     )?;
+    for (family, file) in super::playback::SUBTITLE_FONT_PACK {
+        set(
+            &available,
+            family,
+            &JsValue::from_str(&format!("/ui/assets/fonts/{file}")),
+        )?;
+    }
     let options = js_sys::Object::new();
     set(&options, "video", &video)?;
     set(&options, "subUrl", &JsValue::from_str(url))?;
