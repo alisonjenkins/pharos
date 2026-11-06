@@ -588,7 +588,13 @@ fn groups(rows: &[Row]) -> Vec<(&'static str, Vec<(usize, Row)>)> {
 /// One match in a search list: a thumbnail, the name, and what it is.
 #[component]
 fn SearchHit(item: Item) -> Element {
+    // A season is named only by its number; say whose it is.
+    let show = match item.kind {
+        ItemKind::Season => item.series_name.clone(),
+        _ => None,
+    };
     let detail = std::iter::once(kind_name(item.kind).to_owned())
+        .chain(show)
         .chain(sub_lines(&item))
         .collect::<Vec<_>>()
         .join(" · ");
