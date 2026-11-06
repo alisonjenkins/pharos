@@ -1729,6 +1729,45 @@ pub fn press_key_action(name: &str) -> bool {
     found.is_some_and(|el| click(&el))
 }
 
+/// The page's player: the video's, or the music full player's.
+const PLAYERS: &str = "#pharos-player, .pharos-listen";
+
+/// Press `key` on the page's player when the focus is outside it, since a
+/// player's transport keys are its own handler's (B618). The key is sent
+/// after this listener returns, so the layer does not hear it again
+/// inside its own call; the player then takes it and the layer, hearing
+/// it handled, leaves it. False when there is no player or the focus is
+/// already in it, or the key is Space on a focused button or link.
+pub fn forward_to_player(key: &str) -> bool {
+    let Some(player) = document().and_then(|d| d.query_selector(PLAYERS).ok().flatten()) else {
+        return false;
+    };
+    let at = focused();
+    if at
+        .as_ref()
+        .is_some_and(|el| player.contains(Some(el.unchecked_ref())))
+    {
+        return false;
+    }
+    // Space presses a focused button or link, as everywhere.
+    if key == " " && at.is_some_and(|el| el.matches("a[href], button").unwrap_or(false)) {
+        return false;
+    }
+    focus_element(&player, false);
+    let key = key.to_owned();
+    spawn_detached(async move {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_key(&key);
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        init.set_shift_key(key.chars().any(char::is_uppercase));
+        if let Ok(e) = web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init) {
+            let _ = player.dispatch_event(&e);
+        }
+    });
+    true
+}
+
 /// Whether the focus is inside the `data-key-area="<name>"` area.
 pub fn focus_in_area(name: &str) -> bool {
     focused()
