@@ -1048,6 +1048,37 @@ test.describe("pharos Dioxus UI", () => {
 
     // A TV library lists its series by name and a series opens the show page
     // with its episodes; every step is a click, not a URL.
+    // B599: a show opened from a library grid scrolled down opens at its
+    // top, where its name and overview are, not part way down its episodes.
+    test("a show opened from a scrolled grid opens at its top", async ({ page, request }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      await page.setViewportSize({ width: 420, height: 360 });
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
+      const tile = page
+        .locator("ul.pharos-grid .pharos-poster")
+        .filter({ hasText: "Playwright Show" });
+      await expect(tile).toBeVisible({ timeout: 15_000 });
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(100);
+      await tile.click();
+      await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show", {
+        timeout: 15_000,
+      });
+      await expect(page.locator("ol.pharos-episodes li")).toHaveCount(3);
+      await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+    });
+
     test("browse walks TV: library, series, episode, title", async ({ page, request }) => {
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },
