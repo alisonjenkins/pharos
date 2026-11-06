@@ -135,7 +135,7 @@ pub(super) fn chorded(evt: &KeyboardEvent) -> bool {
 }
 
 /// What a key does to the transport, on the video and music pages alike
-/// (spec 029's Player keys): Space or k plays and pauses, the arrows or
+/// (spec 029's Player keys): Space plays and pauses, the arrows or
 /// h / l seek, the arrows or + / - set the volume, m mutes, a digit seeks
 /// to that tenth of the way in.
 pub(super) fn transport_key(key: &Key, media: &MediaState) -> Option<Control> {
@@ -347,7 +347,7 @@ pub fn WatchView(
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
-        // a bare `k` toggles play, the chord must not.
+        // a bare `k` raises the volume, the chord must not.
         if chorded(&evt) {
             return;
         }
@@ -1229,7 +1229,13 @@ mod tests {
         let key = |k: Key| transport_key(&k, &media);
         let ch = |c: &str| key(Key::Character(c.into()));
         assert_eq!(ch(" "), Some(Control::TogglePlay));
-        assert_eq!(ch("k"), Some(Control::TogglePlay));
+        assert_eq!(
+            ch("k"),
+            Some(Control::Volume {
+                volume: 0.6,
+                muted: false
+            })
+        );
         assert_eq!(
             ch("m"),
             Some(Control::Volume {
