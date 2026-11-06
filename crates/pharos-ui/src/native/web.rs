@@ -2112,25 +2112,56 @@ pub fn stage_arrival(again: bool) {
 /// a library, would otherwise lift as it lands, a jump left and up at the
 /// end of the transition.
 fn hold_lift(window: &web_sys::Window, grid: &web_sys::Element) {
+    thread_local! {
+        /// The one page-wide `pointermove` listener is installed.
+        static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Some grid holds its lift, so the next move releases them all.
+        static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     if let Err(e) = grid.set_attribute("data-lift-held", "") {
         warn(&format!("pharos: lift hold failed error={e:?}"));
         return;
     }
-    let held = grid.clone();
-    let release = Closure::once_into_js(move || {
-        let _ = held.remove_attribute("data-lift-held");
+    HELD.set(true);
+    if INSTALLED.replace(true) {
+        return;
+    }
+    // One listener for every held grid, found by attribute when the pointer
+    // moves, so no grid or closure stays alive after its page goes away on a
+    // device that never sends a move (touch only, remote).
+    let release = Closure::<dyn FnMut()>::new(|| {
+        if !HELD.replace(false) {
+            return;
+        }
+        let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Ok(held) = doc.query_selector_all("[data-lift-held]") {
+            for at in 0..held.length() {
+                if let Some(el) = held
+                    .item(at)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                {
+                    let _ = el.remove_attribute("data-lift-held");
+                }
+            }
+        }
     });
-    let once = web_sys::AddEventListenerOptions::new();
-    once.set_once(true);
-    once.set_passive(true);
+    let passive = web_sys::AddEventListenerOptions::new();
+    passive.set_passive(true);
     if let Err(e) = window.add_event_listener_with_callback_and_add_event_listener_options(
         "pointermove",
-        release.unchecked_ref(),
-        &once,
+        release.as_ref().unchecked_ref(),
+        &passive,
     ) {
+        INSTALLED.set(false);
+        HELD.set(false);
         let _ = grid.remove_attribute("data-lift-held");
         warn(&format!("pharos: lift hold listener failed error={e:?}"));
+        return;
     }
+    // Lives for the page, like the other page-wide listeners here.
+    release.forget();
 }
 
 /// [`stage_arrival`] for one grid's arriving `tiles`, so each grid's wave
