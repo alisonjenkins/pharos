@@ -221,6 +221,18 @@ test.describe("player keys (spec 029)", () => {
     await expect(page.locator("#pharos-player")).toBeFocused();
   });
 
+  test("m still mutes after the volume slider is used (B621)", async ({ page, request }) => {
+    await signIn(page, request);
+    await playFilm(page);
+    await page.locator("#pharos-player").hover();
+    const volume = page.getByRole("slider", { name: "Volume" });
+    await volume.click();
+    await expect(volume).toBeFocused();
+    expect(await muted(page)).toBe(false);
+    await page.keyboard.press("m");
+    await expect.poll(() => muted(page)).toBe(true);
+  });
+
   test("g h in the player goes home rather than seeking back (B617)", async ({
     page,
     request,
@@ -233,3 +245,4 @@ test.describe("player keys (spec 029)", () => {
     await expect(page).toHaveURL(/\/ui\/?$/);
   });
 });
+
