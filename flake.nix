@@ -770,10 +770,13 @@
             for f in crates/pharos-ui/assets/vendor/jassub/*; do
               install -Dm644 "$f" "$out/assets/vendor/jassub/$(basename "$f")"
             done
-            # Liberation Sans (SIL OFL), the font pharos-subs draws plain text
-            # subtitles in (spec 026); fetched only when a text subtitle shows.
-            install -Dm644 crates/pharos-ui/assets/fonts/LiberationSans-Regular.ttf $out/assets/fonts/LiberationSans-Regular.ttf
-            install -Dm644 crates/pharos-ui/assets/fonts/LICENSE-Liberation $out/assets/fonts/LICENSE-Liberation
+            # Subtitle fonts (SIL OFL), each with its licence: Liberation Sans,
+            # which pharos-subs draws plain text in (spec 026), and the pack
+            # the ASS renderer gets for styled tracks (V508). Each is fetched
+            # only when a subtitle uses it.
+            for f in crates/pharos-ui/assets/fonts/{*.ttf,LICENSE-*}; do
+              install -Dm644 "$f" "$out/assets/fonts/$(basename "$f")"
+            done
             runHook postInstall
           '';
           dontFixup = true;
