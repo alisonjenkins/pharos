@@ -16,7 +16,7 @@ use super::queue::{Entry, QueueAction, Source};
 use super::style_picker::StylePicker;
 use super::visualiser::{Analysis, AudioTap, Style, STYLE_KEY};
 use super::watch_view::{
-    chorded, total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
+    not_transport, total_ms, transport_key, use_shortcuts, Control, Volume, SEEK_STEP_MS, VIDEO_ID,
 };
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef, Lyrics};
 
@@ -240,7 +240,7 @@ pub fn ListenView(
     let meta = meta_line(&artists, album.as_deref(), track, year, &genres);
     let on_key = move |evt: KeyboardEvent| {
         // Ctrl+K opens the palette; it must not also toggle play.
-        if chorded(&evt) {
+        if not_transport(&evt) {
             return;
         }
         // Shift+P / Shift+N are page-wide (B562), not the player's own.
