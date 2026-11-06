@@ -7,10 +7,13 @@
 //! Desktop spends at most four `\t` and one `\move` per event and at most
 //! four events per line. The designs are Pharos's own.
 
+mod echo;
 mod hush;
 mod impact;
 mod inner_voice;
+mod memory;
 mod tremor;
+mod wire;
 
 use crate::event::Event;
 use crate::plan::{Intent, LineEffect, Placement, Tier};
@@ -74,18 +77,16 @@ pub(crate) fn events(
     tier: Tier,
 ) -> Option<Vec<Event>> {
     match fx.intent {
+        Intent::AttackCall => Some(echo::events(line, fx, theme, tier)),
+        Intent::Phone => Some(wire::events(line, fx, theme, tier)),
+        Intent::Flashback => Some(memory::events(line, fx, theme, tier)),
         Intent::Thought => Some(inner_voice::events(line, fx, theme, tier)),
         Intent::Shout if fx.intensity >= 3 => Some(tremor::events(line, fx, theme, tier)),
         Intent::Shout => Some(impact::events(line, fx, theme, tier)),
         Intent::Whisper => Some(hush::events(line, fx, theme, tier)),
-        Intent::Plain
-        | Intent::Sarcasm
-        | Intent::Narration
-        | Intent::OffScreen
-        | Intent::Phone
-        | Intent::AttackCall
-        | Intent::Flashback
-        | Intent::Sfx => None,
+        Intent::Plain | Intent::Sarcasm | Intent::Narration | Intent::OffScreen | Intent::Sfx => {
+            None
+        }
     }
 }
 
