@@ -1856,7 +1856,8 @@ fn PaletteScreen() -> Element {
             }
         })
     });
-    use_effect(|| platform::focus(PALETTE_INPUT));
+    // Selected, so typing replaces a term the palette opens on.
+    use_effect(|| platform::select_field(PALETTE_INPUT));
     let kept = move || {
         platform::stored_theme(palette::SEARCHES_KEY)
             .unwrap_or_else(|e| {
