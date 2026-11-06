@@ -241,6 +241,18 @@ pub fn step_tab(_step: i8) -> bool {
 
 pub fn focus_arrival(_id: &str) {}
 
+pub fn focus_key_area(_name: &str) -> bool {
+    false
+}
+
+pub fn focus_in_area(_name: &str) -> bool {
+    false
+}
+
+pub fn dialog_open() -> bool {
+    false
+}
+
 pub struct TrackSkips;
 
 pub fn on_track_skip(

@@ -1729,6 +1729,43 @@ pub fn press_key_action(name: &str) -> bool {
     found.is_some_and(|el| click(&el))
 }
 
+/// Whether the focus is inside the `data-key-area="<name>"` area.
+pub fn focus_in_area(name: &str) -> bool {
+    focused()
+        .and_then(|el| {
+            el.closest(&format!("[data-key-area='{name}']"))
+                .ok()
+                .flatten()
+        })
+        .is_some()
+}
+
+/// Whether a dialog is open in the page, other than the key help.
+pub fn dialog_open() -> bool {
+    document()
+        .and_then(|d| {
+            d.query_selector("[role='dialog']:not(.pharos-key-help), [role='alertdialog']")
+                .ok()
+                .flatten()
+        })
+        .is_some()
+}
+
+/// Focus the first control shown in the `data-key-area="<name>"` area.
+/// False when the area is not in the page.
+pub fn focus_key_area(name: &str) -> bool {
+    let Some(area) = document().and_then(|d| {
+        d.query_selector(&format!("[data-key-area='{name}']"))
+            .ok()
+            .flatten()
+    }) else {
+        return false;
+    };
+    shown_targets(&area)
+        .first()
+        .is_some_and(|(el, _)| focus_element(el, true))
+}
+
 /// Open the tab `step` places from the current one in the page's
 /// `data-key-tabs` strip, and focus it.
 pub fn step_tab(step: i8) -> bool {
@@ -1759,7 +1796,16 @@ pub fn focus_arrival(id: &str) {
     if focused().is_some_and(|el| el.closest("main").ok().flatten().is_some()) {
         return;
     }
-    if let Some(el) = document().and_then(|d| d.get_element_by_id(id)) {
+    let Some(el) = document().and_then(|d| d.get_element_by_id(id)) else {
+        return;
+    };
+    // A row stands for its first control (the album page's first track).
+    let target = if el.matches(KEY_TARGETS).unwrap_or(false) {
+        Some(el)
+    } else {
+        el.query_selector(KEY_TARGETS).ok().flatten()
+    };
+    if let Some(el) = target {
         focus_element(&el, false);
     }
 }

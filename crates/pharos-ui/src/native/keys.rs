@@ -40,7 +40,7 @@ pub fn use_key_mode(mode: Mode) {
             t
         })
     });
-    use_effect(move || at.set(Some((token, mode))));
+    use_effect(use_reactive!(|mode| at.set(Some((token, mode)))));
     use_drop(move || {
         if at.peek().is_some_and(|(t, _)| t == token) {
             at.set(None);
@@ -74,8 +74,17 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     let mut at = use_signal(|| route.clone());
     use_effect(use_reactive!(|route| at.set(route)));
     let mode = use_memo(move || match &*at.read() {
-        Route::Watch(_) => Mode::Player,
-        _ => asked.read().map_or(Mode::Browse, |(_, m)| m),
+        // The music player shares the watch route and asks for its own.
+        Route::Watch(_) => match *asked.read() {
+            Some((_, m @ (Mode::Music | Mode::Queue))) => m,
+            _ => Mode::Player,
+        },
+        // A song playing in the mini bar or floating window keeps the
+        // page's keys.
+        _ => match *asked.read() {
+            Some((_, Mode::Music | Mode::Queue)) | None => Mode::Browse,
+            Some((_, m)) => m,
+        },
     });
     let mut chord = use_signal(Vec::<String>::new);
     let mut help = use_signal(|| None::<Help>);
@@ -111,6 +120,20 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                     || fallback(name).is_some_and(platform::press_key_action)
             }
             Action::Season(step) => platform::step_tab(step),
+            Action::Focus(name) => {
+                if platform::focus_key_area(name) {
+                    return true;
+                }
+                // A hidden area is drawn on the next render.
+                let shown = platform::press_key_action(name);
+                if shown {
+                    platform::spawn_detached(async move {
+                        platform::sleep_ms(0).await;
+                        platform::focus_key_area(name);
+                    });
+                }
+                shown
+            }
         }
     };
     use_hook(move || {
@@ -120,11 +143,15 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                 reset();
                 return true;
             }
+            // An open dialog's Escape is its own (the queue's Clear).
+            if key == "Escape" && platform::dialog_open() {
+                return false;
+            }
             let mut keys = chord.peek().clone();
             keys.push(key.to_owned());
             let typed: Vec<&str> = keys.iter().map(String::as_str).collect();
             generation += 1;
-            match keymap::resolve(*mode.peek(), &typed) {
+            match keymap::resolve(focus_mode(*mode.peek()), &typed) {
                 Resolved::Run(action) => {
                     reset();
                     run(action)
@@ -164,7 +191,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     let Some(shown) = shown else {
         return rsx! {};
     };
-    let mode = mode();
+    let mode = focus_mode(mode());
     let (title, rows) = match &shown {
         Help::After(p) => (
             format!("{} · {}", p.label, mode.label()),
@@ -178,6 +205,17 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     };
     rsx! {
         KeyHelp { title, prefix, rows, on_close: move |_| reset() }
+    }
+}
+
+/// `mode`, or the queue's while the focus is in the music player's queue:
+/// read at each key, since a removed row takes the focus without a
+/// `focusout`.
+fn focus_mode(mode: Mode) -> Mode {
+    match mode {
+        Mode::Music | Mode::Queue if platform::focus_in_area("queue") => Mode::Queue,
+        Mode::Queue => Mode::Music,
+        m => m,
     }
 }
 

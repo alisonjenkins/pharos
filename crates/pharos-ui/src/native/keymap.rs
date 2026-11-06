@@ -99,6 +99,10 @@ pub enum Action {
     Press(&'static str),
     /// Open the season tab before (`-1`) or after (`1`) the one shown.
     Season(i8),
+    /// Focus the first control in the `data-key-area="<name>"` area,
+    /// pressing `data-key-action="<name>"` first to show it when it is
+    /// hidden (the music player's queue).
+    Focus(&'static str),
     Transport(Transport),
 }
 
@@ -147,7 +151,13 @@ pub const PREFIXES: &[Prefix] = &[Prefix {
     label: "Go to",
 }];
 
-const MOVING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail]);
+const MOVING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Queue]);
+const BROWSE: Modes = Modes::Only(&[Mode::Browse]);
+const MUSIC: Modes = Modes::Only(&[Mode::Music]);
+const QUEUE: Modes = Modes::Only(&[Mode::Queue]);
+const LISTENING: Modes = Modes::Only(&[Mode::Music, Mode::Queue]);
+/// Escape is the music player's way back to the library.
+const NOT_MUSIC: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Player, Mode::Queue]);
 const DETAIL: Modes = Modes::Only(&[Mode::Detail]);
 const PLAYERS: Modes = Modes::Only(&[Mode::Player, Mode::Music]);
 const VIDEO: Modes = Modes::Only(&[Mode::Player]);
@@ -412,7 +422,108 @@ pub const BINDINGS: &[Binding] = &[
         VIDEO,
         A::Transport(Transport::NextAudio),
     ),
+    bind(
+        &["a"],
+        "Add to the end of the queue",
+        G::Page,
+        BROWSE,
+        A::Press("queue-end"),
+    ),
+    bind(&["A"], "Play next", G::Page, BROWSE, A::Press("queue-next")),
+    bind(
+        &["x"],
+        "Start a mix like it",
+        G::Page,
+        BROWSE,
+        A::Press("mix"),
+    ),
+    bind(
+        &["F"],
+        "Open the full player",
+        G::Play,
+        Modes::All,
+        A::Press("full-player"),
+    ),
+    bind(
+        &["M"],
+        "Mini bar or floating player",
+        G::Play,
+        Modes::All,
+        A::Press("player-size"),
+    ),
+    bind(
+        &["Escape"],
+        "Back to the library",
+        G::Page,
+        MUSIC,
+        A::Press("shrink"),
+    ),
+    bind(
+        &["Backspace"],
+        "Back to the library",
+        G::Page,
+        MUSIC,
+        A::Press("shrink"),
+    ),
+    bind(&["q"], "Go to the queue", G::Page, MUSIC, A::Focus("queue")),
+    bind(
+        &["s"],
+        "Shuffle on or off",
+        G::Page,
+        LISTENING,
+        A::Press("shuffle"),
+    ),
+    bind(
+        &["C"],
+        "Clear the queue",
+        G::Page,
+        LISTENING,
+        A::Press("clear"),
+    ),
+    bind(&["x"], "Mix", G::Page, LISTENING, A::Press("mix")),
+    bind(
+        &["y"],
+        "Lyrics on or off",
+        G::Page,
+        LISTENING,
+        A::Press("lyrics"),
+    ),
+    bind(
+        &["d"],
+        "Remove from the queue",
+        G::Page,
+        QUEUE,
+        A::Press("remove"),
+    ),
+    bind(
+        &["Delete"],
+        "Remove from the queue",
+        G::Page,
+        QUEUE,
+        A::Press("remove"),
+    ),
+    bind(
+        &["K"],
+        "Move up the queue",
+        G::Page,
+        QUEUE,
+        A::Press("move-up"),
+    ),
+    bind(
+        &["J"],
+        "Move down the queue",
+        G::Page,
+        QUEUE,
+        A::Press("move-down"),
+    ),
     bind(&["g", "h"], "Home", G::GoTo, Modes::All, A::Go(Place::Home)),
+    bind(
+        &["g", "q"],
+        "Now playing",
+        G::GoTo,
+        Modes::All,
+        A::Press("full-player"),
+    ),
     bind(
         &["g", "t"],
         "Watch together",
@@ -433,7 +544,7 @@ pub const BINDINGS: &[Binding] = &[
         &["Escape"],
         "Back, or close",
         G::General,
-        Modes::All,
+        NOT_MUSIC,
         A::Native,
     ),
 ];
@@ -611,6 +722,43 @@ mod tests {
         }
     }
 
+    /// V512: the music player, its queue and the album pages share the
+    /// table: Escape leaves the player, the queue moves with j/k, and the
+    /// same key queues or mixes wherever a song is focused.
+    #[test]
+    fn music_keys_resolve_by_mode() {
+        let run = |mode, keys: &[&str]| match resolve(mode, keys) {
+            Resolved::Run(a) => Some(a),
+            _ => None,
+        };
+        assert_eq!(run(Mode::Music, &["Escape"]), Some(Action::Press("shrink")));
+        assert_eq!(run(Mode::Queue, &["Escape"]), Some(Action::Native));
+        assert_eq!(run(Mode::Music, &["q"]), Some(Action::Focus("queue")));
+        assert_eq!(
+            run(Mode::Music, &["k"]),
+            Some(Action::Transport(Transport::TogglePlay))
+        );
+        assert_eq!(run(Mode::Queue, &["k"]), Some(Action::Move(Dir::Up)));
+        assert_eq!(
+            run(Mode::Queue, &["g", "g"]),
+            Some(Action::Move(Dir::First))
+        );
+        assert_eq!(run(Mode::Queue, &["K"]), Some(Action::Press("move-up")));
+        assert_eq!(run(Mode::Browse, &["a"]), Some(Action::Press("queue-end")));
+        assert_eq!(
+            run(Mode::Player, &["a"]),
+            Some(Action::Transport(Transport::NextAudio))
+        );
+        for mode in [Mode::Music, Mode::Queue, Mode::Browse] {
+            assert_eq!(run(mode, &["x"]), Some(Action::Press("mix")), "{mode:?}");
+            assert_eq!(
+                run(mode, &["g", "q"]),
+                Some(Action::Press("full-player")),
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_binding_says_what_it_does() {
         assert!(BINDINGS
@@ -704,7 +852,10 @@ mod tests {
     fn help_after_g_lists_only_what_follows_it() {
         let rows = help(Mode::Detail, Some("g"));
         let labels: Vec<_> = rows.iter().map(|r| r.label).collect();
-        assert_eq!(labels, ["First", "Home", "Watch together", "Settings"]);
+        assert_eq!(
+            labels,
+            ["First", "Home", "Now playing", "Watch together", "Settings"]
+        );
         assert_eq!(rows[0].keys, ["g"]);
     }
 
