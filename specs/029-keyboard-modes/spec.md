@@ -57,7 +57,7 @@ there. Inside the player the bare keys still work.
 | Seek back / forward 10 s | Shift+Left / Shift+Right |
 | Volume up / down | Shift+Up / Shift+Down |
 | Open the full music player | Shift+F |
-| Switch between the mini and floating player | Shift+M |
+| Switch between the mini and floating player; from the full player, shrink to it | Shift+M |
 
 Shift+F, Shift+M and `g q` are not bound in the video player, which has
 no mini bar or floating window, so its key help does not list them (B619).
