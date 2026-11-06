@@ -28,6 +28,7 @@ use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
 use pharos_store_sqlx::ServerConfigStore;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument as _;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
     // T31: paths registered in lowercase only — the `LowercasePath`
@@ -4106,9 +4107,13 @@ pub(crate) struct SynthParents {
 pub(crate) enum SynthParentLookup {
     /// The current memo named the id.
     Hit,
+    /// A memo behind the library named the id; a refresh runs in the
+    /// background.
+    Stale,
     /// The current memo does not know the id: not a synth parent.
     Miss,
-    /// The memo was absent, stale or behind the library, so it was rebuilt.
+    /// The memo was absent, or behind the library or too old for an id it
+    /// does not know, so this caller waited for a rebuild.
     Rebuilt,
 }
 
@@ -4116,6 +4121,7 @@ impl SynthParentLookup {
     pub(crate) fn label(self) -> &'static str {
         match self {
             SynthParentLookup::Hit => "hit",
+            SynthParentLookup::Stale => "stale",
             SynthParentLookup::Miss => "miss",
             SynthParentLookup::Rebuilt => "rebuilt",
         }
@@ -4124,32 +4130,50 @@ impl SynthParentLookup {
 
 /// The parent filter a synth series/season/artist/album wire id names, if any.
 ///
-/// Answers from the memo while it is as new as the library generation; an id
-/// it does not know also needs the memo to be under [`SYNTH_PARENTS_MAX_AGE`].
-/// Otherwise one caller rebuilds it while the rest wait for that build, so a
-/// genre or person id costs at most one scan a minute or per library change.
-/// A show deleted on another replica keeps resolving to its (now empty)
-/// filter on this one until the generation moves.
+/// An id the memo knows answers at once. When the library has moved since the
+/// memo was built, that answer may be a moment stale, so one background
+/// rebuild is started rather than holding every request behind four table
+/// scans (B612). An id the memo does not know waits for a current memo: it is
+/// most likely the show the library change just added. A genre or person id
+/// therefore costs at most one scan a minute or per library change. A show
+/// deleted on another replica keeps resolving to its (now empty) filter on
+/// this one until the generation moves.
 async fn synth_parent_filter(
     state: &AppState,
     pid: &str,
 ) -> Result<Option<pharos_core::ParentFilter>, pharos_core::DomainError> {
-    let current = |m: &SynthParents, generation: u64| {
-        m.generation >= generation
-            && (m.filters.contains_key(pid) || m.built_at.elapsed() < SYNTH_PARENTS_MAX_AGE)
-    };
     let generation = || {
         state
             .library_generation
             .load(std::sync::atomic::Ordering::Relaxed)
     };
+    let fresh = |m: &SynthParents| {
+        m.generation >= generation()
+            && (m.filters.contains_key(pid) || m.built_at.elapsed() < SYNTH_PARENTS_MAX_AGE)
+    };
     let mut memo = state.synth_parents_memo();
     let mut outcome = SynthParentLookup::Hit;
-    if !memo.as_deref().is_some_and(|m| current(m, generation())) {
-        let _build = state.synth_parents_build.lock().await;
+    if let Some(m) = memo
+        .as_deref()
+        .filter(|m| !fresh(m) && m.filters.contains_key(pid))
+    {
+        outcome = SynthParentLookup::Stale;
+        let found = m.filters.get(pid).cloned();
+        refresh_synth_parents(state);
+        metrics::counter!("pharos_synth_parent_lookup_total", "outcome" => outcome.label())
+            .increment(1);
+        return Ok(found);
+    }
+    if !memo.as_deref().is_some_and(fresh) {
+        let _build = state
+            .synth_parents_build
+            .lock()
+            .instrument(tracing::info_span!("synth_parents.build_wait"))
+            .await;
         memo = state.synth_parents_memo();
-        if !memo.as_deref().is_some_and(|m| current(m, generation())) {
-            let built = std::sync::Arc::new(build_synth_parents(state, generation()).await?);
+        if !memo.as_deref().is_some_and(fresh) {
+            let built =
+                std::sync::Arc::new(build_synth_parents(&state.stores, generation()).await?);
             *state
                 .synth_parents
                 .lock()
@@ -4167,25 +4191,62 @@ async fn synth_parent_filter(
     Ok(found)
 }
 
+/// Rebuild the synth parent memo in the background, unless a build is already
+/// running (it will be at least as new).
+fn refresh_synth_parents(state: &AppState) {
+    let Ok(guard) = state.synth_parents_build.clone().try_lock_owned() else {
+        return;
+    };
+    let stores = state.stores.clone();
+    let memo = state.synth_parents.clone();
+    let generation = state
+        .library_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let span = tracing::info_span!(parent: None, "synth_parents.refresh", generation);
+    span.follows_from(tracing::Span::current());
+    tokio::spawn(
+        async move {
+            let _guard = guard;
+            match build_synth_parents(&stores, generation).await {
+                Ok(built) => {
+                    *memo
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(std::sync::Arc::new(built));
+                }
+                Err(e) => tracing::warn!(error = %e, "synth parent memo refresh failed"),
+            }
+        }
+        .instrument(span),
+    );
+}
+
 /// Hash every distinct series, season, artist and album key. The first kind
 /// to claim an id keeps it, in the order the per-request lookup used to try.
-#[tracing::instrument(skip(state))]
+/// The four scans run at once.
+#[tracing::instrument(skip(stores))]
 async fn build_synth_parents(
-    state: &AppState,
+    stores: &crate::state::Stores,
     generation: u64,
 ) -> Result<SynthParents, pharos_core::DomainError> {
     use crate::api::jellyfin::dto::{
         album_id_for, artist_id_for, season_id_for_key, series_id_for_key,
     };
     use pharos_core::ParentFilter;
+    let (series, seasons, artists, albums) = tokio::try_join!(
+        stores.distinct_series_keys(),
+        stores.distinct_season_keys(),
+        stores.distinct_artist_names(),
+        stores.distinct_album_names(),
+    )?;
     let mut filters = std::collections::HashMap::new();
-    for (folder, name) in state.stores.distinct_series_keys().await? {
+    for (folder, name) in series {
         let id = series_id_for_key(folder.as_deref(), &name);
         filters
             .entry(id)
             .or_insert(ParentFilter::Series { folder, name });
     }
-    for (folder, name, season) in state.stores.distinct_season_keys().await? {
+    for (folder, name, season) in seasons {
         let Ok(season) = u32::try_from(season) else {
             continue;
         };
@@ -4196,12 +4257,12 @@ async fn build_synth_parents(
             season,
         });
     }
-    for name in state.stores.distinct_artist_names().await? {
+    for name in artists {
         filters
             .entry(artist_id_for(&name))
             .or_insert(ParentFilter::Artist { name });
     }
-    for name in state.stores.distinct_album_names().await? {
+    for name in albums {
         filters
             .entry(album_id_for(&name))
             .or_insert(ParentFilter::Album { name });
@@ -8302,11 +8363,53 @@ mod synth_parent_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_known_id_answers_at_once_when_the_library_moves_and_refreshes_behind() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let _g = metrics::set_default_local_recorder(&rec);
+        let state = state_with(&[(1, "Buffy")]).await;
+        let buffy = series_id_for_key(Some("/tv/Buffy"), "Buffy");
+        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+        resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
+        lookups(&rec);
+
+        put_episode(&state, 2, "Angel").await;
+        state.notify_library_changed();
+        let got = resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
+        assert!(matches!(
+            got,
+            ParentResolution::Filter(ParentFilter::Series { .. })
+        ));
+        assert_eq!(count(&lookups(&rec), "stale"), 1, "no wait on the rebuild");
+
+        // The background refresh lands, so the new show resolves without one.
+        let mut landed = false;
+        for _ in 0..500 {
+            if state
+                .synth_parents_memo()
+                .is_some_and(|m| m.filters.contains_key(&angel))
+            {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(landed, "the background refresh did not land within 5 s");
+        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        assert!(matches!(
+            got,
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+        ));
+        assert_eq!(count(&lookups(&rec), "hit"), 1);
+    }
+
     #[test]
     fn lookup_labels_are_distinct() {
-        use super::SynthParentLookup::{Hit, Miss, Rebuilt};
-        let labels: std::collections::HashSet<_> =
-            [Hit, Miss, Rebuilt].iter().map(|o| o.label()).collect();
-        assert_eq!(labels.len(), 3);
+        use super::SynthParentLookup::{Hit, Miss, Rebuilt, Stale};
+        let labels: std::collections::HashSet<_> = [Hit, Stale, Miss, Rebuilt]
+            .iter()
+            .map(|o| o.label())
+            .collect();
+        assert_eq!(labels.len(), 4);
     }
 }
