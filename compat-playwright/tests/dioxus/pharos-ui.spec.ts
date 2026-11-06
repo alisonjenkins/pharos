@@ -1547,6 +1547,67 @@ test.describe("pharos Dioxus UI", () => {
       await expect(palette).toBeVisible();
     });
 
+    // V518: a show's name lists the show first, `s01` opens its season and
+    // `s01e02` that episode; the arrows keep the picked row in sight.
+    test("palette: a show, its season and its episode by name, and the pick stays in sight", async ({
+      page,
+      request,
+    }) => {
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      const palette = page.getByRole("dialog", { name: "Go to or search" });
+      const box = palette.getByRole("combobox");
+      const titles = palette.getByRole("group", { name: "Titles" }).getByRole("option");
+      const open = async (text: string) => {
+        await page.keyboard.press("Control+k");
+        await expect(palette).toBeVisible();
+        await box.fill(text);
+      };
+
+      await open("playwright show");
+      await expect(titles.first()).toContainText("Playwright Show", { timeout: 15_000 });
+      await expect(titles.first()).toContainText("Series");
+      await box.press("Escape");
+
+      await open("playwright show s1");
+      await expect(titles.first()).toContainText("Season 1", { timeout: 15_000 });
+      await expect(titles.first()).toContainText("Season · Playwright Show");
+      await box.press("Enter");
+      await expect(page).toHaveURL(/\/ui\/browse\//);
+      await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show", {
+        timeout: 15_000,
+      });
+
+      await open("playwright show s01e2");
+      await expect(titles.first()).toContainText("Episode", { timeout: 15_000 });
+      await expect(titles.first()).toContainText("E2");
+      await box.press("Enter");
+      await expect(page).toHaveURL(/\/ui\/title\//);
+
+      // The Bulk titles overflow the list; walking down keeps the pick shown.
+      await open("bulk");
+      await expect(titles.nth(20)).toBeAttached({ timeout: 15_000 });
+      for (let i = 0; i < 20; i++) await box.press("ArrowDown");
+      const picked = palette.locator('[role=option][aria-selected="true"]');
+      await expect(picked).toHaveCount(1);
+      await expect(picked).toBeInViewport();
+      await box.press("Escape");
+    });
+
     // The page is told it has neither WebM nor native HLS, as Firefox on a
     // WebM-less build would be, so the server remuxes the VP9 fixture to HLS
     // and the page plays it through the vendored hls.js. MediaSource answers
