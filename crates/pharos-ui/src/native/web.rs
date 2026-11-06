@@ -937,11 +937,6 @@ pub fn focus_by_id(id: &str) {
     }
 }
 
-/// Moves keyboard focus to the element `id`, if it is in the page.
-pub fn focus(id: &str) {
-    focus_by_id(id);
-}
-
 /// Enters fullscreen on the element `id`, or leaves it.
 pub fn toggle_fullscreen(id: &str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
