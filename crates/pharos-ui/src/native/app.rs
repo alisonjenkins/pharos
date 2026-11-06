@@ -31,14 +31,15 @@ use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, crossfade_ms, device_class, fade_volume, max_bitrate_label, parse_crossfade,
-    parse_max_bitrate, parse_volume_setting, position_at, preview_set, rust_subtitle_url, start_ms,
-    starting_tier, starting_tier_line, styled_subtitle_signals, styled_subtitle_url,
-    subtitle_font_urls, subtitle_switch, up_next_at, volume_setting, EffectsLevel, Engine,
+    choose_engine, crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
+    parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting, position_at,
+    preview_set, rust_subtitle_url, start_ms, starting_tier, starting_tier_line,
+    styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls, subtitle_switch,
+    tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel, Engine,
     LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect,
-    PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, Tier, UpNext, UpNextStep,
+    PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop, UpNext, UpNextStep,
     CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY,
-    SUBTITLE_SIZE_KEY, VOLUME_KEY,
+    SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -636,11 +637,45 @@ fn store_effects_level(level: EffectsLevel) -> Result<(), String> {
     })
 }
 
+thread_local! {
+    /// The tier this device dropped to on this page load; it outranks storage
+    /// as [`SESSION_EFFECTS_LEVEL`] does.
+    static SESSION_TIER_DROP: Cell<Option<Tier>> = const { Cell::new(None) };
+}
+
+/// The tier this device last dropped to (spec 028 FR-019): this page load's
+/// drop, else the stored one, else none.
+fn stored_tier_drop() -> Option<Tier> {
+    if let Some(tier) = SESSION_TIER_DROP.with(Cell::get) {
+        return Some(tier);
+    }
+    match platform::stored_theme(TIER_DROP_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .and_then(|v| parse_tier_drop(v, now_ms_u64())),
+        Err(e) => {
+            platform::warn(&format!("pharos: tier_drop storage read failed error={e}"));
+            None
+        }
+    }
+}
+
+/// Keep `tier` as this device's cap for this page load and try to save it
+/// with the time. A cap never rises: the lower of `tier` and the one already
+/// held is kept.
+fn store_tier_drop(tier: Tier) -> Result<(), String> {
+    let keep = stored_tier_drop().map_or(tier, |held| held.min(tier));
+    SESSION_TIER_DROP.with(|s| s.set(Some(keep)));
+    platform::store_theme(TIER_DROP_KEY, &format_tier_drop(keep, now_ms_u64())).inspect_err(|e| {
+        platform::warn(&format!("pharos: tier_drop storage write failed error={e}"));
+    })
+}
+
 /// `(max-width)` below which a coarse-pointer device counts as a phone.
 const NARROW_SCREEN: &str = "(max-width: 600px)";
 
 /// The tier a styled subtitle track is first fetched at on this device, and
-/// the log line saying why. The remembered dropped tier is not stored yet.
+/// the log line saying why.
 // The player takes this once the server serves the styled track (T028-19).
 #[allow(dead_code)]
 fn current_starting_tier() -> Tier {
@@ -651,7 +686,7 @@ fn current_starting_tier() -> Tier {
         platform::android_shell(),
     );
     let reduced_motion = platform::prefers("(prefers-reduced-motion: reduce)");
-    let remembered = None;
+    let remembered = stored_tier_drop();
     let tier = starting_tier(device, reduced_motion, remembered);
     platform::info(&starting_tier_line(
         tier,
@@ -660,6 +695,26 @@ fn current_starting_tier() -> Tier {
         remembered,
     ));
     tier
+}
+
+/// Feed the video's frame counters to `watch`; a drop is remembered for the
+/// device, logged and reported, and the new tier comes back.
+// The player calls this each second once the styled track is served (T028-21).
+#[allow(dead_code)]
+fn on_quality_sample(
+    watch: &mut TierDrop,
+    renderer: &str,
+    now_ms: u64,
+    dropped_total: u64,
+    presented_total: u64,
+    counting: bool,
+) -> Option<Tier> {
+    let drop = watch.sample(now_ms, dropped_total, presented_total, counting)?;
+    platform::info(&tier_drop_line(&drop));
+    platform::report_event(tier_drop_report(renderer, &drop));
+    // A failed write is already warned about; the drop holds for this load.
+    let _ = store_tier_drop(drop.to);
+    Some(drop.to)
 }
 
 /// `caps` with the bitrate to negotiate `kind` with, from the viewer's
@@ -4889,5 +4944,50 @@ mod tests {
             .unwrap_or("");
         assert!(marked.contains("data-theme=\"pharos-night\""), "{html}");
         assert!(html.contains("class=\"pharos-swatch\""), "{html}");
+    }
+
+    #[test]
+    fn a_dropped_tier_outlives_a_storage_that_keeps_nothing() {
+        assert_eq!(stored_tier_drop(), None);
+        store_tier_drop(Tier::Tv).unwrap();
+        assert_eq!(stored_tier_drop(), Some(Tier::Tv));
+    }
+
+    #[test]
+    fn the_starting_tier_is_capped_at_the_dropped_one() {
+        // The host is a Desktop device, so only the cap can make this Tv.
+        store_tier_drop(Tier::Tv).unwrap();
+        assert_eq!(current_starting_tier(), Tier::Tv);
+    }
+
+    #[test]
+    fn a_later_drop_never_raises_the_stored_cap() {
+        store_tier_drop(Tier::Low).unwrap();
+        store_tier_drop(Tier::Tv).unwrap();
+        assert_eq!(stored_tier_drop(), Some(Tier::Low));
+    }
+
+    #[test]
+    fn a_bad_stream_drops_the_tier_once_and_remembers_it() {
+        let mut watch = TierDrop::new(Tier::Desktop);
+        let drops: Vec<Tier> = (0..=25u64)
+            .filter_map(|sec| {
+                on_quality_sample(&mut watch, "jassub", sec * 1000, sec * 30, sec * 60, true)
+            })
+            .collect();
+        assert_eq!(drops, [Tier::Tv]);
+        assert_eq!(stored_tier_drop(), Some(Tier::Tv));
+    }
+
+    #[test]
+    fn a_hidden_page_never_drops_the_tier() {
+        let mut watch = TierDrop::new(Tier::Desktop);
+        for sec in 0..=60u64 {
+            assert_eq!(
+                on_quality_sample(&mut watch, "jassub", sec * 1000, sec * 30, sec * 60, false),
+                None
+            );
+        }
+        assert_eq!(stored_tier_drop(), None);
     }
 }
