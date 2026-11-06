@@ -255,13 +255,6 @@ pub const BINDINGS: &[Binding] = &[
         A::Transport(Transport::TogglePlay),
     ),
     bind(
-        &["k"],
-        "Play or pause",
-        G::Play,
-        PLAYERS,
-        A::Transport(Transport::TogglePlay),
-    ),
-    bind(
         &["ArrowLeft"],
         "Back 10 s",
         G::Play,
@@ -295,6 +288,20 @@ pub const BINDINGS: &[Binding] = &[
         G::Play,
         PLAYERS,
         A::Transport(Transport::VolumeUp),
+    ),
+    bind(
+        &["k"],
+        "Volume up",
+        G::Play,
+        PLAYERS,
+        A::Transport(Transport::VolumeUp),
+    ),
+    bind(
+        &["j"],
+        "Volume down",
+        G::Play,
+        PLAYERS,
+        A::Transport(Transport::VolumeDown),
     ),
     bind(
         &["+"],
@@ -736,7 +743,7 @@ mod tests {
         assert_eq!(run(Mode::Music, &["q"]), Some(Action::Focus("queue")));
         assert_eq!(
             run(Mode::Music, &["k"]),
-            Some(Action::Transport(Transport::TogglePlay))
+            Some(Action::Transport(Transport::VolumeUp))
         );
         assert_eq!(run(Mode::Queue, &["k"]), Some(Action::Move(Dir::Up)));
         assert_eq!(
@@ -818,7 +825,10 @@ mod tests {
     fn the_player_keeps_its_shipped_keys_and_gains_vim_seeks() {
         let t = |k| transport(Mode::Player, k);
         assert_eq!(t(" "), Some(Transport::TogglePlay));
-        assert_eq!(t("k"), Some(Transport::TogglePlay));
+        // The Vim keys mirror the arrows: k and j set the volume like Up
+        // and Down, so k no longer plays and pauses.
+        assert_eq!(t("k"), Some(Transport::VolumeUp));
+        assert_eq!(t("j"), Some(Transport::VolumeDown));
         assert_eq!(t("h"), Some(Transport::SeekBack));
         assert_eq!(t("l"), Some(Transport::SeekForward));
         assert_eq!(t("ArrowUp"), Some(Transport::VolumeUp));
@@ -828,7 +838,7 @@ mod tests {
         assert_eq!(t("a"), Some(Transport::NextAudio));
         // Video-only keys are not the music player's.
         assert_eq!(transport(Mode::Music, "c"), None);
-        assert_eq!(transport(Mode::Music, "k"), Some(Transport::TogglePlay));
+        assert_eq!(transport(Mode::Music, "k"), Some(Transport::VolumeUp));
     }
 
     #[test]
