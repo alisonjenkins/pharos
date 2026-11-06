@@ -151,3 +151,47 @@ test.describe("keyboard modes (spec 029)", () => {
     await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show");
   });
 });
+
+test.describe("player keys (spec 029)", () => {
+  async function playFilm(page: Page): Promise<void> {
+    const search = page.locator(".pharos-search input[type=search]");
+    await search.fill("AA Bulk 026");
+    await expect(page.locator(".pharos-search [role=listbox] [role=option]").first()).toBeVisible({
+      timeout: 15_000,
+    });
+    await search.press("ArrowDown");
+    await search.press("Enter");
+    await expect(page.locator("#pharos-main-action")).toBeFocused({ timeout: 15_000 });
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/ui\/watch\//);
+    await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+  }
+  const muted = (page: Page) =>
+    page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).muted);
+
+  test("the player's keys work with the focus anywhere on the page (B618)", async ({
+    page,
+    request,
+  }) => {
+    await signIn(page, request);
+    await playFilm(page);
+    // Play was pressed and is gone, so the focus is on the page, not the player.
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    expect(await muted(page)).toBe(false);
+    await page.keyboard.press("m");
+    await expect.poll(() => muted(page)).toBe(true);
+    await expect(page.locator("#pharos-player")).toBeFocused();
+  });
+
+  test("g h in the player goes home rather than seeking back (B617)", async ({
+    page,
+    request,
+  }) => {
+    await signIn(page, request);
+    await playFilm(page);
+    await page.locator("#pharos-player").focus();
+    await page.keyboard.press("g");
+    await page.keyboard.press("h");
+    await expect(page).toHaveURL(/\/ui\/?$/);
+  });
+});
