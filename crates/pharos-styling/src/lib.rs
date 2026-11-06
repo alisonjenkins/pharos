@@ -7,6 +7,7 @@
 
 pub mod budget;
 pub mod compile;
+pub mod director;
 mod effects;
 pub mod event;
 pub mod plan;
@@ -18,5 +19,6 @@ pub mod theme;
 pub mod version;
 
 pub use compile::compile;
+pub use director::{direct, Direction};
 pub use plan::{EffectPlan, EffectsLevel, Intent, Karaoke, LineEffect, Placement, Tier};
 pub use version::{COMPILER_VERSION, DIRECTOR_VERSION};
