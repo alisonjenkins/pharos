@@ -92,7 +92,33 @@ impl Lyrics {
     pub fn synced(&self) -> bool {
         !self.lines.is_empty() && self.lines.iter().all(|l| l.start_ms.is_some())
     }
+
+    /// Drop the times of synced lyrics that run past the end of the song.
+    ///
+    /// Synced lyrics timed for another cut of a song (an album version on a
+    /// shorter compilation edit) put lines at the wrong moments, and a line
+    /// starting after the song ends shows it. The words are still right, so
+    /// they are kept as plain lyrics rather than followed along wrongly.
+    #[must_use]
+    pub fn fit_to(mut self, duration_ms: Option<u64>) -> Self {
+        let Some(duration_ms) = duration_ms.filter(|&d| d > 0) else {
+            return self;
+        };
+        let last = self.lines.iter().filter_map(|l| l.start_ms).max();
+        if last.is_some_and(|ms| ms > duration_ms.saturating_add(OVERRUN_SLACK_MS)) {
+            for line in &mut self.lines {
+                line.start_ms = None;
+                line.words.clear();
+            }
+        }
+        self
+    }
 }
+
+/// How far past a song's end a synced line may start before the lyrics are
+/// taken to be timed for a different cut: a probed duration and a lyric
+/// file's stamps can each be a little off.
+const OVERRUN_SLACK_MS: u64 = 3_000;
 
 /// What an online provider is asked about a song.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +239,8 @@ impl LyricsFinder {
         let found = match local {
             Some(found) => Some(found),
             None => self.online(item).await,
-        };
+        }
+        .map(|l| l.fit_to(item.probe.duration_ms));
         let outcome = found.as_ref().map_or("none", |l| l.origin.label());
         metrics::counter!("pharos_lyrics_lookup_total", "outcome" => outcome).increment(1);
         tracing::debug!(
@@ -446,6 +473,40 @@ mod tests {
         assert!(all.unwrap().synced());
         let some = Lyrics::from_lines(vec![line(Some(0), "a"), line(None, "b")], Origin::Online);
         assert!(!some.unwrap().synced());
+    }
+
+    #[test]
+    fn synced_lyrics_past_the_end_of_the_song_lose_their_times() {
+        // Album-version lyrics (last line at 4:37) on a 2:28 compilation edit.
+        let mut late = line(Some(277_190), "(Hey, hey, hey)");
+        late.words = vec![WordStamp {
+            at: 0,
+            start_ms: 277_190,
+        }];
+        let lyrics = Lyrics::from_lines(
+            vec![line(Some(51_680), "I'm the trouble starter"), late],
+            Origin::Online,
+        )
+        .unwrap();
+        let fitted = lyrics.fit_to(Some(147_786));
+        assert!(!fitted.synced());
+        assert!(fitted
+            .lines
+            .iter()
+            .all(|l| l.start_ms.is_none() && l.words.is_empty()));
+        assert_eq!(fitted.lines[0].text, "I'm the trouble starter");
+    }
+
+    #[test]
+    fn synced_lyrics_that_fit_the_song_keep_their_times() {
+        let lyrics = Lyrics::from_lines(
+            vec![line(Some(0), "a"), line(Some(149_000), "b")],
+            Origin::Online,
+        )
+        .unwrap();
+        // Within the slack of a 147.8 s song, and with no duration known.
+        assert_eq!(lyrics.clone().fit_to(Some(147_786)), lyrics);
+        assert_eq!(lyrics.clone().fit_to(None), lyrics);
     }
 
     #[test]
