@@ -1527,7 +1527,7 @@ test.describe("pharos Dioxus UI", () => {
       const box = palette.getByRole("combobox");
       await expect(box).toHaveValue("Playwright");
       await expect(box).toBeFocused();
-      // The term it opens on is selected, so typing replaces it (B622).
+      // The term it opens on is selected, so typing replaces it (B623).
       await expect
         .poll(() =>
           box.evaluate((el: HTMLInputElement) => [el.selectionStart, el.selectionEnd]),
@@ -3003,6 +3003,10 @@ test.describe("pharos Dioxus UI play queue", () => {
     await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
       timeout: 15_000,
     });
+    // And Shift+M makes the full player small again (B623).
+    await page.keyboard.press("Shift+M");
+    await expect(page.locator(".pharos-stage.is-full")).toHaveCount(0);
+    await expect(page.locator(".pharos-stage")).toBeVisible();
   });
 });
 
