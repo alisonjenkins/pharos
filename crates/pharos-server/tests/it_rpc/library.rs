@@ -1925,7 +1925,13 @@ async fn native_search_names_an_album_by_words_from_its_name_and_artist() {
     let session = crate::revocation::signed_in(&client, &fx.user_token).await;
     seed_music_libraries(&fx).await;
 
-    for text in ["beta third", "Third BETA", "thrid beta", "beta thrd"] {
+    for text in [
+        "beta third",
+        "Third BETA",
+        "thrid beta",
+        "beta thrd",
+        "btea third",
+    ] {
         assert_eq!(
             searched(&session, text).await.first(),
             Some(&album_id_for("Third")),
