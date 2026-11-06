@@ -19,6 +19,8 @@ use pharos_client::{CallInfo, ClientError};
 use super::app::{call, remount_on, Ctx};
 use super::art::Art;
 use super::group_app::Together;
+use super::keymap::Mode;
+use super::keys::{use_arrival_focus, use_key_mode};
 use super::letters::{self, Wheel, LETTERS};
 use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
 use super::machine::Event;
@@ -30,8 +32,8 @@ use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
-    display_name, is_placeholder_episode_name, progress_percent, runtime, Link, MarkPlayed,
-    PosterTile, Ratings, WatchedToggle,
+    display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime, Link,
+    MarkPlayed, PosterTile, Ratings, WatchedToggle, MAIN_ACTION,
 };
 use pharos_client::mix::radio;
 
@@ -1351,6 +1353,9 @@ fn Hero(
     facts: Vec<String>,
     square: bool,
     #[props(default)] mark: bool,
+    /// For a series, the episode its Play or Resume starts.
+    #[props(default)]
+    next: Option<Item>,
 ) -> Element {
     let art_class = if square {
         "pharos-hero-art pharos-hero-art-square"
@@ -1374,9 +1379,21 @@ fn Hero(
                 if let Some(d) = detail.as_ref() {
                     Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
                 }
-                if let Some(d) = detail.as_ref().filter(|_| mark) {
+                if next.is_some() || (mark && detail.is_some()) {
                     div { class: "pharos-actions",
-                        WatchedToggle { id: d.item.id, played: d.item.played, what: "show" }
+                        if let Some(ep) = next.as_ref() {
+                            Link {
+                                to: Route::Watch(ep.id),
+                                class: "pharos-button",
+                                plays: ItemKind::Episode,
+                                id: MAIN_ACTION,
+                                key_action: "play",
+                                {next_label(ep)}
+                            }
+                        }
+                        if let Some(d) = detail.as_ref().filter(|_| mark) {
+                            WatchedToggle { id: d.item.id, played: d.item.played, what: "show" }
+                        }
                     }
                 }
                 if let Some(d) = detail.as_ref().filter(|d| !d.overview.is_empty()) {
@@ -1401,6 +1418,8 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
         let _ = series;
         platform::scroll_to_top();
     }));
+    use_key_mode(Mode::Detail);
+    use_arrival_focus(series, MAIN_ACTION);
     let in_group = in_this_group(&show, &seen);
     let facts: Vec<String> = [
         show.series
@@ -1425,13 +1444,15 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                 facts,
                 square: false,
                 mark: true,
+                next: next_episode(&show.episodes.items).cloned(),
             }
             if show.seasons.len() > 1 {
-                nav { class: "pharos-tabs", aria_label: "Seasons",
+                nav { class: "pharos-tabs", aria_label: "Seasons", "data-key-tabs": "seasons",
                     for season in show.seasons.iter() {
                         Link {
                             key: "{season.id}",
                             to: Route::Browse(season.id),
+                            current: Some(season.id) == show.selected,
                             class: if Some(season.id) == show.selected { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
                             "{season.name}"
                         }
@@ -1455,6 +1476,29 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
             InThisGroup { rows: in_group }
             EpisodeList { page: show.episodes.clone(), seen }
         }
+    }
+}
+
+/// The episode a show page's Play starts, from the season shown: the one
+/// part-watched, else the first unwatched, else the first.
+pub fn next_episode(episodes: &[Item]) -> Option<&Item> {
+    episodes
+        .iter()
+        .find(|e| progress_percent(e).is_some())
+        .or_else(|| episodes.iter().find(|e| !e.played))
+        .or(episodes.first())
+}
+
+/// The show page's Play, naming the episode: "Resume S2 · E3".
+fn next_label(episode: &Item) -> String {
+    let verb = if progress_percent(episode).is_some() {
+        "Resume"
+    } else {
+        "Play"
+    };
+    match episode_label(episode) {
+        Some(label) => format!("{verb} {label}"),
+        None => verb.to_owned(),
     }
 }
 
@@ -1510,10 +1554,11 @@ pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Eleme
         if page.items.is_empty() {
             p { class: "pharos-empty", "No episodes yet." }
         }
-        ol { class: "pharos-episodes",
+        ol { class: "pharos-episodes", "data-keys-list": "episodes",
             for ep in page.items.iter() {
                 li {
                     key: "{ep.id}",
+                    "data-key-row": "episode",
                     EpisodeRow { episode: ep.clone(), seen: seen::rows(&seen, ep.id) }
                 }
             }
@@ -1551,7 +1596,11 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 }
             }
             EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
-            Link { to: Route::Watch(episode.id), class: "pharos-button pharos-episode-play", plays: ItemKind::Episode,
+            Link {
+                to: Route::Watch(episode.id),
+                class: "pharos-button pharos-episode-play",
+                plays: ItemKind::Episode,
+                key_action: "play",
                 if progress.is_some() { "Resume" } else { "Play" }
             }
         }
@@ -1574,6 +1623,7 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
             class: if played { "pharos-episode-mark is-watched" } else { "pharos-episode-mark" },
             title: "{what}",
             "aria-label": "{what}",
+            "data-key-action": "watched",
             onclick: move |_| mark.0.call((id, !played)),
             svg { view_box: "0 0 24 24", "aria-hidden": "true",
                 path { d: "M5 12.5l4.5 4.5L19 7.5" }
