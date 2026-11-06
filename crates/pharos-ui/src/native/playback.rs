@@ -648,6 +648,119 @@ pub fn starting_tier_line(
     )
 }
 
+/// A frame-drop measurement window (spec 028 FR-019).
+const TIER_DROP_WINDOW_MS: u64 = 10_000;
+/// The fewest ms between two drops, so a drop gets time to show its effect.
+const TIER_DROP_COOLDOWN_MS: u64 = 30_000;
+/// Dropped frames over presented frames, in percent, past which a window is over budget.
+const TIER_DROP_BUDGET_PERCENT: u128 = 5;
+
+/// One tier lower and why: the measured window behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierDropEvent {
+    pub from: Tier,
+    pub to: Tier,
+    pub dropped: u64,
+    pub presented: u64,
+    pub window_ms: u64,
+}
+
+/// Watches `getVideoPlaybackQuality` counters and says when the styled track
+/// should fall one tier (spec 028 FR-019): over budget across a full 10 s
+/// window, at most once per 30 s, never below Low.
+#[derive(Debug)]
+pub struct TierDrop {
+    tier: Tier,
+    samples: std::collections::VecDeque<QualitySample>,
+    last_drop_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QualitySample {
+    at_ms: u64,
+    dropped: u64,
+    presented: u64,
+}
+
+impl TierDrop {
+    pub fn new(tier: Tier) -> Self {
+        TierDrop {
+            tier,
+            samples: std::collections::VecDeque::new(),
+            last_drop_ms: None,
+        }
+    }
+
+    /// The tier the styled track is on now.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    /// Feed the video's running counters; a drop comes back when one is due.
+    /// `counting` is false while the page is hidden or the video is paused or
+    /// stalled: such a sample says nothing about the renderer, so it only
+    /// restarts the window.
+    pub fn sample(
+        &mut self,
+        now_ms: u64,
+        dropped_total: u64,
+        presented_total: u64,
+        counting: bool,
+    ) -> Option<TierDropEvent> {
+        if !counting {
+            self.samples.clear();
+            return None;
+        }
+        let sample = QualitySample {
+            at_ms: now_ms,
+            dropped: dropped_total,
+            presented: presented_total,
+        };
+        if self.samples.back().is_some_and(|last| {
+            now_ms < last.at_ms || dropped_total < last.dropped || presented_total < last.presented
+        }) {
+            self.samples.clear();
+        }
+        self.samples.push_back(sample);
+        // Keep one sample at or before the window's start as its baseline.
+        let window_start = now_ms.saturating_sub(TIER_DROP_WINDOW_MS);
+        while self
+            .samples
+            .get(1)
+            .is_some_and(|second| second.at_ms <= window_start)
+        {
+            self.samples.pop_front();
+        }
+        let oldest = *self.samples.front()?;
+        let window_ms = now_ms.saturating_sub(oldest.at_ms);
+        let dropped = dropped_total.saturating_sub(oldest.dropped);
+        let presented = presented_total.saturating_sub(oldest.presented);
+        let over_budget = window_ms >= TIER_DROP_WINDOW_MS
+            && u128::from(dropped).saturating_mul(100)
+                > u128::from(presented).saturating_mul(TIER_DROP_BUDGET_PERCENT);
+        let cooled = self.last_drop_ms.map_or(true, |at| {
+            now_ms.saturating_sub(at) >= TIER_DROP_COOLDOWN_MS
+        });
+        let to = match self.tier {
+            Tier::Desktop => Tier::Tv,
+            Tier::Tv | Tier::Low => Tier::Low,
+        };
+        if !over_budget || !cooled || to == self.tier {
+            return None;
+        }
+        let from = std::mem::replace(&mut self.tier, to);
+        self.last_drop_ms = Some(now_ms);
+        self.samples.clear();
+        Some(TierDropEvent {
+            from,
+            to,
+            dropped,
+            presented,
+            window_ms,
+        })
+    }
+}
+
 /// Where the viewer's library card transition is kept; absent or unknown is
 /// [`LibraryTransition::Fade`].
 pub const LIBRARY_TRANSITION_KEY: &str = "pharos.library.transition";
@@ -2398,5 +2511,122 @@ mod tests {
         assert_eq!(start_ms(90_000, false), 90_000);
         assert_eq!(start_ms(90_000, true), 0);
         assert_eq!(start_ms(0, false), 0);
+    }
+
+    /// Feeds `(dropped, presented)` totals once a second from t=0 and returns
+    /// every drop with the second it fired at.
+    fn run(start: Tier, totals: &[(u64, u64)]) -> Vec<(u64, TierDropEvent)> {
+        let mut td = TierDrop::new(start);
+        let mut out = Vec::new();
+        for (i, (d, p)) in totals.iter().enumerate() {
+            let sec = i as u64;
+            if let Some(e) = td.sample(sec * 1000, *d, *p, true) {
+                out.push((sec, e));
+            }
+        }
+        out
+    }
+
+    /// `secs` samples of a stream at 60 fps losing `loss` of every 100 frames.
+    fn stream(secs: u64, loss: u64) -> Vec<(u64, u64)> {
+        (0..=secs).map(|s| (s * 60 * loss / 100, s * 60)).collect()
+    }
+
+    #[test]
+    fn a_steady_good_stream_never_drops() {
+        assert!(run(Tier::Desktop, &stream(120, 1)).is_empty());
+    }
+
+    #[test]
+    fn a_sustained_bad_stream_drops_once_per_cooldown() {
+        let drops = run(Tier::Desktop, &stream(25, 20));
+        assert_eq!(drops.len(), 1);
+        let (sec, e) = drops[0];
+        assert_eq!(sec, 10);
+        assert_eq!(
+            e,
+            TierDropEvent {
+                from: Tier::Desktop,
+                to: Tier::Tv,
+                dropped: 120,
+                presented: 600,
+                window_ms: 10_000
+            }
+        );
+    }
+
+    #[test]
+    fn the_cooldown_spaces_drops_thirty_seconds_apart() {
+        let drops = run(Tier::Desktop, &stream(80, 20));
+        let at: Vec<_> = drops.iter().map(|(s, e)| (*s, e.to)).collect();
+        assert_eq!(at, [(10, Tier::Tv), (40, Tier::Low)]);
+    }
+
+    #[test]
+    fn low_is_the_floor() {
+        assert!(run(Tier::Low, &stream(120, 50)).is_empty());
+        let mut td = TierDrop::new(Tier::Desktop);
+        for (i, (d, p)) in stream(200, 50).into_iter().enumerate() {
+            td.sample(i as u64 * 1000, d, p, true);
+        }
+        assert_eq!(td.tier(), Tier::Low);
+    }
+
+    #[test]
+    fn a_partial_window_does_nothing() {
+        assert!(run(Tier::Desktop, &stream(9, 90)).is_empty());
+    }
+
+    #[test]
+    fn exactly_five_percent_is_within_budget() {
+        let totals: Vec<_> = (0..=30).map(|s| (s * 3, s * 60)).collect();
+        assert!(run(Tier::Desktop, &totals).is_empty());
+        let totals: Vec<_> = (0..=30).map(|s| (s * 3 + s / 10, s * 60)).collect();
+        assert!(!run(Tier::Desktop, &totals).is_empty());
+    }
+
+    #[test]
+    fn counters_going_backwards_restart_the_window() {
+        let mut totals = stream(8, 50);
+        totals.extend(stream(8, 50));
+        assert!(run(Tier::Desktop, &totals).is_empty());
+    }
+
+    #[test]
+    fn a_recovered_stream_stops_dropping() {
+        let mut totals = stream(10, 20);
+        let (d0, p0) = totals[10];
+        totals.extend((1..=60).map(|s| (d0, p0 + s * 60)));
+        let drops = run(Tier::Desktop, &totals);
+        assert_eq!(drops.len(), 1);
+    }
+
+    #[test]
+    fn samples_while_not_counting_restart_the_window() {
+        let sample_at = |hidden_at: Option<u64>| {
+            let mut td = TierDrop::new(Tier::Desktop);
+            let mut fired = Vec::new();
+            for (sec, (d, p)) in stream(14, 50).into_iter().enumerate() {
+                let sec = sec as u64;
+                if td
+                    .sample(sec * 1000, d, p, Some(sec) != hidden_at)
+                    .is_some()
+                {
+                    fired.push(sec);
+                }
+            }
+            fired
+        };
+        assert_eq!(sample_at(None), [10]);
+        // Hidden at 5 s: the window restarts, so the first full one ends at 15 s.
+        assert!(sample_at(Some(5)).is_empty());
+    }
+
+    #[test]
+    fn dropped_frames_with_none_presented_are_over_budget() {
+        let totals: Vec<_> = (0..=10).map(|s| (s, 0)).collect();
+        assert_eq!(run(Tier::Desktop, &totals).len(), 1);
+        let totals: Vec<_> = (0..=10).map(|_| (0, 0)).collect();
+        assert!(run(Tier::Desktop, &totals).is_empty());
     }
 }
