@@ -13,7 +13,7 @@ thiserror.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-# The property test (V511) parses compiled output with the renderer's parser.
+# The property test (V533) parses compiled output with the renderer's parser.
 pharos-subs = { path = "../pharos-subs" }
 proptest = "1"
 serde_json.workspace = true
