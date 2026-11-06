@@ -1796,13 +1796,15 @@ async fn native_search_honours_the_limit() {
     assert_eq!((total, all.len()), (5, 5));
 }
 
-/// T038 parity: `Library.search` lists the same item ids, in the same order,
-/// as `/Search/Hints` lists as item hints (its aggregate hints come after).
+/// T038 parity: `Library.search` lists the same stored item ids, in the same
+/// order, as `/Search/Hints` lists as item hints (the shows, artists and
+/// albums V518 puts ahead of them are left out of the comparison).
 /// Disarm check: a `search` that reverses the store order breaks the
 /// comparison.
 #[actix_web::test]
 async fn native_search_agrees_with_the_jellyfin_search_hints_route() {
     use actix_web::test;
+    use pharos_jellyfin_api::dto::WireId;
 
     let (server, fx) = crate::revocation::start().await;
     let (client, _closed) = crate::revocation::connect(&server).await;
@@ -1828,10 +1830,85 @@ async fn native_search_agrees_with_the_jellyfin_search_hints_route() {
         let ids: Vec<String> = native
             .iter()
             .map(|s| s["Id"].as_str().unwrap().to_owned())
+            .filter(|id| matches!(WireId::parse(id), Some(WireId::Real(_))))
             .collect();
         assert!(!ids.is_empty(), "{term}: the term must match something");
         assert_eq!(ids, hinted, "{term}");
     }
+}
+
+/// The ids a `Library.search` for `text` lists, in order.
+async fn searched(session: &session::Client, text: &str) -> Vec<String> {
+    let (_, found) = wire_search(session, text, 0).await;
+    found
+        .iter()
+        .map(|s| s["Id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// V518: a show's name finds the show ahead of its episodes, and a trailing
+/// `s01` or `s01e02` (`s1`, `s01e2`, `s1 e2`) finds that season or episode.
+/// Disarm check: with `services::search` leaving out shows, "Show" lists
+/// only episodes and the first assertion fails.
+#[actix_web::test]
+async fn native_search_names_a_show_then_its_season_or_episode() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key, WireId};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_shows(&fx).await;
+    let show = series_id_for_key(Some("/libA/Show"), "Show");
+    let season = season_id_for_key(Some("/libA/Show"), "Show", 1);
+    let real = |id| WireId::Real(id).to_string();
+
+    let found = searched(&session, "show").await;
+    assert_eq!(found.first(), Some(&show), "{found:?}");
+    assert!(found[1..].iter().all(|id| *id != show));
+    for text in ["Show s01", "show s1", "SHOW S1"] {
+        assert_eq!(
+            searched(&session, text).await.first(),
+            Some(&season),
+            "{text}"
+        );
+    }
+    for text in ["Show s01e02", "show s01e2", "show s1 e2"] {
+        assert_eq!(
+            searched(&session, text).await.first(),
+            Some(&real(402)),
+            "{text}"
+        );
+    }
+    assert!(searched(&session, "show s02").await.is_empty());
+}
+
+/// V518: an artist's name finds the artist and then their albums, and an
+/// album's name finds the album ahead of tracks of the same name.
+/// Disarm check: with `music_groups_named` leaving out an exact artist's own
+/// albums, "alpha" lists only the artist.
+#[actix_web::test]
+async fn native_search_names_an_artist_with_albums_and_an_album_before_its_tracks() {
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for, WireId};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_music_libraries(&fx).await;
+
+    let found = searched(&session, "alpha").await;
+    assert_eq!(
+        found[..3],
+        [
+            artist_id_for("Alpha"),
+            album_id_for("First"),
+            album_id_for("Second")
+        ],
+        "{found:?}"
+    );
+    let found = searched(&session, "second").await;
+    assert_eq!(
+        found[..2],
+        [album_id_for("Second"), WireId::Real(702).to_string()],
+        "{found:?}"
+    );
 }
 
 /// The names (and index numbers) a `Library.query` page lists, in order.
