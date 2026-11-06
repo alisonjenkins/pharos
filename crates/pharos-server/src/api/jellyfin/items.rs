@@ -6031,17 +6031,20 @@ pub(crate) async fn scoped_tracks(
 }
 
 /// The shows, as (folder, name), of the episodes `user` may see whose title,
-/// show name, artist or album holds `needle`, each once, unordered.
+/// show name, artist or album hold every word of `needle` (B624/V558), each
+/// once, unordered. `loose` looks for the words with typos.
 pub(crate) async fn shows_matching(
     state: &AppState,
     user: &pharos_core::User,
     needle: &str,
+    loose: bool,
 ) -> Result<Vec<(Option<String>, String)>, actix_web::Error> {
     let q = ItemQuery {
         search_term: Some(needle.to_owned()),
         ..ItemQuery::default()
     };
     let mut mq = build_media_query(user.id, &q, &ParentResolution::All, true);
+    mq.search_loose = loose;
     apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
     mq.kinds = vec![MediaKind::Episode];
     mq.limit = None;
@@ -6062,24 +6065,32 @@ pub(crate) async fn shows_matching(
     Ok(shows)
 }
 
-/// The artists and albums `user` may see whose name holds `needle` (any
-/// case), as DTOs: artists best named first; then the albums of an artist
-/// named exactly `needle`, newest first, and the albums best named after
-/// them. At most `limit` of each.
+/// A show, artist or album a search names, with how well it names it.
+pub(crate) type Named = (pharos_core::fuzzy::Score, serde_json::Value);
+
+/// The artists and albums `user` may see that hold every word of `needle`
+/// (any case, any order, B624/V558), as DTOs with their scores: artists by
+/// their name; albums by their name and album artist, so "go moby" names
+/// "Go: The Very Best of Moby". The albums of an artist named exactly
+/// `needle` come first, newest first, scored as that artist; then the
+/// albums best named. At most `limit` of each. `loose` looks for the words
+/// with typos.
 pub(crate) async fn music_groups_named(
     state: &AppState,
     user: &pharos_core::User,
     needle: &str,
     limit: usize,
-) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), actix_web::Error> {
-    use crate::services::search::name_match;
-    // Only tracks whose title, artist or album holds the needle can name a
+    loose: bool,
+) -> Result<(Vec<Named>, Vec<Named>), actix_web::Error> {
+    use pharos_core::fuzzy::score;
+    // Only tracks whose title, artist or album hold the words can name a
     // matching artist or album, so the store narrows them first.
     let q = ItemQuery {
         search_term: Some(needle.to_owned()),
         ..ItemQuery::default()
     };
     let mut mq = build_media_query(user.id, &q, &ParentResolution::All, true);
+    mq.search_loose = loose;
     apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
     mq.kinds = vec![MediaKind::Audio];
     mq.limit = None;
@@ -6092,29 +6103,40 @@ pub(crate) async fn music_groups_named(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let mut artists: Vec<_> = filed_artist_names(&tracks)
         .into_iter()
-        .filter_map(|name| Some((name_match(name, needle)?, name)))
+        .filter_map(|name| Some((score(&[name], needle)?, name)))
         .collect();
     artists.sort();
     artists.truncate(limit);
-    let exact: Vec<&str> = artists
+    let exact: Vec<_> = artists
         .iter()
         .filter(|(rank, _)| rank.is_exact())
-        .map(|(_, name)| *name)
+        .map(|(rank, name)| (*rank, *name))
         .collect();
-    let mut own = aggregate_albums(&tracks, |i| exact.iter().any(|a| on_artist_page(i, a)));
+    let mut own = aggregate_albums(&tracks, |i| exact.iter().any(|(_, a)| on_artist_page(i, a)));
     own.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+    let own_rank = exact.first().map(|(rank, _)| *rank);
     let mut named: Vec<_> = aggregate_albums(&tracks, |_| true)
         .into_iter()
         .filter(|a| !own.iter().any(|o| o.name == a.name))
-        .filter_map(|a| Some((name_match(&a.name, needle)?, a)))
+        .filter_map(|a| {
+            let artist = a.album_artist.as_deref().unwrap_or("");
+            Some((score(&[a.name.as_str(), artist], needle)?, a))
+        })
         .collect();
     named.sort_by(|(x, a), (y, b)| x.cmp(y).then_with(|| a.name.cmp(&b.name)));
+    let ranked = own
+        .iter()
+        .filter_map(|a| Some((own_rank?, a)))
+        .chain(named.iter().map(|(rank, a)| (*rank, a)))
+        .take(limit);
     let mut albums = Vec::with_capacity(limit);
-    for a in own.iter().chain(named.iter().map(|(_, a)| a)).take(limit) {
-        albums.push(synth_album_dto(state, a).await);
+    for (rank, a) in ranked {
+        albums.push((rank, synth_album_dto(state, a).await));
     }
     let names: Vec<&str> = artists.iter().map(|(_, name)| *name).collect();
-    Ok((artist_dtos(state, &names).await, albums))
+    let dtos = artist_dtos(state, &names).await;
+    let artists = artists.iter().map(|(rank, _)| *rank).zip(dtos).collect();
+    Ok((artists, albums))
 }
 
 /// What a music listing folds its tracks into.

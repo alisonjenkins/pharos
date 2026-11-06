@@ -1911,6 +1911,33 @@ async fn native_search_names_an_artist_with_albums_and_an_album_before_its_track
     );
 }
 
+/// V558: an album is named by words from its name and its artist's, in any
+/// order and any case ("go moby" finds "Go: The Very Best of Moby"), and,
+/// when nothing matches as typed, with a typo in a word.
+/// Disarm check: with the store's search term matched as one phrase again,
+/// "beta third" names nothing; with the loose pass dropped, "thrid beta"
+/// names nothing.
+#[actix_web::test]
+async fn native_search_names_an_album_by_words_from_its_name_and_artist() {
+    use pharos_jellyfin_api::dto::album_id_for;
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_music_libraries(&fx).await;
+
+    for text in ["beta third", "Third BETA", "thrid beta", "beta thrd"] {
+        assert_eq!(
+            searched(&session, text).await.first(),
+            Some(&album_id_for("Third")),
+            "{text}"
+        );
+    }
+    // Every word must be found: "beta" alone is not the album "First".
+    assert!(!searched(&session, "beta first")
+        .await
+        .contains(&album_id_for("First")));
+}
+
 /// V518: a show, artist or album in a library the user may not see is never
 /// named by a search, and one in a library they may see still is.
 /// Disarm check: with `apply_policy_scope` dropped from `music_groups_named`,
