@@ -6284,97 +6284,67 @@ async fn synth_series_or_season(
     user: &pharos_core::User,
     id_str: &str,
 ) -> Result<Option<serde_json::Value>, actix_web::Error> {
-    use crate::api::jellyfin::dto::{season_display_name, season_id_for_key, series_id_for_key};
-    let all = state
-        .list_items_cached()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    // First: series match. LIB-C11 — resolve via the folder-keyed id so
-    // the synth DTO matches the ids minted on episodes, and same-name
-    // shows in distinct folders surface as distinct Series.
-    for item in all.iter() {
-        let Some(series) = item.series.as_ref() else {
-            continue;
-        };
-        if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id_str {
-            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
-            // B93 — count the series' distinct seasons + total episodes so the
-            // detail DTO advertises ChildCount / RecursiveItemCount.
-            let mut seasons = std::collections::HashSet::new();
-            let mut episode_count = 0u32;
-            for e in all.iter() {
-                let Some(s) = e.series.as_ref() else {
-                    continue;
-                };
-                if matches!(e.kind, MediaKind::Episode)
-                    && series_id_for_key(s.series_folder.as_deref(), &s.series_name) == id_str
-                {
-                    episode_count += 1;
-                    if let Some(sn) = s.season_number {
-                        seasons.insert(sn);
-                    }
-                }
-            }
-            // T9-series — fold in the show's provider-sourced metadata.
-            use pharos_core::SeriesMetadataStore;
-            let mut meta_map = state
-                .stores
-                .series_metadata_by_keys(&[series.series_key().to_string()])
-                .await
-                .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-            // ADR-0062 — the show's description in the user's language.
-            crate::services::metadata_text::localize_series(state, user.id, &mut meta_map).await;
-            return Ok(Some(series_dto(
-                &state.server_id,
-                series,
-                seasons.len() as u32,
-                episode_count,
-                meta_map.get(series.series_key()),
-                library_parent_id(state, item),
-            )));
-        }
-    }
-    // Then: season match. We need (folder/series, season_number) so
-    // walk every Episode again.
-    for item in all.iter() {
-        let Some(series) = item.series.as_ref() else {
-            continue;
-        };
-        let Some(season_n) = series.season_number else {
-            continue;
-        };
-        if season_id_for_key(
-            series.series_folder.as_deref(),
-            &series.series_name,
+    use crate::api::jellyfin::dto::season_display_name;
+    use pharos_core::ParentFilter;
+    let internal = |e: pharos_core::DomainError| error::ErrorInternalServerError(e.to_string());
+    let filter = match synth_parent_filter(state, id_str).await.map_err(internal)? {
+        Some(f @ (ParentFilter::Series { .. } | ParentFilter::Season { .. })) => f,
+        _ => return Ok(None),
+    };
+    let season = match &filter {
+        ParentFilter::Season { season, .. } => Some(*season),
+        _ => None,
+    };
+    // Only the matched show's rows, without their stream and text fields:
+    // the counts and the series key are all that is read from them.
+    let mq = pharos_core::MediaQuery {
+        parent: Some(filter),
+        sort: vec![(pharos_core::SortKey::Id, pharos_core::SortDir::Asc)],
+        ..Default::default()
+    };
+    let (rows, _) = state.stores.query_shallow(&mq).await.map_err(internal)?;
+    let Some((item, series)) = rows.iter().find_map(|i| i.series.as_ref().map(|s| (i, s))) else {
+        return Ok(None);
+    };
+    crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
+    if let Some(season_n) = season {
+        // B93 — episodes in this season → the Season DTO's ChildCount.
+        let episode_count = rows.iter().filter(|e| e.series.is_some()).count() as u32;
+        return Ok(Some(season_dto(
+            &state.server_id,
+            series,
             season_n,
-        ) == id_str
-        {
-            crate::api::jellyfin::require_item_access(state, user, item.id, "series").await?;
-            // B93 — episodes in this season → the Season DTO's ChildCount.
-            let episode_count = all
-                .iter()
-                .filter(|e| {
-                    e.series
-                        .as_ref()
-                        .and_then(|s| {
-                            s.season_number.map(|n| {
-                                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n)
-                            })
-                        })
-                        .as_deref()
-                        == Some(id_str)
-                })
-                .count() as u32;
-            return Ok(Some(season_dto(
-                &state.server_id,
-                series,
-                season_n,
-                &season_display_name(season_n),
-                episode_count,
-            )));
+            &season_display_name(season_n),
+            episode_count,
+        )));
+    }
+    // B93 — count the series' distinct seasons + total episodes so the
+    // detail DTO advertises ChildCount / RecursiveItemCount.
+    let mut seasons = std::collections::HashSet::new();
+    let mut episode_count = 0u32;
+    for e in rows.iter().filter(|e| matches!(e.kind, MediaKind::Episode)) {
+        episode_count += 1;
+        if let Some(sn) = e.series.as_ref().and_then(|s| s.season_number) {
+            seasons.insert(sn);
         }
     }
-    Ok(None)
+    // T9-series — fold in the show's provider-sourced metadata.
+    use pharos_core::SeriesMetadataStore;
+    let mut meta_map = state
+        .stores
+        .series_metadata_by_keys(&[series.series_key().to_string()])
+        .await
+        .map_err(internal)?;
+    // ADR-0062 — the show's description in the user's language.
+    crate::services::metadata_text::localize_series(state, user.id, &mut meta_map).await;
+    Ok(Some(series_dto(
+        &state.server_id,
+        series,
+        seasons.len() as u32,
+        episode_count,
+        meta_map.get(series.series_key()),
+        library_parent_id(state, item),
+    )))
 }
 
 fn series_dto(
