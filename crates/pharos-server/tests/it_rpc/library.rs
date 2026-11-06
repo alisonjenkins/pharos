@@ -1911,6 +1911,54 @@ async fn native_search_names_an_artist_with_albums_and_an_album_before_its_track
     );
 }
 
+/// V518: a show, artist or album in a library the user may not see is never
+/// named by a search, and one in a library they may see still is.
+/// Disarm check: with `apply_policy_scope` dropped from `music_groups_named`,
+/// "alpha" names the hidden artist. A show is scoped twice, by
+/// `shows_matching` and by the tile's own listing.
+#[actix_web::test]
+async fn native_search_names_no_show_artist_or_album_from_a_hidden_library() {
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for, series_id_for_key};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_shows(&fx).await;
+    seed_music_libraries(&fx).await;
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone(), "e".repeat(32)],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let hidden = [
+        series_id_for_key(Some("/libA/Show"), "Show"),
+        artist_id_for("Alpha"),
+        album_id_for("First"),
+    ];
+    for text in ["show", "alpha", "first", "show s01"] {
+        let found = searched(&session, text).await;
+        assert!(
+            found.iter().all(|id| !hidden.contains(id)),
+            "{text}: {found:?}"
+        );
+    }
+    assert_eq!(
+        searched(&session, "another").await.first(),
+        Some(&series_id_for_key(Some("/libB/Another"), "Another"))
+    );
+    assert_eq!(
+        searched(&session, "gamma").await.first(),
+        Some(&artist_id_for("Gamma"))
+    );
+}
+
 /// The names (and index numbers) a `Library.query` page lists, in order.
 async fn listed(
     session: &session::Client,
