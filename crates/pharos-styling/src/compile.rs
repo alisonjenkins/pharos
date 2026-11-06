@@ -161,6 +161,7 @@ fn effective(
         placement: Placement::Default,
         karaoke: Karaoke::None,
         reason: String::new(),
+        static_only: false,
     };
     let Some(fx) = fx else { return plain };
     let mut fx = fx.clone();
@@ -192,7 +193,7 @@ fn fit(
     tier: Tier,
     placer: &Placer,
 ) -> Option<Vec<Event>> {
-    let mut t = tier;
+    let mut t = if fx.static_only { Tier::Low } else { tier };
     loop {
         let evs: Vec<Event> = effects::events(line, fx, theme, t)
             .unwrap_or_else(|| vec![plain(line, fx)])
@@ -349,6 +350,7 @@ mod tests {
                     placement: Placement::Default,
                     karaoke: Karaoke::None,
                     reason: String::new(),
+                    static_only: false,
                 })
                 .collect(),
         }
@@ -356,6 +358,21 @@ mod tests {
 
     fn run(plan: &EffectPlan, lines: &[SourceLine], tier: Tier, level: EffectsLevel) -> String {
         compile(plan, lines, &Theme::pharos(), tier, level)
+    }
+
+    #[test]
+    fn a_static_only_line_is_drawn_in_its_low_form_at_any_tier() {
+        let lines = lines();
+        let mut plan = plain_plan(lines.len());
+        plan.lines[0].intent = Intent::Shout;
+        plan.lines[0].intensity = 2;
+        let animated = run(&plan, &lines, Tier::Desktop, EffectsLevel::Full);
+        plan.lines[0].static_only = true;
+        let still = run(&plan, &lines, Tier::Desktop, EffectsLevel::Full);
+        let low = run(&plan, &lines, Tier::Low, EffectsLevel::Full);
+        assert_ne!(animated, still, "the flag must change the Desktop output");
+        assert_eq!(dialogue(&still)[0], dialogue(&low)[0]);
+        assert!(!dialogue(&still)[0].contains("\\t("));
     }
 
     fn dialogue(ass: &str) -> Vec<&str> {
@@ -549,6 +566,7 @@ mod tests {
                                 placement,
                                 karaoke: Karaoke::None,
                                 reason: String::new(),
+                                static_only: false,
                             })
                             .collect(),
                     };

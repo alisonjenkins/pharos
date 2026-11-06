@@ -191,6 +191,7 @@ fn plan_of(gen: &[GenLine], cap_intensity: Option<u8>) -> EffectPlan {
                         _ => Karaoke::Ember,
                     },
                     reason: String::new(),
+                    static_only: false,
                 })
             })
             .collect(),
