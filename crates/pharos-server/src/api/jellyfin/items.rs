@@ -4246,10 +4246,8 @@ pub(crate) async fn resolve_parent_filter(
         .find(|l| l.wire_id == pid)
         .map(|l| (l.wire_id.clone(), l.root_path.clone()));
     if let Some((wire_id, root_path)) = matched_lib {
-        if let Ok(ids) = state.stores.item_ids_for_library(&wire_id).await {
-            if !ids.is_empty() {
-                return Ok(ParentResolution::Filter(ParentFilter::Library { wire_id }));
-            }
+        if let Ok(true) = state.stores.library_has_items(&wire_id).await {
+            return Ok(ParentResolution::Filter(ParentFilter::Library { wire_id }));
         }
         // No backfilled rows yet → path-prefix fallback against the root.
         return Ok(ParentResolution::PathPrefix(root_path));
