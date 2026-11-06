@@ -7,6 +7,7 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 
 use super::browse::track_length;
+use super::keymap::{self, Mode, Resolved};
 use super::lyrics::LyricsPanel;
 use super::mixes::{MixBar, MixCtx};
 use super::platform;
@@ -208,6 +209,8 @@ pub fn ListenView(
         }
     };
     let queued = queue.len();
+    // The player's keys, and the queue's while the focus is in it (spec 029).
+    super::keys::use_key_mode(Mode::Music);
     let choose = move |next: Style| {
         style.set(next);
         fallback.set(None);
@@ -280,6 +283,7 @@ pub fn ListenView(
                         class: "pharos-listen-skip pharos-shrink",
                         r#type: "button",
                         aria_label: "Shrink",
+                        "data-key-action": "shrink",
                         title: "Shrink to a small window",
                         onclick: move |_| on_control.call(Control::Shrink),
                         Icon { path: ICON_FLOAT }
@@ -293,6 +297,7 @@ pub fn ListenView(
                     // shows on a touch screen (B362/V302).
                     button {
                         class: "pharos-chip pharos-lyrics-toggle",
+                        "data-key-action": "lyrics",
                         r#type: "button",
                         disabled: lyrics.is_none(),
                         title: lyrics_title(lyrics.is_some(), lyrics_loading, lyrics_failed),
@@ -313,6 +318,7 @@ pub fn ListenView(
                     }
                     button {
                         class: "pharos-chip pharos-queue-toggle",
+                        "data-key-action": "queue",
                         r#type: "button",
                         title: "Show or hide what plays next",
                         aria_pressed: if show_queue() { "true" } else { "false" },
@@ -562,13 +568,18 @@ fn QueuePanel(
             id: QUEUE_PANEL_ID,
             class: "pharos-queue",
             aria_label: "Queue",
+            "data-keys": "list",
+            "data-keys-list": "true",
+            "data-key-area": "queue",
             // The screen's wheel moves the volume; here it scrolls the list.
             onwheel: move |evt: WheelEvent| evt.stop_propagation(),
             // Keys on the queue's own buttons are theirs, not the player's.
             onkeydown: move |evt: KeyboardEvent| {
                 let key = evt.key();
                 let own = matches!(key, Key::Enter | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown)
-                    || matches!(&key, Key::Character(k) if k == " ");
+                    || matches!(&key, Key::Character(k) if k == " ")
+                    // The queue's own keys (spec 029), not the player's k and h/l.
+                    || !matches!(keymap::resolve(Mode::Queue, &[&key.to_string()]), Resolved::Unbound);
                 if own {
                     evt.stop_propagation();
                 }
@@ -583,6 +594,7 @@ fn QueuePanel(
                 span { class: "pharos-muted pharos-queue-total", "{count}" }
                 button {
                     id: SHUFFLE_ID,
+                    "data-key-action": "shuffle",
                     class: "pharos-chip pharos-queue-shuffle",
                     r#type: "button",
                     aria_pressed: if shuffled { "true" } else { "false" },
@@ -593,6 +605,7 @@ fn QueuePanel(
                 if total > 0 && !confirming() {
                     button {
                         id: CLEAR_ID,
+                        "data-key-action": "clear",
                         class: "pharos-chip",
                         r#type: "button",
                         aria_haspopup: "dialog",
@@ -695,6 +708,7 @@ fn QueueRow(
         li {
             class: "pharos-queue-entry",
             draggable: "true",
+            "data-key-row": "true",
             "data-source": entry.source.label(),
             "data-key": "{key}",
             "data-drop": if drop_here && !is_dragged { "true" } else { "false" },
@@ -733,6 +747,7 @@ fn QueueRow(
                 class: "pharos-queue-icon",
                 r#type: "button",
                 aria_label: "Move {name} up",
+                "data-key-action": "move-up",
                 title: "Move up",
                 disabled: at == 0,
                 onclick: move |_| on_queue.call(QueueAction::Move { key, to: at.saturating_sub(1) }),
@@ -742,6 +757,7 @@ fn QueueRow(
                 class: "pharos-queue-icon",
                 r#type: "button",
                 aria_label: "Move {name} down",
+                "data-key-action": "move-down",
                 title: "Move down",
                 disabled: at + 1 >= total,
                 onclick: move |_| on_queue.call(QueueAction::Move { key, to: at + 1 }),
@@ -751,6 +767,7 @@ fn QueueRow(
                 class: "pharos-queue-icon",
                 r#type: "button",
                 aria_label: "Remove {name} from the queue",
+                "data-key-action": "remove",
                 title: "Remove",
                 onclick: move |_| on_queue.call(QueueAction::Remove(key)),
                 Icon { path: ICON_REMOVE }

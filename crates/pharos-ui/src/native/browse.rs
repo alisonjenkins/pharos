@@ -1318,6 +1318,7 @@ fn PosterList(
                     id: if sentinel == Some(at) { SENTINEL_ID },
                     class: tile_class,
                     style: stagger,
+                    "data-key-row": (item.kind == ItemKind::Album).then_some("true"),
                     PosterTile { item: item.clone() }
                     if item.kind == ItemKind::Album {
                         QueueButtons {
@@ -1661,6 +1662,9 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     .into_iter()
     .flatten()
     .collect();
+    let first_track = tracks.items.first().map(|t| t.id);
+    // Opened from the keyboard, Enter plays the first track (spec 029).
+    super::keys::use_arrival_focus(detail.item.id, FIRST_TRACK_ID);
     let discs = discs(&tracks.items);
     let multi = discs.len() > 1;
     let complete = tracks.items.len() >= tracks.total as usize;
@@ -1688,10 +1692,14 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                     if multi {
                         h3 { class: "pharos-section-title", "Disc {disc}" }
                     }
-                    ol { class: "pharos-tracks",
+                    ol { class: "pharos-tracks", "data-keys-list": "true",
                         for track in rows {
                             li { key: "{track.id}",
-                                TrackRow { queued: queued.contains(&track.id), track }
+                                TrackRow {
+                                    queued: queued.contains(&track.id),
+                                    first: Some(track.id) == first_track,
+                                    track,
+                                }
                             }
                         }
                     }
@@ -1701,6 +1709,9 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
         }
     }
 }
+
+/// The album page's first track, focused when the page opens.
+const FIRST_TRACK_ID: &str = "pharos-first-track";
 
 /// `tracks` split by disc, in the order given; a track with no disc number
 /// is on disc 1.
@@ -1723,10 +1734,13 @@ pub fn track_length(ms: u64) -> Option<String> {
 }
 
 #[component]
-fn TrackRow(track: Item, queued: bool) -> Element {
+fn TrackRow(track: Item, queued: bool, #[props(default)] first: bool) -> Element {
     let length = track_length(track.runtime_ms);
     rsx! {
-        div { class: "pharos-track-item",
+        div {
+            class: "pharos-track-item",
+            id: first.then_some(FIRST_TRACK_ID),
+            "data-key-row": "true",
             TrackLink { track: track.clone(), length, queued }
             QueueButtons { name: track.name.clone(), tracks: vec![track], kind: QueueTarget::Song }
         }
@@ -1888,6 +1902,7 @@ pub fn QueueButtons(
                 class: "pharos-queue-button",
                 r#type: "button",
                 title: "{next_label}",
+                "data-key-action": "queue-next",
                 aria_label: "{next_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
@@ -1901,6 +1916,7 @@ pub fn QueueButtons(
                 class: "pharos-queue-button",
                 r#type: "button",
                 title: "{end_label}",
+                "data-key-action": "queue-end",
                 aria_label: "{end_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
@@ -1913,6 +1929,7 @@ pub fn QueueButtons(
             if let (Some(song), Some(MixCtx(mut mix))) = (mix_song, mix) {
                 button {
                     class: "pharos-queue-button pharos-mix-from",
+                    "data-key-action": "mix",
                     r#type: "button",
                     title: "{mix_label}",
                     aria_label: "{mix_label}",
