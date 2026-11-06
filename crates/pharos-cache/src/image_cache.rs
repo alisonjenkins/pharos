@@ -385,7 +385,8 @@ async fn run_encode(ffmpeg: &Path, job: &EncodeJob) {
         .increment(1);
 }
 
-fn encode_width(width: u32) -> u32 {
+/// The width an encoded copy for a `width` request is made at.
+pub fn encode_width(width: u32) -> u32 {
     ENCODE_WIDTHS
         .into_iter()
         .find(|&w| w >= width)

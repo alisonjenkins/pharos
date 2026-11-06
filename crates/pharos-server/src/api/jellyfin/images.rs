@@ -1255,9 +1255,27 @@ async fn serve_local_artwork(
             .await
         {
             pharos_cache::Encoded::Ready(out) => {
+                // Compared at the encode's own bucket width, so an off-bucket
+                // request does not pit a bigger encode against a smaller JPEG.
+                let bucket = pharos_cache::encode_width(width);
+                let jpeg = cache
+                    .scaled_artwork(path, bucket)
+                    .instrument(tracing::info_span!("image.resize", width = bucket))
+                    .await;
+                let delivery = Delivery::pick(&out, &jpeg).await;
+                metrics::counter!(
+                    "pharos_image_encoded_served_total",
+                    "format" => encoded.ext(),
+                    "served" => delivery.label(encoded)
+                )
+                .increment(1);
+                let (file, content_type) = match delivery {
+                    Delivery::Encoded => (&out, encoded.content_type()),
+                    Delivery::Jpeg => (&jpeg, content_type_for_ext(&jpeg)),
+                };
                 return Ok(deliver_image(
-                    &out,
-                    encoded.content_type(),
+                    file,
+                    content_type,
                     ImageFreshness::Settled,
                     head_only,
                     if_none_match,
@@ -1281,6 +1299,42 @@ async fn serve_local_artwork(
         if_none_match,
     )
     .await)
+}
+
+/// Which of a ready encode and its same-width JPEG is sent: the smaller one.
+/// An encode can come out bigger, e.g. from a source that is already a small,
+/// heavily compressed JPEG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Encoded,
+    Jpeg,
+}
+
+impl Delivery {
+    async fn pick(encoded: &std::path::Path, jpeg: &std::path::Path) -> Self {
+        let encoded_bytes = tokio::fs::metadata(encoded).await.ok().map(|m| m.len());
+        let jpeg_bytes = tokio::fs::metadata(jpeg).await.ok().map(|m| m.len());
+        let delivery = match (encoded_bytes, jpeg_bytes) {
+            (Some(e), Some(j)) if j < e => Self::Jpeg,
+            (Some(_), _) => Self::Encoded,
+            // The encode was evicted after the lookup; the JPEG still answers.
+            (None, _) => Self::Jpeg,
+        };
+        tracing::debug!(
+            ?encoded_bytes,
+            ?jpeg_bytes,
+            ?delivery,
+            "encoded artwork delivery"
+        );
+        delivery
+    }
+
+    fn label(self, format: pharos_cache::EncodedFormat) -> &'static str {
+        match self {
+            Self::Encoded => format.ext(),
+            Self::Jpeg => "fallback",
+        }
+    }
 }
 
 /// P46 — client-requested image encoding. Modern web clients +
@@ -2083,6 +2137,17 @@ mod tests {
         let plain = test::call_service(&app, get("/items/56/images/primary")).await;
         assert_eq!(header(&plain, "content-type"), "image/jpeg");
         assert_eq!(header(&plain, "cache-control"), image_cache_control());
+
+        // An encode bigger than the JPEG loses to it, for good.
+        for entry in std::fs::read_dir(cache_dir.path().join("encoded")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "avif") {
+                std::fs::write(&path, vec![0u8; 4 << 20]).unwrap();
+            }
+        }
+        let bigger = test::call_service(&app, get("/items/56/images/primary?format=avif")).await;
+        assert_eq!(header(&bigger, "content-type"), "image/jpeg");
+        assert_eq!(header(&bigger, "cache-control"), image_cache_control());
     }
 
     #[actix_web::test]
