@@ -188,7 +188,7 @@ fn unique_scratch_name(prefix: &str) -> String {
 
 /// Bump when the encode settings below change, so files encoded under the old
 /// settings are not served as the new ones.
-const ENCODE_VERSION: u32 = 1;
+const ENCODE_VERSION: u32 = 2;
 
 /// The widths an encoded copy is made at. A requested width rounds up to the
 /// next one, so a client asking for 300 and one asking for 320 share a file.
@@ -227,15 +227,16 @@ impl EncodedFormat {
         }
     }
 
-    /// Settings from the 2026-11 benchmark (ADR-0063): the smallest files that
-    /// still score at least today's JPEG on SSIMULACRA2. AVIF needs 4:4:4 and
-    /// `tune=iq`; 4:2:0 lost the grain on dark posters.
+    /// Settings from the 2026-11 benchmark (ADR-0068, B611). The JPEG the
+    /// route serves is rate-controlled (SSIMULACRA2 about 67 for a 480 px
+    /// poster); crf 31 scores about 8 points higher at 0.75-0.9x its bytes.
+    /// AVIF needs 4:4:4 and `tune=iq`; 4:2:0 lost the grain on dark posters.
     #[rustfmt::skip]
     fn codec_args(self) -> &'static [&'static str] {
         match self {
             Self::Avif => &[
                 "-c:v", "libaom-av1", "-usage", "allintra", "-still-picture", "1",
-                "-cpu-used", "6", "-crf", "22", "-aom-params", "tune=iq", "-threads", "1",
+                "-cpu-used", "6", "-crf", "31", "-aom-params", "tune=iq", "-threads", "1",
                 "-f", "avif",
             ],
             Self::Webp => &[
