@@ -5,6 +5,7 @@
 //! source lines, theme, device tier and effects level into ASS v4+ text.
 //! The same inputs always give the same bytes.
 
+pub mod budget;
 pub mod plan;
 pub mod source;
 mod tags;

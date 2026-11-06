@@ -52,6 +52,17 @@ pub(crate) fn scan(block: &str) -> Vec<Tag> {
     out
 }
 
+/// All tags of every override block in an event's text.
+pub(crate) fn scan_text(text: &str) -> Vec<Tag> {
+    let mut out = Vec::new();
+    for p in pieces(text) {
+        if let Piece::Block(b) = p {
+            scan_into(b, false, &mut out);
+        }
+    }
+    out
+}
+
 fn scan_into(block: &str, nested: bool, out: &mut Vec<Tag>) {
     let b = block.as_bytes();
     let mut i = 0;
@@ -131,6 +142,14 @@ fn name_len(b: &[u8]) -> usize {
         }
         Some(_) => 0,
     }
+}
+
+/// The tags that make an event animated for the on-screen budget.
+pub(crate) fn is_animation(name: &str) -> bool {
+    matches!(
+        name,
+        "t" | "move" | "fad" | "fade" | "k" | "kf" | "K" | "ko"
+    )
 }
 
 #[cfg(test)]
