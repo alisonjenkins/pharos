@@ -766,8 +766,7 @@ pub(super) fn Volume(
             step: 0.05,
             value: "{shown}",
             style: if filled { fill },
-            // Arrows move the slider, not the player's volume and seek keys.
-            onkeydown: move |evt: KeyboardEvent| evt.stop_propagation(),
+            onkeydown: slider_key,
             oninput: move |evt: FormEvent| {
                 if let Ok(volume) = evt.value().parse::<f64>() {
                     on_control.call(Control::Volume { volume, muted: volume == 0.0 });
@@ -775,6 +774,30 @@ pub(super) fn Volume(
             },
         }
     }
+}
+
+/// A key pressed on a range slider: the keys that move it (the arrows,
+/// Home, End, Page Up and Page Down) are the slider's, not the player's
+/// volume and seek keys; every other key goes on to the player, so `m`
+/// still mutes after the slider is dragged (B621).
+pub(super) fn slider_key(evt: KeyboardEvent) {
+    if moves_a_control(&evt.key()) {
+        evt.stop_propagation();
+    }
+}
+
+fn moves_a_control(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::ArrowUp
+            | Key::ArrowDown
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+    )
 }
 
 /// "Follow group" or "Just me" for the track menus. Only in a group.
