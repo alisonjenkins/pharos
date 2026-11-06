@@ -512,4 +512,78 @@ mod tests {
         let ass = run(&plain_plan(1), &src, Tier::Desktop, EffectsLevel::Full);
         crate::budget::check(&ass, Tier::Desktop).unwrap();
     }
+
+    /// Every intent at every intensity, placement, tier and level, on one
+    /// busy source: the output parses, keeps the budgets and stays in range.
+    #[test]
+    fn every_effect_keeps_every_budget() {
+        let mut srt = String::new();
+        let mut script_lines = Vec::new();
+        for i in 0..Intent::ALL.len() * 4 {
+            let s = 2000 * i as i64;
+            script_lines.push((s, s + 1800));
+            srt.push_str(&format!(
+                "{}\n{} --> {}\n(Line {i}) it is [boom] <i>now</i>\n\n",
+                i + 1,
+                ts(s),
+                ts(s + 1800)
+            ));
+        }
+        let lines = source::read(&srt).unwrap().lines;
+        for tier in Tier::ALL {
+            for level in EffectsLevel::ALL {
+                for placement in [
+                    Placement::Default,
+                    Placement::Top,
+                    Placement::Free { x: 300, y: 400 },
+                ] {
+                    let plan = EffectPlan {
+                        director_version: DIRECTOR_VERSION,
+                        lines: lines
+                            .iter()
+                            .enumerate()
+                            .map(|(line, _)| LineEffect {
+                                line,
+                                intent: Intent::ALL[line / 4],
+                                intensity: (line % 4) as u8,
+                                placement,
+                                karaoke: Karaoke::None,
+                                reason: String::new(),
+                            })
+                            .collect(),
+                    };
+                    let ass = run(&plan, &lines, tier, level);
+                    let ctx = format!("{tier:?} {level:?} {placement:?}\n{ass}");
+                    assert_eq!(pharos_subs::Script::parse(&ass).stats.bad_lines, 0, "{ctx}");
+                    if let Err(b) = crate::budget::check(&ass, tier) {
+                        panic!("{b:?}\n{ctx}");
+                    }
+                    let mut per_line: BTreeMap<usize, usize> = BTreeMap::new();
+                    for d in dialogue(&ass) {
+                        let f: Vec<&str> = d.splitn(10, ',').collect();
+                        let idx: usize = f[4].parse().unwrap();
+                        *per_line.entry(idx).or_default() += 1;
+                        let (a, b) = script_lines[idx];
+                        let t = |s: &str| source::parse_time(s).unwrap();
+                        assert!(t(f[1]) >= a && t(f[2]) <= b, "{d}");
+                    }
+                    assert!(
+                        per_line
+                            .values()
+                            .all(|&n| n <= crate::budget::max_events_per_line(tier)),
+                        "{ctx}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn ts(ms: i64) -> String {
+        format!(
+            "00:{:02}:{:02},{:03}",
+            ms / 60_000,
+            ms / 1000 % 60,
+            ms % 1000
+        )
+    }
 }
