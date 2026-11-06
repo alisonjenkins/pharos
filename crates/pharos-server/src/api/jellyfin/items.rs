@@ -5969,6 +5969,38 @@ pub(crate) async fn scoped_tracks(
     Ok(tracks)
 }
 
+/// The shows, as (folder, name), of the episodes `user` may see whose title,
+/// show name, artist or album holds `needle`, each once, unordered.
+pub(crate) async fn shows_matching(
+    state: &AppState,
+    user: &pharos_core::User,
+    needle: &str,
+) -> Result<Vec<(Option<String>, String)>, actix_web::Error> {
+    let q = ItemQuery {
+        search_term: Some(needle.to_owned()),
+        ..ItemQuery::default()
+    };
+    let mut mq = build_media_query(user.id, &q, &ParentResolution::All, true);
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    mq.kinds = vec![MediaKind::Episode];
+    mq.limit = None;
+    mq.start_index = 0;
+    mq.sort = Vec::new();
+    let (episodes, _total) = state
+        .stores
+        .query(&mq)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut shows: Vec<_> = episodes
+        .into_iter()
+        .filter_map(|e| e.series)
+        .map(|s| (s.series_folder, s.series_name))
+        .collect();
+    shows.sort();
+    shows.dedup();
+    Ok(shows)
+}
+
 /// The artists and albums `user` may see whose name holds `needle` (any
 /// case), as DTOs: artists best named first; then the albums of an artist
 /// named exactly `needle`, newest first, and the albums best named after
