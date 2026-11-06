@@ -558,6 +558,19 @@ async fn deliver_ass(
     media_source_id: Option<&str>,
     stream_index: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let mut track = DeliveredTrack::default();
+    let result = deliver_ass_inner(state, id_str, media_source_id, stream_index, &mut track).await;
+    record_delivery(DeliveryFormat::Ass, track, stream_index, &result);
+    result
+}
+
+async fn deliver_ass_inner(
+    state: &AppState,
+    id_str: &str,
+    media_source_id: Option<&str>,
+    stream_index: u32,
+    track: &mut DeliveredTrack,
+) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = super::media_source::load_named(
@@ -568,7 +581,22 @@ async fn deliver_ass(
     )
     .await?;
 
-    let bytes = ass_script(state, &item, stream_index).await?;
+    // A sidecar is found once, so the track counted is the file served.
+    let sidecar_base = sidecar_base_index(&item.probe);
+    let bytes = if stream_index >= sidecar_base {
+        let offset = (stream_index - sidecar_base) as usize;
+        let sidecar = discover_sidecars(&item.path).await.into_iter().nth(offset);
+        *track = DeliveredTrack::sidecar(sidecar.as_ref().map(|(p, _)| p.as_path()));
+        let Some((sidecar_path, _)) = sidecar else {
+            return Err(error::ErrorNotFound("no sidecar at that index"));
+        };
+        tokio::fs::read(&sidecar_path)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?
+    } else {
+        *track = DeliveredTrack::embedded(&item, stream_index);
+        ass_script(state, &item, stream_index).await?
+    };
     Ok(HttpResponse::Ok()
         .content_type("text/x-ssa; charset=utf-8")
         .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
@@ -1166,6 +1194,30 @@ async fn deliver_vtt(
     forced_only: bool,
     style: SubtitleStyle,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let mut track = DeliveredTrack::default();
+    let result = deliver_vtt_inner(
+        state,
+        id_str,
+        media_source_id,
+        stream_index,
+        forced_only,
+        style,
+        &mut track,
+    )
+    .await;
+    record_delivery(DeliveryFormat::Vtt, track, stream_index, &result);
+    result
+}
+
+async fn deliver_vtt_inner(
+    state: &AppState,
+    id_str: &str,
+    media_source_id: Option<&str>,
+    stream_index: u32,
+    forced_only: bool,
+    style: SubtitleStyle,
+    track: &mut DeliveredTrack,
+) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = super::media_source::load_named(
@@ -1180,12 +1232,14 @@ async fn deliver_vtt(
     let sidecar_base = sidecar_base_index(&item.probe);
     if stream_index >= sidecar_base {
         let offset = (stream_index - sidecar_base) as usize;
-        let sidecars = discover_sidecars(&item.path).await;
-        let Some((sidecar_path, kind)) = sidecars.into_iter().nth(offset) else {
+        let sidecar = discover_sidecars(&item.path).await.into_iter().nth(offset);
+        *track = DeliveredTrack::sidecar(sidecar.as_ref().map(|(p, _)| p.as_path()));
+        let Some((sidecar_path, kind)) = sidecar else {
             return Err(error::ErrorNotFound("no sidecar at that index"));
         };
         return serve_sidecar(state, &sidecar_path, kind, stream_index).await;
     }
+    *track = DeliveredTrack::embedded(&item, stream_index);
 
     // P15 — image-based subtitle codecs (PGS / DVB / VobSub) cannot
     // convert to WebVTT. Refuse with 415 + JSON error so clients
@@ -1681,6 +1735,187 @@ fn is_styled_text_subtitle_codec(codec: &str) -> bool {
     )
 }
 
+/// Which form a text subtitle went out in, the label of
+/// `pharos_subtitle_delivery_total{format}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveryFormat {
+    /// The original ASS/SSA script, for a renderer that draws its styling.
+    Ass,
+    /// WebVTT, plain text.
+    Vtt,
+}
+
+impl DeliveryFormat {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 2] = [Self::Ass, Self::Vtt];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ass => "ass",
+            Self::Vtt => "vtt",
+        }
+    }
+}
+
+/// Where the delivered track lives, the label `{source}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DeliverySource {
+    Embedded,
+    Sidecar,
+    /// The request failed before the item was read (bad id, no item).
+    #[default]
+    Unknown,
+}
+
+impl DeliverySource {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 3] = [Self::Embedded, Self::Sidecar, Self::Unknown];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Sidecar => "sidecar",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What the track's codec can carry, the label `{codec_class}`. `styled`
+/// with `format="vtt"` is an ASS/SSA track going out as plain text: a client
+/// with no ASS renderer, or the native player's hidden `<track>` fallback,
+/// which it fetches beside `stream.ass` (B600).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CodecClass {
+    Styled,
+    Plain,
+    Image,
+    #[default]
+    Unknown,
+}
+
+impl CodecClass {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] = [Self::Styled, Self::Plain, Self::Image, Self::Unknown];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Styled => "styled",
+            Self::Plain => "plain",
+            Self::Image => "image",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn of_codec(codec: &str) -> Self {
+        if is_styled_text_subtitle_codec(codec) {
+            Self::Styled
+        } else if is_image_subtitle_codec(codec) {
+            Self::Image
+        } else {
+            Self::Plain
+        }
+    }
+}
+
+/// The track a subtitle request named, as far as the handler got.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeliveredTrack {
+    pub source: DeliverySource,
+    pub class: CodecClass,
+    /// The codec (embedded) or file extension (sidecar), for the log line.
+    pub codec: String,
+}
+
+impl DeliveredTrack {
+    /// The sidecar at the requested index, `None` when there is none.
+    fn sidecar(path: Option<&std::path::Path>) -> Self {
+        let ext = path
+            .and_then(|p| p.extension())
+            .map(|e| e.to_string_lossy().to_lowercase());
+        Self {
+            source: DeliverySource::Sidecar,
+            class: ext
+                .as_deref()
+                .map_or(CodecClass::Unknown, CodecClass::of_codec),
+            codec: ext.unwrap_or_default(),
+        }
+    }
+
+    fn embedded(item: &pharos_core::MediaItem, stream_index: u32) -> Self {
+        let codec = item
+            .probe
+            .subtitle_tracks
+            .iter()
+            .find(|t| t.stream_index == stream_index)
+            .and_then(|t| t.codec.clone());
+        Self {
+            source: DeliverySource::Embedded,
+            class: codec
+                .as_deref()
+                .map_or(CodecClass::Unknown, CodecClass::of_codec),
+            codec: codec.unwrap_or_default(),
+        }
+    }
+}
+
+/// How a subtitle request ended, the label `{outcome}`.
+pub(crate) fn delivery_outcome(result: &Result<HttpResponse, actix_web::Error>) -> &'static str {
+    let status = match result {
+        Ok(resp) => resp.status(),
+        Err(e) => e.as_response_error().status_code(),
+    };
+    if status.is_success() {
+        "served"
+    } else if status.is_client_error() {
+        "refused"
+    } else {
+        "failed"
+    }
+}
+
+/// B600: count and log every text subtitle delivery with the form it took.
+/// A styled track fetched as WebVTT with no `stream.ass` beside it is one
+/// drawn as plain text; the player's own fallback reports itself as
+/// `rendererMode mode=plain`.
+/// The failure path records the same fields as the success path.
+fn record_delivery(
+    format: DeliveryFormat,
+    track: DeliveredTrack,
+    stream_index: u32,
+    result: &Result<HttpResponse, actix_web::Error>,
+) {
+    let outcome = delivery_outcome(result);
+    metrics::counter!(
+        "pharos_subtitle_delivery_total",
+        "format" => format.label(),
+        "source" => track.source.label(),
+        "codec_class" => track.class.label(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+    let reason = match (format, track.class) {
+        (_, CodecClass::Unknown) => "track not identified",
+        (DeliveryFormat::Ass, CodecClass::Styled) => "script asked for, styling kept",
+        (DeliveryFormat::Vtt, CodecClass::Styled) => {
+            "styled track asked for as WebVTT, as a fallback or by a client without ASS"
+        }
+        (DeliveryFormat::Ass, _) => "non-ASS track asked for as ASS",
+        (DeliveryFormat::Vtt, _) => "text track as WebVTT",
+    };
+    let error = result.as_ref().err().map(ToString::to_string);
+    tracing::info!(
+        format = format.label(),
+        source = track.source.label(),
+        codec_class = track.class.label(),
+        codec = %track.codec,
+        idx = stream_index,
+        outcome,
+        error = error.as_deref().unwrap_or(""),
+        reason,
+        "subtitle delivery"
+    );
+}
+
 /// P15 — known image-based subtitle codecs. ffmpeg can't convert
 /// these to text-WebVTT (they're rasters); attempts produce empty
 /// or malformed output. Refused with 415 so the client doesn't
@@ -2047,6 +2282,47 @@ async fn run_ffmpeg_srt_to_vtt(input: &str) -> Result<Vec<u8>, actix_web::Error>
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// B600: `pharos_subtitle_delivery_total` labels are a dashboard
+    /// contract, distinct within each label.
+    #[test]
+    fn delivery_labels_are_distinct() {
+        use std::collections::HashSet;
+        let f: HashSet<_> = DeliveryFormat::ALL.iter().map(|x| x.label()).collect();
+        let s: HashSet<_> = DeliverySource::ALL.iter().map(|x| x.label()).collect();
+        let c: HashSet<_> = CodecClass::ALL.iter().map(|x| x.label()).collect();
+        assert_eq!(f.len(), DeliveryFormat::ALL.len());
+        assert_eq!(s.len(), DeliverySource::ALL.len());
+        assert_eq!(c.len(), CodecClass::ALL.len());
+    }
+
+    #[test]
+    fn a_codec_or_sidecar_extension_has_a_class() {
+        for (codec, class) in [
+            ("ass", CodecClass::Styled),
+            ("SSA", CodecClass::Styled),
+            ("subrip", CodecClass::Plain),
+            ("srt", CodecClass::Plain),
+            ("vtt", CodecClass::Plain),
+            ("hdmv_pgs_subtitle", CodecClass::Image),
+        ] {
+            assert_eq!(CodecClass::of_codec(codec), class, "{codec}");
+        }
+    }
+
+    #[test]
+    fn a_delivery_outcome_follows_the_status() {
+        assert_eq!(delivery_outcome(&Ok(HttpResponse::Ok().finish())), "served");
+        assert_eq!(
+            delivery_outcome(&Ok(HttpResponse::UnsupportedMediaType().finish())),
+            "refused"
+        );
+        assert_eq!(delivery_outcome(&Err(error::ErrorNotFound("x"))), "refused");
+        assert_eq!(
+            delivery_outcome(&Err(error::ErrorInternalServerError("x"))),
+            "failed"
+        );
+    }
 
     #[test]
     fn batch_extract_opens_source_once_for_all_tracks() {
