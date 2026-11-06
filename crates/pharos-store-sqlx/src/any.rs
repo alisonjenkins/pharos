@@ -165,6 +165,16 @@ impl MediaStore for AnyStore {
         .await
     }
 
+    async fn query_shallow(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
+        timed("query_items_shallow", async {
+            match self {
+                AnyStore::Sqlite(s) => s.query_shallow(q).await,
+                AnyStore::Postgres(p) => p.query_shallow(q).await,
+            }
+        })
+        .await
+    }
+
     async fn query_ids(&self, q: &MediaQuery) -> DomainResult<Vec<MediaId>> {
         timed("query_item_ids", async {
             match self {
