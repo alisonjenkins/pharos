@@ -5969,6 +5969,61 @@ pub(crate) async fn scoped_tracks(
     Ok(tracks)
 }
 
+/// The artists and albums `user` may see whose name holds `needle` (any
+/// case), as DTOs: artists best named first; then the albums of an artist
+/// named exactly `needle`, newest first, and the albums best named after
+/// them. At most `limit` of each.
+pub(crate) async fn music_groups_named(
+    state: &AppState,
+    user: &pharos_core::User,
+    needle: &str,
+    limit: usize,
+) -> Result<(Vec<serde_json::Value>, Vec<serde_json::Value>), actix_web::Error> {
+    use crate::services::search::name_match;
+    // Only tracks whose title, artist or album holds the needle can name a
+    // matching artist or album, so the store narrows them first.
+    let q = ItemQuery {
+        search_term: Some(needle.to_owned()),
+        ..ItemQuery::default()
+    };
+    let mut mq = build_media_query(user.id, &q, &ParentResolution::All, true);
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    mq.kinds = vec![MediaKind::Audio];
+    mq.limit = None;
+    mq.start_index = 0;
+    mq.sort = Vec::new();
+    let (tracks, _total) = state
+        .stores
+        .query(&mq)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let mut artists: Vec<_> = filed_artist_names(&tracks)
+        .into_iter()
+        .filter_map(|name| Some((name_match(name, needle)?, name)))
+        .collect();
+    artists.sort();
+    artists.truncate(limit);
+    let exact: Vec<&str> = artists
+        .iter()
+        .filter(|(rank, _)| rank.is_exact())
+        .map(|(_, name)| *name)
+        .collect();
+    let mut own = aggregate_albums(&tracks, |i| exact.iter().any(|a| on_artist_page(i, a)));
+    own.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| a.name.cmp(&b.name)));
+    let mut named: Vec<_> = aggregate_albums(&tracks, |_| true)
+        .into_iter()
+        .filter(|a| !own.iter().any(|o| o.name == a.name))
+        .filter_map(|a| Some((name_match(&a.name, needle)?, a)))
+        .collect();
+    named.sort_by(|(x, a), (y, b)| x.cmp(y).then_with(|| a.name.cmp(&b.name)));
+    let mut albums = Vec::with_capacity(limit);
+    for a in own.iter().chain(named.iter().map(|(_, a)| a)).take(limit) {
+        albums.push(synth_album_dto(state, a).await);
+    }
+    let names: Vec<&str> = artists.iter().map(|(_, name)| *name).collect();
+    Ok((artist_dtos(state, &names).await, albums))
+}
+
 /// What a music listing folds its tracks into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MusicGrouping {

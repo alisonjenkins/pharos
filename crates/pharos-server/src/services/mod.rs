@@ -12,6 +12,7 @@ pub mod metadata_text;
 pub mod mix;
 pub mod play_state;
 pub mod playback;
+pub mod search;
 pub mod segments;
 pub mod user_data;
 pub mod watch;
