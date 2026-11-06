@@ -1,6 +1,6 @@
 # ADR-0063: Artwork AVIF is encoded from the source, in the background
 
-- **Status:** Accepted
+- **Status:** Superseded in part by ADR-0068 (the encode settings)
 - **Date:** 2026-11-05T00:00:00Z
 - **Deciders:** Ali
 
