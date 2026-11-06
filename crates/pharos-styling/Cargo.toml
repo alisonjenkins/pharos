@@ -1,0 +1,22 @@
+[package]
+name = "pharos-styling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure effect-plan types and the plan-to-ASS compiler for Pharos-styled subtitles (spec 028)"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+# The property test (V511) parses compiled output with the renderer's parser.
+pharos-subs = { path = "../pharos-subs" }
+proptest = "1"
+serde_json.workspace = true
+
+[lints]
+workspace = true

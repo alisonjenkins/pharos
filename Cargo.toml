@@ -12,6 +12,7 @@ members = [
     "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
+    "crates/pharos-styling",
     "crates/pharos-subs",
     "crates/pharos-sync",
     "crates/pharos-test-metrics",

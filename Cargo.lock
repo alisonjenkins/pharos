@@ -5334,6 +5334,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-styling"
+version = "0.0.0"
+dependencies = [
+ "pharos-subs",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "workspace-hack",
+]
+
+[[package]]
 name = "pharos-subs"
 version = "0.0.0"
 dependencies = [
