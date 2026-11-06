@@ -642,6 +642,7 @@ pub fn StageBar(
                         class: "pharos-stage-button",
                         r#type: "button",
                         aria_label: "Expand",
+                        "data-key-action": "full-player",
                         title: "Expand to the full screen",
                         onclick: move |_| on_action.call(StageAction::Show(View::Full)),
                         Icon { path: ICON_FULL }
@@ -651,6 +652,7 @@ pub fn StageBar(
                             class: "pharos-stage-button",
                             r#type: "button",
                             aria_label: "Mini bar",
+                            "data-key-action": "player-size",
                             title: "Shrink to a bar along the bottom",
                             onclick: move |_| on_action.call(StageAction::Show(View::Mini)),
                             Icon { path: ICON_MINI }
@@ -660,6 +662,7 @@ pub fn StageBar(
                             class: "pharos-stage-button",
                             r#type: "button",
                             aria_label: "Floating window",
+                            "data-key-action": "player-size",
                             title: "Float in a window you can move",
                             onclick: move |_| on_action.call(StageAction::Show(View::Floating)),
                             Icon { path: ICON_FLOAT }

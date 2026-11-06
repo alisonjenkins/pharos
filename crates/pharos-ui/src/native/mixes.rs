@@ -470,6 +470,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             } else {
                 button {
                     class: "pharos-chip pharos-mix-toggle",
+                    "data-key-action": "mix",
                     r#type: "button",
                     aria_expanded: if open() { "true" } else { "false" },
                     onclick: move |_| {
