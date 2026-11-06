@@ -33,10 +33,11 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, fade_volume, max_bitrate_label, parse_crossfade,
     parse_max_bitrate, parse_volume_setting, position_at, preview_set, rust_subtitle_url, start_ms,
-    styled_subtitle_url, subtitle_font_urls, subtitle_switch, up_next_at, volume_setting, Engine,
-    LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect,
-    PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, UpNext, UpNextStep, CROSSFADE_KEY,
-    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, VOLUME_KEY,
+    styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls, subtitle_switch, up_next_at,
+    volume_setting, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment,
+    Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, UpNext,
+    UpNextStep, CROSSFADE_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY,
+    SUBTITLE_SIZE_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -3689,12 +3690,15 @@ fn Player(
                     if pick != styled_for.get() {
                         continue;
                     }
+                    let (line, event) = styled_subtitle_signals(&result);
+                    platform::report_event(event);
                     match result {
-                        Ok(()) => styled_ready.set(true),
-                        Err(e) => {
-                            platform::warn(&format!(
-                                "pharos: styled subtitles failed, showing plain text: {e}"
-                            ));
+                        Ok(()) => {
+                            platform::info(&line);
+                            styled_ready.set(true);
+                        }
+                        Err(_) => {
+                            platform::warn(&line);
                             styled.borrow_mut().take();
                             styled_ready.set(false);
                         }

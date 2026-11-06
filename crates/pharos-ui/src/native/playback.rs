@@ -3,7 +3,10 @@
 //! progress. The browser answers come in as plain values, so all of it is
 //! tested on the host.
 
-use pharos_client::api::{Capabilities, Font, Segment, SegmentKind, Track, Trickplay};
+use pharos_client::api::{
+    Capabilities, ClientEvent, ClientEventKind, ClientLevel, Font, Segment, SegmentKind, Track,
+    Trickplay,
+};
 
 /// Something that turns a stream URL into playback on the page's `<video>`
 /// (009 Boundaries: each external dependency sits behind an adapter). The
@@ -1110,6 +1113,28 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
+/// The log line and client event for the ASS renderer getting ready or
+/// failing, which falls back to plain text (B590). Both outcomes carry the
+/// same fields, so a fallback is as visible in the server log as a success.
+pub fn styled_subtitle_signals(result: &Result<(), String>) -> (String, ClientEvent) {
+    let (mode, level, reason) = match result {
+        Ok(()) => ("styled", ClientLevel::Info, "ready".to_owned()),
+        Err(e) => ("plain", ClientLevel::Warn, e.clone()),
+    };
+    let line = format!("pharos: subtitle renderer=jassub mode={mode} reason={reason}");
+    let event = ClientEvent {
+        kind: ClientEventKind::RendererMode,
+        level,
+        route: String::new(),
+        fields: vec![
+            ("renderer", "jassub".to_owned()),
+            ("mode", mode.to_owned()),
+            ("reason", reason),
+        ],
+    };
+    (line, event)
+}
+
 /// The fonts Pharos ships for the subtitles it styles itself (spec 028), as
 /// (lowercased family name, file under `/ui/assets/fonts/`). The ASS renderer
 /// gets them as `availableFonts`, which it fetches only when a style names
@@ -1154,6 +1179,34 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// B590: a styled renderer that fails says so with its reason, in the
+    /// same shape as one that gets ready.
+    #[test]
+    fn a_styled_subtitle_fallback_is_logged_and_sent_with_its_reason() {
+        let (line, event) = styled_subtitle_signals(&Ok(()));
+        assert_eq!(
+            line,
+            "pharos: subtitle renderer=jassub mode=styled reason=ready"
+        );
+        assert_eq!(event.kind, ClientEventKind::RendererMode);
+        assert_eq!(event.level, ClientLevel::Info);
+
+        let (line, event) = styled_subtitle_signals(&Err("not ready after 8000 ms".into()));
+        assert_eq!(
+            line,
+            "pharos: subtitle renderer=jassub mode=plain reason=not ready after 8000 ms"
+        );
+        assert_eq!(event.level, ClientLevel::Warn);
+        assert_eq!(
+            event.fields,
+            [
+                ("renderer", "jassub".to_owned()),
+                ("mode", "plain".to_owned()),
+                ("reason", "not ready after 8000 ms".to_owned()),
+            ]
+        );
+    }
 
     /// V508: each pack font is registered under the family name in its own
     /// name table, the name a style's `Fontname` has to match.
