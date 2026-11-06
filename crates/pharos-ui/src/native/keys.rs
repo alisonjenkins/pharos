@@ -15,6 +15,18 @@ const HELP_AFTER_MS: u32 = 500;
 /// How long a begun sequence waits for its next key at all.
 const SEQUENCE_LAPSES_MS: u32 = 2_000;
 
+thread_local! {
+    /// Whether a sequence (`g` …) waits for its next key.
+    static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a begun sequence waits for its next key: a player's own key
+/// handler, which hears a key before the layer, leaves that key to the
+/// layer, so `g h` goes home rather than seeking back (B617).
+pub fn sequence_pending() -> bool {
+    PENDING.get()
+}
+
 /// The mode a page asked for, with the token of the page that asked, so a
 /// page leaving does not clear the mode the next page already set.
 #[derive(Clone, Copy)]
@@ -91,6 +103,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     // Each key bumps it, so a timer started for an older key stands down.
     let mut generation = use_signal(|| 0u32);
     let mut reset = move || {
+        PENDING.set(false);
         chord.write().clear();
         help.set(None);
     };
@@ -157,6 +170,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                     run(action)
                 }
                 Resolved::Pending(prefix) => {
+                    PENDING.set(true);
                     chord.set(keys);
                     help.set(None);
                     let asked = *generation.peek();

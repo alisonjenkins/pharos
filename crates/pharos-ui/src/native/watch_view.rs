@@ -9,6 +9,7 @@ use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 
 use super::keymap::{self, Mode, Transport};
+use super::keys;
 
 use super::art::Art;
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
@@ -127,11 +128,12 @@ pub(super) fn total_ms(media: &MediaState, runtime_ms: u64) -> u64 {
     }
 }
 
-/// Whether Ctrl or Cmd is held: such a key is a shortcut of the browser or
-/// the palette, never a transport key.
-pub(super) fn chorded(evt: &KeyboardEvent) -> bool {
+/// Whether a key is not the player's to take: Ctrl or Cmd held, a shortcut
+/// of the browser or the palette; or a key sequence (`g` …) under way,
+/// whose next key is the key layer's (B617).
+pub(super) fn not_transport(evt: &KeyboardEvent) -> bool {
     let m = evt.modifiers();
-    m.ctrl() || m.meta()
+    m.ctrl() || m.meta() || keys::sequence_pending()
 }
 
 /// What a key does to the transport, on the video and music pages alike
@@ -347,8 +349,9 @@ pub fn WatchView(
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
-        // a bare `k` raises the volume, the chord must not.
-        if chorded(&evt) {
+        // a bare `k` raises the volume, the chord must not. After `g`, `h`
+        // goes home, not back 10 s.
+        if not_transport(&evt) {
             return;
         }
         // The invite panel is a dialog: its keys are its own, and Escape
