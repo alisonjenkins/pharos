@@ -10,6 +10,7 @@ pub mod compile;
 mod effects;
 pub mod event;
 pub mod plan;
+pub mod signals;
 pub mod source;
 mod tags;
 mod text;
