@@ -485,6 +485,60 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // 014 US10: in a group, a title page's "Play for the group" moves the
+  // group to that title, rather than leaving it for a new group of one.
+  test("another film's Play for the group moves the whole group to it", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(180_000);
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm", {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+    });
+    const { movie: other, nativeId: otherId } = await seededMovie(request, "/fixture-2.webm");
+    try {
+      await waitUntilInSync(people);
+
+      // A leaves the film in the app, still in the group, and opens another.
+      await a.page.mouse.move(220, 220);
+      await a.page.getByRole("button", { name: "Back" }).click();
+      await a.page.getByRole("combobox", { name: "Search all libraries" }).fill(other.Name);
+      const hit = a.page
+        .getByRole("option")
+        .filter({ hasText: other.Name })
+        .first()
+        .getByRole("link");
+      await expect(hit).toBeVisible({ timeout: 15_000 });
+      await hit.click();
+      await expect(a.page).toHaveURL(new RegExp(`/ui/title/${otherId}$`));
+      // In a group the title offers to move it, not to start another.
+      await expect(a.page.getByRole("button", { name: /^Watch together/ })).toHaveCount(0);
+      const moves = await moveCounts(request);
+      await a.page.getByRole("button", { name: /^(Play|Resume) for the group$/ }).click();
+
+      // B, on the group's player, is taken to the new film. A's film was
+      // shrunk to the floating player, which plays it in place, as any play
+      // does there (spec 020 FR-001).
+      await expect(b.page).toHaveURL(new RegExp(`/ui/watch/${otherId}$`), { timeout: 15_000 });
+      for (const p of [a.page, b.page]) {
+        await expect
+          .poll(
+            () =>
+              p.evaluate(
+                () => (document.getElementById("pharos-video") as HTMLVideoElement | null)?.currentSrc ?? "",
+              ),
+            { message: "each member's player plays the new film", timeout: 15_000 },
+          )
+          .toContain(`/videos/${other.Id}/`);
+      }
+      await expect(b.page.locator(".pharos-member-list li")).toHaveCount(2, { timeout: 15_000 });
+      await waitUntilInSync(people);
+      expect(await movesSince(request, moves), "one group move").toEqual({ moved: 1, stale: 0 });
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
 
 /** Clicks `member`'s seek bar at `fraction` of its width. */
