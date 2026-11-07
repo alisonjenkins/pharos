@@ -17,7 +17,7 @@
 //! for the device.
 
 use crate::state::Stores;
-use pharos_core::SyncGroupStore;
+use pharos_core::{PersistedSyncGroup, SyncGroupStore};
 use pharos_sync::group::snapshot_contains_member;
 use pharos_sync::messages::{GroupId, MemberId};
 
@@ -51,11 +51,30 @@ pub fn now_unix_secs() -> i64 {
 pub async fn find_persisted_group(stores: &Stores, member_id: MemberId) -> Option<GroupId> {
     let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
     let rows = stores.list_sync_groups().await.ok()?;
+    pick_recovery_group(&rows, cutoff, |r| {
+        snapshot_contains_member(&r.state_json, member_id)
+    })
+    .and_then(|r| uuid::Uuid::parse_str(&r.group_id).ok())
+    .map(GroupId)
+}
+
+/// The fresh snapshot (`updated_at >= cutoff`) that `contains` accepts, newest
+/// wins. Several snapshots can name the same deterministic member id (a device
+/// that joined two parties, or a stale copy), so the choice must not depend on
+/// the order the rows arrive in: the greatest `updated_at` wins, and an exact
+/// timestamp tie goes to the smaller group id (the store's list order).
+fn pick_recovery_group(
+    rows: &[PersistedSyncGroup],
+    cutoff: i64,
+    contains: impl Fn(&PersistedSyncGroup) -> bool,
+) -> Option<&PersistedSyncGroup> {
     rows.iter()
-        .filter(|r| r.updated_at >= cutoff)
-        .find(|r| snapshot_contains_member(&r.state_json, member_id))
-        .and_then(|r| uuid::Uuid::parse_str(&r.group_id).ok())
-        .map(GroupId)
+        .filter(|r| r.updated_at >= cutoff && contains(r))
+        .max_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| b.group_id.cmp(&a.group_id))
+        })
 }
 
 /// B29 — boot reconciliation: hydrate every FRESH persisted snapshot into a
@@ -151,4 +170,54 @@ pub fn spawn_snapshot_janitor(stores: Stores) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(group_id: &str, updated_at: i64) -> PersistedSyncGroup {
+        PersistedSyncGroup {
+            group_id: group_id.to_string(),
+            epoch_unix_ms: 1_000,
+            state_json: "{}".into(),
+            updated_at,
+        }
+    }
+
+    /// Rows arrive oldest-first (as an unordered scan would deliver them). Both
+    /// snapshots match the member, so the newer one must be chosen, not the
+    /// first one scanned.
+    #[test]
+    fn recovery_picks_most_recent_matching_snapshot() {
+        let rows = vec![row("group-old", 100), row("group-new", 900)];
+        let got = pick_recovery_group(&rows, 0, |_| true).map(|r| r.group_id.as_str());
+        assert_eq!(got, Some("group-new"));
+    }
+
+    #[test]
+    fn recovery_ignores_newer_snapshot_that_lacks_the_member() {
+        let rows = vec![row("group-old", 100), row("group-new", 900)];
+        let got = pick_recovery_group(&rows, 0, |r| r.group_id == "group-old")
+            .map(|r| r.group_id.as_str());
+        assert_eq!(got, Some("group-old"));
+    }
+
+    #[test]
+    fn recovery_skips_stale_snapshots_below_cutoff() {
+        let rows = vec![row("group-stale", 100), row("group-fresh", 500)];
+        let got = pick_recovery_group(&rows, 200, |_| true).map(|r| r.group_id.as_str());
+        assert_eq!(got, Some("group-fresh"));
+    }
+
+    #[test]
+    fn recovery_timestamp_tie_is_order_independent() {
+        let a = vec![row("group-b", 500), row("group-a", 500)];
+        let b = vec![row("group-a", 500), row("group-b", 500)];
+        let pick = |rows: &[PersistedSyncGroup]| {
+            pick_recovery_group(rows, 0, |_| true).map(|r| r.group_id.clone())
+        };
+        assert_eq!(pick(&a), Some("group-a".to_string()));
+        assert_eq!(pick(&b), Some("group-a".to_string()));
+    }
 }
