@@ -47,6 +47,20 @@ pub enum SubtitleKind {
     /// index) as PNGs and a manifest, in a directory of their own (spec
     /// 019): see [`SubtitleCache::image_subtitles`].
     Images,
+    /// The generated "Pharos styled" ASS script compiled for one tier and
+    /// effects level (spec 028). The disk name carries every input that
+    /// changes the bytes, so a restyle (`plan_stamp`, the plan row's
+    /// `styled_at`) or a compiler/director bump never serves a stale
+    /// script. pharos-cache cannot depend on pharos-styling, so the caller
+    /// passes the tier and level as their enum ordinals and the versions as
+    /// plain numbers.
+    Styled {
+        tier: u8,
+        level: u8,
+        compiler_version: u32,
+        director_version: u32,
+        plan_stamp: i64,
+    },
 }
 
 /// Bump when extraction's output changes, so directories an older build
@@ -494,12 +508,19 @@ impl SubtitleCache {
         key.path.hash(&mut h);
         let ph = h.finish();
         let k = match key.kind {
-            SubtitleKind::Embedded => 'e',
-            SubtitleKind::Sidecar => 's',
-            SubtitleKind::EmbeddedAss => 'a',
-            SubtitleKind::EmbeddedSrt => 'r',
-            SubtitleKind::EventWindows => 'w',
-            SubtitleKind::Images => 'i',
+            SubtitleKind::Embedded => "e".to_owned(),
+            SubtitleKind::Sidecar => "s".to_owned(),
+            SubtitleKind::EmbeddedAss => "a".to_owned(),
+            SubtitleKind::EmbeddedSrt => "r".to_owned(),
+            SubtitleKind::EventWindows => "w".to_owned(),
+            SubtitleKind::Images => "i".to_owned(),
+            SubtitleKind::Styled {
+                tier,
+                level,
+                compiler_version,
+                director_version,
+                plan_stamp,
+            } => format!("y{tier}.{level}.c{compiler_version}.d{director_version}.p{plan_stamp}"),
         };
         Some(root.join("subtitles").join(format!(
             "{ph:016x}-{}-{}-{k}.sub",
@@ -1038,6 +1059,41 @@ mod tests {
             disk.disk_path_of(Path::new("/m/x.mkv"), 8, 3, SubtitleKind::EmbeddedAss)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn styled_names_differ_per_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let disk = SubtitleCache::new(1_024, 64).with_disk(dir.path());
+        let base = (0u8, 1u8, 1u32, 1u32, 100i64);
+        let name = |t: (u8, u8, u32, u32, i64)| {
+            disk.disk_path_of(
+                Path::new("/m/x.mkv"),
+                7,
+                3,
+                SubtitleKind::Styled {
+                    tier: t.0,
+                    level: t.1,
+                    compiler_version: t.2,
+                    director_version: t.3,
+                    plan_stamp: t.4,
+                },
+            )
+            .unwrap()
+        };
+        let b = name(base);
+        assert_eq!(b, name(base));
+        for variant in [
+            (1, 1, 1, 1, 100),
+            (0, 2, 1, 1, 100),
+            (0, 1, 2, 1, 100),
+            (0, 1, 1, 2, 100),
+            (0, 1, 1, 1, 101),
+        ] {
+            assert_ne!(b, name(variant), "{variant:?} must not alias the base");
+        }
+        let file = b.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(file.contains("-y0.1.c1.d1.p100."), "{file}");
     }
 
     #[tokio::test]
