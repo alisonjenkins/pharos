@@ -167,6 +167,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
             probe.pixel_format.as_deref(),
         ),
         video_3d_format: probe.video_3d_format,
+        video_range_type: is_video.then(|| probe.video_range_type().to_owned()),
     };
 
     // Capability-aware negotiation: the transcode target is the best codec in
@@ -2123,6 +2124,7 @@ mod native_max_bitrate_tests {
             height: None,
             video_bit_depth: None,
             video_3d_format: None,
+            video_range_type: None,
         }
     }
 
