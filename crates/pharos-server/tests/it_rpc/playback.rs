@@ -60,6 +60,7 @@ fn caps(video: &[&str], audio: &[&str], containers: &[&str]) -> Capabilities {
         audio_codecs: own(audio),
         containers: own(containers),
         max_bitrate: 0,
+        hdr: true,
         image_subtitles: Vec::new(),
     }
 }
@@ -180,6 +181,7 @@ async fn negotiate_at(
             c.reborrow().init_containers(caps.containers.len() as u32),
         );
         c.set_max_bitrate(caps.max_bitrate);
+        c.set_hdr(caps.hdr);
         set(
             &caps.image_subtitles,
             c.reborrow()
@@ -1004,4 +1006,119 @@ async fn the_styled_track_negotiates_as_its_source_track() {
         .unwrap();
     assert_eq!(resumed.subtitle, Some(styled_slot), "{resumed:?}");
     assert_eq!(resumed.method, source.method);
+}
+
+const HDR_MOVIE: u64 = 302;
+
+async fn seed_hdr10(fx: &Fixture) {
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: HDR_MOVIE,
+            path: "/libA/hdr.mp4".into(),
+            title: "HDR".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(3840),
+                height: Some(2160),
+                bitrate_bps: Some(4_000_000),
+                container: Some("mp4".into()),
+                video_codec: Some("h264".into()),
+                audio_codec: Some("aac".into()),
+                color_transfer: Some("smpte2084".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+/// T065: a player that reports no HDR display is not handed an HDR10 source to
+/// direct play; one that does, and an SDR source for either, are unchanged.
+/// The refusal names the range as `direct_play_block="video_range"`, the label
+/// `pharos_playback_decision_total` counts.
+/// Disarm check: with `Capabilities::profile` adding no `VideoRangeType`
+/// condition, the hdr=false case direct-plays and the assertion fails.
+#[actix_web::test]
+async fn an_sdr_only_player_is_not_offered_an_hdr_source_to_direct_play() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_hdr10(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+
+    let sdr_display = Capabilities {
+        hdr: false,
+        ..caps(&["h264"], &["aac"], &["mp4"])
+    };
+    let hdr_display = caps(&["h264"], &["aac"], &["mp4"]);
+    let decide = |id: u64, caps: Capabilities| {
+        let session = &session;
+        async move {
+            negotiate(
+                session,
+                WireId::Real(id),
+                &caps,
+                Choice::Default,
+                Choice::Default,
+            )
+            .await
+            .unwrap()
+            .1
+        }
+    };
+
+    let blocked = decide(HDR_MOVIE, sdr_display.clone()).await;
+    assert_eq!(blocked.method, "transcode");
+    assert_eq!(blocked.block, "video_range");
+    assert_eq!(
+        decide(HDR_MOVIE, hdr_display.clone()).await.method,
+        "direct_play"
+    );
+    assert_eq!(
+        decide(MOVIE, sdr_display.clone()).await.method,
+        "direct_play"
+    );
+    assert_eq!(decide(MOVIE, hdr_display).await.method, "direct_play");
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let item = pharos_core::MediaStore::get(&fx.state.stores, HDR_MOVIE)
+        .await
+        .unwrap();
+    let profile = sdr_display.profile(false);
+    let negotiated = playback::negotiate(
+        &fx.state,
+        &item,
+        &NegotiateRequest {
+            profile: &profile,
+            switches: PlaybackSwitches::default(),
+            explicit_subtitle_index: None,
+            stereo_mode: None,
+            client_is_remote: false,
+            is_web_client: false,
+        },
+    );
+    negotiated.record();
+    assert_eq!(
+        negotiated.direct_play_block,
+        pharos_jellyfin_api::device_profile::DirectPlayBlock::VideoRange {
+            source: "HDR10".into()
+        }
+    );
+    let counted = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .any(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_playback_decision_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "direct_play_block" && l.value() == "video_range")
+        });
+    assert!(counted, "the decision counter carries video_range");
 }
