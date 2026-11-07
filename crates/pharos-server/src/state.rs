@@ -465,6 +465,23 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// One `ActivityLogEntry` for the admin dashboard (`/System/ActivityLog/Entries`
+/// and the `ActivityLogEntry` socket push). Fields are declared in the order of
+/// their PascalCase names, which is the order the former `serde_json::Value`
+/// map serialized to (keys sorted), so the bytes are unchanged.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ActivityLogEntryDto<'a> {
+    date: String,
+    id: i64,
+    name: &'a str,
+    severity: &'static str,
+    short_overview: Option<&'a str>,
+    #[serde(rename = "Type")]
+    kind: &'a str,
+    user_id: Option<&'a str>,
+}
+
 impl AppState {
     /// Look up a memoised synth-id → representative item id, if present.
     ///
@@ -623,15 +640,25 @@ impl AppState {
         let id = self
             .next_activity_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let entry = serde_json::json!({
-            "Id": id,
-            "Name": name,
-            "Type": kind,
-            "Date": crate::api::jellyfin::dto::format_iso8601(unix_now_secs()),
-            "UserId": user_id,
-            "Severity": "Information",
-            "ShortOverview": overview,
-        });
+        let Ok(entry) = serde_json::to_value(ActivityLogEntryDto {
+            date: crate::api::jellyfin::dto::format_iso8601(unix_now_secs()),
+            id,
+            name,
+            severity: "Information",
+            short_overview: overview,
+            kind,
+            user_id,
+        }) else {
+            // A struct of strings and integers cannot fail to serialize; if it
+            // ever does, drop this one best-effort entry rather than panic.
+            tracing::warn!(
+                id,
+                name,
+                kind,
+                "activity entry failed to serialize; dropped"
+            );
+            return;
+        };
         let _ = self.bus.send(SocketBroadcast::ActivityLogEntry {
             entry: entry.clone(),
         });
@@ -1395,6 +1422,37 @@ mod shutdown_tests {
     // that makes the #1 fast-reconnect safe — closing sockets before the LB
     // drain would bounce reconnects back onto the dying pod.
     use super::*;
+
+    #[test]
+    fn activity_log_entry_serializes_to_the_former_literal() {
+        let dto = ActivityLogEntryDto {
+            date: "2026-11-07T00:00:00Z".into(),
+            id: 3,
+            name: "alice signed in",
+            severity: "Information",
+            short_overview: Some("from web"),
+            kind: "SessionStarted",
+            user_id: None,
+        };
+        let got = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "Id": 3,
+                "Name": "alice signed in",
+                "Type": "SessionStarted",
+                "Date": "2026-11-07T00:00:00Z",
+                "UserId": null,
+                "Severity": "Information",
+                "ShortOverview": "from web",
+            })
+        );
+        // Byte-identical to the Value form (sorted keys) the log stores.
+        assert_eq!(
+            serde_json::to_string(&dto).unwrap(),
+            serde_json::to_string(&got).unwrap()
+        );
+    }
 
     #[test]
     fn begin_shutdown_flips_readiness_but_leaves_sockets_open_until_drain() {
