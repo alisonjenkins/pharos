@@ -7347,9 +7347,9 @@ struct LibraryTypeOptionsDto {
 
 const LIBRARY_SUPPORTED_IMAGE_TYPES: &[&str] = &["Primary", "Backdrop", "Logo", "Thumb", "Banner"];
 
-fn library_type_option(t: &'static str) -> LibraryTypeOptionsDto {
+fn library_type_option(t: ItemType) -> LibraryTypeOptionsDto {
     LibraryTypeOptionsDto {
-        type_: t,
+        type_: t.as_wire(),
         metadata_fetchers: &[],
         metadata_fetcher_order: &[],
         image_fetchers: &[],
@@ -7390,12 +7390,12 @@ async fn libraries_available_options(_user: AuthUser) -> impl Responder {
         metadata_readers: LIBRARY_METADATA_READERS,
         subtitle_fetchers: &[],
         type_options: vec![
-            library_type_option("Movie"),
-            library_type_option("Series"),
-            library_type_option("Season"),
-            library_type_option("Episode"),
-            library_type_option("MusicAlbum"),
-            library_type_option("MusicArtist"),
+            library_type_option(ItemType::Movie),
+            library_type_option(ItemType::Series),
+            library_type_option(ItemType::Season),
+            library_type_option(ItemType::Episode),
+            library_type_option(ItemType::MusicAlbum),
+            library_type_option(ItemType::MusicArtist),
         ],
     };
     crate::api::jellyfin::wire::json(&result)
