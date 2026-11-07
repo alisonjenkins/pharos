@@ -422,6 +422,104 @@ async fn reports_and_stop_move_the_resume_point_and_end_the_stream() {
     assert_eq!(closed, actix_web::http::StatusCode::UNAUTHORIZED);
 }
 
+/// T066: a grant lists the player in `/Sessions` as `/Sessions/Playing`
+/// does (user, the token's device, client, item), a report moves its
+/// position and pause, and the stop removes it, as Jellyfin's stop does.
+/// Disarm check: with `start_session` not called, the first listing is empty;
+/// with `Grant::stop` skipping `play_state::stop`, the last one still lists it.
+#[actix_web::test]
+async fn a_native_grant_is_listed_in_sessions_until_it_stops() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let listed = || async {
+        let req = test::TestRequest::get()
+            .uri("/Sessions")
+            .insert_header(("X-Emby-Token", fx.admin_token.as_str()))
+            .to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        body.as_array().unwrap().clone()
+    };
+    assert!(listed().await.is_empty());
+
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, decided) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    let entries = listed().await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry["Id"], decided.psid.as_str());
+    assert_eq!(entry["UserName"], "guest");
+    assert_eq!(entry["UserId"], fx.user_id.0.simple().to_string());
+    // The device the token was issued to, never a client-stated one.
+    assert_eq!(entry["DeviceId"], "test");
+    assert_eq!(entry["Client"], "Pharos");
+    assert_eq!(entry["NowPlayingItemId"], wire_item_id(MOVIE));
+    assert_eq!(entry["PositionTicks"], 0);
+
+    report(&grant, 30_000, true).await.unwrap();
+    let entries = listed().await;
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["PositionTicks"], 300_000_000u64);
+    assert_eq!(entries[0]["IsPaused"], true);
+
+    stop(&grant, 45_000).await.unwrap();
+    assert!(listed().await.is_empty());
+}
+
+/// T066: a grant released without a stop, as a closed tab releases it, ends
+/// its `/Sessions` entry too. Disarm check: with `Grant`'s `Drop` returning
+/// early, the entry stays.
+#[actix_web::test]
+async fn a_released_native_grant_leaves_sessions() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let listed = || async {
+        let req = test::TestRequest::get()
+            .uri("/Sessions")
+            .insert_header(("X-Emby-Token", fx.admin_token.as_str()))
+            .to_request();
+        let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+        body.as_array().unwrap().len()
+    };
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, _) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    report(&grant, 30_000, false).await.unwrap();
+    assert_eq!(listed().await, 1);
+
+    drop(grant);
+    // The end runs after the grant goes, so wait for it.
+    let mut left = listed().await;
+    for _ in 0..100 {
+        if left == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        left = listed().await;
+    }
+    assert_eq!(left, 0, "the released grant's session is still listed");
+}
+
 /// B465: a grant released without a stop, as a reload or a dropped
 /// connection releases it, ends its playback: the stream capability closes
 /// and the last reported position is saved. A grant never reported on closes
