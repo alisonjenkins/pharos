@@ -24,7 +24,8 @@
 
 use crate::api::jellyfin::device_profile::Decision;
 use pharos_core::{
-    MediaId, MediaProbe, PersistedTranscodeSession, SessionHolder, TranscodeSessionStore,
+    MediaId, MediaProbe, PersistedTranscodeSession, PlaySessionId, SessionHolder,
+    TranscodeSessionStore,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -103,16 +104,16 @@ enum Msg {
     /// already counted where it was minted, so no cap applies here.
     Recache(Box<InsertPayload>),
     Get {
-        session_id: String,
-        reply: oneshot::Sender<Option<TranscodeSession>>,
+        session_id: PlaySessionId,
+        reply: oneshot::Sender<(PlaySessionId, Option<TranscodeSession>)>,
     },
     Remove {
-        session_id: String,
+        session_id: PlaySessionId,
     },
 }
 
 struct InsertPayload {
-    session_id: String,
+    session_id: PlaySessionId,
     session: TranscodeSession,
 }
 
@@ -121,13 +122,13 @@ struct Minted {
     /// Live sessions the user held before this one was added.
     held: usize,
     /// Session ids ended from memory to stay within the cap, oldest first.
-    evicted: Vec<String>,
+    evicted: Vec<PlaySessionId>,
 }
 
-async fn delete_durable_row<S: TranscodeSessionStore>(store: &S, session_id: &str) {
-    if let Err(e) = store.remove_transcode_session(session_id).await {
+async fn delete_durable_row<S: TranscodeSessionStore>(store: &S, session_id: &PlaySessionId) {
+    if let Err(e) = store.remove_transcode_session(session_id.as_str()).await {
         tracing::warn!(
-            psid = %pharos_core::secret_prefix(session_id),
+            psid = %pharos_core::secret_prefix(session_id.as_str()),
             error = %e,
             "transcode session store delete failed"
         );
@@ -154,7 +155,7 @@ where
     pub fn spawn(store: S) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(64);
         tokio::spawn(async move {
-            let mut sessions: HashMap<String, Entry> = HashMap::new();
+            let mut sessions: HashMap<PlaySessionId, Entry> = HashMap::new();
             let mut next_minted: u64 = 0;
             while let Some(msg) = rx.recv().await {
                 // Garbage-collect expired sessions on every touch.
@@ -169,7 +170,7 @@ where
                         // Count, evict and insert in one actor step, so two
                         // concurrent mints cannot both see room and overshoot.
                         let user = session.holder.user_id;
-                        let mut others: Vec<(u64, String)> = sessions
+                        let mut others: Vec<(u64, PlaySessionId)> = sessions
                             .iter()
                             .filter(|(id, e)| {
                                 **id != session_id && e.session.holder.user_id == user
@@ -180,7 +181,7 @@ where
                         let held = others.len();
                         let excess =
                             held.saturating_sub(MAX_LIVE_PLAY_SESSIONS_PER_USER.saturating_sub(1));
-                        let evicted: Vec<String> =
+                        let evicted: Vec<PlaySessionId> =
                             others.into_iter().take(excess).map(|(_, id)| id).collect();
                         for id in &evicted {
                             sessions.remove(id);
@@ -218,7 +219,7 @@ where
                         if let Some(entry) = sessions.get_mut(&session_id) {
                             entry.last_used = now;
                         }
-                        let _ = reply.send(s);
+                        let _ = reply.send((session_id, s));
                     }
                     Msg::Remove { session_id } => {
                         sessions.remove(&session_id);
@@ -281,26 +282,26 @@ where
     /// session from the durable store than from memory.
     pub async fn insert(
         &self,
-        session_id: String,
+        session_id: PlaySessionId,
         session: TranscodeSession,
-    ) -> Result<Vec<String>, TranscodeSessionError> {
+    ) -> Result<Vec<PlaySessionId>, TranscodeSessionError> {
         let user = session.holder.user_id;
         match Self::to_persisted(&session) {
             Ok(persisted) => {
                 if let Err(e) = self
                     .store
-                    .upsert_transcode_session(&session_id, &persisted, now_unix_secs())
+                    .upsert_transcode_session(session_id.as_str(), &persisted, now_unix_secs())
                     .await
                 {
                     tracing::warn!(
-                        psid = %pharos_core::secret_prefix(&session_id),
+                        psid = %pharos_core::secret_prefix(session_id.as_str()),
                         error = %e,
                         "transcode session write-through failed; failover unavailable for this session"
                     );
                 }
             }
             Err(e) => tracing::warn!(
-                psid = %pharos_core::secret_prefix(&session_id),
+                psid = %pharos_core::secret_prefix(session_id.as_str()),
                 error = %e,
                 "transcode session serialize failed; not persisted"
             ),
@@ -335,13 +336,13 @@ where
             .store
             .trim_transcode_sessions_for_holder(
                 user,
-                &minted_id,
+                minted_id.as_str(),
                 MAX_LIVE_PLAY_SESSIONS_PER_USER,
                 now_unix_secs() - DB_RETENTION_SECS,
             )
             .await
         {
-            Ok(ids) => ids,
+            Ok(ids) => ids.into_iter().map(PlaySessionId::from).collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(
                     user.id = %user,
@@ -383,24 +384,24 @@ where
     /// underlying cause logged.
     pub async fn get(
         &self,
-        session_id: &str,
+        session_id: PlaySessionId,
     ) -> Result<Option<TranscodeSession>, TranscodeSessionError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Msg::Get {
-                session_id: session_id.to_string(),
+                session_id,
                 reply: tx,
             })
             .await
             .map_err(|_| TranscodeSessionError::ActorDown)?;
-        let local = rx.await.map_err(|_| TranscodeSessionError::ReplyDropped)?;
+        let (session_id, local) = rx.await.map_err(|_| TranscodeSessionError::ReplyDropped)?;
         if local.is_some() {
             return Ok(local);
         }
 
         match self
             .store
-            .get_transcode_session(session_id, now_unix_secs() - DB_RETENTION_SECS)
+            .get_transcode_session(session_id.as_str(), now_unix_secs() - DB_RETENTION_SECS)
             .await
         {
             Ok(Some(persisted)) => match Self::from_persisted(&persisted) {
@@ -415,7 +416,7 @@ where
                     let _ = self
                         .tx
                         .send(Msg::Recache(Box::new(InsertPayload {
-                            session_id: session_id.to_string(),
+                            session_id: session_id.clone(),
                             session: session.clone(),
                         })))
                         .await;
@@ -423,7 +424,7 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(
-                        psid = %pharos_core::secret_prefix(session_id),
+                        psid = %pharos_core::secret_prefix(session_id.as_str()),
                         error = %e,
                         "persisted transcode session failed to decode; ignoring"
                     );
@@ -433,7 +434,7 @@ where
             Ok(None) => Ok(None),
             Err(e) => {
                 tracing::warn!(
-                    psid = %pharos_core::secret_prefix(session_id),
+                    psid = %pharos_core::secret_prefix(session_id.as_str()),
                     error = %e,
                     "transcode session store lookup failed; treating as expired"
                 );
@@ -448,11 +449,11 @@ where
     /// a PlaySessionId polled every few minutes cannot outlive either (B256).
     pub async fn get_stored(
         &self,
-        session_id: &str,
+        session_id: &PlaySessionId,
     ) -> Result<Option<TranscodeSession>, pharos_core::DomainError> {
         let Some(persisted) = self
             .store
-            .get_transcode_session(session_id, now_unix_secs() - DB_RETENTION_SECS)
+            .get_transcode_session(session_id.as_str(), now_unix_secs() - DB_RETENTION_SECS)
             .await?
         else {
             return Ok(None);
@@ -461,7 +462,7 @@ where
             Ok(session) => Ok(session),
             Err(e) => {
                 tracing::warn!(
-                    psid = %pharos_core::secret_prefix(session_id),
+                    psid = %pharos_core::secret_prefix(session_id.as_str()),
                     error = %e,
                     "persisted transcode session failed to decode; ignoring"
                 );
@@ -470,15 +471,15 @@ where
         }
     }
 
-    async fn delete_durable(&self, session_id: &str) {
+    async fn delete_durable(&self, session_id: &PlaySessionId) {
         delete_durable_row(&self.store, session_id).await;
     }
 
-    pub async fn remove(&self, session_id: &str) -> Result<(), TranscodeSessionError> {
+    pub async fn remove(&self, session_id: &PlaySessionId) -> Result<(), TranscodeSessionError> {
         self.delete_durable(session_id).await;
         self.tx
             .send(Msg::Remove {
-                session_id: session_id.to_string(),
+                session_id: session_id.clone(),
             })
             .await
             .map_err(|_| TranscodeSessionError::ActorDown)
@@ -489,10 +490,10 @@ where
     /// another user's PlaySessionId is not enough to stop their playback.
     pub async fn end_held(
         &self,
-        session_id: &str,
+        session_id: &PlaySessionId,
         user: pharos_core::UserId,
     ) -> Result<bool, TranscodeSessionError> {
-        match self.get(session_id).await? {
+        match self.get(session_id.clone()).await? {
             Some(session) if session.holder.user_id == user => {
                 self.remove(session_id).await?;
                 Ok(true)
@@ -570,7 +571,7 @@ mod tests {
             .await
             .unwrap();
         let r = TranscodeSessionRegistry::spawn(store);
-        assert!(r.get("old").await.unwrap().is_none());
+        assert!(r.get("old".into()).await.unwrap().is_none());
     }
 
     /// B256: a stored session past `DB_RETENTION_SECS` authorizes nothing,
@@ -591,8 +592,8 @@ mod tests {
             .await
             .unwrap();
         let r = TranscodeSessionRegistry::spawn(store);
-        assert!(r.get("stale").await.unwrap().is_none());
-        assert!(r.get("fresh").await.unwrap().is_some());
+        assert!(r.get("stale".into()).await.unwrap().is_none());
+        assert!(r.get("fresh".into()).await.unwrap().is_some());
     }
 
     /// B256: a stop on one replica ends the capability on another that still
@@ -606,13 +607,13 @@ mod tests {
         let session = sample_session();
         let holder = session.holder.user_id;
         a.insert("s".into(), session.clone()).await.unwrap();
-        assert!(a.get_stored("s").await.unwrap().is_some());
-        assert!(b.end_held("s", holder).await.unwrap());
+        assert!(a.get_stored(&"s".into()).await.unwrap().is_some());
+        assert!(b.end_held(&"s".into(), holder).await.unwrap());
         assert!(
-            a.get("s").await.unwrap().is_some(),
+            a.get("s".into()).await.unwrap().is_some(),
             "a's cache is untouched"
         );
-        assert!(a.get_stored("s").await.unwrap().is_none());
+        assert!(a.get_stored(&"s".into()).await.unwrap().is_none());
 
         a.insert("old".into(), session).await.unwrap();
         let row = shared
@@ -624,22 +625,22 @@ mod tests {
             .upsert_transcode_session("old", &row, now_unix_secs() - DB_RETENTION_SECS - 1)
             .await
             .unwrap();
-        assert!(a.get("old").await.unwrap().is_some(), "still cached");
-        assert!(a.get_stored("old").await.unwrap().is_none());
+        assert!(a.get("old".into()).await.unwrap().is_some(), "still cached");
+        assert!(a.get_stored(&"old".into()).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn insert_then_get_returns_session() {
         let r = TranscodeSessionRegistry::spawn(store().await);
         r.insert("s1".into(), sample_session()).await.unwrap();
-        let got = r.get("s1").await.unwrap().unwrap();
+        let got = r.get("s1".into()).await.unwrap().unwrap();
         assert_eq!(got.media_id, 42);
     }
 
     #[tokio::test]
     async fn get_missing_returns_none() {
         let r = TranscodeSessionRegistry::spawn(store().await);
-        let got = r.get("missing").await.unwrap();
+        let got = r.get("missing".into()).await.unwrap();
         assert!(got.is_none());
     }
 
@@ -647,8 +648,8 @@ mod tests {
     async fn remove_clears_session() {
         let r = TranscodeSessionRegistry::spawn(store().await);
         r.insert("s1".into(), sample_session()).await.unwrap();
-        r.remove("s1").await.unwrap();
-        let got = r.get("s1").await.unwrap();
+        r.remove(&"s1".into()).await.unwrap();
+        let got = r.get("s1".into()).await.unwrap();
         assert!(got.is_none());
     }
 
@@ -667,7 +668,7 @@ mod tests {
 
         // B never saw the insert in its local cache, but recovers it from
         // the store and returns the negotiated decision.
-        let got = replica_b.get("cross").await.unwrap().unwrap();
+        let got = replica_b.get("cross".into()).await.unwrap().unwrap();
         assert_eq!(got.media_id, 42);
         match got.decision {
             Decision::Transcode {
@@ -689,8 +690,8 @@ mod tests {
             .insert("gone".into(), sample_session())
             .await
             .unwrap();
-        replica_a.remove("gone").await.unwrap();
-        assert!(replica_b.get("gone").await.unwrap().is_none());
+        replica_a.remove(&"gone".into()).await.unwrap();
+        assert!(replica_b.get("gone".into()).await.unwrap().is_none());
     }
 
     fn session_for(user: pharos_core::UserId) -> TranscodeSession {
@@ -699,7 +700,7 @@ mod tests {
         s
     }
 
-    async fn live(r: &TranscodeSessionRegistry<SqliteStore>, ids: &[String]) -> usize {
+    async fn live(r: &TranscodeSessionRegistry<SqliteStore>, ids: &[PlaySessionId]) -> usize {
         let mut n = 0;
         for id in ids {
             if r.get_stored(id).await.unwrap().is_some() {
@@ -722,7 +723,7 @@ mod tests {
         let cap = MAX_LIVE_PLAY_SESSIONS_PER_USER;
         let mut alice_ids = Vec::new();
         for i in 0..cap {
-            let id = format!("alice-{i}");
+            let id = PlaySessionId::from(format!("alice-{i}"));
             assert!(r
                 .insert(id.clone(), session_for(alice))
                 .await
@@ -731,22 +732,22 @@ mod tests {
             alice_ids.push(id);
         }
         let evicted = r
-            .insert(format!("alice-{cap}"), session_for(alice))
+            .insert(format!("alice-{cap}").into(), session_for(alice))
             .await
             .unwrap();
         assert_eq!(
             evicted,
-            vec!["alice-0".to_string()],
+            vec![PlaySessionId::from("alice-0")],
             "the first minted is ended"
         );
-        alice_ids.push(format!("alice-{cap}"));
+        alice_ids.push(PlaySessionId::from(format!("alice-{cap}")));
 
         assert!(
-            r.get("alice-0").await.unwrap().is_none(),
+            r.get("alice-0".into()).await.unwrap().is_none(),
             "cache dropped it"
         );
         assert!(
-            r.get_stored("alice-0").await.unwrap().is_none(),
+            r.get_stored(&"alice-0".into()).await.unwrap().is_none(),
             "store row deleted"
         );
         assert_eq!(
@@ -755,7 +756,7 @@ mod tests {
             "exactly the cap stays live"
         );
         assert!(
-            r.get_stored("bob-0").await.unwrap().is_some(),
+            r.get_stored(&"bob-0".into()).await.unwrap().is_some(),
             "other user untouched"
         );
     }
@@ -771,7 +772,7 @@ mod tests {
         let mut tasks = Vec::new();
         let mut ids = Vec::new();
         for i in 0..total {
-            let id = format!("race-{i}");
+            let id = PlaySessionId::from(format!("race-{i}"));
             ids.push(id.clone());
             let r = r.clone();
             tasks.push(tokio::spawn(async move {
@@ -787,7 +788,7 @@ mod tests {
         );
         let mut cached = 0;
         for id in &ids {
-            if r.get(id).await.unwrap().is_some() {
+            if r.get(id.clone()).await.unwrap().is_some() {
                 cached += 1;
             }
         }
@@ -891,7 +892,7 @@ mod tests {
             "the mint should be parked on the trim"
         );
 
-        let got = tokio::time::timeout(Duration::from_secs(1), r.get("cached"))
+        let got = tokio::time::timeout(Duration::from_secs(1), r.get("cached".into()))
             .await
             .unwrap_or_else(|_| {
                 panic!("get stalled behind a hung store: the actor is doing store I/O")
@@ -940,7 +941,7 @@ mod tests {
         let r = TranscodeSessionRegistry::spawn(store().await);
         let alice = pharos_core::UserId::new();
         for i in 0..=MAX_LIVE_PLAY_SESSIONS_PER_USER {
-            r.insert(format!("log-{i}"), session_for(alice))
+            r.insert(format!("log-{i}").into(), session_for(alice))
                 .await
                 .unwrap();
         }
@@ -1029,8 +1030,11 @@ mod tests {
             let ts = now
                 .saturating_add(100)
                 .saturating_add(i64::try_from(i).unwrap_or(0));
-            store.upsert_transcode_session(&id, &row, ts).await.unwrap();
-            seeds.push(id);
+            store
+                .upsert_transcode_session(id.as_str(), &row, ts)
+                .await
+                .unwrap();
+            seeds.push(PlaySessionId::from(id));
         }
 
         let evicted = r
@@ -1039,18 +1043,24 @@ mod tests {
             .unwrap();
         assert_eq!(
             evicted,
-            vec!["mem-old".to_string(), "seed-00".to_string()],
+            vec![
+                PlaySessionId::from("mem-old"),
+                PlaySessionId::from("seed-00")
+            ],
             "the two oldest durable rows are ended, oldest first"
         );
         assert!(
-            r.get("mem-old").await.unwrap().is_none(),
+            r.get("mem-old".into()).await.unwrap().is_none(),
             "a trimmed session must leave this replica's memory too"
         );
-        assert!(r.get_stored("seed-00").await.unwrap().is_none());
-        assert!(r.get_stored("seed-01").await.unwrap().is_some());
-        assert!(r.get_stored("mint-new").await.unwrap().is_some());
+        assert!(r.get_stored(&"seed-00".into()).await.unwrap().is_none());
+        assert!(r.get_stored(&"seed-01".into()).await.unwrap().is_some());
+        assert!(r.get_stored(&"mint-new".into()).await.unwrap().is_some());
 
-        let mut ids = vec!["mem-old".to_string(), "mint-new".to_string()];
+        let mut ids = vec![
+            PlaySessionId::from("mem-old"),
+            PlaySessionId::from("mint-new"),
+        ];
         ids.extend(seeds.iter().cloned());
         assert_eq!(
             live(&r, &ids).await,

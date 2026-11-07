@@ -18,7 +18,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use pharos_cache::HlsSegmentCache;
-use pharos_core::Prober;
+use pharos_core::{PlaySessionId, Prober};
 use pharos_scanner::FfmpegProber;
 use pharos_transcode::scheduler::{JobClass, PlayheadSeed, StreamKey};
 use pharos_transcode::{
@@ -131,23 +131,27 @@ async fn stop_active_encodings(
 ) -> HttpResponse {
     // PlaySessionId is a query param; match case-insensitively (clients send
     // `PlaySessionId`, some `playSessionId`).
-    let psid = req.query_string().split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        k.eq_ignore_ascii_case("playsessionid")
-            .then(|| v.to_string())
-    });
+    let psid = req
+        .query_string()
+        .split('&')
+        .find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            k.eq_ignore_ascii_case("playsessionid")
+                .then(|| v.to_string())
+        })
+        .map(PlaySessionId::from);
     if let Some(psid) = psid {
         // Cancel this session's outstanding segment prefetch — jellyfin-web
         // sends this DELETE as the first step of a track/quality switch AND when
         // stopping the current item to play the next (episode swap), so the
         // abandoned segments stop transcoding instead of stealing encoder slots.
-        state.prefetch_tasks.cancel(&psid);
+        state.prefetch_tasks.cancel(psid.as_str());
         // Only the session's holder may end it (B256), the same rule as
         // /Sessions/Playing/Stopped.
         if let Err(e) = state.transcode_sessions.end_held(&psid, user.0.id).await {
             tracing::warn!(
                 error = %e,
-                psid = %pharos_core::secret_prefix(&psid),
+                psid = %pharos_core::secret_prefix(psid.as_str()),
                 "stop_active_encodings: session remove failed"
             );
         }
@@ -866,7 +870,12 @@ async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Opt
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| k.eq_ignore_ascii_case("PlaySessionId"))
         .map(|(_, v)| v.to_string())?;
-    let session = state.transcode_sessions.get(&psid).await.ok().flatten()?;
+    let session = state
+        .transcode_sessions
+        .get(PlaySessionId::from(psid))
+        .await
+        .ok()
+        .flatten()?;
     match session.decision {
         Decision::Transcode {
             max_video_bitrate_bps,
@@ -894,7 +903,12 @@ async fn session_burn_indices(
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| k.eq_ignore_ascii_case("PlaySessionId"))
         .map(|(_, v)| v.to_string())?;
-    let session = state.transcode_sessions.get(&psid).await.ok().flatten()?;
+    let session = state
+        .transcode_sessions
+        .get(PlaySessionId::from(psid))
+        .await
+        .ok()
+        .flatten()?;
     Some(session.burn_subtitle_indices)
 }
 
@@ -1037,7 +1051,11 @@ async fn serve_segment(
     // through to the conservative-defaults path (legacy clients that
     // hit master.m3u8 cold).
     let session = if let Some(psid) = q.play_session_id.as_deref() {
-        match state.transcode_sessions.get(psid).await {
+        match state
+            .transcode_sessions
+            .get(PlaySessionId::from(psid))
+            .await
+        {
             Ok(Some(s)) => Some(s),
             Ok(None) => return Err(error::ErrorGone("play session expired")),
             Err(e) => {
@@ -3436,7 +3454,11 @@ async fn fetch_req_item(
 /// `.ts` segment handler: a GC'd/stopped session must not keep serving bytes.
 async fn check_session(state: &AppState, psid: Option<&str>) -> Result<(), actix_web::Error> {
     if let Some(psid) = psid {
-        match state.transcode_sessions.get(psid).await {
+        match state
+            .transcode_sessions
+            .get(PlaySessionId::from(psid))
+            .await
+        {
             Ok(Some(_)) => {}
             Ok(None) => return Err(error::ErrorGone("play session expired")),
             Err(e) => {

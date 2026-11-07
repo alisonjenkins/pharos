@@ -516,7 +516,7 @@ async fn a_released_grant_ends_its_playback_at_the_last_report() {
         if fx
             .state
             .transcode_sessions
-            .get(&decided.psid)
+            .get(pharos_core::PlaySessionId::from(decided.psid.clone()))
             .await
             .unwrap()
             .is_none()

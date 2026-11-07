@@ -513,7 +513,7 @@ pub async fn register(
     match state
         .transcode_sessions
         .insert(
-            play_session_id.to_owned(),
+            pharos_core::PlaySessionId::from(play_session_id),
             crate::transcode_sessions::TranscodeSession {
                 media_id,
                 decision: negotiated.decision.clone(),
@@ -532,11 +532,11 @@ pub async fn register(
             // Stop what the cap ended the way a client's Stopped report does,
             // minus the final UserData write: its prefetch and its record go.
             for id in &evicted {
-                state.prefetch_tasks.cancel(id);
+                state.prefetch_tasks.cancel(id.as_str());
                 if let Err(e) = state
                     .sessions
                     .apply(crate::sessions::SessionEvent::Stopped {
-                        session_id: id.clone(),
+                        session_id: id.as_str().to_owned(),
                     })
                     .await
                 {
