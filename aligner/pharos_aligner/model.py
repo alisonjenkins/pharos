@@ -47,16 +47,17 @@ class Aligner:
             if num_frames == 0:
                 return []
 
-            # A star token either side soaks up the music before the first
-            # word and after the last; without them CTC must spend every frame
-            # of the window on the lyrics, smearing the words across an
-            # instrumental break up to the next line.
-            tokenized = self._tokenizer([STAR, *tokens, STAR])
+            # A star token after the last word soaks up the music that follows
+            # the line; without it CTC must spend every frame of the window on
+            # the lyrics, smearing the words across an instrumental break up
+            # to the next line. None goes before the first word: a line is sung
+            # from its stamp, and a leading star let the words drift late.
+            tokenized = self._tokenizer([*tokens, STAR])
             # CTC needs a frame a character: a window too short for its text
             # cannot be aligned, and the aligner would raise.
             if sum(len(t) for t in tokenized) > num_frames:
                 return []
-            spans = self._aligner(emission[0], tokenized)[1:-1]
+            spans = self._aligner(emission[0], tokenized)[:-1]
 
         ratio = (n_samples / num_frames / 16000.0) * 1000.0
         result: list[tuple[int, int]] = []
