@@ -838,9 +838,11 @@ pub enum Sections {
 impl Sections {
     /// The sections a listing sorted by `sort_by` falls into.
     pub fn of(sort_by: Option<&str>) -> Self {
-        match sort_by.and_then(|s| s.split(',').map(str::trim).find(|t| !t.is_empty())) {
-            Some("PremiereDate" | "ProductionYear") => Self::Released,
-            Some("DateCreated" | "DateAdded") => Self::Added,
+        use pharos_jellyfin_api::kinds::SortField;
+        let first = sort_by.and_then(SortField::first_of);
+        match first {
+            Some(SortField::PremiereDate | SortField::ProductionYear) => Self::Released,
+            Some(SortField::DateCreated | SortField::DateAdded) => Self::Added,
             _ => Self::Letters,
         }
     }
