@@ -815,7 +815,7 @@ async fn music_similar(
                 artist_id_for(n),
                 n.clone(),
                 state.server_id.clone(),
-                "MusicArtist",
+                ItemType::MusicArtist.as_wire(),
             )
         })
         .collect();
@@ -1142,7 +1142,7 @@ async fn list_albums(
                     album_id_for(n),
                     n.clone(),
                     state.server_id.clone(),
-                    "MusicAlbum",
+                    ItemType::MusicAlbum.as_wire(),
                 )
             }
         })
@@ -1244,7 +1244,7 @@ async fn list_tags(
                 tc.tag.wire_id.clone(),
                 tc.tag.name.clone(),
                 state.server_id.clone(),
-                "Folder",
+                ItemType::Folder.as_wire(),
             )
         })
         .collect();
@@ -1790,7 +1790,7 @@ fn collection_dto(
             collection.wire_id.clone(),
             collection.name.clone(),
             state.server_id.clone(),
-            "BoxSet",
+            ItemType::BoxSet.as_wire(),
         )
     })
     .unwrap_or(serde_json::Value::Null)
@@ -3063,7 +3063,7 @@ async fn visible_views(
                 id: view.id,
                 name: view.name,
                 server_id: state.server_id.clone(),
-                kind: "CollectionFolder",
+                kind: ItemType::CollectionFolder.as_wire(),
                 collection_type: wire_collection_type(view.kind.collection_type())
                     .as_str()
                     .map(str::to_string),
@@ -3085,7 +3085,7 @@ fn all_media_placeholder(server_id: &str) -> serde_json::Value {
         id: ALL_MEDIA_ID.to_string(),
         name: "All Media".to_string(),
         server_id: server_id.to_string(),
-        kind: "CollectionFolder",
+        kind: ItemType::CollectionFolder.as_wire(),
         collection_type: None,
         media_type: "Unknown",
         is_folder: true,
@@ -3601,7 +3601,7 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
             album_id,
             a.name.clone(),
             state.server_id.clone(),
-            "MusicAlbum",
+            ItemType::MusicAlbum.as_wire(),
         )
     })
     .unwrap_or(serde_json::Value::Null)
@@ -3703,7 +3703,7 @@ fn artist_folder(state: &AppState, name: &str) -> SynthItemDto {
             artist_id_for(name),
             name.to_owned(),
             state.server_id.clone(),
-            "MusicArtist",
+            ItemType::MusicArtist.as_wire(),
         )
     }
 }
@@ -5313,7 +5313,7 @@ async fn synth_album_or_artist(
                 id_str.to_string(),
                 name.to_string(),
                 state.server_id.clone(),
-                "MusicAlbum",
+                ItemType::MusicAlbum.as_wire(),
             )
         };
         // B580 — an album sits under its artist, as the music browse
@@ -5375,7 +5375,7 @@ async fn synth_album_or_artist(
                     id_str.to_string(),
                     name.to_string(),
                     state.server_id.clone(),
-                    "MusicArtist",
+                    ItemType::MusicArtist.as_wire(),
                 )
             })
             .unwrap_or(serde_json::Value::Null),
@@ -6506,7 +6506,7 @@ fn series_dto(
     serde_json::to_value(SeriesFolderDto {
         name: series.series_name.clone(),
         server_id: server_id.to_string(),
-        kind: "Series",
+        kind: ItemType::Series.as_wire(),
         media_type: "Unknown",
         is_folder: true,
         can_play: false,
@@ -6561,7 +6561,7 @@ fn season_dto(
     serde_json::to_value(SeriesFolderDto {
         name: season_name.to_string(),
         server_id: server_id.to_string(),
-        kind: "Season",
+        kind: ItemType::Season.as_wire(),
         media_type: "Unknown",
         is_folder: true,
         can_play: false,
