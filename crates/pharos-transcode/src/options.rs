@@ -728,10 +728,11 @@ impl Tonemap {
 
     /// Decide from [`pharos_core::MediaProbe::video_range_type`]. An unknown
     /// range reads as SDR and is left alone.
-    pub fn for_range_type(range_type: &str) -> Self {
-        match range_type {
-            "HDR10" | "HLG" => Self::HdrToSdr,
-            _ => Self::Off,
+    pub fn for_range_type(range_type: pharos_core::VideoRangeType) -> Self {
+        if range_type.is_hdr() {
+            Self::HdrToSdr
+        } else {
+            Self::Off
         }
     }
 

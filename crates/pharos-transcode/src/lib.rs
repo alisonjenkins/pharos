@@ -2863,9 +2863,18 @@ mod tests {
     #[test]
     fn tonemap_decision_follows_the_range_type_and_labels_are_distinct() {
         use crate::options::Tonemap;
-        assert_eq!(Tonemap::for_range_type("HDR10"), Tonemap::HdrToSdr);
-        assert_eq!(Tonemap::for_range_type("HLG"), Tonemap::HdrToSdr);
-        assert_eq!(Tonemap::for_range_type("SDR"), Tonemap::Off);
+        assert_eq!(
+            Tonemap::for_range_type(pharos_core::VideoRangeType::Hdr10),
+            Tonemap::HdrToSdr
+        );
+        assert_eq!(
+            Tonemap::for_range_type(pharos_core::VideoRangeType::Hlg),
+            Tonemap::HdrToSdr
+        );
+        assert_eq!(
+            Tonemap::for_range_type(pharos_core::VideoRangeType::Sdr),
+            Tonemap::Off
+        );
         let labels: std::collections::HashSet<_> = Tonemap::ALL.iter().map(|t| t.label()).collect();
         assert_eq!(labels.len(), Tonemap::ALL.len());
     }
