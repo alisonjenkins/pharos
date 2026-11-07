@@ -20,6 +20,7 @@ use super::seen::{self, MemberSeen};
 use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
     GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SELF_SEEK_GRACE_MS,
+    SETTLE_AFTER_COMMAND_MS,
 };
 use super::track_follow::{
     follows_group, route_pick, GroupTracksView, PickRoute, TrackChoice, TrackPicks,
@@ -553,6 +554,9 @@ struct Inner {
     leaving: bool,
     /// When this session last moved the player itself.
     self_seek_ms: Option<i64>,
+    /// When the drift check last started a player it found paused while the
+    /// group plays (B660), so a refused `play()` is not retried every tick.
+    resumed_ms: Option<i64>,
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
@@ -1171,10 +1175,21 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         };
         // Still loading: another seek would restart the load, push back the
         // grace that reports a real stall, and land on data not yet fetched.
-        if player.paused() || {
+        let (loading, owes_ready) = {
             let inner = self.inner.borrow();
-            inner.held_waiting || inner.buffering_sent
-        } {
+            (
+                inner.held_waiting || inner.buffering_sent,
+                inner.state.owes_ready,
+            )
+        };
+        if loading {
+            return;
+        }
+        if player.paused() {
+            // A player still owing its ready is loading what the group asked for.
+            if !owes_ready {
+                self.resume_paused(&player, expected, since, now);
+            }
             return;
         }
         let actual = player.position_ms();
@@ -1200,6 +1215,34 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 );
             }
         }
+    }
+
+    /// B660: the group plays but the driven player sits paused, with nothing
+    /// loading. Nothing else would start it (the drift check skips a paused
+    /// player, and the server thinks every member plays), so put it where the
+    /// group is and start it: after the server's last command has settled,
+    /// and once per settle window, so a refused `play()` is not asked again
+    /// each second.
+    fn resume_paused(&self, player: &Rc<dyn GroupPlayer>, expected: u64, since: u64, now: i64) {
+        let settle = i64::try_from(SETTLE_AFTER_COMMAND_MS).unwrap_or(i64::MAX);
+        {
+            let mut inner = self.inner.borrow_mut();
+            let recent = inner
+                .resumed_ms
+                .is_some_and(|at| now.saturating_sub(at) < settle);
+            if since < SETTLE_AFTER_COMMAND_MS || recent {
+                return;
+            }
+            inner.resumed_ms = Some(now);
+            inner.self_seek_ms = Some(now);
+        }
+        self.env.info(&format!(
+            "pharos: group resume reason=paused_while_group_plays position_ms={} expected_ms={expected}",
+            player.position_ms()
+        ));
+        self.set_rate(player, 1.0);
+        player.seek_ms(expected);
+        player.play();
     }
 
     fn set_rate(&self, player: &Rc<dyn GroupPlayer>, rate: f64) {
@@ -2398,6 +2441,96 @@ mod tests {
         rig.env.settle();
         rig.player.log.borrow_mut().clear();
         rig
+    }
+
+    /// B660: a driven player left paused while the group plays (a track
+    /// change remounts the video, and the new one never starts) is put back
+    /// where the group is and started, once the server's command has settled.
+    #[test]
+    fn a_player_paused_while_the_group_plays_is_resumed_at_the_group() {
+        let rig = playing_rig();
+        rig.player.paused.set(true);
+        rig.player.position.set(5_000);
+        // Inside the settle window the server's own command may still land.
+        rig.env.now.set(102_999);
+        rig.session.check_drift();
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
+
+        rig.env.now.set(110_000);
+        rig.session.check_drift();
+        assert_eq!(*rig.player.log.borrow(), ["seek(20000)", "play"]);
+        assert_eq!(
+            rig.env
+                .logged("pharos: group resume reason=paused_while_group_plays position_ms=5000 expected_ms=20000")
+                .len(),
+            1
+        );
+    }
+
+    /// A player that stays paused (the browser refused the `play()`) is not
+    /// asked again every second: once per settle window.
+    #[test]
+    fn a_refused_resume_is_retried_once_per_settle_window() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.paused.set(true);
+        rig.session.check_drift();
+        rig.player.paused.set(true);
+        let plays = || {
+            rig.player
+                .log
+                .borrow()
+                .iter()
+                .filter(|l| *l == "play")
+                .count()
+        };
+        assert_eq!(plays(), 1);
+        rig.env.now.set(112_999);
+        rig.session.check_drift();
+        assert_eq!(plays(), 1);
+        rig.env.now.set(113_000);
+        rig.session.check_drift();
+        assert_eq!(plays(), 2);
+    }
+
+    /// Paused because the group is paused, or while the video is buffering,
+    /// the player is left alone.
+    #[test]
+    fn a_paused_player_is_left_alone_when_the_group_is_paused_or_it_buffers() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Pause {
+            at_server_ms: 100_000,
+            position_ms: 10_000,
+            by: None,
+        });
+        rig.env.settle();
+        rig.player.log.borrow_mut().clear();
+        rig.player.paused.set(true);
+        rig.env.now.set(110_000);
+        rig.session.check_drift();
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
+
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.position.set(20_000);
+        rig.session.on_media(MediaEvent::Waiting);
+        rig.env.settle();
+        rig.player.log.borrow_mut().clear();
+        rig.player.paused.set(true);
+        rig.session.check_drift();
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
     }
 
     #[test]
