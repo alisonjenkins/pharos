@@ -83,6 +83,7 @@ impl Fixture {
         self.state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: session.into(),
                 user_id: user,
                 user_name: name.into(),

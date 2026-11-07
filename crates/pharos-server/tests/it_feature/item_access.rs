@@ -1713,6 +1713,7 @@ async fn a_new_group_is_seeded_only_with_an_item_its_creator_may_see() {
         f.state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: device.into(),
                 user_id: f.user_id,
                 user_name: "guest".into(),

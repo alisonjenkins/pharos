@@ -58,6 +58,7 @@ async fn seed_two_users_and_sessions() -> (web::Data<AppState>, String, String) 
     state
         .sessions
         .apply(SessionEvent::Started {
+            supports_remote_control: true,
             session_id: "alice-sess".into(),
             user_id: alice,
             user_name: "alice".into(),
@@ -73,6 +74,7 @@ async fn seed_two_users_and_sessions() -> (web::Data<AppState>, String, String) 
     state
         .sessions
         .apply(SessionEvent::Started {
+            supports_remote_control: true,
             session_id: "bob-sess".into(),
             user_id: bob,
             user_name: "bob".into(),
@@ -165,6 +167,7 @@ async fn admin_bearer_sees_every_session() {
         state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: sess_id.into(),
                 user_id: id,
                 user_name: format!("user-{sess_id}"),

@@ -103,6 +103,9 @@ pub enum SessionEvent {
         version: String,
         item_id: String,
         position_ticks: u64,
+        /// Whether anything can send this session commands: a Jellyfin client
+        /// with a `/socket` can, a native player has no command channel.
+        supports_remote_control: bool,
     },
     Progress {
         session_id: String,
@@ -220,6 +223,7 @@ impl SessionRegistry {
                         version,
                         item_id,
                         position_ticks,
+                        supports_remote_control,
                     }) => {
                         // Preserve any capabilities the client
                         // advertised earlier (P28) — Started events
@@ -301,7 +305,7 @@ impl SessionRegistry {
                                     .map(|c| c.3)
                                     .unwrap_or(false),
                                 is_active: true,
-                                supports_remote_control: true,
+                                supports_remote_control,
                                 has_custom_device_name: false,
                                 last_activity_date: iso_now(),
                                 last_playback_check_in: iso_now(),
@@ -405,6 +409,7 @@ mod tests {
 
     fn started(session_id: &str, item: &str, pos: u64) -> SessionEvent {
         SessionEvent::Started {
+            supports_remote_control: true,
             session_id: session_id.into(),
             user_id: UserId::new(),
             user_name: "u".into(),
@@ -468,6 +473,7 @@ mod tests {
 
     fn started_as(session_id: &str, user_id: UserId, device_id: &str, item: &str) -> SessionEvent {
         SessionEvent::Started {
+            supports_remote_control: true,
             session_id: session_id.into(),
             user_id,
             user_name: "u".into(),
