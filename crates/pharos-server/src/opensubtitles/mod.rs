@@ -4,6 +4,7 @@
 //! background job are tested with a fake; nothing in a test touches the
 //! network.
 
+pub mod client;
 pub mod hash;
 pub mod quota;
 
