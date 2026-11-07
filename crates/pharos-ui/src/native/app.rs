@@ -776,6 +776,11 @@ fn stored_mse_engine_raw() -> Option<String> {
     })
 }
 
+/// The engine this device's Playback setting names; hls.js when unset.
+fn stored_mse_engine() -> MseEngine {
+    pick_mse_engine("", stored_mse_engine_raw().as_deref()).0
+}
+
 pub(super) fn set_crossfade_seconds(seconds: u32) {
     CROSSFADE_S.set(Some(seconds));
     platform::info(&format!("pharos: crossfade set seconds={seconds}"));
@@ -2504,6 +2509,7 @@ fn PlaybackScreen() -> Element {
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut crossfade = use_signal(crossfade_seconds);
+    let mut mse_engine = use_signal(stored_mse_engine);
     rsx! {
         playback_settings::PlaybackView {
             notice: notice.read().clone(),
@@ -2533,6 +2539,24 @@ fn PlaybackScreen() -> Element {
             on_crossfade: move |seconds| {
                 set_crossfade_seconds(seconds);
                 crossfade.set(seconds);
+            },
+            engine: mse_engine(),
+            on_engine: move |engine: MseEngine| {
+                // Only a saved choice is shown: the engine is read at the next play.
+                if let Err(e) = platform::store_theme(MSE_ENGINE_KEY, engine.as_str()) {
+                    platform::warn(&format!(
+                        "pharos: engine storage write failed engine={} error={e}",
+                        engine.as_str()
+                    ));
+                    notify(
+                        notice,
+                        format!("Could not save the streaming engine on this device: {e}."),
+                        true,
+                    );
+                    return;
+                }
+                mse_engine.set(engine);
+                platform::info(&format!("pharos: engine set={}", engine.as_str()));
             },
         }
     }
