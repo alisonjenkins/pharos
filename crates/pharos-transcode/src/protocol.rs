@@ -593,6 +593,7 @@ mod tests {
                 muxed_audio_source: None,
                 video_3d_format: None,
                 stereo_output: Default::default(),
+                tonemap: Default::default(),
                 filler: None,
             },
             device: DeviceId::hw(HwAccel::Nvenc, 0),

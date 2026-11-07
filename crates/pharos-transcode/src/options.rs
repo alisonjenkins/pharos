@@ -365,6 +365,8 @@ pub struct TranscodeOptions {
     /// Whether the source is plain 8-bit SDR; see [`SourceVideoKind`]. Read by
     /// the scheduler to decide the VAAPI pipeline, never by the worker.
     pub source_video_kind: SourceVideoKind,
+    /// Map HDR pixels to SDR in the video filter graph; see [`Tonemap`].
+    pub tonemap: Tonemap,
     pub audio: Option<AudioCodec>,
     pub video_bitrate_bps: Option<u64>,
     pub audio_bitrate_bps: Option<u64>,
@@ -529,6 +531,8 @@ struct TranscodeOptionsBinary {
     muxed_audio_source: Option<MuxedAudio>,
     video_3d_format: Option<pharos_core::Video3DFormat>,
     stereo_output: StereoOutput,
+    #[serde(default)]
+    tonemap: Tonemap,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -560,6 +564,8 @@ struct TranscodeOptionsJson {
     video_3d_format: Option<pharos_core::Video3DFormat>,
     #[serde(default, skip_serializing_if = "StereoOutput::is_preserve")]
     stereo_output: StereoOutput,
+    #[serde(default, skip_serializing_if = "Tonemap::is_off")]
+    tonemap: Tonemap,
 }
 
 macro_rules! impl_transcode_options_shim {
@@ -587,6 +593,7 @@ macro_rules! impl_transcode_options_shim {
                     muxed_audio_source: o.muxed_audio_source.clone(),
                     video_3d_format: o.video_3d_format,
                     stereo_output: o.stereo_output,
+                    tonemap: o.tonemap,
                 }
             }
         }
@@ -614,6 +621,7 @@ macro_rules! impl_transcode_options_shim {
                     muxed_audio_source: o.muxed_audio_source,
                     video_3d_format: o.video_3d_format,
                     stereo_output: o.stereo_output,
+                    tonemap: o.tonemap,
                     filler: None,
                 }
             }
@@ -673,7 +681,74 @@ impl Default for TranscodeOptions {
             muxed_audio_source: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Tonemap::Off,
             filler: None,
+        }
+    }
+}
+
+/// Whether the video filter graph maps HDR pixels to SDR (ADR-0070).
+///
+/// Every transcode this crate builds encodes 8-bit 4:2:0 with no HDR
+/// signalling, so an HDR source (HDR10 PQ, HLG) is only right when its pixels
+/// are mapped down. Without it the BT.2020/PQ values go out as if they were
+/// BT.709 and render washed out. The caller decides from the probe; the arg
+/// builder lowers it, so no caller builds the filter string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tonemap {
+    #[default]
+    Off,
+    HdrToSdr,
+}
+
+/// The pixel format the tonemap chain hands to what follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TonemapOutput {
+    /// Software / NVENC / QSV / VideoToolbox take system-memory `yuv420p`.
+    Yuv420p,
+    /// VAAPI: the `format=nv12,hwupload` that follows needs `nv12`.
+    Nv12,
+}
+
+impl Tonemap {
+    pub const ALL: [Self; 2] = [Self::Off, Self::HdrToSdr];
+
+    /// Stable log/metric label (`tonemap` on the playback decision).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::HdrToSdr => "hdr_to_sdr",
+        }
+    }
+
+    pub const fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// Decide from [`pharos_core::MediaProbe::video_range_type`]. An unknown
+    /// range reads as SDR and is left alone.
+    pub fn for_range_type(range_type: &str) -> Self {
+        match range_type {
+            "HDR10" | "HLG" => Self::HdrToSdr,
+            _ => Self::Off,
+        }
+    }
+
+    /// The software filters, comma-joined, or `None` when off: PQ/HLG to
+    /// linear light at 100 nit, BT.709 primaries, Hable curve, BT.709 limited
+    /// range. Needs `zscale` (libzimg) in the ffmpeg build.
+    pub fn filters(self, out: TonemapOutput) -> Option<String> {
+        match self {
+            Self::Off => None,
+            Self::HdrToSdr => Some(format!(
+                "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+                 tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format={}",
+                match out {
+                    TonemapOutput::Yuv420p => "yuv420p",
+                    TonemapOutput::Nv12 => "nv12",
+                }
+            )),
         }
     }
 }
@@ -982,6 +1057,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -1011,6 +1087,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         assert_eq!(o.start_position_seconds(), None);
     }
@@ -1061,6 +1138,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         }
     }
 
@@ -1226,6 +1304,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let mut named = base.clone();
         named.source_video_codec = Some(SourceCodec::Av1);
