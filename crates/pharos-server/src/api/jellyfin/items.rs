@@ -26,7 +26,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
-use pharos_jellyfin_api::kinds::ItemType;
+use pharos_jellyfin_api::kinds::{ItemType, SortField};
 use pharos_store_sqlx::ServerConfigStore;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
@@ -4339,38 +4339,50 @@ pub(crate) enum SortPrimary {
 /// "first non-empty comma token, else SortName" rule and the exact set of
 /// tokens the in-memory `filter_and_sort` handled.
 pub(crate) fn sort_primary(sort_by: Option<&str>) -> SortPrimary {
-    let raw = sort_by.unwrap_or("SortName");
-    let primary = raw
-        .split(',')
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .unwrap_or("SortName");
-    sort_token_primary(primary)
+    sort_token_primary(SortField::first_of(sort_by.unwrap_or("SortName")))
 }
 
-/// One `SortBy` token → its [`SortPrimary`].
-fn sort_token_primary(primary: &str) -> SortPrimary {
-    match primary {
-        "None" | "Default" => SortPrimary::None,
-        "Random" => SortPrimary::Random,
-        "DateCreated" | "DateAdded" => SortPrimary::DateCreated,
-        "RuntimeTicks" | "Runtime" => SortPrimary::Runtime,
-        "AlbumArtist" => SortPrimary::AlbumArtist,
-        "Album" => SortPrimary::Album,
-        "ParentIndexNumber" | "IndexNumber" => SortPrimary::TrackOrder,
+/// One `SortBy` token → its [`SortPrimary`]. An unknown token (`None`) sorts
+/// by `SortName` (V583).
+fn sort_token_primary(field: Option<SortField>) -> SortPrimary {
+    use pharos_core::SortKey;
+    let Some(field) = field else {
+        return SortPrimary::SortName;
+    };
+    match field {
+        SortField::None | SortField::Default => SortPrimary::None,
+        SortField::Random => SortPrimary::Random,
+        SortField::DateCreated | SortField::DateAdded => SortPrimary::DateCreated,
+        SortField::RuntimeTicks | SortField::Runtime => SortPrimary::Runtime,
+        SortField::AlbumArtist => SortPrimary::AlbumArtist,
+        SortField::Album => SortPrimary::Album,
+        SortField::ParentIndexNumber | SortField::IndexNumber => SortPrimary::TrackOrder,
         // 004-books — a shelf view. `SeriesSortName` already means "group by
         // series" in Jellyfin; for a books library the series is the shelf and
         // the index is the volume.
-        "SeriesSortName" => SortPrimary::BookSeriesOrder,
-        "PremiereDate" => SortPrimary::Keyed(pharos_core::SortKey::PremiereDate),
-        "ProductionYear" => SortPrimary::Keyed(pharos_core::SortKey::ProductionYear),
-        "CommunityRating" => SortPrimary::Keyed(pharos_core::SortKey::CommunityRating),
-        "CriticRating" => SortPrimary::Keyed(pharos_core::SortKey::CriticRating),
-        "ParentalRating" => SortPrimary::Keyed(pharos_core::SortKey::ParentalRating),
-        "PlayCount" => SortPrimary::Keyed(pharos_core::SortKey::PlayCount),
-        "DatePlayed" => SortPrimary::Keyed(pharos_core::SortKey::DatePlayed),
-        "Name" => SortPrimary::Name,
-        _ => SortPrimary::SortName,
+        SortField::SeriesSortName => SortPrimary::BookSeriesOrder,
+        SortField::PremiereDate => SortPrimary::Keyed(SortKey::PremiereDate),
+        SortField::ProductionYear => SortPrimary::Keyed(SortKey::ProductionYear),
+        SortField::CommunityRating => SortPrimary::Keyed(SortKey::CommunityRating),
+        SortField::CriticRating => SortPrimary::Keyed(SortKey::CriticRating),
+        SortField::ParentalRating => SortPrimary::Keyed(SortKey::ParentalRating),
+        SortField::PlayCount => SortPrimary::Keyed(SortKey::PlayCount),
+        SortField::DatePlayed => SortPrimary::Keyed(SortKey::DatePlayed),
+        SortField::Name => SortPrimary::Name,
+        SortField::SortName
+        | SortField::AiredEpisodeOrder
+        | SortField::Artist
+        | SortField::OfficialRating
+        | SortField::StartDate
+        | SortField::IsFolder
+        | SortField::IsUnplayed
+        | SortField::IsPlayed
+        | SortField::VideoBitRate
+        | SortField::AirTime
+        | SortField::Studio
+        | SortField::IsFavoriteOrLiked
+        | SortField::DateLastContentAdded
+        | SortField::SeriesDatePlayed => SortPrimary::SortName,
     }
 }
 
@@ -4394,12 +4406,14 @@ fn first_sort_order_descending(sort_order: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// `SortBy` tokens split on commas, blanks dropped.
-fn sort_tokens(sort_by: &str) -> Vec<&str> {
+/// `SortBy` tokens split on commas, blanks dropped; an unknown token stays
+/// in position as `None` so it still occupies its `SortOrder` slot.
+fn sort_tokens(sort_by: &str) -> Vec<Option<SortField>> {
     sort_by
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(SortField::from_wire)
         .collect()
 }
 
@@ -4417,13 +4431,18 @@ fn sort_needs_chain(sort_by: Option<&str>, orders: &[bool]) -> bool {
     let Some((first, rest)) = tokens.split_first() else {
         return false;
     };
-    if orders.len() > 1 || matches!(sort_token_primary(first), SortPrimary::Keyed(_)) {
+    if orders.len() > 1 || matches!(sort_token_primary(*first), SortPrimary::Keyed(_)) {
         return true;
     }
     rest.iter().any(|t| {
         !matches!(
             *t,
-            "SortName" | "Name" | "IndexNumber" | "ParentIndexNumber"
+            Some(
+                SortField::SortName
+                    | SortField::Name
+                    | SortField::IndexNumber
+                    | SortField::ParentIndexNumber
+            )
         )
     })
 }
@@ -4525,10 +4544,12 @@ fn sort_chain(
             SortDir::Asc
         };
         let keys: Vec<SortKey> = match (token, sort_token_primary(token)) {
-            ("ParentIndexNumber", _) if episode_scoped => vec![SortKey::SeasonNumber],
-            ("ParentIndexNumber", _) => vec![SortKey::DiscNumber],
-            ("IndexNumber", _) if episode_scoped => vec![SortKey::IndexNumber],
-            ("IndexNumber", _) => vec![SortKey::TrackNumber],
+            (Some(SortField::ParentIndexNumber), _) if episode_scoped => {
+                vec![SortKey::SeasonNumber]
+            }
+            (Some(SortField::ParentIndexNumber), _) => vec![SortKey::DiscNumber],
+            (Some(SortField::IndexNumber), _) if episode_scoped => vec![SortKey::IndexNumber],
+            (Some(SortField::IndexNumber), _) => vec![SortKey::TrackNumber],
             (_, SortPrimary::None | SortPrimary::Random) => Vec::new(),
             (_, SortPrimary::DateCreated) => vec![SortKey::DateCreated],
             (_, SortPrimary::Runtime) => vec![SortKey::Runtime],
@@ -8356,5 +8377,37 @@ mod synth_parent_tests {
             .map(|o| o.label())
             .collect();
         assert_eq!(labels.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod sort_field_tests {
+    use super::*;
+
+    #[test]
+    fn sort_by_is_case_insensitive_and_unknown_tokens_sort_by_sort_name() {
+        assert_eq!(sort_primary(Some("dateCreated")), SortPrimary::DateCreated);
+        assert_eq!(sort_primary(Some("RANDOM")), SortPrimary::Random);
+        assert_eq!(sort_primary(Some("Bogus")), SortPrimary::SortName);
+        assert_eq!(sort_primary(Some(",Name")), SortPrimary::Name);
+        assert_eq!(
+            SortField::parse_list("dateCreated,sortname"),
+            vec![SortField::DateCreated, SortField::SortName]
+        );
+        assert_eq!(sort_primary(None), SortPrimary::SortName);
+    }
+
+    #[test]
+    fn an_unknown_trailing_token_forces_the_chain_but_tie_breaks_do_not() {
+        assert!(!sort_needs_chain(
+            Some("ParentIndexNumber,IndexNumber,sortname"),
+            &[]
+        ));
+        assert!(sort_needs_chain(Some("SortName,Bogus"), &[]));
+    }
+
+    #[test]
+    fn chain_folds_an_unknown_token_into_sort_name() {
+        assert_eq!(sort_chain("SortName,Bogus", &[], false).len(), 1);
     }
 }
