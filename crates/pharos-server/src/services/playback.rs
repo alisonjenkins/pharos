@@ -167,6 +167,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
             probe.pixel_format.as_deref(),
         ),
         video_3d_format: probe.video_3d_format,
+        video_range_type: is_video.then(|| probe.video_range_type().to_owned()),
     };
 
     // Capability-aware negotiation: the transcode target is the best codec in
@@ -1230,13 +1231,16 @@ pub(crate) fn resolve_audio_pick(
 }
 
 /// What a native player says it can play (`Playback.negotiate`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Capabilities {
     pub video_codecs: Vec<String>,
     pub audio_codecs: Vec<String>,
     pub containers: Vec<String>,
     /// Bits per second; 0 is "no limit".
     pub max_bitrate: u64,
+    /// Whether the display shows HDR. False adds a `VideoRangeType` condition
+    /// that admits SDR only, so an HDR source is never copied to the player.
+    pub hdr: bool,
     /// Image subtitle codecs the player draws from extracted PNGs (spec 019).
     pub image_subtitles: Vec<String>,
 }
@@ -1249,7 +1253,8 @@ impl Capabilities {
     /// when `draws_images` (this server extracts them); otherwise they burn.
     pub fn profile(&self, draws_images: bool) -> DeviceProfile {
         use pharos_jellyfin_api::device_profile::{
-            DirectPlayProfile, SubtitleProfileDto, TranscodingProfile,
+            CodecProfileDto, DirectPlayProfile, ProfileCondition, SubtitleProfileDto,
+            TranscodingProfile,
         };
         let csv = |v: &[String]| v.join(",");
         let (containers, video, audio) = (
@@ -1257,7 +1262,22 @@ impl Capabilities {
             csv(&self.video_codecs),
             csv(&self.audio_codecs),
         );
+        let codec_profiles = if self.hdr {
+            Vec::new()
+        } else {
+            vec![CodecProfileDto {
+                kind: "Video".into(),
+                codec: String::new(),
+                conditions: vec![ProfileCondition {
+                    condition: "Equals".into(),
+                    property: "VideoRangeType".into(),
+                    value: "SDR".into(),
+                    is_required: true,
+                }],
+            }]
+        };
         DeviceProfile {
+            codec_profiles,
             direct_play_profiles: vec![
                 DirectPlayProfile {
                     container: containers.clone(),
@@ -2123,6 +2143,7 @@ mod native_max_bitrate_tests {
             height: None,
             video_bit_depth: None,
             video_3d_format: None,
+            video_range_type: None,
         }
     }
 
@@ -2132,6 +2153,7 @@ mod native_max_bitrate_tests {
             audio_codecs: vec!["aac".into()],
             containers: vec!["mp4".into()],
             max_bitrate,
+            hdr: true,
             image_subtitles: vec![],
         }
     }

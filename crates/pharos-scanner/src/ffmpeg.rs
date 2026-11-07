@@ -767,6 +767,7 @@ mod tests {
         // HDR derivation lands via the MediaProbe helper.
         assert!(p.is_hdr());
         assert_eq!(p.video_range(), "HDR");
+        assert_eq!(p.video_range_type(), "HDR10");
     }
 
     #[test]
@@ -784,6 +785,7 @@ mod tests {
         }"#;
         let info = parse_ffprobe_output(json).unwrap();
         assert_eq!(info.probe.video_range(), "SDR");
+        assert_eq!(info.probe.video_range_type(), "SDR");
         assert!(!info.probe.is_hdr());
     }
 
