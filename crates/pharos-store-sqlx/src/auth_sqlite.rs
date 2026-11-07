@@ -535,4 +535,27 @@ impl TokenStore for SqliteStore {
         .map_err(map_sqlx)?;
         Ok(res.rows_affected())
     }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0.simple()))]
+    async fn count_sessions_excluding_device(
+        &self,
+        user: UserId,
+        device_id: &str,
+    ) -> AuthResult<u32> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT device_id) FROM auth_tokens \
+             WHERE user_id = ?1 AND (scope IS NULL OR scope = ?2) AND parent_hash IS NULL \
+             AND (expires_at IS NULL OR expires_at > ?3) \
+             AND substr(device_id, 1, length(?4)) <> ?4 AND device_id <> ?5",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(TokenScope::Full.to_stored())
+        .bind(now_unix_secs())
+        .bind(pharos_core::API_KEY_DEVICE_PREFIX)
+        .bind(device_id)
+        .fetch_one(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
 }

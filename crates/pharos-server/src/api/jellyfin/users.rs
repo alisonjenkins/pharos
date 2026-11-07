@@ -306,6 +306,29 @@ pub(super) fn login_refused(
     }
 }
 
+/// Jellyfin's post-password policy checks (access schedule, session cap):
+/// a refusal is a `SecurityException`, which its middleware answers 403.
+async fn gate_login(
+    state: &AppState,
+    user: &pharos_core::User,
+    device_id: &str,
+) -> Result<crate::services::auth::SessionSlot, actix_web::Error> {
+    Ok(crate::services::auth::login_gate(state, user, device_id).await?)
+}
+
+impl From<crate::services::auth::LoginGateError> for actix_web::Error {
+    fn from(e: crate::services::auth::LoginGateError) -> Self {
+        use crate::services::auth::LoginGateError;
+        match e {
+            LoginGateError::Refused(gate) => actix_web::error::ErrorForbidden(gate.message()),
+            LoginGateError::Store(e) => {
+                tracing::error!(error = %e, "login gate: could not count the user's sessions");
+                actix_web::error::ErrorInternalServerError("login unavailable")
+            }
+        }
+    }
+}
+
 /// The device id a new session is stored under: the client's `DeviceId`,
 /// else its `Device`, else a fresh one. A client may not pick an id shaped
 /// like an API key's (`apikey:…`): that session would be listed and revoked
@@ -362,14 +385,14 @@ async fn authenticate_by_name(
                 "invalid credentials",
             )
         })?;
-    crate::services::auth::login_gate(&user)
-        .map_err(|g| actix_web::error::ErrorForbidden(g.message()))?;
+    let slot = gate_login(&state, &user, &device_id).await?;
 
     let token = state
         .stores
         .issue(user.id, &device_id)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    drop(slot);
 
     let user_id_str = user.id.0.simple().to_string();
     // T73 — record the login for the dashboard Activity panel.
@@ -431,6 +454,29 @@ struct QuickConnectDto {
 /// AccessToken against the authorizing user, and returns the same
 /// `AuthenticationResult` shape as `/Users/AuthenticateByName` — which is what
 /// jellyfin-web reads for `result.User.Id` + `result.AccessToken`.
+async fn quick_connect_ask(
+    state: &AppState,
+    secret: &str,
+    consume: bool,
+) -> Result<Option<crate::quick_connect::PendingRequest>, actix_web::Error> {
+    use crate::quick_connect::QcMsg;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let secret = secret.to_owned();
+    let msg = if consume {
+        QcMsg::Consume { secret, reply }
+    } else {
+        QcMsg::Connect { secret, reply }
+    };
+    state
+        .quick_connect
+        .tx
+        .send(msg)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    rx.await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))
+}
+
 async fn authenticate_with_quick_connect(
     state: web::Data<AppState>,
     req: HttpRequest,
@@ -440,27 +486,15 @@ async fn authenticate_with_quick_connect(
     if secret.trim().is_empty() {
         return Err(actix_web::error::ErrorBadRequest("Secret required"));
     }
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    state
-        .quick_connect
-        .tx
-        .send(crate::quick_connect::QcMsg::Consume {
-            secret,
-            reply: reply_tx,
-        })
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-    let entry = reply_rx
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
-    // None = unknown/expired secret OR not yet authorized. Either way the
-    // caller isn't cleared to log in.
-    let Some(entry) = entry else {
+    // A read first: the one-time code is spent only once the login is allowed
+    // (a closed schedule or full session cap must not burn it), as on the
+    // native path. None = unknown/expired secret OR not yet authorized.
+    let Some(entry) = quick_connect_ask(&state, &secret, false).await? else {
         return Err(ErrorUnauthorized("quick connect not authorized"));
     };
-    let by = entry.authorized_by.ok_or_else(|| {
-        actix_web::error::ErrorInternalServerError("consumed entry lacks authorizer")
-    })?;
+    let by = entry
+        .authorized_by
+        .ok_or_else(|| ErrorUnauthorized("quick connect not authorized"))?;
 
     // Resolve the authorizing user (same path the auth extractor uses).
     let record = state
@@ -469,20 +503,25 @@ async fn authenticate_with_quick_connect(
         .await
         .map_err(|e| ErrorUnauthorized(format!("authorizing user unavailable: {e}")))?;
     // A disabled account must not receive a token (same rule as password
-    // login); the secret is already consumed, so the client restarts the flow.
+    // login); its code is spent, so the client restarts the flow.
     if record.policy.is_disabled {
         tracing::warn!(user = %by, "quickconnect: finalize refused, authorizing user is disabled");
+        quick_connect_ask(&state, &secret, true).await?;
         return Err(ErrorUnauthorized("quick connect not authorized"));
     }
     let user = record.into_user();
-    crate::services::auth::login_gate(&user)
-        .map_err(|g| actix_web::error::ErrorForbidden(g.message()))?;
+    let slot = gate_login(&state, &user, &entry.device_id).await?;
+    // One-shot: of two racing finalizes, only one consumes the entry.
+    let Some(entry) = quick_connect_ask(&state, &secret, true).await? else {
+        return Err(ErrorUnauthorized("quick connect not authorized"));
+    };
 
     let token = state
         .stores
         .issue(by, &entry.device_id)
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+    drop(slot);
 
     let auth = auth_header_from_request(&req);
     let user_id_str = user.id.0.simple().to_string();

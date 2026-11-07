@@ -229,6 +229,37 @@ where
     .await
     .unwrap();
 
+    // T68 (V579): the session count is distinct full-scope devices, minus the
+    // one asked about; API keys and restricted tokens are not sessions.
+    let capped = user_record("session-count-user");
+    let cid = capped.id;
+    UserStore::create(&store, capped).await.unwrap();
+    for device in ["dev-a", "dev-a", "dev-b", "apikey:ci"] {
+        TokenStore::issue(&store, cid, device).await.unwrap();
+    }
+    TokenStore::issue_with_ttl(
+        &store,
+        cid,
+        "cast:Den",
+        3600,
+        pharos_core::TokenScope::Playback,
+    )
+    .await
+    .unwrap();
+    TokenStore::issue_with_ttl(&store, cid, "dev-gone", 0, pharos_core::TokenScope::Full)
+        .await
+        .unwrap();
+    let sessions = |device: &'static str| {
+        let store = &store;
+        async move {
+            TokenStore::count_sessions_excluding_device(store, cid, device)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(sessions("dev-a").await, 1, "dev-b only");
+    assert_eq!(sessions("dev-new").await, 2, "dev-a and dev-b");
+
     // Login lookup: case-insensitive, every case variant returned, exact first.
     UserStore::create(&store, user_record("Mixed-Case"))
         .await

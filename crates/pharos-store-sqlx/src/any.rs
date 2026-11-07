@@ -1519,4 +1519,15 @@ impl TokenStore for AnyStore {
             AnyStore::Postgres(p) => p.revoke_sessions_except(user, keep).await,
         }
     }
+
+    async fn count_sessions_excluding_device(
+        &self,
+        user: UserId,
+        device_id: &str,
+    ) -> AuthResult<u32> {
+        match self {
+            AnyStore::Sqlite(s) => s.count_sessions_excluding_device(user, device_id).await,
+            AnyStore::Postgres(p) => p.count_sessions_excluding_device(user, device_id).await,
+        }
+    }
 }
