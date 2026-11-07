@@ -422,6 +422,69 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // 014 US9: the episode skips move the whole group, not just the member who
+  // pressed them, and an episode's end, where both members' players advance
+  // on their own, moves the group once.
+  test("next and previous episode, and an episode's end, move the whole group", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(240_000);
+    const episode = (n: number) => `/Playwright Show - S01E0${n}.webm`;
+    const { a, b, people, logs } = await startGroup(browser, request, open, episode(1), {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+    });
+    const [byA, byB] = people;
+    const [e1, e2, e3] = await Promise.all(
+      [1, 2, 3].map(async (n) => (await seededMovie(request, episode(n))).nativeId),
+    );
+    const onEpisode = async (id: string, why: string) => {
+      for (const p of [a.page, b.page]) {
+        await expect(p, why).toHaveURL(new RegExp(`/ui/watch/${id}$`), { timeout: 15_000 });
+        await expect(p.locator(".pharos-member-list li"), why).toHaveCount(2, {
+          timeout: 15_000,
+        });
+      }
+      await waitUntilInSync(people);
+    };
+    const skip = async (m: typeof byA, name: "Next episode" | "Previous episode") => {
+      // The controls hide while the pointer rests; moving wakes them.
+      await m.page.mouse.move(200, 200);
+      await m.page.getByRole("button", { name, exact: true }).click();
+    };
+    try {
+      await waitUntilInSync(people);
+
+      // A skips forward: both land on episode 2 and play it together.
+      let moves = await moveCounts(request);
+      await skip(byA, "Next episode");
+      await onEpisode(e2, "A's next episode brings both to episode 2");
+      expect(await movesSince(request, moves), "one group move").toEqual({ moved: 1, stale: 0 });
+
+      // B skips back: both return to episode 1.
+      moves = await moveCounts(request);
+      await skip(byB, "Previous episode");
+      await onEpisode(e1, "B's previous episode brings both back to episode 1");
+      expect(await movesSince(request, moves), "one group move").toEqual({ moved: 1, stale: 0 });
+
+      // Into episode 2, then to its last seconds: each member's player
+      // advances at the end, and the group moves to episode 3 once (the
+      // second advance names the entry the first replaced, so is stale).
+      await skip(byA, "Next episode");
+      await onEpisode(e2, "A's next episode brings both to episode 2 again");
+      moves = await moveCounts(request);
+      await seekTo(byA, 0.97);
+      await onEpisode(e3, "episode 2's end brings both to episode 3");
+      const ended = await movesSince(request, moves);
+      expect(ended.moved, `the end moves the group once: ${JSON.stringify(ended)}`).toBe(1);
+      // Still in step, and still one group: a pause from B reaches A.
+      await toggleUntil(byB, true);
+      await assertPausedAll(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
 
 /** Clicks `member`'s seek bar at `fraction` of its width. */
@@ -468,4 +531,23 @@ async function waitsReported(
   } catch (e) {
     throw new Error(`${(e as Error).message}\ncounted since the seek: ${line(seen)}`);
   }
+}
+
+/** The server's `pharos_syncplay_move_to_item_total` counts by outcome. */
+async function moveCounts(request: APIRequestContext): Promise<Map<string, number>> {
+  const text = await (await request.get(`${PHAROS_URL}/metrics`)).text();
+  const out = new Map<string, number>();
+  for (const m of text.matchAll(
+    /^pharos_syncplay_move_to_item_total\{[^}]*outcome="(\w+)"[^}]*\}\s+(\S+)/gm,
+  )) {
+    out.set(m[1], (out.get(m[1]) ?? 0) + Number(m[2]));
+  }
+  return out;
+}
+
+/** The moved and stale group moves since `before`. */
+async function movesSince(request: APIRequestContext, before: Map<string, number>) {
+  const now = await moveCounts(request);
+  const d = (k: string) => (now.get(k) ?? 0) - (before.get(k) ?? 0);
+  return { moved: d("moved"), stale: d("stale") };
 }
