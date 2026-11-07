@@ -1496,6 +1496,54 @@ pub trait RatingsStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
+/// The style director's effect plan for one subtitle track of a video item
+/// (spec 028). The signature fields (`source_*`, `sidecar_*`) are what the
+/// plan was read against: when the file's current signature differs the plan
+/// is stale and the item is styled again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleStyling {
+    pub item_id: MediaId,
+    /// The subtitle stream (or sidecar slot) the plan was made from.
+    pub source_index: u32,
+    pub source_mtime: i64,
+    pub source_size: u64,
+    /// The sidecar file's signature; `None` when the source is an embedded stream.
+    pub sidecar_mtime: Option<i64>,
+    pub sidecar_size: Option<u64>,
+    pub director_version: u32,
+    pub outcome: String,
+    /// The plan as JSON; `None` for a version-only row (an undecodable file
+    /// or no usable source), kept so the item is not retried every pass.
+    pub plan_json: Option<String>,
+    pub styled_at: i64,
+}
+
+/// Storage for [`SubtitleStyling`] rows. Split from [`MediaStore`] like
+/// [`RatingsStore`] so in-memory test stores don't have to implement it.
+pub trait SubtitleStylingStore: Send + Sync {
+    /// Upsert by `(item_id, source_index)`, and delete the item's other rows:
+    /// an item has one styled track, so a new source choice replaces the old
+    /// one rather than leaving a stale plan beside it.
+    fn put_subtitle_styling(
+        &self,
+        row: SubtitleStyling,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// The item's row, or `None` when it was never styled. Callers compare
+    /// its signature with the file's before using `plan_json`.
+    fn subtitle_styling(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SubtitleStyling>>> + Send;
+
+    /// Every row with `plan_json` always `None`: the backfill pass only needs
+    /// the signatures and version to skip finished items, and the plans are
+    /// the bulk of the data.
+    fn subtitle_styling_index(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SubtitleStyling>>> + Send;
+}
+
 /// T70 — playlists as first-class, user-owned, ordered item containers.
 /// Split from [`MediaStore`] like [`CollectionStore`] so in-memory test
 /// stores that only round-trip items don't have to implement the join.
