@@ -240,7 +240,27 @@ impl LyricsFinder {
             Some(found) => Some(found),
             None => self.online(item).await,
         }
-        .map(|l| l.fit_to(item.probe.duration_ms));
+        .map(|l| {
+            let last_line_ms = l.lines.iter().filter_map(|line| line.start_ms).max();
+            let was_synced = l.synced();
+            let fitted = l.fit_to(item.probe.duration_ms);
+            if was_synced && !fitted.synced() {
+                metrics::counter!(
+                    "pharos_lyrics_unsynced_total",
+                    "reason" => "past_song_end",
+                    "origin" => fitted.origin.label()
+                )
+                .increment(1);
+                tracing::info!(
+                    media.id = item.id,
+                    origin = fitted.origin.label(),
+                    last_line_ms,
+                    duration_ms = item.probe.duration_ms,
+                    "lyrics: synced lines run past the song's end, shown unsynced"
+                );
+            }
+            fitted
+        });
         let outcome = found.as_ref().map_or("none", |l| l.origin.label());
         metrics::counter!("pharos_lyrics_lookup_total", "outcome" => outcome).increment(1);
         tracing::debug!(
