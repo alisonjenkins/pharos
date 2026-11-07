@@ -11,6 +11,7 @@ pub mod secret;
 pub mod segment_grid;
 pub mod time;
 pub mod video_3d;
+pub mod video_range;
 
 pub use segment_grid::{
     frame_snapped_start, segment_range, segment_seek_bias, SegmentGrid, SegmentIndex,
@@ -26,6 +27,7 @@ pub use client_ids::{ClientDeviceId, PlaySessionId};
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
+pub use video_range::{ParseVideoRangeTypeError, VideoRangeType};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -2411,11 +2413,11 @@ impl MediaProbe {
     /// (`smpte2084`), `HLG` (`arib-std-b67`), else `SDR`. Dolby Vision and
     /// HDR10+ are not told apart: the probe keeps no side data for them, so
     /// a Dolby Vision stream reports whatever its base layer carries.
-    pub fn video_range_type(&self) -> &'static str {
+    pub fn video_range_type(&self) -> VideoRangeType {
         match self.color_transfer.as_deref() {
-            Some("smpte2084") => "HDR10",
-            Some("arib-std-b67") => "HLG",
-            _ => "SDR",
+            Some("smpte2084") => VideoRangeType::Hdr10,
+            Some("arib-std-b67") => VideoRangeType::Hlg,
+            _ => VideoRangeType::Sdr,
         }
     }
 

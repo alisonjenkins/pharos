@@ -154,9 +154,8 @@ impl Negotiated {
 /// The `range` label of `pharos_video_range_unenforced_total`, bounded to the
 /// ranges the probe can report.
 fn range_label(range: &str) -> &'static str {
-    match range {
-        "HDR10" => "HDR10",
-        "HLG" => "HLG",
+    match range.parse::<pharos_core::VideoRangeType>() {
+        Ok(r) if r.is_hdr() => r.label(),
         _ => "other",
     }
 }
@@ -198,7 +197,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
             probe.pixel_format.as_deref(),
         ),
         video_3d_format: probe.video_3d_format,
-        video_range_type: is_video.then(|| probe.video_range_type().to_owned()),
+        video_range_type: is_video.then(|| probe.video_range_type().label().to_owned()),
     };
 
     // Capability-aware negotiation: the transcode target is the best codec in

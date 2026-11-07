@@ -1492,13 +1492,14 @@ fn source_video_kind(
     )
 }
 
-/// The (`tonemap`, `source_range`) pairs `source_tonemap` can emit. Bounded:
-/// `video_range_type` answers one of three strings.
-pub(crate) const TONEMAP_SERIES: [(pharos_transcode::Tonemap, &str); 3] = [
-    (pharos_transcode::Tonemap::Off, "SDR"),
-    (pharos_transcode::Tonemap::HdrToSdr, "HDR10"),
-    (pharos_transcode::Tonemap::HdrToSdr, "HLG"),
-];
+/// The (`tonemap`, `source_range`) pairs `source_tonemap` can emit, one per
+/// range the probe can report, so a new range cannot miss its series.
+pub(crate) fn tonemap_series(
+) -> impl Iterator<Item = (pharos_transcode::Tonemap, pharos_core::VideoRangeType)> {
+    pharos_core::VideoRangeType::ALL
+        .into_iter()
+        .map(|r| (pharos_transcode::Tonemap::for_range_type(r), r))
+}
 
 /// Whether a transcode of this source maps HDR pixels to SDR (ADR-0070), and
 /// the one place that counts the decision (`pharos_transcode_tonemap_total`).
@@ -1509,7 +1510,7 @@ pub(crate) fn source_tonemap(probe: &pharos_core::MediaProbe) -> pharos_transcod
     metrics::counter!(
         "pharos_transcode_tonemap_total",
         "tonemap" => tonemap.label(),
-        "source_range" => range,
+        "source_range" => range.label(),
     )
     .increment(1);
     tonemap
