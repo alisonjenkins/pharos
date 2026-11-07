@@ -10,17 +10,62 @@ use super::{Downloaded, ProviderError, SubtitleHit};
 pub enum Op {
     Search,
     Download,
+    /// One decision of the background job.
+    Job,
 }
 
 impl Op {
-    pub const ALL: [Op; 2] = [Op::Search, Op::Download];
+    pub const ALL: [Op; 3] = [Op::Search, Op::Download, Op::Job];
 
     pub fn label(self) -> &'static str {
         match self {
             Op::Search => "search",
             Op::Download => "download",
+            Op::Job => "job",
         }
     }
+}
+
+/// What the background job decided about one item and language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Downloaded,
+    /// Searched; nothing good enough. Remembered in the miss memo.
+    Miss,
+    /// Skipped: a fresh miss is on record.
+    SkippedMemo,
+    /// A provider error that says nothing about the item.
+    Error,
+    /// The pass stopped: provider quota or rate limit.
+    QuotaStop,
+    /// The pass stopped: the daily ceiling is reached.
+    BudgetStop,
+}
+
+impl JobOutcome {
+    pub const ALL: [JobOutcome; 6] = [
+        JobOutcome::Downloaded,
+        JobOutcome::Miss,
+        JobOutcome::SkippedMemo,
+        JobOutcome::Error,
+        JobOutcome::QuotaStop,
+        JobOutcome::BudgetStop,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            JobOutcome::Downloaded => "downloaded",
+            JobOutcome::Miss => "miss",
+            JobOutcome::SkippedMemo => "skipped_memo",
+            JobOutcome::Error => "error",
+            JobOutcome::QuotaStop => "quota_stop",
+            JobOutcome::BudgetStop => "budget_stop",
+        }
+    }
+}
+
+pub fn record_job(outcome: JobOutcome) {
+    count(Op::Job, outcome.label());
 }
 
 impl ProviderError {
@@ -129,6 +174,9 @@ mod tests {
     fn labels_are_distinct() {
         let ops: std::collections::HashSet<_> = Op::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(ops.len(), Op::ALL.len());
+        let jobs: std::collections::HashSet<_> =
+            JobOutcome::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(jobs.len(), JobOutcome::ALL.len());
         let errs: std::collections::HashSet<_> = ProviderError::LABELS.iter().collect();
         assert_eq!(errs.len(), ProviderError::LABELS.len());
         for reserved in ["ok", "empty"] {
