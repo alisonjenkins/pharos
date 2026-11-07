@@ -86,7 +86,7 @@ impl Fixture {
                 session_id: session.into(),
                 user_id: user,
                 user_name: name.into(),
-                device_id: format!("dev-{name}"),
+                device_id: format!("dev-{name}").into(),
                 device_name: format!("dev-{name}"),
                 client: "test".into(),
                 version: "1".into(),

@@ -398,7 +398,9 @@ async fn creator_now_playing(
     let sessions = state.sessions.snapshot().await.ok()?;
     let matches: Vec<_> = sessions
         .into_iter()
-        .filter(|s| s.user_id == uid && s.device_id == device_id && s.now_playing_item_id.is_some())
+        .filter(|s| {
+            s.user_id == uid && s.device_id.as_str() == device_id && s.now_playing_item_id.is_some()
+        })
         .collect();
     resolve_seed(matches)
 }
