@@ -6,6 +6,8 @@
 use crate::state::AppState;
 use pharos_core::{SecretString, TokenScope, TokenStore, UserId, UserStore};
 use pharos_sync::group::GroupHandle;
+use pharos_sync::registry::RegistryError;
+use pharos_sync::GroupRegistry;
 use pharos_sync::TokenResolver;
 use std::future::Future;
 use std::pin::Pin;
@@ -51,19 +53,21 @@ impl TokenResolver for StoreTokenResolver {
         })
     }
 
-    fn may_join<'a>(
+    fn joinable_group<'a>(
         &'a self,
         user: UserId,
-        group: &'a GroupHandle,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        registry: &'a GroupRegistry,
+        group_id: pharos_sync::messages::GroupId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupHandle>, RegistryError>> + Send + 'a>> {
         Box::pin(async move {
             let Some(user) = self.user(user).await else {
-                return false;
+                return Ok(None);
             };
-            crate::api::jellyfin::syncplay::may_join(
+            crate::sync_recovery::joinable_group(
                 &self.0,
+                registry,
                 &user,
-                group,
+                group_id,
                 crate::api::jellyfin::syncplay::GroupHiddenRoute::Native,
             )
             .await

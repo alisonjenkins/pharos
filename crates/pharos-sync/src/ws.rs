@@ -271,14 +271,12 @@ where
         sonic_rs::from_str(&txt).map_err(|e| WsError::Protocol(format!("join parse: {e}")))?;
     match msg {
         ClientMsg::Join { group_id } => {
-            let handle = registry
-                .get_or_create(group_id)
+            // Absent and hidden groups answer alike; neither spawns a group.
+            resolver
+                .joinable_group(user_id, registry, group_id)
                 .await
-                .map_err(|_| WsError::Protocol("registry actor down".into()))?;
-            if !resolver.may_join(user_id, &handle).await {
-                return Err(WsError::Protocol("unknown group".into()));
-            }
-            Ok(handle)
+                .map_err(|_| WsError::Protocol("registry actor down".into()))?
+                .ok_or_else(|| WsError::Protocol("unknown group".into()))
         }
         ClientMsg::CreateAndJoin => {
             if !resolver.may_create(user_id).await {
