@@ -182,9 +182,13 @@ pub fn Root() -> Element {
     // The store's pushes arrive outside the Dioxus runtime; this task is how
     // they reach the screens.
     let group_ui = use_coroutine(move |mut rx: UnboundedReceiver<Ui>| async move {
+        let keeper = super::group_app::GroupKeeper::default();
         while let Some(ui) = rx.next().await {
             match ui {
-                Ui::View(view) => group_view.set(view),
+                Ui::View(view) => {
+                    keeper.keep(&view);
+                    group_view.set(view);
+                }
                 Ui::Navigate(item) => replace.0.call(Route::Watch(item)),
             }
         }
@@ -1333,6 +1337,30 @@ fn NativeApp(route: Route) -> Element {
         api,
         machine,
         marks,
+    });
+    // A reloaded tab joins the group it was in again (B665): the server kept
+    // its seat for the socket-loss grace, and the group's item brings the
+    // tab to what the group plays. Read before this page publishes a view.
+    let kept_group = use_hook(|| Rc::new(RefCell::new(super::group_app::kept_before_load())));
+    let together = use_context::<Together>();
+    use_effect(move || {
+        let Some(api) = api.read().clone() else {
+            return;
+        };
+        let kept = kept_group.borrow_mut().take();
+        let Some(id) = super::group_app::group_to_rejoin(kept, together.view.peek().active) else {
+            return;
+        };
+        platform::info(&format!("pharos: group rejoin reason=reload group={id}"));
+        let session = together.session(&api);
+        spawn_forever(async move {
+            if let Err(e) = session.join(&id).await {
+                platform::info(&format!(
+                    "pharos: group rejoin failed group={id} error={}",
+                    e.0
+                ));
+            }
+        });
     });
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);
