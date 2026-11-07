@@ -124,7 +124,7 @@ impl From<&VirtualTvSession> for SessionRecord {
             id: v.id.clone(),
             user_id: v.user_id.clone(),
             user_name: v.user_name.clone(),
-            device_id: v.id.clone(),
+            device_id: v.id.clone().into(),
             device_name: v.device_name.clone(),
             client: TV_CLIENT.into(),
             application_version: String::new(),

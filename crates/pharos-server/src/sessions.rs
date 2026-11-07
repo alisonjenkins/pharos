@@ -1,7 +1,7 @@
 //! `SessionRegistry` actor — owns the set of active playback sessions.
 //! V18 — handlers send mpsc messages; no `Mutex` on the request path.
 
-use pharos_core::UserId;
+use pharos_core::{ClientDeviceId, UserId};
 use pharos_jellyfin_api::dto::format_iso8601;
 use serde::Serialize;
 use std::time::Duration;
@@ -39,7 +39,7 @@ pub struct SessionRecord {
     pub id: String,
     pub user_id: String,
     pub user_name: String,
-    pub device_id: String,
+    pub device_id: ClientDeviceId,
     pub device_name: String,
     pub client: String,
     pub application_version: String,
@@ -85,7 +85,7 @@ pub enum SessionEvent {
         session_id: String,
         user_id: UserId,
         user_name: String,
-        device_id: String,
+        device_id: ClientDeviceId,
         device_name: String,
         client: String,
         version: String,
@@ -329,7 +329,7 @@ impl SessionRegistry {
                                     id: session_id,
                                     user_id: String::new(),
                                     user_name: String::new(),
-                                    device_id: String::new(),
+                                    device_id: ClientDeviceId::default(),
                                     device_name: String::new(),
                                     client: String::new(),
                                     application_version: String::new(),
@@ -426,6 +426,16 @@ mod tests {
         let snap = r.snapshot().await.unwrap();
         assert_eq!(snap[0].position_ticks, 12345);
         assert!(snap[0].is_paused);
+    }
+
+    /// The `/Sessions` wire form carries the device id as the bare string.
+    #[tokio::test]
+    async fn snapshot_serializes_device_id_as_a_bare_string() {
+        let r = SessionRegistry::spawn();
+        r.apply(started("s1", "100", 0)).await.unwrap();
+        let snap = r.snapshot().await.unwrap();
+        let v = serde_json::to_value(&snap[0]).unwrap();
+        assert_eq!(v["DeviceId"], serde_json::json!("d"));
     }
 
     #[tokio::test]
