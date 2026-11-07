@@ -158,14 +158,15 @@ export async function seededMovie(request: APIRequestContext, file: string) {
 /**
  * Two signed-in browsers in one group on the seeded movie `file`: A, signed
  * in as `opts.accounts[0]`, starts it, and B, as `opts.accounts[1]`, joins by
- * the invite link. Both default to the seeded user.
+ * the invite link. Both default to the seeded user. With
+ * `opts.pausedBeforeJoin`, A pauses the group before B joins.
  */
 export async function startGroup(
   browser: Browser,
   request: APIRequestContext,
   open: { context: BrowserContext; page: Page }[],
   file: string,
-  opts: { subtitled?: boolean; accounts?: [Account, Account] } = {},
+  opts: { subtitled?: boolean; accounts?: [Account, Account]; pausedBeforeJoin?: boolean } = {},
 ) {
   const [asA, asB] = opts.accounts ?? [SEEDED, SEEDED];
   const { api, movie, nativeId } = await seededMovie(request, file);
@@ -200,6 +201,20 @@ export async function startGroup(
   await a.page.getByRole("button", { name: /^Watch together( from start)?$/ }).click();
   await expect(a.page).toHaveURL(new RegExp(`/ui/watch/${nativeId}$`));
   await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+
+  // A pauses the group before B joins, so B joins a paused group.
+  if (opts.pausedBeforeJoin) {
+    // Playing first: a click while the new group still starts would ask to
+    // play it, not to pause.
+    const alone = new Member("A", a.page);
+    await expect
+      .poll(() => alone.probe().then((p) => (p.paused ? 0 : p.currentTime)), {
+        message: "A's group plays before A pauses it",
+        timeout: 30_000,
+      })
+      .toBeGreaterThan(1);
+    await toggleUntil(alone, true);
+  }
 
   // B follows the invite link and joins.
   let groupId = "";

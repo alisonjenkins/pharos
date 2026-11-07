@@ -539,6 +539,57 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // B664: a member who joins a paused group waits at the group's position,
+  // not at their own resume point (B has one 70 s in, from watching alone).
+  test("a member who joins a paused group waits at its position, not their own", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(180_000);
+    const { nativeId } = await seededMovie(request, "/fixture-1.webm");
+    const solo = await signIn(browser, "B alone", OPTED_IN_B);
+    open.push(solo);
+    const alone = new Member("B alone", solo.page);
+    await solo.page.goto(`${PHAROS_URL}/ui/watch/${nativeId}`);
+    await expect
+      .poll(() => alone.probe().then((p) => p.currentTime), { timeout: 30_000 })
+      .toBeGreaterThan(1);
+    await seekTo(alone, 0.6);
+    await expect
+      .poll(() => alone.probe().then((p) => p.currentTime), { timeout: 15_000 })
+      .toBeGreaterThan(70);
+    // Closing the player saves where B is.
+    await solo.page.mouse.move(220, 220);
+    await solo.page.getByRole("button", { name: "Back" }).click();
+    await solo.context.close();
+    open.splice(open.indexOf(solo), 1);
+
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm", {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+      pausedBeforeJoin: true,
+    });
+    try {
+      await assertPausedAll(people);
+      // B is put at the group's position as it finishes loading; a paused
+      // group corrects nothing after that, so where B settles is final.
+      await expect
+        .poll(
+          async () => {
+            const [pa, pb] = await Promise.all(people.map((m) => m.probe()));
+            return Math.abs(pa.currentTime - pb.currentTime);
+          },
+          {
+            message: "B waits at the group's position, not at its own resume point",
+            timeout: 10_000,
+          },
+        )
+        .toBeLessThan(1);
+      await assertPausedAll(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
 
 /** Clicks `member`'s seek bar at `fraction` of its width. */
