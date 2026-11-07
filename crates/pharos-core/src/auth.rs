@@ -75,11 +75,25 @@ pub struct UserPolicy {
     pub sync_play_access: String,
 }
 
+/// Jellyfin's lockout limit when a policy says `0`.
+const DEFAULT_LOGIN_ATTEMPTS_BEFORE_LOCKOUT: i32 = 3;
+
 impl UserPolicy {
     /// Whether this user may see the library with `wire_id`
     /// (`EnableAllFolders` / `EnabledFolders`).
     pub fn allows_library(&self, wire_id: &str) -> bool {
         self.enable_all_folders || self.enabled_folders.iter().any(|f| f == wire_id)
+    }
+
+    /// Consecutive failed password logins that disable the user, or `None`
+    /// for no lockout. Jellyfin `UserManager.UpdatePolicyAsync`: `-1` is
+    /// unlimited and `0` means its default of 3 (T68, V577).
+    pub fn lockout_threshold(&self) -> Option<i32> {
+        match self.login_attempts_before_lockout {
+            n if n < 0 => None,
+            0 => Some(DEFAULT_LOGIN_ATTEMPTS_BEFORE_LOCKOUT),
+            n => Some(n),
+        }
     }
 }
 

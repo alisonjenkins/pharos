@@ -17,3 +17,4 @@ mod playlists;
 mod styled_subtitle;
 mod subtitle_fonts;
 mod thin_endpoints;
+mod user_policy_login;

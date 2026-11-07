@@ -297,7 +297,9 @@ pub(super) fn login_refused(
             actix_web::error::InternalError::from_response("too many failed login attempts", resp)
                 .into()
         }
-        crate::auth::LoginRefusal::Invalid => ErrorUnauthorized(invalid),
+        crate::auth::LoginRefusal::Invalid | crate::auth::LoginRefusal::LockedOut(_) => {
+            ErrorUnauthorized(invalid)
+        }
         crate::auth::LoginRefusal::Backend(e) => {
             actix_web::error::ErrorInternalServerError(e.to_string())
         }
@@ -354,7 +356,12 @@ async fn authenticate_by_name(
         .login_throttle
         .verify(&state.auth, &body.username, &password, client_ip)
         .await
-        .map_err(|r| login_refused(r, "invalid credentials"))?;
+        .map_err(|r| {
+            login_refused(
+                crate::services::auth::settle_lockout(&state, r),
+                "invalid credentials",
+            )
+        })?;
 
     let token = state
         .stores

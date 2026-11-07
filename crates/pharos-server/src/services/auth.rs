@@ -115,6 +115,8 @@ pub enum RevokeCause {
     PolicyChanged,
     /// The user's password changed, so tokens issued under the old one go.
     PasswordChanged,
+    /// Too many wrong passwords disabled the account (V577).
+    LockedOut,
 }
 
 impl RevokeCause {
@@ -126,7 +128,26 @@ impl RevokeCause {
             RevokeCause::UserDeleted => "user_deleted",
             RevokeCause::PolicyChanged => "policy_changed",
             RevokeCause::PasswordChanged => "password_changed",
+            RevokeCause::LockedOut => "locked_out",
         }
+    }
+}
+
+/// Announces a lockout the sign-in just caused and answers it as the plain
+/// wrong password it looks like to the client: the account is now disabled,
+/// so its open native sockets must re-check (V577). Any other refusal passes
+/// through.
+pub fn settle_lockout(
+    state: &AppState,
+    refusal: crate::auth::LoginRefusal,
+) -> crate::auth::LoginRefusal {
+    use crate::auth::LoginRefusal;
+    match refusal {
+        LoginRefusal::LockedOut(user) => {
+            state.revocations.announce(user, RevokeCause::LockedOut);
+            LoginRefusal::Invalid
+        }
+        other => other,
     }
 }
 
@@ -331,7 +352,9 @@ impl PasswordLoginError {
         use crate::auth::LoginRefusal;
         match self {
             PasswordLoginError::Refused(LoginRefusal::Throttled(_)) => LoginOutcome::Throttled,
-            PasswordLoginError::Refused(LoginRefusal::Invalid) => LoginOutcome::Invalid,
+            PasswordLoginError::Refused(LoginRefusal::Invalid | LoginRefusal::LockedOut(_)) => {
+                LoginOutcome::Invalid
+            }
             PasswordLoginError::Refused(LoginRefusal::Backend(_))
             | PasswordLoginError::Issue(_) => LoginOutcome::Unavailable,
             PasswordLoginError::Capped { .. } => LoginOutcome::Capped,
@@ -372,7 +395,7 @@ pub async fn password_login(
             .login_throttle
             .verify(&state.auth, name, password, client_ip)
             .await
-            .map_err(PasswordLoginError::Refused)?;
+            .map_err(|r| PasswordLoginError::Refused(settle_lockout(state, r)))?;
         admit(&user).map_err(|(held, max)| PasswordLoginError::Capped { held, max })?;
         let token = state
             .stores
@@ -506,7 +529,7 @@ pub async fn change_own_password(
         }
         state
             .login_throttle
-            .verify(&state.auth, &user.name, current, client_ip)
+            .verify_recheck(&state.auth, &user.name, current, client_ip)
             .await
             .map_err(ChangePasswordError::Refused)?;
         let hash = state
@@ -713,6 +736,7 @@ mod tests {
             RevokeCause::UserDeleted,
             RevokeCause::PolicyChanged,
             RevokeCause::PasswordChanged,
+            RevokeCause::LockedOut,
         ];
         let unique: std::collections::HashSet<_> = causes.iter().map(|c| c.label()).collect();
         assert_eq!(unique.len(), causes.len());
