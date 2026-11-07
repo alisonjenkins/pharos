@@ -57,7 +57,8 @@ impl SyncGroupStore for SqliteStore {
     #[tracing::instrument(skip(self))]
     async fn list_sync_groups(&self) -> DomainResult<Vec<PersistedSyncGroup>> {
         let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
-            "SELECT group_id, epoch_unix_ms, state_json, updated_at FROM sync_groups",
+            "SELECT group_id, epoch_unix_ms, state_json, updated_at FROM sync_groups \
+             ORDER BY updated_at DESC, group_id ASC",
         )
         .fetch_all(self.pool())
         .await
@@ -93,5 +94,67 @@ impl SyncGroupStore for SqliteStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(res.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use pharos_core::SyncGroupStore;
+
+    fn snapshot(group_id: &str, updated_at: i64) -> PersistedSyncGroup {
+        PersistedSyncGroup {
+            group_id: group_id.to_string(),
+            epoch_unix_ms: 1_000,
+            state_json: "{}".into(),
+            updated_at,
+        }
+    }
+
+    /// Recovery picks the first match in list order, so the list must be
+    /// newest-first. The older snapshot is inserted first so an unordered scan
+    /// (rowid order) would return it first and fail this test.
+    #[tokio::test]
+    async fn list_returns_newest_snapshot_first() {
+        let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        s.upsert_sync_group(&snapshot("group-a", 100), 100)
+            .await
+            .unwrap();
+        s.upsert_sync_group(&snapshot("group-b", 300), 300)
+            .await
+            .unwrap();
+        s.upsert_sync_group(&snapshot("group-c", 200), 200)
+            .await
+            .unwrap();
+        let ids: Vec<String> = s
+            .list_sync_groups()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.group_id)
+            .collect();
+        assert_eq!(ids, ["group-b", "group-c", "group-a"]);
+    }
+
+    /// Equal `updated_at` must still order deterministically (by group id).
+    #[tokio::test]
+    async fn list_breaks_recency_ties_by_group_id() {
+        let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        s.upsert_sync_group(&snapshot("group-z", 500), 500)
+            .await
+            .unwrap();
+        s.upsert_sync_group(&snapshot("group-m", 500), 500)
+            .await
+            .unwrap();
+        let ids: Vec<String> = s
+            .list_sync_groups()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.group_id)
+            .collect();
+        assert_eq!(ids, ["group-m", "group-z"]);
     }
 }

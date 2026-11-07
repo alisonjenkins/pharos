@@ -4026,7 +4026,8 @@ pub trait SyncGroupStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Option<PersistedSyncGroup>>> + Send;
 
     /// Every persisted group snapshot (for the `/SyncPlay/List` surface, which
-    /// must include groups owned by other replicas).
+    /// must include groups owned by other replicas). Ordered newest first by
+    /// `updated_at`, ties broken by ascending `group_id`, on every backend.
     fn list_sync_groups(
         &self,
     ) -> impl std::future::Future<Output = DomainResult<Vec<PersistedSyncGroup>>> + Send;
