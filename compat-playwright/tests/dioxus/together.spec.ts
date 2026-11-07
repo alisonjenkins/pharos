@@ -1,10 +1,19 @@
 import { test, expect, BrowserContext, Page } from "@playwright/test";
 import { assertPausedAll, assertSeekConverged, waitUntilInSync } from "../lib/sync-oracle";
 import {
+  ClientEventCounts,
+  clientEvents,
+  delta,
+  describe as line,
+  errorEvents,
+} from "../lib/client-events";
+import {
   Member,
+  OPTED_IN_A,
+  OPTED_IN_B,
   PHAROS_URL,
-  TEST_USER,
   failure,
+  groupLaunchOptions,
   pickUntil,
   seededMovie,
   signIn,
@@ -18,23 +27,37 @@ import {
 // `/ui/together/{group}` and joins. The group's play, pause and seek then
 // reach both `<video>`s, held to `lib/sync-oracle.ts`'s tolerances.
 //
+// A and B sign in as the two seeded users who opted in to diagnostics, so
+// every case also checks that neither browser reported an error-level client
+// event (spec 016) while it ran.
+//
 // Needs the same server as the rest of this suite: `[server.native_api]`
-// enabled, the seeded user and the seeded `fixture-1.webm` (see
+// enabled, the seeded users and the seeded `fixture-1.webm` (see
 // `just compat-dioxus-full`).
 
-// Joining is a click, which is the gesture playback needs; headless Chromium
-// still wants autoplay allowed for the play the group schedules later.
-test.use({
-  launchOptions: { args: ["--autoplay-policy=no-user-gesture-required"] },
-});
+// Joining is a click, which is the gesture playback needs; the browser still
+// wants autoplay allowed for the play the group schedules later. Muted.
+test.use({ launchOptions: groupLaunchOptions });
 
 test.describe("pharos Dioxus UI watch together", () => {
   // Each try's browsers, so afterEach leaves the group even when the test
   // fails. A group left behind would show in the next try's list (retries
   // run in the same server).
   let open: { context: BrowserContext; page: Page }[] = [];
+  // The server's client-event counts when the case started.
+  let start: ClientEventCounts = new Map();
 
-  test.afterEach(async () => {
+  test.beforeEach(async ({ request }) => {
+    start = await clientEvents(request, PHAROS_URL);
+  });
+
+  test.afterEach(async ({ request }) => {
+    // Checked while the members are still in the group, and only for a case
+    // that passed so far: a failure's own error says more.
+    const passing = test.info().status === test.info().expectedStatus;
+    const errors = passing
+      ? errorEvents(delta(start, await clientEvents(request, PHAROS_URL)))
+      : new Map();
     for (const { context, page } of open) {
       // The overlay hides when the pointer rests; moving wakes it.
       await page.mouse.move(20, 20).catch(() => {});
@@ -46,11 +69,14 @@ test.describe("pharos Dioxus UI watch together", () => {
       await context.close();
     }
     open = [];
+    expect(errors.size, `the members reported errors: ${line(errors)}`).toBe(0);
   });
 
   test("two browsers play, pause and seek in step", async ({ browser, request }) => {
     test.setTimeout(150_000);
-    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm");
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm", {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+    });
     try {
       const [byA] = people;
 
@@ -93,9 +119,9 @@ test.describe("pharos Dioxus UI watch together", () => {
   }) => {
     test.setTimeout(150_000);
     const { nativeId } = await seededMovie(request, "/fixture-1.webm");
-    const a = await signIn(browser, "A");
+    const a = await signIn(browser, "A", OPTED_IN_A);
     open.push(a);
-    const b = await signIn(browser, "B");
+    const b = await signIn(browser, "B", OPTED_IN_B);
     open.push(b);
     const logs = () => [...a.lines, ...b.lines].join("\n");
     const byA = new Member("A", a.page);
@@ -161,11 +187,17 @@ test.describe("pharos Dioxus UI watch together", () => {
   // plays it on their own, with the queue's Mix button.
   test("a song opened while in a group on a film plays on its own, with Mix", async ({
     browser,
+    browserName,
     request,
   }) => {
+    // Playwright's Firefox has no audio output here: an `<audio>` element
+    // fails with `OnMediaSinkAudioError` (MEDIA_ERR_DECODE) whatever the
+    // prefs, while a video's audio track plays. The group logic under test
+    // is the same in both browsers.
+    test.skip(browserName === "firefox", "Playwright's Firefox cannot play an <audio> element here");
     test.setTimeout(120_000);
     const { nativeId } = await seededMovie(request, "/fixture-1.webm");
-    const a = await signIn(browser, "A");
+    const a = await signIn(browser, "A", OPTED_IN_A);
     open.push(a);
     const byA = new Member("A", a.page);
     try {
@@ -223,17 +255,16 @@ test.describe("pharos Dioxus UI watch together", () => {
       request,
       open,
       "/07-test-subtitles.webm",
-      { subtitled: true },
+      { subtitled: true, accounts: [OPTED_IN_A, OPTED_IN_B] },
     );
     try {
       const [byA] = people;
       await waitUntilInSync(people);
 
-      // A pauses; B's page says so, naming the member (both browsers sign in
-      // as the same user, so the name is that user's).
+      // A pauses; B's page says so, naming the member.
       await toggleUntil(byA, true);
       await expect(b.page.locator(".pharos-activity-line").last()).toHaveText(
-        new RegExp(`^${TEST_USER} paused at \\d+:\\d\\d$`),
+        new RegExp(`^${OPTED_IN_A.name} paused at \\d+:\\d\\d$`),
         { timeout: 10_000 },
       );
 
