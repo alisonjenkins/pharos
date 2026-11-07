@@ -114,7 +114,7 @@ impl RuntimeCastDirectory {
             let (now_playing_item_id, is_paused) = self.group_view(cast.group).await;
             next.push(ActiveCastInfo {
                 tv: cast.tv,
-                owner_user_id: cast.owner.0.simple().to_string(),
+                owner_user_id: cast.owner,
                 owner_user_name,
                 now_playing_item_id,
                 position_ticks: 0,
