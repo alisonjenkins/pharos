@@ -18,6 +18,17 @@ pub fn styled_index(probe: &pharos_core::MediaProbe, sidecar_count: u32) -> u32 
     sidecar_base_index(probe).saturating_add(sidecar_count)
 }
 
+/// Whether `stream_index` is the item's styled slot, row or no row: the slot
+/// is a fixed place in the index space, so every plain subtitle route can
+/// refuse it by name.
+pub async fn is_styled_index(item: &MediaItem, stream_index: u32) -> bool {
+    if stream_index < sidecar_base_index(&item.probe) {
+        return false;
+    }
+    let count = discover_sidecars(&item.path).await.len();
+    stream_index == styled_index(&item.probe, u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// The item's styling row when its plan can still be served: it has a plan,
 /// the director version is current, the video file is the one the plan was
 /// made from, and a sidecar source still has the signature it had then.

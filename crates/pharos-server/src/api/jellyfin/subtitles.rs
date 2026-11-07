@@ -18,6 +18,7 @@
 //! starting at `1_000_000` so their numeric IDs never collide with
 //! real ffprobe stream indices.
 
+use super::items::query_param;
 use crate::{bg_io::BgPermit, state::AppState};
 use actix_web::{error, http::header, web, HttpRequest, HttpResponse};
 use pharos_cache::subtitle_cache::{
@@ -535,7 +536,7 @@ async fn stream_ass(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, msid, stream_index) = path.into_inner();
     bearer(&state, &req, &id, "subtitle").await?;
-    deliver_ass(&state, &id, Some(&msid), stream_index).await
+    deliver_ass(&state, &id, Some(&msid), stream_index, req.query_string()).await
 }
 
 async fn stream_ass_short(
@@ -545,7 +546,7 @@ async fn stream_ass_short(
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, stream_index) = path.into_inner();
     bearer(&state, &req, &id, "subtitle").await?;
-    deliver_ass(&state, &id, None, stream_index).await
+    deliver_ass(&state, &id, None, stream_index, req.query_string()).await
 }
 
 /// Serve a subtitle track as RAW ASS/SSA (for SubtitlesOctopus). Sidecars pass
@@ -557,9 +558,18 @@ async fn deliver_ass(
     id_str: &str,
     media_source_id: Option<&str>,
     stream_index: u32,
+    query: &str,
 ) -> Result<HttpResponse, actix_web::Error> {
     let mut track = DeliveredTrack::default();
-    let result = deliver_ass_inner(state, id_str, media_source_id, stream_index, &mut track).await;
+    let result = deliver_ass_inner(
+        state,
+        id_str,
+        media_source_id,
+        stream_index,
+        query,
+        &mut track,
+    )
+    .await;
     record_delivery(DeliveryFormat::Ass, track, stream_index, &result);
     result
 }
@@ -569,6 +579,7 @@ async fn deliver_ass_inner(
     id_str: &str,
     media_source_id: Option<&str>,
     stream_index: u32,
+    query: &str,
     track: &mut DeliveredTrack,
 ) -> Result<HttpResponse, actix_web::Error> {
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
@@ -580,6 +591,11 @@ async fn deliver_ass_inner(
         media_source_id,
     )
     .await?;
+
+    if crate::styled_track::is_styled_index(&item, stream_index).await {
+        *track = DeliveredTrack::generated();
+        return deliver_styled_ass(state, &item, stream_index, query).await;
+    }
 
     // A sidecar is found once, so the track counted is the file served.
     let sidecar_base = sidecar_base_index(&item.probe);
@@ -601,6 +617,135 @@ async fn deliver_ass_inner(
         .content_type("text/x-ssa; charset=utf-8")
         .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
         .body(bytes))
+}
+
+/// Serve the generated Pharos styled track (spec 028 FR-017): the item's
+/// stored effect plan compiled over its source subtitle for `?tier=` (default
+/// `tv`) and `?effects=` (default `subtle`). Cached per tier, level, compiler
+/// and director version and the plan's `styled_at` stamp, so a restyle or a
+/// version bump never serves an old script.
+async fn deliver_styled_ass(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    styled_idx: u32,
+    query: &str,
+) -> Result<HttpResponse, actix_web::Error> {
+    use pharos_styling::{EffectsLevel, Tier};
+
+    let tier = match query_param(query, "tier") {
+        None => Tier::Tv,
+        Some(v) => Tier::parse(v).ok_or_else(|| error::ErrorBadRequest("unknown tier"))?,
+    };
+    let level = match query_param(query, "effects") {
+        None => EffectsLevel::Subtle,
+        Some(v) => {
+            EffectsLevel::parse(v).ok_or_else(|| error::ErrorBadRequest("unknown effects level"))?
+        }
+    };
+    let Some(row) = crate::styled_track::current(&state.stores, item).await else {
+        return Err(error::ErrorNotFound("no styled track for this item"));
+    };
+    let kind = SubtitleKind::Styled {
+        tier: u8::try_from(Tier::ALL.iter().position(|t| *t == tier).unwrap_or(0))
+            .unwrap_or(u8::MAX),
+        level: u8::try_from(
+            EffectsLevel::ALL
+                .iter()
+                .position(|l| *l == level)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u8::MAX),
+        compiler_version: pharos_styling::COMPILER_VERSION,
+        director_version: pharos_styling::DIRECTOR_VERSION,
+        plan_stamp: row.styled_at,
+    };
+    let mtime = mtime_secs(&item.path).await;
+    let cache = state.subtitles.as_ref();
+    let _guard;
+    if let Some(cache) = cache {
+        if let Some(bytes) = cache.get(&item.path, mtime, styled_idx, kind).await {
+            return Ok(styled_response(tier, (*bytes).clone()));
+        }
+        let lock = cache.lock(&item.path, mtime, styled_idx, kind).await;
+        _guard = lock.lock_owned().await;
+        if let Some(bytes) = cache.get(&item.path, mtime, styled_idx, kind).await {
+            return Ok(styled_response(tier, (*bytes).clone()));
+        }
+    }
+    let script = match styled_script(state, item, &row, tier, level).await {
+        Ok(script) => script,
+        Err(e) => {
+            tracing::error!(
+                media.id = item.id,
+                source_index = row.source_index,
+                tier = tier.label(),
+                effects = level.label(),
+                error = %e,
+                "styled subtitle could not be compiled"
+            );
+            return Err(error::ErrorInternalServerError("styled subtitle failed"));
+        }
+    };
+    let bytes = match cache {
+        Some(cache) => (*cache
+            .store(&item.path, mtime, styled_idx, kind, script)
+            .await)
+            .clone(),
+        None => script,
+    };
+    Ok(styled_response(tier, bytes))
+}
+
+fn styled_response(tier: pharos_styling::Tier, body: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/x-ssa; charset=utf-8")
+        // The URL stays the same across a restyle, so the client revalidates.
+        .insert_header((header::CACHE_CONTROL, "private, no-cache"))
+        .insert_header(("X-Pharos-Subtitle-Tier", tier.label()))
+        .body(body)
+}
+
+/// Compiles the item's stored plan over the source subtitle. An ASS source
+/// (embedded or sidecar) and any sidecar are read as they are, `source::read`
+/// sniffing ASS, WebVTT or SRT; an embedded SRT or other text stream is read
+/// from its WebVTT extraction.
+async fn styled_script(
+    state: &AppState,
+    item: &pharos_core::MediaItem,
+    row: &pharos_core::SubtitleStyling,
+    tier: pharos_styling::Tier,
+    level: pharos_styling::EffectsLevel,
+) -> Result<Vec<u8>, String> {
+    let sidecar_base = sidecar_base_index(&item.probe);
+    let embedded_codec = (row.source_index < sidecar_base)
+        .then(|| {
+            item.probe
+                .subtitle_tracks
+                .iter()
+                .find(|t| t.stream_index == row.source_index)
+                .and_then(|t| t.codec.as_deref())
+        })
+        .flatten();
+    let raw = match embedded_codec {
+        Some(codec) if !is_styled_text_subtitle_codec(codec) => {
+            resolve_vtt_bytes(state, item, row.source_index).await
+        }
+        _ => ass_script(state, item, row.source_index).await,
+    }
+    .map_err(|e| format!("read source: {e}"))?;
+    let plan_json = row.plan_json.clone().ok_or("row has no plan")?;
+    tokio::task::spawn_blocking(move || {
+        // Lossy, as the styling job reads it: the plan's line indices only hold
+        // over the same text.
+        let text = String::from_utf8_lossy(&raw);
+        let source = pharos_styling::source::read(&text).map_err(|e| format!("source: {e}"))?;
+        let plan = serde_json::from_str::<pharos_styling::EffectPlan>(&plan_json)
+            .map_err(|e| format!("plan: {e}"))?;
+        let theme = pharos_styling::theme::Theme::pharos();
+        Ok(pharos_styling::compile(&plan, &source.lines, &theme, tier, level).into_bytes())
+    })
+    .await
+    .map_err(|e| format!("compile task: {e}"))?
 }
 
 /// The raw ASS/SSA script of the subtitle at `stream_index`: a sidecar's file
@@ -1796,6 +1941,8 @@ impl DeliveryFormat {
 pub(crate) enum DeliverySource {
     Embedded,
     Sidecar,
+    /// The Pharos styled track compiled from a stored plan (spec 028).
+    Generated,
     /// The request failed before the item was read (bad id, no item).
     #[default]
     Unknown,
@@ -1803,12 +1950,18 @@ pub(crate) enum DeliverySource {
 
 impl DeliverySource {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 3] = [Self::Embedded, Self::Sidecar, Self::Unknown];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Embedded,
+        Self::Sidecar,
+        Self::Generated,
+        Self::Unknown,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Embedded => "embedded",
             Self::Sidecar => "sidecar",
+            Self::Generated => "generated",
             Self::Unknown => "unknown",
         }
     }
@@ -1872,6 +2025,15 @@ impl DeliveredTrack {
                 .as_deref()
                 .map_or(CodecClass::Unknown, CodecClass::of_codec),
             codec: ext.unwrap_or_default(),
+        }
+    }
+
+    /// The styled track: generated ASS, which no source codec describes.
+    fn generated() -> Self {
+        Self {
+            source: DeliverySource::Generated,
+            class: CodecClass::Styled,
+            codec: "ass".to_owned(),
         }
     }
 
