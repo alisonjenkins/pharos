@@ -179,7 +179,10 @@ test.describe("pharos Dioxus UI watch together", () => {
         await expect(p.locator(".pharos-member-list li")).toHaveCount(2, { timeout: 15_000 });
       }
       await waitUntilInSync([byA, byB]);
-      expect((await byB.probe()).currentTime).toBeGreaterThan(before);
+      // At the group's place, not the start: within the oracle's 1.5 s of
+      // where A was. B's own resume point can sit just behind the group's
+      // (an earlier run left it there), which the drift check closes by rate.
+      expect((await byB.probe()).currentTime).toBeGreaterThan(before - 1.5);
     } catch (e) {
       throw await failure(e, a, b, logs);
     }
@@ -275,6 +278,14 @@ test.describe("pharos Dioxus UI watch together", () => {
       const track = await subtitles(a.page).locator("option").nth(1).getAttribute("value");
       expect(track, "a subtitle track is offered").toMatch(/^\d+$/);
       await expect(subtitles(b.page)).toHaveValue("off");
+      // The server starts a user on the subtitle they last picked for the
+      // item, and this case ends with A's on: an earlier run leaves A showing
+      // it, and picking what is shown sends nothing. Start A from off.
+      if ((await subtitles(a.page).inputValue()) !== "off") {
+        await pickUntil(a.page, "Subtitles", "off", () =>
+          expect(subtitles(a.page)).toHaveValue("off", { timeout: 5_000 }),
+        );
+      }
       await pickUntil(a.page, "Subtitles", track!, () =>
         expect(subtitles(b.page)).toHaveValue(track!, { timeout: 5_000 }),
       );
