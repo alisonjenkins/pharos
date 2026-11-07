@@ -53,6 +53,14 @@ driven by a thin MSE adapter in `pharos-ui`, as specified in
   fallback (also when the Rust engine fails to start) until the spec's
   parity table and weak-device budgets are met. Flipping the default is a
   separate change with its own measurements.
+- Quality switching lives in the engine, not in UI reloads. When the Rust
+  engine asks (`abr=1`), the server's browser master lists an H.264 fMP4
+  ladder on the shared segment grid, one rung per `Variant` up to the source
+  and the session cap, all bound to the one demuxed audio group. The engine
+  switches rung at a segment boundary on the same `SourceBuffer`, by a pure
+  ABR rule in `pharos-hls` that knows rungs are encoded on demand (an
+  up-switch costs a cold segment encode). hls.js clients keep the single-rung
+  master.
 - The engine reports through the same paths hls.js does (`OnFatal`,
   `OnFragment`, `playbackError` client events), with `engine=rust`.
 
@@ -64,22 +72,28 @@ driven by a thin MSE adapter in `pharos-ui`, as specified in
   and visible in telemetry.
 - We own an HLS client. Its behaviour is narrow on purpose: it plays the
   playlists Pharos emits, and rejects anything else with a named reason
-  rather than guessing (live playlists, TS, encryption, multi-rung ABR all
-  fall back to hls.js until a slice adds them).
+  rather than guessing (live playlists, TS and encryption fall back to
+  hls.js).
 - The fixes hls.js makes quietly (small buffered gaps, `tfdt` drift between
   audio and video, stalls at segment boundaries) must be rediscovered, so
   each slice is checked against hls.js on the same streams before merging.
-- More code to maintain than a vendored script: a parser, a scheduler and
-  an MSE driver, plus their tests and a comparison harness.
+- More code to maintain than a vendored script: a parser, a scheduler, an
+  ABR rule and an MSE driver, plus their tests and a comparison harness.
+- A viewer whose link drops gets a lower rung within a segment or two
+  instead of a stall and a reload. The server encodes a rung only when it
+  is fetched, so a switch spends one cold encode; H.264 rungs can use the
+  GPU (spec 003), VP9 stays one rung.
 
 ## Alternatives considered
 
 - **Keep hls.js.** No new code, but no control over buffering on weak
   devices, a 190 KB second download, and nothing reusable outside a browser.
   Remains the fallback.
-- **Port hls.js whole, including the TS transmuxer and multi-rung ABR.** The
-  server already sends fMP4 with a single rung to browsers, so that work would
-  run on nothing but the audio-only ladder. Deferred until a measured need.
+- **Port hls.js whole, including the TS transmuxer.** The server already
+  sends fMP4 to browsers, so the transmuxer would run on nothing but the
+  audio-only ladder. Deferred until a measured need.
+- **Keep quality changes as UI reloads.** No server change, but every change
+  restarts the stream and shows a gap; rejected by Alison (2026-11-07).
 - **Run the engine in a Web Worker with MSE-in-Worker.** Not available in
   every target browser, and with no transmux the main-thread cost is an
   append call per segment. Revisit if the slice 0 baseline shows main-thread
