@@ -1492,6 +1492,29 @@ fn source_video_kind(
     )
 }
 
+/// The (`tonemap`, `source_range`) pairs `source_tonemap` can emit. Bounded:
+/// `video_range_type` answers one of three strings.
+pub(crate) const TONEMAP_SERIES: [(pharos_transcode::Tonemap, &str); 3] = [
+    (pharos_transcode::Tonemap::Off, "SDR"),
+    (pharos_transcode::Tonemap::HdrToSdr, "HDR10"),
+    (pharos_transcode::Tonemap::HdrToSdr, "HLG"),
+];
+
+/// Whether a transcode of this source maps HDR pixels to SDR (ADR-0070), and
+/// the one place that counts the decision (`pharos_transcode_tonemap_total`).
+/// Every transcode output is 8-bit SDR, so any HDR source needs it.
+pub(crate) fn source_tonemap(probe: &pharos_core::MediaProbe) -> pharos_transcode::Tonemap {
+    let range = probe.video_range_type();
+    let tonemap = pharos_transcode::Tonemap::for_range_type(range);
+    metrics::counter!(
+        "pharos_transcode_tonemap_total",
+        "tonemap" => tonemap.label(),
+        "source_range" => range,
+    )
+    .increment(1);
+    tonemap
+}
+
 fn build_segment_opts(
     session: Option<crate::transcode_sessions::TranscodeSession>,
     item: &pharos_core::MediaItem,
@@ -1649,7 +1672,7 @@ fn build_segment_opts(
                     burn_fonts_dir: None,
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
-                    tonemap: pharos_transcode::Tonemap::Off,
+                    tonemap: source_tonemap(&item.probe),
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1686,7 +1709,7 @@ fn build_segment_opts(
                     burn_fonts_dir: None,
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
-                    tonemap: pharos_transcode::Tonemap::Off,
+                    tonemap: source_tonemap(&item.probe),
                 };
             }
             _ => {}
@@ -1723,7 +1746,7 @@ fn build_segment_opts(
         burn_fonts_dir: None,
         video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
-        tonemap: pharos_transcode::Tonemap::Off,
+        tonemap: source_tonemap(&item.probe),
     }
 }
 
@@ -3621,7 +3644,7 @@ fn fmp4_segment_opts_resolved(
         burn_fonts_dir: None,
         video_3d_format: item.probe.video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
-        tonemap: pharos_transcode::Tonemap::Off,
+        tonemap: source_tonemap(&item.probe),
     }
 }
 
@@ -5009,6 +5032,55 @@ mod tests {
         let opts = build_segment_opts(None, &item, 0, None, None);
         assert_eq!(opts.burn_subtitle_stream_index, None);
         assert!(!opts.burn_subtitle_is_text);
+    }
+
+    /// ADR-0070 — an HDR source is tonemapped on every transcode path, an SDR
+    /// source never, and each decision is counted with its source range.
+    #[::core::prelude::v1::test]
+    fn hdr_sources_are_tonemapped_and_the_decision_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use pharos_transcode::Tonemap;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut item = item_with_subs();
+        for (transfer, want) in [
+            (None, Tonemap::Off),
+            (Some("bt709"), Tonemap::Off),
+            (Some("smpte2084"), Tonemap::HdrToSdr),
+            (Some("arib-std-b67"), Tonemap::HdrToSdr),
+        ] {
+            item.probe.color_transfer = transfer.map(str::to_string);
+            let opts = build_segment_opts(None, &item, 0, None, None);
+            assert_eq!(opts.tonemap, want, "{transfer:?}");
+        }
+
+        let mut seen = Vec::new();
+        for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
+            if ck.key().name() != "pharos_transcode_tonemap_total" {
+                continue;
+            }
+            let label = |n: &str| {
+                ck.key()
+                    .labels()
+                    .find(|l| l.key() == n)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default()
+            };
+            if let DebugValue::Counter(c) = v {
+                seen.push((label("tonemap"), label("source_range"), c));
+            }
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("hdr_to_sdr".into(), "HDR10".into(), 1),
+                ("hdr_to_sdr".into(), "HLG".into(), 1),
+                ("off".into(), "SDR".into(), 2),
+            ]
+        );
     }
 
     #[actix_web::test]

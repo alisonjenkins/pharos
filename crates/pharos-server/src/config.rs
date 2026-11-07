@@ -707,9 +707,9 @@ pub struct ServerConfig {
     pub remote_default_bitrate_bps: u64,
     /// Enforce `VideoRangeType` conditions (Jellyfin profiles, and a native
     /// player with `hdr=false`) so an HDR source is transcoded instead of
-    /// direct-played. Default `false`: pharos has no tonemapping, so a
-    /// transcode would show washed-out colour where a browser tonemaps the
-    /// direct play itself. While off, the verdict is still computed and a
+    /// direct-played. Default `false`: a transcode tonemaps HDR to SDR in
+    /// software (ADR-0070), which is costly and coarser than a browser
+    /// tonemapping the direct play itself. While off, the verdict is still computed and a
     /// would-block is counted in `pharos_video_range_unenforced_total`.
     ///
     /// Native clients built before the `hdr` capability existed send
