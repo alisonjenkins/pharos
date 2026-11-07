@@ -100,6 +100,10 @@ pub fn position_ms(_video_id: &str) -> u64 {
     0
 }
 
+pub fn ended(_video_id: &str) -> bool {
+    false
+}
+
 pub fn media_state(_video_id: &str) -> MediaState {
     MediaState::default()
 }
