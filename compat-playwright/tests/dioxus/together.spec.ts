@@ -364,6 +364,51 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // 014 US7: the group's audio pick, like its subtitle pick, reaches a
+  // following member, whose player loads the new track and plays on in step.
+  test("the group's audio pick reaches B and both play on in step", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(180_000);
+    const { a, b, people, logs } = await startGroup(
+      browser,
+      request,
+      open,
+      "/multitrack.mkv",
+      { accounts: [OPTED_IN_A, OPTED_IN_B] },
+    );
+    const audio = (p: Page) => p.getByRole("combobox", { name: "Audio", exact: true });
+    try {
+      await waitUntilInSync(people);
+      // Mid-film, as a viewer would.
+      await bothPast(people, 5);
+      const first = await audio(a.page).inputValue();
+      const second = await audio(a.page).locator("option").nth(1).getAttribute("value");
+      expect(second, "a second audio track is offered").toMatch(/^\d+$/);
+      expect(second).not.toBe(first);
+      await expect(audio(b.page)).toHaveValue(first);
+
+      // A switches to the second track; B's picker and player follow.
+      await pickUntil(a.page, "Audio", second!, () =>
+        expect(audio(b.page)).toHaveValue(second!, { timeout: 5_000 }),
+      );
+      await expect(audio(a.page)).toHaveValue(second!);
+      await expect(b.page.locator(".pharos-activity-line").last()).toContainText(
+        `${OPTED_IN_A.name} switched audio`,
+      );
+      await waitUntilInSync(people);
+
+      // B switches back; A follows.
+      await pickUntil(b.page, "Audio", first, () =>
+        expect(audio(a.page)).toHaveValue(first, { timeout: 5_000 }),
+      );
+      await waitUntilInSync(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
 
 /** Clicks `member`'s seek bar at `fraction` of its width. */
