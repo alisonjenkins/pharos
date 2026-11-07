@@ -20,6 +20,7 @@ pharos-jellyfin-api = { path = "../pharos-jellyfin-api" }
 pharos-scanner = { path = "../pharos-scanner" }
 pharos-store-sqlx = { path = "../pharos-store-sqlx" }
 pharos-sync = { path = "../pharos-sync" }
+pharos-styling = { path = "../pharos-styling" }
 pharos-transcode = { path = "../pharos-transcode", default-features = false }
 actix-cors.workspace = true
 actix-files.workspace = true
