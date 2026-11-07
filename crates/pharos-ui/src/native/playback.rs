@@ -1449,6 +1449,21 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
+/// The URL of a generated styled track's script at `tier` and `level`
+/// (spec 028 FR-006): `None` for any other track, and for every track while
+/// Effects is Off, where the plain track draws instead.
+pub fn styled_track_url(track: &Track, tier: Tier, level: EffectsLevel) -> Option<String> {
+    if level == EffectsLevel::Off {
+        return None;
+    }
+    let url = track.styled_url.as_deref()?;
+    Some(format!(
+        "{url}?tier={}&effects={}",
+        tier.label(),
+        level.as_str()
+    ))
+}
+
 /// The log line and client event for the ASS renderer getting ready or
 /// failing, which falls back to plain text (B600). Both outcomes carry the
 /// same fields, so a fallback is as visible in the server log as a success.
@@ -2404,6 +2419,35 @@ mod tests {
             SubtitleSwitch::Renegotiate
         );
         assert_eq!(subtitle_switch(true, None), SubtitleSwitch::Renegotiate);
+    }
+
+    #[test]
+    fn a_styled_track_is_fetched_at_the_tier_and_level() {
+        let styled = Track {
+            vtt_url: Some("/videos/7/subtitles/3/stream.vtt".into()),
+            styled_url: Some("/videos/7/subtitles/3/stream.ass".into()),
+            ..Track::default()
+        };
+        assert_eq!(
+            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle).as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Desktop, EffectsLevel::Full).as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=desktop&effects=full")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Low, EffectsLevel::Off),
+            None
+        );
+        let source = Track {
+            styled_url: None,
+            ..styled
+        };
+        assert_eq!(
+            styled_track_url(&source, Tier::Tv, EffectsLevel::Full),
+            None
+        );
     }
 
     #[test]
