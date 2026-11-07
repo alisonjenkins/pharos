@@ -315,6 +315,24 @@ impl NativeMembership {
         })
     }
 
+    /// Moves the group to `item` from `position_ms` (014 US9): the next or
+    /// previous episode, or another title. `playlist_item_id` is the entry
+    /// this member moves from; the group drops the move if it has already
+    /// left it. Needs a server on schemaVersion 23 or later.
+    pub async fn set_item(
+        &self,
+        call: &CallInfo,
+        item: ItemRef,
+        position_ms: u64,
+        playlist_item_id: &str,
+    ) -> Result<(), ClientError> {
+        command!(self, call, set_item_request, |p| {
+            set_item_ref(p.reborrow().init_item(), item);
+            p.set_position_ms(position_ms);
+            p.set_playlist_item_id(playlist_item_id);
+        })
+    }
+
     /// `false` puts this member on their own tracks ("Just me"); `true`
     /// puts them back on the group's.
     pub async fn follow_tracks(&self, call: &CallInfo, follow: bool) -> Result<(), ClientError> {
