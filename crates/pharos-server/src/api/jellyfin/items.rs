@@ -26,6 +26,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore, UserDataStore, UserId};
+use pharos_jellyfin_api::kinds::ItemType;
 use pharos_store_sqlx::ServerConfigStore;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument as _;
@@ -2897,36 +2898,6 @@ async fn latest_items(
     Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 
-/// Types pharos SYNTHESISES rather than stores: they are not a [`MediaKind`],
-/// but a request naming one is still answerable — by a short-circuit, or by
-/// post-processing stored rows (Series/Season tiles are folded out of episode
-/// rows further down this very path). Naming one must NOT be read as "nothing
-/// can match".
-///
-/// Anything outside this list and outside [`MediaKind::from_wire`] is a type
-/// pharos holds none of, so the honest answer is an empty list.
-const SYNTHESISED_ITEM_TYPES: &[&str] = &[
-    "series",
-    "season",
-    "musicalbum",
-    "musicartist",
-    "playlist",
-    "boxset",
-    "folder",
-    "collectionfolder",
-    "userview",
-    "genre",
-    "musicgenre",
-    "studio",
-    "person",
-    "tvchannel",
-    "livetvchannel",
-    "program",
-    "tvprogram",
-    "livetvprogram",
-    "recording",
-];
-
 /// On the `/Items` path every synth short-circuit (MusicAlbum, MusicArtist,
 /// Playlist, BoxSet, the show folders) has declined the request before this
 /// runs, and the SQL path can only return stored kinds, so naming none of
@@ -2936,33 +2907,43 @@ fn parse_kind_filter(include: Option<&str>) -> KindFilter {
     let Some(raw) = include.map(str::trim).filter(|s| !s.is_empty()) else {
         return KindFilter::Unset;
     };
-    let named: Vec<&str> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    if named.is_empty() {
+    // Separators only (`,`, ` , `) name no token at all: nothing narrows.
+    if raw.split(',').all(|t| t.trim().is_empty()) {
         return KindFilter::Unset;
     }
-    let wanted: Vec<MediaKind> = named
-        .iter()
-        .filter_map(|t| MediaKind::from_wire(t))
-        .collect();
+    let types = ItemType::parse_list(raw);
+    let wanted = ItemType::stored_kinds(raw);
     if !wanted.is_empty() {
         return KindFilter::Kinds(wanted);
     }
-    // `Audiobook`/`AudioBook` land here on purpose: audiobooks are out of scope
-    // (specs/004-books), so no stored kind is one and the query matches nothing.
+    // `AudioBook` lands in `MatchesNothing` on purpose: audiobooks are out of
+    // scope (specs/004-books), so no stored kind is one. Unknown tokens are
+    // ignored (V583), so an all-unknown list also matches nothing.
     // No stored kind named. If any named type is one pharos synthesises, leave
     // the query unfiltered and let the path that understands it answer.
-    let any_synth = named.iter().any(|t| {
-        let t = t.to_ascii_lowercase();
-        SYNTHESISED_ITEM_TYPES.contains(&t.as_str())
-    });
-    if any_synth {
+    if types.iter().any(|t| t.is_synthesised()) {
         KindFilter::Unset
     } else {
         KindFilter::MatchesNothing
+    }
+}
+
+#[cfg(test)]
+mod include_item_types_tests {
+    use super::*;
+
+    #[test]
+    fn separators_only_list_is_unset_not_matches_nothing() {
+        assert_eq!(parse_kind_filter(Some(",")), KindFilter::Unset);
+        assert_eq!(parse_kind_filter(Some(" , ")), KindFilter::Unset);
+    }
+
+    #[test]
+    fn unknown_only_list_matches_nothing() {
+        assert_eq!(
+            parse_kind_filter(Some("SomeFutureType")),
+            KindFilter::MatchesNothing
+        );
     }
 }
 
@@ -3391,27 +3372,18 @@ fn default_limit() -> u32 {
     100
 }
 
-/// LIB-C5 — a `/Items?IncludeItemTypes=BoxSet` request (with no media
-/// kinds alongside) is asking for the box-set list, which lives in the
-/// `collections` entity table, NOT the media_items `store.list()` set
-/// that powers the rest of `/Items`. Detect that shape so the handler
-/// can short-circuit to the box sets (the "Collections" library view
-/// jellyfin-web renders). Returns `None` when BoxSet wasn't requested
-/// (or was requested alongside real media kinds, which we don't mix).
-fn boxset_only_request(q: &ListQuery) -> bool {
-    let Some(types) = q.include_item_types.as_deref() else {
-        return false;
-    };
-    let mut saw_boxset = false;
-    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if t.eq_ignore_ascii_case("BoxSet") {
-            saw_boxset = true;
-        } else {
-            // Any non-BoxSet type → this isn't a pure box-set request.
-            return false;
-        }
-    }
-    saw_boxset
+/// True when `/Items` asks ONLY for `t`, with no other kind alongside. Those
+/// requests short-circuit before the media_items set is read:
+/// - `BoxSet` (LIB-C5): box sets live in the `collections` entity table.
+/// - `Playlist` (T70): playlists live in the `playlists` entity table.
+/// - `MusicAlbum`: pharos stores no album entity (albums are grouped from
+///   audio rows). Without the short-circuit the type filter silently
+///   dropped nothing and the request returned every kind (jellyfin-web's
+///   "More From {artist}" rail rendered TV shows and movies).
+fn only_type(q: &ListQuery, t: ItemType) -> bool {
+    q.include_item_types
+        .as_deref()
+        .is_some_and(|types| ItemType::list_is_only(types, &[t]))
 }
 
 /// Build the box-set `/Items` page (entity-backed) for a BoxSet-only
@@ -3438,25 +3410,6 @@ async fn list_boxsets_page(
         })
         .unwrap_or(serde_json::Value::Null),
     )
-}
-
-/// T70 — an `?IncludeItemTypes=Playlist` request (with no media kinds
-/// alongside) asks for the playlist list, which lives in the `playlists`
-/// entity table, NOT the media_items set. Same shape as
-/// [`boxset_only_request`].
-fn playlist_only_request(q: &ListQuery) -> bool {
-    let Some(types) = q.include_item_types.as_deref() else {
-        return false;
-    };
-    let mut saw = false;
-    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if t.eq_ignore_ascii_case("Playlist") {
-            saw = true;
-        } else {
-            return false;
-        }
-    }
-    saw
 }
 
 /// Build the playlist `/Items` page (entity-backed) for a Playlist-only
@@ -3493,28 +3446,6 @@ async fn list_playlists_page(
         })
         .unwrap_or(serde_json::Value::Null),
     )
-}
-
-/// A `/Items` request that asks ONLY for MusicAlbum rows. pharos stores no
-/// album entity — albums are synthesised by grouping audio rows — so this
-/// short-circuits to [`list_music_albums_page`] the same way BoxSet /
-/// Playlist requests do. (`MediaKind::from_wire` has no MusicAlbum mapping,
-/// so without the short-circuit the type filter silently DROPPED nothing and
-/// the request returned every kind — jellyfin-web's "More From {artist}"
-/// rail rendered TV shows + movies under a music album.)
-fn music_album_only_request(q: &ListQuery) -> bool {
-    let Some(types) = q.include_item_types.as_deref() else {
-        return false;
-    };
-    let mut saw = false;
-    for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if t.eq_ignore_ascii_case("MusicAlbum") {
-            saw = true;
-        } else {
-            return false;
-        }
-    }
-    saw
 }
 
 /// Parse a comma-separated synth-id list into a set for hash matching.
@@ -3796,7 +3727,7 @@ async fn maybe_list_music(
 ) -> Result<Option<HttpResponse>, actix_web::Error> {
     use crate::api::jellyfin::dto::{album_id_for, artist_id_for};
 
-    let album_only = music_album_only_request(q);
+    let album_only = only_type(q, ItemType::MusicAlbum);
     // Artist-children shape: ParentId resolves to an artist, no type filter.
     let artist_parent: Option<String> = if q.include_item_types.is_none() {
         match resolve_parent_filter(state, q.parent_id.as_deref())
@@ -3950,13 +3881,13 @@ async fn list_items(
     q: CiQuery<ListQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
-    if boxset_only_request(&q) {
+    if only_type(&q, ItemType::BoxSet) {
         return Ok(crate::api::jellyfin::wire::json(
             &list_boxsets_page(&state, &user.0, &q).await?,
         ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
-    if playlist_only_request(&q) {
+    if only_type(&q, ItemType::Playlist) {
         return Ok(crate::api::jellyfin::wire::json(
             &list_playlists_page(&state, &user.0, &q).await?,
         ));
@@ -3984,13 +3915,13 @@ async fn list_user_items(
         return Err(error::ErrorForbidden("user mismatch"));
     }
     // LIB-C5 — BoxSet-only listing comes from the collections entity table.
-    if boxset_only_request(&q) {
+    if only_type(&q, ItemType::BoxSet) {
         return Ok(crate::api::jellyfin::wire::json(
             &list_boxsets_page(&state, &user.0, &q).await?,
         ));
     }
     // T70 — Playlist-only listing comes from the playlists entity table.
-    if playlist_only_request(&q) {
+    if only_type(&q, ItemType::Playlist) {
         return Ok(crate::api::jellyfin::wire::json(
             &list_playlists_page(&state, &user.0, &q).await?,
         ));
@@ -4746,7 +4677,7 @@ pub(crate) fn build_media_query(
         f.genre_probe_token = Some(token.clone());
     }
     if let Some(types) = q.exclude_item_types.as_deref() {
-        f.exclude_kinds = types.split(',').filter_map(MediaKind::from_wire).collect();
+        f.exclude_kinds = ItemType::stored_kinds(types);
     }
     if let Some(raw) = q.media_types.as_deref() {
         let want_audio = raw
@@ -5850,20 +5781,12 @@ pub(crate) enum ShowFolderKind {
 
 fn virtual_show_kind(include_item_types: Option<&str>) -> Option<ShowFolderKind> {
     let raw = include_item_types?;
-    let types: Vec<String> = raw
-        .split(',')
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if types.is_empty() {
-        return None;
-    }
     // Every requested type must be a virtual show folder for us to intercept.
-    if !types.iter().all(|t| t == "series" || t == "season") {
+    if !ItemType::list_is_only(raw, &[ItemType::Series, ItemType::Season]) {
         return None;
     }
     // Season wins when present (a Season browse is always scoped to a series).
-    if types.iter().any(|t| t == "season") {
+    if ItemType::parse_list(raw).contains(&ItemType::Season) {
         Some(ShowFolderKind::Season)
     } else {
         Some(ShowFolderKind::Series)

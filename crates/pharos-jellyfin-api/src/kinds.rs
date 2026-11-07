@@ -270,6 +270,30 @@ mod tests {
     }
 
     #[test]
+    fn media_kind_is_read_through_item_type() {
+        // Case-insensitive and trimmed, as the retired MediaKind::from_wire was.
+        assert_eq!(
+            ItemType::from_wire("Book").and_then(ItemType::media_kind),
+            Some(MediaKind::Book)
+        );
+        assert_eq!(
+            ItemType::from_wire(" audio ").and_then(ItemType::media_kind),
+            Some(MediaKind::Audio)
+        );
+        assert_eq!(
+            ItemType::from_wire("EPISODE").and_then(ItemType::media_kind),
+            Some(MediaKind::Episode)
+        );
+        for t in ["Series", "Season", "MusicAlbum", "BoxSet", "Person", ""] {
+            assert_eq!(
+                ItemType::from_wire(t).and_then(ItemType::media_kind),
+                None,
+                "{t} must not map to a stored kind"
+            );
+        }
+    }
+
+    #[test]
     fn first_of_takes_the_first_non_empty_token_only() {
         assert_eq!(
             SortField::first_of(" ,DateCreated"),

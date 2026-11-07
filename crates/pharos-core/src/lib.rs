@@ -2485,27 +2485,9 @@ impl MediaKind {
         }
     }
 
-    /// T88(d) — the single canonical parser for the Jellyfin wire `Type`
-    /// discriminator (`IncludeItemTypes` / `Type` params). Case-insensitive:
-    /// some clients send lowercase (Finamp's `audio`) and real Jellyfin
-    /// accepts both. `None` for a value that names no STORABLE kind —
-    /// synthesised Series / Season / MusicAlbum / BoxSet / Person are not
-    /// `MediaKind`s, so those callers handle them explicitly. Replaces the
-    /// two divergent match tables (one was case-sensitive, silently dropping
-    /// lowercase types) so a typo can never silently no-match in one path
-    /// but match in another.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "movie" => Some(MediaKind::Movie),
-            "episode" => Some(MediaKind::Episode),
-            "audio" => Some(MediaKind::Audio),
-            "book" => Some(MediaKind::Book),
-            _ => None,
-        }
-    }
-
     /// The Jellyfin `BaseItemKind` wire token (`BaseItemDto.Type`) for this
-    /// kind — PascalCase, the inverse of [`Self::from_wire`]. Distinct from
+    /// kind — PascalCase, the spelling `ItemType::from_wire` in
+    /// `pharos-jellyfin-api` parses back. Distinct from
     /// [`Self::as_str`], which is the lowercase internal token. The kotlin
     /// `BaseItemDto` deserializer hard-REQUIRES `Type` on every item, so this
     /// is the single canonical projection every wire builder must use — a
@@ -2560,29 +2542,6 @@ mod artwork_source_tests {
         assert!(!artwork_source_is_item_servable("url"));
         assert!(!artwork_source_is_item_servable(""));
         assert!(!artwork_source_is_item_servable("fanart"));
-    }
-}
-
-#[cfg(test)]
-mod media_kind_wire_tests {
-    use super::MediaKind;
-
-    #[test]
-    fn from_wire_is_case_insensitive_and_trims() {
-        // PascalCase (real Jellyfin) AND lowercase (Finamp) both parse — the
-        // old search.rs table was case-sensitive and silently dropped these.
-        assert_eq!(MediaKind::from_wire("Movie"), Some(MediaKind::Movie));
-        assert_eq!(MediaKind::from_wire("movie"), Some(MediaKind::Movie));
-        assert_eq!(MediaKind::from_wire(" Audio "), Some(MediaKind::Audio));
-        assert_eq!(MediaKind::from_wire("EPISODE"), Some(MediaKind::Episode));
-    }
-
-    #[test]
-    fn from_wire_none_for_synthesised_or_unknown_types() {
-        // Series/Season/MusicAlbum/BoxSet/Person are not storable MediaKinds.
-        for t in ["Series", "Season", "MusicAlbum", "BoxSet", "Person", ""] {
-            assert_eq!(MediaKind::from_wire(t), None, "{t} must not parse");
-        }
     }
 }
 
