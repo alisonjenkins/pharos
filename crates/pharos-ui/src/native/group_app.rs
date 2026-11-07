@@ -74,6 +74,10 @@ impl GroupPlayer for VideoPlayer {
         platform::media_state(self.id).paused
     }
 
+    fn ended(&self) -> bool {
+        platform::ended(self.id)
+    }
+
     fn play(&self) {
         platform::play(self.id);
     }

@@ -403,6 +403,11 @@ pub fn position_ms(video_id: &str) -> u64 {
     video_element(video_id).map_or(0, |v| seconds_to_ms(v.current_time()))
 }
 
+/// Whether the `<video>` played to its end; false when it is gone.
+pub fn ended(video_id: &str) -> bool {
+    video_element(video_id).is_some_and(|v| v.ended())
+}
+
 /// What the controls show of the `<video>`.
 pub fn media_state(video_id: &str) -> MediaState {
     video_element(video_id).map_or_else(MediaState::default, |v| MediaState {

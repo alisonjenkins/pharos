@@ -96,6 +96,8 @@ pub trait Env {
 pub trait GroupPlayer {
     fn position_ms(&self) -> u64;
     fn paused(&self) -> bool;
+    /// The video played to its end (it is paused there, not by anyone).
+    fn ended(&self) -> bool;
     fn play(&self);
     fn pause(&self);
     fn seek_ms(&self, ms: u64);
@@ -1186,8 +1188,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             return;
         }
         if player.paused() {
-            // A player still owing its ready is loading what the group asked for.
-            if !owes_ready {
+            // A player still owing its ready is loading what the group asked
+            // for; one at its end has nothing left to play.
+            if !owes_ready && !player.ended() {
                 self.resume_paused(&player, expected, since, now);
             }
             return;
@@ -1712,6 +1715,7 @@ mod tests {
     struct TestPlayer {
         position: Cell<u64>,
         paused: Cell<bool>,
+        ended: Cell<bool>,
         log: RefCell<Vec<String>>,
         /// Audio and subtitle stream indexes of the item.
         streams: RefCell<(Vec<u32>, Vec<u32>)>,
@@ -1724,6 +1728,9 @@ mod tests {
         }
         fn paused(&self) -> bool {
             self.paused.get()
+        }
+        fn ended(&self) -> bool {
+            self.ended.get()
         }
         fn play(&self) {
             self.paused.set(false);
@@ -2495,6 +2502,22 @@ mod tests {
         rig.env.now.set(113_000);
         rig.session.check_drift();
         assert_eq!(plays(), 2);
+    }
+
+    /// A video that played to its end is not restarted at the group's
+    /// position past it: the group's clock runs on until the next item.
+    #[test]
+    fn a_player_at_its_end_is_not_resumed() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.paused.set(true);
+        rig.player.ended.set(true);
+        rig.session.check_drift();
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
     }
 
     /// Paused because the group is paused, or while the video is buffering,
