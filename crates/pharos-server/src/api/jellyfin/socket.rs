@@ -1127,6 +1127,18 @@ fn is_for_another_device(b: &SocketBroadcast, device_key: &str) -> bool {
     matches!(b, SocketBroadcast::DeviceCommand { device_key: to, .. } if to != device_key)
 }
 
+/// `Data` of the `RefreshProgress` push. Fields are declared in the order of
+/// their PascalCase names, which is the order the former `serde_json::json!`
+/// map serialized to (keys sorted), so the bytes are unchanged. `progress` is
+/// owned because it is the formatted, clamped percent string; the wire value
+/// must stay a string (jellyfin-web does `parseFloat` on it).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RefreshProgressDto<'a> {
+    item_id: &'a str,
+    progress: String,
+}
+
 pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
     match b {
         SocketBroadcast::LibraryChanged { added, removed } => {
@@ -1247,10 +1259,11 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
         // and only shows the ring while it is a non-zero numeric string.
         SocketBroadcast::RefreshProgress { item_id, progress } => Some(Outbound::new(
             "RefreshProgress",
-            serde_json::json!({
-                "ItemId": item_id,
-                "Progress": format!("{:.1}", progress.clamp(0.0, 100.0)),
-            }),
+            serde_json::to_value(RefreshProgressDto {
+                item_id: &item_id,
+                progress: format!("{:.1}", progress.clamp(0.0, 100.0)),
+            })
+            .ok()?,
         )),
         SocketBroadcast::ActivityLogEntry { entry } => Some(Outbound::new(
             "ActivityLogEntry",
@@ -1653,6 +1666,27 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&over).unwrap()).unwrap();
         assert_eq!(v["Data"]["Progress"], "100.0");
+    }
+
+    #[test]
+    fn refresh_progress_dto_serializes_to_the_former_literal() {
+        // Pins the typed RefreshProgressDto to the bytes the old json! literal
+        // produced, for an in-range and a clamped percent.
+        for progress in [42.47_f64, 150.0] {
+            let formatted = format!("{:.1}", progress.clamp(0.0, 100.0));
+            let dto = RefreshProgressDto {
+                item_id: "abc123",
+                progress: formatted.clone(),
+            };
+            let old = serde_json::json!({
+                "ItemId": "abc123",
+                "Progress": formatted,
+            });
+            assert_eq!(
+                serde_json::to_string(&dto).unwrap(),
+                serde_json::to_string(&old).unwrap(),
+            );
+        }
     }
 
     #[test]
