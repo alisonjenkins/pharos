@@ -5397,6 +5397,41 @@ mod tests {
         (cache, encodes)
     }
 
+    /// [`slow_test_cache`] whose encoder blocks until the returned gate file
+    /// exists, so a test decides when the encode finishes instead of racing a
+    /// wall-clock sleep against scheduler load.
+    fn gated_test_cache(dir: &TempDir) -> (HlsSegmentCache, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join("gated-ffmpeg");
+        let encodes = dir.path().join("encodes");
+        let gate = dir.path().join("gate");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf 'e' >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nprintf '%s' '{}'\n",
+                encodes.display(),
+                gate.display(),
+                SLOW_SEGMENT_BYTES,
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = HlsSegmentCache::new(dir.path().join("cache"), 1 << 30).with_ffmpeg(&bin);
+        (cache, encodes, gate)
+    }
+
+    /// Polls `cond` until it holds. Bounded only so a broken test fails
+    /// instead of hanging; it is a state wait, not a timing assumption.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..3000 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
     /// How many times the stub encoder actually ran.
     fn encode_count(encodes: &Path) -> u64 {
         std::fs::metadata(encodes).map(|m| m.len()).unwrap_or(0)
@@ -5554,11 +5589,10 @@ mod tests {
     #[tokio::test]
     async fn a_second_requester_awaits_the_result_rather_than_the_lock() {
         let dir = TempDir::new().unwrap();
-        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(400));
+        let (cache, encodes, gate) = gated_test_cache(&dir);
         let opts = slow_opts();
 
-        let started = std::time::Instant::now();
-        let a = {
+        let request = |cache: &HlsSegmentCache| {
             let c = cache.clone();
             let o = opts.clone();
             tokio::spawn(async move {
@@ -5566,17 +5600,19 @@ mod tests {
                     .await
             })
         };
-        // Arrive well after the first requester has begun the encode.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let b = {
-            let c = cache.clone();
-            let o = opts.clone();
-            tokio::spawn(async move {
-                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
-                    .await
-            })
-        };
+        let a = request(&cache);
+        // The first requester is mid-encode (the gate holds it there) before
+        // the second one arrives.
+        wait_until("the first encode to start", || encode_count(&encodes) == 1).await;
+        let b = request(&cache);
+        // Nothing can have finished: no bytes exist until the gate opens.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !a.is_finished() && !b.is_finished(),
+            "a requester returned without bytes"
+        );
 
+        std::fs::write(&gate, b"").unwrap();
         let a = a.await.unwrap().unwrap();
         let b = b.await.unwrap().unwrap();
         assert_eq!(a, b, "both requesters get the same bytes");
@@ -5585,11 +5621,6 @@ mod tests {
             encode_count(&encodes),
             1,
             "the second requester started a second encode"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(700),
-            "the second requester serialised behind a second encode: {:?}",
-            started.elapsed()
         );
     }
 
