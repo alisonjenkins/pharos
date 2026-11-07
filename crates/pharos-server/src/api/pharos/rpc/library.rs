@@ -1145,13 +1145,14 @@ fn dto_str<'a>(dto: &'a serde_json::Value, key: &str) -> &'a str {
 }
 
 fn synth_kind(dto: &serde_json::Value) -> Kind {
-    match dto_str(dto, "Type") {
-        "Series" => Kind::Series,
-        "Season" => Kind::Season,
-        "MusicAlbum" => Kind::Album,
-        "MusicArtist" => Kind::Artist,
-        "Playlist" => Kind::Playlist,
-        "CollectionFolder" | "UserView" => Kind::Library,
+    use pharos_jellyfin_api::kinds::ItemType;
+    match ItemType::from_wire(dto_str(dto, "Type")) {
+        Some(ItemType::Series) => Kind::Series,
+        Some(ItemType::Season) => Kind::Season,
+        Some(ItemType::MusicAlbum) => Kind::Album,
+        Some(ItemType::MusicArtist) => Kind::Artist,
+        Some(ItemType::Playlist) => Kind::Playlist,
+        Some(ItemType::CollectionFolder | ItemType::UserView) => Kind::Library,
         _ => Kind::Collection,
     }
 }
