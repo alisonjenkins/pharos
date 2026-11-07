@@ -1538,6 +1538,21 @@ pub fn subtitle_font_urls(fonts: &[Font], subtitle: u32) -> Vec<String> {
         .collect()
 }
 
+/// The font URLs for the track `shown`. A generated styled track has no font
+/// route of its own, so it loads its source track's embedded fonts; none when
+/// the source is not listed.
+pub fn shown_font_urls(fonts: &[Font], tracks: &[Track], shown: u32) -> Vec<String> {
+    let is_generated = tracks
+        .iter()
+        .any(|t| t.index == shown && t.styled_url.is_some());
+    if !is_generated {
+        return subtitle_font_urls(fonts, shown);
+    }
+    source_of_styled(tracks, shown)
+        .map(|source| subtitle_font_urls(fonts, source))
+        .unwrap_or_default()
+}
+
 /// The WebVTT URL of a plain text subtitle the Rust renderer draws (spec
 /// 026): SRT-family tracks the server serves as WebVTT. ASS/SSA keep their
 /// own renderer this slice ([`styled_subtitle_url`]); image subtitles are
@@ -1625,6 +1640,30 @@ mod tests {
             ]
         );
         assert!(subtitle_font_urls(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn a_generated_track_loads_its_sources_fonts() {
+        let fonts = [Font {
+            index: 4,
+            url: "/videos/7/subtitles/{subtitle}/fonts/4".into(),
+            ..Font::default()
+        }];
+        let track = |index, vtt: &str, styled: Option<&str>| Track {
+            index,
+            vtt_url: Some(vtt.into()),
+            styled_url: styled.map(Into::into),
+            ..Track::default()
+        };
+        let tracks = [
+            track(3, "/s/3.vtt", None),
+            track(9, "/s/3.vtt", Some("/s/9.ass")),
+        ];
+        let urls = |shown| shown_font_urls(&fonts, &tracks, shown);
+        assert_eq!(urls(9), ["/videos/7/subtitles/3/fonts/4"]);
+        assert_eq!(urls(3), ["/videos/7/subtitles/3/fonts/4"]);
+        let orphan = [track(9, "/s/x.vtt", Some("/s/9.ass"))];
+        assert!(shown_font_urls(&fonts, &orphan, 9).is_empty());
     }
 
     #[test]

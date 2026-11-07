@@ -33,13 +33,13 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
     offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting,
-    position_at, preview_set, rust_subtitle_url, source_of_styled, start_ms, starting_tier,
-    starting_tier_line, styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls,
-    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel,
-    Engine, LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing,
-    OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
-    UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
-    OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    position_at, preview_set, rust_subtitle_url, shown_font_urls, source_of_styled, start_ms,
+    starting_tier, starting_tier_line, styled_subtitle_signals, styled_subtitle_url,
+    styled_track_url, subtitle_switch, tier_drop_line, tier_drop_report, up_next_at,
+    volume_setting, EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal,
+    OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch,
+    Tier, TierDrop, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
+    MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -671,6 +671,9 @@ fn store_tier_drop(tier: Tier) -> Result<(), String> {
     })
 }
 
+/// The media query for a viewer who asked for less motion.
+const REDUCED_MOTION: &str = "(prefers-reduced-motion: reduce)";
+
 /// `(max-width)` below which a coarse-pointer device counts as a phone.
 const NARROW_SCREEN: &str = "(max-width: 600px)";
 
@@ -683,7 +686,7 @@ fn current_starting_tier() -> Tier {
         platform::prefers(NARROW_SCREEN),
         platform::android_shell(),
     );
-    let reduced_motion = platform::prefers("(prefers-reduced-motion: reduce)");
+    let reduced_motion = platform::prefers(REDUCED_MOTION);
     let remembered = stored_tier_drop();
     let tier = starting_tier(device, reduced_motion, remembered);
     platform::info(&starting_tier_line(
@@ -3968,6 +3971,24 @@ fn Player(
             }
         }
     });
+    // The tier the generated styled track is fetched at: the device's, then
+    // lower when the video drops frames (T028-21).
+    let mut tier = use_signal(current_starting_tier);
+    let tier_watch = use_hook(|| Rc::new(RefCell::new(TierDrop::new(*tier.peek()))));
+    // Reduced motion lowers the starting tier; a change reloads the script
+    // at the new one.
+    use_hook({
+        let tier_watch = Rc::clone(&tier_watch);
+        move || {
+            Rc::new(platform::on_media_change(REDUCED_MOTION, move || {
+                let now = current_starting_tier();
+                if *tier.peek() != now {
+                    *tier_watch.borrow_mut() = TierDrop::new(now);
+                    tier.set(now);
+                }
+            }))
+        }
+    });
     use_effect({
         let (p, styled, styled_for) = (Rc::clone(&p), Rc::clone(&styled), Rc::clone(&styled_for));
         move || {
@@ -3976,13 +3997,33 @@ fn Player(
             styled_for.set(pick);
             styled.borrow_mut().take();
             styled_ready.set(false);
-            let script = shown
-                .and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i))
-                .and_then(styled_subtitle_url);
+            // Read before any return, so a tier drop or a level change
+            // reloads the script in place.
+            let (tier_now, level_now) = (tier(), effects());
+            let track = shown.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
+            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now));
+            // A generated track at Off draws as the plain track beside it,
+            // never from its source's raw script.
+            let script = generated.clone().or_else(|| {
+                track
+                    .filter(|t| t.styled_url.is_none())
+                    .and_then(styled_subtitle_url)
+            });
             let Some(url) = script else {
                 return;
             };
-            let fonts = subtitle_font_urls(&p.detail.fonts, shown.unwrap_or_default());
+            if generated.is_some() {
+                platform::info(&format!(
+                    "pharos: subtitle styled url={url} tier={} effects={}",
+                    tier_now.label(),
+                    level_now.as_str()
+                ));
+            }
+            let fonts = shown_font_urls(
+                &p.detail.fonts,
+                &p.detail.subtitle_tracks,
+                shown.unwrap_or_default(),
+            );
             let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
             spawn(async move {
                 let report: Rc<dyn Fn(Result<(), String>)> =
@@ -3995,10 +4036,6 @@ fn Player(
             });
         }
     });
-    // The tier the generated styled track is fetched at: the device's, then
-    // lower when the video drops frames (T028-21).
-    let mut tier = use_signal(current_starting_tier);
-    let tier_watch = use_hook(|| Rc::new(RefCell::new(TierDrop::new(*tier.peek()))));
     let sampling = use_hook(|| Rc::new(Cell::new(0_u64)));
     use_drop({
         let sampling = Rc::clone(&sampling);
