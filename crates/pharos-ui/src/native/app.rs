@@ -2948,8 +2948,9 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 #[component]
 fn SeenTitle(detail: Detail, on_watch_together: EventHandler<(ItemRef, u64)>) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
+    let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
-    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen } }
+    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen, in_group } }
 }
 
 #[component]
@@ -2988,6 +2989,12 @@ fn TitleScreen(id: ItemRef) -> Element {
         let session = together.session(&api);
         let mut group_error = group_error;
         group_error.set(None);
+        // In a group, the title's together buttons move that group here
+        // (014 US10) rather than leave it for a new one; its item update
+        // brings this member to the player.
+        if session.play_for_group(id, from_ms) {
+            return;
+        }
         platform::info(&format!("pharos: group create item={id} from_ms={from_ms}"));
         spawn_forever(async move {
             match session.create(id, from_ms).await {

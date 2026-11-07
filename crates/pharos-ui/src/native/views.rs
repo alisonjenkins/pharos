@@ -718,13 +718,16 @@ pub fn TitleView(
     /// What the group's members have seen, when in one.
     #[props(default)]
     seen: Vec<MemberSeen>,
+    /// The viewer is in a group: the together buttons move it here.
+    #[props(default)]
+    in_group: bool,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
     use_arrival_focus(detail.item.id, MAIN_ACTION);
     let stage = try_use_context::<StageCtx>();
     let item = &detail.item;
-    let in_group = if seen.is_empty() {
+    let group_rows = if seen.is_empty() {
         Vec::new()
     } else {
         vec![(String::new(), seen::rows(&seen, item.id))]
@@ -786,7 +789,7 @@ pub fn TitleView(
                         }
                     }
                     if can_watch_together(item.kind) {
-                        for (label, from, class, key_action) in together_starts(item) {
+                        for (label, from, class, key_action) in together_starts(item, in_group) {
                             {
                                 let id = item.id;
                                 rsx! {
@@ -808,7 +811,7 @@ pub fn TitleView(
                         WatchedToggle { id: item.id, played: item.played }
                     }
                 }
-                InThisGroup { rows: in_group }
+                InThisGroup { rows: group_rows }
                 if !detail.overview.is_empty() {
                     p { class: "pharos-overview", "{detail.overview}" }
                 }
@@ -1016,27 +1019,44 @@ pub fn ends_at(left: Option<Left>) -> Option<String> {
     Some(ends_at_label(&time, left.before_credits))
 }
 
-/// The title page's ways to start a group on `item`: label, start position
-/// and button class. A part-watched title starts where the viewer left off,
-/// or over (B556/V466).
-fn together_starts(item: &Item) -> Vec<(&'static str, u64, &'static str, &'static str)> {
+/// The title page's ways to start a group on `item`, or, `in_group`, to
+/// move the viewer's group to it (014 US10): label, start position and
+/// button class. A part-watched title starts where the viewer left off, or
+/// over (B556/V466).
+fn together_starts(
+    item: &Item,
+    in_group: bool,
+) -> Vec<(&'static str, u64, &'static str, &'static str)> {
+    let (resume, from_start, fresh) = if in_group {
+        (
+            "Resume for the group",
+            "Play for the group from start",
+            "Play for the group",
+        )
+    } else {
+        (
+            "Resume together",
+            "Watch together from start",
+            "Watch together",
+        )
+    };
     if progress_percent(item).is_some() {
         vec![
             (
-                "Resume together",
+                resume,
                 start_ms(item.position_ms, item.played),
                 "pharos-button",
                 "together",
             ),
             (
-                "Watch together from start",
+                from_start,
                 0,
                 "pharos-button pharos-button-secondary",
                 "together-start",
             ),
         ]
     } else {
-        vec![("Watch together", 0, "pharos-button", "together")]
+        vec![(fresh, 0, "pharos-button", "together")]
     }
 }
 
@@ -1697,7 +1717,7 @@ mod tests {
         let mut film = item(ItemKind::Movie);
         film.runtime_ms = 100 * 60_000;
         let starts = |i: &Item| {
-            together_starts(i)
+            together_starts(i, false)
                 .into_iter()
                 .map(|(label, from, _, _)| (label, from))
                 .collect::<Vec<_>>()
@@ -1711,6 +1731,45 @@ mod tests {
                 ("Watch together from start", 0)
             ]
         );
+    }
+
+    /// 014 US10: in a group, the together buttons move the group to this
+    /// title instead of starting another group, from the same positions.
+    #[test]
+    fn in_a_group_the_together_buttons_play_for_the_group() {
+        let mut film = item(ItemKind::Movie);
+        film.runtime_ms = 100 * 60_000;
+        let starts = |i: &Item| {
+            together_starts(i, true)
+                .into_iter()
+                .map(|(label, from, _, _)| (label, from))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(&film), vec![("Play for the group", 0)]);
+        film.position_ms = 60_000;
+        assert_eq!(
+            starts(&film),
+            vec![
+                ("Resume for the group", 60_000),
+                ("Play for the group from start", 0)
+            ]
+        );
+        let detail = Detail {
+            item: film,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone(), in_group: true } });
+        assert!(html.contains(">Resume for the group<"), "{html}");
+        assert!(!html.contains("together<"), "{html}");
     }
 
     #[test]
