@@ -31,15 +31,17 @@ use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
-    choose_engine, crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
-    offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting,
-    position_at, preview_set, restart_styled, rust_subtitle_url, shown_font_urls, source_of_styled,
-    start_ms, starting_tier, starting_tier_line, styled_subtitle_signals, styled_subtitle_url,
-    styled_track_url, subtitle_switch, tier_drop_line, tier_drop_report, up_next_at,
-    volume_setting, EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal,
+    choose_engine, crossfade_ms, device_class, engine_verdict, fade_volume, format_tier_drop,
+    max_bitrate_label, offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop,
+    parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
+    rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
+    starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
+    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel,
+    Engine, EngineReason, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal,
     OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch,
     Tier, TierDrop, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
-    MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY,
+    VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -759,6 +761,19 @@ pub(super) fn crossfade_seconds() -> u32 {
     };
     CROSSFADE_S.set(Some(seconds));
     seconds
+}
+
+/// This page load's HLS engine and why (V630).
+fn mse_engine_choice() -> (MseEngine, EngineReason) {
+    let stored = stored_mse_engine_raw();
+    pick_mse_engine(&platform::current_search(), stored.as_deref())
+}
+
+fn stored_mse_engine_raw() -> Option<String> {
+    platform::stored_theme(MSE_ENGINE_KEY).unwrap_or_else(|e| {
+        platform::warn(&format!("pharos: engine storage read failed error={e}"));
+        None
+    })
 }
 
 pub(super) fn set_crossfade_seconds(seconds: u32) {
@@ -3228,11 +3243,19 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             .await;
             Some(
                 settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
-                    let engine = choose_engine(
+                    let (mse_engine, engine_reason) = mse_engine_choice();
+                    let picked = choose_engine(
                         decision.is_hls(),
                         platform::plays_hls(),
                         platform::has_mse(),
+                        mse_engine,
                     );
+                    let verdict = engine_verdict(picked, engine_reason);
+                    let engine = verdict.engine;
+                    if picked.reports_fragments() {
+                        platform::info(&verdict.line());
+                        platform::report_event(verdict.report());
+                    }
                     platform::info(&format!(
                         "pharos: playback method={} engine={engine:?} block={} downgrade={} audio={:?} subtitle={:?} url={}",
                         decision.method,
@@ -3848,9 +3871,9 @@ fn Player(
             stop();
         }
     });
-    // Auto quality judges video played by hls.js, the one engine that shows
-    // the downloads; a change reloads at the position, as a track change does.
-    let auto = p.engine == Engine::HlsJs && p.kind != ItemKind::Audio;
+    // Auto quality judges video played by an MSE engine, the only kind that
+    // sees the downloads; a change reloads at the position, as a track change does.
+    let auto = p.engine.reports_fragments() && p.kind != ItemKind::Audio;
     use_hook(|| {
         if auto {
             watch.0.borrow_mut().restarted(now_ms_u64());
