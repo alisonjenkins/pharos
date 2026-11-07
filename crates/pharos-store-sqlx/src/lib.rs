@@ -91,6 +91,9 @@ pub(crate) mod series_meta_row;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod ratings;
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod subtitle_styling;
+
 /// Per-language provider text for shows and episodes (ADR-0062).
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod translations;

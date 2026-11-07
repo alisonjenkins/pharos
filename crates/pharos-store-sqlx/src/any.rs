@@ -624,6 +624,35 @@ impl pharos_core::RatingsStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// SubtitleStylingStore
+// ---------------------------------------------------------------------
+impl pharos_core::SubtitleStylingStore for AnyStore {
+    async fn put_subtitle_styling(&self, row: pharos_core::SubtitleStyling) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_subtitle_styling(row).await,
+            AnyStore::Postgres(p) => p.put_subtitle_styling(row).await,
+        }
+    }
+
+    async fn subtitle_styling(
+        &self,
+        item: MediaId,
+    ) -> DomainResult<Option<pharos_core::SubtitleStyling>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_styling(item).await,
+            AnyStore::Postgres(p) => p.subtitle_styling(item).await,
+        }
+    }
+
+    async fn subtitle_styling_index(&self) -> DomainResult<Vec<pharos_core::SubtitleStyling>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_styling_index().await,
+            AnyStore::Postgres(p) => p.subtitle_styling_index().await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // SeriesMetadataStore
 // ---------------------------------------------------------------------
 impl SeriesMetadataStore for AnyStore {
