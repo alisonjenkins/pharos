@@ -24,7 +24,7 @@ use pharos_sync::{GroupRegistry, LocalDelivery, MemberSinks, SessionHub};
 use pharos_test_metrics::CumulativeSnapshotter;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 pub const TV: &str = "Living Room";
 pub const ITEM: &str = "item-1";
@@ -60,6 +60,7 @@ pub struct CastRig {
     /// service reaches it through the real `CastV2Transport`.
     pub mock: Option<MockTv>,
     _tv_listener: std::net::TcpListener,
+    metrics_hold: std::sync::Mutex<Option<MetricsHold>>,
 }
 
 /// One process-wide recorder: handlers and the cast actor run on other
@@ -74,6 +75,19 @@ pub fn snapshotter() -> &'static CumulativeSnapshotter {
             .expect("no other recorder in this binary");
         snap
     })
+}
+
+/// The recorder is process-wide, so a counter moves for every rig running in
+/// parallel. Each rig holds this shared; a test asserting a counter delta
+/// takes it exclusively (`CastRig::exclusive_metrics`) and so runs alone.
+fn metrics_gate() -> Arc<RwLock<()>> {
+    static GATE: OnceLock<Arc<RwLock<()>>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(RwLock::new(()))).clone()
+}
+
+enum MetricsHold {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
 }
 
 /// Current value of `name`, summed over the series whose labels include all of `labels`.
@@ -182,6 +196,7 @@ impl CastRig {
         stored: Option<(u64, pharos_core::MediaKind)>,
     ) -> Self {
         snapshotter();
+        let hold = MetricsHold::Shared(metrics_gate().read_owned().await);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = mock.as_ref().map_or_else(
             || listener.local_addr().unwrap().port(),
@@ -297,9 +312,22 @@ impl CastRig {
             tv_id: tv_session_id(TV),
             mock,
             _tv_listener: listener,
+            metrics_hold: std::sync::Mutex::new(Some(hold)),
         };
         rig.wait_until_listed().await;
         rig
+    }
+
+    /// Wait until no other rig is running and keep it that way until this one
+    /// drops, so counter deltas read after this call are this test's alone.
+    /// Read counter baselines after calling it. Never build another `CastRig`
+    /// afterwards in the same test: its shared lock would queue behind this
+    /// exclusive one, which never drops, and deadlock.
+    pub async fn exclusive_metrics(&self) {
+        let shared = self.metrics_hold.lock().unwrap().take();
+        drop(shared);
+        let hold = MetricsHold::Exclusive(metrics_gate().write_owned().await);
+        *self.metrics_hold.lock().unwrap() = Some(hold);
     }
 
     /// The reachability prober's first probe is asynchronous.
