@@ -51,18 +51,190 @@ pub enum Engine {
     NativeHls,
     /// An HLS playlist played through Media Source Extensions by hls.js.
     HlsJs,
+    /// An HLS playlist played through Media Source Extensions by Pharos's
+    /// own engine (spec 031).
+    RustHls,
     /// HLS with neither native support nor MSE.
     Unsupported,
 }
 
-/// The engine for a stream: native HLS where the browser has it, else hls.js
-/// where Media Source Extensions exist.
-pub fn choose_engine(is_hls: bool, native_hls: bool, mse: bool) -> Engine {
+impl Engine {
+    /// Whether the engine sees each fragment it downloads, which auto quality
+    /// needs to judge the connection.
+    pub fn reports_fragments(self) -> bool {
+        matches!(self, Engine::HlsJs | Engine::RustHls)
+    }
+}
+
+/// The engine for a stream: native HLS where the browser has it, else the
+/// device's chosen MSE engine where Media Source Extensions exist.
+pub fn choose_engine(is_hls: bool, native_hls: bool, mse: bool, mse_engine: MseEngine) -> Engine {
     match (is_hls, native_hls, mse) {
         (false, _, _) => Engine::Direct,
         (true, true, _) => Engine::NativeHls,
-        (true, false, true) => Engine::HlsJs,
+        (true, false, true) => match mse_engine {
+            MseEngine::HlsJs => Engine::HlsJs,
+            MseEngine::Rust => Engine::RustHls,
+        },
         (true, false, false) => Engine::Unsupported,
+    }
+}
+
+/// Which engine plays HLS through Media Source Extensions on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MseEngine {
+    /// The vendored hls.js (ADR-0035), the default until spec 031 reaches
+    /// parity.
+    #[default]
+    HlsJs,
+    /// Pharos's own engine (ADR-0071), opt-in.
+    Rust,
+}
+
+impl MseEngine {
+    pub const ALL: [MseEngine; 2] = [MseEngine::HlsJs, MseEngine::Rust];
+
+    /// The stored and logged name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MseEngine::HlsJs => "hlsjs",
+            MseEngine::Rust => "rust",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MseEngine::HlsJs => "hls.js",
+            MseEngine::Rust => "Pharos (experimental)",
+        }
+    }
+
+    pub fn parse(stored: &str) -> Option<MseEngine> {
+        MseEngine::ALL
+            .into_iter()
+            .find(|e| e.as_str() == stored.trim())
+    }
+}
+
+/// Where this device's [`MseEngine`] choice is kept.
+pub const MSE_ENGINE_KEY: &str = "pharos.player.engine";
+
+/// Why an [`MseEngine`] was picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineReason {
+    /// `?engine=` on the page URL, for this page load only.
+    Override,
+    /// The device's Playback setting.
+    Setting,
+    /// Nothing usable chosen.
+    Default,
+}
+
+impl EngineReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            EngineReason::Override => "override",
+            EngineReason::Setting => "setting",
+            EngineReason::Default => "default",
+        }
+    }
+}
+
+/// The MSE engine for this page load: a valid `engine=` in the page's query
+/// `search` wins, then the `stored` setting, then the default (V630).
+pub fn pick_mse_engine(search: &str, stored: Option<&str>) -> (MseEngine, EngineReason) {
+    let asked = search
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("engine="))
+        .find_map(MseEngine::parse);
+    if let Some(engine) = asked {
+        return (engine, EngineReason::Override);
+    }
+    match stored.and_then(MseEngine::parse) {
+        Some(engine) => (engine, EngineReason::Setting),
+        None => (MseEngine::default(), EngineReason::Default),
+    }
+}
+
+/// Whether [`Engine::RustHls`] can play yet (spec 031 slice 2).
+const RUST_HLS_BUILT: bool = false;
+
+/// The HLS engine a play actually uses once `picked` for `reason`: the
+/// Rust engine hands over to hls.js until it is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineVerdict {
+    pub engine: Engine,
+    pub picked: Engine,
+    pub reason: EngineReason,
+    /// Why `engine` differs from `picked`, when it does.
+    pub fallback: Option<&'static str>,
+}
+
+pub fn engine_verdict(picked: Engine, reason: EngineReason) -> EngineVerdict {
+    let (engine, fallback) = match picked {
+        Engine::RustHls if !RUST_HLS_BUILT => (Engine::HlsJs, Some("not_built")),
+        other => (other, None),
+    };
+    EngineVerdict {
+        engine,
+        picked,
+        reason,
+        fallback,
+    }
+}
+
+impl EngineVerdict {
+    /// The watch page's log line for this verdict (V630).
+    pub fn line(&self) -> String {
+        match self.fallback {
+            Some(cause) => format!(
+                "pharos: playback engine={} reason=fallback cause={cause} asked={} asked_by={}",
+                engine_label(self.engine),
+                engine_label(self.picked),
+                self.reason.label()
+            ),
+            None => format!(
+                "pharos: playback engine={} reason={}",
+                engine_label(self.engine),
+                self.reason.label()
+            ),
+        }
+    }
+
+    /// The `rendererMode` client event naming the HLS engine a play uses
+    /// and why (V630).
+    pub fn report(&self) -> ClientEvent {
+        let mut fields = vec![
+            ("renderer", "hls".to_owned()),
+            ("mode", engine_label(self.engine).to_owned()),
+            ("asked", engine_label(self.picked).to_owned()),
+            ("asked_by", self.reason.label().to_owned()),
+        ];
+        match self.fallback {
+            Some(cause) => {
+                fields.push(("reason", "fallback".to_owned()));
+                fields.push(("cause", cause.to_owned()));
+            }
+            None => fields.push(("reason", self.reason.label().to_owned())),
+        }
+        ClientEvent {
+            kind: ClientEventKind::RendererMode,
+            level: ClientLevel::Info,
+            route: String::new(),
+            fields,
+        }
+    }
+}
+
+/// The logged name of `engine`.
+pub fn engine_label(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Direct => "direct",
+        Engine::NativeHls => "native",
+        Engine::HlsJs => "hlsjs",
+        Engine::RustHls => "rust",
+        Engine::Unsupported => "unsupported",
     }
 }
 
@@ -2615,11 +2787,127 @@ mod tests {
 
     #[test]
     fn hls_prefers_native_then_hlsjs() {
-        assert_eq!(choose_engine(false, false, false), Engine::Direct);
-        assert_eq!(choose_engine(false, true, true), Engine::Direct);
-        assert_eq!(choose_engine(true, true, true), Engine::NativeHls);
-        assert_eq!(choose_engine(true, false, true), Engine::HlsJs);
-        assert_eq!(choose_engine(true, false, false), Engine::Unsupported);
+        let js = MseEngine::HlsJs;
+        assert_eq!(choose_engine(false, false, false, js), Engine::Direct);
+        assert_eq!(choose_engine(false, true, true, js), Engine::Direct);
+        assert_eq!(choose_engine(true, true, true, js), Engine::NativeHls);
+        assert_eq!(choose_engine(true, false, true, js), Engine::HlsJs);
+        assert_eq!(choose_engine(true, false, false, js), Engine::Unsupported);
+    }
+
+    #[test]
+    fn the_rust_engine_only_replaces_hlsjs() {
+        let rust = MseEngine::Rust;
+        assert_eq!(choose_engine(false, false, true, rust), Engine::Direct);
+        assert_eq!(choose_engine(true, true, true, rust), Engine::NativeHls);
+        assert_eq!(choose_engine(true, false, true, rust), Engine::RustHls);
+        assert_eq!(choose_engine(true, false, false, rust), Engine::Unsupported);
+    }
+
+    /// V630: override, then setting, then default; junk falls through.
+    #[test]
+    fn mse_engine_is_override_then_setting_then_default() {
+        use EngineReason::{Default, Override, Setting};
+        assert_eq!(pick_mse_engine("", None), (MseEngine::HlsJs, Default));
+        assert_eq!(
+            pick_mse_engine("", Some("rust")),
+            (MseEngine::Rust, Setting)
+        );
+        assert_eq!(
+            pick_mse_engine("", Some("hlsjs")),
+            (MseEngine::HlsJs, Setting)
+        );
+        assert_eq!(
+            pick_mse_engine("", Some("shaka")),
+            (MseEngine::HlsJs, Default)
+        );
+        assert_eq!(
+            pick_mse_engine("?a=1&engine=rust", Some("hlsjs")),
+            (MseEngine::Rust, Override)
+        );
+        assert_eq!(
+            pick_mse_engine("?engine=hlsjs", Some("rust")),
+            (MseEngine::HlsJs, Override)
+        );
+        assert_eq!(
+            pick_mse_engine("?engine=nope", Some("rust")),
+            (MseEngine::Rust, Setting)
+        );
+        assert_eq!(
+            pick_mse_engine("?xengine=rust", None),
+            (MseEngine::HlsJs, Default)
+        );
+        assert_eq!(
+            pick_mse_engine("?engine=nope&engine=rust", Some("hlsjs")),
+            (MseEngine::Rust, Override)
+        );
+    }
+
+    #[test]
+    fn mse_engine_names_round_trip_and_are_distinct() {
+        for engine in MseEngine::ALL {
+            assert_eq!(MseEngine::parse(engine.as_str()), Some(engine));
+        }
+        assert_ne!(MseEngine::HlsJs.as_str(), MseEngine::Rust.as_str());
+    }
+
+    #[test]
+    fn engine_labels_are_distinct() {
+        let all = [
+            Engine::Direct,
+            Engine::NativeHls,
+            Engine::HlsJs,
+            Engine::RustHls,
+            Engine::Unsupported,
+        ];
+        let labels: std::collections::BTreeSet<_> = all.iter().map(|e| engine_label(*e)).collect();
+        assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn only_mse_engines_report_fragments() {
+        assert!(Engine::HlsJs.reports_fragments());
+        assert!(Engine::RustHls.reports_fragments());
+        assert!(!Engine::NativeHls.reports_fragments());
+        assert!(!Engine::Direct.reports_fragments());
+    }
+
+    /// V630: one verdict per play, naming what plays, what was asked and why.
+    #[test]
+    fn the_rust_engine_hands_over_to_hlsjs_until_built_and_says_so() {
+        let v = engine_verdict(Engine::RustHls, EngineReason::Override);
+        assert_eq!(v.engine, Engine::HlsJs);
+        assert_eq!(v.fallback, Some("not_built"));
+        assert_eq!(
+            v.line(),
+            "pharos: playback engine=hlsjs reason=fallback cause=not_built asked=rust asked_by=override"
+        );
+        let event = v.report();
+        assert_eq!(event.kind, ClientEventKind::RendererMode);
+        for field in [
+            ("renderer", "hls"),
+            ("mode", "hlsjs"),
+            ("asked", "rust"),
+            ("asked_by", "override"),
+            ("reason", "fallback"),
+            ("cause", "not_built"),
+        ] {
+            assert!(
+                event.fields.contains(&(field.0, field.1.to_owned())),
+                "{field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hlsjs_plays_as_picked() {
+        let v = engine_verdict(Engine::HlsJs, EngineReason::Default);
+        assert_eq!((v.engine, v.fallback), (Engine::HlsJs, None));
+        assert_eq!(v.line(), "pharos: playback engine=hlsjs reason=default");
+        assert!(v
+            .report()
+            .fields
+            .contains(&("reason", "default".to_owned())));
     }
 
     /// A browser without WebM still offers VP9: codecs are asked about in
