@@ -590,6 +590,30 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // B665: a member whose tab reloads is back in the group, on its film and in
+  // step, and the others still see two members, not a third or a ghost.
+  test("a member who reloads the page is back in the group, in step", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(180_000);
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm", {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+    });
+    try {
+      await waitUntilInSync(people);
+      await b.page.reload();
+      await expect(b.page.locator(".pharos-member-list li")).toHaveCount(2, { timeout: 20_000 });
+      await waitUntilInSync(people);
+      await expect(a.page.locator(".pharos-member-list li")).toHaveCount(2);
+      // Still one group: a pause from the reloaded tab reaches A.
+      await toggleUntil(people[1], true);
+      await assertPausedAll(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
 
 /** Clicks `member`'s seek bar at `fraction` of its width. */
