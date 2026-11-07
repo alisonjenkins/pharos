@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod hash;
+pub mod memo;
 pub mod quota;
 pub mod store;
 pub mod telemetry;
