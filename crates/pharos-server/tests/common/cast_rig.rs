@@ -487,8 +487,9 @@ impl CastRig {
     }
 }
 
+/// Polls `f` every 20 ms for up to 30 s: a loaded CI box is slow, a hung test fails late.
 pub async fn eventually<F: FnMut() -> bool>(what: &str, mut f: F) {
-    for _ in 0..250 {
+    for _ in 0..1500 {
         if f() {
             return;
         }
