@@ -468,7 +468,12 @@ impl server::library::Handler for Library {
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
         let draws_images = knows_image_delivery && watch::extracts_image_subtitles(state);
-        let tracks = watch::tracks(&item, draws_images).await;
+        let styling = if watch::is_video(&item) {
+            crate::styled_track::current(&state.stores, &item).await
+        } else {
+            None
+        };
+        let tracks = watch::tracks(&item, draws_images, styling.as_ref()).await;
         write_tracks(
             out.reborrow().init_audio_tracks(len(&tracks.audio)),
             &tracks.audio,
@@ -1383,6 +1388,7 @@ fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: 
         w.set_is_default(t.is_default);
         w.set_is_forced(t.is_forced);
         w.set_is_hearing_impaired(t.is_hearing_impaired);
+        w.set_styled_url(t.styled.as_deref().unwrap_or_default());
         match &t.drawn {
             Some(watch::Drawn::Vtt(url)) => {
                 w.set_delivery(SubtitleDelivery::External);
