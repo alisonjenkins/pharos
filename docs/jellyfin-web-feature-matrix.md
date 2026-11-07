@@ -145,7 +145,7 @@ jellyfin-web: `src/components/{subtitleeditor,subtitleuploader,lyricseditor}/`.
 | Feature | jellyfin-web source | Server endpoint | status | Test |
 |---|---|---|---|---|
 | Subtitle delivery | `htmlVideoPlayer/` | `GET Videos/{id}/{ms}/Subtitles/{idx}/Stream.{fmt}` | DONE | `jellyfin_subtitles` |
-| Remote subtitle search/download | `subtitleeditor/` | `GET Items/{id}/RemoteSearch/Subtitles/{lang}`, `POST .../Subtitles/{id}` | MISSING | `remote_subtitle_search` *(T76)* — empty (no providers) |
+| Remote subtitle search/download | `subtitleeditor/` | `GET Items/{id}/RemoteSearch/Subtitles/{lang}`, `POST .../Subtitles/{id}` | DONE (opt-in) | `api/jellyfin/remote_subtitles.rs` *(spec 030)* — OpenSubtitles when `[opensubtitles].api_key` is set, else empty |
 | Subtitle upload/delete | `subtitleuploader/` | `POST/DELETE Videos/{id}/Subtitles` | MISSING | *(T76 backlog)* |
 | Lyrics CRUD | `lyricseditor/`, `controllers/lyrics.js` | `GET/POST/DELETE …/Lyrics` | MISSING | `lyrics_crud` *(T76)* — GET from .lrc sidecar |
 

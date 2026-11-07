@@ -1,6 +1,6 @@
 # ADR-0069: OpenSubtitles downloads go to the cache volume, behind a provider trait
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-07T00:00:00Z
 - **Deciders:** Ali
 
@@ -15,11 +15,11 @@ OpenSubtitles.com offers a REST API v1 (`api.opensubtitles.com/api/v1`) with sea
 - We use the OpenSubtitles.com REST API v1, with `reqwest` already in `pharos-server`. The code is a module `pharos-server/src/opensubtitles/`, not a new crate: it has one consumer and no dependency of its own.
 - The client sits behind an object-safe `SubtitleProvider` trait so handlers and the job are tested with a fake. No test touches the network.
 - The feature is off unless `[opensubtitles].api_key` (or `PHAROS_OPENSUBTITLES_API_KEY`) is set. `username` and `password` are optional and raise the quota. They follow the TMDB/TVDB secret rule: env var first, never in a committed config, never logged.
-- Downloaded subtitles are stored at `<subtitle cache dir>/opensubtitles/<item id>/<lang>.<file id>.srt` and never beside the media. With no subtitle cache directory the feature stays off.
-- `discover_sidecars` also lists that directory, after the sidecars beside the media, so a downloaded track is an External stream with a stable index. The sidecar cache key includes that directory's mtime. The root is a process-wide setting installed at startup (`OnceLock`), because `discover_sidecars` has a dozen callers that hold only a media path.
-- The Jellyfin `RemoteSubtitleInfo.Id` is the OpenSubtitles `file_id`.
+- Downloaded subtitles are stored at `<subtitle cache dir>/opensubtitles/<media id>/os<file id>.<lang>.srt` (`<media id>` is the hex `stable_id` of the media path) and never beside the media. With no subtitle cache directory the feature stays off.
+- `discover_sidecars` also lists that directory, sorted by path with the others, so a downloaded track is an External stream with a stable index. The sidecar cache key includes that directory's mtime. The root is a process-wide setting installed at startup (`OnceLock`), because `discover_sidecars` has a dozen callers that hold only a media path.
+- The Jellyfin `RemoteSubtitleInfo.Id` is `<file id>-<language>`, since the download POST carries nothing else and the stored file needs its language.
 - Slice 2 adds a bounded background job (one item at a time, a daily ceiling below the account quota, a persisted miss memo beside the cache like `probe_memo`, stop for the day on 406/429).
-- The quota is never hard-coded. A 406 or 429 on `/download` sets an in-memory gate until the reported reset time.
+- The quota is never hard-coded. A 406 on `/download` sets an in-memory gate until the reported reset time; a 429 is reported with its `Retry-After`.
 
 ## Consequences
 

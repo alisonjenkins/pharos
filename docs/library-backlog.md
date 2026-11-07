@@ -126,7 +126,7 @@ update. IDs are placeholders; they become numbered `SPEC.md §T` tasks when sche
 | LIB-E5 | MusicBrainz + cover-art-archive provider (music) | L | E2 |
 | LIB-E6 | fanart.tv provider (artwork) | M | E2 |
 | LIB-E7 | "Identify / Match" + "Refresh Metadata" admin actions (force re-resolve) | M | E3,E4 |
-| LIB-E8 | Subtitle search/download provider (OpenSubtitles) | M | E2 |
+| LIB-E8 | Subtitle search/download provider (OpenSubtitles) | M | E2 (slice 1 done, spec 030; background job is slice 2) |
 
 ### EPIC F — Superset discovery / UX  *(pharos clients)*
 

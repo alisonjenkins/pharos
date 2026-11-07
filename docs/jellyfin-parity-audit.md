@@ -313,7 +313,7 @@ Browse-axis collections. Cheap once `/Items` filter knobs exist.
 | `/FallbackFont/Fonts[/{name}]` | GET | → | List / serve bundled fonts for ASS rendering. |
 | `/Videos/{itemId}/Subtitles` | POST | ✗ | Upload sidecar. Admin. |
 | `/Videos/{itemId}/Subtitles/{index}` | DELETE | ✗ | Delete sidecar. |
-| `/Items/{itemId}/RemoteSearch/Subtitles/{language}` | GET | ✗ | OpenSubtitles plugin path. |
+| `/Items/{itemId}/RemoteSearch/Subtitles/{language}` | GET | ✓ | OpenSubtitles.com (spec 030, ADR-0069); empty list when no `[opensubtitles].api_key`. |
 | `/Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}` | POST | ✗ | As above. |
 | `/Providers/Subtitles/Subtitles/{subtitleId}` | GET | ✗ | As above. |
 
