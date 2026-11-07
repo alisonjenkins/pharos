@@ -112,7 +112,10 @@ export async function signIn(browser: Browser, label: string, account: Account =
   return { context, page, lines };
 }
 
-/** The seeded movie `file`: its native id, and an API token for the user. */
+/**
+ * The seeded film or episode whose path ends in `file`: its native id, and an
+ * API token for the user.
+ */
 export async function seededMovie(request: APIRequestContext, file: string) {
   const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
     headers: { Accept: "application/json" },
@@ -134,7 +137,7 @@ export async function seededMovie(request: APIRequestContext, file: string) {
   const find = async () => {
     const movies = await (
       await request.get(
-        `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+        `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path`,
         { headers: api },
       )
     ).json();
