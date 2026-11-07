@@ -326,6 +326,8 @@ pub struct Capabilities {
     pub containers: Vec<String>,
     /// Bits per second; 0 = no limit.
     pub max_bitrate: u64,
+    /// Whether the display shows HDR; false gets HDR sources transcoded.
+    pub hdr: bool,
     /// Image subtitle codecs the player draws from the server's PNGs.
     pub image_subtitles: Vec<String>,
 }
@@ -1085,6 +1087,7 @@ impl PharosApi for NativeApi {
                 &caps.containers,
             );
             c.set_max_bitrate(caps.max_bitrate);
+            c.set_hdr(caps.hdr);
             set_texts(
                 c.reborrow()
                     .init_image_subtitles(len(&caps.image_subtitles)),
