@@ -123,10 +123,7 @@ impl From<&VirtualTvSession> for SessionRecord {
         let now = crate::sessions::iso_now();
         Self {
             id: v.id.clone(),
-            user_id: v
-                .user_id
-                .map(|u| u.0.simple().to_string())
-                .unwrap_or_default(),
+            user_id: v.user_id,
             user_name: v.user_name.clone(),
             device_id: v.id.clone().into(),
             device_name: v.device_name.clone(),
@@ -157,10 +154,7 @@ impl From<&VirtualTvSession> for SessionsBroadcastEntry {
         let now = crate::sessions::iso_now();
         Self {
             id: v.id.clone(),
-            user_id: v
-                .user_id
-                .map(|u| u.0.simple().to_string())
-                .unwrap_or_default(),
+            user_id: crate::sessions::user_id_wire(v.user_id),
             user_name: Some(v.user_name.clone()),
             device_id: Some(v.id.clone()),
             device_name: Some(v.device_name.clone()),

@@ -394,12 +394,13 @@ async fn creator_now_playing(
     user_id: &pharos_core::UserId,
     device_id: &str,
 ) -> Option<SeedCandidate> {
-    let uid = user_id.0.simple().to_string();
     let sessions = state.sessions.snapshot().await.ok()?;
     let matches: Vec<_> = sessions
         .into_iter()
         .filter(|s| {
-            s.user_id == uid && s.device_id.as_str() == device_id && s.now_playing_item_id.is_some()
+            s.user_id == Some(*user_id)
+                && s.device_id.as_str() == device_id
+                && s.now_playing_item_id.is_some()
         })
         .collect();
     resolve_seed(matches)
@@ -1699,7 +1700,7 @@ mod tests {
     fn make_record(id: &str, item: &str, age_secs: u64) -> crate::sessions::SessionRecord {
         crate::sessions::SessionRecord {
             id: id.into(),
-            user_id: "u".into(),
+            user_id: Some(pharos_core::UserId::new()),
             user_name: "u".into(),
             device_id: "d".into(),
             device_name: "d".into(),
