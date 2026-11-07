@@ -13,7 +13,7 @@
 The web UI plays HLS through hls.js, a 190 KB gzip script we vendor and cannot tune where it matters.
 
 - Its buffering, retry and recovery behaviour are hls.js defaults. Nobody chose them for a Quest, a Steam Frame or the TCL G08 TV, and the UI cannot see them: the only signals are `hlsError` and `hlsFragLoaded` (`native/web.rs` `HlsJs`).
-- Most of hls.js does no work here. Browsers get all-fMP4 masters with one video rung and one demuxed Opus audio group (`hls.rs` `master_playlist`, `push_h264_cmaf_rungs`, `push_vp9_rungs`), so its MPEG-TS transmuxer and multi-rung ABR run only for audio-only items.
+- Most of hls.js does no work here. Browsers get all-fMP4 masters with one video rung and one demuxed Opus audio group (`hls.rs` `master_playlist`, `push_h264_cmaf_rungs`, `push_vp9_rungs`), so its MPEG-TS transmuxer and multi-rung ABR run only for audio-only items. Quality changes are instead whole reloads made by the UI (`app.rs` auto quality), which restart the stream at a lower cap.
 - None of it is reusable by the Android shell or a later native-video client.
 
 Assumption, stated because the request named a solution: the goal is control and observability of playback on weak devices, and a smaller download, with no regression in start time, seeking or recovery. If hls.js turns out cheaper on those devices than this engine (slice 0 baseline against slice 3), the engine stays opt-in and this spec says so.
@@ -31,12 +31,12 @@ Assumption, stated because the request named a solution: the goal is control and
 | Fragment and playlist retries with backoff | hls.js | engine | yes, slice 3 |
 | Fatal error recovery (`startLoad`, `recoverMediaError`) | `playback.rs` `RecoveryBudget` | UI + engine | yes, slice 3 (same budget, engine error vocabulary) |
 | Fragment download stats for auto quality | `web.rs` `fragment_load`, `app.rs` auto quality | UI, fed by engine | yes, slice 2 (`OnFragment`) |
-| Quality change | `app.rs` auto quality reloads with a cap | UI | unchanged (reload) |
+| Quality change | `app.rs` auto quality reloads with a cap | engine | yes, slice 4: switching between rungs inside the player, no reload (user story 4) |
 | Audio track change | reload with `AudioStreamIndex` | UI | unchanged (reload) |
 | Subtitles | `pharos-subs` / JASSUB; server sends no `TYPE=SUBTITLES` (`hls.rs` master comment) | UI | out of scope |
 | Trickplay | image tiles (`trail.rs`, `watch_view.rs`) | UI | out of scope |
 | SyncPlay rate control | `video.playbackRate` (`web.rs`, `together.rs`) | UI | unchanged; engine must not reset the rate |
-| Multi-rung ABR | hls.js; browsers get one rung | engine | later slice, only if the server sends a ladder to browsers |
+| Multi-rung H.264 fMP4 ladder for browsers | not sent; browsers get one rung | server | yes, slice 4, only when the engine asks for it |
 | MPEG-TS demux (audio-only AAC ladder) | hls.js | engine | open question 1 |
 
 ## Hard requirement: runs well on weak devices
@@ -79,6 +79,12 @@ A segment request fails, a segment is corrupt, or the browser cannot play the st
 
 **Acceptance**: a failed segment is retried with backoff and playback continues; a media error rebuilds the MediaSource at the position under the same `RecoveryBudget` limits; an unsupported stream (TS, encrypted, live, unknown codec) falls back to hls.js before the first append with `reason=<the named cause>` logged and reported. Every failure path logs and reports what its success path does (V637-V641).
 
+## User story 4 - Quality follows the connection without a reload (Priority: P1)
+
+A viewer on the Rust engine watches over a link that drops from fast to slow and back. The picture steps down a rung before the buffer runs dry and steps back up when the link recovers, with no reload, no black frame and no jump in position. A maximum quality picked in Settings is a ceiling the engine never goes above.
+
+**Acceptance**: on a throttled link (e2e, Chromium and Firefox) the engine switches rung at a segment boundary, playback never stalls for a down-switch that the buffer could have covered, and each switch is logged and reported with its inputs (V644-V649).
+
 ## Requirements
 
 - **FR-001** `pharos-hls` has no browser, wasm-bindgen or async-runtime dependency, and builds for the host and `wasm32-unknown-unknown`.
@@ -88,6 +94,11 @@ A segment request fails, a segment is corrupt, or the browser cannot play the st
 - **FR-005** Segment requests time out after a deadline sized for on-demand transcodes (the server may take seconds to produce a segment), configurable per device class; the defaults come from slice 0 measurements, not hls.js.
 - **FR-006** Errors are reported in the vocabulary `RecoveryBudget` already uses (`networkError`, `mediaError`, plus engine `details` strings), with `engine=rust` in the client event, so existing dashboards and the recovery budget work unchanged.
 - **FR-007** The engine emits `OnFragment` for each video segment with the same byte and timing semantics as `fragment_load` (first byte to last byte), so auto quality judges both engines alike.
+- **FR-009** Quality switching happens in the engine. For the Rust engine the server's browser master lists an H.264 fMP4 ladder (the source rung plus `Variant::ladder_for`, capped by the session bitrate as the mpegts ladder is), each rung with its own media playlist, init segment and segments on the shared `SegmentGrid`, so every rung's segment boundaries line up. The ladder is sent only when the request asks for it (`abr=1`); hls.js and other clients keep today's single-rung master. All rungs share the one demuxed audio group, so a switch never touches audio.
+- **FR-010** A switch appends the new rung's init segment and then its next segment on the same video `SourceBuffer`, calling `changeType` first when the codec string differs. No reload, no position change.
+- **FR-011** The ABR rule lives in `pharos-hls` as a pure function of: a bandwidth estimate (fast and slow EWMAs of first-to-last-byte throughput, the lower of the two), the forward buffer, the rung ladder, the user's maximum quality, and the time the server takes to produce a cold segment. Rungs are encoded on demand, so the first segment after a switch can be slow: an up-switch needs a buffer margin that covers a cold encode, and a down-switch is taken early enough to arrive before the buffer empties. Switches are rate-limited (no more than one up-switch per 10 s by default) so the picture does not oscillate.
+- **FR-012** While the engine adapts, the UI's reload-based auto quality is off for that play; a maximum quality change from Settings is passed to the engine as a new ceiling without a reload.
+- **FR-013** Every switch logs `pharos: abr switch from=<rung> to=<rung> reason=<bandwidth|buffer|ceiling|start> est_kbps=… buffer_ms=… cold_ms=…` and reports it as a client event; the server's existing segment metrics carry the rung, so switches can be seen from both ends.
 - **FR-008** Dropping the engine aborts every request, removes every listener and ends the MediaSource; nothing keeps running after the player closes (V642).
 
 ## Slices
@@ -96,8 +107,9 @@ A segment request fails, a segment is corrupt, or the browser cannot play the st
 1. **Seam**: the engine setting and override, `Engine::RustHls` routing to hls.js until the engine exists, engine-neutral telemetry labels, and auto quality gated on "engine reports fragments" instead of `Engine::HlsJs`.
 2. **Play**: `pharos-hls` parser, timeline and planner; the MSE adapter; start position, seek, eviction, `OnFragment`, fallback for unsupported streams.
 3. **Recover**: retries, gap jumping, stall nudges, MediaSource rebuild, `QuotaExceededError` handling, recovery budget.
-4. **Measure and flip**: the comparison harness in CI, device traces against slice 0, then a separate decision to make the Rust engine the default.
-5. **Later, if needed**: TS audio (open question 1), multi-rung ABR, Web Worker placement.
+4. **Adapt**: the server's opt-in H.264 fMP4 ladder for browsers (FR-009), rung switching in the adapter (FR-010), the ABR rule and its estimator (FR-011), the ceiling and auto-quality hand-over (FR-012), switch telemetry (FR-013).
+5. **Measure and flip**: the comparison harness in CI, device traces against slice 0, then a separate decision to make the Rust engine the default. The default does not flip without slice 4.
+6. **Later, if needed**: TS audio (open question 1), a VP9 ladder, Web Worker placement.
 
 ## Verification
 
@@ -117,10 +129,18 @@ A segment request fails, a segment is corrupt, or the browser cannot play the st
 | V641 | `OnFragment` reports the same bytes and first-to-last-byte time as `fragment_load` does for hls.js on the same segment | adapter test against recorded timings |
 | V642 | Dropping the engine leaves no request, listener or timer running | e2e: close the player, assert no further segment requests |
 | V643 | The added wasm stays within 60 KB gzip | CI size check |
+| V644 | A browser master asked for with `abr=1` lists the H.264 fMP4 ladder, every rung sharing the audio group and the same segment boundaries; without it the master is unchanged | server handler tests |
+| V645 | The ABR rule never picks a rung above the user's maximum quality or the session cap | property test of the rule |
+| V646 | An up-switch is taken only with a forward buffer that covers a cold segment encode, and at most once per up-switch interval | property test of the rule with a fake clock |
+| V647 | A down-switch is taken while the forward buffer still covers the next segment's download at the estimated rate | property test of the rule |
+| V648 | A rung switch appends the new init then the next segment, with no reload and no change in `currentTime` | adapter e2e on a throttled link |
+| V649 | Every switch is logged and reported with from, to, reason, estimate, buffer and cold-encode time | log/event test with a disarm check |
 
 ## Open questions
 
-1. **Audio-only TS.** Audio-only items still get an MPEG-TS AAC ladder. Either the server sends web clients fMP4 audio (one server change, no client demuxer), or `pharos-hls` gains an ADTS-to-fMP4 remux. Leaning to the server change; decide before slice 5.
+1. **Audio-only TS.** Audio-only items still get an MPEG-TS AAC ladder. Either the server sends web clients fMP4 audio (one server change, no client demuxer), or `pharos-hls` gains an ADTS-to-fMP4 remux. Leaning to the server change; decide before slice 6.
 2. **Steam Frame browser.** Which engine its browser uses and whether it has MSE; confirm on the device in slice 0.
 3. **Device classes.** Which signal picks the "low" buffer targets (`navigator.deviceMemory`, the 025 TV build, a user setting). Decide in slice 2 from slice 0 numbers.
 4. **Worker placement.** Only if slice 0 or slice 3 traces show the engine causing long tasks.
+5. **VP9 ladder.** VP9 is CPU-only on the current host; a VP9 ladder multiplies that cost. Browsers that take H.264 get the ladder; VP9-only clients keep one rung until measured.
+6. **Cold-encode estimate.** Whether the engine learns cold-segment time from its own first fetches or the server advertises it. Start with the engine's own measurement.
