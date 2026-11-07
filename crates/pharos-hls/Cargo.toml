@@ -1,0 +1,16 @@
+[package]
+name = "pharos-hls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure-Rust HLS playlist parser, timeline and buffer planner for the Pharos web player"
+
+# Deliberately no workspace-hack: it unifies native-only features (tokio/mio)
+# that do not compile for wasm32. See .config/hakari.toml final-excludes.
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
