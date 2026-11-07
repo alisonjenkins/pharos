@@ -281,3 +281,39 @@ async fn a_client_sets_tracks_follows_and_sees_who_paused() {
     .await;
     assert_eq!(by, a_id);
 }
+
+/// 014 US9 through the client: `set_item` moves the group, and the other
+/// member is told the item and the position to start it from.
+/// Disarm check: with `set_item` writing no item, the server refuses it as
+/// `invalid` and this fails.
+#[actix_web::test]
+async fn a_client_moves_the_group_to_another_item() {
+    let rig = rig().await;
+    let a = group(&rig, &rig.fx.admin_token).await;
+    let b = group(&rig, &rig.fx.user_token).await;
+    let (a_sink, _a_seen) = collector();
+    let a_call = call("dev-a");
+    let a_member = a
+        .create(&a_call, ItemRef::Real(MOVIE), 5_000, a_sink)
+        .await
+        .expect("create");
+    let listed = b.list(&call("dev-b")).await.expect("list");
+    let (b_sink, mut b_seen) = collector();
+    let _b_member = b
+        .join(&call("dev-b"), &listed[0].id, b_sink)
+        .await
+        .expect("join");
+    let other = rig.fx.other_item_id;
+    a_member
+        .set_item(&a_call, ItemRef::Real(other), 2_000, "")
+        .await
+        .expect("set item");
+    let moved = until(&mut b_seen, |u| match u {
+        GroupUpdate::Item {
+            item, position_ms, ..
+        } if *item == ItemRef::Real(other) => Some(*position_ms),
+        _ => None,
+    })
+    .await;
+    assert_eq!(moved, 2_000);
+}
