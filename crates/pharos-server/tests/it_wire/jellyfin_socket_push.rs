@@ -195,6 +195,8 @@ async fn activity_log_entry_start_pushes_new_entries_to_admin_until_stop() {
     assert_eq!(entries[0]["Name"], "alice signed in");
     assert_eq!(entries[0]["Type"], "SessionStarted");
     assert_eq!(entries[0]["Severity"], "Information");
+    // B636: a user-less entry carries Jellyfin's Guid.Empty, never null.
+    assert_eq!(entries[0]["UserId"], "00000000-0000-0000-0000-000000000000");
     assert!(entries[0]["Id"].is_i64() && entries[0]["Date"].is_string());
 
     send(&mut ws, "ActivityLogEntryStop", Value::Null).await;
