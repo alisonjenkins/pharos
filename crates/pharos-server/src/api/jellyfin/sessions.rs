@@ -210,11 +210,12 @@ async fn playing_started(
             session_id,
             user_id: user.0.id,
             user_name: user.0.name.clone(),
-            device_id: auth
-                .device_id
-                .clone()
-                .or_else(|| auth.device.clone())
-                .unwrap_or_else(|| "unknown".into()),
+            device_id: pharos_core::ClientDeviceId::from(
+                auth.device_id
+                    .clone()
+                    .or_else(|| auth.device.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
             device_name: auth.device_label(),
             client: auth.client_label(),
             version: auth.version_label(),
