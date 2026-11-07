@@ -1046,16 +1046,6 @@ struct GroupInfoDto {
     last_updated_at: String,
 }
 
-fn play_state_str(s: pharos_sync::messages::GroupPlayState) -> &'static str {
-    use pharos_sync::messages::GroupPlayState;
-    match s {
-        GroupPlayState::Idle => "Idle",
-        GroupPlayState::Waiting => "Waiting",
-        GroupPlayState::Playing => "Playing",
-        GroupPlayState::Paused => "Paused",
-    }
-}
-
 /// Where a group was withheld from a user: the `route` label of
 /// `pharos_syncplay_group_hidden_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,7 +1342,7 @@ async fn list_groups(
         .map(|g| GroupInfoDto {
             group_id: g.id,
             group_name: g.name,
-            state: play_state_str(g.state),
+            state: g.state.as_jellyfin_str(),
             participants: g.participants,
             last_updated_at: now_iso8601(),
         })
