@@ -4225,6 +4225,7 @@ fn Player(
     // that counts as watching this one to its end comes through here.
     let advance = {
         let (p, clock, advanced) = (Rc::clone(&p), Rc::clone(&clock), Rc::clone(&advanced));
+        let session = session.clone();
         move |next: ItemRef| {
             if advanced.replace(true) {
                 return;
@@ -4239,6 +4240,12 @@ fn Player(
                     platform::warn(&format!("pharos: marking watched failed: {e}"));
                 }
             });
+            // In a group the group moves on, and its item brings every
+            // member there; two members' up next moving it at once move it
+            // once (014 US9).
+            if session().is_some_and(|s| s.move_to(next, 0)) {
+                return;
+            }
             on_advance.call(next);
         }
     };
@@ -4246,11 +4253,8 @@ fn Player(
     // The next episode often arrives after the player mounts, and the media
     // handlers can outlive the render that made them, so they read it here.
     let up_next_to = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
-    // In a group the group decides what plays next, as for a song's queue.
-    up_next_to.set(
-        near.next
-            .filter(|_| p.kind == ItemKind::Episode && !grouped),
-    );
+    // In a group, moving on moves the group (`advance`).
+    up_next_to.set(near.next.filter(|_| p.kind == ItemKind::Episode));
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
@@ -4468,8 +4472,13 @@ fn Player(
                     advance(id);
                 }
                 // In place of this episode, so Back leaves the show rather than
-                // replaying every episode watched.
-                Control::Play(id) => go(id),
+                // replaying every episode watched. On the group's player it
+                // moves the group, whose item brings this member too (014 US9).
+                Control::Play(id) => {
+                    if !session().is_some_and(|s| s.move_to(id, 0)) {
+                        go(id);
+                    }
+                }
                 Control::PlayNext => {
                     if let Some(next) = up_next_to.get() {
                         platform::info(&format!("pharos: up next: playing {next} (play now)"));
