@@ -19,7 +19,6 @@ pub mod group_ops;
 pub mod health;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
-#[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_memo;
 pub mod library_watch;
 pub mod metadata_backfill;
