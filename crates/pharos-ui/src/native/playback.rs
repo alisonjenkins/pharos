@@ -112,6 +112,7 @@ pub fn capabilities(
         audio_codecs: pick(AUDIO_CODECS, &codec),
         containers: pick(CONTAINERS, &container),
         max_bitrate: 0,
+        hdr: false,
         image_subtitles: IMAGE_SUBTITLES.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
