@@ -667,9 +667,99 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
     }
 }
 
-pub use super::subs_web::{
-    rust_subtitles, set_controls_visible as set_subtitle_controls_visible, RustSubtitles,
-};
+pub use super::subs_web::{rust_subtitles, RustSubtitles};
+
+thread_local! {
+    /// Whether the control bar shows, for the JASSUB canvas lift (B634).
+    static STYLED_CONTROLS_VISIBLE: Cell<bool> = const { Cell::new(true) };
+    /// Watches each JASSUB canvas so the lift follows a resize or full
+    /// screen: it fires after JASSUB refits the canvas, at most once a frame.
+    static STYLED_LIFT_OBSERVER: RefCell<Option<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Whether the player's control bar shows. Both subtitle renderers clear it
+/// while it does: the Rust one places its text above it, and the JASSUB
+/// canvas moves up (`lift_styled_subtitles`). Called when the bar shows or
+/// hides, not per pointer move.
+pub fn set_subtitle_controls_visible(visible: bool) {
+    super::subs_web::set_controls_visible(visible);
+    STYLED_CONTROLS_VISIBLE.with(|c| c.set(visible));
+    lift_styled_subtitles();
+}
+
+/// Has the shared resize observer watch `canvas` (a no-op if it already
+/// does), so its lift is redone when JASSUB refits it.
+fn observe_styled_canvas(canvas: &web_sys::Element) {
+    STYLED_LIFT_OBSERVER.with(|o| {
+        let mut o = o.borrow_mut();
+        if o.is_none() {
+            let cb = Closure::<dyn FnMut()>::new(lift_styled_subtitles);
+            if let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) {
+                *o = Some((observer, cb));
+            }
+        }
+        if let Some((observer, _)) = o.as_ref() {
+            observer.observe(canvas);
+        }
+    });
+}
+
+/// Moves each JASSUB canvas clear of the control bar while it shows, by
+/// setting `--pharos-ass-lift` on its frame; pharos.css turns that into a
+/// transform, so the script is not drawn again (B634, V583). Runs when the
+/// bar shows or hides, when a renderer gets ready, and when a canvas is
+/// resized; the transform itself changes no canvas size, so it does not
+/// trigger itself.
+fn lift_styled_subtitles() {
+    let visible = STYLED_CONTROLS_VISIBLE.with(Cell::get);
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(canvases) = doc.query_selector_all(".pharos-video-frame > canvas.JASSUB") else {
+        return;
+    };
+    for i in 0..canvases.length() {
+        let Some(canvas) = canvases
+            .item(i)
+            .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+        else {
+            continue;
+        };
+        observe_styled_canvas(&canvas);
+        let Some(frame) = canvas
+            .parent_element()
+            .and_then(|f| f.dyn_into::<web_sys::HtmlElement>().ok())
+        else {
+            continue;
+        };
+        let player = frame.closest(".pharos-player").ok().flatten();
+        let (player_bottom, controls_height) = player
+            .as_ref()
+            .and_then(|p| {
+                let bar = p
+                    .query_selector(".pharos-controls")
+                    .ok()
+                    .flatten()?
+                    .dyn_into::<web_sys::HtmlElement>()
+                    .ok()?;
+                Some((
+                    p.get_bounding_client_rect().bottom(),
+                    f64::from(bar.offset_height()),
+                ))
+            })
+            .unwrap_or((f64::NAN, 0.0));
+        // Layout offsets, not the on-screen box: the canvas's own transform
+        // must not feed back into its lift.
+        let canvas_bottom = frame.get_bounding_client_rect().top()
+            + f64::from(canvas.offset_top() + canvas.offset_height());
+        let lift =
+            super::subtitles::styled_lift(visible, canvas_bottom, player_bottom, controls_height);
+        let _ = frame
+            .style()
+            .set_property("--pharos-ass-lift", &lift.to_string());
+    }
+}
 
 /// Where the `<video>` `video_id`'s cues are laid out now: the width a cue
 /// of `size` 100 spans (the picture's: `.pharos-video` is `object-fit:
@@ -2747,6 +2837,10 @@ pub async fn styled_subtitles(
                 }
             };
             if live.get() {
+                if result.is_ok() {
+                    // The canvas is new: give it the lift the bar already has.
+                    lift_styled_subtitles();
+                }
                 report(result);
             }
         }

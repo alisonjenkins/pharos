@@ -1076,6 +1076,23 @@ body:has(.pharos-stage.is-full) .pharos-error {
   height: 100%;
   pointer-events: none;
 }
+/* ASS subtitles drawn by JASSUB (ADR-0057) on a canvas it fits to the picture:
+   while the control bar shows, the canvas moves up clear of it by the overlap
+   the player sets in `--pharos-ass-lift` (px, B634, V583). A transform, so the
+   compositor moves the drawn frame and libass draws nothing again; it changes
+   only when the bar shows or hides, never per pointer move. `will-change`
+   keeps the canvas on its own layer: without it Firefox does not show a frame
+   the worker draws while paused (after a seek) until something else repaints. */
+.pharos-video-frame > canvas.JASSUB {
+  will-change: transform;
+  transform: translateY(calc(var(--pharos-ass-lift, 0) * -1px));
+  transition: transform 0.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pharos-video-frame > canvas.JASSUB {
+    transition: none;
+  }
+}
 /* WebVTT cues: an outline and soft shadow instead of the browser's opaque
    box. `::cue` takes no border-radius or padding, so any box stays square;
    the dark outline keeps white text readable on a white frame. */
