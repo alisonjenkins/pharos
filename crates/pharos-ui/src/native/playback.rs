@@ -1476,7 +1476,7 @@ pub fn offered_subtitles(tracks: &[Track], level: EffectsLevel) -> Vec<Track> {
 }
 
 /// Whether the ASS renderer must be rebuilt for `script` when it was last
-/// started for `loaded` (B635): for a new script, or to tear it down when
+/// started for `loaded` (B637): for a new script, or to tear it down when
 /// there is none. The pick set again to the track already drawn (as happens
 /// once playback starts) keeps the renderer and fetches nothing.
 pub fn restart_styled(loaded: Option<&str>, script: Option<&str>) -> bool {
@@ -2493,7 +2493,7 @@ mod tests {
         assert_eq!(subtitle_switch(true, None), SubtitleSwitch::Renegotiate);
     }
 
-    /// B635: the pick set again to the drawn track keeps its renderer; a new
+    /// B637: the pick set again to the drawn track keeps its renderer; a new
     /// script or none rebuilds or tears it down.
     #[test]
     fn the_ass_renderer_is_rebuilt_only_for_a_new_script() {
