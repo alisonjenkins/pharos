@@ -106,6 +106,7 @@ fn transcode_segment(dir: &std::path::Path, src: &std::path::Path) -> std::path:
         filler: None,
         video_3d_format: None,
         stereo_output: Default::default(),
+        tonemap: Default::default(),
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         src.to_str().expect("utf8 tmpdir"),

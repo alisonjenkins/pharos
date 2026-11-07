@@ -117,6 +117,7 @@ fn transcode_segment(
         filler: None,
         video_3d_format: None,
         stereo_output: Default::default(),
+        tonemap: Default::default(),
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
@@ -206,6 +207,7 @@ fn transcode_segment_from_sidecar(
         filler: None,
         video_3d_format: None,
         stereo_output: Default::default(),
+        tonemap: Default::default(),
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),

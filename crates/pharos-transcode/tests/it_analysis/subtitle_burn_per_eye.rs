@@ -84,6 +84,7 @@ fn burn_segment(
         filler: None,
         video_3d_format: Some(format),
         stereo_output,
+        tonemap: Default::default(),
     };
     let args = pharos_transcode::ffmpeg_transcode_args(
         input.to_str().unwrap(),
