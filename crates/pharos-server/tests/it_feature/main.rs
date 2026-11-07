@@ -14,5 +14,6 @@ mod jellyfin_feature_user_policy;
 mod opensubtitles;
 mod playback_access;
 mod playlists;
+mod styled_subtitle;
 mod subtitle_fonts;
 mod thin_endpoints;
