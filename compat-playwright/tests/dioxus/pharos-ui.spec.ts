@@ -1769,6 +1769,85 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // V630: `?engine=rust` picks the Pharos engine for one page load. Until it
+    // is built (spec 031 slice 2) the watch page says so and plays through
+    // hls.js, so the override can never leave a viewer without playback.
+    test("the engine override is logged and falls back to hls.js", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-engine-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/fixture-1.webm"));
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+        };
+      });
+      const logs: string[] = [];
+      page.on("console", (m) => logs.push(m.text()));
+      const hlsjs: string[] = [];
+      page.on("request", (r) => {
+        if (r.url().includes("/assets/vendor/hls.min.js")) hlsjs.push(r.url());
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+      const verdict =
+        "pharos: playback engine=hlsjs reason=fallback cause=not_built asked=rust asked_by=override";
+      await expect
+        .poll(() => logs.some((l) => l.includes(verdict)), { timeout: 15_000 })
+        .toBe(true);
+      await expect.poll(() => hlsjs.length, { timeout: 15_000 }).toBe(1);
+      await expect
+        .poll(
+          () =>
+            page.evaluate(
+              () =>
+                (document.getElementById("pharos-video") as HTMLVideoElement | null)
+                  ?.currentTime ?? 0,
+            ),
+          { timeout: 60_000 },
+        )
+        .toBeGreaterThan(1);
+    });
+
     // B551: a seek that waits on the server shows a spinner over the video,
     // outside the chrome that hides on idle, and it goes once data arrives.
     test("a seek that waits on the server shows a loading spinner", async ({ page, request }) => {
