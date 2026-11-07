@@ -3210,6 +3210,19 @@ pub fn apply_subtitle_size(size: SubtitleSize) {
     }
 }
 
+/// Set `data-device` on `<html>` so a TV gets the ten-foot layout.
+pub fn apply_device(device: super::playback::DeviceClass) {
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    else {
+        return;
+    };
+    if let Err(e) = root.set_attribute("data-device", device.label()) {
+        warn(&format!("pharos: device apply failed error={e:?}"));
+    }
+}
+
 /// Set `data-library-transition` on `<html>` so a library's cards arrive
 /// with `fx`.
 pub fn apply_library_transition(fx: LibraryTransition) {

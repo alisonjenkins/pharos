@@ -3332,6 +3332,27 @@ body::before {
   outline-offset: 3px;
 }
 
+/* 025: the ten-foot layout. A TV keeps content inside the title-safe area
+   (48 x 27 px of a 960 x 540 viewport, Android TV's overscan margin) and the
+   D-pad focus ring is the only pointer, so it is thicker and glows. Rails
+   still scroll out to the screen edge through the wider gutter. */
+:root[data-device="tv"] {
+  scroll-padding-block: 27px;
+}
+:root[data-device="tv"] .pharos-banner {
+  padding: 27px 48px 1rem;
+}
+:root[data-device="tv"] .pharos-main {
+  --px-gutter: 48px;
+  padding: 1.5rem var(--px-gutter) 27px;
+}
+:root[data-device="tv"] :focus-visible:not(.pharos-poster, .pharos-player),
+:root[data-device="tv"] .pharos-poster:focus-visible .pharos-poster-art {
+  outline: 3px solid var(--px-color-focus);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 8px color-mix(in srgb, var(--px-color-focus) 35%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* Focus still shows, by shadow and ring, but nothing moves. */
   .pharos-poster:hover .pharos-poster-art,
