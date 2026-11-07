@@ -1,4 +1,4 @@
-import { test, expect, BrowserContext, Page } from "@playwright/test";
+import { test, expect, APIRequestContext, BrowserContext, Page } from "@playwright/test";
 import { assertPausedAll, assertSeekConverged, waitUntilInSync } from "../lib/sync-oracle";
 import {
   ClientEventCounts,
@@ -308,4 +308,106 @@ test.describe("pharos Dioxus UI watch together", () => {
       throw await failure(e, a, b, logs);
     }
   });
+
+  // Any member can seek, either way, playing or paused, and the group goes
+  // with them. A seek while playing holds the group until every member has
+  // the new position loaded, then starts them together: each member reports
+  // that wait (`groupWait`).
+  test("seeking forward and back, by either member, moves both", async ({ browser, request }) => {
+    test.setTimeout(180_000);
+    const { a, b, people, logs } = await startGroup(browser, request, open, "/fixture-1.webm", {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+    });
+    const [byA, byB] = people;
+    try {
+      await waitUntilInSync(people);
+
+      // A jumps forward to 60% (72 s of 120 s) while the group plays.
+      let before = await clientEvents(request, PHAROS_URL);
+      await seekTo(byA, 0.6);
+      await bothPast(people, 65);
+      await waitUntilInSync(people);
+      await waitsReported(request, before, "after A's seek forward");
+      // B's page names who moved the group, and where to (the newest line
+      // may already be the restart that followed).
+      await expect(
+        b.page
+          .locator(".pharos-activity-line")
+          .filter({ hasText: new RegExp(`^${OPTED_IN_A.name} skipped to 1:1\\d$`) }),
+      ).not.toHaveCount(0);
+
+      // B jumps back to 10% (12 s).
+      before = await clientEvents(request, PHAROS_URL);
+      await seekTo(byB, 0.1);
+      await expect
+        .poll(() => byA.probe().then((p) => p.currentTime), {
+          message: "B's seek back reaches A",
+          timeout: 15_000,
+        })
+        .toBeLessThan(30);
+      await waitUntilInSync(people);
+      await waitsReported(request, before, "after B's seek back");
+
+      // Paused, B seeks forward to 40% (48 s): both stay paused, there.
+      await toggleUntil(byA, true);
+      await assertPausedAll(people);
+      await seekTo(byB, 0.4);
+      await expect
+        .poll(() => byA.probe().then((p) => p.currentTime), {
+          message: "B's paused seek reaches A",
+          timeout: 15_000,
+        })
+        .toBeGreaterThan(40);
+      await assertSeekConverged(people, (await byB.probe()).currentTime * 1000);
+      await assertPausedAll(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
 });
+
+/** Clicks `member`'s seek bar at `fraction` of its width. */
+async function seekTo(member: Member, fraction: number) {
+  // The controls hide while the pointer rests; moving wakes them.
+  await member.page.mouse.move(200, 200);
+  const bar = member.page.locator("#pharos-seek");
+  const box = await bar.boundingBox();
+  expect(box, `${member.label}'s seek bar is drawn`).not.toBeNull();
+  await bar.click({
+    position: { x: (box?.width ?? 0) * fraction, y: (box?.height ?? 2) / 2 },
+  });
+}
+
+/** Waits for every member's video to pass `seconds`. */
+async function bothPast(people: Member[], seconds: number) {
+  for (const m of people) {
+    await expect
+      .poll(() => m.probe().then((p) => p.currentTime), {
+        message: `${m.label} reaches ${seconds} s`,
+        timeout: 15_000,
+      })
+      .toBeGreaterThan(seconds);
+  }
+}
+
+/** Both members report their wait for the group to start again (`groupWait`). */
+async function waitsReported(
+  request: APIRequestContext,
+  before: ClientEventCounts,
+  when: string,
+) {
+  let seen: ClientEventCounts = new Map();
+  try {
+    await expect
+      .poll(
+        async () => {
+          seen = delta(before, await clientEvents(request, PHAROS_URL));
+          return seen.get("groupWait/info") ?? 0;
+        },
+        { message: `each member reports its wait ${when}`, timeout: 15_000 },
+      )
+      .toBeGreaterThanOrEqual(2);
+  } catch (e) {
+    throw new Error(`${(e as Error).message}\ncounted since the seek: ${line(seen)}`);
+  }
+}
