@@ -132,26 +132,36 @@ async fn handle_connection<S>(
         close_with_error(&mut session, ErrorCode::Internal, "group actor dropped").await;
         return;
     }
-    let Joined {
-        group_id,
-        leader,
-        members,
-    } = match reply_rx.await {
-        Ok(j) => j,
+    // A remote handle with no persisted snapshot to read the name and state
+    // from drops the reply instead of inventing them: the owner's `Joined`
+    // then reaches this socket over delivery as the first one. A reply
+    // dropped by a dead local actor is still an error.
+    match reply_rx.await {
+        Ok(Joined {
+            group_id,
+            leader,
+            members,
+            group_name,
+            state,
+        }) => {
+            let _ = send(
+                &mut session,
+                ServerMsg::Joined {
+                    group_id,
+                    leader,
+                    members,
+                    group_name,
+                    state,
+                },
+            )
+            .await;
+        }
+        Err(_) if !group_handle.tx.is_closed() => {}
         Err(_) => {
             close_with_error(&mut session, ErrorCode::Internal, "join reply dropped").await;
             return;
         }
-    };
-    let _ = send(
-        &mut session,
-        ServerMsg::Joined {
-            group_id,
-            leader,
-            members,
-        },
-    )
-    .await;
+    }
 
     // 5) bidirectional pump: WS frames → group; group outbound → WS.
     let group_tx = group_handle.tx.clone();

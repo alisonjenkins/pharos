@@ -977,12 +977,14 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         ServerMsg::Joined {
             group_id: gid,
             members,
+            group_name,
+            state,
             ..
         } => {
             let info = GroupInfoData {
                 group_id: gid.to_string(),
-                group_name: "SyncPlay".to_string(),
-                state: "Idle",
+                group_name,
+                state: state.as_jellyfin_str(),
                 participants: members.into_iter().map(|m| m.name).collect(),
                 last_updated_at: format_iso8601_ms(unix_now_ms()),
             };
@@ -1427,6 +1429,42 @@ fn is_general_command(cmd: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// V581: `GroupJoined`'s `GroupInfoDto` carries the group's real name and
+    /// play state, not the `SyncPlay` / `Idle` placeholders.
+    #[test]
+    fn group_joined_carries_real_name_and_state() {
+        use pharos_sync::messages::{GroupId, GroupPlayState, MemberId, MemberSummary};
+        let ctx = TranslateCtx {
+            group_id: None,
+            epoch_unix_ms: 0,
+            current_pli: None,
+        };
+        let m = MemberId::new();
+        let out = translate_outbound(
+            ServerMsg::Joined {
+                group_id: GroupId::new(),
+                leader: m,
+                members: vec![MemberSummary {
+                    member_id: m,
+                    name: "lace".into(),
+                    is_leader: true,
+                    device: None,
+                }],
+                group_name: "Movie Night".into(),
+                state: GroupPlayState::Paused,
+            },
+            &ctx,
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["Data"]["Type"], "GroupJoined");
+        assert_eq!(v["Data"]["Data"]["GroupName"], "Movie Night");
+        assert_eq!(v["Data"]["Data"]["State"], "Paused");
+        assert_eq!(v["Data"]["Data"]["Participants"][0], "lace");
+        assert!(v["Data"]["Data"]["LastUpdatedAt"].is_string());
+    }
 
     #[test]
     fn translate_pause_carries_position_ticks() {
