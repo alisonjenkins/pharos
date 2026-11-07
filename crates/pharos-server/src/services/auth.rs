@@ -20,6 +20,9 @@ pub enum TokenRefusal {
     /// [`TokenScope::Playback`]), and the caller needs a full credential: a
     /// restricted token reaches only the allowlisted HTTP routes (V229).
     ScopeRestricted,
+    /// The user's access schedule is closed right now (V578). Jellyfin
+    /// answers 403 here, not 401: the credential is fine, the hour is not.
+    OutsideSchedule,
 }
 
 impl TokenRefusal {
@@ -30,6 +33,7 @@ impl TokenRefusal {
             TokenRefusal::UserRevoked => "user_revoked",
             TokenRefusal::Unavailable(_) => "store_unavailable",
             TokenRefusal::ScopeRestricted => "scope_restricted",
+            TokenRefusal::OutsideSchedule => "outside_schedule",
         }
     }
 }
@@ -87,7 +91,64 @@ async fn live_user(stores: &Stores, uid: UserId) -> Result<User, TokenRefusal> {
     if record.policy.is_disabled {
         return Err(TokenRefusal::UserRevoked);
     }
+    // Jellyfin DefaultAuthorizationHandler: admins skip the schedule on a
+    // request; everyone else is refused outside their windows (V578).
+    if !record.policy.admin {
+        let (weekday, hour) = crate::local_time::now_local();
+        if !record.policy.within_access_schedule(weekday, hour) {
+            return Err(TokenRefusal::OutsideSchedule);
+        }
+    }
     Ok(record.into_user())
+}
+
+/// Why a user who proved who they are was still refused a new session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginGate {
+    /// Their access schedule is closed right now (V578).
+    OutsideSchedule,
+}
+
+impl LoginGate {
+    /// The `reason` label of `pharos_login_gated_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            LoginGate::OutsideSchedule => "outside_schedule",
+        }
+    }
+
+    /// Jellyfin's `SecurityException` text for this refusal.
+    pub fn message(self) -> &'static str {
+        match self {
+            LoginGate::OutsideSchedule => "User is not allowed access at this time.",
+        }
+    }
+}
+
+/// The policy checks Jellyfin makes after a correct password and before it
+/// issues a session (`UserManager.AuthenticateUser`). Unlike a request,
+/// a login is gated for admins too. Only called with a verified user, so
+/// the refusal can say why without telling a guesser anything (V578).
+pub fn login_gate(user: &User) -> Result<(), LoginGate> {
+    let (weekday, hour) = crate::local_time::now_local();
+    login_gate_at(user, weekday, hour)
+}
+
+fn login_gate_at(user: &User, weekday: u8, hour: f64) -> Result<(), LoginGate> {
+    let gate = if user.policy.within_access_schedule(weekday, hour) {
+        return Ok(());
+    } else {
+        LoginGate::OutsideSchedule
+    };
+    metrics::counter!("pharos_login_gated_total", "reason" => gate.label()).increment(1);
+    tracing::warn!(
+        user.id = %user.id,
+        reason = gate.label(),
+        weekday,
+        hour,
+        "login refused by user policy"
+    );
+    Err(gate)
 }
 
 /// A backend failure is `Unavailable` whatever stage it hit; any other error
@@ -303,6 +364,9 @@ pub enum LoginOutcome {
     /// The password was right but the user holds the most connections they
     /// may (FR-010); no token was issued.
     Capped,
+    /// The password was right but the user's policy (access schedule) forbids
+    /// a session; no token was issued.
+    Gated,
     /// A Quick Connect poll for a code nobody has authorized yet. Not
     /// counted: clients poll every few seconds.
     Pending,
@@ -317,6 +381,7 @@ impl LoginOutcome {
             LoginOutcome::Unavailable => "unavailable",
             LoginOutcome::OriginRefused => "origin_refused",
             LoginOutcome::Capped => "capped",
+            LoginOutcome::Gated => "gated",
             LoginOutcome::Pending => "pending",
         }
     }
@@ -345,6 +410,8 @@ pub enum PasswordLoginError {
         held: u32,
         max: u32,
     },
+    /// The password was right but the user's policy forbids a session now.
+    Gated(LoginGate),
 }
 
 impl PasswordLoginError {
@@ -358,6 +425,7 @@ impl PasswordLoginError {
             PasswordLoginError::Refused(LoginRefusal::Backend(_))
             | PasswordLoginError::Issue(_) => LoginOutcome::Unavailable,
             PasswordLoginError::Capped { .. } => LoginOutcome::Capped,
+            PasswordLoginError::Gated(_) => LoginOutcome::Gated,
         }
     }
 }
@@ -396,6 +464,7 @@ pub async fn password_login(
             .verify(&state.auth, name, password, client_ip)
             .await
             .map_err(|r| PasswordLoginError::Refused(settle_lockout(state, r)))?;
+        login_gate(&user).map_err(PasswordLoginError::Gated)?;
         admit(&user).map_err(|(held, max)| PasswordLoginError::Capped { held, max })?;
         let token = state
             .stores
@@ -582,6 +651,8 @@ pub enum QuickConnectLoginError {
     /// `admit` refused the authorizing user (a connection cap); the code is
     /// kept, so a retry can still sign in.
     Capped { held: u32, max: u32 },
+    /// The authorizing user's policy forbids a session now; the code is kept.
+    Gated(LoginGate),
     /// The registry, user store or token store failed.
     Unavailable(String),
 }
@@ -592,6 +663,7 @@ impl QuickConnectLoginError {
             Self::Unknown | Self::Disabled => LoginOutcome::Invalid,
             Self::Pending => LoginOutcome::Pending,
             Self::Capped { .. } => LoginOutcome::Capped,
+            Self::Gated(_) => LoginOutcome::Gated,
             Self::Unavailable(_) => LoginOutcome::Unavailable,
         }
     }
@@ -643,6 +715,7 @@ pub async fn quick_connect_login(
             return Err(E::Disabled);
         }
         let user = record.into_user();
+        login_gate(&user).map_err(E::Gated)?;
         admit(&user).map_err(|(held, max)| E::Capped { held, max })?;
         // One-shot: of two racing polls, only one consumes the entry.
         let entry = ask(true).await?.ok_or(E::Unknown)?;
@@ -777,6 +850,7 @@ mod tests {
             TokenRefusal::UserRevoked.label(),
             TokenRefusal::Unavailable(String::new()).label(),
             TokenRefusal::ScopeRestricted.label(),
+            TokenRefusal::OutsideSchedule.label(),
         ];
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), labels.len());

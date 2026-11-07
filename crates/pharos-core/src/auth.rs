@@ -85,6 +85,17 @@ impl UserPolicy {
         self.enable_all_folders || self.enabled_folders.iter().any(|f| f == wire_id)
     }
 
+    /// Whether the user may use the server on `weekday` (0 = Sunday) at
+    /// `hour` (fractional, 0.0 to 24.0), both in server local time. No
+    /// schedules means always (Jellyfin `IsParentalScheduleAllowed`, V578).
+    pub fn within_access_schedule(&self, weekday: u8, hour: f64) -> bool {
+        self.access_schedules.is_empty()
+            || self
+                .access_schedules
+                .iter()
+                .any(|s| s.allows(weekday, hour))
+    }
+
     /// Consecutive failed password logins that disable the user, or `None`
     /// for no lockout. Jellyfin `UserManager.UpdatePolicyAsync`: `-1` is
     /// unlimited and `0` means its default of 3 (T68, V577).
@@ -128,6 +139,31 @@ pub struct AccessSchedule {
     pub day_of_week: String,
     pub start_hour: f64,
     pub end_hour: f64,
+}
+
+impl AccessSchedule {
+    /// Jellyfin `UserEntityExtensions.IsParentalScheduleAllowed`: the day
+    /// matches and `start_hour <= hour <= end_hour`, both ends inclusive.
+    /// `weekday` is 0 = Sunday. `Everyday`, `Weekday` (Mon-Fri) and
+    /// `Weekend` (Sat, Sun) are Jellyfin's `DynamicDayOfWeek` groups; an
+    /// unrecognised day matches nothing, so a typo restricts rather than
+    /// opens access.
+    pub fn allows(&self, weekday: u8, hour: f64) -> bool {
+        let day_matches = match self.day_of_week.as_str() {
+            "Sunday" => weekday == 0,
+            "Monday" => weekday == 1,
+            "Tuesday" => weekday == 2,
+            "Wednesday" => weekday == 3,
+            "Thursday" => weekday == 4,
+            "Friday" => weekday == 5,
+            "Saturday" => weekday == 6,
+            "Everyday" => true,
+            "Weekday" => (1..=5).contains(&weekday),
+            "Weekend" => weekday == 0 || weekday == 6,
+            _ => false,
+        };
+        day_matches && hour >= self.start_hour && hour <= self.end_hour
+    }
 }
 
 impl Default for AccessSchedule {
@@ -485,6 +521,43 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn sched(day: &str, start: f64, end: f64) -> AccessSchedule {
+        AccessSchedule {
+            day_of_week: day.into(),
+            start_hour: start,
+            end_hour: end,
+        }
+    }
+
+    // V578 — Jellyfin IsParentalScheduleAllowed.
+    #[test]
+    fn schedule_window_is_inclusive_and_day_groups_expand() {
+        let s = sched("Monday", 9.0, 17.5);
+        assert!(s.allows(1, 9.0) && s.allows(1, 17.5) && s.allows(1, 12.0));
+        assert!(!s.allows(1, 8.99) && !s.allows(1, 17.51) && !s.allows(2, 12.0));
+        let weekday = sched("Weekday", 0.0, 24.0);
+        assert!((1..=5).all(|d| weekday.allows(d, 3.0)));
+        assert!(!weekday.allows(0, 3.0) && !weekday.allows(6, 3.0));
+        let weekend = sched("Weekend", 0.0, 24.0);
+        assert!(weekend.allows(0, 3.0) && weekend.allows(6, 3.0) && !weekend.allows(3, 3.0));
+        assert!((0..=6).all(|d| sched("Everyday", 0.0, 24.0).allows(d, 23.9)));
+        assert!(
+            !sched("Funday", 0.0, 24.0).allows(1, 1.0),
+            "unknown day fails closed"
+        );
+    }
+
+    #[test]
+    fn no_schedules_always_allows_and_any_one_match_suffices() {
+        let mut p = UserPolicy::default();
+        assert!(p.within_access_schedule(3, 4.0));
+        p.access_schedules = vec![sched("Monday", 9.0, 10.0), sched("Friday", 0.0, 24.0)];
+        assert!(p.within_access_schedule(5, 4.0));
+        assert!(p.within_access_schedule(1, 9.5));
+        assert!(!p.within_access_schedule(1, 11.0));
+        assert!(!p.within_access_schedule(2, 9.5));
+    }
 
     #[test]
     fn user_id_new_is_unique() {

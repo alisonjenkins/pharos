@@ -86,6 +86,9 @@ fn login_denial(error: &PasswordLoginError) -> Denial {
         PasswordLoginError::Issue(_) => Denial::Unavailable {
             dependency: "token store",
         },
+        PasswordLoginError::Gated(gate) => Denial::NotPermitted {
+            what: gate.message(),
+        },
         PasswordLoginError::Capped { held, max } => Refusal::TooManyConnections {
             held: *held,
             max: *max,
@@ -386,6 +389,9 @@ fn quick_connect_denial(error: &QuickConnectLoginError) -> Denial {
             max: *max,
         }
         .denial(),
+        QuickConnectLoginError::Gated(gate) => Denial::NotPermitted {
+            what: gate.message(),
+        },
         QuickConnectLoginError::Unavailable(_) => Denial::Unavailable {
             dependency: "quick connect",
         },
