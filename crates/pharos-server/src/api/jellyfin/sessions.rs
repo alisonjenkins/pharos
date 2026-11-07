@@ -142,7 +142,7 @@ struct CapabilitiesBody {
 /// item). Shared by `GET /Sessions` and the `/socket` `SessionsStart` push.
 pub(crate) async fn visible_sessions(
     state: &AppState,
-    user_id_hex: &str,
+    user_id: pharos_core::UserId,
     admin: bool,
 ) -> Result<Vec<crate::sessions::SessionRecord>, String> {
     let snap = state.sessions.snapshot().await.map_err(|e| e.to_string())?;
@@ -150,7 +150,7 @@ pub(crate) async fn visible_sessions(
         snap
     } else {
         snap.into_iter()
-            .filter(|s| s.user_id == user_id_hex)
+            .filter(|s| s.user_id == Some(user_id))
             .collect()
     })
 }
@@ -159,13 +159,9 @@ async fn list_sessions(
     state: web::Data<AppState>,
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
-    let mut visible = visible_sessions(
-        &state,
-        &user.0.id.0.simple().to_string(),
-        user.0.policy.admin,
-    )
-    .await
-    .map_err(error::ErrorInternalServerError)?;
+    let mut visible = visible_sessions(&state, user.0.id, user.0.policy.admin)
+        .await
+        .map_err(error::ErrorInternalServerError)?;
     if let Some(directory) = &state.cast_directory {
         let viewer = crate::cast_sessions::ViewerInfo {
             user_id: user.0.id,

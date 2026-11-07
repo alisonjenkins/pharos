@@ -33,11 +33,23 @@ pub(crate) fn iso_now() -> String {
     format_iso8601(secs)
 }
 
+/// Wire form of a session's user id: unhyphenated hex, or `""` for a record
+/// with no user yet (a capabilities-only stub, an idle cast TV).
+pub(crate) fn user_id_wire(id: Option<UserId>) -> String {
+    id.map(|u| u.0.simple().to_string()).unwrap_or_default()
+}
+
+fn serialize_user_id<S: serde::Serializer>(id: &Option<UserId>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&user_id_wire(*id))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SessionRecord {
     pub id: String,
-    pub user_id: String,
+    /// `None` serialises as `""`, as the C# DTO's absent user did.
+    #[serde(serialize_with = "serialize_user_id")]
+    pub user_id: Option<UserId>,
     pub user_name: String,
     pub device_id: ClientDeviceId,
     pub device_name: String,
@@ -157,7 +169,7 @@ fn sweep_idle_sessions(state: &mut std::collections::HashMap<String, SessionReco
     for s in &evicted {
         tracing::info!(
             session_id = %pharos_core::secret_prefix(&s.id),
-            user_id = %s.user_id,
+            user_id = %user_id_wire(s.user_id),
             device_id = %s.device_id,
             item_id = s.now_playing_item_id.as_deref().unwrap_or(""),
             idle_ms = s.activity_age_ms(),
@@ -239,7 +251,10 @@ impl SessionRegistry {
                         let uid = user_id.0.simple().to_string();
                         let mut superseded: Vec<(String, Option<String>)> = Vec::new();
                         state.retain(|id, s| {
-                            if id == &session_id || s.user_id != uid || s.device_id != device_id {
+                            if id == &session_id
+                                || s.user_id != Some(user_id)
+                                || s.device_id != device_id
+                            {
                                 return true;
                             }
                             superseded.push((s.id.clone(), s.now_playing_item_id.clone()));
@@ -263,7 +278,7 @@ impl SessionRegistry {
                             session_id.clone(),
                             SessionRecord {
                                 id: session_id,
-                                user_id: user_id.0.simple().to_string(),
+                                user_id: Some(user_id),
                                 user_name,
                                 device_id,
                                 device_name,
@@ -327,7 +342,7 @@ impl SessionRegistry {
                                 .entry(session_id.clone())
                                 .or_insert_with(|| SessionRecord {
                                     id: session_id,
-                                    user_id: String::new(),
+                                    user_id: None,
                                     user_name: String::new(),
                                     device_id: ClientDeviceId::default(),
                                     device_name: String::new(),
@@ -589,5 +604,34 @@ mod tests {
             matches!(count, DebugValue::Counter(1)),
             "exactly one idle eviction happened — got {count:?}"
         );
+    }
+
+    /// Wire pin: `UserId` is unhyphenated lowercase hex.
+    #[tokio::test]
+    async fn user_id_serialises_as_simple_hex() {
+        let r = SessionRegistry::spawn();
+        let user = UserId::new();
+        r.apply(started_as("s1", user, "dev", "100")).await.unwrap();
+        let snap = r.snapshot().await.unwrap();
+        let json = serde_json::to_value(&snap[0]).unwrap();
+        assert_eq!(json["UserId"], user.0.simple().to_string());
+    }
+
+    /// Wire pin: a capabilities-only stub has no user and serialises `""`.
+    #[tokio::test]
+    async fn capabilities_stub_user_id_serialises_empty() {
+        let r = SessionRegistry::spawn();
+        r.apply(SessionEvent::SetCapabilities {
+            session_id: "s1".into(),
+            playable_media_types: Vec::new(),
+            supported_commands: Vec::new(),
+            max_streaming_bitrate: None,
+            supports_media_control: false,
+        })
+        .await
+        .unwrap();
+        let snap = r.snapshot().await.unwrap();
+        let json = serde_json::to_value(&snap[0]).unwrap();
+        assert_eq!(json["UserId"], "");
     }
 }

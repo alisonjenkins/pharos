@@ -399,7 +399,7 @@ async fn handle_connection<S>(
                 }
             } => {
                 match crate::api::jellyfin::sessions::visible_sessions(
-                    &state, &bound_user_id, is_admin,
+                    &state, user.id, is_admin,
                 ).await {
                     Ok(list) => {
                         let mut out = Outbound::new(
