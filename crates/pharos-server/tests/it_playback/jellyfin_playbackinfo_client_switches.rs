@@ -161,7 +161,7 @@ async fn forbidding_video_copy_turns_an_audio_remux_into_a_transcode() {
             let id = v["PlaySessionId"].as_str().unwrap().to_string();
             state
                 .transcode_sessions
-                .get(&id)
+                .get(pharos_core::PlaySessionId::from(id))
                 .await
                 .unwrap()
                 .unwrap()
@@ -205,7 +205,7 @@ async fn forced_transcode_uses_the_clients_own_transcoding_profile() {
     let id = v["PlaySessionId"].as_str().unwrap();
     let decision = state
         .transcode_sessions
-        .get(id)
+        .get(pharos_core::PlaySessionId::from(id))
         .await
         .unwrap()
         .unwrap()

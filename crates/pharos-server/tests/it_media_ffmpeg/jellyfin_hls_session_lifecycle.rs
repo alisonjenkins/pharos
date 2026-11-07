@@ -183,7 +183,11 @@ async fn segment_410s_after_session_removed_even_when_cached() {
     );
 
     // Invalidate the session.
-    state.transcode_sessions.remove("psid1").await.unwrap();
+    state
+        .transcode_sessions
+        .remove(&pharos_core::PlaySessionId::from("psid1"))
+        .await
+        .unwrap();
 
     // Second fetch — same URL — must 410 even though the file is on
     // disk. This is the W4 contract.

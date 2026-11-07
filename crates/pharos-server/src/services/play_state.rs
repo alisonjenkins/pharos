@@ -145,7 +145,11 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
 pub async fn end(state: &AppState, owner: UserId, session_id: &str) -> Result<(), ReportError> {
     // B256: the PlaySessionId authorizes streams on its own, so the
     // stop that ends the playback ends the capability too.
-    if let Err(e) = state.transcode_sessions.end_held(session_id, owner).await {
+    if let Err(e) = state
+        .transcode_sessions
+        .end_held(&pharos_core::PlaySessionId::from(session_id), owner)
+        .await
+    {
         tracing::warn!(error = %e, "playback stop: transcode session end failed");
     }
     state

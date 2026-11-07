@@ -571,7 +571,11 @@ async fn authorize_media(
     let qs = req.query_string();
     for key in ["tag", "PlaySessionId"] {
         if let Some(cap) = query_value_ci(qs, key) {
-            match state.transcode_sessions.get_stored(&cap).await {
+            match state
+                .transcode_sessions
+                .get_stored(&pharos_core::PlaySessionId::from(cap))
+                .await
+            {
                 Ok(Some(session)) if session.media_id == media_id => {
                     return capability_holder_allowed(state, &session.holder, media_id).await;
                 }
