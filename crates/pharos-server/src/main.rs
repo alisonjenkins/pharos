@@ -1680,7 +1680,40 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         });
         if let Some(dir) = sub_dir {
             tracing::info!(dir = %dir.display(), "subtitle cache persisting to disk");
+            // Spec 030 — OpenSubtitles needs the key and somewhere on the
+            // cache volume to keep downloads (never beside the media).
+            if let Some(key) = cfg.opensubtitles.key() {
+                use pharos_server::opensubtitles::{client::OpenSubtitlesClient, OpenSubtitles};
+                let gate = std::sync::Arc::new(pharos_server::opensubtitles::QuotaGate::new());
+                match OpenSubtitlesClient::new(
+                    key.to_string(),
+                    cfg.opensubtitles.login(),
+                    gate.clone(),
+                ) {
+                    Ok(client) => {
+                        tracing::info!(
+                            dir = %dir.join("opensubtitles").display(),
+                            logged_in = cfg.opensubtitles.login().is_some(),
+                            "opensubtitles enabled"
+                        );
+                        state = state.with_opensubtitles(OpenSubtitles {
+                            provider: std::sync::Arc::new(client),
+                            root: dir.join("opensubtitles"),
+                            gate,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "opensubtitles disabled: HTTP client failed to build");
+                    }
+                }
+            } else {
+                tracing::info!("opensubtitles disabled (no [opensubtitles].api_key)");
+            }
             sub_cache = sub_cache.with_disk(dir);
+        } else if cfg.opensubtitles.key().is_some() {
+            tracing::warn!(
+                "opensubtitles disabled: no subtitle cache directory (set [server].subtitle_cache_dir)"
+            );
         }
         // Event-window scans (burn gating) share the resident libav pool and
         // yield to live playback via the adaptive bg-I/O gate (a whole-file
