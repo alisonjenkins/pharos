@@ -863,6 +863,51 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         true
     }
 
+    /// Move the group to `item` from `position_ms` (014 US9): the next or
+    /// previous episode, or another title, picked on the player the group
+    /// drives. `true` when it went to the group, whose item update then
+    /// brings every member there, this one included; `false` when the caller
+    /// plays it alone (not in a group, or the stage shows another item).
+    /// Should the group refuse it (a server before schemaVersion 23, or an
+    /// item another member may not see), this member plays it alone.
+    pub fn move_to(&self, item: ItemRef, position_ms: u64) -> bool {
+        let (driving, from, epoch) = {
+            let inner = self.inner.borrow();
+            (
+                inner.active && inner.state.drives_stage(),
+                inner.state.playlist_item_id.clone(),
+                inner.epoch,
+            )
+        };
+        self.env.info(&format!(
+            "pharos: group move item={item} position_ms={position_ms} from={from:?} route={}",
+            if driving { "group" } else { "alone" }
+        ));
+        if !driving {
+            return false;
+        }
+        if let Some(me) = self.me() {
+            let client = self.client.clone();
+            self.env.spawn(Box::pin(async move {
+                let Err(e) = client.set_item(item, position_ms, from).await else {
+                    return;
+                };
+                me.env.warn(&format!(
+                    "pharos: group move refused item={item} reason={:?}; playing it alone",
+                    e.0
+                ));
+                let still = {
+                    let inner = me.inner.borrow();
+                    inner.active && inner.epoch == epoch
+                };
+                if still {
+                    me.env.ui(Ui::Navigate(item));
+                }
+            }));
+        }
+        true
+    }
+
     /// The group did not take a pick (the call failed), so change this player
     /// alone and say so. The server drops a stale, unchanged or non-member pick
     /// without an answer; none of those needs a local change.
@@ -1898,6 +1943,57 @@ mod tests {
             .ui
             .borrow()
             .contains(&Ui::Navigate(ItemRef::Real(8))));
+    }
+
+    /// 014 US9: the next episode picked on the group's player goes to the
+    /// group, from the entry playing, and the group's item update is what
+    /// brings this member there.
+    #[test]
+    fn a_move_goes_to_the_group_and_its_item_brings_this_member() {
+        let rig = rig();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.session.deliver(item_update(0, true));
+        rig.env.settle();
+        assert!(rig.session.move_to(ItemRef::Real(8), 0));
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "set_item"), ["set_item(8,0,p1)"]);
+        assert!(rig
+            .env
+            .ui
+            .borrow()
+            .contains(&Ui::Navigate(ItemRef::Real(8))));
+    }
+
+    /// Off the group's item (a song while the group is on a film, V508), a
+    /// pick plays alone: nothing goes to the group.
+    #[test]
+    fn a_move_from_another_item_plays_alone() {
+        let rig = rig();
+        rig.session.deliver(item_update(0, true));
+        rig.session.set_watching(Some(ItemRef::Real(9)));
+        rig.env.settle();
+        assert!(!rig.session.move_to(ItemRef::Real(10), 0));
+        rig.env.settle();
+        assert!(calls_with(&rig, "set_item").is_empty());
+    }
+
+    /// A move the group refuses (an older server, or an item another member
+    /// may not see) still takes this member there, alone.
+    #[test]
+    fn a_refused_move_plays_the_item_alone() {
+        let rig = rig();
+        rig.groups.refuse_set_item();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.session.deliver(item_update(0, true));
+        rig.env.settle();
+        assert!(rig.session.move_to(ItemRef::Real(8), 0));
+        rig.env.settle();
+        assert!(rig
+            .env
+            .ui
+            .borrow()
+            .contains(&Ui::Navigate(ItemRef::Real(8))));
+        assert_eq!(rig.env.logged("pharos: group move refused item=8").len(), 1);
     }
 
     #[test]

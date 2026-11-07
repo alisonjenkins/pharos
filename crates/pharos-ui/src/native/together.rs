@@ -340,6 +340,15 @@ pub trait GroupClient {
     ) -> Result<(), GroupError>;
     /// `false` puts this member on their own tracks ("Just me").
     async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError>;
+    /// Move the group to `item` from `position_ms` (014 US9).
+    /// `playlist_item_id` is the entry this member moves from: the group
+    /// drops the move if it has already left it.
+    async fn set_item(
+        &self,
+        item: ItemRef,
+        position_ms: u64,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError>;
     /// What each member has seen of `ids` (at most 200).
     async fn seen(&self, ids: Vec<ItemRef>) -> Result<Vec<MemberSeen>, GroupError>;
 }
@@ -368,6 +377,7 @@ pub struct FakeGroups {
     seen: Rc<RefCell<Vec<MemberSeen>>>,
     refuse_follow: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
+    refuse_set_item: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
     buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
 }
@@ -393,6 +403,11 @@ impl FakeGroups {
     /// Makes every `set_tracks` fail, as a dropped connection would.
     pub fn refuse_tracks(&self) {
         self.refuse_tracks.set(true);
+    }
+
+    /// Makes every `set_item` fail, as a server before schemaVersion 23 would.
+    pub fn refuse_set_item(&self) {
+        self.refuse_set_item.set(true);
     }
 
     /// Makes every `follow_tracks` fail, as a dropped connection would.
@@ -593,6 +608,28 @@ impl GroupClient for FakeGroups {
         self.push(&GroupUpdate::Tracks {
             tracks,
             by: Some(Self::me().id),
+        });
+        Ok(())
+    }
+
+    async fn set_item(
+        &self,
+        item: ItemRef,
+        position_ms: u64,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError> {
+        self.log(format!("set_item({item},{position_ms},{playlist_item_id})"));
+        if self.refuse_set_item.get() {
+            return Err(GroupError("Refused".into()));
+        }
+        let Some(()) = self.with_joined(|g| g.item = Some(item)) else {
+            return Err(GroupError("Not in a group".into()));
+        };
+        self.push(&GroupUpdate::Item {
+            item,
+            playlist_item_id: format!("pli-{item}"),
+            position_ms,
+            playing: true,
         });
         Ok(())
     }
