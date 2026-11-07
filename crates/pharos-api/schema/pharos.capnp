@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 21;
+const schemaVersion :UInt32 = 22;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -218,6 +218,7 @@ struct Track {
   isDefault @4 :Bool; isForced @5 :Bool; isHearingImpaired @6 :Bool;
   delivery @7 :SubtitleDelivery;    # subtitles only
   url @8 :Text;                     # WebVTT for `external`, the PNG manifest for `image` (HTTP, 017 §Scope), else empty
+  styledUrl @9 :Text;               # the generated Pharos-styled ASS script (spec 028), fetched with ?tier=&effects=; empty for every other track
 }
 # `external`: the player renders the WebVTT at Track.url itself. `burn`: an
 # image subtitle the server draws into the video, so choosing it renegotiates.

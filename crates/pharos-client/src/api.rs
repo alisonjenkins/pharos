@@ -266,6 +266,9 @@ pub struct Track {
     /// An image subtitle's same-origin PNG manifest, which the player draws
     /// itself (spec 019); set only when the server extracts image subtitles.
     pub images_url: Option<String>,
+    /// The generated Pharos-styled ASS script (spec 028), fetched with
+    /// `?tier=&effects=`; `None` for every other track.
+    pub styled_url: Option<String>,
 }
 
 /// Trickplay sprites: `tile_url` with `{tile}` replaced fetches tile n, a
@@ -1196,6 +1199,7 @@ fn read_tracks(
                     SubtitleDelivery::Image => Some(text(t.get_url())?),
                     SubtitleDelivery::External | SubtitleDelivery::Burn => None,
                 },
+                styled_url: Some(text(t.get_styled_url())?).filter(|u| !u.is_empty()),
             })
         })
         .collect()
@@ -1456,6 +1460,35 @@ mod tests {
             ),
             (None, None)
         );
+    }
+
+    #[test]
+    fn a_styled_url_reads_as_some_and_an_empty_one_as_none() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let root: capnp::any_pointer::Builder<'_> = message.init_root();
+            let mut list = root.initn_as::<capnp::struct_list::Builder<'_, track::Owned>>(2);
+            let mut t = list.reborrow().get(0);
+            t.set_delivery(SubtitleDelivery::External);
+            t.set_url("/videos/1/subtitles/2/stream.vtt");
+            t.set_styled_url("/videos/1/subtitles/2/stream.ass");
+            let mut plain = list.reborrow().get(1);
+            plain.set_delivery(SubtitleDelivery::External);
+            plain.set_url("/videos/1/subtitles/2/stream.vtt");
+        }
+        let reader = message
+            .get_root_as_reader::<capnp::any_pointer::Reader<'_>>()
+            .unwrap();
+        let tracks = read_tracks(reader.get_as().unwrap()).unwrap();
+        assert_eq!(
+            tracks[0].styled_url.as_deref(),
+            Some("/videos/1/subtitles/2/stream.ass")
+        );
+        assert_eq!(
+            tracks[0].vtt_url.as_deref(),
+            Some("/videos/1/subtitles/2/stream.vtt")
+        );
+        assert_eq!(tracks[1].styled_url, None);
     }
 
     #[test]
