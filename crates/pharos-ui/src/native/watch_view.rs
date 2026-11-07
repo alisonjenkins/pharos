@@ -239,6 +239,9 @@ pub enum Control {
 #[component]
 pub fn WatchView(
     title: String,
+    /// The line under the title: "S1 · E22 · Future Enemies", a film's year.
+    #[props(default)]
+    title_detail: Option<String>,
     controls: Controls,
     on_media: EventHandler<MediaEvent>,
     on_control: EventHandler<Control>,
@@ -475,7 +478,12 @@ pub fn WatchView(
                         onclick: move |_| on_control.call(Control::Back),
                         "←"
                     }
-                    h2 { class: "pharos-watch-title", "{title}" }
+                    div { class: "pharos-watch-heading",
+                        h2 { class: "pharos-watch-title", "{title}" }
+                        if let Some(detail) = title_detail {
+                            p { class: "pharos-watch-title-detail", "{detail}" }
+                        }
+                    }
                     if can_start_together && !in_group {
                         button {
                             class: "pharos-control pharos-together-start",

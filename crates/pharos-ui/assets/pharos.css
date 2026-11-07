@@ -1144,13 +1144,26 @@ body:has(.pharos-stage.is-full) .pharos-error {
   background: linear-gradient(rgb(0 0 0 / 0.7), transparent); /* not themed: controls sit on the video, whose colours no theme sets */
   transition: opacity 0.2s;
 }
-.pharos-watch-title {
+/* Show over "S1 · E22 · Title": two short lines, each cut with an ellipsis,
+   so the bar grows by one small line and never wraps on a phone. */
+.pharos-watch-heading {
+  min-width: 0;
+  line-height: 1.25;
+}
+.pharos-watch-title,
+.pharos-watch-title-detail {
   margin: 0;
-  font-size: 1.125rem;
-  font-weight: 600;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+.pharos-watch-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+}
+.pharos-watch-title-detail {
+  font-size: 0.875rem;
+  opacity: 0.85;
 }
 /* Watch together: the member strip rides in the top bar, so it fades with it. */
 .pharos-members {

@@ -4732,6 +4732,7 @@ fn Player(
             });
         }
     }
+    let heading = super::views::watch_heading(&p.detail.item);
     rsx! {
         if compact {
             StageBar {
@@ -4809,7 +4810,8 @@ fn Player(
             }
         } else {
             WatchView {
-                title: p.title.clone(),
+                title: heading.0,
+                title_detail: heading.1,
                 controls,
                 on_media,
                 on_control,
