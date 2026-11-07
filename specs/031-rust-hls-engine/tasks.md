@@ -32,7 +32,15 @@ Notes from slice 1 (2026-11-07T23:00:00Z): Playwright's bundled Firefox does not
 - [ ] T031-15 Gap jumping and stall nudges, each counted and logged.
 - [ ] T031-16 MediaSource rebuild on media error under `RecoveryBudget` (V638); failure-path symmetry tests with a disarm check (V640).
 
-## Slice 4 - Measure and flip
+## Slice 4 - Adapt (V644-V649)
+
+- [ ] T031-19 Server: `abr=1` on the browser master lists the H.264 fMP4 ladder (`h264cmaf/{rung}/main.m3u8`, per-rung init and segments, encoder caps from `Variant`), all rungs on `SegmentGrid` and bound to the one audio group; without `abr=1` the master is byte-identical to today. Segment metrics carry the rung (V644).
+- [ ] T031-20 `pharos-hls` bandwidth estimator: fast and slow EWMAs over first-to-last-byte samples, minimum-sample guard.
+- [ ] T031-21 `pharos-hls` ABR rule: ceiling, buffer-aware down-switch, cold-encode-aware up-switch, up-switch interval (V645-V647, property tests with a fake clock).
+- [ ] T031-22 Adapter: rung switch on the video `SourceBuffer` (init then segment, `changeType` when codecs differ), the engine asks for `abr=1`, UI auto quality off while the engine adapts, Settings ceiling passed in live (V648).
+- [ ] T031-23 Switch log line and client event with a disarm check (V649); throttled-link e2e in Chromium and Firefox.
+
+## Slice 5 - Measure and flip
 
 - [ ] T031-17 Comparison harness in CI on the corpus streams, both engines.
 - [ ] T031-18 Device traces against the slice 0 baseline; a separate ADR or ADR-0071 acceptance to flip the default.
