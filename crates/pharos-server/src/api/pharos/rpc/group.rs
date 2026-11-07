@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use super::library::{read_item_id, set_item_id};
 use super::session::Session;
 use crate::api::jellyfin::syncplay::{
-    add_caller_to_group, end_owned_cast, listed_groups, may_join, may_queue, prewarm_seek,
+    add_caller_to_group, end_owned_cast, listed_groups, may_queue, prewarm_seek,
     resolve_runtimes_ms, sync_play_allows, GroupHiddenRoute, ListedGroup, QueueVia, SyncPlayNeed,
 };
 use crate::group_ops::{route_command, CommandOutcome, SyncDeps};
@@ -59,44 +59,29 @@ impl Group {
         Ok((user, deps))
     }
 
-    /// The group `id` names, which must already exist: live, or held by a
-    /// fresh persisted snapshot a restart or another replica left (then it
-    /// is hydrated, as a Jellyfin join does). A group that is gone is
-    /// `None`; it is never created.
-    async fn existing_group(
+    /// The group `id` names that `user` may join: live, or held by a fresh
+    /// persisted snapshot or another replica (then it is hydrated or routed,
+    /// as a Jellyfin join does). `None` when the group is gone OR the user may
+    /// not see it: the same decision as the other join transports
+    /// (`joinable_group`), so a hidden group cannot be told from an absent
+    /// one, and a refused probe hydrates nothing. Never creates a group.
+    async fn joinable_group(
         &self,
         deps: &SyncDeps,
+        user: &pharos_core::User,
         id: GroupId,
     ) -> Result<Option<GroupHandle>, Denial> {
-        use pharos_core::SyncGroupStore as _;
-        let unavailable = || Denial::Unavailable {
+        crate::sync_recovery::joinable_group(
+            &self.session.state,
+            &deps.registry,
+            user,
+            id,
+            GroupHiddenRoute::RpcJoin,
+        )
+        .await
+        .map_err(|_| Denial::Unavailable {
             dependency: "syncplay",
-        };
-        if let Some(handle) = deps.registry.get(id).await.map_err(|_| unavailable())? {
-            return Ok(Some(handle));
-        }
-        let cutoff = crate::sync_recovery::recovery_cutoff();
-        let persisted = match self
-            .session
-            .state
-            .stores
-            .get_sync_group(&id.to_string())
-            .await
-        {
-            Ok(row) => row.is_some_and(|row| row.updated_at >= cutoff),
-            Err(e) => {
-                tracing::warn!(group = %id, error = %e, "syncplay: native join could not read the persisted group");
-                return Err(unavailable());
-            }
-        };
-        if !persisted {
-            return Ok(None);
-        }
-        deps.registry
-            .get_or_create(id)
-            .await
-            .map(Some)
-            .map_err(|_| unavailable())
+        })
     }
 
     /// Takes the call's device out of the group it is still in, when that is
@@ -803,12 +788,10 @@ impl server::group::Handler for Group {
             if !sync_play_allows(&user, SyncPlayNeed::Join, "rpc_join") {
                 return Err(Denial::NotPermitted { what: "syncplay" });
             }
-            let Some(handle) = self.existing_group(&deps, gid).await? else {
+            // A group the caller may not see answers as a missing one.
+            let Some(handle) = self.joinable_group(&deps, &user, gid).await? else {
                 return Err(Denial::NotFound { what: "group" });
             };
-            if !may_join(&self.session.state, &user, &handle, GroupHiddenRoute::RpcJoin).await {
-                return Err(Denial::NotPermitted { what: "group" });
-            }
             // Only now does the device move: a refused join leaves the
             // device's existing membership, if any, as it was.
             self.leave_previous(&deps, &user, &device, Some(handle.group_id))
