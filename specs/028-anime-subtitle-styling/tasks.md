@@ -23,8 +23,8 @@ Every task follows TDD: a failing test first, then the code. Metrics and log lin
 ## Slice 3 — director and job (B603; V535, V537)
 
 - [ ] T028-11 `director.rs`: the ordered rules from plan.md, a `reason` per line, track medians, and the all-caps track guard. Table tests per rule, plus "no signal gives Plain".
-- [ ] T028-12 Migration `0068_subtitle_styling` (sqlite + postgres), `SubtitleStylingStore` in `pharos-core`, and the sqlx implementations. Run `just test-postgres`.
-- [ ] T028-13 `pharos-server/src/subtitle_styling.rs`: warm-up, the background-leader gate, waiting while `pharos_transcode_pending_jobs > 0`, `BgPermit` around signals, one item at a time, an on-demand queue ahead of the backfill, the genre gate (FR-015), source choice (FR-016), and version-only rows for undecodable files. Metrics `pharos_subtitle_styling_total{outcome,stage}`, `_seconds{stage}`, `_pending` and `pharos_subtitle_effect_total{intent,source}`; one info line per item and one debug line per line decision. Tests use a fake signals source: each outcome is counted once with its stage, and failures carry the same fields (V535).
+- [x] T028-12 Migration `0068_subtitle_styling` (sqlite + postgres), `SubtitleStylingStore` in `pharos-core`, and the sqlx implementations. Run `just test-postgres`.
+- [x] T028-13 `pharos-server/src/subtitle_styling.rs`: warm-up, the background-leader gate, waiting while `pharos_transcode_pending_jobs > 0`, `BgPermit` around signals, one item at a time, an on-demand queue ahead of the backfill, the genre gate (FR-015), source choice (FR-016), and version-only rows for undecodable files. Metrics `pharos_subtitle_styling_total{outcome,stage}`, `_seconds{stage}`, `_pending` and `pharos_subtitle_effect_total{intent,source}`; one info line per item and one debug line per line decision. Tests use a fake signals source: each outcome is counted once with its stage, and failures carry the same fields (V535).
 - [ ] T028-14 A reference-episode report tool (`just styling-report <item>`) that prints 50 non-Plain lines per episode with their intents, for Alison to label (SC-002, V537: a manual gate).
 
 ## Slice 4 — serving (B604; V532)

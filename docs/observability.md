@@ -21,7 +21,7 @@ Three pillars wired from T1, deepened in T23. Behaviour is governed by SPEC §V 
   - `http_request_duration_seconds{method,path}` — histogram, 1 ms to 30 s buckets
 - Path label is the route match pattern (e.g. `/Items/{id}`), not the concrete URI; a request matching no route is `path="unmatched"` and a non-standard method is `method="OTHER"`, so scanner traffic cannot mint series. Guarded by unit tests in `middleware/red_metrics.rs` (`unmatched_paths_and_odd_methods_share_one_series`, `middleware_labels_use_route_pattern_not_concrete_uri`).
 - Every `*_seconds` metric is a real histogram (summaries cannot be aggregated across pods). Bucket ladders live in `obs.rs`: 1 ms to 30 s by default, up to 1 h for long-running timings (`LONG_RUNNING_SECONDS`: syncplay, transcode, scan), 0.1 ms to 10 s for `pharos_store_query_seconds`. A new timing metric that can exceed 30 s must be added to `LONG_RUNNING_SECONDS`, or `histogram_quantile` caps at 30 s.
-- Other series: `pharos_db_pool_*` (pool saturation, with a timed acquire probe), `pharos_store_query_seconds{method,outcome}`, `pharos_scan_*`, `process_*`, and every `pharos_segment_produced_total` series pre-registered at zero so `rate()` works from the first scrape.
+- Other series: `pharos_db_pool_*` (pool saturation, with a timed acquire probe), `pharos_store_query_seconds{method,outcome}`, `pharos_scan_*`, `pharos_subtitle_styling_{total,seconds,pending}` and `pharos_subtitle_effect_total` (the anime subtitle styling job), `process_*`, and every `pharos_segment_produced_total` series pre-registered at zero so `rate()` works from the first scrape.
 - Subsystems may emit their own counters/histograms freely; they land in the same registry and surface at `/metrics`.
 
 ## Health (V14)
