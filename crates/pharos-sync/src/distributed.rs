@@ -223,18 +223,54 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
     })
 }
 
+/// What a replica that does not own a group knows of it from the owner's last
+/// persisted snapshot, enough to fill a synthetic `Joined` truthfully.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteHint {
+    pub(crate) group_name: String,
+    pub(crate) state: crate::messages::GroupPlayState,
+}
+
+impl RemoteHint {
+    /// `None` when the snapshot does not parse.
+    pub(crate) fn from_snapshot(state_json: &str) -> Option<Self> {
+        let summary = crate::group::snapshot_summary(state_json)?;
+        Some(Self {
+            group_name: summary.group_name,
+            state: summary.play_state,
+        })
+    }
+}
+
 /// Spawn a *remote* group handle: a `GroupHandle` whose `tx` feeds a task that
 /// forwards each command to the owner via `commands`. The owner's broadcasts
 /// reach this replica's members over the delivery bus, so this handle only ever
 /// sends upstream. `AddMember` is answered with a synthetic `Joined` (the real
-/// one arrives via delivery); `Snapshot` (rare — the list surface uses the
-/// store) gets an empty reply.
+/// one arrives via delivery) carrying `hint`'s name and play state; with no
+/// `hint` the reply is dropped rather than filled with placeholders, so the
+/// delivered `Joined` is the first the client sees. `Snapshot` (rare — the
+/// list surface uses the store) gets an empty reply.
 pub(crate) fn spawn_remote_handle(
     group_id: GroupId,
     epoch_unix_ms: u64,
     commands: Arc<dyn CommandSink>,
+    hint: Option<RemoteHint>,
 ) -> GroupHandle {
     let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
+    let synthetic = move |member_id: crate::messages::MemberId, name: String| {
+        hint.as_ref().map(|hint| crate::group::Joined {
+            group_id,
+            leader: member_id,
+            members: vec![crate::messages::MemberSummary {
+                member_id,
+                name,
+                is_leader: true,
+                device: None,
+            }],
+            group_name: hint.group_name.clone(),
+            state: hint.state,
+        })
+    };
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             // Answer reply-carrying variants locally before/instead of
@@ -250,16 +286,9 @@ pub(crate) fn spawn_remote_handle(
                     // roster + GroupJoined arrive over delivery.
                     let (member_id, name, user) = (*member_id, name.clone(), *user);
                     if let GroupMsg::AddMember { reply, .. } = msg {
-                        let _ = reply.send(crate::group::Joined {
-                            group_id,
-                            leader: member_id,
-                            members: vec![crate::messages::MemberSummary {
-                                member_id,
-                                name: name.clone(),
-                                is_leader: true,
-                                device: None,
-                            }],
-                        });
+                        if let Some(joined) = synthetic(member_id, name.clone()) {
+                            let _ = reply.send(joined);
+                        }
                     }
                     commands.submit(
                         group_id,
@@ -278,16 +307,9 @@ pub(crate) fn spawn_remote_handle(
                         reply,
                     } = msg
                     {
-                        let _ = reply.send(crate::group::Joined {
-                            group_id,
-                            leader: member_id,
-                            members: vec![crate::messages::MemberSummary {
-                                member_id,
-                                name: name.clone(),
-                                is_leader: true,
-                                device: None,
-                            }],
-                        });
+                        if let Some(joined) = synthetic(member_id, name.clone()) {
+                            let _ = reply.send(joined);
+                        }
                         commands.submit(
                             group_id,
                             RemoteCommand::AddCastSeat {
@@ -394,5 +416,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    struct NoCommands;
+    impl CommandSink for NoCommands {
+        fn submit(&self, _group_id: GroupId, _cmd: RemoteCommand) {}
+    }
+
+    async fn join_remote(
+        hint: Option<RemoteHint>,
+        cast: bool,
+    ) -> Result<crate::group::Joined, tokio::sync::oneshot::error::RecvError> {
+        let group_id = GroupId::new();
+        let h = spawn_remote_handle(group_id, 0, Arc::new(NoCommands), hint);
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let member_id = MemberId::new();
+        let msg = if cast {
+            GroupMsg::AddCastSeat {
+                member_id,
+                name: "tv".into(),
+                cast: crate::group::CastBinding {
+                    tv: "tv".into(),
+                    owner: "o".into(),
+                },
+                reply,
+            }
+        } else {
+            GroupMsg::AddMember {
+                user: None,
+                member_id,
+                name: "late".into(),
+                reply,
+            }
+        };
+        h.tx.send(msg).await.unwrap();
+        rx.await
+    }
+
+    /// V581: a synthetic `Joined` from a remote handle carries the owner's
+    /// persisted name and play state, never `""` / `Idle` placeholders.
+    #[tokio::test]
+    async fn a_remote_join_reply_carries_the_snapshot_name_and_state() {
+        for cast in [false, true] {
+            let hint = RemoteHint {
+                group_name: "Movie Night".into(),
+                state: crate::messages::GroupPlayState::Paused,
+            };
+            let joined = join_remote(Some(hint), cast).await.unwrap();
+            assert_eq!(joined.group_name, "Movie Night");
+            assert_eq!(joined.state, crate::messages::GroupPlayState::Paused);
+        }
+    }
+
+    /// With nothing known of the group the reply is dropped, so no
+    /// placeholder `Joined` is forwarded ahead of the owner's.
+    #[tokio::test]
+    async fn a_remote_join_reply_without_a_snapshot_is_dropped() {
+        for cast in [false, true] {
+            assert!(join_remote(None, cast).await.is_err());
+        }
+    }
+
+    #[test]
+    fn a_hint_needs_a_parseable_snapshot() {
+        assert!(RemoteHint::from_snapshot("not json").is_none());
     }
 }

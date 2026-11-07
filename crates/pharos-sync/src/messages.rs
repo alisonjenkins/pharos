@@ -93,9 +93,10 @@ pub struct GroupTracks {
 /// Coarse group playback state, mirrored to Jellyfin's `GroupStateType`
 /// (`Idle`/`Waiting`/`Playing`/`Paused`). Emitted in [`ServerMsg::StateUpdate`]
 /// so a client can drive its SyncPlay UI (spinner while `Waiting`, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupPlayState {
+    #[default]
     Idle,
     Waiting,
     Playing,
@@ -185,6 +186,13 @@ pub enum ServerMsg {
         group_id: GroupId,
         leader: MemberId,
         members: Vec<MemberSummary>,
+        /// The name the creator gave the group on `New` (Jellyfin
+        /// `GroupInfoDto.GroupName`). Empty from an older peer.
+        #[serde(default)]
+        group_name: String,
+        /// The group's coarse play state at join time (`GroupInfoDto.State`).
+        #[serde(default)]
+        state: GroupPlayState,
     },
     Pong {
         client_ms_echo: u64,

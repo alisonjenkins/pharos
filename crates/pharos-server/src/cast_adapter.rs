@@ -385,6 +385,8 @@ mod tests {
                 group_id: GroupId::new(),
                 leader: m,
                 members: vec![],
+                group_name: String::new(),
+                state: GroupPlayState::Idle,
             },
             ServerMsg::Pong {
                 client_ms_echo: 1,
