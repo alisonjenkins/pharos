@@ -1053,6 +1053,7 @@ impl AppState {
     /// Spec 030: attach the OpenSubtitles feature (a provider, its storage
     /// root and quota gate).
     pub fn with_opensubtitles(mut self, os: crate::opensubtitles::OpenSubtitles) -> Self {
+        crate::opensubtitles::store::install_root(&os.root);
         self.opensubtitles = Some(os);
         self
     }

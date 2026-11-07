@@ -2104,7 +2104,8 @@ async fn scan_all_subs(dir: &std::path::Path, found: &mut Vec<(std::path::PathBu
 /// `Subs/<stem>/` subfolder doesn't bump the parent mtime, so that rare case is
 /// picked up on the next server restart / library refresh.
 type SidecarList = Vec<(std::path::PathBuf, SidecarKind)>;
-type SidecarCache = std::collections::HashMap<std::path::PathBuf, (u64, SidecarList)>;
+/// `(parent dir mtime secs, OpenSubtitles store dir mtime nanos, list)`.
+type SidecarCache = std::collections::HashMap<std::path::PathBuf, (u64, u64, SidecarList)>;
 static SIDECAR_CACHE: std::sync::LazyLock<std::sync::Mutex<SidecarCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -2124,17 +2125,30 @@ pub async fn discover_sidecars(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Downloaded subtitles live on the cache volume, not beside the media, so a
+    // download bumps this directory's mtime rather than the parent's (nanos:
+    // a download in the same second as the last scan must still invalidate).
+    let store_mtime = match crate::opensubtitles::store::installed_root() {
+        Some(root) => tokio::fs::metadata(crate::opensubtitles::store::item_dir(root, media_path))
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| u64::try_from(d.as_nanos()).ok())
+            .unwrap_or(0),
+        None => 0,
+    };
     let key = media_path.to_path_buf();
     if let Ok(cache) = SIDECAR_CACHE.lock() {
-        if let Some((cached_mtime, subs)) = cache.get(&key) {
-            if *cached_mtime == mtime {
+        if let Some((cached_mtime, cached_store, subs)) = cache.get(&key) {
+            if *cached_mtime == mtime && *cached_store == store_mtime {
                 return subs.clone();
             }
         }
     }
     let result = discover_sidecars_uncached(media_path).await;
     if let Ok(mut cache) = SIDECAR_CACHE.lock() {
-        cache.insert(key, (mtime, result.clone()));
+        cache.insert(key, (mtime, store_mtime, result.clone()));
     }
     result
 }
@@ -2178,6 +2192,16 @@ async fn discover_sidecars_uncached(
     // (c) per-episode folder directly beside the media, `<stem>/English.srt`.
     if let Some(epdir) = find_subdir_ci(parent, &stem_lower).await {
         scan_all_subs(&epdir, &mut found).await;
+    }
+
+    // (d) subtitles downloaded from OpenSubtitles, kept on the cache volume
+    // (spec 030).
+    if let Some(root) = crate::opensubtitles::store::installed_root() {
+        scan_all_subs(
+            &crate::opensubtitles::store::item_dir(root, media_path),
+            &mut found,
+        )
+        .await;
     }
 
     found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2501,6 +2525,42 @@ mod tests {
         assert!(!text.contains("color:"));
         assert!(!text.contains("background-color:"));
         assert!(!text.contains("font-size:"));
+    }
+
+    /// V565: a download kept on the cache volume joins the item's external
+    /// subtitles with its language, and a download after a first discovery is
+    /// seen (the memo is invalidated by the store directory's mtime).
+    #[tokio::test]
+    async fn discover_sidecars_includes_opensubtitles_downloads() {
+        let td = TempDir::new().unwrap();
+        let media = td.path().join("dl-show.mkv");
+        tokio::fs::write(&media, b"x").await.unwrap();
+        let root = crate::opensubtitles::store::shared_test_root();
+        assert!(discover_sidecars(&media).await.is_empty());
+        crate::opensubtitles::store::save(
+            &root,
+            &media,
+            "en",
+            31,
+            b"1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+        )
+        .await
+        .unwrap();
+        let found = discover_sidecars(&media).await;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0.starts_with(&root));
+        assert_eq!(found[0].1, SidecarKind::Convert);
+        assert_eq!(
+            sidecar_language_from_name(found[0].0.file_name().unwrap().to_str().unwrap())
+                .as_deref(),
+            Some("en")
+        );
+        let mut beside = tokio::fs::read_dir(td.path()).await.unwrap();
+        let mut n = 0;
+        while beside.next_entry().await.unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1, "nothing was written beside the media");
     }
 
     #[tokio::test]
