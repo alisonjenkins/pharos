@@ -758,7 +758,25 @@ impl Tonemap {
             )),
         }
     }
+
+    /// The GPU route's filter chain (ADR-0072), or `None` when off: libplacebo
+    /// tonemaps and converts to BT.709 limited-range NV12 on the GPU, the frame
+    /// is read back, and `hwupload=derive_device=vaapi` hands it to the VAAPI
+    /// encoder. It takes Vulkan frames, so only the GPU-tonemap argv may use it.
+    pub fn gpu_filters(self) -> Option<String> {
+        match self {
+            Self::Off => None,
+            Self::HdrToSdr => Some(format!(
+                "libplacebo=tonemapping={GPU_TONEMAP_CURVE}:colorspace=bt709:\
+                 color_primaries=bt709:color_trc=bt709:range=tv:format=nv12,\
+                 hwdownload,format=nv12,hwupload=derive_device=vaapi"
+            )),
+        }
+    }
 }
+
+/// libplacebo's tonemapping curve for the GPU route.
+pub const GPU_TONEMAP_CURVE: &str = "bt.2390";
 
 /// Stereoscopic downmix mode for transcoding (spec 018-3d-media).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
