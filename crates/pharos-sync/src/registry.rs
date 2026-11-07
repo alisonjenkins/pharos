@@ -14,7 +14,7 @@
 //!   group survives the deploy.
 
 use super::delivery::Delivery;
-use super::distributed::{spawn_remote_handle, Distributed};
+use super::distributed::{spawn_remote_handle, Distributed, RemoteHint};
 use super::group::{GroupHandle, RemoteCommand};
 use super::messages::GroupId;
 use std::collections::{HashMap, HashSet};
@@ -161,13 +161,12 @@ impl Actor {
                     return h.clone();
                 }
             }
-            let epoch = d
-                .hydration
-                .load(group_id)
-                .await
-                .map(|(e, _)| e)
-                .unwrap_or_else(unix_now_ms);
-            let h = spawn_remote_handle(group_id, epoch, d.commands.clone());
+            let loaded = d.hydration.load(group_id).await;
+            let epoch = loaded.as_ref().map_or_else(unix_now_ms, |(e, _)| *e);
+            let hint = loaded
+                .as_ref()
+                .and_then(|(_, json)| RemoteHint::from_snapshot(json));
+            let h = spawn_remote_handle(group_id, epoch, d.commands.clone(), hint);
             self.groups.insert(group_id, h.clone());
             h
         }

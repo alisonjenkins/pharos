@@ -816,6 +816,8 @@ pub struct Joined {
     pub group_id: GroupId,
     pub leader: MemberId,
     pub members: Vec<MemberSummary>,
+    pub group_name: String,
+    pub state: GroupPlayState,
 }
 
 #[derive(Debug, Clone)]
@@ -3441,6 +3443,8 @@ fn add_member(
             group_id: state.id,
             leader,
             members: summaries.clone(),
+            group_name: state.group_name.clone(),
+            state: state.play_state(),
         });
         state.send_one(
             member_id,
@@ -3448,6 +3452,8 @@ fn add_member(
                 group_id: state.id,
                 leader,
                 members: summaries,
+                group_name: state.group_name.clone(),
+                state: state.play_state(),
             },
         );
         state.send_catch_up(member_id);
@@ -3483,6 +3489,8 @@ fn add_member(
         group_id: state.id,
         leader,
         members: summaries.clone(),
+        group_name: state.group_name.clone(),
+        state: state.play_state(),
     });
     // Notify the joiner over its own sink too (not just the oneshot
     // reply), so the HTTP-driven join path — where the reply goes to the
@@ -3494,6 +3502,8 @@ fn add_member(
             group_id: state.id,
             leader,
             members: summaries.clone(),
+            group_name: state.group_name.clone(),
+            state: state.play_state(),
         },
     );
     // Tell existing members someone joined (not the joiner itself).
@@ -3620,6 +3630,8 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                         group_id: state.id,
                         leader: state.leader.unwrap_or(member_id),
                         members: state.member_summaries(),
+                        group_name: state.group_name.clone(),
+                        state: state.play_state(),
                     },
                 );
                 state.send_catch_up(member_id);
@@ -5853,6 +5865,43 @@ mod tests {
         let mut names = snap.participants.clone();
         names.sort();
         assert_eq!(names, vec!["first".to_string(), "gf".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn joined_carries_group_name_and_play_state() {
+        // V581 — GroupJoined renders GroupName + State from Joined; a
+        // joiner must see the creator's name and the live play state, not
+        // placeholders.
+        let (h, sinks, _rx, _mid) = fresh().await;
+        h.tx.send(GroupMsg::SetGroupName {
+            name: "Movie Night".into(),
+        })
+        .await
+        .unwrap();
+        let mid = MemberId::new();
+        let (tx, mut rx) = mpsc::channel(64);
+        sinks.insert(mid, 1, tx);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            user: None,
+            member_id: mid,
+            name: "late".into(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        let joined = reply_rx.await.unwrap();
+        assert_eq!(joined.group_name, "Movie Night");
+        assert_eq!(joined.state, GroupPlayState::Idle);
+        match rx.recv().await {
+            Some(ServerMsg::Joined {
+                group_name, state, ..
+            }) => {
+                assert_eq!(group_name, "Movie Night");
+                assert_eq!(state, GroupPlayState::Idle);
+            }
+            other => panic!("expected Joined, got {other:?}"),
+        }
     }
 
     #[tokio::test]
