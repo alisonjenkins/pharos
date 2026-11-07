@@ -32,6 +32,15 @@
           overlays = [ (import rust-overlay) ];
         };
 
+        # ADR-0072: the `ffmpeg` binary the server spawns carries libplacebo,
+        # which the GPU HDR tonemap route needs. ffmpeg 9.0.1's libplacebo
+        # filter fails to configure with a Vulkan hw device on radv
+        # ("Error initializing filters", EINVAL, no log line), where 8.x runs
+        # the same graph, so the binary is the 8.x line while the libav libs
+        # ffmpeg-the-third links stay on pkgs.ffmpeg-headless. Fixtures keep
+        # plain ffmpeg-headless (a cached input).
+        ffmpegGpu = pkgs.ffmpeg_8-headless.override { withPlacebo = true; };
+
         # Pinned toolchain (rust + clippy + rustfmt + wasm target).
         # Used by the devShell + the buildRustPackage builds below so
         # the server/worker binaries compile with the same compiler that
@@ -635,7 +644,7 @@
           contents = [
             pharos
             transcodeWorker
-            pkgs.ffmpeg-headless
+            ffmpegGpu
             # 008 — URL-backed sources. Present unconditionally rather than
             # behind a build flag: the feature is off by default at RUNTIME
             # (`[remote].enabled`), so shipping the binary costs an unused
@@ -690,7 +699,7 @@
             };
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=${pharos}/bin:${transcodeWorker}/bin:${pkgs.ffmpeg-headless}/bin:${pkgs.yt-dlp}/bin"
+              "PATH=${pharos}/bin:${transcodeWorker}/bin:${ffmpegGpu}/bin:${pkgs.yt-dlp}/bin"
               # Explicit worker path so the transcode scheduler uses the
               # crash-isolated worker pool, not the inline-ffmpeg fallback.
               "PHAROS_TRANSCODE_WORKER=${transcodeWorker}/bin/transcode-worker"
@@ -699,6 +708,11 @@
               "FONTCONFIG_FILE=${fontsConf}/etc/fonts/fonts.conf"
               # libva searches FHS paths that do not exist in this image.
               "LIBVA_DRIVERS_PATH=${pkgs.mesa}/lib/dri"
+              # Same for Vulkan: the GPU tonemap route (ADR-0072) loads radv
+              # through the loader, which otherwise finds no ICD in this image.
+              # Both names, as older loaders read only the first.
+              "VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+              "VK_DRIVER_FILES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
             ];
             WorkingDir = "/var/lib/pharos";
           };
@@ -1286,6 +1300,11 @@
             wasmBindgenCli
             # 017 — Cap'n Proto compiler for pharos-api's capnpc build step.
             pkgs.capnproto
+            # The spawned `ffmpeg` with libplacebo, listed first so it wins
+            # on PATH (its bin output only: its dev output would put ffmpeg 8's
+            # pkg-config files ahead of 9's) ...
+            (pkgs.lib.getBin ffmpegGpu)
+            # ... and the libav dev libs ffmpeg-the-third builds against (9.x).
             pkgs.ffmpeg-headless
             # 019 — spumux builds the dvd_subtitle test source.
             pkgs.dvdauthor
