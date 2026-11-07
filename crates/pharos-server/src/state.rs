@@ -178,6 +178,10 @@ pub struct AppState {
     /// Read by `GET /admin/integrity/damaged` — the one place "a number
     /// stating corruption" becomes "which files".
     pub integrity_memo: Option<std::sync::Arc<crate::integrity_memo::IntegrityMemo>>,
+    /// Spec 028 — queue of the video a viewer just opened, ahead of the
+    /// subtitle styling backfill. `None` where the job is not spawned (no
+    /// `ffmpeg-lib`, tests).
+    pub subtitle_styling: Option<crate::subtitle_styling::OnDemand>,
     /// Load-balancing transcode scheduler (multi-GPU + all-CPU). When
     /// present, the live/uncached HLS path streams through it; the cached
     /// path uses its own clone held inside `HlsSegmentCache`.
@@ -688,6 +692,7 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
             remote_cache: None,
@@ -807,6 +812,7 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
             remote_cache: None,
@@ -1035,6 +1041,11 @@ impl AppState {
 
     pub fn with_trickplay_cache(mut self, cache: TrickplayCache) -> Self {
         self.trickplay = Some(cache);
+        self
+    }
+
+    pub fn with_subtitle_styling(mut self, queue: crate::subtitle_styling::OnDemand) -> Self {
+        self.subtitle_styling = Some(queue);
         self
     }
 

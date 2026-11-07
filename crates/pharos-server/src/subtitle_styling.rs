@@ -1669,6 +1669,26 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_is_a_deduped_capped_fifo() {
+        let q = OnDemand::default();
+        for id in [5, 6, 5, 7] {
+            q.request(id);
+        }
+        assert_eq!(
+            [q.pop(), q.pop(), q.pop(), q.pop()],
+            [Some(5), Some(6), Some(7), None]
+        );
+        for id in 0..(ON_DEMAND_CAP as u64 + 10) {
+            q.request(id);
+        }
+        let mut n = 0;
+        while q.pop().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, ON_DEMAND_CAP, "a full queue drops further requests");
+    }
+
+    #[test]
     fn genre_gate_ignores_case_and_wants_the_whole_name() {
         let g =
             |s: &[&str]| has_styled_genre(&s.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());

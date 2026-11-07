@@ -1775,7 +1775,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // Spec 028 — direct and store the effect plan of every anime subtitle
     // track, one item at a time behind the same gate.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
-    let _subtitle_styling = pharos_server::subtitle_styling::spawn(
+    let subtitle_styling = pharos_server::subtitle_styling::spawn(
         state.stores.clone(),
         state.is_bg_leader.clone(),
         state.bg_io.clone(),
@@ -1783,6 +1783,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state.subtitles.clone(),
         state.transcode_scheduler.clone(),
     );
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    {
+        state = state.with_subtitle_styling(subtitle_styling);
+    }
     // T81 — resolve real cast portraits from TMDB when a key is configured.
     // Gated on the key: with none, this library's people rows keep their
     // legacy (unreachable) thumb paths and the /Persons image route 404s to a
