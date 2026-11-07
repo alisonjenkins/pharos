@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 22;
+const schemaVersion :UInt32 = 23;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -448,6 +448,13 @@ interface Membership {
   setTracks @9 (ctx :CallContext, audio :TrackChoice, subtitle :TrackChoice, playlistItemId :Text) -> (result :Done);
   # false = "Just me" (own tracks), true = back on the group's tracks.
   followTracks @10 (ctx :CallContext, follow :Bool) -> (result :Done);
+  # Move the group to `item` from `positionMs` (014 US9): the next or previous
+  # episode, or another title. Every member must be able to see it, else
+  # `notPermitted{what "queueing"}`. `playlistItemId` names the entry the caller
+  # is moving FROM: the group drops a request whose entry is no longer the
+  # playing one, so two members' autoplay at an episode's end moves it once.
+  # Empty skips that check. Since schemaVersion 23.
+  setItem   @11 (ctx :CallContext, item :ItemId, positionMs :UInt64, playlistItemId :Text) -> (result :Done);
 }
 # For a film or episode `played` and `positionPct` (0-100, the resume point)
 # apply. For a series or season `playedCount` of `totalCount` episodes (the ones
