@@ -134,3 +134,7 @@ runs before each push (CLAUDE.md).
   refused move plays the episode alone.
 - [x] T047 [US9] Two-browser Playwright: A's next episode and B's previous
   episode move both members; an episode's end moves the group once.
+- [x] T048 [US10] UI: in a group, the title page's together buttons read
+  "Play for the group" and call `Session::play_for_group`, which moves the
+  group from any page; two-browser Playwright: A opens another film's title
+  and plays it for the group, both members play it in step; V612.

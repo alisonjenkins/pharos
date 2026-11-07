@@ -110,6 +110,19 @@ The group moves only to an item every member may see, as a queue change
 23), the member who pressed it plays it on their own and stays a member. A
 member watching another item on their own (V508) moves only themself (V611).
 
+### US10 — the group swaps to another title (P1)
+
+Alison, 2026-11-07: test "swapping content" in a group. In a group, a film or
+episode's title page offers "Play for the group" ("Resume for the group" and
+"Play for the group from start" for a part-watched title, from the viewer's
+place as for Watch together) in place of Watch together. It moves the whole
+group to that title, as a next episode does (US9, V611), even from a member
+watching something else on their own; before this, Watch together there left
+the group and started a new one with nobody else in it. Play, and any song,
+still plays for that member alone (V508). A member whose film is shrunk to the
+floating player plays the new title there, as any play does (spec 020 FR-001)
+(V612).
+
 ## Functional Requirements
 
 - **FR-001** Group-sync client implementing `docs/group-sync-protocol.md` over
