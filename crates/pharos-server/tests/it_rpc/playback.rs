@@ -760,6 +760,7 @@ async fn an_image_subtitle_burns_unless_both_sides_can_draw_it() {
         ("server cannot extract", false, &draws),
     ];
     for (case, server_extracts, player) in cases {
+        #[cfg(feature = "ffmpeg-lib")]
         let cache = tempfile::tempdir().unwrap();
         let (server, fx) = if server_extracts {
             #[cfg(feature = "ffmpeg-lib")]
