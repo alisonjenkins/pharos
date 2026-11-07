@@ -6,6 +6,7 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
+use crate::cast_rig::eventually;
 use crate::common;
 
 use actix_web::{http::StatusCode, test, web};
@@ -273,16 +274,6 @@ async fn running_cast(
             _rx: rx,
         },
     )
-}
-
-async fn eventually<F: FnMut() -> bool>(what: &str, mut f: F) {
-    for _ in 0..250 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for: {what}");
 }
 
 async fn wait_following(service: &CastServiceHandle) {
