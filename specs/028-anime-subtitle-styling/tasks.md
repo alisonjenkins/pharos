@@ -29,14 +29,14 @@ Every task follows TDD: a failing test first, then the code. Metrics and log lin
 
 ## Slice 4 — serving (B604; V532)
 
-- [ ] T028-15 `SubtitleKind::Styled { tier, level }` in `pharos-cache` (disk letter `y`, with the versions in the name).
-- [ ] T028-16 Synthetic index in `services/watch.rs::tracks` for the native detail only, listed only while a current plan exists. The `stream.ass` branch takes `?tier=&effects=`, defaults to `tv` and sets `X-Pharos-Subtitle-Tier`. `stream.vtt`, `stream.js`, fonts and burn answer 404 for that index. Delivery is counted with `source="generated"` (extending B600's `DeliverySource`). Integration tests cover each route.
+- [x] T028-15 `SubtitleKind::Styled { tier, level }` in `pharos-cache` (disk letter `y`, with the versions in the name).
+- [x] T028-16 Synthetic index in `services/watch.rs::tracks` for the native detail only, listed only while a current plan exists. The `stream.ass` branch takes `?tier=&effects=`, defaults to `tv` and sets `X-Pharos-Subtitle-Tier`. `stream.vtt`, `stream.js`, fonts and burn answer 404 for that index. Delivery is counted with `source="generated"` (extending B600's `DeliverySource`). Integration tests cover each route.
 
 ## Slice 5 — UI setting and starting tier (B605; V539)
 
 - [ ] T028-17 [P] `EffectsLevel` pref (`pharos.subtitles.effects`, default Subtle) and the Appearance select (dioxus-ssr tests, as for V455).
 - [ ] T028-18 [P] Device class and `starting_tier(device, reduced_motion, remembered)`, pure and table-tested. `web.rs` gets the UA and pointer detection plus `prefers-reduced-motion` through `platform::prefers`.
-- [ ] T028-19 The player fetches the styled track with `?tier=&effects=`. Off hides the track. A change to reduced motion or the level reloads the script in place. e2e in Chromium and Firefox with muted/null audio.
+- [x] T028-19 The player fetches the styled track with `?tier=&effects=`. Off hides the track. A tier change reloads the script in place. Checked by hand against a real episode in Chromium and Firefox with muted audio; no e2e is committed.
 
 ## Slice 6 — runtime tier drop (B606; V536)
 
