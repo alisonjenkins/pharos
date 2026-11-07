@@ -2,7 +2,7 @@ import { test, expect, type APIRequestContext, type Page } from "@playwright/tes
 
 // Spec 025: the UI as an Android TV or Google TV draws it. A TV user agent
 // gets the ten-foot layout (title-safe margins, a glowing focus ring), and
-// later fixes walk it with a remote (B710).
+// a remote's Back returns the focus to the tile it opened (B710, B712).
 
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
@@ -30,6 +30,8 @@ async function signIn(page: Page, request: APIRequestContext): Promise<void> {
   await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
 }
 
+const focusedText = (page: Page) =>
+  page.evaluate(() => document.activeElement?.textContent?.trim() ?? "");
 const focusedIsPoster = (page: Page) =>
   page.evaluate(() => !!document.activeElement?.matches(".pharos-poster"));
 
@@ -57,5 +59,46 @@ test.describe("Android TV (spec 025)", () => {
     });
     expect(ring).toMatchObject({ width: "3px", style: "solid" });
     expect(ring.glow).not.toBe("none");
+  });
+
+  test("the first press after a page opens lands on its content, not the header (B712)", async ({
+    page,
+    request,
+  }) => {
+    await signIn(page, request);
+    await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
+    await expect(page.locator("ul.pharos-grid .pharos-poster").first()).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("ArrowDown");
+    const inMain = await page.evaluate(() => !!document.activeElement?.closest("main"));
+    expect(inMain).toBe(true);
+  });
+
+  test("Back returns the remote to the tile it opened (B712)", async ({ page, request }) => {
+    await signIn(page, request);
+    await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
+    const grid = page.locator("ul.pharos-grid .pharos-poster");
+    await expect(grid.first()).toBeVisible({ timeout: 15_000 });
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    for (let i = 0; i < 6 && !(await focusedIsPoster(page)); i++) {
+      await page.keyboard.press("ArrowDown");
+    }
+    for (let i = 0; i < 6 && !(await focusedText(page)).includes("Playwright Show"); i++) {
+      await page.keyboard.press("ArrowRight");
+    }
+    expect(await focusedText(page)).toContain("Playwright Show");
+    await page.keyboard.press("Enter");
+    await expect(page.locator("section.pharos-show h2")).toHaveText("Playwright Show", {
+      timeout: 15_000,
+    });
+
+    await page.goBack();
+    await expect(grid.first()).toBeVisible({ timeout: 15_000 });
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("ArrowDown");
+    expect(await focusedIsPoster(page)).toBe(true);
+    expect(await focusedText(page)).toContain("Playwright Show");
   });
 });

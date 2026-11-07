@@ -3,6 +3,7 @@
 //! [`Machine`](super::machine::Machine); no state lives here.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::diagnostics::{self, Sink};
@@ -1772,6 +1773,103 @@ fn shown_targets(scope: &web_sys::Element) -> Vec<(web_sys::Element, super::keym
         .collect()
 }
 
+thread_local! {
+    /// Per page path, the control the arrow keys last focused there: its
+    /// selector (`href`, else `id`) and which match it was (B712).
+    static LEFT_AT: RefCell<HashMap<String, (String, u32)>> = RefCell::new(HashMap::new());
+}
+
+/// Pages whose last focus is kept; past this the oldest are forgotten
+/// wholesale, so a TV left running for days keeps a small map.
+const LEFT_AT_PAGES: usize = 64;
+
+/// `value` inside a single-quoted CSS attribute selector.
+fn css_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// How a control is found again: a link by its `href`, else by its `id`.
+fn focus_mark(el: &web_sys::Element) -> Option<String> {
+    el.get_attribute("href")
+        .map(|href| format!("[href='{}']", css_quoted(&href)))
+        .or_else(|| {
+            Some(el.id())
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("[id='{}']", css_quoted(&id)))
+        })
+}
+
+/// Keep `el` as where the keys left this page; a control that cannot be
+/// found again forgets the page's earlier mark rather than restore a
+/// stale one.
+fn remember_focus(doc: &web_sys::Document, el: &web_sys::Element) {
+    let path = current_path();
+    let mark = focus_mark(el).and_then(|mark| {
+        let list = doc.query_selector_all(&mark).ok()?;
+        let nth = (0..list.length()).find(|&i| {
+            list.item(i)
+                .is_some_and(|node| node.is_same_node(Some(el.as_ref())))
+        })?;
+        Some((mark, nth))
+    });
+    LEFT_AT.with(|m| {
+        let mut m = m.borrow_mut();
+        match mark {
+            Some(mark) => {
+                if m.len() >= LEFT_AT_PAGES && !m.contains_key(&path) {
+                    m.clear();
+                }
+                m.insert(path, mark);
+            }
+            None => {
+                m.remove(&path);
+            }
+        }
+    });
+}
+
+/// Back on a page with the focus on nothing: focus the control the arrow
+/// keys left it on, so a remote's Back returns to the tile it opened.
+fn focus_where_left(doc: &web_sys::Document) -> bool {
+    let Some((mark, nth)) = LEFT_AT.with(|m| m.borrow().get(&current_path()).cloned()) else {
+        return false;
+    };
+    let Some(el) = doc
+        .query_selector_all(&mark)
+        .ok()
+        .and_then(|list| list.item(nth))
+        .and_then(|node| node.dyn_into::<web_sys::Element>().ok())
+    else {
+        return false;
+    };
+    let r = el.get_bounding_client_rect();
+    if r.width() <= 0.0 || r.height() <= 0.0 || !focus_element(&el, true) {
+        return false;
+    }
+    el.scroll_into_view_with_bool(false);
+    true
+}
+
+/// With the focus on nothing, focus the first control in view: in an open
+/// modal dialog, else in the page's content, else in its key area, so the
+/// first press after a page change lands on the page and not its header.
+fn focus_first_shown(doc: &web_sys::Document) -> bool {
+    let (_, view_h) = viewport();
+    let in_view = |area: &web_sys::Element| {
+        shown_targets(area)
+            .into_iter()
+            .find(|(_, r)| r.1 + r.3 > 0.0 && r.1 < view_h)
+    };
+    let pick = |selector: &str| doc.query_selector(selector).ok().flatten();
+    let first = match pick(MODAL) {
+        Some(modal) => in_view(&modal),
+        None => pick("[data-keys] main")
+            .and_then(|main| in_view(&main))
+            .or_else(|| pick("[data-keys]").and_then(|area| in_view(&area))),
+    };
+    first.is_some_and(|(el, _)| focus_element(&el, true))
+}
+
 /// An open modal dialog, which keeps the arrow keys' focus inside it.
 const MODAL: &str = "[aria-modal='true']";
 
@@ -1785,19 +1883,9 @@ pub fn move_focus(dir: super::keymap::Dir) -> bool {
         return false;
     };
     let Some(from) = focused() else {
-        let area = doc
-            .query_selector(MODAL)
-            .ok()
-            .flatten()
-            .or_else(|| doc.query_selector("[data-keys]").ok().flatten());
-        let Some(area) = area else {
-            return false;
-        };
-        let (_, view_h) = viewport();
-        let first = shown_targets(&area)
-            .into_iter()
-            .find(|(_, r)| r.1 + r.3 > 0.0 && r.1 < view_h);
-        return first.is_some_and(|(el, _)| focus_element(&el, true));
+        // An open modal dialog wins over where the page was left.
+        let modal_open = doc.query_selector(MODAL).ok().flatten().is_some();
+        return (!modal_open && focus_where_left(&doc)) || focus_first_shown(&doc);
     };
     let near = |selector: &str| from.closest(selector).ok().flatten();
     // A modal dialog holds the focus: the keys never walk out to the page
@@ -1820,6 +1908,7 @@ pub fn move_focus(dir: super::keymap::Dir) -> bool {
             let moved = focus_element(el, true);
             if moved {
                 el.scroll_into_view_with_bool(false);
+                remember_focus(&doc, el);
             }
             moved
         }
