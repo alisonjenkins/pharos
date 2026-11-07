@@ -1,4 +1,5 @@
 import { test, expect, Browser } from "@playwright/test";
+import { groupLaunchOptions } from "../lib/together";
 
 // 014 T035 - who in a watch-together group has seen what, in two browsers
 // signed in as two users.
@@ -22,9 +23,9 @@ const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
 const VIEWER = "pw-seen-viewer";
 const VIEWER_PASS = "pw-seen-viewer-pw";
 
-test.use({
-  launchOptions: { args: ["--autoplay-policy=no-user-gesture-required"] },
-});
+// Joining is a click, which is the gesture playback needs; the browser still
+// wants autoplay allowed for the play the group schedules later. Muted.
+test.use({ launchOptions: groupLaunchOptions });
 
 async function signIn(browser: Browser, name: string, password: string) {
   const context = await browser.newContext();
