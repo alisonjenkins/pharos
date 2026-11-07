@@ -70,9 +70,9 @@ runs before each push (CLAUDE.md).
   joins, or shows "This group has ended".
 - [ ] T024 [US2] Member strip on the watch page overlay: names, who is
   buffering, a Leave button. Player controls send group commands while joined.
-- [ ] T025 FR-005: the group store reports `groupDrift`, `groupHardSeek` and
+- [x] T025 FR-005: the group store reports `groupDrift`, `groupHardSeek` and
   `groupWait` (kinds added in T010); test names the disarm.
-- [ ] T026 [US1] Two-browser Playwright test on `sync-oracle.ts`: A creates,
+- [x] T026 [US1] Two-browser Playwright test on `sync-oracle.ts`: A creates,
   B opens the invite link, both play in sync, A pauses and B pauses, A seeks
   and B converges. The player's `<video>` carries `data-item-id`.
 - [ ] T028 [US1] Mixed group in Playwright: a pharos-ui browser and a
@@ -119,3 +119,10 @@ runs before each push (CLAUDE.md).
 - [x] T043 [US1] UI: start a group from the player mid-watch at the video's
   position, with an Invite button and panel for the group's link; V479.
   Two-browser Playwright: A watches, starts the group, B joins by the link.
+- [x] T044 [US1][US7] Two-browser Playwright as users opted in to diagnostics
+  (seeded together-a, together-b), each case failing on an error-level client
+  event: seek forward and back by either member, playing and paused; the
+  group's audio pick and back (B660); the group events (`groupWait`,
+  `groupDrift`, `groupHardSeek`) counted in `/metrics`, and none from a member
+  who has not opted in. `playwright.together.config.ts` runs them in Chromium
+  and Firefox.
