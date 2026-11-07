@@ -140,11 +140,16 @@ async fn the_styled_track_is_listed_only_while_a_current_plan_exists() {
         "MediaStreams must not list the styled track"
     );
 
-    // An old director version is not served.
-    let mut old = row.clone();
-    old.director_version = pharos_styling::DIRECTOR_VERSION + 1;
-    fx.state.stores.put_subtitle_styling(old).await.unwrap();
-    assert_eq!(subtitles(&session, 401).await.len(), 2, "director version");
+    // V613: a plan from an older director stays listed until the job
+    // re-styles it; one from a newer director (a rollback) is not served.
+    let mut older = row.clone();
+    older.director_version = pharos_styling::DIRECTOR_VERSION - 1;
+    fx.state.stores.put_subtitle_styling(older).await.unwrap();
+    assert_eq!(subtitles(&session, 401).await.len(), 3, "older director");
+    let mut newer = row.clone();
+    newer.director_version = pharos_styling::DIRECTOR_VERSION + 1;
+    fx.state.stores.put_subtitle_styling(newer).await.unwrap();
+    assert_eq!(subtitles(&session, 401).await.len(), 2, "newer director");
     // A version-only row (no plan) is not served.
     let mut empty = row.clone();
     empty.plan_json = None;

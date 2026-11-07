@@ -681,7 +681,7 @@ async fn deliver_styled_ass(
         )
         .unwrap_or(u8::MAX),
         compiler_version: pharos_styling::COMPILER_VERSION,
-        director_version: pharos_styling::DIRECTOR_VERSION,
+        director_version: row.director_version,
         plan_stamp: row.styled_at,
     };
     let mtime = mtime_secs(&item.path).await;
