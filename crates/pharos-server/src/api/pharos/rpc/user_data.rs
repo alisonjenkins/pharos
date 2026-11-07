@@ -10,7 +10,7 @@ use pharos_jellyfin_api::dto::WireId;
 
 use super::library::{item_denial, read_item_id, wire_denial, write_user_state};
 use super::session::Session;
-use crate::services::user_data;
+use crate::services::user_data::{self, Mark};
 
 pub(super) struct UserData {
     session: Rc<Session>,
@@ -39,16 +39,14 @@ impl server::user_data::Handler for UserData {
                     .map_err(|e| item_denial(id, &e, "set_played"))
             }
             // A series or season: every episode in it the user may see.
-            (Ok(user), synth @ WireId::Synth(_)) => {
-                // An episode already watched keeps its play count and date.
-                user_data::update_folder(&self.session.state, &user, &synth.to_string(), |d| {
-                    if !(played && d.played) {
-                        user_data::apply_played(d, played);
-                    }
-                })
-                .await
-                .map_err(|e| wire_denial(synth, &e, "set_played"))
-            }
+            (Ok(user), synth @ WireId::Synth(_)) => user_data::set_folder(
+                &self.session.state,
+                &user,
+                &synth.to_string(),
+                Mark::Played(played),
+            )
+            .await
+            .map_err(|e| wire_denial(synth, &e, "set_played")),
         };
         write_result(results.get().init_result(), written);
         Ok(())
@@ -69,16 +67,18 @@ impl server::user_data::Handler for UserData {
                     .map(|(_, data)| data)
                     .map_err(|e| item_denial(id, &e, "set_favorite"))
             }
-            (Ok(_), WireId::Synth(_)) => Err(synth_denial()),
+            (Ok(user), synth @ WireId::Synth(_)) => user_data::set_folder(
+                &self.session.state,
+                &user,
+                &synth.to_string(),
+                Mark::Favorite(favorite),
+            )
+            .await
+            .map_err(|e| wire_denial(synth, &e, "set_favorite")),
         };
         write_result(results.get().init_result(), written);
         Ok(())
     }
-}
-
-/// Synthesised items (series, season, album…) have no native favourite yet.
-fn synth_denial() -> Denial {
-    Denial::NotFound { what: "item" }
 }
 
 fn write_result(out: user_state_result::Builder<'_>, written: Result<UserItemData, Denial>) {

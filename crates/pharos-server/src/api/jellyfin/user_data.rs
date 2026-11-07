@@ -7,11 +7,13 @@
 
 use crate::{
     api::jellyfin::{auth_extractor::AuthUser, dto::UserItemDataDto},
-    services::{library::DetailError, user_data},
+    services::{
+        library::DetailError,
+        user_data::{self, Mark},
+    },
     state::AppState,
 };
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::UserItemData;
 use uuid::Uuid;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -52,22 +54,6 @@ pub fn register(cfg: &mut web::ServiceConfig) {
     );
 }
 
-/// The four UserData mutations, shared by the legacy `/Users/{userId}/…`
-/// routes and the modern userId-less `/UserPlayedItems|UserFavoriteItems/…`
-/// routes so the two families can never drift.
-fn op_mark_played(d: &mut UserItemData) {
-    user_data::apply_played(d, true);
-}
-fn op_unmark_played(d: &mut UserItemData) {
-    user_data::apply_played(d, false);
-}
-fn op_mark_favorite(d: &mut UserItemData) {
-    user_data::apply_favorite(d, true);
-}
-fn op_unmark_favorite(d: &mut UserItemData) {
-    user_data::apply_favorite(d, false);
-}
-
 /// `POST /UserPlayedItems/{itemId}` — mark played for the bearer (no path
 /// userId). Same body shape (UserItemDataDto) as the legacy route.
 async fn mark_played_me(
@@ -75,7 +61,7 @@ async fn mark_played_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, &user.0, &path.into_inner(), op_mark_played).await
+    mutate(&state, &user.0, &path.into_inner(), Mark::Played(true)).await
 }
 
 async fn unmark_played_me(
@@ -83,7 +69,7 @@ async fn unmark_played_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, &user.0, &path.into_inner(), op_unmark_played).await
+    mutate(&state, &user.0, &path.into_inner(), Mark::Played(false)).await
 }
 
 async fn mark_favorite_me(
@@ -91,7 +77,7 @@ async fn mark_favorite_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, &user.0, &path.into_inner(), op_mark_favorite).await
+    mutate(&state, &user.0, &path.into_inner(), Mark::Favorite(true)).await
 }
 
 async fn unmark_favorite_me(
@@ -99,7 +85,7 @@ async fn unmark_favorite_me(
     user: AuthUser,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
-    mutate(&state, &user.0, &path.into_inner(), op_unmark_favorite).await
+    mutate(&state, &user.0, &path.into_inner(), Mark::Favorite(false)).await
 }
 
 async fn mark_played(
@@ -109,7 +95,7 @@ async fn mark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, &user.0, &item_id, op_mark_played).await
+    mutate(&state, &user.0, &item_id, Mark::Played(true)).await
 }
 
 async fn unmark_played(
@@ -119,7 +105,7 @@ async fn unmark_played(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, &user.0, &item_id, op_unmark_played).await
+    mutate(&state, &user.0, &item_id, Mark::Played(false)).await
 }
 
 async fn mark_favorite(
@@ -129,7 +115,7 @@ async fn mark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, &user.0, &item_id, op_mark_favorite).await
+    mutate(&state, &user.0, &item_id, Mark::Favorite(true)).await
 }
 
 async fn unmark_favorite(
@@ -139,7 +125,7 @@ async fn unmark_favorite(
 ) -> Result<impl Responder, actix_web::Error> {
     let (uid_path, item_id) = path.into_inner();
     require_bearer_match(&user, &uid_path)?;
-    mutate(&state, &user.0, &item_id, op_unmark_favorite).await
+    mutate(&state, &user.0, &item_id, Mark::Favorite(false)).await
 }
 
 fn require_bearer_match(user: &AuthUser, uid_path: &str) -> Result<(), actix_web::Error> {
@@ -156,23 +142,20 @@ fn require_bearer_match(user: &AuthUser, uid_path: &str) -> Result<(), actix_web
     Ok(())
 }
 
-async fn mutate<F>(
+async fn mutate(
     state: &AppState,
     user: &pharos_core::User,
     item_id_str: &str,
-    f: F,
-) -> Result<HttpResponse, actix_web::Error>
-where
-    F: Fn(&mut UserItemData),
-{
+    mark: Mark,
+) -> Result<HttpResponse, actix_web::Error> {
     let Some(item_id) = pharos_jellyfin_api::dto::parse_item_id(item_id_str) else {
         // Not a library item id — synthetic series/season ids land here.
         // jellyfin-web's series/season pages offer mark-played /
         // favourite buttons, so cascade over the child episodes instead
         // of 400ing (B36).
-        return mutate_synth_folder(state, user, item_id_str, f).await;
+        return mutate_synth_folder(state, user, item_id_str, mark).await;
     };
-    let (item, data) = user_data::update(state, user, item_id, f)
+    let (item, data) = user_data::update(state, user, item_id, |d| mark.apply(d))
         .await
         .map_err(detail_error)?;
     let runtime = item.probe.run_time_ticks().unwrap_or(0);
@@ -191,15 +174,12 @@ fn detail_error(e: DetailError) -> actix_web::Error {
 /// B36 — mark-played / favourite on a synthetic series or season id:
 /// apply the mutation to every child episode and return the folder-level
 /// DTO the way real Jellyfin does.
-async fn mutate_synth_folder<F>(
+async fn mutate_synth_folder(
     state: &AppState,
     user: &pharos_core::User,
     id_str: &str,
-    f: F,
-) -> Result<HttpResponse, actix_web::Error>
-where
-    F: Fn(&mut UserItemData),
-{
+    mark: Mark,
+) -> Result<HttpResponse, actix_web::Error> {
     // B91 — the Android TV kotlin SDK marks a whole show / season watched via
     // `POST /UserPlayedItems/{id}` with the synth id re-serialised DASHED
     // (`11a177ee-3a0e-0b8f-11a1-77ee3a0e0b8f`). Every comparison is against
@@ -209,7 +189,7 @@ where
     // The same dashed-id sweep already fixed nav (B85) + parent lists (B82).
     let canonical = crate::api::jellyfin::items::canonical_wire_id(id_str);
     let id_str: &str = canonical.as_ref();
-    let folder = user_data::update_folder(state, user, id_str, f)
+    let folder = user_data::set_folder(state, user, id_str, mark)
         .await
         .map_err(detail_error)?;
     Ok(crate::api::jellyfin::wire::json(&UserItemDataDto::folder(

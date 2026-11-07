@@ -201,8 +201,8 @@ async fn a_hidden_item_cannot_be_marked() {
 }
 
 /// Marking a season or a series marks every episode in it: played sets
-/// each unwatched one and counts the play, leaving one already watched as it
-/// was, and unplayed clears each one. Their detail
+/// each one and counts the play, one already watched included as the Jellyfin
+/// route does, and unplayed clears each one. Their detail
 /// says watched once every episode in them is.
 /// Disarm check: with the native `setPlayed` refusing synthesised ids again,
 /// marking the season answers notFound; with `synth_played` answering
@@ -244,8 +244,8 @@ async fn a_season_or_series_marks_every_episode_in_it() {
     assert!(watched(show).await);
     assert_eq!(
         played(601).await,
-        (true, 1),
-        "already watched: not counted again"
+        (true, 2),
+        "already watched: counted again, as the Jellyfin route does"
     );
     assert_eq!(played(603).await, (true, 1));
     assert_eq!(
