@@ -382,6 +382,18 @@ async fn image_subtitle_track<'a>(
     })
 }
 
+/// The image-subtitle manifest before the extractor has written one. Fields are
+/// declared in alphabetical order, the order the former `json!` map (sorted
+/// keys) serialized to, so the bytes are unchanged.
+#[derive(serde::Serialize)]
+struct EmptyManifestDto {
+    complete: bool,
+    events: Vec<serde_json::Value>,
+    height: u32,
+    through_ms: u32,
+    width: u32,
+}
+
 /// `raw` (the extractor's manifest, `None` before its first write) with each
 /// event's `file` replaced by `url` = `{base}/{file}?v={version}`.
 fn manifest_with_urls(
@@ -390,9 +402,13 @@ fn manifest_with_urls(
     version: &str,
 ) -> Result<serde_json::Value, serde_json::Error> {
     let Some(raw) = raw else {
-        return Ok(serde_json::json!({
-            "width": 0, "height": 0, "complete": false, "through_ms": 0, "events": [],
-        }));
+        return serde_json::to_value(EmptyManifestDto {
+            complete: false,
+            events: Vec::new(),
+            height: 0,
+            through_ms: 0,
+            width: 0,
+        });
     };
     let mut manifest: serde_json::Value = serde_json::from_slice(raw)?;
     if let Some(events) = manifest.get_mut("events").and_then(|e| e.as_array_mut()) {
@@ -2701,6 +2717,11 @@ mod tests {
         let got = manifest_with_urls(None, "/x", "7-1").unwrap();
         assert_eq!(got["complete"], false);
         assert_eq!(got["events"], serde_json::json!([]));
+        // Byte-identical to the former literal (sorted keys).
+        assert_eq!(
+            serde_json::to_string(&got).unwrap(),
+            r#"{"complete":false,"events":[],"height":0,"through_ms":0,"width":0}"#
+        );
     }
 
     #[test]
