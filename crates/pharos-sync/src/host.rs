@@ -10,6 +10,7 @@
 //! macro dep.
 
 use crate::group::GroupHandle;
+use crate::registry::{GroupRegistry, RegistryError};
 use pharos_core::{SecretString, UserId};
 use std::future::Future;
 use std::pin::Pin;
@@ -23,11 +24,15 @@ pub trait TokenResolver: Send + Sync + 'static {
     /// Whether `user` may create a group, asked before `CreateAndJoin`.
     fn may_create(&self, user: UserId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
 
-    /// Whether `user` may join `group`, asked before a `Join` admits them. A
-    /// refusal reads to the client as an unknown group.
-    fn may_join<'a>(
+    /// The group `user` may join, or `None` when it does not exist or the user
+    /// may not see it: the two answer alike so a hidden group cannot be
+    /// probed. A group that is not live here but persisted, or live on another
+    /// replica, is hydrated or routed only after the user's access is checked
+    /// (V582).
+    fn joinable_group<'a>(
         &'a self,
         user: UserId,
-        group: &'a GroupHandle,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+        registry: &'a GroupRegistry,
+        group_id: crate::messages::GroupId,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupHandle>, RegistryError>> + Send + 'a>>;
 }
