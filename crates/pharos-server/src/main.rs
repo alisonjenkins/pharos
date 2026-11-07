@@ -1696,11 +1696,29 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                             logged_in = cfg.opensubtitles.login().is_some(),
                             "opensubtitles enabled"
                         );
-                        state = state.with_opensubtitles(OpenSubtitles {
+                        let os = OpenSubtitles {
                             provider: std::sync::Arc::new(client),
                             root: dir.join("opensubtitles"),
                             gate,
-                        });
+                        };
+                        let job_cfg = pharos_server::opensubtitles::job::JobConfig::from_config(
+                            &cfg.opensubtitles,
+                        );
+                        if job_cfg.languages.is_empty() || job_cfg.max_downloads_per_day == 0 {
+                            tracing::info!(
+                                "opensubtitles job off (no usable [opensubtitles].languages or max_downloads_per_day = 0)"
+                            );
+                        } else {
+                            pharos_server::opensubtitles::job::spawn(
+                                os.clone(),
+                                state.stores.clone(),
+                                job_cfg,
+                                dir.join("opensubtitles-misses.json"),
+                                state.is_bg_leader.clone(),
+                                state.bg_io.clone(),
+                            );
+                        }
+                        state = state.with_opensubtitles(os);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "opensubtitles disabled: HTTP client failed to build");
