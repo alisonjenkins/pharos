@@ -119,19 +119,38 @@ pub fn content_box(width: u32, height: u32, video_w: u32, video_h: u32) -> Rect 
     }
 }
 
-/// How far the control bar covers the bottom of the player: the distance
-/// from the top of the bar to the bottom of the player while the controls
-/// show, nothing while they are hidden.
-pub fn controls_inset(controls_visible: bool, player_bottom: f64, controls_top: f64) -> u32 {
+/// How far the control bar covers the bottom of a box (the player, or the
+/// ASS canvas): the distance from the top of the bar to the box's bottom
+/// while the controls show, nothing while they are hidden.
+pub fn controls_inset(controls_visible: bool, box_bottom: f64, controls_top: f64) -> u32 {
     if !controls_visible {
         return 0;
     }
-    let covered = player_bottom - controls_top;
+    let covered = box_bottom - controls_top;
     if covered.is_finite() && covered > 0.0 {
         covered.round() as u32
     } else {
         0
     }
+}
+
+/// How far the ASS renderer's canvas moves up while the control bar shows
+/// (B634, V583): the overlap of the canvas, which JASSUB fits to the picture,
+/// with the bar's laid-out box, `player_bottom - controls_height` (the bar sits
+/// at the bottom of the player; its height, not its on-screen box, so a bar
+/// still sliding in is measured where it ends). Nothing for a letterboxed
+/// picture that ends above the bar, or while the bar is hidden.
+pub fn styled_lift(
+    controls_visible: bool,
+    canvas_bottom: f64,
+    player_bottom: f64,
+    controls_height: f64,
+) -> u32 {
+    controls_inset(
+        controls_visible,
+        canvas_bottom,
+        player_bottom - controls_height,
+    )
 }
 
 /// Why a text track fell back to the browser's own cue display. The label
@@ -367,6 +386,49 @@ mod tests {
         // A bar measured off screen or not laid out never pushes them up.
         assert_eq!(controls_inset(true, 720.0, 800.0), 0);
         assert_eq!(controls_inset(true, 720.0, f64::NAN), 0);
+    }
+
+    #[test]
+    fn the_ass_canvas_clears_the_control_bar_only_while_it_shows() {
+        // A picture down to the player's bottom moves up by the bar's height.
+        assert_eq!(styled_lift(true, 720.0, 720.0, 96.0), 96);
+        // Hidden controls: the canvas stays where JASSUB put it.
+        assert_eq!(styled_lift(false, 720.0, 720.0, 96.0), 0);
+        // A letterboxed picture ending above the bar needs no move, and one
+        // ending inside it moves only by the overlap.
+        assert_eq!(styled_lift(true, 600.0, 720.0, 96.0), 0);
+        assert_eq!(styled_lift(true, 650.0, 720.0, 96.0), 26);
+        // A canvas not laid out yet never moves.
+        assert_eq!(styled_lift(true, f64::NAN, 720.0, 96.0), 0);
+    }
+
+    /// B634: the move is a transform on the canvas (no redraw of the script)
+    /// with a short transition, and no transition under reduced motion.
+    #[test]
+    fn the_ass_canvas_moves_by_a_transform_in_the_stylesheet() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = sheet
+            .split(".pharos-video-frame > canvas.JASSUB {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(
+            rule.contains("transform: translateY(calc(var(--pharos-ass-lift, 0) * -1px))"),
+            "{rule}"
+        );
+        assert!(rule.contains("transition: transform"), "{rule}");
+        // Firefox shows a paused frame on a transformed canvas only on its
+        // own layer.
+        assert!(rule.contains("will-change: transform"), "{rule}");
+        let reduced = sheet
+            .split("@media (prefers-reduced-motion: reduce)")
+            .any(|m| {
+                m.split("\n}").next().is_some_and(|b| {
+                    b.contains(".pharos-video-frame > canvas.JASSUB")
+                        && b.contains("transition: none")
+                })
+            });
+        assert!(reduced, "reduced motion drops the transition");
     }
 
     #[test]
