@@ -99,6 +99,9 @@ pub struct Negotiated {
     pub explicit_preserve: bool,
     /// A `CodecProfile` condition rejected the source's 3D format.
     pub profile_rejected_3d: bool,
+    /// The source range a `VideoRangeType` condition would have blocked, when
+    /// enforcement is off and so playback went ahead.
+    pub video_range_unenforced: Option<String>,
     /// A subtitle is burned into a packed 3D source: drawn into each eye, the
     /// layout kept (V234), unless the output is 2D.
     pub burning_sub_per_eye: bool,
@@ -133,6 +136,28 @@ impl Negotiated {
             "downgrade" => self.downgrade.unwrap_or("none"),
         )
         .increment(1);
+        if let Some(range) = &self.video_range_unenforced {
+            metrics::counter!(
+                "pharos_video_range_unenforced_total",
+                "range" => range_label(range),
+            )
+            .increment(1);
+            tracing::info!(
+                video_range = %range,
+                "a VideoRangeType condition would have blocked direct play; \
+                 enforce_video_range is off"
+            );
+        }
+    }
+}
+
+/// The `range` label of `pharos_video_range_unenforced_total`, bounded to the
+/// ranges the probe can report.
+fn range_label(range: &str) -> &'static str {
+    match range {
+        "HDR10" => "HDR10",
+        "HLG" => "HLG",
+        _ => "other",
     }
 }
 
@@ -140,7 +165,13 @@ impl Negotiated {
 /// profile, the WAN clamp, the downgrades in the order they apply, the
 /// client's own switches last, and the 3D output.
 pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>) -> Negotiated {
-    let profile = req.profile;
+    let stripped;
+    let profile = if state.enforce_video_range {
+        req.profile
+    } else {
+        stripped = req.profile.without_video_range_conditions();
+        &stripped
+    };
     let switches = req.switches;
     let explicit_subtitle_index = req.explicit_subtitle_index;
     let is_web_client = req.is_web_client;
@@ -194,6 +225,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // constructed, but a lie about the client, and indistinguishable on the
     // dashboard from the real "clients are sending nothing" failure.
     let remote = item.origin().is_remote();
+    let mut video_range_unenforced = None;
     let (decision, direct_play_block) = if remote {
         let mut forced = profile.clone();
         forced.direct_play_profiles.clear();
@@ -205,7 +237,14 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
             },
         )
     } else {
-        negotiate_explained(profile, &source, &server_codecs)
+        let verdict = negotiate_explained(profile, &source, &server_codecs);
+        if !state.enforce_video_range {
+            let (would, block) = negotiate_explained(req.profile, &source, &server_codecs);
+            if would != verdict.0 && matches!(block, DirectPlayBlock::VideoRange { .. }) {
+                video_range_unenforced = source.video_range_type.clone();
+            }
+        }
+        verdict
     };
     // Which post-negotiation override (if any) replaced the negotiator's
     // decision. These fire AFTER `negotiate` and can turn a DirectPlay into a
@@ -459,6 +498,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         explicit_mono,
         explicit_preserve,
         profile_rejected_3d,
+        video_range_unenforced,
         burning_sub_per_eye,
         stereo_output,
         direct_play,

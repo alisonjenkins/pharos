@@ -1035,7 +1035,7 @@ async fn seed_hdr10(fx: &Fixture) {
         .unwrap();
 }
 
-/// T065: a player that reports no HDR display is not handed an HDR10 source to
+/// T065, with `enforce_video_range` on: a player that reports no HDR display is not handed an HDR10 source to
 /// direct play; one that does, and an SDR source for either, are unchanged.
 /// The refusal names the range as `direct_play_block="video_range"`, the label
 /// `pharos_playback_decision_total` counts.
@@ -1043,7 +1043,7 @@ async fn seed_hdr10(fx: &Fixture) {
 /// condition, the hdr=false case direct-plays and the assertion fails.
 #[actix_web::test]
 async fn an_sdr_only_player_is_not_offered_an_hdr_source_to_direct_play() {
-    let (server, fx) = crate::revocation::start().await;
+    let (server, fx) = crate::revocation::start_enforcing_video_range().await;
     seed_playable(&fx).await;
     seed_hdr10(&fx).await;
     let (client, _closed) = crate::revocation::connect(&server).await;
@@ -1121,4 +1121,69 @@ async fn an_sdr_only_player_is_not_offered_an_hdr_source_to_direct_play() {
                     .any(|l| l.key() == "direct_play_block" && l.value() == "video_range")
         });
     assert!(counted, "the decision counter carries video_range");
+}
+
+/// T065: with enforcement off (the default) an `hdr=false` player still
+/// direct-plays an HDR10 source, and the would-block is counted by range.
+/// Disarm check: without the `video_range_unenforced` bookkeeping in
+/// `playback::negotiate`, the counter reads nothing.
+#[actix_web::test]
+async fn video_range_unenforced_plays_on_and_counts_the_would_block() {
+    let (_server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    seed_hdr10(&fx).await;
+    let hdr_item = pharos_core::MediaStore::get(&fx.state.stores, HDR_MOVIE)
+        .await
+        .unwrap();
+    let sdr_item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let profile = Capabilities {
+        hdr: false,
+        ..caps(&["h264"], &["aac"], &["mp4"])
+    }
+    .profile(false);
+    let run = |item: &MediaItem| {
+        let negotiated = playback::negotiate(
+            &fx.state,
+            item,
+            &NegotiateRequest {
+                profile: &profile,
+                switches: PlaybackSwitches::default(),
+                explicit_subtitle_index: None,
+                stereo_mode: None,
+                client_is_remote: false,
+                is_web_client: false,
+            },
+        );
+        negotiated.record();
+        negotiated
+    };
+    let hdr = run(&hdr_item);
+    assert_eq!(hdr.decision_kind(), "direct_play");
+    assert_eq!(hdr.video_range_unenforced.as_deref(), Some("HDR10"));
+    let sdr = run(&sdr_item);
+    assert_eq!(sdr.decision_kind(), "direct_play");
+    assert_eq!(sdr.video_range_unenforced, None);
+
+    let counted: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_video_range_unenforced_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "range" && l.value() == "HDR10")
+        })
+        .map(|(.., v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n) => n,
+            other => panic!("{other:?}"),
+        })
+        .sum();
+    assert_eq!(counted, 1, "one HDR10 would-block, none for the SDR source");
 }

@@ -1987,6 +1987,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     ));
     state = state.with_user_defaults(cfg.user_defaults.clone());
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
+    state = state.with_enforce_video_range(cfg.server.enforce_video_range);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
     let trusted_proxies =
