@@ -669,13 +669,16 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
 
 pub use super::subs_web::{rust_subtitles, RustSubtitles};
 
+/// The shared resize observer for the JASSUB canvases and its callback,
+/// kept alive together.
+type CanvasObserver = (web_sys::ResizeObserver, Closure<dyn FnMut()>);
+
 thread_local! {
     /// Whether the control bar shows, for the JASSUB canvas lift (B634).
     static STYLED_CONTROLS_VISIBLE: Cell<bool> = const { Cell::new(true) };
     /// Watches each JASSUB canvas so the lift follows a resize or full
     /// screen: it fires after JASSUB refits the canvas, at most once a frame.
-    static STYLED_LIFT_OBSERVER: RefCell<Option<(web_sys::ResizeObserver, Closure<dyn FnMut()>)>> =
-        const { RefCell::new(None) };
+    static STYLED_LIFT_OBSERVER: RefCell<Option<CanvasObserver>> = const { RefCell::new(None) };
 }
 
 /// Whether the player's control bar shows. Both subtitle renderers clear it
