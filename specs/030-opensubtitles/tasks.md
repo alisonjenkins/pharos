@@ -14,6 +14,6 @@
 
 ## Slice 2 - Background job (V567, V568, V569, V571)
 
-- [ ] T030-08 `opensubtitles/memo.rs`: miss memo beside the cache, keyed by item id and language, signature `(mtime, size)` plus a 7-day expiry and a schema version.
-- [ ] T030-09 `opensubtitles/job.rs`: after-scan pass over items with no subtitle in the configured languages. One at a time, `max_downloads_per_day`, 1 s spacing, `bg_io` permit, stops for the day on a quota error. Tests with a fake provider and clock.
-- [ ] T030-10 Spawn the job from `main.rs` behind the key, and add the `pharos_opensubtitles_total` outcomes for the job with a disarm check.
+- [x] T030-08 `opensubtitles/memo.rs`: miss memo beside the cache, keyed by item id and language, signature `(mtime, size)` plus a 7-day expiry and a schema version.
+- [x] T030-09 `opensubtitles/job.rs`: after-scan pass over items with no subtitle in the configured languages. One at a time, `max_downloads_per_day`, 1 s spacing, `bg_io` permit, stops for the day on a quota error. Tests with a fake provider and clock.
+- [x] T030-10 Spawn the job from `main.rs` behind the key, and add the `pharos_opensubtitles_total` outcomes for the job with a disarm check.
