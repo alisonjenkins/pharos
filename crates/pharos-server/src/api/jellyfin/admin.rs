@@ -66,8 +66,10 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/system/activitylog/entries",
             web::get().to(activity_log_entries),
         )
-        // POST writes to /System/Configuration are accepted + no-op'd;
-        // pharos's runtime config is the toml file (re-read on restart).
+        // POST /System/Configuration persists the branding fields
+        // (server_name, login_disclaimer, custom_css) via set_runtime_config
+        // (T65); other keys are accepted and ignored. Named sections live at
+        // /System/Configuration/{key} and persist via set_named_config (T72).
         .route(
             "/system/configuration",
             web::post().to(post_system_configuration),
