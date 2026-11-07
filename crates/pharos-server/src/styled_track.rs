@@ -1,0 +1,95 @@
+//! The generated "English (Pharos styled)" subtitle track (spec 028 FR-017).
+//!
+//! A background job directs a source subtitle into an effect plan and stores
+//! it per item ([`pharos_core::SubtitleStyling`]). This module decides whether
+//! that row may still be served, and where the synthetic track sits in the
+//! subtitle index space.
+
+use pharos_core::{MediaItem, SubtitleStyling, SubtitleStylingStore};
+use pharos_jellyfin_api::dto::sidecar_base_index;
+use pharos_styling::DIRECTOR_VERSION;
+
+use crate::api::jellyfin::subtitles::discover_sidecars;
+use crate::subtitle_styling::signature;
+
+/// The styled track's subtitle index: one past the last sidecar (FR-017), so
+/// it never collides with a real stream and B71's contiguous rule holds.
+pub fn styled_index(probe: &pharos_core::MediaProbe, sidecar_count: u32) -> u32 {
+    sidecar_base_index(probe).saturating_add(sidecar_count)
+}
+
+/// The item's styling row when its plan can still be served: it has a plan,
+/// the director version is current, the video file is the one the plan was
+/// made from, and a sidecar source still has the signature it had then.
+/// A read error is logged and answers `None`.
+pub async fn current<S: SubtitleStylingStore>(
+    store: &S,
+    item: &MediaItem,
+) -> Option<SubtitleStyling> {
+    let row = match store.subtitle_styling(item.id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(item = %item.id, error = %e, "styled subtitle row unreadable");
+            return None;
+        }
+    };
+    // A row without a plan is the job's own verdict (undecodable, no source),
+    // logged when it was made; every other rejection withdraws a track the
+    // viewer may have seen before, so it is logged at info.
+    let rejected = |reason: &str, stored: String, found: String| {
+        tracing::info!(
+            item = %item.id,
+            source_index = row.source_index,
+            reason,
+            stored,
+            found,
+            "styled track: plan not current"
+        );
+    };
+    row.plan_json.as_ref()?;
+    if row.director_version != DIRECTOR_VERSION {
+        rejected(
+            "director version",
+            row.director_version.to_string(),
+            DIRECTOR_VERSION.to_string(),
+        );
+        return None;
+    }
+    let video = signature(&item.path).await;
+    if video != Some((row.source_mtime, row.source_size)) {
+        rejected(
+            "video signature",
+            format!("{:?}", (row.source_mtime, row.source_size)),
+            format!("{video:?}"),
+        );
+        return None;
+    }
+    if let (Some(mtime), Some(size)) = (row.sidecar_mtime, row.sidecar_size) {
+        let sidecars = discover_sidecars(&item.path).await;
+        let base = sidecar_base_index(&item.probe);
+        let path = row
+            .source_index
+            .checked_sub(base)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| sidecars.get(offset));
+        let Some((path, _)) = path else {
+            rejected(
+                "sidecar missing",
+                row.source_index.to_string(),
+                format!("{} sidecars from {base}", sidecars.len()),
+            );
+            return None;
+        };
+        let found = signature(path).await;
+        if found != Some((mtime, size)) {
+            rejected(
+                "sidecar signature",
+                format!("{:?}", (mtime, size)),
+                format!("{found:?}"),
+            );
+            return None;
+        }
+    }
+    Some(row)
+}

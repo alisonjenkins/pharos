@@ -44,6 +44,7 @@ pub mod services;
 pub mod session_start;
 pub mod sessions;
 pub mod state;
+pub mod styled_track;
 pub mod subtitle_styling;
 #[cfg(feature = "postgres")]
 pub mod sync_distributed;
