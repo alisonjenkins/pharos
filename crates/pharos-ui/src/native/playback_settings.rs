@@ -5,7 +5,9 @@
 use dioxus::prelude::*;
 
 use super::appearance::Notice;
-use super::playback::{parse_crossfade, SubtitleSize, CROSSFADE_CHOICES, MAX_BITRATE_CHOICES};
+use super::playback::{
+    parse_crossfade, MseEngine, SubtitleSize, CROSSFADE_CHOICES, MAX_BITRATE_CHOICES,
+};
 use super::settings::Choices;
 
 #[component]
@@ -18,7 +20,14 @@ pub fn PlaybackView(
     /// The crossfade between songs, in seconds; 0 is off.
     crossfade_s: u32,
     on_crossfade: EventHandler<u32>,
+    /// The engine that plays HLS through Media Source Extensions here.
+    engine: MseEngine,
+    on_engine: EventHandler<MseEngine>,
 ) -> Element {
+    let engines = MseEngine::ALL
+        .iter()
+        .map(|e| (e.as_str().to_owned(), e.label().to_owned()))
+        .collect::<Vec<_>>();
     let qualities = MAX_BITRATE_CHOICES
         .iter()
         .map(|(bps, label)| (bps.to_string(), (*label).to_owned()))
@@ -106,6 +115,26 @@ pub fn PlaybackView(
                         on_pick: move |value: String| on_crossfade.call(parse_crossfade(&value)),
                     }
                 }
+                div { class: "pharos-setting pharos-engine",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "engine-label", "Streaming engine" }
+                        p { id: "engine-help", class: "pharos-setting-help",
+                            "What plays streamed video in this browser. hls.js is the default; the Pharos engine is experimental and still hands playback to hls.js where it cannot play a stream. Kept on this device."
+                        }
+                    }
+                    Choices {
+                        id: "engine",
+                        labelled_by: "engine-label",
+                        described_by: "engine-help".to_owned(),
+                        options: engines,
+                        selected: engine.as_str().to_owned(),
+                        on_pick: move |value: String| {
+                            if let Some(engine) = MseEngine::parse(&value) {
+                                on_engine.call(engine);
+                            }
+                        },
+                    }
+                }
             }
         }
     }
@@ -116,8 +145,27 @@ mod tests {
     use super::*;
 
     fn page(max_quality: u64, subtitle_size: SubtitleSize, crossfade_s: u32) -> String {
+        page_with_engine(
+            max_quality,
+            subtitle_size,
+            crossfade_s,
+            MseEngine::default(),
+        )
+    }
+
+    fn page_with_engine(
+        max_quality: u64,
+        subtitle_size: SubtitleSize,
+        crossfade_s: u32,
+        engine: MseEngine,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(max_quality, subtitle_size, crossfade_s): (u64, SubtitleSize, u32)| {
+            |(max_quality, subtitle_size, crossfade_s, engine): (
+                u64,
+                SubtitleSize,
+                u32,
+                MseEngine,
+            )| {
                 rsx! {
                     PlaybackView {
                         notice: None,
@@ -127,10 +175,12 @@ mod tests {
                         on_subtitle_size: |_| {},
                         crossfade_s,
                         on_crossfade: |_| {},
+                        engine,
+                        on_engine: |_| {},
                     }
                 }
             },
-            (max_quality, subtitle_size, crossfade_s),
+            (max_quality, subtitle_size, crossfade_s, engine),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -214,5 +264,26 @@ mod tests {
         );
         assert!(html.contains("id=\"crossfade-12\""), "{html}");
         assert_eq!(pressed(&html, "crossfade").len(), 1, "{html}");
+    }
+
+    #[test]
+    fn engine_defaults_to_hlsjs_and_offers_the_rust_engine() {
+        let html = page(0, SubtitleSize::default(), 0);
+        assert_eq!(pressed(&html, "engine").len(), 1, "{html}");
+        assert!(
+            button(&html, "engine-hlsjs").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(html.contains("Pharos (experimental)"), "{html}");
+    }
+
+    #[test]
+    fn engine_presses_only_the_stored_choice() {
+        let html = page_with_engine(0, SubtitleSize::default(), 0, MseEngine::Rust);
+        assert_eq!(pressed(&html, "engine").len(), 1, "{html}");
+        assert!(
+            button(&html, "engine-rust").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
     }
 }
