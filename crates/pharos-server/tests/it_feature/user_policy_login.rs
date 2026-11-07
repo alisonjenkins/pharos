@@ -266,3 +266,111 @@ async fn an_existing_token_is_403_outside_the_schedule_and_works_inside_it() {
     );
     assert_eq!(get_me(&f, &f.user_token).await, 200);
 }
+
+// ---- V579: MaxActiveSessions ----
+
+async fn login_from(f: &Fixture, device: &str, pw: &str) -> u16 {
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let header = format!(
+        r#"MediaBrowser Client="Test", Device="{device}", DeviceId="{device}", Version="1.0""#
+    );
+    let req = test::TestRequest::post()
+        .uri("/Users/AuthenticateByName")
+        .insert_header(("X-Emby-Authorization", header))
+        .set_json(json!({ "Username": "guest", "Pw": pw }))
+        .to_request();
+    test::call_service(&app, req).await.status().as_u16()
+}
+
+#[actix_web::test]
+async fn a_new_device_is_403_at_the_session_cap_and_200_below_it() {
+    let f = seed_rich().await;
+    // The fixture already holds one session for guest.
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 2 })).await,
+        204
+    );
+    assert_eq!(login_from(&f, "dev-a", "hunter2").await, 200);
+    // Two held now: a third device is refused, after the password check.
+    assert_eq!(login_from(&f, "dev-b", "hunter2").await, 403);
+    assert_eq!(login_from(&f, "dev-b", "wrong").await, 401);
+    // Signing in again from a device that already has a session is not a
+    // new session.
+    assert_eq!(login_from(&f, "dev-a", "hunter2").await, 200);
+    // Raising the cap, or removing it, lets the third device in.
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 3 })).await,
+        204
+    );
+    assert_eq!(login_from(&f, "dev-b", "hunter2").await, 200);
+    assert_eq!(login_from(&f, "dev-c", "hunter2").await, 403);
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 0 })).await,
+        204
+    );
+    assert_eq!(login_from(&f, "dev-c", "hunter2").await, 200);
+}
+
+/// The cap is checked and the token inserted as one step: of two devices
+/// racing for the last session, exactly one gets it.
+#[actix_web::test]
+async fn two_concurrent_logins_at_the_last_session_let_exactly_one_in() {
+    let f = seed_rich().await;
+    // The fixture already holds one session for guest: one slot is left.
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 2 })).await,
+        204
+    );
+    let (a, b) = tokio::join!(
+        login_from(&f, "dev-a", "hunter2"),
+        login_from(&f, "dev-b", "hunter2")
+    );
+    let mut got = [a, b];
+    got.sort_unstable();
+    assert_eq!(got, [200, 403]);
+}
+
+/// A refused gate must not burn the one-time Quick Connect code (as on the
+/// native path): the same code works once the gate opens.
+#[actix_web::test]
+async fn a_gated_quick_connect_finalize_keeps_the_code() {
+    let f = seed_rich().await;
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::post()
+        .uri("/QuickConnect/Initiate")
+        .insert_header(("X-Emby-Authorization", AUTH_HEADER))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let code = v["Code"].as_str().unwrap().to_string();
+    let secret = v["Secret"].as_str().unwrap().to_string();
+    let req = test::TestRequest::post()
+        .uri(&format!("/QuickConnect/Authorize?Code={code}"))
+        .insert_header(("X-Emby-Token", f.user_token.as_str()))
+        .to_request();
+    assert_eq!(test::call_service(&app, req).await.status().as_u16(), 200);
+
+    // The fixture's session already fills a cap of one.
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 1 })).await,
+        204
+    );
+    let finalize = || {
+        test::TestRequest::post()
+            .uri("/Users/AuthenticateWithQuickConnect")
+            .set_json(json!({ "Secret": secret }))
+            .to_request()
+    };
+    assert_eq!(
+        test::call_service(&app, finalize()).await.status().as_u16(),
+        403
+    );
+    assert_eq!(
+        post_policy(&f, json!({ "MaxActiveSessions": 0 })).await,
+        204
+    );
+    assert_eq!(
+        test::call_service(&app, finalize()).await.status().as_u16(),
+        200
+    );
+}

@@ -453,6 +453,9 @@ pub struct AppState {
     /// Tells open native connections a user's tokens may have been revoked
     /// (T025).
     pub revocations: crate::services::auth::Revocations,
+    /// Per-user lock around a capped login's session count and token insert
+    /// (V579).
+    pub session_slots: crate::services::auth::SessionSlots,
     /// Proxies whose `X-Forwarded-For` is believed when keying the throttle
     /// (`[server].trusted_proxies`); empty means the peer address always.
     pub trusted_proxies: crate::client_ip::TrustedProxies,
@@ -796,6 +799,7 @@ impl AppState {
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             revocations: Default::default(),
+            session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
@@ -917,6 +921,7 @@ impl AppState {
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             revocations: Default::default(),
+            session_slots: Default::default(),
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         })
     }

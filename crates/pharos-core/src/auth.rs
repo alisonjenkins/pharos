@@ -496,6 +496,16 @@ pub trait TokenStore: Send + Sync {
         user: UserId,
         keep: Option<&str>,
     ) -> impl std::future::Future<Output = AuthResult<u64>> + Send;
+
+    /// How many sessions `user` holds besides the one on `device_id`: the
+    /// distinct devices with a live full-scope login token, API keys and
+    /// restricted or child tokens excluded. What `MaxActiveSessions` caps
+    /// (T68, V579).
+    fn count_sessions_excluding_device(
+        &self,
+        user: UserId,
+        device_id: &str,
+    ) -> impl std::future::Future<Output = AuthResult<u32>> + Send;
 }
 
 /// Per-token metadata exposed to admin endpoints. The actual token
