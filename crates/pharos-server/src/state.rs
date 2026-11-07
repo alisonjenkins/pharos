@@ -479,7 +479,18 @@ struct ActivityLogEntryDto<'a> {
     short_overview: Option<&'a str>,
     #[serde(rename = "Type")]
     kind: &'a str,
-    user_id: Option<&'a str>,
+    user_id: &'a str,
+}
+
+/// Jellyfin's `Guid.Empty`: the `UserId` of an activity entry with no user.
+/// jellyfin-sdk-kotlin decodes `UserId` as a non-null UUID, so `null` here
+/// fails the whole list. Jellyfin stores the `Guid` default and serializes it
+/// as this value (`ActivityManager.ConvertToOldModel`).
+const NIL_USER_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The `UserId` an activity entry serializes with: the user, or the nil GUID.
+fn activity_user_id(user_id: Option<&str>) -> &str {
+    user_id.unwrap_or(NIL_USER_ID)
 }
 
 impl AppState {
@@ -647,7 +658,7 @@ impl AppState {
             severity: "Information",
             short_overview: overview,
             kind,
-            user_id,
+            user_id: activity_user_id(user_id),
         }) else {
             // A struct of strings and integers cannot fail to serialize; if it
             // ever does, drop this one best-effort entry rather than panic.
@@ -1432,7 +1443,7 @@ mod shutdown_tests {
             severity: "Information",
             short_overview: Some("from web"),
             kind: "SessionStarted",
-            user_id: None,
+            user_id: "8f0c2a1e5b6d4c3a9e7f1a2b3c4d5e6f",
         };
         let got = serde_json::to_value(&dto).unwrap();
         assert_eq!(
@@ -1442,7 +1453,7 @@ mod shutdown_tests {
                 "Name": "alice signed in",
                 "Type": "SessionStarted",
                 "Date": "2026-11-07T00:00:00Z",
-                "UserId": null,
+                "UserId": "8f0c2a1e5b6d4c3a9e7f1a2b3c4d5e6f",
                 "Severity": "Information",
                 "ShortOverview": "from web",
             })
@@ -1452,6 +1463,31 @@ mod shutdown_tests {
             serde_json::to_string(&dto).unwrap(),
             serde_json::to_string(&got).unwrap()
         );
+    }
+
+    #[test]
+    fn a_user_less_activity_entry_serializes_the_nil_guid_not_null() {
+        // Jellyfin's Guid.Empty; kotlin's non-null UUID rejects null.
+        assert_eq!(
+            activity_user_id(None),
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(activity_user_id(Some("abc")), "abc");
+        let dto = ActivityLogEntryDto {
+            date: "2026-11-07T00:00:00Z".into(),
+            id: 4,
+            name: "pharos started",
+            severity: "Information",
+            short_overview: None,
+            kind: "ServerStarted",
+            user_id: activity_user_id(None),
+        };
+        let got = serde_json::to_value(&dto).unwrap();
+        assert_eq!(
+            got["UserId"],
+            serde_json::json!("00000000-0000-0000-0000-000000000000")
+        );
+        assert_eq!(got["ShortOverview"], serde_json::Value::Null);
     }
 
     #[test]
