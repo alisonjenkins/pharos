@@ -179,6 +179,19 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
             sender,
             playlist_item_id,
         },
+        GroupMsg::MoveToItem {
+            sender,
+            from,
+            item_id,
+            runtime_ms,
+            start_position_ms,
+        } => RemoteCommand::MoveToItem {
+            sender,
+            from,
+            item_id,
+            runtime_ms,
+            start_position_ms,
+        },
         GroupMsg::NextItem {
             sender,
             playlist_item_id,

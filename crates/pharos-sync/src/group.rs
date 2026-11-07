@@ -337,6 +337,20 @@ pub enum GroupMsg {
         sender: MemberId,
         playlist_item_id: String,
     },
+    /// Native `Membership.setItem` (014 US9): replace the queue with one item,
+    /// as [`SetNewQueue`](GroupMsg::SetNewQueue) does, unless `from` names an
+    /// entry that is no longer the playing one. Two members whose autoplay
+    /// both fire at an episode's end send the same `from`; the second is
+    /// dropped, so the group moves once.
+    MoveToItem {
+        sender: MemberId,
+        /// The entry the sender is moving from; `None` skips the check.
+        from: Option<String>,
+        item_id: String,
+        /// The item's duration, when resolvable (see [`QueueEntry::runtime_ms`]).
+        runtime_ms: Option<u64>,
+        start_position_ms: u64,
+    },
     /// Jellyfin HTTP `/SyncPlay/Queue` — add items to the existing queue
     /// without disturbing playback.
     Queue {
@@ -559,6 +573,15 @@ pub enum RemoteCommand {
         sender: MemberId,
         playlist_item_id: String,
     },
+    MoveToItem {
+        sender: MemberId,
+        #[serde(default)]
+        from: Option<String>,
+        item_id: String,
+        #[serde(default)]
+        runtime_ms: Option<u64>,
+        start_position_ms: u64,
+    },
     Queue {
         sender: MemberId,
         item_ids: Vec<String>,
@@ -734,6 +757,19 @@ impl RemoteCommand {
             } => GroupMsg::SetPlaylistItem {
                 sender,
                 playlist_item_id,
+            },
+            RemoteCommand::MoveToItem {
+                sender,
+                from,
+                item_id,
+                runtime_ms,
+                start_position_ms,
+            } => GroupMsg::MoveToItem {
+                sender,
+                from,
+                item_id,
+                runtime_ms,
+                start_position_ms,
             },
             RemoteCommand::Queue {
                 sender,
@@ -1332,6 +1368,39 @@ impl NextItemOutcome {
 fn record_next_item_outcome(outcome: NextItemOutcome) {
     metrics::counter!(
         "pharos_syncplay_next_item_total",
+        "outcome" => outcome.label(),
+    )
+    .increment(1);
+}
+
+/// What became of a native `setItem` (014 US9), counted as
+/// `pharos_syncplay_move_to_item_total{outcome}`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MoveToItemOutcome {
+    /// The group's queue is now the item.
+    Moved,
+    /// The sender moved from an entry that is no longer playing; ignored.
+    Stale,
+    /// The sender is not a member of this group; ignored.
+    NotInGroup,
+    /// No item named; ignored.
+    NoItem,
+}
+
+impl MoveToItemOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            MoveToItemOutcome::Moved => "moved",
+            MoveToItemOutcome::Stale => "stale",
+            MoveToItemOutcome::NotInGroup => "not_in_group",
+            MoveToItemOutcome::NoItem => "no_item",
+        }
+    }
+}
+
+fn record_move_to_item_outcome(outcome: MoveToItemOutcome) {
+    metrics::counter!(
+        "pharos_syncplay_move_to_item_total",
         "outcome" => outcome.label(),
     )
     .increment(1);
@@ -1991,6 +2060,47 @@ impl GroupState {
             .items
             .get(self.queue.playing_index)
             .map(|e| e.playlist_item_id.as_str())
+    }
+
+    /// Replace the queue with `item_ids`, playing `playing_index` from
+    /// `start_position_ms`, and hold the group until every member is ready
+    /// on it. `item_runtimes_ms` is index-aligned with `item_ids`.
+    fn set_new_queue(
+        &mut self,
+        item_ids: Vec<String>,
+        item_runtimes_ms: &[Option<u64>],
+        playing_index: usize,
+        start_position_ms: u64,
+    ) {
+        self.queue.items = item_ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, item_id)| QueueEntry {
+                item_id,
+                playlist_item_id: Uuid::new_v4().simple().to_string(),
+                // Index-aligned by construction (the caller maps over this
+                // same list). A short or absent vec reads as unknown, which
+                // leaves the position unclamped — never misassigns another
+                // item's duration to this one.
+                runtime_ms: item_runtimes_ms.get(i).copied().flatten(),
+            })
+            .collect();
+        self.queue.playing_index = playing_index.min(self.queue.items.len().saturating_sub(1));
+        self.item_started_at = Some(tokio::time::Instant::now());
+        self.next_item_advanced_at = None;
+        self.broadcast_play_queue("new_playlist", true, start_position_ms);
+        // Settle playback at the NEW item's start before the gate opens.
+        // Without this, `self.playback` still holds the previous item's
+        // `Playing{old_pos, old_anchor}` through the whole gate — so the new
+        // item's BufferingStart reads a stale Playing and broadcasts a Pause
+        // at the old (growing) position, and a join/reconnect mid-gate is
+        // told to play the new item from the old position. (SeekTo settles
+        // Paused first for the same reason.)
+        self.playback = PlaybackState::Paused {
+            position_ms: start_position_ms,
+        };
+        let pending = self.follower_ids();
+        self.enter_waiting(pending, true, start_position_ms, GateReason::QueueChange, 0);
     }
 
     /// B37 — a client-reported `PlaylistItemId` that names anything OTHER
@@ -3370,6 +3480,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::SeekTo { sender, .. }
         | GroupMsg::SetNewQueue { sender, .. }
         | GroupMsg::SetPlaylistItem { sender, .. }
+        | GroupMsg::MoveToItem { sender, .. }
         | GroupMsg::Queue { sender, .. }
         | GroupMsg::RemoveFromPlaylist { sender, .. }
         | GroupMsg::MovePlaylistItem { sender, .. }
@@ -4345,36 +4456,50 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
                 tracing::warn!(group = %state.id, "syncplay: SetNewQueue with empty queue ignored");
                 return;
             }
-            state.queue.items = item_ids
-                .into_iter()
-                .enumerate()
-                .map(|(i, item_id)| QueueEntry {
-                    item_id,
-                    playlist_item_id: Uuid::new_v4().simple().to_string(),
-                    // Index-aligned by construction (the caller maps over this
-                    // same list). A short or absent vec reads as unknown, which
-                    // leaves the position unclamped — never misassigns another
-                    // item's duration to this one.
-                    runtime_ms: item_runtimes_ms.get(i).copied().flatten(),
-                })
-                .collect();
-            state.queue.playing_index =
-                playing_index.min(state.queue.items.len().saturating_sub(1));
-            state.item_started_at = Some(tokio::time::Instant::now());
-            state.next_item_advanced_at = None;
-            state.broadcast_play_queue("new_playlist", true, start_position_ms);
-            // Settle playback at the NEW item's start before the gate opens.
-            // Without this, `state.playback` still holds the previous item's
-            // `Playing{old_pos, old_anchor}` through the whole gate — so the new
-            // item's BufferingStart reads a stale Playing and broadcasts a Pause
-            // at the old (growing) position, and a join/reconnect mid-gate is
-            // told to play the new item from the old position. (SeekTo settles
-            // Paused first for the same reason.)
-            state.playback = PlaybackState::Paused {
-                position_ms: start_position_ms,
-            };
-            let pending = state.follower_ids();
-            state.enter_waiting(pending, true, start_position_ms, GateReason::QueueChange, 0);
+            state.set_new_queue(
+                item_ids,
+                &item_runtimes_ms,
+                playing_index,
+                start_position_ms,
+            );
+        }
+        GroupMsg::MoveToItem {
+            sender,
+            from,
+            item_id,
+            runtime_ms,
+            start_position_ms,
+        } => {
+            if !state.members.contains_key(&sender) {
+                tracing::info!(group = %state.id, member = %sender, "syncplay: move to item from a non-member ignored");
+                record_move_to_item_outcome(MoveToItemOutcome::NotInGroup);
+                return;
+            }
+            // The sender moved on from an entry the group has already left:
+            // another member's identical move (both autoplays at an episode's
+            // end) won, and applying this one would move the group twice.
+            if state.pli_is_stale(&from) {
+                tracing::info!(
+                    group = %state.id, member = %sender, item = %item_id,
+                    sent = from.as_deref().unwrap_or(""),
+                    current = state.current_playlist_item_id().unwrap_or(""),
+                    "syncplay: move to item from a stale entry ignored"
+                );
+                record_move_to_item_outcome(MoveToItemOutcome::Stale);
+                return;
+            }
+            if item_id.is_empty() {
+                record_move_to_item_outcome(MoveToItemOutcome::NoItem);
+                return;
+            }
+            tracing::info!(
+                group = %state.id, member = %sender, item = %item_id,
+                from = from.as_deref().unwrap_or(""),
+                start_position_ms,
+                "syncplay: group moved to item"
+            );
+            record_move_to_item_outcome(MoveToItemOutcome::Moved);
+            state.set_new_queue(vec![item_id], &[runtime_ms], 0, start_position_ms);
         }
         GroupMsg::SeedQueue {
             item_id,
@@ -10151,6 +10276,88 @@ mod tests {
             panic!("valid NextItem must broadcast");
         };
         assert_eq!(playing_index, 2);
+    }
+
+    /// 014 US9 — a member's `setItem` replaces the queue with the item, from
+    /// the position asked, for every member.
+    #[tokio::test(start_paused = true)]
+    async fn move_to_item_replaces_the_queue_with_the_item() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        h.tx.send(GroupMsg::MoveToItem {
+            sender: leader,
+            from: Some(plis[0].clone()),
+            item_id: "20".into(),
+            runtime_ms: Some(1_200_000),
+            start_position_ms: 4_000,
+        })
+        .await
+        .unwrap();
+        let Some(ServerMsg::PlayQueue {
+            items,
+            playing_index,
+            start_position_ms,
+            ..
+        }) = recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+            matches!(m, ServerMsg::PlayQueue { .. })
+        })
+        .await
+        else {
+            panic!("MoveToItem must broadcast the new queue");
+        };
+        let ids: Vec<_> = items.iter().map(|i| i.item_id.as_str()).collect();
+        assert_eq!(ids, ["20"]);
+        assert_eq!((playing_index, start_position_ms), (0, 4_000));
+        assert_ne!(items[0].playlist_item_id, plis[0], "a new entry");
+    }
+
+    /// 014 US9 — two members' autoplay at an episode's end both move the
+    /// group from the same entry; the second finds that entry gone and is
+    /// dropped, so the group moves once, not twice.
+    #[tokio::test(start_paused = true)]
+    async fn move_to_item_from_a_stale_entry_is_ignored() {
+        let (h, _sinks, mut leader_rx, leader) = fresh().await;
+        let plis = seed_queue(&h, leader, &mut leader_rx).await;
+        let next = |item: &str| GroupMsg::MoveToItem {
+            sender: leader,
+            from: Some(plis[0].clone()),
+            item_id: item.into(),
+            runtime_ms: None,
+            start_position_ms: 0,
+        };
+        h.tx.send(next("20")).await.unwrap();
+        assert!(
+            recv_matching(&mut leader_rx, Duration::from_secs(2), |m| {
+                matches!(m, ServerMsg::PlayQueue { .. })
+            })
+            .await
+            .is_some(),
+            "the first move broadcasts"
+        );
+        h.tx.send(next("21")).await.unwrap();
+        let snap = snapshot_of(&h).await;
+        while let Ok(m) = leader_rx.try_recv() {
+            assert!(
+                !matches!(m, ServerMsg::PlayQueue { .. }),
+                "a move from a stale entry must not move the group again"
+            );
+        }
+        assert_eq!(snap.queue_item_ids, ["20"]);
+    }
+
+    /// Every `setItem` outcome's label is distinct and stable.
+    #[test]
+    fn move_to_item_outcome_labels_are_distinct() {
+        const ALL: [MoveToItemOutcome; 4] = [
+            MoveToItemOutcome::Moved,
+            MoveToItemOutcome::Stale,
+            MoveToItemOutcome::NotInGroup,
+            MoveToItemOutcome::NoItem,
+        ];
+        let labels: std::collections::HashSet<&str> = ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), ALL.len(), "{labels:?}");
+        assert_eq!(MoveToItemOutcome::Moved.label(), "moved");
+        assert_eq!(MoveToItemOutcome::Stale.label(), "stale");
     }
 
     /// B226 (ODD) — every `NextItem` outcome's label is distinct and stable.
