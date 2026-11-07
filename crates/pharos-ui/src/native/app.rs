@@ -676,8 +676,6 @@ const NARROW_SCREEN: &str = "(max-width: 600px)";
 
 /// The tier a styled subtitle track is first fetched at on this device, and
 /// the log line saying why.
-// The player takes this once the server serves the styled track (T028-19).
-#[allow(dead_code)]
 fn current_starting_tier() -> Tier {
     let device = device_class(
         &platform::user_agent(),
@@ -697,10 +695,12 @@ fn current_starting_tier() -> Tier {
     tier
 }
 
+/// How often the player reads the video's dropped frames while a generated
+/// styled track shows; one second is a fine-enough grain for a 10 s window.
+const QUALITY_SAMPLE_MS: u32 = 1_000;
+
 /// Feed the video's frame counters to `watch`; a drop is remembered for the
 /// device, logged and reported, and the new tier comes back.
-// The player calls this each second once the styled track is served (T028-21).
-#[allow(dead_code)]
 fn on_quality_sample(
     watch: &mut TierDrop,
     renderer: &str,
@@ -3991,6 +3991,58 @@ fn Player(
                     Ok(s) if styled_for.get() == pick => *styled.borrow_mut() = Some(s),
                     Ok(_) => {}
                     Err(e) => report(Err(e)),
+                }
+            });
+        }
+    });
+    // The tier the generated styled track is fetched at: the device's, then
+    // lower when the video drops frames (T028-21).
+    let mut tier = use_signal(current_starting_tier);
+    let tier_watch = use_hook(|| Rc::new(RefCell::new(TierDrop::new(*tier.peek()))));
+    let sampling = use_hook(|| Rc::new(Cell::new(0_u64)));
+    use_drop({
+        let sampling = Rc::clone(&sampling);
+        move || sampling.set(sampling.get().wrapping_add(1))
+    });
+    use_effect({
+        let (p, tier_watch, sampling) =
+            (Rc::clone(&p), Rc::clone(&tier_watch), Rc::clone(&sampling));
+        move || {
+            let run = sampling.get().wrapping_add(1);
+            sampling.set(run);
+            let generated = !burned
+                && subtitle()
+                    .and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i))
+                    .is_some_and(|t| t.styled_url.is_some());
+            if !(generated && styled_ready()) {
+                return;
+            }
+            let (tier_watch, sampling) = (Rc::clone(&tier_watch), Rc::clone(&sampling));
+            spawn(async move {
+                while sampling.get() == run {
+                    platform::sleep_ms(QUALITY_SAMPLE_MS).await;
+                    if sampling.get() != run {
+                        break;
+                    }
+                    let Some((dropped, presented)) = platform::video_quality(VIDEO_ID) else {
+                        break;
+                    };
+                    let counting = platform::page_visible() && {
+                        let m = media.peek();
+                        !m.paused && !m.loading
+                    };
+                    let lower = on_quality_sample(
+                        &mut tier_watch.borrow_mut(),
+                        "jassub",
+                        now_ms_u64(),
+                        dropped,
+                        presented,
+                        counting,
+                    );
+                    if let Some(lower) = lower {
+                        tier.set(lower);
+                        break;
+                    }
                 }
             });
         }
