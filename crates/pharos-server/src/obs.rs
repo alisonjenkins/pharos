@@ -216,6 +216,7 @@ const LONG_RUNNING_SECONDS: &[&str] = &[
     "pharos_transcode_stage_seconds",
     "pharos_scan_duration_seconds",
     "pharos_media_integrity_seconds",
+    "pharos_subtitle_styling_seconds",
 ];
 
 const LONG_SECONDS_BUCKETS: &[f64] = &[

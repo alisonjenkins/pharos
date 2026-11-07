@@ -54,11 +54,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Delay before the first pass, so boot I/O settles.
-const WARMUP: Duration = Duration::from_secs(180);
+pub(crate) const WARMUP: Duration = Duration::from_secs(180);
 
 /// Interval between passes. A pass over an analysed library is one list and
 /// no decodes, so this only governs how soon new songs are analysed.
-const PASS_INTERVAL: Duration = Duration::from_secs(3600);
+pub(crate) const PASS_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The decode the sweep needs. The pool in production; a fake in tests.
 pub trait Analyser: Send + Sync {
