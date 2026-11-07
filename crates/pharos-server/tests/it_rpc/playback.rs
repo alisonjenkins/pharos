@@ -825,3 +825,82 @@ async fn an_image_subtitle_burns_for_a_client_older_than_image_delivery() {
         assert_eq!(decided.subtitle, Some(3), "schema {schema_version}");
     }
 }
+
+/// 028 FR-017 (B604): naming the styled track negotiates its source track
+/// (text, drawn by the client), and the grant echoes the styled pick. With no
+/// current plan the pick is dropped and the server's default choice applies,
+/// so a viewer who remembered the styled track does not start with none.
+#[actix_web::test]
+async fn the_styled_track_negotiates_as_its_source_track() {
+    use pharos_core::SubtitleStylingStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (dir, item) = crate::styled_track::seed(&fx, 402).await;
+    let sidecar = dir.path().join("Show.eng.ass");
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let id = WireId::Real(402);
+    let styled_slot = 4;
+
+    let (_g, none) = negotiate(
+        &session,
+        id,
+        &direct,
+        Choice::Default,
+        Choice::Index(styled_slot),
+    )
+    .await
+    .unwrap();
+    let (_g, default) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(
+        none.subtitle, default.subtitle,
+        "no plan: the pick is dropped and the default applies"
+    );
+
+    fx.state
+        .stores
+        .put_subtitle_styling(crate::styled_track::styling_row(&item, 3, Some(&sidecar)))
+        .await
+        .unwrap();
+    let (styled_grant, styled) = negotiate(
+        &session,
+        id,
+        &direct,
+        Choice::Default,
+        Choice::Index(styled_slot),
+    )
+    .await
+    .unwrap();
+    let (_g, source) = negotiate(&session, id, &direct, Choice::Default, Choice::Index(3))
+        .await
+        .unwrap();
+    assert_eq!(styled.subtitle, Some(styled_slot), "the pick is echoed");
+    assert_eq!(source.subtitle, Some(3));
+    assert_eq!(
+        (&styled.method, &styled.block, &styled.downgrade),
+        (&source.method, &source.block, &source.downgrade),
+        "the styled pick decides like its source track"
+    );
+    assert_eq!(
+        normalised(&styled.url, &styled.psid),
+        normalised(&source.url, &source.psid)
+    );
+
+    // The player reports the styled pick, so the next playback remembers it
+    // and must start on the same track instead of with no subtitle.
+    let mut req = styled_grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(10_000);
+    set_choice(req.get().init_audio(), Choice::Default);
+    set_choice(req.get().init_subtitle(), Choice::Index(styled_slot));
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let (_g, resumed) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(resumed.subtitle, Some(styled_slot), "{resumed:?}");
+    assert_eq!(resumed.method, source.method);
+}
