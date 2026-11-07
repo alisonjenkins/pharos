@@ -2407,6 +2407,18 @@ impl MediaProbe {
         }
     }
 
+    /// Jellyfin `VideoRangeType` from the transfer characteristic: `HDR10`
+    /// (`smpte2084`), `HLG` (`arib-std-b67`), else `SDR`. Dolby Vision and
+    /// HDR10+ are not told apart: the probe keeps no side data for them, so
+    /// a Dolby Vision stream reports whatever its base layer carries.
+    pub fn video_range_type(&self) -> &'static str {
+        match self.color_transfer.as_deref() {
+            Some("smpte2084") => "HDR10",
+            Some("arib-std-b67") => "HLG",
+            _ => "SDR",
+        }
+    }
+
     /// True when the probe carries HDR transfer characteristics.
     pub fn is_hdr(&self) -> bool {
         matches!(self.video_range(), "HDR")
