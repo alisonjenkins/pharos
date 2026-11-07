@@ -9,6 +9,7 @@ use pharos_server::state::SocketBroadcast;
 /// A play state as (played, favourite, play count, position in ms).
 type State = (bool, bool, u32, u64);
 
+#[derive(Clone, Copy, PartialEq)]
 enum Set {
     Played(bool),
     Favorite(bool),
@@ -191,6 +192,10 @@ async fn a_hidden_item_cannot_be_marked() {
         wire_set(&session, synth, Set::Played(true)).await,
         not_found
     );
+    assert_eq!(
+        wire_set(&session, synth, Set::Favorite(true)).await,
+        not_found
+    );
     let stored = fx
         .state
         .stores
@@ -314,5 +319,105 @@ async fn pipelined_writes_to_one_item_both_land() {
             .await
             .unwrap();
         assert!(!stored.played && !stored.is_favorite, "{stored:?}");
+    }
+}
+
+/// T063: a series or season marked from the native API leaves the user's
+/// stored state on every episode exactly as the Jellyfin route does, for
+/// played and favourite, with one episode already watched beforehand. The
+/// folder answer matches the route's body, and a hidden show stays unmarked.
+/// Pins the route's outcome for the pre-watched episode: marking played counts
+/// its play again. Disarm check: with the native favourite refusing
+/// synthesised ids, or either side skipping a watched episode, the states differ.
+#[actix_web::test]
+async fn native_and_jellyfin_agree_on_marking_a_series_or_season() {
+    use actix_web::test;
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_tv_library(&fx).await;
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let episodes = [601_u64, 602, 603, 604];
+    let snapshot = || async {
+        let mut out = Vec::new();
+        for id in episodes {
+            let d = fx.state.stores.get_user_data(fx.user_id, id).await.unwrap();
+            out.push((id, d.played, d.is_favorite, d.play_count));
+        }
+        out
+    };
+    let fx_ref = &fx;
+    let reset = |starred: bool| async move {
+        for id in episodes {
+            let watched = id == 601;
+            let data = pharos_core::UserItemData {
+                played: watched,
+                is_favorite: starred,
+                play_count: u32::from(watched),
+                ..Default::default()
+            };
+            fx_ref
+                .state
+                .stores
+                .set_user_data(fx_ref.user_id, id, data)
+                .await
+                .unwrap();
+        }
+    };
+
+    let season = season_id_for_key(Some("/libTV/Show"), "Show", 1);
+    let show = series_id_for_key(Some("/libTV/Show"), "Show");
+    for id in [&season, &show] {
+        for (native, route, delete) in [
+            (Set::Played(true), "UserPlayedItems", false),
+            (Set::Played(false), "UserPlayedItems", true),
+            (Set::Favorite(true), "UserFavoriteItems", false),
+            (Set::Favorite(false), "UserFavoriteItems", true),
+        ] {
+            let starred = native == Set::Favorite(false);
+            reset(starred).await;
+            let before = snapshot().await;
+            let answered = wire_set(&session, WireId::parse(id).unwrap(), native)
+                .await
+                .unwrap();
+            let by_native = snapshot().await;
+
+            reset(starred).await;
+            let req = if delete {
+                test::TestRequest::delete()
+            } else {
+                test::TestRequest::post()
+            };
+            let req = req
+                .uri(&format!("/{route}/{id}"))
+                .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+                .to_request();
+            let body: serde_json::Value = test::call_and_read_body_json(&app, req).await;
+            let by_jellyfin = snapshot().await;
+
+            assert_eq!(by_native, by_jellyfin, "{id} {route} delete={delete}");
+            if native == Set::Played(true) {
+                assert_eq!(
+                    by_jellyfin[0],
+                    (601, true, false, 2),
+                    "watched counted again"
+                );
+            }
+            assert_ne!(
+                by_native, before,
+                "{id} {route} delete={delete} wrote nothing"
+            );
+            assert_eq!(
+                (answered.0, answered.1, answered.2),
+                (
+                    body["Played"].as_bool().unwrap(),
+                    body["IsFavorite"].as_bool().unwrap(),
+                    u32::try_from(body["PlayCount"].as_u64().unwrap()).unwrap()
+                ),
+                "folder answer, {id} {route} delete={delete}"
+            );
+            assert_eq!(by_native[3], before[3], "another show is untouched");
+        }
     }
 }
