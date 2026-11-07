@@ -186,6 +186,7 @@ fn item_has_styled_genre(i: &MediaItem) -> bool {
 pub const NO_SOURCE_INDEX: u32 = u32::MAX;
 
 /// How often a waiting item re-checks the transcode queue.
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
 const QUEUE_POLL: Duration = Duration::from_secs(5);
 /// How long reading one source track may take. A cold embedded extraction
 /// demuxes the whole file, so this is generous; it exists so a hung mount
