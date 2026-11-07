@@ -3,7 +3,7 @@
 //! serves these; the Jellyfin wire builds the same facts into its DTOs from
 //! the same helpers.
 
-use pharos_core::{MediaItem, MediaKind};
+use pharos_core::{MediaItem, MediaKind, SubtitleStyling};
 use pharos_jellyfin_api::dto::{
     build_layout, build_media_streams_with_subtitles, sidecar_base_index, wire_item_id,
     MediaStreamDto, SubtitleStreamCtx,
@@ -13,6 +13,7 @@ use crate::api::jellyfin::subtitles::{
     discover_sidecars, is_image_subtitle_codec, sidecar_language_from_name,
 };
 use crate::state::AppState;
+use crate::styled_track::styled_index;
 
 /// One audio or subtitle stream. `index` is the absolute stream index a
 /// negotiation takes.
@@ -28,6 +29,9 @@ pub struct Track {
     /// How the player draws this subtitle itself. `None` for a subtitle that
     /// only plays burned into the video, and for every audio track.
     pub drawn: Option<Drawn>,
+    /// The ASS script a renderer fetches with `?tier=&effects=` (spec 028
+    /// FR-017); set only on the generated styled track.
+    pub styled: Option<String>,
 }
 
 /// A subtitle the player draws over the video rather than one burned in.
@@ -54,7 +58,15 @@ pub struct Tracks {
 /// `webvtt`.
 /// Image subtitles are offered as PNGs when `draws_images` (the server can
 /// extract them, [`extracts_image_subtitles`]), else they burn.
-pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
+///
+/// `styling` is the item's current styling row ([`crate::styled_track::current`]);
+/// when present the generated "English (Pharos styled)" track follows the
+/// sidecars. It is native-only: the Jellyfin wire never lists it.
+pub async fn tracks(
+    item: &MediaItem,
+    draws_images: bool,
+    styling: Option<&SubtitleStyling>,
+) -> Tracks {
     if !is_video(item) {
         return Tracks::default();
     }
@@ -93,8 +105,29 @@ pub async fn tracks(item: &MediaItem, draws_images: bool) -> Tracks {
             _ => {}
         }
     }
+    if let Some(row) = styling {
+        let sidecar_count = u32::try_from(sidecars.len()).unwrap_or(u32::MAX);
+        let index = styled_index(&item.probe, sidecar_count);
+        out.subtitles.push(Track {
+            index,
+            language: Some("eng".to_owned()),
+            title: Some(STYLED_TITLE.to_owned()),
+            codec: Some("ass".to_owned()),
+            is_default: false,
+            is_forced: false,
+            is_hearing_impaired: false,
+            drawn: Some(Drawn::Vtt(format!(
+                "/videos/{id}/subtitles/{}/stream.vtt",
+                row.source_index
+            ))),
+            styled: Some(format!("/videos/{id}/subtitles/{index}/stream.ass")),
+        });
+    }
     out
 }
+
+/// The generated track's title.
+const STYLED_TITLE: &str = "English (Pharos styled)";
 
 /// `ass` or `ssa` for a sidecar script of that extension; `None` for any
 /// other sidecar, which stays WebVTT.
@@ -117,7 +150,7 @@ pub fn extracts_image_subtitles(state: &AppState) -> bool {
         .is_some_and(pharos_cache::subtitle_cache::SubtitleCache::extracts_images)
 }
 
-fn is_video(item: &MediaItem) -> bool {
+pub(crate) fn is_video(item: &MediaItem) -> bool {
     matches!(item.kind, MediaKind::Movie | MediaKind::Episode)
 }
 
@@ -150,6 +183,7 @@ fn track(s: MediaStreamDto, drawn: Option<Drawn>) -> Track {
         is_forced: s.is_forced,
         is_hearing_impaired: s.is_hearing_impaired,
         drawn,
+        styled: None,
     }
 }
 
