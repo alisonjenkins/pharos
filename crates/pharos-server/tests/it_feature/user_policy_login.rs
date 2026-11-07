@@ -374,3 +374,43 @@ async fn a_gated_quick_connect_finalize_keeps_the_code() {
         200
     );
 }
+
+// ---- V580: IsHidden ----
+
+async fn user_names(f: &Fixture, uri: &str) -> Vec<String> {
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::get()
+        .uri(uri)
+        .insert_header(("X-Emby-Token", f.admin_token.as_str()))
+        .to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["Name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[actix_web::test]
+async fn hidden_users_stay_off_the_public_list_and_the_is_hidden_filter_applies() {
+    let f = seed_rich().await;
+    assert_eq!(post_policy(&f, json!({ "IsHidden": true })).await, 204);
+
+    // Jellyfin's public list is `isHidden=false, isDisabled=false`. Pharos
+    // serves no names to anonymous callers at all, so a hidden user (or any
+    // other) can never appear on it.
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::get().uri("/Users/Public").to_request();
+    let body = test::call_and_read_body(&app, req).await;
+    let public: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(public, json!([]));
+
+    // The authenticated list takes Jellyfin's optional filters.
+    let all = user_names(&f, "/Users").await;
+    assert!(all.contains(&"guest".to_string()), "unfiltered keeps it");
+    let visible = user_names(&f, "/Users?isHidden=false").await;
+    assert!(!visible.contains(&"guest".to_string()), "{visible:?}");
+    assert!(visible.contains(&"ali".to_string()));
+    assert_eq!(user_names(&f, "/Users?isHidden=true").await, ["guest"]);
+}
