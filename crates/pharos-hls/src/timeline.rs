@@ -2,18 +2,31 @@
 
 use std::cmp::Ordering;
 
-use crate::playlist::MediaPlaylist;
+use crate::playlist::{MediaPlaylist, Segment};
 
 /// Total playlist duration in milliseconds (the end of the last segment, or 0 if empty).
 pub fn duration_ms(p: &MediaPlaylist) -> u64 {
-    p.segments
-        .last()
-        .map_or(0, |seg| seg.start_ms.saturating_add(seg.duration_ms))
+    segments_duration_ms(&p.segments)
 }
 
 /// Index of the segment whose `[start_ms, start_ms + duration_ms)` interval holds `at_ms`.
 pub fn segment_at(p: &MediaPlaylist, at_ms: u64) -> Option<usize> {
-    p.segments
+    segment_at_slice(&p.segments, at_ms)
+}
+
+/// Returns `(start_ms, end_ms)` for the segment at `index`.
+pub fn range_of(p: &MediaPlaylist, index: usize) -> Option<(u64, u64)> {
+    range_of_slice(&p.segments, index)
+}
+
+pub(crate) fn segments_duration_ms(segments: &[Segment]) -> u64 {
+    segments
+        .last()
+        .map_or(0, |seg| seg.start_ms.saturating_add(seg.duration_ms))
+}
+
+pub(crate) fn segment_at_slice(segments: &[Segment], at_ms: u64) -> Option<usize> {
+    segments
         .binary_search_by(|seg| {
             let end_ms = seg.start_ms.saturating_add(seg.duration_ms);
             if at_ms < seg.start_ms {
@@ -27,9 +40,8 @@ pub fn segment_at(p: &MediaPlaylist, at_ms: u64) -> Option<usize> {
         .ok()
 }
 
-/// Returns `(start_ms, end_ms)` for the segment at `index`.
-pub fn range_of(p: &MediaPlaylist, index: usize) -> Option<(u64, u64)> {
-    let seg = p.segments.get(index)?;
+pub(crate) fn range_of_slice(segments: &[Segment], index: usize) -> Option<(u64, u64)> {
+    let seg = segments.get(index)?;
     Some((seg.start_ms, seg.start_ms.saturating_add(seg.duration_ms)))
 }
 
