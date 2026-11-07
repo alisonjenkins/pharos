@@ -69,6 +69,35 @@ pub fn apply_favorite(d: &mut UserItemData, favorite: bool) {
     d.is_favorite = favorite;
 }
 
+/// A played or favourite change both wire layers can ask for on a stored
+/// item, or on every episode of a synthesised series or season.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Played(bool),
+    Favorite(bool),
+}
+
+impl Mark {
+    /// The change on one stored item.
+    pub fn apply(self, d: &mut UserItemData) {
+        match self {
+            Self::Played(played) => apply_played(d, played),
+            Self::Favorite(favorite) => apply_favorite(d, favorite),
+        }
+    }
+}
+
+/// Applies `mark` to every episode of synthesised series or season `id`
+/// that `user` may see (B36, T063); see [`update_folder`].
+pub async fn set_folder(
+    state: &AppState,
+    user: &User,
+    id: &str,
+    mark: Mark,
+) -> Result<UserItemData, DetailError> {
+    update_folder(state, user, id, |d| mark.apply(d)).await
+}
+
 /// Sets whether `user` has played stored item `id`.
 pub async fn set_played(
     state: &AppState,
