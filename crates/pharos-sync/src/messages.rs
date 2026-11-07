@@ -299,6 +299,10 @@ pub enum ServerMsg {
     /// `MemberLeft` can't serve here: the leaver is already out of the roster
     /// when it broadcasts, so it only ever reaches the REMAINING members.
     GroupLeft,
+    /// A `/SyncPlay/Join` named a group that is neither live nor a fresh
+    /// persisted snapshot. Translated to Jellyfin's `SyncPlayGroupUpdate` /
+    /// `GroupDoesNotExist`, which jellyfin-web shows as a toast (V582).
+    GroupDoesNotExist,
 }
 
 impl ServerMsg {
@@ -320,6 +324,7 @@ impl ServerMsg {
             ServerMsg::PlayQueue { .. } => "play_queue",
             ServerMsg::Error { .. } => "error",
             ServerMsg::NotInGroup => "not_in_group",
+            ServerMsg::GroupDoesNotExist => "group_does_not_exist",
             ServerMsg::GroupLeft => "group_left",
         }
     }
