@@ -5187,6 +5187,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pharos-hls"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "pharos-jellyfin-api"
 version = "0.0.0"
 dependencies = [
