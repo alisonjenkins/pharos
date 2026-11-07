@@ -48,6 +48,83 @@ pub fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether `group_id` has a persisted snapshot fresh enough to be recovered
+/// (the same window `/SyncPlay/List` offers it in — B28) AND readable (the
+/// parse B28 lists it through). A group present only as such a snapshot is
+/// still joinable: Join hydrates it. A fresh snapshot that does not parse
+/// is no group, so Join answers GroupDoesNotExist instead of letting
+/// `get_or_create` fail on it. Store errors count as "no" (best-effort, like
+/// [`find_persisted_group`]).
+async fn has_usable_snapshot(stores: &Stores, group_id: GroupId) -> bool {
+    let row = match stores.get_sync_group(&group_id.to_string()).await {
+        Ok(Some(row)) if row.updated_at >= recovery_cutoff() => row,
+        Ok(_) => return false,
+        Err(e) => {
+            tracing::warn!(group = %group_id, error = %e, "syncplay: persisted group snapshot unreadable");
+            return false;
+        }
+    };
+    if pharos_sync::group::snapshot_summary(&row.state_json).is_none() {
+        tracing::warn!(group = %group_id, "syncplay: fresh persisted group snapshot is corrupt; treating the group as nonexistent");
+        return false;
+    }
+    true
+}
+
+/// Where a Join's target group stands.
+pub enum GroupLocation {
+    /// Running in this process's registry.
+    Live(pharos_sync::group::GroupHandle),
+    /// Not in this registry, but joinable: a fresh readable snapshot holds
+    /// it, or another replica holds its lease (it is live there). Joining
+    /// goes through `get_or_create`, which hydrates or builds a remote router.
+    Cold,
+    /// Neither. A stale id must not spawn a phantom empty group (V582).
+    Absent,
+}
+
+/// Classify `group_id` for a Join without creating or hydrating anything.
+pub async fn locate_group(
+    stores: &Stores,
+    registry: &pharos_sync::GroupRegistry,
+    group_id: GroupId,
+) -> Result<GroupLocation, pharos_sync::registry::RegistryError> {
+    if let Some(h) = registry.get(group_id).await? {
+        return Ok(GroupLocation::Live(h));
+    }
+    // A snapshot's `updated_at` only moves on mutation, so a party paused
+    // for a day is stale while still live on its owner replica.
+    if has_usable_snapshot(stores, group_id).await || registry.held_elsewhere(group_id).await? {
+        return Ok(GroupLocation::Cold);
+    }
+    Ok(GroupLocation::Absent)
+}
+
+/// The group `user` may join: `None` when it does not exist OR the user may
+/// not see it, so a hidden group cannot be told from an absent one (Jellyfin
+/// answers `LibraryAccessDenied` for the latter, which confirms the group
+/// exists). The permission check runs before a cold group is hydrated, so a
+/// refused probe leaves the registry untouched.
+pub(crate) async fn joinable_group(
+    state: &crate::state::AppState,
+    registry: &pharos_sync::GroupRegistry,
+    user: &pharos_core::User,
+    group_id: GroupId,
+    route: crate::api::jellyfin::syncplay::GroupHiddenRoute,
+) -> Result<Option<pharos_sync::group::GroupHandle>, pharos_sync::registry::RegistryError> {
+    use crate::api::jellyfin::syncplay::{may_join, may_join_cold};
+    match locate_group(&state.stores, registry, group_id).await? {
+        GroupLocation::Live(h) => Ok(may_join(state, user, &h, route).await.then_some(h)),
+        GroupLocation::Cold => {
+            if !may_join_cold(state, user, group_id, route).await {
+                return Ok(None);
+            }
+            registry.get_or_create(group_id).await.map(Some)
+        }
+        GroupLocation::Absent => Ok(None),
+    }
+}
+
 /// The persisted group `member_id` belongs to, if any. A handful of rows at
 /// most (groups are pruned), each a cheap JSON scan — only runs on a socket
 /// connect that has no in-memory membership. Snapshots stale past

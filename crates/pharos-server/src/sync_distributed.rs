@@ -64,6 +64,32 @@ impl OwnershipSource for StoreOwnership {
         })
     }
 
+    fn held_elsewhere(&self, group_id: GroupId) -> OwnFuture<'_> {
+        Box::pin(async move {
+            let ours = self
+                .leases
+                .lock()
+                .map(|leases| leases.contains_key(&group_id))
+                .unwrap_or(false);
+            if ours {
+                return false;
+            }
+            match self
+                .stores
+                .try_acquire_group_ownership(&group_id.to_string())
+                .await
+            {
+                // Nobody held it: dropping the probe lease frees it again.
+                Ok(Some(_probe)) => false,
+                Ok(None) => true,
+                Err(e) => {
+                    tracing::warn!(%group_id, error = %e, "group ownership probe failed");
+                    false
+                }
+            }
+        })
+    }
+
     fn release(&self, group_id: GroupId) {
         // Dropping the lease closes its connection, releasing the advisory lock.
         if let Ok(mut leases) = self.leases.lock() {

@@ -1072,6 +1072,17 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // jellyfin-web handles NotInGroup by disabling SyncPlay locally — a
         // visible clean exit instead of a silent one-sided desync.
         ServerMsg::NotInGroup => group_update(ctx, "NotInGroup", serde_json::Value::Null),
+        // V582 — Jellyfin's SyncPlayManager.JoinGroup answers a join to an
+        // unknown group with GroupId = Guid.Empty and Data = "".
+        ServerMsg::GroupDoesNotExist => Some(Outbound::new(
+            "SyncPlayGroupUpdate",
+            serde_json::to_value(GroupUpdateData {
+                kind: "GroupDoesNotExist",
+                group_id: uuid::Uuid::nil().to_string(),
+                data: serde_json::Value::String(String::new()),
+            })
+            .ok()?,
+        )),
         // B25 — leave acknowledgement to the leaver; jellyfin-web exits
         // SyncPlay mode (disableSyncPlay) on this.
         ServerMsg::GroupLeft => group_update(ctx, "GroupLeft", serde_json::Value::Null),
@@ -1464,6 +1475,23 @@ mod tests {
         assert_eq!(v["Data"]["Data"]["State"], "Paused");
         assert_eq!(v["Data"]["Data"]["Participants"][0], "lace");
         assert!(v["Data"]["Data"]["LastUpdatedAt"].is_string());
+    }
+
+    /// V582: the wire shape of Jellyfin's `SyncPlayGroupDoesNotExistUpdate`.
+    #[test]
+    fn group_does_not_exist_matches_jellyfin_wire_shape() {
+        let ctx = TranslateCtx {
+            group_id: None,
+            epoch_unix_ms: 0,
+            current_pli: None,
+        };
+        let out = translate_outbound(ServerMsg::GroupDoesNotExist, &ctx).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["MessageType"], "SyncPlayGroupUpdate");
+        assert_eq!(v["Data"]["Type"], "GroupDoesNotExist");
+        assert_eq!(v["Data"]["GroupId"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(v["Data"]["Data"], "");
     }
 
     #[test]

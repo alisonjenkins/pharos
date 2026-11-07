@@ -185,6 +185,7 @@ pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
         | ServerMsg::StateUpdate { .. }
         | ServerMsg::Error { .. }
         | ServerMsg::NotInGroup
+        | ServerMsg::GroupDoesNotExist
         | ServerMsg::GroupLeft => None,
     }
 }
