@@ -45,6 +45,7 @@ async fn transport_commands_reach_the_group_and_the_tv_and_are_counted() {
     let mut rig = rig_with_cast().await;
     rig.bus_events();
 
+    rig.exclusive_metrics().await;
     let before = command_total("pause", "dispatched");
     let (status, body) = tv_command(&rig, &rig.bob, "Pause", "").await;
     assert_eq!(status, 204, "{body}");
@@ -258,6 +259,7 @@ fn tv_commands_named(rig: &CastRig, name: &str) -> usize {
 #[actix_web::test]
 async fn a_pause_on_the_tv_pauses_the_group_once_and_the_planner_leaves_it_alone() {
     let mut rig = settled_cast().await;
+    rig.exclusive_metrics().await;
     let before = command_total("pause", "dispatched");
     let tv_pauses = tv_commands_named(&rig, "Pause");
 
@@ -293,6 +295,7 @@ async fn a_pause_on_the_tv_pauses_the_group_once_and_the_planner_leaves_it_alone
 #[actix_web::test]
 async fn a_seek_on_the_tv_seeks_the_group_once_and_the_planner_leaves_it_alone() {
     let mut rig = settled_cast().await;
+    rig.exclusive_metrics().await;
     let before = command_total("seek", "dispatched");
     let tv_seeks = tv_commands_named(&rig, "Seek");
 

@@ -316,6 +316,7 @@ async fn drift_beyond_the_threshold_is_corrected_and_the_tv_converges() {
         tv_gap_ms(&rig, &clock) <= TOLERANCE_MS
     })
     .await;
+    rig.exclusive_metrics().await;
     let before = correction_total();
 
     // The TV skips 20 s ahead without telling anyone.
@@ -336,6 +337,7 @@ async fn a_dropped_connection_inside_the_grace_reconnects_and_resyncs() {
     let token = rig.tv_token();
     let mock = rig.mock.as_ref().unwrap();
     let connections = mock.connections();
+    rig.exclusive_metrics().await;
     let lost = seat_total("lost", "tv_unreachable");
     let back = seat_total("reconnected", "tv_unreachable");
     let ended = seat_total("ended", "grace_expired");
@@ -363,6 +365,7 @@ async fn stopping_on_the_tv_ends_the_cast_as_user_stop_and_revokes_the_token() {
     let (rig, _clock) = casting().await;
     let token = rig.tv_token();
     assert_eq!(rig.token_status(&token).await, 200);
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "user_stop");
 
     rig.receiver.user_stop();

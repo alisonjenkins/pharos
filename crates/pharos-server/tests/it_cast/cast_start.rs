@@ -204,6 +204,7 @@ async fn a_tv_running_another_app_is_refused_with_tv_busy_naming_the_app() {
             display_name: Some("Default Media Receiver".into()),
         },
     );
+    rig.exclusive_metrics().await;
     let before = seat_total("rejected", "tv_busy");
 
     let (status, body) = rig.play_on_tv(&rig.alice).await;
@@ -243,6 +244,7 @@ async fn a_tv_that_is_slow_to_load_gets_its_seat_without_holding_the_group() {
 async fn a_tv_that_never_reports_the_item_ends_the_cast_with_a_reason() {
     let mut rig = CastRig::new().await;
     rig.receiver.configure(|c| c.command_latency_ms = 3_600_000);
+    rig.exclusive_metrics().await;
     let (lost, ended) = (
         seat_total("lost", "tv_unreachable"),
         seat_total("ended", "tv_unreachable"),

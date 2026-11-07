@@ -24,6 +24,7 @@ async fn the_owner_leaving_the_group_ends_the_cast_with_reason_owner_left() {
     let (status, body) = rig.play_on_tv(&rig.alice).await;
     assert_eq!(status, 204, "{body}");
     assert_eq!(rig.service.snapshot().await.len(), 1);
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
     let stop_before = seat_total("ended", "user_stop");
 
@@ -56,6 +57,7 @@ async fn another_member_leaving_leaves_the_cast_running() {
 async fn a_second_start_by_the_seat_owner_is_refused_with_user_has_seat() {
     let rig = CastRig::new().await;
     assert_eq!(rig.play_on_tv(&rig.alice).await.0, 204);
+    rig.exclusive_metrics().await;
     let before = seat_total("rejected", "user_has_seat");
 
     let (status, body) = rig.play_on_tv(&rig.alice).await;
@@ -104,6 +106,7 @@ async fn rig_casting() -> (CastRig, String) {
 #[actix_web::test]
 async fn the_owner_stopping_on_the_tv_session_ends_the_cast_and_revokes_the_token() {
     let (rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "user_stop");
 
     let (status, body) = rig
@@ -132,6 +135,7 @@ async fn the_owner_stopping_on_the_tv_session_ends_the_cast_and_revokes_the_toke
 #[actix_web::test]
 async fn a_tv_that_drops_off_the_network_past_the_grace_ends_the_cast() {
     let (rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let lost = seat_total("lost", "tv_unreachable");
     let ended = seat_total("ended", "grace_expired");
 
@@ -159,6 +163,7 @@ async fn a_tv_that_drops_off_the_network_past_the_grace_ends_the_cast() {
 #[actix_web::test]
 async fn a_tv_that_comes_back_inside_the_grace_keeps_its_seat_and_token() {
     let (rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let lost = seat_total("lost", "tv_unreachable");
     let back = seat_total("reconnected", "tv_unreachable");
     let ended = seat_total("ended", "grace_expired");
@@ -180,6 +185,7 @@ async fn a_tv_that_comes_back_inside_the_grace_keeps_its_seat_and_token() {
 #[actix_web::test]
 async fn a_dissolved_group_ends_the_cast_with_group_gone_and_revokes_the_token() {
     let (rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "group_gone");
 
     // The seat goes before the owner: an owner removed while the seat is still
@@ -366,6 +372,7 @@ async fn the_owners_socket_dropping_leaves_the_cast_following_and_the_owner_list
 #[actix_web::test]
 async fn an_owner_pruned_after_its_socket_grace_takes_the_cast_with_it() {
     let (mut rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
     rig.group
         .tx
@@ -421,6 +428,7 @@ async fn cast_tokens(rig: &CastRig) -> usize {
 async fn a_tv_answering_after_its_owner_left_is_not_given_a_seat() {
     let rig = CastRig::new().await;
     let release = rig.factory.hold_open(cast_rig::TV);
+    rig.exclusive_metrics().await;
     let before = seat_total("rejected", "not_in_group");
 
     let start = rig.play_on_tv(&rig.alice);
@@ -504,6 +512,7 @@ fn second_device(rig: &CastRig, device: &str) -> cast_rig::Person {
 async fn a_leave_from_another_device_of_the_owner_leaves_the_cast_untouched() {
     let (rig, token) = rig_casting().await;
     let laptop = second_device(&rig, "dev-laptop");
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
 
     let (status, body) = rig.post(&laptop, "/SyncPlay/Leave", None).await;
@@ -519,6 +528,7 @@ async fn a_leave_from_another_device_of_the_owner_leaves_the_cast_untouched() {
 #[actix_web::test]
 async fn the_owner_removed_by_another_replica_ends_the_cast_with_owner_left() {
     let (rig, token) = rig_casting().await;
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
 
     rig.group
@@ -547,6 +557,7 @@ async fn a_transport_command_for_a_cast_held_by_another_replica_is_503_not_no_ca
     };
     rig.hub.attach_group(&rig.carol.key, remote);
     let labels = [("reason", "cast_on_other_replica")];
+    rig.exclusive_metrics().await;
     let before = counter("pharos_cast_transport_refused_total", &labels);
 
     let (status, body) = rig
