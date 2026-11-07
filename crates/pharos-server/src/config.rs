@@ -27,6 +27,10 @@ pub struct Config {
     /// Supply `api_key` via `PHAROS_OMDB_API_KEY`, never `config.toml`.
     #[serde(default)]
     pub omdb: OmdbConfig,
+    /// Spec 030 — optional OpenSubtitles.com subtitle search and download.
+    /// Off unless `api_key` (or `PHAROS_OPENSUBTITLES_API_KEY`) is set.
+    #[serde(default)]
+    pub opensubtitles: OpenSubtitlesConfig,
     /// Optional MusicBrainz + Cover Art Archive album artwork. Gated on
     /// `contact` rather than a key — see [`MusicBrainzConfig`].
     #[serde(default)]
@@ -229,6 +233,79 @@ pub struct TvdbConfig {
     /// TVDB v4 API key. `None` (the default) disables the feature.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// `[opensubtitles]` — OpenSubtitles.com REST API v1 (spec 030, ADR-0069).
+/// Supply the secrets via `PHAROS_OPENSUBTITLES_API_KEY`,
+/// `PHAROS_OPENSUBTITLES_USERNAME` and `PHAROS_OPENSUBTITLES_PASSWORD` (k8s
+/// Secret env vars) rather than putting them in `config.toml`. `Debug` is
+/// hand-written so the secrets cannot reach a log line (V570).
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+pub struct OpenSubtitlesConfig {
+    /// API key from an OpenSubtitles consumer. `None` (the default) turns the
+    /// whole feature off.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Account name; with `password` it raises the daily download quota.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Languages the background job fills in (slice 2). Default `["en"]`.
+    #[serde(default = "default_opensubtitles_languages")]
+    pub languages: Vec<String>,
+    /// Ceiling on background downloads per UTC day (slice 2). Default 20,
+    /// under the lowest account quota.
+    #[serde(default = "default_opensubtitles_daily_limit")]
+    pub max_downloads_per_day: u32,
+}
+
+fn default_opensubtitles_languages() -> Vec<String> {
+    vec!["en".to_string()]
+}
+
+fn default_opensubtitles_daily_limit() -> u32 {
+    20
+}
+
+impl Default for OpenSubtitlesConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            username: None,
+            password: None,
+            languages: default_opensubtitles_languages(),
+            max_downloads_per_day: default_opensubtitles_daily_limit(),
+        }
+    }
+}
+
+impl OpenSubtitlesConfig {
+    /// `(username, password)` when both are set and non-empty.
+    pub fn login(&self) -> Option<(String, String)> {
+        match (self.username.as_deref(), self.password.as_deref()) {
+            (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => {
+                Some((u.to_string(), p.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The API key when set and non-blank.
+    pub fn key(&self) -> Option<&str> {
+        self.api_key.as_deref().filter(|k| !k.trim().is_empty())
+    }
+}
+
+impl std::fmt::Debug for OpenSubtitlesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSubtitlesConfig")
+            .field("api_key_set", &self.api_key.is_some())
+            .field("login_set", &self.login().is_some())
+            .field("languages", &self.languages)
+            .field("max_downloads_per_day", &self.max_downloads_per_day)
+            .finish()
+    }
 }
 
 /// `[omdb]` — OMDb (omdbapi.com): IMDb and Rotten Tomatoes scores for films
@@ -1491,6 +1568,29 @@ impl Config {
                 self.tvdb.api_key = Some(v.to_string());
             }
         }
+        // Mirrors PHAROS_TMDB_API_KEY above. Each overrides the matching
+        // `[opensubtitles]` field; a blank value counts as unset.
+        for (var, slot) in [
+            (
+                "PHAROS_OPENSUBTITLES_API_KEY",
+                &mut self.opensubtitles.api_key,
+            ),
+            (
+                "PHAROS_OPENSUBTITLES_USERNAME",
+                &mut self.opensubtitles.username,
+            ),
+            (
+                "PHAROS_OPENSUBTITLES_PASSWORD",
+                &mut self.opensubtitles.password,
+            ),
+        ] {
+            if let Ok(v) = std::env::var(var) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    *slot = Some(v.to_string());
+                }
+            }
+        }
         // Mirrors PHAROS_TMDB_API_KEY above. Overrides `[omdb].api_key`.
         if let Ok(v) = std::env::var("PHAROS_OMDB_API_KEY") {
             let v = v.trim();
@@ -1561,6 +1661,26 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn opensubtitles_is_off_by_default_and_debug_hides_secrets() {
+        let c: OpenSubtitlesConfig = toml::from_str("").unwrap();
+        assert_eq!(c, OpenSubtitlesConfig::default());
+        assert!(c.key().is_none() && c.login().is_none());
+        assert_eq!(c.languages, ["en"]);
+        let c: OpenSubtitlesConfig = toml::from_str(
+            "api_key = \"k-secret\"\nusername = \"bob-user\"\npassword = \"pw-secret\"",
+        )
+        .unwrap();
+        assert_eq!(c.key(), Some("k-secret"));
+        assert!(c.login().is_some());
+        let dbg = format!("{c:?}");
+        for secret in ["k-secret", "bob-user", "pw-secret"] {
+            assert!(!dbg.contains(secret), "{dbg}");
+        }
+        let blank: OpenSubtitlesConfig = toml::from_str("api_key = \"  \"").unwrap();
+        assert!(blank.key().is_none(), "a blank key counts as unset");
+    }
 
     #[test]
     fn gpu_resident_vaapi_is_off_unless_asked_for() {

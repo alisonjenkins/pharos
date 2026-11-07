@@ -436,6 +436,8 @@ pub struct AppState {
     /// the T9 backfill's own spawn already does (see `main.rs`).
     pub tmdb_api_key: Option<String>,
     pub tvdb_api_key: Option<String>,
+    /// Spec 030: OpenSubtitles search and download; None when off.
+    pub opensubtitles: Option<crate::opensubtitles::OpenSubtitles>,
     /// T11 — online-enrichment tunables (refresh cadence, match-confidence
     /// floor), mirrored onto state so the manual apply endpoint's immediate
     /// re-enrich shares the configured knobs instead of silently defaulting.
@@ -747,6 +749,7 @@ impl AppState {
             parental_ratings: crate::parental::ParentalRatingMap::us_default(),
             tmdb_api_key: None,
             tvdb_api_key: None,
+            opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             revocations: Default::default(),
@@ -866,6 +869,7 @@ impl AppState {
             parental_ratings: crate::parental::ParentalRatingMap::us_default(),
             tmdb_api_key: None,
             tvdb_api_key: None,
+            opensubtitles: None,
             metadata_config: crate::config::MetadataConfig::default(),
             login_throttle: crate::auth::LoginThrottle::default().with_per_ip(false),
             revocations: Default::default(),
@@ -1043,6 +1047,13 @@ impl AppState {
         memo: std::sync::Arc<crate::integrity_memo::IntegrityMemo>,
     ) -> Self {
         self.integrity_memo = Some(memo);
+        self
+    }
+
+    /// Spec 030: attach the OpenSubtitles feature (a provider, its storage
+    /// root and quota gate).
+    pub fn with_opensubtitles(mut self, os: crate::opensubtitles::OpenSubtitles) -> Self {
+        self.opensubtitles = Some(os);
         self
     }
 
