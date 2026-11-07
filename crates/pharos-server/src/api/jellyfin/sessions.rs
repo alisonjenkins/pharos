@@ -186,26 +186,15 @@ async fn playing_started(
     if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&body.item_id) {
         crate::api::jellyfin::require_item_access(&state, &user.0, id, "playback").await?;
     }
-    // Bump the item being played to the front of the trickplay/subtitle
-    // pre-generator. PlaybackInfo already nudges, but not every client calls
-    // it (and a pod restarted mid-episode would otherwise never re-learn what's
-    // playing) — the playback-report path is the ground truth for "watched
-    // RIGHT NOW". Best-effort; duplicates are deduped by the worker.
-    if let Some(tx) = &state.trickplay_priority {
-        if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&body.item_id) {
-            let _ = tx.send(id);
-        }
-    }
     let session_id = body
         .play_session_id
         .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let auth = auth_header_from_request(&req);
-    state
-        .sessions
-        .apply(SessionEvent::Started {
-            session_id,
-            user_id: user.0.id,
-            user_name: user.0.name.clone(),
+    play_state::start(
+        &state,
+        play_state::Start {
+            play_session_id: session_id,
+            user: &user.0,
             device_id: pharos_core::ClientDeviceId::from(
                 auth.device_id
                     .clone()
@@ -215,11 +204,12 @@ async fn playing_started(
             device_name: auth.device_label(),
             client: auth.client_label(),
             version: auth.version_label(),
-            item_id: body.item_id,
+            item_wire_id: body.item_id,
             position_ticks: body.position_ticks.unwrap_or(0),
-        })
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        },
+    )
+    .await
+    .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
 }
 

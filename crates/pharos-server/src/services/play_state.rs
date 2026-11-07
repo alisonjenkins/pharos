@@ -38,6 +38,58 @@ pub enum ReportError {
     RegistryDown(String),
 }
 
+/// A player starting an item: the now-playing entry `/Sessions` lists.
+pub struct Start<'a> {
+    pub play_session_id: String,
+    pub user: &'a User,
+    pub device_id: pharos_core::ClientDeviceId,
+    pub device_name: String,
+    pub client: String,
+    pub version: String,
+    /// The item as the client names it on the wire.
+    pub item_wire_id: String,
+    pub position_ticks: u64,
+}
+
+/// Starts the live session a report then moves, and bumps the item to the
+/// front of the trickplay pre-generator. Both wire layers start here, so a
+/// native player and jellyfin-web show up in `/Sessions` the same way. The
+/// caller has already checked the user may play the item.
+pub async fn start(state: &AppState, s: Start<'_>) -> Result<(), ReportError> {
+    // The playback-report path is the ground truth for "watched right
+    // now": not every client calls PlaybackInfo, and a restarted pod would
+    // otherwise never re-learn what is playing. Best-effort; the worker
+    // dedupes.
+    if let Some(tx) = &state.trickplay_priority {
+        if let Some(id) = pharos_jellyfin_api::dto::parse_item_id(&s.item_wire_id) {
+            let _ = tx.send(id);
+        }
+    }
+    tracing::info!(
+        play_session_id = %pharos_core::secret_prefix(&s.play_session_id),
+        user_id = %s.user.id.0.simple(),
+        device_id = %s.device_id,
+        client = %s.client,
+        item = %s.item_wire_id,
+        "playback: session started"
+    );
+    state
+        .sessions
+        .apply(SessionEvent::Started {
+            session_id: s.play_session_id,
+            user_id: s.user.id,
+            user_name: s.user.name.clone(),
+            device_id: s.device_id,
+            device_name: s.device_name,
+            client: s.client,
+            version: s.version,
+            item_id: s.item_wire_id,
+            position_ticks: s.position_ticks,
+        })
+        .await
+        .map_err(|e| ReportError::RegistryDown(e.to_string()))
+}
+
 /// Records a progress report: the live session, the sockets' Currently
 /// Watching, and (coalesced by `progress_writes`) the resume position.
 pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), ReportError> {
