@@ -142,6 +142,8 @@ pub async fn rust_subtitles(
 
 pub fn set_subtitle_controls_visible(_visible: bool) {}
 
+pub async fn video_metadata(_video_id: &str) {}
+
 pub struct StyledSubtitles;
 
 pub async fn styled_subtitles(
