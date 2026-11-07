@@ -16,9 +16,9 @@ use pharos_core::{
     MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore, PersistedSyncGroup,
     PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
     RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
-    StudioStore, SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, TranslationOwner,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore,
-    SEGMENT_SCHEMA_VERSION,
+    StudioStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore, TagStore, TokenStore,
+    TranscodeSessionStore, TranslationOwner, UserDataStore, UserId, UserItemData, UserPolicy,
+    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -93,6 +93,7 @@ where
         + pharos_core::RatingsStore
         + pharos_core::MetadataTranslationStore
         + pharos_core::MediaSegmentStore
+        + pharos_core::SubtitleStylingStore
         + pharos_store_sqlx::ServerConfigStore
         + Clone
         + Send
@@ -2255,6 +2256,106 @@ where
     MediaStore::put_audio_analysis(&store, song + 1, analysis, (1, 1))
         .await
         .unwrap();
+
+    // -----------------------------------------------------------------
+    // Spec 028 — subtitle styling: one row per item, replaced by a new
+    // source choice, plan_json left out of the index, gone with the item.
+    // Last, because the cascade check sweeps the whole conformance root.
+    // -----------------------------------------------------------------
+    let film: MediaId = (UserId::new().0.as_u128() as u64) >> 2;
+    MediaStore::put(&store, media_item(film, "styled"))
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
+    let styled = SubtitleStyling {
+        item_id: film,
+        source_index: 2,
+        source_mtime: 1_700_000_000,
+        source_size: u64::from(u32::MAX) + 7,
+        sidecar_mtime: Some(1_700_000_001),
+        sidecar_size: Some(321),
+        director_version: 1,
+        outcome: "styled".into(),
+        plan_json: Some(r#"{"effects":[]}"#.into()),
+        styled_at: 1_700_000_100,
+    };
+    SubtitleStylingStore::put_subtitle_styling(&store, styled.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        Some(styled.clone())
+    );
+    let index = SubtitleStylingStore::subtitle_styling_index(&store)
+        .await
+        .unwrap();
+    let indexed = index.iter().find(|r| r.item_id == film).unwrap();
+    assert_eq!(indexed.plan_json, None, "the index never loads plans");
+    assert_eq!(
+        SubtitleStyling {
+            plan_json: None,
+            ..styled.clone()
+        },
+        *indexed
+    );
+    // Same key: an upsert.
+    let redone = SubtitleStyling {
+        director_version: 2,
+        styled_at: 1_700_000_200,
+        ..styled.clone()
+    };
+    SubtitleStylingStore::put_subtitle_styling(&store, redone.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        Some(redone)
+    );
+    // A new source replaces the old row; a version-only row has no plan or sidecar.
+    let version_only = SubtitleStyling {
+        source_index: 5,
+        sidecar_mtime: None,
+        sidecar_size: None,
+        outcome: "undecodable".into(),
+        plan_json: None,
+        ..styled
+    };
+    SubtitleStylingStore::put_subtitle_styling(&store, version_only.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        Some(version_only)
+    );
+    let index = SubtitleStylingStore::subtitle_styling_index(&store)
+        .await
+        .unwrap();
+    assert_eq!(index.iter().filter(|r| r.item_id == film).count(), 1);
+    // Deleting the item cascades.
+    let sweep = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
+        .await
+        .unwrap();
+    let swept = MediaStore::sweep_unseen(&store, sweep, "/media/conformance")
+        .await
+        .unwrap();
+    assert!(swept.contains(&film));
+    assert_eq!(
+        SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[cfg(feature = "sqlite")]
