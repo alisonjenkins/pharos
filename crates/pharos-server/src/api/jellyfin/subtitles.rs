@@ -132,6 +132,9 @@ async fn subtitle_font(
     let item =
         super::media_source::load_named(&state, super::media_source::Route::Subtitles, id, None)
             .await?;
+    if crate::styled_track::is_styled_index(&item, stream_index).await {
+        return Err(styled_only());
+    }
     let Some(attachment) = item
         .probe
         .attachments
@@ -617,6 +620,12 @@ async fn deliver_ass_inner(
         .content_type("text/x-ssa; charset=utf-8")
         .insert_header((header::CACHE_CONTROL, "private, max-age=3600"))
         .body(bytes))
+}
+
+/// The refusal every plain subtitle route gives the styled index: only
+/// `stream.ass` serves it, so it is not "a missing sidecar".
+fn styled_only() -> actix_web::Error {
+    error::ErrorNotFound("the styled track is served by stream.ass only")
 }
 
 /// Serve the generated Pharos styled track (spec 028 FR-017): the item's
@@ -1193,6 +1202,9 @@ async fn deliver_srt(
         media_source_id,
     )
     .await?;
+    if crate::styled_track::is_styled_index(&item, stream_index).await {
+        return Err(styled_only());
+    }
     if let Some(track) = item
         .probe
         .subtitle_tracks
@@ -1389,6 +1401,10 @@ async fn deliver_vtt_inner(
         media_source_id,
     )
     .await?;
+    if crate::styled_track::is_styled_index(&item, stream_index).await {
+        *track = DeliveredTrack::generated();
+        return Err(styled_only());
+    }
 
     // Sidecar lookups first — they're free (no ffmpeg spawn).
     let sidecar_base = sidecar_base_index(&item.probe);
@@ -1539,6 +1555,10 @@ async fn deliver_js(
         media_source_id,
     )
     .await?;
+
+    if crate::styled_track::is_styled_index(&item, stream_index).await {
+        return Err(styled_only());
+    }
 
     // Image subtitles can't become cue text — they burn into the transcode.
     if let Some(codec) = item
