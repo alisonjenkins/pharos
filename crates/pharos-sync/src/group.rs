@@ -2062,10 +2062,6 @@ impl GroupState {
             .map(|e| e.playlist_item_id.as_str())
     }
 
-    /// B37 — a client-reported `PlaylistItemId` that names anything OTHER
-    /// than the current queue entry is STALE: the client hasn't applied the
-    /// latest queue change yet (or its old player raced a teardown
-    /// transition). `None` (legacy / ws-native callers) is never stale.
     /// Replace the queue with `item_ids`, playing `playing_index` from
     /// `start_position_ms`, and hold the group until every member is ready
     /// on it. `item_runtimes_ms` is index-aligned with `item_ids`.
@@ -2107,6 +2103,10 @@ impl GroupState {
         self.enter_waiting(pending, true, start_position_ms, GateReason::QueueChange, 0);
     }
 
+    /// B37 — a client-reported `PlaylistItemId` that names anything OTHER
+    /// than the current queue entry is STALE: the client hasn't applied the
+    /// latest queue change yet (or its old player raced a teardown
+    /// transition). `None` (legacy / ws-native callers) is never stale.
     fn pli_is_stale(&self, pli: &Option<String>) -> bool {
         match (pli.as_deref(), self.current_playlist_item_id()) {
             (Some(sent), Some(current)) => sent != current,
