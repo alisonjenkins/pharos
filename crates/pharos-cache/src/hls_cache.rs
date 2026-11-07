@@ -5635,10 +5635,10 @@ mod tests {
     #[tokio::test]
     async fn cancelling_the_first_requester_does_not_abort_the_encode() {
         let dir = TempDir::new().unwrap();
-        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(400));
+        let (cache, encodes, gate) = gated_test_cache(&dir);
         let opts = slow_opts();
 
-        let a = {
+        let request = |cache: &HlsSegmentCache| {
             let c = cache.clone();
             let o = opts.clone();
             tokio::spawn(async move {
@@ -5646,23 +5646,34 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let b = {
-            let c = cache.clone();
-            let o = opts.clone();
-            tokio::spawn(async move {
-                c.segment_bytes(1, 0, Path::new("/no/source"), &o, JobClass::Interactive)
-                    .await
-            })
-        };
+        let a = request(&cache);
+        // The first requester is mid-encode (the gate holds it there) before
+        // anything else happens.
+        wait_until("the first encode to start", || encode_count(&encodes) == 1).await;
+        let b = request(&cache);
         // Give the second requester the chance to attach to the in-flight
         // encode before the first one goes away, which is the shape the live
         // path has: a client seeks away while another request is already
-        // waiting on the same segment.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // waiting on the same segment. Attachment is observed directly: the
+        // registry's sender counts exactly the requesters still waiting.
+        wait_until("the second requester to attach", || {
+            cache
+                .inflight
+                .iter()
+                .next()
+                .is_some_and(|e| e.value().tx.receiver_count() == 2)
+        })
+        .await;
         // The client seeked away / disconnected.
         a.abort();
+        assert!(
+            a.await.unwrap_err().is_cancelled(),
+            "the first requester was not aborted"
+        );
 
+        // The encode is still held by the gate, so the abort happened while
+        // work was in flight. Only now does the encode finish.
+        std::fs::write(&gate, b"").unwrap();
         let bytes = b.await.unwrap().unwrap();
         assert!(!bytes.is_empty(), "the surviving requester got nothing");
         assert_eq!(
