@@ -32,14 +32,14 @@ use super::palette::{self, Row};
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
-    parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting, position_at,
-    preview_set, rust_subtitle_url, start_ms, starting_tier, starting_tier_line,
-    styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls, subtitle_switch,
-    tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel, Engine,
-    LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing, OverlayEffect,
-    PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop, UpNext, UpNextStep,
-    CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, OVERLAY_EFFECT_KEY,
-    SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting,
+    position_at, preview_set, rust_subtitle_url, source_of_styled, start_ms, starting_tier,
+    starting_tier_line, styled_subtitle_signals, styled_subtitle_url, subtitle_font_urls,
+    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel,
+    Engine, LibraryTransition, MediaEvent, MediaState, OnFatal, OnFragment, Outgoing,
+    OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
+    UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
+    OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -3579,6 +3579,34 @@ fn Player(
     // The subtitle the viewer switched to in place, which reports carry so
     // the next playback starts on it.
     let switched = use_hook(|| Rc::new(Cell::new(None::<TrackChoice>)));
+    // The Appearance page is another route, so the level cannot change while
+    // this player is mounted: it is read once, at mount.
+    let effects = use_signal(stored_effects_level);
+    // The generated styled track needs Effects on: with it Off, the viewer
+    // moves to the plain track it is made from, else to no subtitle.
+    use_effect({
+        let (p, switched) = (Rc::clone(&p), Rc::clone(&switched));
+        move || {
+            if effects() != EffectsLevel::Off {
+                return;
+            }
+            let tracks = &p.detail.subtitle_tracks;
+            // Read, not peeked: a pick made later (a group-watch switch skips
+            // the picker's filter) is moved off the styled track too.
+            let Some(shown) = subtitle() else {
+                return;
+            };
+            if !tracks
+                .iter()
+                .any(|t| t.index == shown && t.styled_url.is_some())
+            {
+                return;
+            }
+            let to = source_of_styled(tracks, shown);
+            switched.set(Some(choice(to)));
+            subtitle.set(to);
+        }
+    });
     let mut up_next = use_signal(UpNext::default);
     let mut up_next_step = use_signal(|| UpNextStep::Hidden);
     let advanced = use_hook(|| Rc::new(Cell::new(false)));
@@ -4491,7 +4519,7 @@ fn Player(
         preview: preview_set(&p.detail.trickplay).cloned(),
         hover_ms: hover_ms(),
         audio: p.detail.audio_tracks.clone(),
-        subtitles: p.detail.subtitle_tracks.clone(),
+        subtitles: offered_subtitles(&p.detail.subtitle_tracks, effects()),
         audio_pick: p.audio,
         subtitle_pick: subtitle(),
         previous: near.previous,
