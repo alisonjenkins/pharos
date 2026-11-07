@@ -37,10 +37,8 @@ const MUSIC_SHOUT_EXTRA_DLU: f32 = 3.0;
 const SHOUT_STEP_DLU: f32 = 3.0;
 const ATTACK_DLU: f32 = 9.0;
 const WHISPER_DLU: f32 = -8.0;
-/// "About the median" for Phone and Thought.
+/// "About the median" for Thought.
 const NEAR_MEDIAN_DLU: f32 = 4.0;
-/// A phone voice has under this share of the median high-band energy.
-const PHONE_HB_RATIO: f32 = 0.3;
 /// Narration by italics needs a line longer than this inside a Recap.
 const NARRATION_MS: i64 = 4000;
 const CAPS_RATIO: f32 = 0.8;
@@ -62,6 +60,18 @@ const PHONE_DEVICES: [&str; 11] = [
     "walkie-talkie",
 ];
 
+/// The [`PHONE_DEVICES`] a bracket may name on its own, without `on` or
+/// `over`.
+const BARE_PHONE_DEVICES: [&str; 7] = [
+    "phone",
+    "telephone",
+    "radio",
+    "intercom",
+    "speakerphone",
+    "tv",
+    "walkie-talkie",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
     Intro,
@@ -74,14 +84,12 @@ enum Class {
 struct Audio {
     lufs: Option<f32>,
     pitch: Option<f32>,
-    hb: Option<f32>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct Medians {
     lufs: Option<f32>,
     pitch: Option<f32>,
-    hb: Option<f32>,
 }
 
 /// Directs `lines`: one [`LineEffect`] each, from the first rule that
@@ -179,18 +187,11 @@ fn decide(
             format!("rule=narration italic secs={secs:.1} seg=recap"),
         );
     }
-    // 3
+    // 3. Only the author's own cue: a dub's mix, a cartoon's voice
+    // processing or a dull microphone looks like a phone line to the audio
+    // (B661), so the high-band share no longer decides it.
     if phone_tag {
         return effect(Intent::Phone, 1, "rule=phone tag".into());
-    }
-    if let (Some(h), Some(mh), Some(d)) = (a.hb, med.hb, dlu) {
-        if mh > 0.0 && h < PHONE_HB_RATIO * mh && d.abs() <= NEAR_MEDIAN_DLU {
-            return effect(
-                Intent::Phone,
-                1,
-                format!("rule=phone hb={h:.2} med={mh:.2} dlu={dlu_s}"),
-            );
-        }
     }
     // 4
     if whisper_tag {
@@ -301,13 +302,17 @@ fn groups(text: &str) -> Vec<String> {
     out
 }
 
+/// A bracket naming a device the voice comes through: `[phone]`, `(radio)`,
+/// `(over radio)`, `(on the phone)`, `[through the intercom]`.
 fn is_phone_tag(group: &str) -> bool {
     let g = group.trim();
-    let Some(rest) = ["on ", "over ", "via "]
+    let Some(rest) = ["on ", "over ", "via ", "through ", "into "]
         .iter()
         .find_map(|p| g.strip_prefix(p))
     else {
-        return false;
+        // A bare word only for a device that never names a sound or a
+        // speaker on its own: `[speaker]` and `(comms)` stay what they were.
+        return BARE_PHONE_DEVICES.contains(&g);
     };
     let rest = rest.trim_start_matches("the ").trim_start_matches("a ");
     PHONE_DEVICES.contains(&rest.trim())
@@ -396,7 +401,6 @@ fn audio_of(s: Option<&LineSignals>) -> Audio {
         pitch: s
             .pitch_hz
             .filter(|p| p.is_finite() && *p > 0.0 && s.voiced_ratio >= MIN_VOICED_RATIO),
-        hb: s.high_band_share.filter(|h| h.is_finite()),
     }
 }
 
@@ -426,7 +430,6 @@ fn medians(lines: &[SourceLine], kinds: &[Option<SegmentKind>], audio: &[Audio])
     [Class::Intro, Class::Outro, Class::Rest].map(|c| Medians {
         lufs: pick(c, |a| a.lufs),
         pitch: pick(c, |a| a.pitch),
-        hb: pick(c, |a| a.hb),
     })
 }
 
@@ -606,11 +609,42 @@ mod tests {
 
     #[test]
     fn phone() {
-        assert_eq!(intent(case("(over radio) Come in")), Intent::Phone);
-        assert_eq!(intent(case("Come in").hb(0.10)), Intent::Phone);
-        assert_eq!(intent(case("Come in").hb(0.13)), Intent::Plain);
-        assert_eq!(intent(case("Come in").hb(0.10).dlu(5.0)), Intent::Plain);
-        assert_eq!(intent(case("Come in").hb(0.10).dlu(-4.0)), Intent::Phone);
+        for cue in [
+            "(over radio) Come in",
+            "(on the phone) Come in",
+            "[phone] Come in",
+            "(radio) Come in",
+            "[TV] Come in",
+            "(intercom) Come in",
+            "(through the intercom) Come in",
+            "[on phone]",
+            "[radio]",
+            "[TV]",
+        ] {
+            assert_eq!(intent(case(cue)), Intent::Phone, "{cue}");
+        }
+        assert_eq!(intent(case("[speaker]")), Intent::Sfx);
+        for not_a_cue in [
+            "(phone rings)",
+            "[radio static]",
+            "(telephoto) Come in",
+            "(speaker) Come in",
+        ] {
+            assert_ne!(intent(case(not_a_cue)), Intent::Phone, "{not_a_cue}");
+        }
+    }
+
+    /// B661: a muffled voice is not a phone without the author's cue; a dub's
+    /// mix, a cartoon's processing or a dull microphone all read as one.
+    #[test]
+    fn a_dull_voice_without_a_cue_is_not_a_phone() {
+        for c in [
+            case("Come in").hb(0.10),
+            case("Come in").hb(0.01).dlu(-4.0),
+            case("Come in").hb(0.0).dlu(0.0),
+        ] {
+            assert_eq!(intent(c), Intent::Plain);
+        }
     }
 
     #[test]
