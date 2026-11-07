@@ -465,6 +465,8 @@ async fn a_native_grant_is_listed_in_sessions_until_it_stops() {
     assert_eq!(entry["Client"], "Pharos");
     assert_eq!(entry["NowPlayingItemId"], wire_item_id(MOVIE));
     assert_eq!(entry["PositionTicks"], 0);
+    // Nothing can send a native player commands, so no remote is offered.
+    assert_eq!(entry["SupportsRemoteControl"], false);
 
     report(&grant, 30_000, true).await.unwrap();
     let entries = listed().await;

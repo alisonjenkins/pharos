@@ -150,6 +150,7 @@ async fn start_session(
             },
             item_wire_id: grant.item_wire_id.clone(),
             position_ticks: 0,
+            supports_remote_control: false,
         },
     )
     .await;

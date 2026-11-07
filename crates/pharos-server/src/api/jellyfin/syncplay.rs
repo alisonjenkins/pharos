@@ -1648,6 +1648,7 @@ mod tests {
         state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: "alison-sess".into(),
                 user_id: alison,
                 user_name: "alison".into(),
@@ -1663,6 +1664,7 @@ mod tests {
         state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: "lace-sess".into(),
                 user_id: lace,
                 user_name: "lace".into(),
@@ -1788,6 +1790,7 @@ mod tests {
         state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: "a".into(),
                 user_id: user,
                 user_name: "u".into(),
@@ -1804,6 +1807,7 @@ mod tests {
         state
             .sessions
             .apply(SessionEvent::Started {
+                supports_remote_control: true,
                 session_id: "b".into(),
                 user_id: user,
                 user_name: "u".into(),
