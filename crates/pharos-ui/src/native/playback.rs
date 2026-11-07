@@ -1475,6 +1475,14 @@ pub fn offered_subtitles(tracks: &[Track], level: EffectsLevel) -> Vec<Track> {
         .collect()
 }
 
+/// Whether the ASS renderer must be rebuilt for `script` when it was last
+/// started for `loaded` (B635): for a new script, or to tear it down when
+/// there is none. The pick set again to the track already drawn (as happens
+/// once playback starts) keeps the renderer and fetches nothing.
+pub fn restart_styled(loaded: Option<&str>, script: Option<&str>) -> bool {
+    script.is_none() || loaded != script
+}
+
 /// The track a generated styled track `styled` is made from: the one that
 /// serves the same WebVTT and is not itself generated. `None` when `styled`
 /// is not a generated track or its source is not listed.
@@ -2483,6 +2491,19 @@ mod tests {
             SubtitleSwitch::Renegotiate
         );
         assert_eq!(subtitle_switch(true, None), SubtitleSwitch::Renegotiate);
+    }
+
+    /// B635: the pick set again to the drawn track keeps its renderer; a new
+    /// script or none rebuilds or tears it down.
+    #[test]
+    fn the_ass_renderer_is_rebuilt_only_for_a_new_script() {
+        let a = Some("/videos/1/subtitles/4/stream.ass?tier=desktop&effects=subtle");
+        let b = Some("/videos/1/subtitles/4/stream.ass?tier=low&effects=subtle");
+        assert!(restart_styled(None, a), "first script");
+        assert!(!restart_styled(a, a), "same script again: no second fetch");
+        assert!(restart_styled(a, b), "a tier drop reloads");
+        assert!(restart_styled(a, None), "no script tears it down");
+        assert!(restart_styled(None, None));
     }
 
     #[test]
