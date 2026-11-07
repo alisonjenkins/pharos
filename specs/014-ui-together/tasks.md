@@ -126,3 +126,11 @@ runs before each push (CLAUDE.md).
   `groupDrift`, `groupHardSeek`) counted in `/metrics`, and none from a member
   who has not opted in. `playwright.together.config.ts` runs them in Chromium
   and Firefox.
+- [x] T045 [US9] Server: `Membership.setItem` (schemaVersion 23), the group
+  actor's `MoveToItem` (a stale `from` entry dropped, `may_queue` checked),
+  `pharos_syncplay_move_to_item_total{outcome}`; `it_rpc` cases; V611.
+- [x] T046 [US9] `pharos-client` `NativeMembership::set_item`; UI: next and
+  previous episode and the end of an episode call `Session::move_to`, and a
+  refused move plays the episode alone.
+- [x] T047 [US9] Two-browser Playwright: A's next episode and B's previous
+  episode move both members; an episode's end moves the group once.

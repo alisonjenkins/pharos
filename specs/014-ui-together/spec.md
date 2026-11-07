@@ -96,6 +96,20 @@ over the video for a few seconds even while the player's controls are hidden,
 and the strip keeps the last few. A change the group makes on its own (everyone
 ready, so play starts) says so instead of naming anyone (V395).
 
+### US9 — the group moves to the next episode together (P1)
+
+Alison, 2026-11-07: test "skipping back and forward episodes" and "swapping
+content" in a group, then "Yes add that please" to the group moving with them.
+A member who presses the player's next or previous episode, or whose player
+reaches the end of an episode with another after it, moves the whole group:
+every member's player opens that episode and they play it together from its
+start. When both players reach the end at once, the group moves once: the
+second move names the entry the first one replaced and is dropped as stale.
+The group moves only to an item every member may see, as a queue change
+(V201); otherwise, or on a server too old for the move (schemaVersion below
+23), the member who pressed it plays it on their own and stays a member. A
+member watching another item on their own (V508) moves only themself (V611).
+
 ## Functional Requirements
 
 - **FR-001** Group-sync client implementing `docs/group-sync-protocol.md` over
