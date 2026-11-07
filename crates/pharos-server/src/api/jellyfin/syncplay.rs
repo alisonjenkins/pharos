@@ -1408,8 +1408,7 @@ pub(crate) async fn listed_groups(
     // `get_or_create`, which hydrates from this same snapshot.
     {
         use pharos_core::SyncGroupStore;
-        let cutoff =
-            crate::sync_recovery::now_unix_secs() - crate::sync_recovery::RECOVERY_WINDOW_SECS;
+        let cutoff = crate::sync_recovery::recovery_cutoff();
         if let Ok(rows) = state.stores.list_sync_groups().await {
             for row in rows {
                 if row.updated_at < cutoff || seen.contains(&row.group_id) {

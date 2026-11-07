@@ -75,8 +75,7 @@ impl Group {
         if let Some(handle) = deps.registry.get(id).await.map_err(|_| unavailable())? {
             return Ok(Some(handle));
         }
-        let cutoff =
-            crate::sync_recovery::now_unix_secs() - crate::sync_recovery::RECOVERY_WINDOW_SECS;
+        let cutoff = crate::sync_recovery::recovery_cutoff();
         let persisted = match self
             .session
             .state

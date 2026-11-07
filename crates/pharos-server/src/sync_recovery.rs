@@ -27,6 +27,12 @@ use pharos_sync::messages::{GroupId, MemberId};
 /// never re-attached to last week's leftovers.
 pub const RECOVERY_WINDOW_SECS: i64 = 24 * 3600;
 
+/// The oldest `updated_at` (unix secs) a snapshot may carry and still count as
+/// recoverable.
+pub fn recovery_cutoff() -> i64 {
+    now_unix_secs() - RECOVERY_WINDOW_SECS
+}
+
 /// Snapshots older than this are garbage-collected by the janitor. Kept past
 /// the recovery window so an operator can still inspect a recently-dead group.
 const PRUNE_CUTOFF_SECS: i64 = 48 * 3600;
@@ -49,7 +55,7 @@ pub fn now_unix_secs() -> i64 {
 /// recovery is best-effort, the fallback (`NotInGroup` on the next command)
 /// keeps the client consistent.
 pub async fn find_persisted_group(stores: &Stores, member_id: MemberId) -> Option<GroupId> {
-    let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
+    let cutoff = recovery_cutoff();
     let rows = stores.list_sync_groups().await.ok()?;
     rows.iter()
         .filter(|r| r.updated_at >= cutoff)
@@ -89,7 +95,7 @@ pub fn spawn_boot_reconciliation(stores: Stores, registry: pharos_sync::GroupReg
                 20
             }))
             .await;
-            let cutoff = now_unix_secs() - RECOVERY_WINDOW_SECS;
+            let cutoff = recovery_cutoff();
             let rows = match stores.list_sync_groups().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -151,4 +157,17 @@ pub fn spawn_snapshot_janitor(stores: Stores) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_cutoff_is_one_window_before_now() {
+        let before = now_unix_secs() - RECOVERY_WINDOW_SECS;
+        let cutoff = recovery_cutoff();
+        let after = now_unix_secs() - RECOVERY_WINDOW_SECS;
+        assert!((before..=after).contains(&cutoff));
+    }
 }
