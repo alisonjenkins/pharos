@@ -11,6 +11,7 @@ mod jellyfin_feature_inventory;
 mod jellyfin_feature_library_options;
 mod jellyfin_feature_metadata;
 mod jellyfin_feature_user_policy;
+mod opensubtitles;
 mod playback_access;
 mod playlists;
 mod subtitle_fonts;
