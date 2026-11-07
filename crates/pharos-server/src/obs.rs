@@ -452,6 +452,14 @@ where
 /// `rate()` / `increase()` see them from startup. Call once after [`init`].
 pub fn register_static_series() {
     pharos_cache::hls_cache::register_segment_metrics();
+    for (tonemap, range) in crate::api::jellyfin::hls::TONEMAP_SERIES {
+        metrics::counter!(
+            "pharos_transcode_tonemap_total",
+            "tonemap" => tonemap.label(),
+            "source_range" => range,
+        )
+        .increment(0);
+    }
 }
 
 /// Render Prometheus exposition text for `/metrics`. Lock-free.
