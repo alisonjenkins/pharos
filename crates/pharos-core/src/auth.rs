@@ -228,6 +228,26 @@ pub trait UserStore: Send + Sync {
         id: UserId,
         password_hash: SecretString,
     ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
+    /// Atomically add one to the user's consecutive-failed-login counter and
+    /// return the new value (T68, V577).
+    fn record_failed_login(
+        &self,
+        id: UserId,
+    ) -> impl std::future::Future<Output = AuthResult<i32>> + Send;
+
+    /// Zero the consecutive-failed-login counter (successful login, or an
+    /// admin re-enabling a locked-out user).
+    fn reset_failed_logins(
+        &self,
+        id: UserId,
+    ) -> impl std::future::Future<Output = AuthResult<()>> + Send;
+
+    /// Set only `is_disabled` on the user's policy, leaving every other
+    /// field as stored. The lockout uses this instead of `set_policy`, whose
+    /// read-modify-write could overwrite a concurrent admin edit (V577).
+    /// Idempotent.
+    fn disable_user(&self, id: UserId) -> impl std::future::Future<Output = AuthResult<()>> + Send;
 }
 
 /// An API key is stored as an ordinary token whose `device_id` is this prefix

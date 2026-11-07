@@ -175,6 +175,52 @@ impl UserStore for SqliteStore {
         }
         Ok(())
     }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn record_failed_login(&self, id: UserId) -> AuthResult<i32> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 \
+             WHERE id = ? RETURNING failed_login_attempts",
+        )
+        .bind(id.0.as_bytes().to_vec())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        let (n,) = row.ok_or(AuthError::UserNotFound)?;
+        Ok(i32::try_from(n).unwrap_or(i32::MAX))
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn reset_failed_logins(&self, id: UserId) -> AuthResult<()> {
+        let res = sqlx::query("UPDATE users SET failed_login_attempts = 0 WHERE id = ?")
+            .bind(id.0.as_bytes().to_vec())
+            .execute(self.pool())
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn disable_user(&self, id: UserId) -> AuthResult<()> {
+        // A NULL or malformed blob reads as the default policy, so it is
+        // rewritten as `{}` before the flag is set.
+        let res = sqlx::query(
+            "UPDATE users SET policy_json = json_set(\
+             CASE WHEN json_valid(policy_json) THEN policy_json ELSE '{}' END, \
+             '$.is_disabled', json('true')) WHERE id = ?",
+        )
+        .bind(id.0.as_bytes().to_vec())
+        .execute(self.pool())
+        .await
+        .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
 }
 
 fn record_from_row(row: UserRow) -> AuthResult<UserRecord> {

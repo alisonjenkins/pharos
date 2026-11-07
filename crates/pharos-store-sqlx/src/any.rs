@@ -1408,6 +1408,27 @@ impl UserStore for AnyStore {
             AnyStore::Postgres(p) => p.set_password(id, password_hash).await,
         }
     }
+
+    async fn record_failed_login(&self, id: UserId) -> AuthResult<i32> {
+        match self {
+            AnyStore::Sqlite(s) => s.record_failed_login(id).await,
+            AnyStore::Postgres(p) => p.record_failed_login(id).await,
+        }
+    }
+
+    async fn reset_failed_logins(&self, id: UserId) -> AuthResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.reset_failed_logins(id).await,
+            AnyStore::Postgres(p) => p.reset_failed_logins(id).await,
+        }
+    }
+
+    async fn disable_user(&self, id: UserId) -> AuthResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.disable_user(id).await,
+            AnyStore::Postgres(p) => p.disable_user(id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

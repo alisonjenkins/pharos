@@ -923,6 +923,7 @@ mod tests {
     #[derive(Default)]
     struct MemUsers {
         by_name: Mutex<HashMap<String, UserRecord>>,
+        failed: Mutex<HashMap<UserId, i32>>,
     }
 
     impl UserStore for MemUsers {
@@ -993,6 +994,26 @@ mod tests {
             for rec in g.values_mut() {
                 if rec.id == id {
                     rec.password_hash = password_hash;
+                    return Ok(());
+                }
+            }
+            Err(AuthError::UserNotFound)
+        }
+        async fn record_failed_login(&self, id: UserId) -> AuthResult<i32> {
+            let mut g = self.failed.lock().await;
+            let n = g.entry(id).or_insert(0);
+            *n += 1;
+            Ok(*n)
+        }
+        async fn reset_failed_logins(&self, id: UserId) -> AuthResult<()> {
+            self.failed.lock().await.remove(&id);
+            Ok(())
+        }
+        async fn disable_user(&self, id: UserId) -> AuthResult<()> {
+            let mut g = self.by_name.lock().await;
+            for rec in g.values_mut() {
+                if rec.id == id {
+                    rec.policy.is_disabled = true;
                     return Ok(());
                 }
             }
