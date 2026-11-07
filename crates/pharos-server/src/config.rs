@@ -705,6 +705,18 @@ pub struct ServerConfig {
     /// falls back to the source/ceiling behaviour). Default 6 Mbps.
     #[serde(default = "default_remote_default_bitrate_bps")]
     pub remote_default_bitrate_bps: u64,
+    /// Enforce `VideoRangeType` conditions (Jellyfin profiles, and a native
+    /// player with `hdr=false`) so an HDR source is transcoded instead of
+    /// direct-played. Default `false`: pharos has no tonemapping, so a
+    /// transcode would show washed-out colour where a browser tonemaps the
+    /// direct play itself. While off, the verdict is still computed and a
+    /// would-block is counted in `pharos_video_range_unenforced_total`.
+    ///
+    /// Native clients built before the `hdr` capability existed send
+    /// `hdr=false`, so enabling this also transcodes HDR for them even if
+    /// their display can show it.
+    #[serde(default)]
+    pub enforce_video_range: bool,
     /// `[server.native_api]` — the pharos-native Cap'n Proto API (spec 017).
     #[serde(default)]
     pub native_api: NativeApiConfig,

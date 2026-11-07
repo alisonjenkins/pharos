@@ -309,6 +309,9 @@ pub struct AppState {
     /// the negotiated cap to this value (min with any lower client pick). `0`
     /// disables it. Config `[server].remote_default_bitrate_bps`.
     pub remote_default_bitrate_bps: u64,
+    /// Whether `VideoRangeType` conditions decide playback. Config
+    /// `[server].enforce_video_range`; off until the transcoder tonemaps.
+    pub enforce_video_range: bool,
     /// P43 — inter-probe sleep in milliseconds for background
     /// `/Library/Refresh` passes. 0 disables rate-limiting. Surfaced
     /// here so the admin spawn reads the configured value without
@@ -771,6 +774,7 @@ impl AppState {
             )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
+            enforce_video_range: false,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -893,6 +897,7 @@ impl AppState {
             )),
             user_defaults: Default::default(),
             remote_default_bitrate_bps: 0,
+            enforce_video_range: false,
             scan_rate_limit_ms: 0,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
@@ -946,6 +951,12 @@ impl AppState {
     /// count so a capable GPU warms a deeper buffer.
     pub fn with_hw_encode_session_budget(mut self, budget: usize) -> Self {
         self.hw_encode_session_budget = budget;
+        self
+    }
+
+    /// Enforce `VideoRangeType` conditions. See `enforce_video_range`.
+    pub fn with_enforce_video_range(mut self, enforce: bool) -> Self {
+        self.enforce_video_range = enforce;
         self
     }
 
