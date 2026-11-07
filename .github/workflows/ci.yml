@@ -265,7 +265,11 @@ jobs:
           # pharos-aligner (ADR-0066) is 3-4 GB and changes rarely, so it is
           # tagged by its script's store hash and streamed only when that tag
           # is missing; the chart pins the tag (aligner.image.tag).
-          aligner_script="$(nix build .#alignerOci --no-link --print-out-paths)"
+          # Rooted in the host's gcroots drop box: the `nix develop` of the
+          # tag check below can start an auto-GC that deletes an unrooted
+          # script before it is streamed (B628).
+          aligner_script="$(nix build .#alignerOci --print-out-paths \
+            --out-link /nix/var/nix/gcroots/gha/pharos-aligner-oci)"
           aligner_tag="$(basename "$aligner_script" | cut -d- -f1)"
           if nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
                "docker://ghcr.io/alisonjenkins/pharos-aligner:${aligner_tag}" >/dev/null 2>&1; then
