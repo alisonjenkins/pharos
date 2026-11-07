@@ -107,6 +107,8 @@ async fn live_user(stores: &Stores, uid: UserId) -> Result<User, TokenRefusal> {
 pub enum LoginGate {
     /// Their access schedule is closed right now (V578).
     OutsideSchedule,
+    /// They already hold `held` of at most `max` sessions (V579).
+    SessionLimit { held: u32, max: u32 },
 }
 
 impl LoginGate {
@@ -114,6 +116,7 @@ impl LoginGate {
     pub fn label(self) -> &'static str {
         match self {
             LoginGate::OutsideSchedule => "outside_schedule",
+            LoginGate::SessionLimit { .. } => "session_limit",
         }
     }
 
@@ -121,24 +124,124 @@ impl LoginGate {
     pub fn message(self) -> &'static str {
         match self {
             LoginGate::OutsideSchedule => "User is not allowed access at this time.",
+            LoginGate::SessionLimit { .. } => "User is at their maximum number of sessions.",
         }
     }
 }
 
-/// The policy checks Jellyfin makes after a correct password and before it
-/// issues a session (`UserManager.AuthenticateUser`). Unlike a request,
-/// a login is gated for admins too. Only called with a verified user, so
-/// the refusal can say why without telling a guesser anything (V578).
-pub fn login_gate(user: &User) -> Result<(), LoginGate> {
-    let (weekday, hour) = crate::local_time::now_local();
-    login_gate_at(user, weekday, hour)
+/// [`login_gate`] gave no verdict or refused.
+#[derive(Debug)]
+pub enum LoginGateError {
+    Refused(LoginGate),
+    /// The token store could not count the user's sessions; the login fails
+    /// closed rather than skipping the cap.
+    Store(AuthError),
 }
 
-fn login_gate_at(user: &User, weekday: u8, hour: f64) -> Result<(), LoginGate> {
-    let gate = if user.policy.within_access_schedule(weekday, hour) {
-        return Ok(());
+impl From<LoginGate> for LoginGateError {
+    fn from(gate: LoginGate) -> Self {
+        Self::Refused(gate)
+    }
+}
+
+impl From<LoginGateError> for PasswordLoginError {
+    fn from(e: LoginGateError) -> Self {
+        match e {
+            LoginGateError::Refused(gate) => Self::Gated(gate),
+            LoginGateError::Store(e) => Self::Issue(e),
+        }
+    }
+}
+
+impl From<LoginGateError> for QuickConnectLoginError {
+    fn from(e: LoginGateError) -> Self {
+        match e {
+            LoginGateError::Refused(gate) => Self::Gated(gate),
+            LoginGateError::Store(e) => Self::Unavailable(e.to_string()),
+        }
+    }
+}
+
+/// Entries kept before idle per-user locks are dropped from [`SessionSlots`].
+const SESSION_SLOTS_PRUNE_AT: usize = 256;
+
+/// One lock per user, so the session count and the token insert of a capped
+/// login happen as a unit: two concurrent logins cannot both see room for
+/// the last session (V579). In-process only, like [`Revocations`].
+#[derive(Debug, Default)]
+pub struct SessionSlots {
+    locks:
+        std::sync::Mutex<std::collections::HashMap<UserId, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SessionSlots {
+    async fn acquire(&self, user: UserId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if locks.len() >= SESSION_SLOTS_PRUNE_AT {
+                // An entry nobody else holds or waits on is idle.
+                locks.retain(|_, l| std::sync::Arc::strong_count(l) > 1);
+            }
+            std::sync::Arc::clone(locks.entry(user).or_default())
+        };
+        lock.lock_owned().await
+    }
+}
+
+/// Proof a capped login's count still holds. Keep it alive until the token
+/// is issued; dropping it lets the user's next login count.
+#[derive(Debug)]
+pub struct SessionSlot {
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// The policy checks Jellyfin makes after a correct password and before it
+/// issues a session (`UserManager.AuthenticateUser`, then
+/// `SessionManager.AuthenticateNewSessionInternal`): the access schedule,
+/// then `MaxActiveSessions`. Unlike a request, a login is gated for admins
+/// too. Only called with a verified user, so the refusal can say why without
+/// telling a guesser anything (V578, V579). `device_id` is the device the
+/// new token is for: signing in again from a device that already has a
+/// session does not count against the cap. For a capped user the returned
+/// [`SessionSlot`] serialises this login's count with its token insert.
+pub async fn login_gate(
+    state: &AppState,
+    user: &User,
+    device_id: &str,
+) -> Result<SessionSlot, LoginGateError> {
+    let (weekday, hour) = crate::local_time::now_local();
+    let capped = user.policy.max_active_sessions >= 1;
+    let guard = if capped {
+        Some(state.session_slots.acquire(user.id).await)
     } else {
+        None
+    };
+    let held = if capped {
+        state
+            .stores
+            .count_sessions_excluding_device(user.id, device_id)
+            .await
+            .map_err(LoginGateError::Store)?
+    } else {
+        0
+    };
+    login_gate_at(user, weekday, hour, held).map_err(LoginGateError::Refused)?;
+    Ok(SessionSlot { _guard: guard })
+}
+
+fn login_gate_at(user: &User, weekday: u8, hour: f64, held: u32) -> Result<(), LoginGate> {
+    let gate = if !user.policy.within_access_schedule(weekday, hour) {
         LoginGate::OutsideSchedule
+    } else if let Some(max) = u32::try_from(user.policy.max_active_sessions)
+        .ok()
+        .filter(|max| *max >= 1 && held >= *max)
+    {
+        LoginGate::SessionLimit { held, max }
+    } else {
+        return Ok(());
     };
     metrics::counter!("pharos_login_gated_total", "reason" => gate.label()).increment(1);
     tracing::warn!(
@@ -464,7 +567,7 @@ pub async fn password_login(
             .verify(&state.auth, name, password, client_ip)
             .await
             .map_err(|r| PasswordLoginError::Refused(settle_lockout(state, r)))?;
-        login_gate(&user).map_err(PasswordLoginError::Gated)?;
+        let _slot = login_gate(state, &user, device_id).await?;
         admit(&user).map_err(|(held, max)| PasswordLoginError::Capped { held, max })?;
         let token = state
             .stores
@@ -715,7 +818,7 @@ pub async fn quick_connect_login(
             return Err(E::Disabled);
         }
         let user = record.into_user();
-        login_gate(&user).map_err(E::Gated)?;
+        let _slot = login_gate(state, &user, &entry.device_id).await?;
         admit(&user).map_err(|(held, max)| E::Capped { held, max })?;
         // One-shot: of two racing polls, only one consumes the entry.
         let entry = ask(true).await?.ok_or(E::Unknown)?;
@@ -841,6 +944,59 @@ mod tests {
             matches!(counted, Some((.., DebugValue::Counter(1)))),
             "{counted:?}"
         );
+    }
+
+    /// `pharos_login_gated_total{reason}` is a dashboard contract: one
+    /// distinct label per gate, and each refusal bumps its own series.
+    #[test]
+    fn login_gate_labels_are_distinct_and_each_refusal_is_counted() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let gates = [
+            LoginGate::OutsideSchedule,
+            LoginGate::SessionLimit { held: 1, max: 1 },
+        ];
+        let labels: std::collections::HashSet<_> = gates.iter().map(|g| g.label()).collect();
+        assert_eq!(labels.len(), gates.len());
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            let mut user = User {
+                id: UserId::new(),
+                name: "u".into(),
+                policy: pharos_core::UserPolicy::default(),
+                has_password: true,
+            };
+            user.policy.max_active_sessions = 1;
+            // Open all week, and one session held: only the cap refuses.
+            assert!(matches!(
+                login_gate_at(&user, 3, 12.0, 1),
+                Err(LoginGate::SessionLimit { .. })
+            ));
+            user.policy.access_schedules = vec![pharos_core::AccessSchedule {
+                day_of_week: "Everyday".into(),
+                start_hour: 1.0,
+                end_hour: 1.5,
+            }];
+            assert!(matches!(
+                login_gate_at(&user, 3, 12.0, 0),
+                Err(LoginGate::OutsideSchedule)
+            ));
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        for gate in gates {
+            let counted = snapshot.iter().find(|(k, ..)| {
+                k.key().name() == "pharos_login_gated_total"
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == gate.label())
+            });
+            assert!(
+                matches!(counted, Some((.., DebugValue::Counter(1)))),
+                "{}: {counted:?}",
+                gate.label()
+            );
+        }
     }
 
     #[test]
