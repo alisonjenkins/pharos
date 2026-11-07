@@ -23,6 +23,13 @@ use tokio::sync::RwLock;
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::online_enrich::{EnrichedMetadata, RemoteArt, TextsFetch};
 use pharos_core::{ArtworkRole, LocalizedText, MediaKind, SearchCandidate};
+use serde::Serialize;
+
+/// Body of `POST /login` on the TVDB v4 API.
+#[derive(Serialize)]
+struct LoginRequest<'a> {
+    apikey: &'a str,
+}
 
 /// TVDB v4 REST base.
 const API_BASE: &str = "https://api4.thetvdb.com/v4";
@@ -92,7 +99,7 @@ impl TvdbTransport for ReqwestTransport {
         let resp = self
             .http
             .post(format!("{API_BASE}/login"))
-            .json(&serde_json::json!({ "apikey": apikey }))
+            .json(&LoginRequest { apikey })
             .send()
             .await
             .ok()?;
@@ -1251,6 +1258,16 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn login_request_body_is_the_apikey_object() {
+        let body = serde_json::to_value(LoginRequest { apikey: "k-1" }).unwrap();
+        assert_eq!(body, serde_json::json!({ "apikey": "k-1" }));
+        assert_eq!(
+            serde_json::to_string(&LoginRequest { apikey: "k-1" }).unwrap(),
+            r#"{"apikey":"k-1"}"#
+        );
+    }
 
     #[test]
     fn tvdb_parse_artworks_maps_known_types() {
