@@ -121,6 +121,7 @@ fn opts() -> SegmentOpts {
         burn_fonts_dir: None,
         video_3d_format: None,
         stereo_output: Default::default(),
+        tonemap: Default::default(),
     }
 }
 

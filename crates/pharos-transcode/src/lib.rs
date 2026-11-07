@@ -44,7 +44,7 @@ pub use capability::{EncodeAccel, RelCost, ServerEncodeCapabilities, VideoEncode
 pub use hwaccel::HwAccel;
 pub use options::{
     per_eye_layout, stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D,
-    RenditionKey, SourceCodec, StereoOutput, TranscodeOptions, VideoCodec,
+    RenditionKey, SourceCodec, StereoOutput, Tonemap, TonemapOutput, TranscodeOptions, VideoCodec,
 };
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
@@ -325,8 +325,19 @@ fn push_video_filters(
     muxed_audio: bool,
     mono_filter: Option<&str>,
     per_eye: Option<pharos_core::Video3DFormat>,
+    // HDR to SDR mapping (`Tonemap::filters`). It runs on the decoded frames,
+    // before any subtitle is drawn, so libass colours are not pushed through
+    // the PQ curve. The per-eye 3D burn graphs run it on the whole frame ahead
+    // of the split, so neither eye's subtitle copy sees it either.
+    tonemap: Option<&str>,
 ) {
     let layout = per_eye.and_then(per_eye_layout);
+    let pre_joined: Option<String> = match (layout.is_some(), mono_filter, tonemap) {
+        (false, Some(m), Some(t)) => Some(format!("{m},{t}")),
+        (false, None, Some(t)) => Some(t.to_string()),
+        _ => mono_filter.map(str::to_string),
+    };
+    let mono_filter = pre_joined.as_deref();
     match (burn_subtitle_stream_index, burn_is_text) {
         (Some(si), true) => {
             // Prefer the small pre-extracted `.ass` sidecar: ffmpeg's
@@ -360,6 +371,10 @@ fn push_video_filters(
                 // they share the same shifted clock.
                 let start = start_seconds.filter(|s| *s > 0.0);
                 let mut graph = String::from("[0:v:0]");
+                if let Some(t) = tonemap {
+                    graph.push_str(t);
+                    graph.push(',');
+                }
                 if let Some(start) = start {
                     graph.push_str(&format!("setpts=PTS+{start:.6}/TB,"));
                 }
@@ -401,7 +416,10 @@ fn push_video_filters(
             if let Some(l) = layout {
                 // V234 — the bitmap track is copied once per eye, each copy
                 // overlaid on its own (unsqueezed) eye.
-                graph.push_str(&format!("[0:v:0]split=2[e0][e1];[0:s:{si}]split=2[s0][s1]"));
+                let tonemap_head = tonemap.map(|t| format!("{t},")).unwrap_or_default();
+                graph.push_str(&format!(
+                    "[0:v:0]{tonemap_head}split=2[e0][e1];[0:s:{si}]split=2[s0][s1]"
+                ));
                 for (i, crop) in l.eye_crops.iter().enumerate() {
                     let mut eye = vec![(*crop).to_string()];
                     eye.extend(l.unsqueeze.map(str::to_string));
@@ -652,6 +670,12 @@ impl DecodeAccel {
         {
             return Self::NoDecoderForAccel;
         }
+        // The tonemap chain is zscale/tonemap on system-memory frames, and the
+        // same CPU-filter hazard as B240 applies to every encoder, not only
+        // NVENC; software decode is the only decode all of them agree on.
+        if !opts.tonemap.is_off() {
+            return Self::NoDecoderForAccel;
+        }
         match device.hwaccel().decoder_hwaccel() {
             Some(name) => Self::Gpu { name },
             None => Self::NoDecoderForAccel,
@@ -739,6 +763,7 @@ fn resident_argv_applies(
     ) && matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265))
         && !has_filler
         && !crate::device::shared_init_fmp4(opts)
+        && opts.tonemap.is_off()
         && opts.burn_subtitle_stream_index.is_none()
         && !opts.burn_intent
         && matches!(
@@ -1224,6 +1249,18 @@ fn build_args_for_pipeline(
                     ..
                 }
             );
+            // A filler window is synthetic, so there is nothing to map.
+            let tonemap_vf = if filler.is_some() {
+                None
+            } else {
+                opts.tonemap.filters(
+                    if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
+                        options::TonemapOutput::Nv12
+                    } else {
+                        options::TonemapOutput::Yuv420p
+                    },
+                )
+            };
             if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
                 // VAAPI: upload frames to the GPU, then encode. The
                 // upload filter chains after any software filters.
@@ -1231,7 +1268,10 @@ fn build_args_for_pipeline(
                 // source decodes to NV12 surfaces, which h264_vaapi/hevc_vaapi
                 // take as they are.
                 if !resident {
-                    vf_parts.push("format=nv12".into());
+                    // The tonemap chain already ends in nv12.
+                    if tonemap_vf.is_none() {
+                        vf_parts.push("format=nv12".into());
+                    }
                     vf_parts.push("hwupload".into());
                     push_video_filters(
                         &mut a,
@@ -1248,6 +1288,7 @@ fn build_args_for_pipeline(
                         opts.muxed_audio_source.is_some(),
                         opts.active_stereo_mono_filter(),
                         opts.per_eye_burn_format(),
+                        tonemap_vf.as_deref(),
                     );
                 }
                 a.push("-c:v".into());
@@ -1286,6 +1327,7 @@ fn build_args_for_pipeline(
                     opts.muxed_audio_source.is_some(),
                     opts.active_stereo_mono_filter(),
                     opts.per_eye_burn_format(),
+                    tonemap_vf.as_deref(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -1649,6 +1691,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         }
     }
 
@@ -2126,6 +2169,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -2191,6 +2235,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -2233,6 +2278,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let nvenc = build_args_for_device(
             "/m/x.mkv",
@@ -2341,6 +2387,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -2374,6 +2421,7 @@ mod tests {
             filler: None,
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
@@ -2650,6 +2698,176 @@ mod tests {
         // VAAPI sets the format via the filter (nv12 in GPU memory), not a
         // software `-pix_fmt` (which would clash with the hw frames).
         assert!(!joined.contains("-pix_fmt"), "{joined}");
+    }
+
+    const TONEMAP_CORE: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv";
+
+    fn vf_of(device: crate::protocol::DeviceId, o: &TranscodeOptions) -> Option<String> {
+        let a = build_args_for_device(
+            "/m/x.mkv",
+            o,
+            device,
+            "out.ts",
+            crate::DecodeOffload::Allowed,
+            None,
+        );
+        a.iter().position(|x| x == "-vf").map(|i| a[i + 1].clone())
+    }
+
+    fn hdr_opts() -> TranscodeOptions {
+        let mut o = opts();
+        o.tonemap = crate::options::Tonemap::HdrToSdr;
+        o
+    }
+
+    #[test]
+    fn tonemap_software_ends_in_yuv420p_before_the_encoder() {
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &hdr_opts()).expect("-vf");
+        assert_eq!(vf, format!("{TONEMAP_CORE},format=yuv420p"));
+    }
+
+    #[test]
+    fn tonemap_nvenc_and_qsv_hand_system_memory_yuv420p_to_the_encoder() {
+        use crate::protocol::DeviceId;
+        for accel in [HwAccel::Nvenc, HwAccel::Qsv] {
+            let vf = vf_of(DeviceId::hw(accel, 0), &hdr_opts()).expect("-vf");
+            assert_eq!(vf, format!("{TONEMAP_CORE},format=yuv420p"), "{accel:?}");
+        }
+    }
+
+    #[test]
+    fn tonemap_vaapi_runs_on_cpu_frames_before_hwupload() {
+        let vf = vf_of(
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            &hdr_opts(),
+        )
+        .expect("-vf");
+        assert_eq!(vf, format!("{TONEMAP_CORE},format=nv12,hwupload"));
+    }
+
+    #[test]
+    fn sdr_source_never_gets_tonemap_filters() {
+        use crate::protocol::DeviceId;
+        for d in [
+            DeviceId::Cpu,
+            DeviceId::hw(HwAccel::Nvenc, 0),
+            DeviceId::hw(HwAccel::Qsv, 0),
+            DeviceId::hw(HwAccel::Vaapi, 0),
+        ] {
+            let vf = vf_of(d, &opts()).unwrap_or_default();
+            assert!(
+                !vf.contains("zscale") && !vf.contains("tonemap"),
+                "{d:?}: {vf}"
+            );
+        }
+    }
+
+    #[test]
+    fn tonemap_runs_before_a_text_subtitle_is_burned() {
+        let mut o = hdr_opts();
+        o.burn_subtitle_stream_index = Some(0);
+        o.burn_intent = true;
+        o.burn_subtitle_is_text = true;
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &o).expect("-vf");
+        let tm = vf.find("tonemap=").expect("tonemap");
+        let sub = vf.find("subtitles=").expect("subtitles");
+        assert!(tm < sub, "{vf}");
+    }
+
+    #[test]
+    fn tonemap_and_a_stream_copy_do_not_mix() {
+        let mut o = hdr_opts();
+        o.video = Some(VideoCodec::Copy);
+        let a = build_args("/m/x.mkv", &o).join(" ");
+        assert!(!a.contains("zscale"), "{a}");
+    }
+
+    #[test]
+    fn tonemap_rules_out_the_gpu_resident_pipeline() {
+        let mut o = resident_opts();
+        let dev = crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0);
+        assert!(resident_argv_applies(
+            &o,
+            dev,
+            DecodeOffload::Allowed,
+            false
+        ));
+        o.tonemap = crate::options::Tonemap::HdrToSdr;
+        assert!(!resident_argv_applies(
+            &o,
+            dev,
+            DecodeOffload::Allowed,
+            false
+        ));
+    }
+
+    #[test]
+    fn tonemap_forces_software_decode_on_every_encoder() {
+        use crate::protocol::DeviceId;
+        for accel in [
+            HwAccel::Nvenc,
+            HwAccel::Qsv,
+            HwAccel::Vaapi,
+            HwAccel::VideoToolbox,
+        ] {
+            let device = DeviceId::hw(accel, 0);
+            let o = hdr_opts();
+            assert_eq!(
+                DecodeAccel::of(&o, device, DecodeOffload::Allowed),
+                DecodeAccel::NoDecoderForAccel,
+                "{accel:?}"
+            );
+            let a = build_args_for_device(
+                "/m/x.mkv",
+                &o,
+                device,
+                "out.ts",
+                DecodeOffload::Allowed,
+                None,
+            );
+            assert!(!a.iter().any(|x| x == "-hwaccel"), "{accel:?}: {a:?}");
+            // The control: the same job without tonemap does decode on the GPU.
+            assert!(
+                DecodeAccel::of(&opts(), device, DecodeOffload::Allowed).is_gpu(),
+                "{accel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_eye_burn_tonemaps_before_the_split_so_subtitles_stay_sdr() {
+        use pharos_core::Video3DFormat as F;
+        for text in [true, false] {
+            let mut o = hdr_opts();
+            o.video_3d_format = Some(F::HalfSideBySide);
+            o.stereo_output = StereoOutput::Preserve;
+            o.burn_intent = true;
+            o.burn_subtitle_stream_index = Some(2);
+            o.burn_subtitle_is_text = text;
+            let a = build_args("/m/3d.mkv", &o);
+            let fc = a
+                .iter()
+                .position(|x| x == "-filter_complex")
+                .expect("-filter_complex");
+            let g = &a[fc + 1];
+            assert_eq!(g.matches("zscale=t=linear").count(), 1, "{g}");
+            assert_in_order(g, &["[0:v:0]", "tonemap=", "split=2[e0][e1]"]);
+            let overlay_or_subs = if text { "subtitles=" } else { "overlay=" };
+            let tm = g.find("tonemap=").expect("tonemap");
+            assert!(tm < g.find(overlay_or_subs).expect("burn"), "{g}");
+            assert!(g.ends_with("[vout]") && !g.contains("hstack,zscale"), "{g}");
+        }
+    }
+
+    #[test]
+    fn tonemap_decision_follows_the_range_type_and_labels_are_distinct() {
+        use crate::options::Tonemap;
+        assert_eq!(Tonemap::for_range_type("HDR10"), Tonemap::HdrToSdr);
+        assert_eq!(Tonemap::for_range_type("HLG"), Tonemap::HdrToSdr);
+        assert_eq!(Tonemap::for_range_type("SDR"), Tonemap::Off);
+        let labels: std::collections::HashSet<_> = Tonemap::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels.len(), Tonemap::ALL.len());
     }
 
     fn resident_opts() -> TranscodeOptions {

@@ -1649,6 +1649,7 @@ fn build_segment_opts(
                     burn_fonts_dir: None,
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
+                    tonemap: pharos_transcode::Tonemap::Off,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1685,6 +1686,7 @@ fn build_segment_opts(
                     burn_fonts_dir: None,
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
+                    tonemap: pharos_transcode::Tonemap::Off,
                 };
             }
             _ => {}
@@ -1721,6 +1723,7 @@ fn build_segment_opts(
         burn_fonts_dir: None,
         video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
+        tonemap: pharos_transcode::Tonemap::Off,
     }
 }
 
@@ -3618,6 +3621,7 @@ fn fmp4_segment_opts_resolved(
         burn_fonts_dir: None,
         video_3d_format: item.probe.video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
+        tonemap: pharos_transcode::Tonemap::Off,
     }
 }
 

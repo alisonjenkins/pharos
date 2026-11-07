@@ -202,6 +202,10 @@ pub struct SegmentOpts {
     /// Target stereoscopic output mode (preserve or downmix to 2D mono).
     #[serde(default)]
     pub stereo_output: crate::options::StereoOutput,
+    /// HDR to SDR mapping. Part of the segment's identity: the same source,
+    /// window and bitrate produce different pixels with it on.
+    #[serde(default)]
+    pub tonemap: crate::options::Tonemap,
 }
 
 /// A segment's audio once it is SETTLED.
@@ -330,6 +334,7 @@ impl ResolvedSegment {
             filler: None,
             video_3d_format: s.video_3d_format,
             stereo_output: s.stereo_output,
+            tonemap: s.tonemap,
         }
     }
 }
@@ -363,6 +368,7 @@ mod tests {
             burn_fonts_dir: Some(std::path::PathBuf::from("/cache/fonts")),
             video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
             stereo_output: crate::options::StereoOutput::Mono2D,
+            tonemap: Default::default(),
         };
         let slice = crate::options::MuxedAudio {
             path: std::path::PathBuf::from("/cache/continuous.m4a"),
@@ -439,6 +445,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: crate::options::StereoOutput::Preserve,
+            tonemap: Default::default(),
         };
         let argv = |r: &ResolvedSegment| {
             crate::ffmpeg_transcode_args(

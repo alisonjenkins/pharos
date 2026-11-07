@@ -258,6 +258,8 @@ pub struct SegmentIdentity {
     /// filenames are byte-identical to what they were before this existed.
     source_gen: SourceGen,
     stereo_output: pharos_transcode::StereoOutput,
+    /// HDR sources are tonemapped to SDR, which changes the pixels.
+    tonemap: pharos_transcode::Tonemap,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -1427,6 +1429,7 @@ impl SegmentIdentity {
             codec_tag: codec_tag(opts.video, opts.audio_codec(), opts.container),
             source_gen,
             stereo_output: opts.stereo_output,
+            tonemap: opts.tonemap,
         }
     }
 
@@ -1448,6 +1451,7 @@ impl SegmentIdentity {
             codec_tag,
             source_gen,
             stereo_output,
+            tonemap: _,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -3773,6 +3777,7 @@ impl HlsSegmentCache {
             codec_tag: 0,
             source_gen: SourceGen::LOCAL,
             stereo_output: pharos_transcode::StereoOutput::Preserve,
+            tonemap: Default::default(),
         })
     }
 
@@ -5222,6 +5227,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -5259,6 +5265,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         }
     }
 
@@ -5578,6 +5585,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         }
     }
 
@@ -9288,6 +9296,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         }
     }
 
@@ -9760,6 +9769,7 @@ mod tests {
                     codec_tag: 0,
                     source_gen: SourceGen::LOCAL,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
+                    tonemap: Default::default(),
                 },
                 body.len() as u64,
             )
@@ -10027,6 +10037,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10055,6 +10066,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10148,6 +10160,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -10191,6 +10204,7 @@ mod tests {
             burn_fonts_dir: None,
             video_3d_format: None,
             stereo_output: Default::default(),
+            tonemap: Default::default(),
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10235,6 +10249,7 @@ mod tests {
                 burn_fonts_dir: None,
                 video_3d_format: None,
                 stereo_output: Default::default(),
+                tonemap: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -10259,6 +10274,7 @@ mod tests {
                 burn_fonts_dir: None,
                 video_3d_format: None,
                 stereo_output: Default::default(),
+                tonemap: Default::default(),
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
