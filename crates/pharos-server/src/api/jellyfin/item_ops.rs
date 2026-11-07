@@ -35,7 +35,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         )
         .route(
             "/items/{id}/remotesearch/subtitles/{lang}",
-            web::get().to(remote_subtitle_search),
+            web::get().to(super::remote_subtitles::remote_subtitle_search),
+        )
+        .route(
+            "/items/{id}/remotesearch/subtitles/{subtitle_id}",
+            web::post().to(super::remote_subtitles::remote_subtitle_download),
         )
         .route("/audio/{id}/lyrics", web::get().to(get_lyrics))
         .route("/items/{id}/instantmix", web::get().to(instant_mix))
@@ -761,16 +765,6 @@ async fn remote_images_download(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// `GET /Items/{id}/RemoteSearch/Subtitles/{lang}` — remote subtitle
-/// search. No subtitle providers configured → an empty
-/// `RemoteSubtitleInfo[]` (200).
-async fn remote_subtitle_search(
-    _user: AuthUser,
-    _path: web::Path<(String, String)>,
-) -> impl Responder {
-    crate::api::jellyfin::wire::json(&serde_json::Value::Array(vec![]))
-}
-
 /// `GET /Audio/{id}/Lyrics` — the song's lyrics from the shared lyrics
 /// service (tags, sidecars, optional online provider; B360/V300), else an
 /// empty lyric doc (200). Shape is Jellyfin's `LyricDto` (`{ Metadata,
@@ -895,7 +889,7 @@ async fn instant_mix(
 
 // ---------------------------------------------------------------------
 // T11 — manual Identify: search a provider for candidates, apply a chosen
-// one as an override. Unlike `remote_images`/`remote_subtitle_search`
+// one as an override. Unlike `remote_images`/subtitle search
 // above (pharos has NO providers for those), pharos DOES have TMDB/TVDB
 // wired for the T9 background enrichment sweep — these endpoints expose
 // that same capability to jellyfin-web's Identify dialog for a manual
@@ -999,7 +993,7 @@ fn candidates_to_dto(
 
 /// Core of `GET /Items/{id}/RemoteSearch/Movie` — search TMDB for candidate
 /// matches. No `[tmdb].api_key` configured → an honest empty array, the
-/// same treatment `remote_images`/`remote_subtitle_search` above give their
+/// same treatment `remote_images`/subtitle search above give their
 /// (also absent) providers, rather than erroring the client's fetch.
 /// Split from the actix handler below so it's directly callable from tests
 /// without going through `web::Path` extraction.
