@@ -252,7 +252,7 @@ async fn handle_connection<S>(
     let is_admin = user.policy.admin;
     let started = Instant::now();
     let viewer = crate::cast_sessions::ViewerInfo {
-        user_id: bound_user_id.clone(),
+        user_id: user.id,
         is_admin,
     };
     let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(64);

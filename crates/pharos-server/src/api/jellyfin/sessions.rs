@@ -168,7 +168,7 @@ async fn list_sessions(
     .map_err(error::ErrorInternalServerError)?;
     if let Some(directory) = &state.cast_directory {
         let viewer = crate::cast_sessions::ViewerInfo {
-            user_id: user.0.id.0.simple().to_string(),
+            user_id: user.0.id,
             is_admin: user.0.policy.admin,
         };
         visible.extend(

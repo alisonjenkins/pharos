@@ -8,6 +8,7 @@
 //! surfaces are built from its output through typed DTOs (V38/V39).
 
 use crate::{config::CastConfig, sessions::SessionRecord};
+use pharos_core::UserId;
 use pharos_jellyfin_api::socket_messages::{SessionPlayStateLite, SessionsBroadcastEntry};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -35,7 +36,7 @@ pub fn tv_session_id(tv_name: &str) -> String {
 /// Who is asking; decides which TVs they may see (V9).
 #[derive(Debug, Clone)]
 pub struct ViewerInfo {
-    pub user_id: String,
+    pub user_id: UserId,
     pub is_admin: bool,
 }
 
@@ -43,7 +44,7 @@ pub struct ViewerInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveCastInfo {
     pub tv: String,
-    pub owner_user_id: String,
+    pub owner_user_id: UserId,
     pub owner_user_name: String,
     pub now_playing_item_id: Option<String>,
     pub position_ticks: u64,
@@ -66,8 +67,8 @@ pub trait CastDirectory: Send + Sync {
 pub struct VirtualTvSession {
     pub id: String,
     pub device_name: String,
-    /// Empty unless a cast is active, then the owner.
-    pub user_id: String,
+    /// `None` unless a cast is active, then the owner.
+    pub user_id: Option<UserId>,
     pub user_name: String,
     pub now_playing_item_id: Option<String>,
     pub position_ticks: u64,
@@ -85,7 +86,7 @@ pub fn virtual_tv_sessions(
     cfg.tvs
         .iter()
         .filter(|tv| reachable.get(&tv.name).copied().unwrap_or(false))
-        .filter(|tv| tv.permits(&viewer.user_id, viewer.is_admin))
+        .filter(|tv| tv.permits(&viewer.user_id.0.simple().to_string(), viewer.is_admin))
         .map(|tv| {
             let cast = active
                 .iter()
@@ -93,7 +94,7 @@ pub fn virtual_tv_sessions(
             VirtualTvSession {
                 id: tv_session_id(&tv.name),
                 device_name: tv.name.clone(),
-                user_id: cast.map(|c| c.owner_user_id.clone()).unwrap_or_default(),
+                user_id: cast.map(|c| c.owner_user_id),
                 user_name: cast.map(|c| c.owner_user_name.clone()).unwrap_or_default(),
                 now_playing_item_id: cast.and_then(|c| c.now_playing_item_id.clone()),
                 position_ticks: cast.map(|c| c.position_ticks).unwrap_or(0),
@@ -122,7 +123,10 @@ impl From<&VirtualTvSession> for SessionRecord {
         let now = crate::sessions::iso_now();
         Self {
             id: v.id.clone(),
-            user_id: v.user_id.clone(),
+            user_id: v
+                .user_id
+                .map(|u| u.0.simple().to_string())
+                .unwrap_or_default(),
             user_name: v.user_name.clone(),
             device_id: v.id.clone().into(),
             device_name: v.device_name.clone(),
@@ -153,7 +157,10 @@ impl From<&VirtualTvSession> for SessionsBroadcastEntry {
         let now = crate::sessions::iso_now();
         Self {
             id: v.id.clone(),
-            user_id: v.user_id.clone(),
+            user_id: v
+                .user_id
+                .map(|u| u.0.simple().to_string())
+                .unwrap_or_default(),
             user_name: Some(v.user_name.clone()),
             device_id: Some(v.id.clone()),
             device_name: Some(v.device_name.clone()),

@@ -95,7 +95,7 @@ async fn add_user(stores: &Stores, name: &str, admin: bool) -> (UserId, String) 
 /// `directory` receives the users' ids so a test can mark a cast as theirs.
 async fn boot(
     reachable: &[(&str, bool)],
-    active: impl FnOnce(&str) -> Vec<ActiveCastInfo>,
+    active: impl FnOnce(UserId) -> Vec<ActiveCastInfo>,
     configured: bool,
 ) -> Rig {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
@@ -111,7 +111,7 @@ async fn boot(
                 .iter()
                 .map(|(n, r)| ((*n).to_string(), *r))
                 .collect(),
-            active: active(&alice_id),
+            active: active(alice),
         }));
     }
     let state = web::Data::new(state);
@@ -226,7 +226,7 @@ async fn an_active_cast_shows_its_owner_and_item() {
         |alice| {
             vec![ActiveCastInfo {
                 tv: "Living room".into(),
-                owner_user_id: alice.into(),
+                owner_user_id: alice,
                 owner_user_name: "alice".into(),
                 now_playing_item_id: Some("100".into()),
                 position_ticks: 42,
@@ -252,7 +252,7 @@ async fn rest_and_socket_carry_identical_values() {
         |alice| {
             vec![ActiveCastInfo {
                 tv: "Living room".into(),
-                owner_user_id: alice.into(),
+                owner_user_id: alice,
                 owner_user_name: "alice".into(),
                 now_playing_item_id: Some("100".into()),
                 position_ticks: 42,
