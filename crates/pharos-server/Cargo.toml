@@ -108,6 +108,7 @@ pharos-test-metrics = { path = "../pharos-test-metrics" }
 pharos-jellyfin-test-client = { path = "../pharos-jellyfin-test-client" }
 proptest = "1"
 regex-lite = "0.1"
+pharos-subs = { path = "../pharos-subs" }
 serde_json = "1"
 
 [lints]

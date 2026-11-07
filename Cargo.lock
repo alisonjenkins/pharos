@@ -5285,6 +5285,7 @@ dependencies = [
  "pharos-scanner",
  "pharos-store-sqlx",
  "pharos-styling",
+ "pharos-subs",
  "pharos-sync",
  "pharos-test-metrics",
  "pharos-transcode",

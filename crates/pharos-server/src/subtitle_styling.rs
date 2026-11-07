@@ -981,7 +981,7 @@ fn now_secs() -> i64 {
 }
 
 /// The file's mtime (whole seconds) and size, as the scanner records them.
-async fn signature(path: &std::path::Path) -> Option<(i64, u64)> {
+pub(crate) async fn signature(path: &std::path::Path) -> Option<(i64, u64)> {
     let m = tokio::fs::metadata(path).await.ok()?;
     let mtime = m
         .modified()
