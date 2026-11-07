@@ -1464,6 +1464,31 @@ pub fn styled_track_url(track: &Track, tier: Tier, level: EffectsLevel) -> Optio
     ))
 }
 
+/// The subtitle tracks a picker offers at `level`: the generated styled track
+/// is hidden while Effects is Off (spec 028 FR-006), as the plain tracks
+/// beside it still draw.
+pub fn offered_subtitles(tracks: &[Track], level: EffectsLevel) -> Vec<Track> {
+    tracks
+        .iter()
+        .filter(|t| level != EffectsLevel::Off || t.styled_url.is_none())
+        .cloned()
+        .collect()
+}
+
+/// The track a generated styled track `styled` is made from: the one that
+/// serves the same WebVTT and is not itself generated. `None` when `styled`
+/// is not a generated track or its source is not listed.
+pub fn source_of_styled(tracks: &[Track], styled: u32) -> Option<u32> {
+    let generated = tracks
+        .iter()
+        .find(|t| t.index == styled && t.styled_url.is_some())?;
+    let vtt = generated.vtt_url.as_deref()?;
+    tracks
+        .iter()
+        .find(|t| t.styled_url.is_none() && t.vtt_url.as_deref() == Some(vtt))
+        .map(|t| t.index)
+}
+
 /// The log line and client event for the ASS renderer getting ready or
 /// failing, which falls back to plain text (B600). Both outcomes carry the
 /// same fields, so a fallback is as visible in the server log as a success.
@@ -2448,6 +2473,57 @@ mod tests {
             styled_track_url(&source, Tier::Tv, EffectsLevel::Full),
             None
         );
+    }
+
+    fn styled_pair() -> Vec<Track> {
+        let vtt = "/videos/7/subtitles/3/stream.vtt";
+        vec![
+            Track {
+                index: 1,
+                vtt_url: Some("/videos/7/subtitles/1/stream.vtt".into()),
+                ..Track::default()
+            },
+            Track {
+                index: 3,
+                codec: "ass".into(),
+                vtt_url: Some(vtt.into()),
+                ..Track::default()
+            },
+            Track {
+                index: 9,
+                codec: "ass".into(),
+                vtt_url: Some(vtt.into()),
+                styled_url: Some("/videos/7/subtitles/3/stream.ass".into()),
+                ..Track::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn effects_off_hides_the_styled_track_from_the_picker() {
+        let tracks = styled_pair();
+        let indexes = |level| -> Vec<u32> {
+            offered_subtitles(&tracks, level)
+                .iter()
+                .map(|t| t.index)
+                .collect()
+        };
+        assert_eq!(indexes(EffectsLevel::Off), [1, 3]);
+        assert_eq!(indexes(EffectsLevel::Subtle), [1, 3, 9]);
+        assert_eq!(indexes(EffectsLevel::Full), [1, 3, 9]);
+    }
+
+    #[test]
+    fn the_source_of_a_styled_track_is_the_one_with_its_plain_text() {
+        let tracks = styled_pair();
+        assert_eq!(source_of_styled(&tracks, 9), Some(3));
+        // Not generated: nothing to switch from.
+        assert_eq!(source_of_styled(&tracks, 3), None);
+        assert_eq!(source_of_styled(&tracks, 1), None);
+        assert_eq!(source_of_styled(&tracks, 42), None);
+        // The source is no longer listed: the player turns subtitles off.
+        let orphan: Vec<Track> = tracks.into_iter().filter(|t| t.index != 3).collect();
+        assert_eq!(source_of_styled(&orphan, 9), None);
     }
 
     #[test]
