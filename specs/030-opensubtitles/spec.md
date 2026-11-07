@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/opensubtitles-provider`
 **Created**: 2026-11-07T00:00:00Z
-**Status**: Draft
+**Status**: Slice 1 landed; slice 2 (V568, V569) open
 **Scope**: Search OpenSubtitles.com for subtitles from the Jellyfin "Search for subtitles" dialog, download the chosen one to the cache volume, and (slice 2) fetch missing subtitles in the background after a scan.
 **Decision record**: ADR-0069. **Task**: T76 (the two RemoteSearch endpoints, today stubs). **Verification**: V562-V571.
 **Depends on**: `SubtitleCache` and the cache PVC conventions (`[server].subtitle_cache_dir`), `discover_sidecars` (external subtitle streams), the TMDB/TVDB secret handling in `config.rs`.
@@ -58,11 +58,12 @@ After a scan, for each item with no subtitle (embedded or external) in any confi
 - **FR-001** The feature is off unless `[opensubtitles].api_key` or `PHAROS_OPENSUBTITLES_API_KEY` is set (blank is unset). `username` and `password` (or `PHAROS_OPENSUBTITLES_USERNAME` / `_PASSWORD`) are optional and raise the download quota. Secrets are never logged and never appear in a metric label (V570).
 - **FR-002** `/download` is called with a bearer token when a username and password are configured, and with the API key alone otherwise. The JWT is cached in memory until 5 minutes before expiry and refreshed once on a 401.
 - **FR-003** The OpenSubtitles hash is the file size plus the sum of the first 64 KiB and last 64 KiB read as little-endian u64 words, wrapping, printed as 16 lowercase hex digits. Files under 128 KiB have no hash (V562).
-- **FR-004** Downloaded subtitles live at `<subtitle cache dir>/opensubtitles/<item id>/<lang>.<file id>.srt`. When no subtitle cache directory is configured the feature is off with a startup warning (V564).
-- **FR-005** `discover_sidecars` also lists the files in that directory, after the sidecars beside the media, sorted by path, so the stream index is stable between PlaybackInfo and `Stream.vtt` (V565).
-- **FR-006** The client sends `User-Agent: Pharos v<crate version>`, paces itself to at most 4 requests per second, honours `Retry-After`, and treats 406 and 429 on `/download` as quota exhaustion, not a retryable error (V567).
+- **FR-004** Downloaded subtitles live at `<subtitle cache dir>/opensubtitles/<media id>/os<file id>.<lang>.srt`. When no subtitle cache directory is configured the feature is off with a startup warning (V564).
+- **FR-005** `discover_sidecars` also lists the files in that directory, sorted by path together with the sidecars beside the media, so the stream index is stable between PlaybackInfo and `Stream.vtt` (V565). The sidecar memo is invalidated by that directory's mtime.
+- **FR-006** The client sends `User-Agent: Pharos v<crate version>` and paces itself to at most 4 requests per second. A 429 is reported with its `Retry-After` and not retried inside the call. A 406 on `/download` is quota exhaustion: it closes the shared gate until the `reset_time_utc` the API names (24 h when absent), as does a successful download that leaves `remaining` at 0 (V567).
 - **FR-007** The job (slice 2) is bounded: one item at a time, a `[opensubtitles].max_downloads_per_day` ceiling (default 20) below the account's quota, a pause between items, a persisted memo of misses (V569), and it yields to playback (`bg_io`).
 - **FR-008** The languages the job searches come from `[opensubtitles].languages` (default `["en"]`).
+- **FR-009** The Jellyfin `RemoteSubtitleInfo.Id` is `<file id>-<language>` (for example `4242-en`), because the download POST carries nothing else and the stored file needs its language. Search and download require an admin.
 
 ## Verification
 

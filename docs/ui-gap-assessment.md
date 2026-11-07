@@ -121,7 +121,7 @@ native apps.
 | D15 | Chromecast sender | **Defer** (needs Google Cast SDK + a registered receiver) | Remote control of other pharos sessions (014) covers "play on the TV". Confirm. |
 | D16 | Display "layout mode" (TV / mobile / desktop / experimental) | **Replace** with one responsive layout + 011 input modes | One codebase, adapting to input instead of a mode switch. |
 | D17 | Help/tooltip dialogs linking to jellyfin docs | **Replace** with the shortcut sheet (`?`) and inline hints | |
-| D18 | Remote subtitle / image / metadata *provider search* (OpenSubtitles etc.) | **Defer** until a server provider exists | Endpoints return empty (T76). |
+| D18 | Remote subtitle / image / metadata *provider search* (OpenSubtitles etc.) | Subtitles: **done** (spec 030, OpenSubtitles, opt-in by API key). Images and metadata provider search: as before | Subtitle search returns results only with `[opensubtitles].api_key`; otherwise empty. |
 
 ---
 
