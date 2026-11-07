@@ -9124,6 +9124,59 @@ mod tests {
         );
     }
 
+    /// V575: a leader Play must cancel an open readiness gate, so a follower's
+    /// later Ready cannot resolve the stale gate and re-play its position.
+    #[tokio::test]
+    async fn leader_play_cancels_an_open_gate() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let (m2, _rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::SeekTo {
+            sender: m1,
+            position_ms: 60_000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot_of(&h).await.play_state,
+            GroupPlayState::Waiting,
+            "seek should open a gate"
+        );
+        h.tx.send(GroupMsg::LeaderPlay {
+            sender: m1,
+            position_ms: 5_000,
+        })
+        .await
+        .unwrap();
+        let _ = snapshot_of(&h).await;
+        while rx1.try_recv().is_ok() {}
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for mid in [m1, m2] {
+            h.tx.send(GroupMsg::MemberReady {
+                member_id: mid,
+                position_ms: 60_000,
+                playlist_item_id: None,
+                is_playing: false,
+            })
+            .await
+            .unwrap();
+        }
+        let _ = snapshot_of(&h).await;
+        while let Ok(msg) = rx1.try_recv() {
+            assert!(
+                !matches!(
+                    msg,
+                    ServerMsg::Play {
+                        position_ms: 60_000,
+                        ..
+                    }
+                ),
+                "stale seek gate re-played after a leader play: {msg:?}"
+            );
+        }
+        assert_eq!(snapshot_of(&h).await.play_state, GroupPlayState::Playing);
+    }
+
     /// D: a LeaderSeek (native/ws path) must behave like the HTTP SeekTo —
     /// open a readiness gate and resume playing on the followers' Ready — not
     /// broadcast a lone Seek that leaves the group ungated and drifting.
