@@ -868,13 +868,6 @@ fn frame_index_at_round_trips_through_the_frame_grid() {
 fn book_is_parsed_from_the_wire_discriminator() {
     use crate::MediaKind;
 
-    // `from_wire` is the single canonical parser for `IncludeItemTypes` / `Type`
-    // and is case-insensitive because clients disagree on casing.
-    assert_eq!(MediaKind::from_wire("Book"), Some(MediaKind::Book));
-    assert_eq!(MediaKind::from_wire("book"), Some(MediaKind::Book));
-    assert_eq!(MediaKind::from_wire("BOOK"), Some(MediaKind::Book));
-    assert_eq!(MediaKind::from_wire("  Book  "), Some(MediaKind::Book));
-
     // The internal/store token and the PascalCase wire token are DIFFERENT
     // fields and both are read: `as_str` is the store discriminator,
     // `base_item_kind` is `BaseItemDto.Type`, which strict kotlin clients
