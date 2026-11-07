@@ -977,6 +977,21 @@ fn sub_lines(item: &Item) -> Vec<String> {
     }
 }
 
+/// The player's heading: the show's name over "S1 · E22 · Title" for an
+/// episode, a film's name over its year. An episode with only a stand-in
+/// name drops it, since the numbers already say "E22".
+pub fn watch_heading(item: &Item) -> (String, Option<String>) {
+    match (item.kind, &item.series_name) {
+        (ItemKind::Episode, Some(series)) => {
+            let name = (!is_placeholder_episode_name(item)).then(|| item.name.clone());
+            let line: Vec<String> = [episode_label(item), name].into_iter().flatten().collect();
+            (series.clone(), (!line.is_empty()).then(|| line.join(" · ")))
+        }
+        (ItemKind::Episode, None) => (display_name(item), episode_label(item)),
+        _ => (display_name(item), item.year.map(|y| y.to_string())),
+    }
+}
+
 /// When a film or episode would end if played now, from where Play starts.
 fn title_ends_at(detail: &Detail) -> Option<String> {
     let item = &detail.item;
@@ -1072,6 +1087,50 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
         }
+    }
+
+    #[test]
+    fn the_player_heading_names_the_show_season_and_episode() {
+        let episode = Item {
+            name: "Future Enemies".into(),
+            series_name: Some("Frieren".into()),
+            season: Some(1),
+            episode: Some(22),
+            ..item(ItemKind::Episode)
+        };
+        assert_eq!(
+            watch_heading(&episode),
+            (
+                "Frieren".to_owned(),
+                Some("S1 · E22 · Future Enemies".to_owned())
+            )
+        );
+        let stand_in = Item {
+            name: "Frieren S01E22".into(),
+            ..episode.clone()
+        };
+        assert_eq!(
+            watch_heading(&stand_in),
+            ("Frieren".to_owned(), Some("S1 · E22".to_owned()))
+        );
+        let no_show = Item {
+            series_name: None,
+            ..episode
+        };
+        assert_eq!(
+            watch_heading(&no_show),
+            ("Future Enemies".to_owned(), Some("S1 · E22".to_owned()))
+        );
+        let film = Item {
+            name: "Dune".into(),
+            ..item(ItemKind::Movie)
+        };
+        assert_eq!(
+            watch_heading(&film),
+            ("Dune".to_owned(), Some("2001".to_owned()))
+        );
+        let undated = Item { year: None, ..film };
+        assert_eq!(watch_heading(&undated), ("Dune".to_owned(), None));
     }
 
     #[test]
