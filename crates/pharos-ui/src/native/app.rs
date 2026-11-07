@@ -33,8 +33,8 @@ use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, device_class, fade_volume, format_tier_drop, max_bitrate_label,
     offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop, parse_volume_setting,
-    position_at, preview_set, rust_subtitle_url, shown_font_urls, source_of_styled, start_ms,
-    starting_tier, starting_tier_line, styled_subtitle_signals, styled_subtitle_url,
+    position_at, preview_set, restart_styled, rust_subtitle_url, shown_font_urls, source_of_styled,
+    start_ms, starting_tier, starting_tier_line, styled_subtitle_signals, styled_subtitle_url,
     styled_track_url, subtitle_switch, tier_drop_line, tier_drop_report, up_next_at,
     volume_setting, EffectsLevel, Engine, LibraryTransition, MediaEvent, MediaState, OnFatal,
     OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch,
@@ -3617,6 +3617,11 @@ fn Player(
     // for; its WebVTT stays on screen until the renderer is ready.
     let styled = use_hook(|| Rc::new(RefCell::new(None::<platform::StyledSubtitles>)));
     let styled_for = use_hook(|| Rc::new(Cell::new(0_u64)));
+    // The script URL the renderer was last started for: a re-run that
+    // resolves to the same script (the effect runs again once playback
+    // starts) keeps the renderer instead of fetching the script a second
+    // time. Cleared when the renderer fails, so the next run retries.
+    let styled_url_for = use_hook(|| Rc::new(RefCell::new(None::<String>)));
     let mut styled_ready = use_signal(|| false);
     // A plain text subtitle drawn by the Rust renderer (spec 026), and the
     // pick it is for; its `<track>` stays loaded but hidden, and shows if the
@@ -3946,9 +3951,17 @@ fn Player(
     let burned = p.burned();
     // The renderer calls back from worker events, outside the Dioxus runtime.
     let styled_events = use_coroutine({
-        let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+        let (styled, styled_for, styled_url_for) = (
+            Rc::clone(&styled),
+            Rc::clone(&styled_for),
+            Rc::clone(&styled_url_for),
+        );
         move |mut events: UnboundedReceiver<(u64, Result<(), String>)>| {
-            let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
+            let (styled, styled_for, styled_url_for) = (
+                Rc::clone(&styled),
+                Rc::clone(&styled_for),
+                Rc::clone(&styled_url_for),
+            );
             async move {
                 while let Some((pick, result)) = events.next().await {
                     if pick != styled_for.get() {
@@ -3964,6 +3977,7 @@ fn Player(
                         Err(_) => {
                             platform::warn(&line);
                             styled.borrow_mut().take();
+                            styled_url_for.replace(None);
                             styled_ready.set(false);
                         }
                     }
@@ -3990,13 +4004,14 @@ fn Player(
         }
     });
     use_effect({
-        let (p, styled, styled_for) = (Rc::clone(&p), Rc::clone(&styled), Rc::clone(&styled_for));
+        let (p, styled, styled_for, styled_url_for) = (
+            Rc::clone(&p),
+            Rc::clone(&styled),
+            Rc::clone(&styled_for),
+            Rc::clone(&styled_url_for),
+        );
         move || {
             let shown = if burned { None } else { subtitle() };
-            let pick = styled_for.get().wrapping_add(1);
-            styled_for.set(pick);
-            styled.borrow_mut().take();
-            styled_ready.set(false);
             // Read before any return, so a tier drop or a level change
             // reloads the script in place.
             let (tier_now, level_now) = (tier(), effects());
@@ -4009,6 +4024,14 @@ fn Player(
                     .filter(|t| t.styled_url.is_none())
                     .and_then(styled_subtitle_url)
             });
+            if !restart_styled(styled_url_for.borrow().as_deref(), script.as_deref()) {
+                return;
+            }
+            styled_url_for.replace(script.clone());
+            let pick = styled_for.get().wrapping_add(1);
+            styled_for.set(pick);
+            styled.borrow_mut().take();
+            styled_ready.set(false);
             let Some(url) = script else {
                 return;
             };
