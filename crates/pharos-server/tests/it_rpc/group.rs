@@ -1926,3 +1926,95 @@ async fn a_permitted_join_of_a_fresh_persisted_group_hydrates_and_joins_it() {
     // The owner's seat from the snapshot, plus the joiner.
     assert_eq!(live.snapshot().await.unwrap().member_count, 2);
 }
+
+/// `Membership.setItem` to `item` from `position_ms`, moving from the queue
+/// entry `from` (empty: any).
+async fn set_item(
+    member: &membership::Client,
+    item: u64,
+    position_ms: u64,
+    from: &str,
+) -> Result<(), String> {
+    let mut req = member.set_item_request();
+    {
+        let mut p = req.get();
+        set_device(p.reborrow().init_ctx(), "dev");
+        p.reborrow().init_item().set_real(item);
+        p.set_position_ms(position_ms);
+        p.set_playlist_item_id(from);
+    }
+    let reply = req.send().promise.await.expect("call");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        pharos_api::pharos_capnp::done::Ok(()) => Ok(()),
+        pharos_api::pharos_capnp::done::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+/// The next item B's sink is told the group moved to, as (item, position).
+async fn next_item(seen: &mut mpsc::UnboundedReceiver<Seen>) -> (u64, u64) {
+    until(seen, |s| match s {
+        Seen::Item {
+            item, position_ms, ..
+        } => Some((*item, *position_ms)),
+        _ => None,
+    })
+    .await
+}
+
+/// 014 US9: a member moves the group to the next episode, from a position,
+/// and every member is told.
+/// Disarm check: with `setItem` answering ok without sending `MoveToItem`, B
+/// never hears the item and this times out.
+#[actix_web::test]
+async fn a_member_moves_the_group_to_the_next_episode() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    let mut pair = playing_pair(&rig).await;
+    set_item(&pair.a, SHOW_S1[1], 3_000, "").await.unwrap();
+    assert_eq!(next_item(&mut pair.b_seen).await, (SHOW_S1[1], 3_000));
+}
+
+/// 014 US9: a move from a queue entry the group has already left is answered
+/// ok and dropped (the second of two members' autoplay at an episode's end),
+/// so the next valid move is the first the group hears.
+/// Disarm check: with the stale check removed, B hears the stale move first.
+#[actix_web::test]
+async fn a_move_from_a_left_entry_is_dropped() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    let mut pair = playing_pair(&rig).await;
+    set_item(&pair.a, SHOW_S1[1], 0, "not-the-playing-entry")
+        .await
+        .unwrap();
+    set_item(&pair.a, SHOW_S1[2], 0, "").await.unwrap();
+    assert_eq!(next_item(&mut pair.b_seen).await, (SHOW_S1[2], 0));
+}
+
+/// V201 for `setItem`: the group is not moved to an item one of its members
+/// may not see.
+/// Disarm check: with the `may_queue` check dropped, the move is answered ok
+/// and B is sent an item it may not open.
+#[actix_web::test]
+async fn the_group_is_not_moved_to_an_item_a_member_may_not_see() {
+    let rig = rig().await;
+    seed_show(&rig).await;
+    let mut pair = playing_pair(&rig).await;
+    rig.fx
+        .state
+        .stores
+        .set_policy(
+            rig.fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![rig.fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    let err = set_item(&pair.a, SHOW_S1[1], 0, "").await.unwrap_err();
+    assert_eq!(err, "not permitted: queueing");
+    let other = rig.fx.other_item_id;
+    set_item(&pair.a, other, 0, "").await.unwrap();
+    assert_eq!(next_item(&mut pair.b_seen).await, (other, 0));
+}

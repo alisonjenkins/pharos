@@ -940,6 +940,17 @@ impl Membership {
         label: &str,
         make: impl FnOnce(MemberId) -> GroupMsg,
     ) -> Result<(), Denial> {
+        self.command_checked(label, async |_| true, make).await
+    }
+
+    /// [`Self::command`], sent only if `check` passes on the group; a
+    /// refusal answers `notPermitted{what "command"}`.
+    async fn command_checked(
+        &self,
+        label: &str,
+        check: impl AsyncFnOnce(&GroupHandle) -> bool,
+        make: impl FnOnce(MemberId) -> GroupMsg,
+    ) -> Result<(), Denial> {
         if self.left.get() {
             return Err(Denial::NotFound { what: "group" });
         }
@@ -960,7 +971,7 @@ impl Membership {
             &self.session.state.stores,
             Some(&self.key),
             label,
-            async |_| true,
+            check,
             make,
         )
         .await;
@@ -1194,6 +1205,49 @@ impl server::membership::Handler for Membership {
                 playlist_item_id,
             })
             .await;
+        write_done(results.get().init_result(), done);
+        Ok(())
+    }
+
+    async fn set_item(
+        self: Rc<Self>,
+        params: member_wire::SetItemParams,
+        results: &mut member_wire::SetItemResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let item = read_item_id(params.get_item()?)?;
+        let position_ms = params.get_position_ms();
+        let from = playlist_item_id(params.get_playlist_item_id()?.to_string()?);
+        let done = async {
+            let WireId::Real(item) = item else {
+                return Err(Denial::Invalid { field: "item" });
+            };
+            let user = self.session.current_user().await?;
+            let queued = vec![wire_item_id(item)];
+            let runtime_ms = resolve_runtimes_ms(&self.session.state, &queued)
+                .await
+                .into_iter()
+                .next()
+                .flatten();
+            let state = &self.session.state;
+            self.command_checked(
+                "set_item",
+                async |group| may_queue(state, &user, group, &queued, QueueVia::SetNewQueue).await,
+                |sender| GroupMsg::MoveToItem {
+                    sender,
+                    from,
+                    item_id: queued[0].clone(),
+                    runtime_ms,
+                    start_position_ms: position_ms,
+                },
+            )
+            .await
+            .map_err(|denial| match denial {
+                Denial::NotPermitted { .. } => Denial::NotPermitted { what: "queueing" },
+                other => other,
+            })
+        }
+        .await;
         write_done(results.get().init_result(), done);
         Ok(())
     }
