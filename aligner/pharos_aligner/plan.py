@@ -16,9 +16,17 @@ class Line(NamedTuple):
     text: str
 
 
-def window(line: Line) -> tuple[int, int]:
+# A line is aligned against at most this long a stretch of audio a word, plus
+# CAP_EXTRA_MS, however far off the next line starts: a line followed by an
+# instrumental break otherwise hands CTC a window that is mostly music.
+CAP_MS_PER_WORD = 700
+CAP_EXTRA_MS = 2000
+
+
+def window(line: Line, n_words: int) -> tuple[int, int]:
     """Compute audio decode window with safety margin around line LRC span."""
-    return (max(0, line.start_ms - MARGIN_MS), line.end_ms + MARGIN_MS)
+    end_ms = min(line.end_ms, line.start_ms + n_words * CAP_MS_PER_WORD + CAP_EXTRA_MS)
+    return (max(0, line.start_ms - MARGIN_MS), end_ms + MARGIN_MS)
 
 
 def stamps(

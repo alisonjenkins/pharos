@@ -133,7 +133,7 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     if not w_list:
                         out_lines.append({"words": []})
                         continue
-                    w_start, w_end = window(line)
+                    w_start, w_end = window(line, len(w_list))
                     pcm = decoder(full_path, w_start, w_end)
                     tokens = [w.token for w in w_list]
                     try:
