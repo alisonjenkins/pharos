@@ -536,7 +536,7 @@ pub async fn register(
                 if let Err(e) = state
                     .sessions
                     .apply(crate::sessions::SessionEvent::Stopped {
-                        session_id: id.as_str().to_owned(),
+                        session_id: id.clone(),
                     })
                     .await
                 {

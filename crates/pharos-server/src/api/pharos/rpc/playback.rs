@@ -225,6 +225,7 @@ impl Drop for Grant {
         }
         let session = Rc::clone(&self.session);
         let play_session_id = std::mem::take(&mut self.play_session_id);
+        let psid = pharos_core::PlaySessionId::from(play_session_id.as_str());
         let item_wire_id = std::mem::take(&mut self.item_wire_id);
         let reported_ms = self.reported_ms.get();
         actix_web::rt::spawn(async move {
@@ -245,15 +246,12 @@ impl Drop for Grant {
                     // end the playback without saving a position.
                     Err(play_state::ReportError::Withheld(hidden)) => {
                         tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
-                        (
-                            play_state::end(&session.state, user.id, &play_session_id).await,
-                            false,
-                        )
+                        (play_state::end(&session.state, user.id, &psid).await, false)
                     }
                     other => (other, reported_ms.is_some()),
                 },
                 Err(_) => (
-                    play_state::end(&session.state, session.owner(), &play_session_id).await,
+                    play_state::end(&session.state, session.owner(), &psid).await,
                     false,
                 ),
             };

@@ -142,20 +142,20 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
 /// now-playing entry. It reads and writes nothing of the user's, so it needs
 /// no live session: a grant released after its token was revoked still ends
 /// what it started.
-pub async fn end(state: &AppState, owner: UserId, session_id: &str) -> Result<(), ReportError> {
+pub async fn end(
+    state: &AppState,
+    owner: UserId,
+    session_id: &pharos_core::PlaySessionId,
+) -> Result<(), ReportError> {
     // B256: the PlaySessionId authorizes streams on its own, so the
     // stop that ends the playback ends the capability too.
-    if let Err(e) = state
-        .transcode_sessions
-        .end_held(&pharos_core::PlaySessionId::from(session_id), owner)
-        .await
-    {
+    if let Err(e) = state.transcode_sessions.end_held(session_id, owner).await {
         tracing::warn!(error = %e, "playback stop: transcode session end failed");
     }
     state
         .sessions
         .apply(SessionEvent::Stopped {
-            session_id: session_id.to_owned(),
+            session_id: session_id.clone(),
         })
         .await
         .map_err(|e| ReportError::RegistryDown(e.to_string()))
@@ -174,7 +174,12 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
             .map_err(ReportError::Withheld)?;
     }
     if let Some(session_id) = r.play_session_id {
-        end(state, user.id, session_id).await?;
+        end(
+            state,
+            user.id,
+            &pharos_core::PlaySessionId::from(session_id),
+        )
+        .await?;
     }
 
     // Persist final UserData. If the client stopped within the last

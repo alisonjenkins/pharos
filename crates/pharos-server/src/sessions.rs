@@ -1,7 +1,7 @@
 //! `SessionRegistry` actor — owns the set of active playback sessions.
 //! V18 — handlers send mpsc messages; no `Mutex` on the request path.
 
-use pharos_core::{ClientDeviceId, UserId};
+use pharos_core::{ClientDeviceId, PlaySessionId, UserId};
 use pharos_jellyfin_api::dto::format_iso8601;
 use serde::Serialize;
 use std::time::Duration;
@@ -99,7 +99,7 @@ pub enum SessionEvent {
         is_paused: bool,
     },
     Stopped {
-        session_id: String,
+        session_id: PlaySessionId,
     },
     /// P28 — apply a client's advertised capabilities to its
     /// session record. No-op when the session isn't tracked yet
@@ -310,7 +310,7 @@ impl SessionRegistry {
                         }
                     }
                     Msg::Apply(SessionEvent::Stopped { session_id }) => {
-                        state.remove(&session_id);
+                        state.remove(session_id.as_str());
                     }
                     Msg::Apply(SessionEvent::SetCapabilities {
                         session_id,
