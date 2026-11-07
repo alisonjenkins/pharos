@@ -195,3 +195,74 @@ async fn wrong_current_passwords_on_change_password_never_lock_the_user_out() {
     assert_eq!(guest_policy(&f).await["IsDisabled"], false);
     assert_eq!(login(&f, "guest", "hunter2").await.0, 200);
 }
+
+// ---- V578: AccessSchedules ----
+
+const DAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+/// A schedule that is closed now: a whole day three days from today, so a
+/// midnight rollover during the test cannot open it.
+fn closed_schedule() -> Value {
+    let (today, _) = pharos_server::local_time::now_local();
+    json!([{
+        "DayOfWeek": DAYS[usize::from((today + 3) % 7)],
+        "StartHour": 0.0,
+        "EndHour": 24.0
+    }])
+}
+
+fn open_schedule() -> Value {
+    json!([{ "DayOfWeek": "Everyday", "StartHour": 0.0, "EndHour": 24.0 }])
+}
+
+async fn get_me(f: &Fixture, token: &str) -> u16 {
+    let app = test::init_service(build_app(f.state.clone())).await;
+    let req = test::TestRequest::get()
+        .uri("/Users/Me")
+        .insert_header(("X-Emby-Token", token))
+        .to_request();
+    test::call_service(&app, req).await.status().as_u16()
+}
+
+#[actix_web::test]
+async fn login_outside_the_access_schedule_is_403_and_inside_is_200() {
+    let f = seed_rich().await;
+    assert_eq!(
+        post_policy(&f, json!({ "AccessSchedules": closed_schedule() })).await,
+        204
+    );
+    // Jellyfin: SecurityException -> 403, after the password was checked.
+    assert_eq!(login(&f, "guest", "hunter2").await.0, 403);
+    // A wrong password stays a plain 401: the schedule is not revealed.
+    assert_eq!(login(&f, "guest", "wrong").await.0, 401);
+
+    assert_eq!(
+        post_policy(&f, json!({ "AccessSchedules": open_schedule() })).await,
+        204
+    );
+    assert_eq!(login(&f, "guest", "hunter2").await.0, 200);
+}
+
+#[actix_web::test]
+async fn an_existing_token_is_403_outside_the_schedule_and_works_inside_it() {
+    let f = seed_rich().await;
+    assert_eq!(get_me(&f, &f.user_token).await, 200);
+    assert_eq!(
+        post_policy(&f, json!({ "AccessSchedules": closed_schedule() })).await,
+        204
+    );
+    assert_eq!(get_me(&f, &f.user_token).await, 403);
+    assert_eq!(
+        post_policy(&f, json!({ "AccessSchedules": open_schedule() })).await,
+        204
+    );
+    assert_eq!(get_me(&f, &f.user_token).await, 200);
+}

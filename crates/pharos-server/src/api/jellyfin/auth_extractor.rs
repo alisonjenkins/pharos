@@ -318,6 +318,7 @@ fn auth_failure(refusal: TokenRefusal) -> actix_web::Error {
         TokenRefusal::ScopeRestricted => {
             actix_web::error::ErrorForbidden("token scope does not permit this route")
         }
+        TokenRefusal::OutsideSchedule => ErrorForbidden("User is not allowed access at this time."),
     }
 }
 
