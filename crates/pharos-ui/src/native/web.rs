@@ -362,7 +362,10 @@ pub fn capabilities() -> Capabilities {
             .is_some_and(|v| !v.can_play_type(mime).is_empty())
     };
     let mse = |mime: &str| web_sys::MediaSource::is_type_supported(mime);
-    super::playback::capabilities(|mime| (has_mse() && mse(mime)) || can_play(mime), can_play)
+    let mut caps =
+        super::playback::capabilities(|mime| (has_mse() && mse(mime)) || can_play(mime), can_play);
+    caps.hdr = prefers("(dynamic-range: high)");
+    caps
 }
 
 pub(super) fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
