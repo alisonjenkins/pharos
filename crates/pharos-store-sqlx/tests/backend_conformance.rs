@@ -165,6 +165,70 @@ where
     let got_admin = UserStore::get(&store, uid).await.unwrap();
     assert!(got_admin.policy.admin, "set_policy must flip admin flag");
 
+    // T68 (V577): the failed-login counter counts up, resets, is per user,
+    // and a missing user is an error rather than a silent no-op.
+    assert_eq!(
+        UserStore::record_failed_login(&store, uid).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        UserStore::record_failed_login(&store, uid).await.unwrap(),
+        2
+    );
+    UserStore::reset_failed_logins(&store, uid).await.unwrap();
+    assert_eq!(
+        UserStore::record_failed_login(&store, uid).await.unwrap(),
+        1
+    );
+    UserStore::reset_failed_logins(&store, uid).await.unwrap();
+    assert!(matches!(
+        UserStore::record_failed_login(&store, UserId::new()).await,
+        Err(pharos_core::AuthError::UserNotFound)
+    ));
+    assert!(matches!(
+        UserStore::reset_failed_logins(&store, UserId::new()).await,
+        Err(pharos_core::AuthError::UserNotFound)
+    ));
+
+    // disable_user sets only is_disabled: the rest of the stored policy
+    // survives, it is idempotent, and a missing user is an error.
+    UserStore::set_policy(
+        &store,
+        uid,
+        UserPolicy {
+            admin: true,
+            max_active_sessions: 3,
+            blocked_tags: vec!["kept".to_string()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    UserStore::disable_user(&store, uid).await.unwrap();
+    UserStore::disable_user(&store, uid).await.unwrap();
+    let disabled = UserStore::get(&store, uid).await.unwrap();
+    assert!(
+        disabled.policy.is_disabled,
+        "disable_user must set the flag"
+    );
+    assert!(disabled.policy.admin);
+    assert_eq!(disabled.policy.max_active_sessions, 3);
+    assert_eq!(disabled.policy.blocked_tags, vec!["kept".to_string()]);
+    assert!(matches!(
+        UserStore::disable_user(&store, UserId::new()).await,
+        Err(pharos_core::AuthError::UserNotFound)
+    ));
+    UserStore::set_policy(
+        &store,
+        uid,
+        UserPolicy {
+            admin: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
     // Login lookup: case-insensitive, every case variant returned, exact first.
     UserStore::create(&store, user_record("Mixed-Case"))
         .await

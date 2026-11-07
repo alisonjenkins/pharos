@@ -3122,6 +3122,50 @@ impl UserStore for PostgresStore {
         }
         Ok(())
     }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn record_failed_login(&self, id: UserId) -> AuthResult<i32> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 \
+             WHERE id = $1 RETURNING failed_login_attempts",
+        )
+        .bind(id.0.as_bytes().to_vec())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let (n,) = row.ok_or(AuthError::UserNotFound)?;
+        Ok(n)
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn reset_failed_logins(&self, id: UserId) -> AuthResult<()> {
+        let res = sqlx::query("UPDATE users SET failed_login_attempts = 0 WHERE id = $1")
+            .bind(id.0.as_bytes().to_vec())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %id))]
+    async fn disable_user(&self, id: UserId) -> AuthResult<()> {
+        let res = sqlx::query(
+            "UPDATE users SET policy_json = \
+             (COALESCE(NULLIF(policy_json, '')::jsonb, '{}'::jsonb) \
+              || '{\"is_disabled\": true}'::jsonb)::text WHERE id = $1",
+        )
+        .bind(id.0.as_bytes().to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound);
+        }
+        Ok(())
+    }
 }
 
 impl PostgresStore {
