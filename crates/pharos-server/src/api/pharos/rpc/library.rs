@@ -428,6 +428,13 @@ impl server::library::Handler for Library {
                 return Ok(());
             }
         };
+        // Spec 028 — a viewer who opens a video gets its subtitles styled
+        // ahead of the backfill.
+        if let Some(queue) = state.subtitle_styling.as_ref() {
+            if matches!(item.kind, MediaKind::Movie | MediaKind::Episode) {
+                queue.request(item.id);
+            }
+        }
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
         let mut out = results.get().init_result().init_detail();
         let mut summary = out.reborrow().init_summary();
