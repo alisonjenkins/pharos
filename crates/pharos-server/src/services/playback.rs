@@ -1368,12 +1368,24 @@ pub async fn grant(
     // else their language rules.
     let streams = crate::services::watch::streams(&item).await;
     let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
+    // A remembered pick counts as the player's own: the grant echoes the
+    // styled index, so that is what the player reports and gets remembered.
+    let stated_subtitle = r.subtitle_stream_index.or_else(|| {
+        audio
+            .prefs
+            .remember_subtitle
+            .then_some(audio.remembered.subtitle_stream_index)
+            .flatten()
+            .map(i64::from)
+    });
+    let (requested_subtitle, styled_pick) =
+        crate::styled_track::negotiation_choice(&state.stores, &item, stated_subtitle).await;
     let subtitle = pick_subtitle(
         &audio,
         &streams,
         &item.probe,
         &profile.subtitle_profiles,
-        r.subtitle_stream_index,
+        requested_subtitle,
     );
     // The decision names these tracks, so the stream must carry them: the
     // picked subtitle (or none) is what gets burned, and an audio track other
@@ -1420,7 +1432,7 @@ pub async fn grant(
                 play_session_id: &play_session_id,
                 api_key: None,
                 audio_stream_index: audio.index.map(|i| i.to_string()),
-                explicit_subtitle_index: r.subtitle_stream_index,
+                explicit_subtitle_index: requested_subtitle,
                 is_web_client: false,
                 resume_ticks,
                 transcoding: true,
@@ -1462,7 +1474,7 @@ pub async fn grant(
         negotiated,
         stream_url,
         audio_stream_index: audio.index,
-        subtitle_stream_index: subtitle,
+        subtitle_stream_index: styled_pick.or(subtitle),
     })
 }
 

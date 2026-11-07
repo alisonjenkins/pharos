@@ -29,6 +29,37 @@ pub async fn is_styled_index(item: &MediaItem, stream_index: u32) -> bool {
     stream_index == styled_index(&item.probe, u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// A native player's subtitle pick as negotiation sees it. The styled track
+/// is drawn by the client from `stream.ass`, never burned, so naming it
+/// negotiates as its source track (text, drawn by the client). The second
+/// value is the styled index when that substitution happened, so the grant
+/// can echo the player's own pick. A styled pick whose plan is no longer
+/// current (the file changed and the job has not restyled it yet) negotiates
+/// as no pick, so the server's default choice applies rather than none.
+pub async fn negotiation_choice<S: SubtitleStylingStore>(
+    store: &S,
+    item: &MediaItem,
+    requested: Option<i64>,
+) -> (Option<i64>, Option<u32>) {
+    let Some(n) = requested.and_then(|n| u32::try_from(n).ok()) else {
+        return (requested, None);
+    };
+    if !is_styled_index(item, n).await {
+        return (requested, None);
+    }
+    match current(store, item).await {
+        Some(row) => (Some(i64::from(row.source_index)), Some(n)),
+        None => {
+            tracing::info!(
+                item = %item.id,
+                requested = n,
+                "styled track asked for without a current plan; negotiating the default subtitle"
+            );
+            (None, None)
+        }
+    }
+}
+
 /// The item's styling row when its plan can still be served: it has a plan,
 /// the director version is current, the video file is the one the plan was
 /// made from, and a sidecar source still has the signature it had then.
