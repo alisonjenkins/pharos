@@ -871,16 +871,31 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// Should the group refuse it (a server before schemaVersion 23, or an
     /// item another member may not see), this member plays it alone.
     pub fn move_to(&self, item: ItemRef, position_ms: u64) -> bool {
+        self.send_move(item, position_ms, true)
+    }
+
+    /// Move the group to `item` from `position_ms` because the viewer asked
+    /// for it on a title page ("Play for the group", 014 US10), even while
+    /// this member watches something else alone. `false` out of a group,
+    /// where the caller starts one. A refused move plays the item alone, as
+    /// for `move_to`.
+    pub fn play_for_group(&self, item: ItemRef, position_ms: u64) -> bool {
+        self.send_move(item, position_ms, false)
+    }
+
+    /// `setItem` to the group, from the player it drives when `from_stage`.
+    fn send_move(&self, item: ItemRef, position_ms: u64, from_stage: bool) -> bool {
         let (driving, from, epoch) = {
             let inner = self.inner.borrow();
             (
-                inner.active && inner.state.drives_stage(),
+                inner.active && (!from_stage || inner.state.drives_stage()),
                 inner.state.playlist_item_id.clone(),
                 inner.epoch,
             )
         };
         self.env.info(&format!(
-            "pharos: group move item={item} position_ms={position_ms} from={from:?} route={}",
+            "pharos: group move item={item} position_ms={position_ms} from={from:?} asked={} route={}",
+            if from_stage { "player" } else { "title" },
             if driving { "group" } else { "alone" }
         ));
         if !driving {
@@ -1975,6 +1990,36 @@ mod tests {
         assert!(!rig.session.move_to(ItemRef::Real(10), 0));
         rig.env.settle();
         assert!(calls_with(&rig, "set_item").is_empty());
+    }
+
+    /// "Play for the group" on a title page (014 US10) moves the group even
+    /// from a member watching something else alone, from the position asked,
+    /// and the group's item update then brings this member to it.
+    #[test]
+    fn playing_a_title_for_the_group_moves_it_from_anywhere() {
+        let rig = rig();
+        rig.session.deliver(item_update(0, true));
+        rig.session.set_watching(Some(ItemRef::Real(9)));
+        rig.env.settle();
+        assert!(rig.session.play_for_group(ItemRef::Real(10), 5_000));
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "set_item"), ["set_item(10,5000,p1)"]);
+        assert!(rig
+            .env
+            .ui
+            .borrow()
+            .contains(&Ui::Navigate(ItemRef::Real(10))));
+    }
+
+    /// Out of a group there is no group to play for: the caller starts one.
+    #[test]
+    fn playing_for_the_group_out_of_one_sends_nothing() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let env = TestEnv::default();
+        let session = Session::new(groups.clone(), env.clone());
+        assert!(!session.play_for_group(ItemRef::Real(10), 0));
+        env.settle();
+        assert!(groups.calls().iter().all(|c| !c.starts_with("set_item")));
     }
 
     /// A move the group refuses (an older server, or an item another member
