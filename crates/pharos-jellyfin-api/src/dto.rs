@@ -2859,6 +2859,41 @@ pub struct MediaAttachmentDto {
     pub delivery_url: String,
 }
 
+/// Jellyfin `RemoteSubtitleInfo` (`GET /Items/{id}/RemoteSearch/Subtitles/{lang}`),
+/// the shape in jellyfin-sdk-kotlin's generated model. Every field is nullable
+/// there, so absent values are omitted rather than sent as null. Typed per
+/// B78/V38.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub struct RemoteSubtitleInfoDto {
+    #[serde(
+        rename = "ThreeLetterISOLanguageName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub three_letter_iso_language_name: Option<String>,
+    /// Handed back verbatim in `POST .../RemoteSearch/Subtitles/{subtitleId}`.
+    pub id: String,
+    pub provider_name: String,
+    pub name: String,
+    pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub community_rating: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<f32>,
+    pub download_count: u32,
+    pub is_hash_match: bool,
+    pub ai_translated: bool,
+    pub machine_translated: bool,
+    pub forced: bool,
+    pub hearing_impaired: bool,
+}
+
 /// `media_source_id` names the source the attachments belong to when it is
 /// not the item's own file (a grouped edition).
 pub fn build_media_attachments(
