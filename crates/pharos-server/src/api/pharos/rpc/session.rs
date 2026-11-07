@@ -100,6 +100,26 @@ impl Session {
         crate::api::jellyfin::items::ip_is_remote(&self.ctx.client_ip)
     }
 
+    /// The device this session's token was issued to: the server's own
+    /// `pharos-native-…` id from sign-in, never one the client states. It is
+    /// the key `/Sessions` lists the device under, as the token's device is
+    /// for a `/socket` that sends no `deviceId`. `None`, with a WARN, when the
+    /// store errors or no longer knows the token: a session is never listed
+    /// under a made-up device, which would supersede every other such one.
+    pub(super) async fn device_id(&self) -> Option<pharos_core::ClientDeviceId> {
+        match self.state.stores.device_for_token(&self.token).await {
+            Ok(Some(device)) => Some(pharos_core::ClientDeviceId::from(device)),
+            Ok(None) => {
+                tracing::warn!("native session: token has no device");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "native session: token device lookup failed");
+                None
+            }
+        }
+    }
+
     /// Whether `user` has opted in to sending diagnostics: the pref reads
     /// `true`. Absent or anything else is off.
     pub(super) async fn diagnostics_opted_in(&self, user: UserId) -> DomainResult<bool> {

@@ -58,6 +58,12 @@ impl server::playback::Handler for Playback {
             stream_choice::None(()) => Some(-1),
             stream_choice::Default(()) => None,
         };
+        // A version that is not text only costs the listing its version.
+        let client_version = params
+            .get_ctx()?
+            .get_client_version()?
+            .to_string()
+            .unwrap_or_default();
         let session = &self.session;
         let granted = match (session.current_user().await, id, audio_stream_index) {
             (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
@@ -69,14 +75,16 @@ impl server::playback::Handler for Playback {
                     token: &session.token,
                     client_is_remote: session.client_is_remote(),
                 };
-                playback::grant(&session.state, &user, id, &request)
-                    .await
-                    .map_err(|e| match e {
-                        GrantError::Item(e) => item_denial(id, &e, "negotiate"),
-                        GrantError::NotPlayable => Denial::NotPermitted {
-                            what: "streaming a book",
-                        },
-                    })
+                match playback::grant(&session.state, &user, id, &request).await {
+                    Ok(grant) => {
+                        start_session(session, &user, &grant, client_version).await;
+                        Ok(grant)
+                    }
+                    Err(GrantError::Item(e)) => Err(item_denial(id, &e, "negotiate")),
+                    Err(GrantError::NotPlayable) => Err(Denial::NotPermitted {
+                        what: "streaming a book",
+                    }),
+                }
             }
             (Ok(_), WireId::Synth(_), Ok(_)) => Err(Denial::NotFound { what: "item" }),
         };
@@ -102,6 +110,55 @@ impl server::playback::Handler for Playback {
             Err(denial) => denial.write(out.init_error()),
         }
         Ok(())
+    }
+}
+
+/// The client name `/Sessions` lists a native player under.
+const NATIVE_CLIENT: &str = "Pharos";
+/// The device name it lists it under: the connection states none.
+const NATIVE_DEVICE_NAME: &str = "Pharos native";
+
+/// Lists the grant in `/Sessions` as `/Sessions/Playing` would, so the
+/// dashboard shows it and the grant's reports and stop have an entry to move
+/// and end. A registry fault is logged and the grant stands: the player can
+/// still play, it just is not listed.
+async fn start_session(
+    session: &Session,
+    user: &pharos_core::User,
+    grant: &playback::Grant,
+    client_version: String,
+) {
+    let Some(device_id) = session.device_id().await else {
+        tracing::warn!(
+            play_session_id = %pharos_core::secret_prefix(&grant.play_session_id),
+            "native playback: session not listed, device unknown"
+        );
+        return;
+    };
+    let started = play_state::start(
+        &session.state,
+        play_state::Start {
+            play_session_id: grant.play_session_id.clone(),
+            user,
+            device_id,
+            device_name: NATIVE_DEVICE_NAME.into(),
+            client: NATIVE_CLIENT.into(),
+            version: if client_version.is_empty() {
+                "0".into()
+            } else {
+                client_version
+            },
+            item_wire_id: grant.item_wire_id.clone(),
+            position_ticks: 0,
+        },
+    )
+    .await;
+    if let Err(e) = started {
+        tracing::warn!(
+            play_session_id = %pharos_core::secret_prefix(&grant.play_session_id),
+            error = %e,
+            "native playback: session not listed"
+        );
     }
 }
 
