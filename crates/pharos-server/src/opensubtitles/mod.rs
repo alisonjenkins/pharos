@@ -8,6 +8,7 @@ pub mod client;
 pub mod hash;
 pub mod quota;
 pub mod store;
+pub mod telemetry;
 
 use std::future::Future;
 use std::pin::Pin;
