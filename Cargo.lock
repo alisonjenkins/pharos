@@ -5284,6 +5284,7 @@ dependencies = [
  "pharos-jellyfin-test-client",
  "pharos-scanner",
  "pharos-store-sqlx",
+ "pharos-styling",
  "pharos-sync",
  "pharos-test-metrics",
  "pharos-transcode",
