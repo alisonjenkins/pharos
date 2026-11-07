@@ -362,6 +362,8 @@ async fn authenticate_by_name(
                 "invalid credentials",
             )
         })?;
+    crate::services::auth::login_gate(&user)
+        .map_err(|g| actix_web::error::ErrorForbidden(g.message()))?;
 
     let token = state
         .stores
@@ -473,6 +475,8 @@ async fn authenticate_with_quick_connect(
         return Err(ErrorUnauthorized("quick connect not authorized"));
     }
     let user = record.into_user();
+    crate::services::auth::login_gate(&user)
+        .map_err(|g| actix_web::error::ErrorForbidden(g.message()))?;
 
     let token = state
         .stores
