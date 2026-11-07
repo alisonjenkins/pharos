@@ -138,3 +138,10 @@ runs before each push (CLAUDE.md).
   "Play for the group" and call `Session::play_for_group`, which moves the
   group from any page; two-browser Playwright: A opens another film's title
   and plays it for the group, both members play it in step; V612.
+- [x] T049 [US1] UI: a member says ready only at the group's position: a
+  joiner whose player loaded at their own resume point is seeked to the group
+  first (B664, V615). Two-browser Playwright: B, with a resume point 72 s in,
+  joins a paused group and waits at its position.
+- [x] T050 [US1] UI: a reloaded tab joins its group again from the id it kept
+  in sessionStorage (B665, V616). Two-browser Playwright: B reloads mid-film
+  and is back in the group, in step.
