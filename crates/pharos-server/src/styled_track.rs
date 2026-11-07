@@ -61,7 +61,7 @@ pub async fn negotiation_choice<S: SubtitleStylingStore>(
 }
 
 /// The item's styling row when its plan can still be served: it has a plan,
-/// the director version is current, the video file is the one the plan was
+/// its director is this one or older, the video file is the one the plan was
 /// made from, and a sidecar source still has the signature it had then.
 /// A read error is logged and answers `None`.
 pub async fn current<S: SubtitleStylingStore>(
@@ -90,13 +90,26 @@ pub async fn current<S: SubtitleStylingStore>(
         );
     };
     row.plan_json.as_ref()?;
-    if row.director_version != DIRECTOR_VERSION {
+    // A plan from an older director is still served until the job replaces
+    // it (V613): a director bump re-styles every item in the background, and
+    // withdrawing each track until then would hide styled subtitles for
+    // hours. Only a plan from a newer director (a rollback) is refused, as
+    // this build may not read it.
+    if row.director_version > DIRECTOR_VERSION {
         rejected(
             "director version",
             row.director_version.to_string(),
             DIRECTOR_VERSION.to_string(),
         );
         return None;
+    }
+    if row.director_version < DIRECTOR_VERSION {
+        tracing::debug!(
+            item = %item.id,
+            stored = row.director_version,
+            current = DIRECTOR_VERSION,
+            "styled track: serving a plan from an older director until it is re-styled"
+        );
     }
     let video = signature(&item.path).await;
     if video != Some((row.source_mtime, row.source_size)) {
