@@ -623,12 +623,30 @@ pub(crate) async fn ass_script(
             .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")));
     }
 
+    embedded_ass_script(
+        state.subtitles.as_ref(),
+        item,
+        stream_index,
+        &BgPermit::playback_priority(),
+    )
+    .await
+}
+
+/// The ASS/SSA script of the embedded stream `stream_index`, extracted once and
+/// cached when a cache is given. The caller's `permit` is the I/O budget the
+/// extraction runs under.
+pub(crate) async fn embedded_ass_script(
+    cache: Option<&pharos_cache::SubtitleCache>,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+    permit: &BgPermit,
+) -> Result<Vec<u8>, actix_web::Error> {
     let input = item
         .path
         .to_str()
         .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
     let mtime = mtime_secs(&item.path).await;
-    if let Some(cache) = state.subtitles.as_ref() {
+    if let Some(cache) = cache {
         if let Some(bytes) = cache
             .get(&item.path, mtime, stream_index, SubtitleKind::EmbeddedAss)
             .await
@@ -645,8 +663,7 @@ pub(crate) async fn ass_script(
         {
             return Ok((*bytes).clone());
         }
-        let out =
-            run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await?;
+        let out = run_ffmpeg_embedded_ass(input, stream_index, permit).await?;
         let stored = cache
             .store(
                 &item.path,
@@ -658,7 +675,7 @@ pub(crate) async fn ass_script(
             .await;
         return Ok((*stored).clone());
     }
-    run_ffmpeg_embedded_ass(input, stream_index, &BgPermit::playback_priority()).await
+    run_ffmpeg_embedded_ass(input, stream_index, permit).await
 }
 
 /// Pre-extract every text subtitle track of `item` into the subtitle cache so
@@ -1431,12 +1448,29 @@ async fn resolve_vtt_bytes(
         };
     }
 
+    embedded_vtt(
+        state.subtitles.as_ref(),
+        item,
+        stream_index,
+        &BgPermit::playback_priority(),
+    )
+    .await
+}
+
+/// The WebVTT form of the embedded text stream `stream_index`, extracted once
+/// and cached when a cache is given, under the caller's `permit`.
+pub(crate) async fn embedded_vtt(
+    cache: Option<&pharos_cache::SubtitleCache>,
+    item: &pharos_core::MediaItem,
+    stream_index: u32,
+    permit: &BgPermit,
+) -> Result<Vec<u8>, actix_web::Error> {
     let input = item
         .path
         .to_str()
         .ok_or_else(|| error::ErrorInternalServerError("non-utf8 path"))?;
     let mtime = mtime_secs(&item.path).await;
-    if let Some(cache) = state.subtitles.as_ref() {
+    if let Some(cache) = cache {
         if let Some(bytes) = cache
             .get(&item.path, mtime, stream_index, SubtitleKind::Embedded)
             .await
@@ -1461,13 +1495,13 @@ async fn resolve_vtt_bytes(
             idx = stream_index,
             "subtitle cache MISS — extracting on the request path"
         );
-        let out = run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await?;
+        let out = run_ffmpeg_embedded(input, stream_index, permit).await?;
         let stored = cache
             .store(&item.path, mtime, stream_index, SubtitleKind::Embedded, out)
             .await;
         return Ok((*stored).clone());
     }
-    run_ffmpeg_embedded(input, stream_index, &BgPermit::playback_priority()).await
+    run_ffmpeg_embedded(input, stream_index, permit).await
 }
 
 /// Parse a WebVTT document into jellyfin's `{ "TrackEvents": [...] }` JSON.
