@@ -2160,7 +2160,7 @@ pub(crate) fn client_is_remote(req: &actix_web::HttpRequest) -> bool {
 /// Extract `key`'s value from a raw query string, case-insensitively,
 /// treating an empty value as absent (same rule the audio/subtitle
 /// track-selection forwarding in `playback_info` uses).
-fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_param<'a>(query_string: &'a str, key: &str) -> Option<&'a str> {
     query_string
         .split('&')
         .filter_map(|kv| kv.split_once('='))
