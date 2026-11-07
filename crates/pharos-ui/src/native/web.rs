@@ -2587,6 +2587,7 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
             load_script(HLSJS_SRC, "Hls").await?;
             Ok(Box::new(HlsJs::default()))
         }
+        Engine::RustHls => Err("the Pharos engine is not built yet".into()),
         Engine::Unsupported => Err("this browser cannot play HLS".into()),
     }
 }
