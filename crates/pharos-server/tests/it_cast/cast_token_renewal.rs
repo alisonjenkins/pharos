@@ -15,6 +15,7 @@ fn renewed() -> u64 {
 #[actix_web::test]
 async fn a_cast_keeps_working_past_the_first_tokens_expiry() {
     let rig = CastRig::with_cast_settings("tv_token_lifetime_secs = 4").await;
+    rig.exclusive_metrics().await;
     let before = renewed();
     assert_eq!(rig.play_on_tv(&rig.alice).await.0, 204);
     eventually("TV playing", || rig.receiver.state().playing).await;
