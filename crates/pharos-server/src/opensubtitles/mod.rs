@@ -7,6 +7,7 @@
 pub mod client;
 pub mod hash;
 pub mod quota;
+pub mod store;
 
 use std::future::Future;
 use std::pin::Pin;
