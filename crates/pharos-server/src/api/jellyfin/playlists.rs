@@ -21,6 +21,7 @@ use crate::{
 use actix_web::{error, web, HttpResponse, Responder};
 use pharos_core::{MediaStore, PlaylistStore};
 use pharos_jellyfin_api::dto::SynthItemDto;
+use pharos_jellyfin_api::kinds::ItemType;
 use serde::Deserialize;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -327,7 +328,7 @@ pub(crate) fn playlist_dto(
             playlist.wire_id.clone(),
             playlist.name.clone(),
             state.server_id.clone(),
-            "Playlist",
+            ItemType::Playlist.as_wire(),
         )
     })
     .unwrap_or(serde_json::Value::Null)
