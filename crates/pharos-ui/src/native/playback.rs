@@ -1526,15 +1526,13 @@ pub fn styled_subtitle_signals(result: &Result<(), String>) -> (String, ClientEv
 /// one, so a device downloads a font only for a track that uses it. Each key
 /// is the font's own family name: libass matches `Fontname` against the
 /// name table, so a key that differs falls back to the default face (V530).
-pub const SUBTITLE_FONT_PACK: [(&str, &str); 4] = [
+pub const SUBTITLE_FONT_PACK: [(&str, &str); 3] = [
     // Shouts, attack calls and sound effects.
     ("bangers", "Bangers-Regular.ttf"),
     // Signs, captions and narration.
     ("anton", "Anton-Regular.ttf"),
     // Inner voice and thoughts.
     ("patrick hand", "PatrickHand-Regular.ttf"),
-    // Phone calls, radio and messages.
-    ("courier prime", "CourierPrime-Regular.ttf"),
 ];
 
 /// The URLs of the file's embedded fonts, each cut to the glyphs the subtitle
