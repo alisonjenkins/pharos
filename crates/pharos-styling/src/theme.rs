@@ -22,8 +22,10 @@ pub mod faces {
     pub const DISPLAY: &str = "Bangers";
     pub const CONDENSED: &str = "Anton";
     pub const HAND: &str = "Patrick Hand";
-    pub const MONO: &str = "Courier Prime";
 }
+
+/// Wire's text colour, a cool silver-blue.
+pub const WIRE_PRIMARY: u32 = rgb(200, 225, 255);
 
 /// An opaque `&H00BBGGRR` colour from RGB.
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -162,14 +164,14 @@ impl Theme {
             outline: 4.0,
             ..StyleDef::base(ECHO)
         };
+        // The dialogue face and size in a cool silver-blue with a soft dark
+        // outline: it reads as a voice from elsewhere without a box (B662).
         let wire = StyleDef {
-            font: faces::MONO,
-            size: 44,
-            primary: rgb(184, 255, 200),
-            outline_colour: with_alpha(rgb(12, 20, 16), 0x40),
-            border_style: 3,
-            outline: 8.0,
-            shadow: 0.0,
+            primary: WIRE_PRIMARY,
+            outline_colour: with_alpha(rgb(10, 20, 38), 0x30),
+            back: with_alpha(rgb(0, 6, 20), 0xA0),
+            outline: 2.5,
+            shadow: 1.5,
             ..StyleDef::base(WIRE)
         };
         let memory = StyleDef {
@@ -257,16 +259,26 @@ mod tests {
         let used: std::collections::BTreeSet<_> = t.styles.iter().map(|s| s.font).collect();
         assert_eq!(
             used.into_iter().collect::<Vec<_>>(),
-            [
-                "Anton",
-                "Bangers",
-                "Courier Prime",
-                "Liberation Sans",
-                "Patrick Hand"
-            ]
+            ["Anton", "Bangers", "Liberation Sans", "Patrick Hand"]
         );
         assert_eq!(t.styles[0].name, "Default");
         assert_eq!((t.play_res_x, t.play_res_y), (1920, 1080));
+    }
+
+    /// B662: Wire is the dialogue face and size with an outline and shadow,
+    /// not a monospaced box.
+    #[test]
+    fn wire_is_dialogue_shaped_in_silver_blue() {
+        let t = Theme::pharos();
+        let (wire, dialogue) = (t.style(names::WIRE).unwrap(), &t.styles[0]);
+        assert_eq!((wire.font, wire.size), (dialogue.font, dialogue.size));
+        assert_eq!(wire.primary, rgb(200, 225, 255));
+        assert_eq!(wire.border_style, 1);
+        assert!(wire.outline > 0.0 && wire.outline <= dialogue.outline);
+        assert!(wire.shadow > 0.0 && wire.shadow <= 2.0);
+        assert!(wire
+            .render()
+            .starts_with("Style: Wire,Liberation Sans,56,&H00FFE1C8,"));
     }
 
     #[test]

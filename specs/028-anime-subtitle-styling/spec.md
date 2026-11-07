@@ -83,7 +83,7 @@ An operator can tell, from Prometheus and Loki alone, how many items were styled
   - **Hush** (Whisper): smaller, 70% opacity, a soft blur, a slow fade.
   - **Inner voice** (Thought): italic in the handwritten face with a soft halo, and the source's brackets dropped.
   - **Echo** (AttackCall): two ghost copies that trail and fade. At Full intensity it becomes a big title-card variant.
-  - **Wire** (Phone, radio): boxed, monospaced, with a slight flicker.
+  - **Wire** (Phone, radio): the dialogue face and size in a cool silver-blue, with a soft dark outline and a small shadow. Desktop fades in once from a paler tint; TV fades; Low is the style alone (B662).
   - **Memory** (Flashback): desaturated, a warm tint, letter-spaced.
   - **Caption** (Narration): the condensed face in a top box.
   - **Aside** (OffScreen): the dialogue face, dimmer and italic.
