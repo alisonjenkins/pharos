@@ -1380,6 +1380,14 @@
             # executablePath; the spec asserts h264 decode and fails loudly
             # with a swap-to-google-chrome hint if this build lacks it.
             export PHAROS_H264_BROWSER=${pkgs.chromium}/bin/chromium
+            # Playwright's Firefox decodes AAC and H.264 through the host's
+            # libavcodec, which NixOS does not put on the loader path: without
+            # it Firefox answers "no" to MP4 audio a second after it starts,
+            # and an HLS stream fails in hls.js (manifestIncompatibleCodecs).
+            # Its build loads libavcodec 54-61, so ffmpeg 7, not the 9 the
+            # server uses. tests/lib/together.ts puts this on Firefox's
+            # LD_LIBRARY_PATH.
+            export PHAROS_FIREFOX_LIBAV=${pkgs.ffmpeg_7-headless.lib}/lib
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.
