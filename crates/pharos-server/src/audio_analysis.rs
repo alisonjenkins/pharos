@@ -43,6 +43,7 @@
 //! confidence, the energy, or the decoder's own error.
 
 use crate::bg_io::BgPermit;
+use crate::subtitle_styling::signature;
 use pharos_core::{AudioAnalysis, MediaItem, MediaKind, MediaStore, TempoSource};
 use pharos_transcode::audio_features::{window_for, AudioFeatures, ANALYSIS_VERSION};
 use pharos_transcode::protocol::WorkerError;
@@ -357,17 +358,6 @@ pub async fn run_pass<S: MediaStore, A: Analyser>(
         "audio analysis: pass complete",
     );
     sum
-}
-
-/// The file signature the scanner records: whole-second mtime and size.
-async fn signature(path: &std::path::Path) -> Option<(i64, u64)> {
-    let m = tokio::fs::metadata(path).await.ok()?;
-    let mtime = m
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs() as i64);
-    Some((mtime, m.len()))
 }
 
 #[cfg(test)]
