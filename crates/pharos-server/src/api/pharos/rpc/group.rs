@@ -439,7 +439,9 @@ fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Upda
             }
         }
         ServerMsg::GroupLeft => Update::Ended(EndReason::Left),
-        ServerMsg::NotInGroup => Update::Ended(EndReason::NotInGroup),
+        ServerMsg::NotInGroup | ServerMsg::GroupDoesNotExist => {
+            Update::Ended(EndReason::NotInGroup)
+        }
         ServerMsg::Welcome { .. }
         | ServerMsg::Pong { .. }
         | ServerMsg::LeaderChange { .. }

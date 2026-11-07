@@ -29,6 +29,13 @@ pub type LoadFuture<'a> = Pin<Box<dyn Future<Output = Option<(u64, String)>> + S
 pub trait OwnershipSource: Send + Sync + 'static {
     fn try_own(&self, group_id: GroupId) -> OwnFuture<'_>;
     fn release(&self, group_id: GroupId);
+
+    /// Whether ANOTHER replica holds the group's lease right now, i.e. the
+    /// group is live elsewhere. Probes without retaining anything. An election
+    /// that cannot be probed answers `false`.
+    fn held_elsewhere(&self, _group_id: GroupId) -> OwnFuture<'_> {
+        Box::pin(async { false })
+    }
 }
 
 /// Loads a group's persisted snapshot for takeover, or `None` if there is

@@ -62,6 +62,10 @@ enum Msg {
         group_id: GroupId,
         reply: oneshot::Sender<bool>,
     },
+    HeldElsewhere {
+        group_id: GroupId,
+        reply: oneshot::Sender<bool>,
+    },
     TryLease {
         key: GroupId,
         reply: oneshot::Sender<bool>,
@@ -197,6 +201,18 @@ impl Actor {
         self.cached_owned(group_id).is_some()
     }
 
+    /// Whether another replica runs the group's actor (a group this replica
+    /// owns, or any group of a single-replica registry, is not elsewhere).
+    async fn held_elsewhere(&mut self, group_id: GroupId) -> bool {
+        if self.owned.contains(&group_id) || self.leases.contains(&group_id) {
+            return false;
+        }
+        match &self.distributed {
+            Some(d) => d.ownership.held_elsewhere(group_id).await,
+            None => false,
+        }
+    }
+
     async fn try_lease(&mut self, key: GroupId) -> bool {
         if self.leases.contains(&key) {
             return true;
@@ -286,6 +302,9 @@ impl GroupRegistry {
                     Msg::IsOwned { group_id, reply } => {
                         let _ = reply.send(actor.is_owned(group_id));
                     }
+                    Msg::HeldElsewhere { group_id, reply } => {
+                        let _ = reply.send(actor.held_elsewhere(group_id).await);
+                    }
                     Msg::TryLease { key, reply } => {
                         let _ = reply.send(actor.try_lease(key).await);
                     }
@@ -309,6 +328,21 @@ impl GroupRegistry {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Msg::IsOwned {
+                group_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| RegistryError::ActorDown)?;
+        rx.await.map_err(|_| RegistryError::ReplyDropped)
+    }
+
+    /// Whether another replica holds the group's lease, so the group is live
+    /// there although this replica has no handle for it. Always `false` for a
+    /// single-replica registry.
+    pub async fn held_elsewhere(&self, group_id: GroupId) -> Result<bool, RegistryError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::HeldElsewhere {
                 group_id,
                 reply: tx,
             })

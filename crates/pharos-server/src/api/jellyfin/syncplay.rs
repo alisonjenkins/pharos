@@ -534,20 +534,35 @@ async fn join_group(
     let Some(dev) = auth.sync_key() else {
         return no_content();
     };
-    let Ok(handle) = registry.get_or_create(GroupId(body.group_id)).await else {
-        tracing::error!("syncplay: group registry unreachable on Join");
-        return no_content();
-    };
-    if !may_join(&state, &auth.user, &handle, GroupHiddenRoute::Join).await {
-        // Jellyfin-web leaves group mode on NotInGroup rather than waiting.
-        if let Some(sess) = hub.resolve(&dev) {
-            let _ = sess
-                .sink
-                .send(pharos_sync::messages::ServerMsg::NotInGroup)
-                .await;
+    let handle = match crate::sync_recovery::joinable_group(
+        &state,
+        &registry,
+        &auth.user,
+        GroupId(body.group_id),
+        GroupHiddenRoute::Join,
+    )
+    .await
+    {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            // V582 — Jellyfin answers a join to a group that does not exist
+            // with GroupDoesNotExist; never spawn a phantom empty group. A
+            // group the user may not see gets the same answer (Jellyfin
+            // sends LibraryAccessDenied there, which confirms it exists).
+            tracing::info!(device_id = %dev, group = %body.group_id, "syncplay: Join of a nonexistent or hidden group");
+            if let Some(sess) = hub.resolve(&dev) {
+                let _ = sess
+                    .sink
+                    .send(pharos_sync::messages::ServerMsg::GroupDoesNotExist)
+                    .await;
+            }
+            return no_content();
         }
-        return no_content();
-    }
+        Err(e) => {
+            tracing::error!(error = %e, "syncplay: group registry unreachable on Join");
+            return no_content();
+        }
+    };
     tracing::info!(device_id = %dev, group = %handle.group_id, "syncplay: Join group");
     add_caller_to_group(&hub, &sinks, &dev, auth.user.id, handle).await;
     no_content()
@@ -1158,14 +1173,39 @@ pub(crate) async fn may_join(
     handle: &GroupHandle,
     route: GroupHiddenRoute,
 ) -> bool {
+    may_join_group(state, user, handle.group_id, Some(handle), route).await
+}
+
+/// [`may_join`] for a group with no handle yet: the queue is read from its
+/// persisted snapshot, so the check can run before the group is hydrated.
+pub(crate) async fn may_join_cold(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    group_id: GroupId,
+    route: GroupHiddenRoute,
+) -> bool {
+    may_join_group(state, user, group_id, None, route).await
+}
+
+async fn may_join_group(
+    state: &crate::state::AppState,
+    user: &pharos_core::User,
+    group_id: GroupId,
+    live: Option<&GroupHandle>,
+    route: GroupHiddenRoute,
+) -> bool {
     if !sync_play_allows(user, SyncPlayNeed::Join, route.label()) {
         return false;
     }
     if crate::services::library::hides_nothing(&user.policy) {
         return true;
     }
-    let group = handle.group_id.to_string();
-    let queue = match handle.snapshot().await {
+    let group = group_id.to_string();
+    let snap = match live {
+        Some(handle) => handle.snapshot().await,
+        None => None,
+    };
+    let queue = match snap {
         Some(snap) => Some(snap.queue_item_ids),
         None => persisted_queue(state, &group).await,
     };
