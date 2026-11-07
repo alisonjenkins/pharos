@@ -15,3 +15,4 @@ mod playback_access;
 mod playlists;
 mod subtitle_fonts;
 mod thin_endpoints;
+mod user_policy_login;

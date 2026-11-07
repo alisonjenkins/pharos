@@ -640,9 +640,11 @@ fn write_change_password_error(
             out.get_kind().set_unavailable("token store");
             return;
         }
-        ChangePasswordError::Refused(LoginRefusal::Invalid) => Denial::NotPermitted {
-            what: "current password is wrong",
-        },
+        ChangePasswordError::Refused(LoginRefusal::Invalid | LoginRefusal::LockedOut(_)) => {
+            Denial::NotPermitted {
+                what: "current password is wrong",
+            }
+        }
         // V174: the wait is machine-readable, in seconds.
         ChangePasswordError::Refused(LoginRefusal::Throttled(retry)) => Denial::Throttled {
             name: "login_retry_after_secs",

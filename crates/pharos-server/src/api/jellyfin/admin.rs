@@ -544,8 +544,17 @@ async fn set_user_policy(
             ));
         }
     }
+    // An admin saving an enabled user starts them from a clean count (V577);
+    // otherwise the next typo would lock a re-enabled user out again. The
+    // reset is idempotent, so it does not depend on reading the old state.
+    let enabled = !policy.is_disabled;
     match state.stores.set_policy(target, policy).await {
         Ok(()) => {
+            if enabled {
+                if let Err(e) = state.stores.reset_failed_logins(target).await {
+                    tracing::error!(user.id = %target, error = %e, "could not reset failed-login counter on re-enable");
+                }
+            }
             // It may now be disabled: its open native connections re-check.
             state
                 .revocations
@@ -685,7 +694,7 @@ async fn change_password(
         let current = SecretString::new(body.current_pw.clone());
         state
             .login_throttle
-            .verify(&auth, &user.0.name, &current, client_ip)
+            .verify_recheck(&auth, &user.0.name, &current, client_ip)
             .await
             .map_err(|r| super::users::login_refused(r, "current password mismatch"))?;
     }

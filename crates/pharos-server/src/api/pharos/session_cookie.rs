@@ -138,9 +138,9 @@ pub async fn sign_in(
                     .insert_header((actix_web::http::header::RETRY_AFTER, retry.secs.to_string()))
                     .body("too many failed login attempts")
             }
-            Err(PasswordLoginError::Refused(LoginRefusal::Invalid)) => {
-                HttpResponse::Unauthorized().body("invalid credentials")
-            }
+            Err(PasswordLoginError::Refused(
+                LoginRefusal::Invalid | LoginRefusal::LockedOut(_),
+            )) => HttpResponse::Unauthorized().body("invalid credentials"),
             // The cause is in the server log (`native login refused`).
             Err(_) => HttpResponse::ServiceUnavailable().body("sign-in unavailable"),
         },
