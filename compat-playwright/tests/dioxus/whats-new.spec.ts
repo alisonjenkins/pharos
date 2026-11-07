@@ -135,6 +135,27 @@ test("a new account is walked through setup with live demos, then never again", 
   await expect(badge(page)).toHaveCount(0);
 });
 
+test("the arrow keys stay inside the dialog and never walk out to the page behind (B711)", async ({
+  page,
+  request,
+}) => {
+  const name = await newUser(request, await admin(request), "keys");
+  await page.goto("/ui/");
+  await signIn(page, name);
+  const box = dialog(page);
+  await expect(box.locator("#pharos-whats-new-next")).toBeFocused({ timeout: 15_000 });
+  const inside = () =>
+    page.evaluate(() => !!document.activeElement?.closest(".pharos-whats-new[role=dialog]"));
+  for (const key of ["ArrowDown", "ArrowDown", "ArrowRight", "ArrowLeft", "ArrowUp", "ArrowUp"]) {
+    await page.keyboard.press(key);
+    expect(await inside(), `focus left the dialog after ${key}`).toBe(true);
+  }
+  // Left from Next reaches its neighbour, so the dialog is still walkable.
+  await box.locator("#pharos-whats-new-next").focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(box.getByRole("button", { name: "Remind me later" })).toBeFocused();
+});
+
 test("Remind me later leaves the badge, and a reload splashes again", async ({
   page,
   request,
