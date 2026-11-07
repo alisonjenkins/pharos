@@ -268,7 +268,14 @@ function firefoxGroupLaunch() {
       "media.autoplay.blocking_policy": 0,
       "media.volume_scale": "0.0",
     },
-    ...(libav ? { env: { ...process.env, LD_LIBRARY_PATH: libav } } : {}),
+    ...(libav
+      ? {
+          env: {
+            ...process.env,
+            LD_LIBRARY_PATH: [libav, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
+          },
+        }
+      : {}),
   };
 }
 

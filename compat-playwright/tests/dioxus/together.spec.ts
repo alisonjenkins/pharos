@@ -6,6 +6,7 @@ import {
   delta,
   describe as line,
   errorEvents,
+  settledClientEvents,
 } from "../lib/client-events";
 import {
   Member,
@@ -48,7 +49,8 @@ test.describe("pharos Dioxus UI watch together", () => {
   let start: ClientEventCounts = new Map();
 
   test.beforeEach(async ({ request }) => {
-    start = await clientEvents(request, PHAROS_URL);
+    // Settled, so the last case's closing pages are not counted in this one.
+    start = await settledClientEvents(request, PHAROS_URL);
   });
 
   test.afterEach(async ({ request }) => {
