@@ -18,6 +18,7 @@ fn seat_total(event: &str, reason: &str) -> u64 {
 #[actix_web::test]
 async fn casting_before_joining_is_refused_then_works_after_joining() {
     let rig = CastRig::new().await;
+    rig.exclusive_metrics().await;
     let before = seat_total("rejected", "not_in_group");
 
     let (status, body) = rig.play_on_tv(&rig.carol).await;
@@ -74,6 +75,7 @@ async fn leaving_the_group_while_casting_ends_the_seat() {
         .await;
     assert_eq!(status, 204);
     assert_eq!(rig.play_on_tv(&rig.carol).await.0, 204);
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
 
     let (status, body) = rig.post(&rig.carol, "/SyncPlay/Leave", None).await;
