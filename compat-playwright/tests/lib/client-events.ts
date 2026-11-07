@@ -75,3 +75,25 @@ export function describe(d: ClientEventCounts): string {
 export function errorEvents(d: ClientEventCounts): ClientEventCounts {
   return new Map([...d].filter(([key, n]) => key.endsWith("/error") && n > 0));
 }
+
+/**
+ * Scrapes until two scrapes `quietMs` apart agree, so events still in flight
+ * from an earlier step (a closing page's last submit) are counted before the
+ * step that follows, not in it. Gives up after `timeoutMs` with the last one.
+ */
+export async function settledClientEvents(
+  request: APIRequestContext,
+  baseUrl: string,
+  quietMs = 1_000,
+  timeoutMs = 10_000,
+): Promise<ClientEventCounts> {
+  const until = Date.now() + timeoutMs;
+  let last = await clientEvents(request, baseUrl);
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, quietMs));
+    const now = await clientEvents(request, baseUrl);
+    if (delta(last, now).size === 0) return now;
+    last = now;
+  }
+  return last;
+}
