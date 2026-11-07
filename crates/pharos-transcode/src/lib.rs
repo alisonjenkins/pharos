@@ -2700,8 +2700,8 @@ mod tests {
         assert!(!joined.contains("-pix_fmt"), "{joined}");
     }
 
-    const TONEMAP_CORE: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
-         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv";
+    const TONEMAP_CORE: &str = "zscale=t=linear:npl=100:p=bt709:dither=none,format=gbrpf32le,\
+         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv:dither=none";
 
     fn vf_of(device: crate::protocol::DeviceId, o: &TranscodeOptions) -> Option<String> {
         let a = build_args_for_device(
