@@ -30,12 +30,17 @@ pub(crate) struct Rig {
 }
 
 pub(crate) async fn rig() -> Rig {
+    rig_with(|_, sinks| GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone())))).await
+}
+
+/// [`rig`] over the registry `make` builds from the fixture and sinks.
+pub(crate) async fn rig_with(make: impl FnOnce(&Fixture, &MemberSinks) -> GroupRegistry) -> Rig {
     let (server, fx) = crate::revocation::start().await;
     seed_playable(&fx).await;
     let sinks = MemberSinks::new();
     let deps = SyncDeps {
         hub: SessionHub::new(),
-        registry: GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone()))),
+        registry: make(&fx, &sinks),
         sinks,
         socket_loss_grace: Duration::from_millis(300),
     };
@@ -1093,7 +1098,9 @@ async fn a_restricted_user_neither_sees_nor_joins_nor_starts_a_group_on_a_hidden
         .await
         .err()
         .unwrap();
-    assert_eq!(err, "not permitted: group");
+    // V585: a hidden group answers exactly as an absent one (no existence
+    // oracle), so the refusal is "not found", not "not permitted".
+    assert_eq!(err, "not found: group");
     let (sink_c, _seen) = sink();
     let err = create(&session, "dev-b", MOVIE, 0, sink_c)
         .await
@@ -1722,4 +1729,200 @@ async fn seen_is_refused_outside_the_group_and_over_the_cap() {
         seen(&pair.b, &[WireId::Real(801)]).await.unwrap_err(),
         "not found: group"
     );
+}
+
+/// A distributed replica sharing the rig's store; no other replica holds a
+/// lease.
+struct SoleOwner;
+impl pharos_sync::distributed::OwnershipSource for SoleOwner {
+    fn try_own(
+        &self,
+        _g: pharos_sync::messages::GroupId,
+    ) -> pharos_sync::distributed::OwnFuture<'_> {
+        Box::pin(async { true })
+    }
+    fn release(&self, _g: pharos_sync::messages::GroupId) {}
+    fn held_elsewhere(
+        &self,
+        _g: pharos_sync::messages::GroupId,
+    ) -> pharos_sync::distributed::OwnFuture<'_> {
+        Box::pin(async { false })
+    }
+}
+struct NoCommands;
+impl pharos_sync::distributed::CommandSink for NoCommands {
+    fn submit(&self, _g: pharos_sync::messages::GroupId, _c: pharos_sync::group::RemoteCommand) {}
+}
+struct StoreHydration(pharos_server::state::Stores);
+impl pharos_sync::distributed::HydrationSource for StoreHydration {
+    fn load(&self, g: pharos_sync::messages::GroupId) -> pharos_sync::distributed::LoadFuture<'_> {
+        Box::pin(async move {
+            use pharos_core::SyncGroupStore as _;
+            let row = self.0.get_sync_group(&g.to_string()).await.ok()??;
+            Some((row.epoch_unix_ms as u64, row.state_json))
+        })
+    }
+}
+struct NoSnapshots;
+impl pharos_sync::distributed::HydrationSource for NoSnapshots {
+    fn load(&self, _g: pharos_sync::messages::GroupId) -> pharos_sync::distributed::LoadFuture<'_> {
+        Box::pin(async { None })
+    }
+}
+#[derive(Default)]
+struct Captured(std::sync::Mutex<Option<String>>);
+impl pharos_sync::persistence::GroupPersistence for Captured {
+    fn persist(&self, _g: pharos_sync::messages::GroupId, _e: u64, json: String) {
+        *self.0.lock().unwrap() = Some(json);
+    }
+    fn remove(&self, _g: pharos_sync::messages::GroupId) {}
+}
+
+fn distributed_registry(fx: &Fixture, sinks: &MemberSinks) -> GroupRegistry {
+    GroupRegistry::spawn_distributed(
+        Arc::new(LocalDelivery::new(sinks.clone())),
+        pharos_sync::distributed::Distributed {
+            ownership: Arc::new(SoleOwner),
+            hydration: Arc::new(StoreHydration(fx.state.stores.clone())),
+            commands: Arc::new(NoCommands),
+            persistence: Arc::new(Captured::default()),
+        },
+    )
+}
+
+/// Persists, as an owner replica would, a fresh snapshot of a group playing
+/// `MOVIE`; no actor for it runs in `rig`'s registry.
+async fn persist_cold_group(rig: &Rig) -> pharos_sync::messages::GroupId {
+    use pharos_core::SyncGroupStore as _;
+    let captured = Arc::new(Captured::default());
+    let owner = GroupRegistry::spawn_distributed(
+        Arc::new(LocalDelivery::new(MemberSinks::new())),
+        pharos_sync::distributed::Distributed {
+            ownership: Arc::new(SoleOwner),
+            hydration: Arc::new(NoSnapshots),
+            commands: Arc::new(NoCommands),
+            persistence: captured.clone(),
+        },
+    );
+    let group = owner.create().await.unwrap();
+    // A group is only persisted once its creator has joined; a snapshot with
+    // no member hydrates into an actor that dissolves on its first loop turn
+    // (B29), which races the join under load.
+    let (reply, joined) = oneshot::channel();
+    group
+        .tx
+        .send(GroupMsg::AddMember {
+            member_id: pharos_sync::messages::MemberId::new(),
+            name: "owner".into(),
+            user: Some(rig.fx.admin_id),
+            reply,
+        })
+        .await
+        .unwrap();
+    joined.await.unwrap();
+    group
+        .tx
+        .send(GroupMsg::SeedQueue {
+            item_id: wire_item_id(MOVIE),
+            runtime_ms: Some(60_000),
+            position_ms: 0,
+            is_paused: true,
+        })
+        .await
+        .unwrap();
+    group.snapshot().await.unwrap();
+    let json = captured.0.lock().unwrap().clone().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    rig.fx
+        .state
+        .stores
+        .upsert_sync_group(
+            &pharos_core::PersistedSyncGroup {
+                group_id: group.group_id.to_string(),
+                epoch_unix_ms: 1_000,
+                state_json: json,
+                updated_at: 0,
+            },
+            now - 60,
+        )
+        .await
+        .unwrap();
+    group.group_id
+}
+
+async fn restrict_to_lib_b(rig: &Rig) {
+    rig.fx
+        .state
+        .stores
+        .set_policy(
+            rig.fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![rig.fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// V585: a denied native join of a live hidden group and a join of an id no
+/// group has get the identical error, so the join is no existence oracle.
+/// Disarm check: answering `not permitted` for the hidden group again makes
+/// the two differ.
+#[actix_web::test]
+async fn a_denied_join_of_a_hidden_live_group_looks_like_an_absent_one() {
+    let rig = rig().await;
+    let (handle, _rx) = rig.jellyfin_group("Movie night").await;
+    let session = rig.session(&rig.fx.user_token).await;
+    restrict_to_lib_b(&rig).await;
+    let (sink_a, _seen) = sink();
+    let hidden = join(&session, "dev-b", &handle.group_id.to_string(), sink_a)
+        .await
+        .err()
+        .unwrap();
+    let (sink_b, _seen) = sink();
+    let absent = join(&session, "dev-b", &uuid::Uuid::new_v4().to_string(), sink_b)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(hidden, absent);
+    assert_eq!(hidden, "not found: group");
+}
+
+/// V585: the permission check precedes hydration on the native join too: a
+/// refused probe of a group held only by a fresh snapshot does not start it.
+#[actix_web::test]
+async fn a_denied_join_of_a_fresh_persisted_group_does_not_hydrate_it() {
+    let rig = rig_with(distributed_registry).await;
+    let gid = persist_cold_group(&rig).await;
+    let session = rig.session(&rig.fx.user_token).await;
+    restrict_to_lib_b(&rig).await;
+    let (sink_a, _seen) = sink();
+    let err = join(&session, "dev-b", &gid.to_string(), sink_a)
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err, "not found: group");
+    assert!(rig.deps.registry.list().await.unwrap().is_empty());
+    assert!(rig.deps.registry.get(gid).await.unwrap().is_none());
+}
+
+/// A permitted native join of a fresh persisted group hydrates it and joins.
+#[actix_web::test]
+async fn a_permitted_join_of_a_fresh_persisted_group_hydrates_and_joins_it() {
+    let rig = rig_with(distributed_registry).await;
+    let gid = persist_cold_group(&rig).await;
+    let session = rig.session(&rig.fx.user_token).await;
+    let (sink_a, _seen) = sink();
+    join(&session, "dev-b", &gid.to_string(), sink_a)
+        .await
+        .map_err(|e| e.to_string())
+        .unwrap();
+    let live = rig.deps.registry.get(gid).await.unwrap().unwrap();
+    // The owner's seat from the snapshot, plus the joiner.
+    assert_eq!(live.snapshot().await.unwrap().member_count, 2);
 }
