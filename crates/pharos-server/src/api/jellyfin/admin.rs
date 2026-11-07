@@ -406,9 +406,21 @@ async fn activity_log_entries(
     ))
 }
 
+/// Jellyfin `GET /Users` filters: `isHidden` / `isDisabled` keep only users
+/// whose flag equals the value; absent means no filtering (V580).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ListUsersQuery {
+    #[serde(alias = "IsHidden", alias = "ishidden")]
+    is_hidden: Option<bool>,
+    #[serde(alias = "IsDisabled", alias = "isdisabled")]
+    is_disabled: Option<bool>,
+}
+
 async fn list_users(
     state: web::Data<AppState>,
     user: AuthUser,
+    q: web::Query<ListUsersQuery>,
 ) -> Result<impl Responder, actix_web::Error> {
     require_admin(&user)?;
     let users = state
@@ -419,6 +431,11 @@ async fn list_users(
     let mut tags = crate::avatar::tags(&state.stores).await;
     let dtos: Vec<UserDto> = users
         .into_iter()
+        .filter(|u| q.is_hidden.map_or(true, |want| u.policy.is_hidden == want))
+        .filter(|u| {
+            q.is_disabled
+                .map_or(true, |want| u.policy.is_disabled == want)
+        })
         .map(|u| {
             let user = u.into_user();
             let mut dto = UserDto::from_domain(&user, &state.server_id);
