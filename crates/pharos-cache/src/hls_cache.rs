@@ -1451,7 +1451,7 @@ impl SegmentIdentity {
             codec_tag,
             source_gen,
             stereo_output,
-            tonemap: _,
+            tonemap,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -1475,8 +1475,15 @@ impl SegmentIdentity {
             pharos_transcode::StereoOutput::Preserve => "",
             pharos_transcode::StereoOutput::Mono2D => "_mono2d",
         };
+        // Off adds nothing, so every SDR segment keeps the name it had; an HDR
+        // source cached before tonemapping existed holds untonemapped pixels
+        // under the bare name and is never read for a tonemapped request.
+        let tonemap = match tonemap {
+            pharos_transcode::Tonemap::Off => "",
+            pharos_transcode::Tonemap::HdrToSdr => "_tm",
+        };
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -9536,6 +9543,34 @@ mod tests {
             );
             assert_ne!(other.etag(), base.etag(), "{what} must change the ETag");
         }
+    }
+
+    #[test]
+    fn segment_identity_tonemap_distinguishes_cache_and_etag() {
+        let sdr = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        let mut hdr = sdr.clone();
+        hdr.tonemap = pharos_transcode::Tonemap::HdrToSdr;
+        let key_sdr = SegmentIdentity::new(1, 5, Some(1), None, &sdr, SourceGen::LOCAL);
+        let key_hdr = SegmentIdentity::new(1, 5, Some(1), None, &hdr, SourceGen::LOCAL);
+
+        assert!(
+            !key_sdr.filename().contains("_tm"),
+            "{}",
+            key_sdr.filename()
+        );
+        assert!(
+            key_hdr.filename().ends_with("_tm.ts"),
+            "{}",
+            key_hdr.filename()
+        );
+        assert_ne!(key_hdr.cache_relative_path(), key_sdr.cache_relative_path());
+        assert_ne!(key_hdr.etag(), key_sdr.etag());
     }
 
     #[test]
