@@ -102,6 +102,19 @@ pub enum GroupPlayState {
     Paused,
 }
 
+impl GroupPlayState {
+    /// The `Idle|Waiting|Playing|Paused` string Jellyfin's `GroupStateType`
+    /// serialises as.
+    pub fn as_jellyfin_str(self) -> &'static str {
+        match self {
+            GroupPlayState::Idle => "Idle",
+            GroupPlayState::Waiting => "Waiting",
+            GroupPlayState::Playing => "Playing",
+            GroupPlayState::Paused => "Paused",
+        }
+    }
+}
+
 /// One entry in a group's play queue. `playlist_item_id` is the server-assigned,
 /// per-entry stable id the Jellyfin client echoes on every command — a
 /// `SendCommand` whose `PlaylistItemId` doesn't match the client's current queue
@@ -371,5 +384,13 @@ mod tests {
         let a = MemberId(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
         let b = MemberId(Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap());
         assert!(a < b);
+    }
+
+    #[test]
+    fn play_state_jellyfin_strings() {
+        assert_eq!(GroupPlayState::Idle.as_jellyfin_str(), "Idle");
+        assert_eq!(GroupPlayState::Waiting.as_jellyfin_str(), "Waiting");
+        assert_eq!(GroupPlayState::Playing.as_jellyfin_str(), "Playing");
+        assert_eq!(GroupPlayState::Paused.as_jellyfin_str(), "Paused");
     }
 }

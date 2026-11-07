@@ -20,7 +20,7 @@ use pharos_core::TokenStore;
 use pharos_jellyfin_api::dto::format_iso8601_ms;
 use pharos_sync::{
     group::{GroupHandle, GroupMsg},
-    messages::{GroupId, GroupPlayState, MemberId, QueueItemInfo, ServerMsg},
+    messages::{GroupId, MemberId, QueueItemInfo, ServerMsg},
     registry::GroupRegistry,
     MemberSinks, SessionHub,
 };
@@ -98,16 +98,6 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The `Idle|Waiting|Playing|Paused` wire string for a `GroupPlayState`.
-fn play_state_str(s: GroupPlayState) -> &'static str {
-    match s {
-        GroupPlayState::Idle => "Idle",
-        GroupPlayState::Waiting => "Waiting",
-        GroupPlayState::Playing => "Playing",
-        GroupPlayState::Paused => "Paused",
-    }
 }
 
 /// Context the socket threads into [`translate_outbound`] so a `ServerMsg`
@@ -1027,7 +1017,7 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
             ctx,
             "StateUpdate",
             serde_json::to_value(GroupStateUpdate {
-                state: play_state_str(state),
+                state: state.as_jellyfin_str(),
                 reason,
             })
             .ok()?,
