@@ -4260,7 +4260,8 @@ impl SyncGroupStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn list_sync_groups(&self) -> DomainResult<Vec<PersistedSyncGroup>> {
         let rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
-            "SELECT group_id, epoch_unix_ms, state_json, updated_at FROM sync_groups",
+            "SELECT group_id, epoch_unix_ms, state_json, updated_at FROM sync_groups \
+             ORDER BY updated_at DESC, group_id ASC",
         )
         .fetch_all(self.pool())
         .await
