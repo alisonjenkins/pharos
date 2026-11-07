@@ -265,10 +265,10 @@ impl<U: UserStore> BuiltinAuth<U> {
         slots: &Arc<Semaphore>,
         wait: Duration,
     ) -> AuthResult<User> {
-        self.judge_with(name, password, slots, wait)
+        self.judge_with(name, password, Purpose::SignIn, slots, wait)
             .await
             .map_err(|denial| match denial {
-                Denial::Refused { .. } => AuthError::InvalidCredentials,
+                Denial::Refused { .. } | Denial::LockedOut { .. } => AuthError::InvalidCredentials,
                 Denial::Backend(e) => e,
             })
     }
@@ -277,14 +277,36 @@ impl<U: UserStore> BuiltinAuth<U> {
     /// is for the server's own log and metric only; the caller still answers
     /// every refusal alike (T68, V177).
     pub async fn judge(&self, name: &str, password: &SecretString) -> Result<User, Denial> {
-        self.judge_with(name, password, &VERIFY_SLOTS, VERIFY_QUEUE_TIMEOUT)
-            .await
+        self.judge_with(
+            name,
+            password,
+            Purpose::SignIn,
+            &VERIFY_SLOTS,
+            VERIFY_QUEUE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Check the password of an already signed-in user (the self
+    /// change-password step). Unlike [`Self::judge`] it never touches the
+    /// failed-login counter: a stolen bearer token must not be able to lock
+    /// the real user out by guessing here (V577).
+    pub async fn judge_recheck(&self, name: &str, password: &SecretString) -> Result<User, Denial> {
+        self.judge_with(
+            name,
+            password,
+            Purpose::Recheck,
+            &VERIFY_SLOTS,
+            VERIFY_QUEUE_TIMEOUT,
+        )
+        .await
     }
 
     async fn judge_with(
         &self,
         name: &str,
         password: &SecretString,
+        purpose: Purpose,
         slots: &Arc<Semaphore>,
         wait: Duration,
     ) -> Result<User, Denial> {
@@ -351,6 +373,17 @@ impl<U: UserStore> BuiltinAuth<U> {
             Bounded::Done(verdict) => verdict.map_err(Denial::Backend)?,
         };
         if !matched {
+            // Jellyfin counts a wrong password only for an enabled user: a
+            // disabled account is refused before the counter moves.
+            if purpose == Purpose::SignIn
+                && !record.policy.is_disabled
+                && self.count_failed_login(&record).await
+            {
+                return Err(Denial::LockedOut {
+                    user: record.id,
+                    name_mismatch,
+                });
+            }
             return Err(Denial::Refused {
                 reason: LoginFailure::BadPassword,
                 name_mismatch,
@@ -366,7 +399,50 @@ impl<U: UserStore> BuiltinAuth<U> {
                 name_mismatch,
             });
         }
+        // Jellyfin zeroes InvalidLoginAttemptCount on every successful login.
+        if purpose == Purpose::SignIn {
+            if let Err(e) = self.users.reset_failed_logins(record.id).await {
+                tracing::error!(user.id = %record.id, error = %e, "auth: could not reset failed-login counter");
+            }
+        }
         Ok(record.into_user())
+    }
+
+    /// Jellyfin `UserManager.AuthenticateUser`: add one to the user's failed
+    /// login count and, once it reaches `LoginAttemptsBeforeLockout`, disable
+    /// the account (an admin re-enables it). A store error is logged, not
+    /// returned: the password was wrong either way (V577). Returns whether
+    /// this failure disabled the account, so the caller can announce it.
+    async fn count_failed_login(&self, record: &UserRecord) -> bool {
+        let count = match self.users.record_failed_login(record.id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(user.id = %record.id, error = %e, "auth: could not record failed login");
+                return false;
+            }
+        };
+        let Some(limit) = record.policy.lockout_threshold() else {
+            return false;
+        };
+        if count < limit {
+            return false;
+        }
+        match self.users.disable_user(record.id).await {
+            Ok(()) => {
+                metrics::counter!("pharos_login_lockout_total").increment(1);
+                tracing::warn!(
+                    user.id = %record.id,
+                    attempts = count,
+                    limit,
+                    "user disabled after too many failed logins"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(user.id = %record.id, error = %e, "auth: lockout could not disable the user");
+                false
+            }
+        }
     }
 
     /// Create a user with the given plaintext password, hashing it first.
@@ -481,11 +557,26 @@ impl NameMismatch {
     }
 }
 
+/// What a password check is for. Only a sign-in moves the failed-login
+/// counter (V577).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    SignIn,
+    Recheck,
+}
+
 /// Why [`BuiltinAuth::judge`] returned no user.
 #[derive(Debug)]
 pub enum Denial {
     Refused {
         reason: LoginFailure,
+        name_mismatch: NameMismatch,
+    },
+    /// A wrong password that reached `LoginAttemptsBeforeLockout` and
+    /// disabled the account. Answers like [`Denial::Refused`] with
+    /// `BadPassword`; the caller announces the revocation (V577).
+    LockedOut {
+        user: UserId,
         name_mismatch: NameMismatch,
     },
     /// No verdict: the store failed or no verify slot freed in time.
@@ -525,6 +616,10 @@ pub enum LoginRefusal {
     Throttled(RetryAfter),
     /// Wrong password or no such user; counted against both keys.
     Invalid,
+    /// Wrong password that disabled the account (V577). Answer it as
+    /// [`LoginRefusal::Invalid`], and announce the user's revocation so open
+    /// native sockets drop.
+    LockedOut(UserId),
     /// The user store failed; not counted.
     Backend(AuthError),
 }
@@ -759,10 +854,43 @@ impl LoginThrottle {
         password: &SecretString,
         ip: IpAddr,
     ) -> Result<User, LoginRefusal> {
+        self.verify_for(auth, user, password, ip, Purpose::SignIn)
+            .await
+    }
+
+    /// Like [`Self::verify`] for the signed-in user's own password check
+    /// (change password): throttled the same way, but a wrong password does
+    /// not count toward `LoginAttemptsBeforeLockout`, so a stolen bearer
+    /// token cannot lock the owner out (V577). Jellyfin's
+    /// `UserController.UpdateUserPassword` calls `AuthenticateUser`, which
+    /// does count here; pharos deliberately does not.
+    pub async fn verify_recheck<U: UserStore>(
+        &self,
+        auth: &BuiltinAuth<U>,
+        user: &str,
+        password: &SecretString,
+        ip: IpAddr,
+    ) -> Result<User, LoginRefusal> {
+        self.verify_for(auth, user, password, ip, Purpose::Recheck)
+            .await
+    }
+
+    async fn verify_for<U: UserStore>(
+        &self,
+        auth: &BuiltinAuth<U>,
+        user: &str,
+        password: &SecretString,
+        ip: IpAddr,
+        purpose: Purpose,
+    ) -> Result<User, LoginRefusal> {
         let attempt = self
             .begin(user, ip, Instant::now())
             .map_err(LoginRefusal::Throttled)?;
-        match auth.judge(user, password).await {
+        let verdict = match purpose {
+            Purpose::SignIn => auth.judge(user, password).await,
+            Purpose::Recheck => auth.judge_recheck(user, password).await,
+        };
+        match verdict {
             Ok(u) => {
                 attempt.succeeded();
                 Ok(u)
@@ -774,6 +902,13 @@ impl LoginThrottle {
                 // Dropped unsettled: stays counted as a failed login.
                 attempt.fail(reason, name_mismatch);
                 Err(LoginRefusal::Invalid)
+            }
+            Err(Denial::LockedOut {
+                user: id,
+                name_mismatch,
+            }) => {
+                attempt.fail(LoginFailure::BadPassword, name_mismatch);
+                Err(LoginRefusal::LockedOut(id))
             }
             Err(Denial::Backend(e)) => {
                 attempt.abandon();
@@ -1154,6 +1289,91 @@ mod tests {
         SecretString::new("wrong")
     }
 
+    async fn seed_with_limit(auth: &BuiltinAuth<MemUsers>, limit: i32) -> UserRecord {
+        let mut rec = seed(auth, "ali", "hunter2").await;
+        rec.policy.login_attempts_before_lockout = limit;
+        auth.users()
+            .set_policy(rec.id, rec.policy.clone())
+            .await
+            .unwrap();
+        rec
+    }
+
+    /// V577: the limit-th wrong password disables the account, reports the
+    /// lockout to the caller (who announces it), and counts it.
+    #[tokio::test]
+    async fn the_wrong_password_that_reaches_the_limit_reports_a_lockout() {
+        let rec = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&rec);
+        let _m = metrics::set_default_local_recorder(&rec);
+        let auth = fresh().await;
+        let user = seed_with_limit(&auth, 2).await;
+
+        assert!(matches!(
+            auth.judge("ali", &wrong()).await,
+            Err(Denial::Refused { .. })
+        ));
+        match auth.judge("ali", &wrong()).await {
+            Err(Denial::LockedOut { user: id, .. }) => assert_eq!(id, user.id),
+            other => panic!("expected a lockout, got {other:?}"),
+        }
+        assert!(auth.users().get(user.id).await.unwrap().policy.is_disabled);
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == "pharos_login_lockout_total");
+        assert!(
+            matches!(
+                counted,
+                Some((.., metrics_util::debugging::DebugValue::Counter(1)))
+            ),
+            "{counted:?}"
+        );
+    }
+
+    /// V577: the change-password check never moves the counter, so a stolen
+    /// bearer token cannot lock the owner out by guessing the current password.
+    #[tokio::test]
+    async fn rechecking_a_password_never_counts_toward_lockout() {
+        let auth = fresh().await;
+        let user = seed_with_limit(&auth, 2).await;
+        for _ in 0..6 {
+            assert!(matches!(
+                auth.judge_recheck("ali", &wrong()).await,
+                Err(Denial::Refused { .. })
+            ));
+        }
+        assert!(!auth.users().get(user.id).await.unwrap().policy.is_disabled);
+        assert!(auth
+            .judge_recheck("ali", &SecretString::new("hunter2"))
+            .await
+            .is_ok());
+        // The two misses a sign-in may still make were not spent.
+        assert!(matches!(
+            auth.judge("ali", &wrong()).await,
+            Err(Denial::Refused { .. })
+        ));
+    }
+
+    /// The recheck also leaves a counted sign-in miss alone on success.
+    #[tokio::test]
+    async fn a_correct_recheck_does_not_reset_the_sign_in_count() {
+        let auth = fresh().await;
+        seed_with_limit(&auth, 2).await;
+        assert!(matches!(
+            auth.judge("ali", &wrong()).await,
+            Err(Denial::Refused { .. })
+        ));
+        auth.judge_recheck("ali", &SecretString::new("hunter2"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.judge("ali", &wrong()).await,
+            Err(Denial::LockedOut { .. })
+        ));
+    }
+
     /// Refused with no slot free, a login is a backend fault, never a wrong
     /// password: the throttle abandons the attempt instead of counting it.
     #[tokio::test]
@@ -1326,7 +1546,13 @@ mod tests {
             ("disabled user", "off", "hunter2"),
         ] {
             match auth
-                .judge_with(name, &SecretString::new(password), &no_slots, wait)
+                .judge_with(
+                    name,
+                    &SecretString::new(password),
+                    Purpose::SignIn,
+                    &no_slots,
+                    wait,
+                )
                 .await
             {
                 Err(Denial::Backend(AuthError::Backend(msg))) => {
