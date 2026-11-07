@@ -49,6 +49,7 @@ pub struct Start<'a> {
     /// The item as the client names it on the wire.
     pub item_wire_id: String,
     pub position_ticks: u64,
+    pub supports_remote_control: bool,
 }
 
 /// Starts the live session a report then moves, and bumps the item to the
@@ -85,6 +86,7 @@ pub async fn start(state: &AppState, s: Start<'_>) -> Result<(), ReportError> {
             version: s.version,
             item_id: s.item_wire_id,
             position_ticks: s.position_ticks,
+            supports_remote_control: s.supports_remote_control,
         })
         .await
         .map_err(|e| ReportError::RegistryDown(e.to_string()))

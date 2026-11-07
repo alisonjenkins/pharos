@@ -206,6 +206,7 @@ async fn playing_started(
             version: auth.version_label(),
             item_wire_id: body.item_id,
             position_ticks: body.position_ticks.unwrap_or(0),
+            supports_remote_control: true,
         },
     )
     .await
