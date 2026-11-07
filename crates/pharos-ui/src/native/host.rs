@@ -434,6 +434,8 @@ pub fn store_theme(_key: &str, _value: &str) -> Result<(), String> {
 
 pub fn apply_subtitle_size(_size: SubtitleSize) {}
 
+pub fn apply_device(_device: super::playback::DeviceClass) {}
+
 pub fn apply_library_transition(_fx: LibraryTransition) {}
 
 pub fn apply_overlay_effect(_fx: OverlayEffect) {}

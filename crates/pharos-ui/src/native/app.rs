@@ -36,12 +36,12 @@ use super::playback::{
     parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
-    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, EffectsLevel,
-    Engine, EngineReason, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal,
-    OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize, SubtitleSwitch,
-    Tier, TierDrop, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
-    MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY,
-    VOLUME_KEY,
+    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, DeviceClass,
+    EffectsLevel, Engine, EngineReason, LibraryTransition, MediaEvent, MediaState, MseEngine,
+    OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize,
+    SubtitleSwitch, Tier, TierDrop, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY,
+    TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -313,6 +313,13 @@ struct Boot {
 /// Load the custom themes, then apply the device's stored choice before the
 /// first native paint, logging which theme and, on a fallback, why.
 fn boot_theme() -> Boot {
+    let device = this_device();
+    platform::info(&format!(
+        "pharos: device class={} android_shell={}",
+        device.label(),
+        platform::android_shell()
+    ));
+    platform::apply_device(device);
     platform::apply_subtitle_size(stored_subtitle_size());
     platform::apply_library_transition(stored_library_transition());
     platform::apply_overlay_effect(stored_overlay_effect());
@@ -679,15 +686,21 @@ const REDUCED_MOTION: &str = "(prefers-reduced-motion: reduce)";
 /// `(max-width)` below which a coarse-pointer device counts as a phone.
 const NARROW_SCREEN: &str = "(max-width: 600px)";
 
-/// The tier a styled subtitle track is first fetched at on this device, and
-/// the log line saying why.
-fn current_starting_tier() -> Tier {
-    let device = device_class(
+/// What kind of screen this page runs on: a TV gets the ten-foot layout
+/// and starts styled subtitles at the TV tier.
+fn this_device() -> DeviceClass {
+    device_class(
         &platform::user_agent(),
         platform::prefers("(pointer: coarse)"),
         platform::prefers(NARROW_SCREEN),
         platform::android_shell(),
-    );
+    )
+}
+
+/// The tier a styled subtitle track is first fetched at on this device, and
+/// the log line saying why.
+fn current_starting_tier() -> Tier {
+    let device = this_device();
     let reduced_motion = platform::prefers(REDUCED_MOTION);
     let remembered = stored_tier_drop();
     let tier = starting_tier(device, reduced_motion, remembered);
