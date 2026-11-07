@@ -1032,7 +1032,7 @@ async fn native_reply(
 
 /// B265 / V201: a `Join` on the native `/sync/v1/ws` admits only a user who
 /// may see the group's queue; a refusal reads as an unknown group.
-/// Disarm check: with `StoreTokenResolver::may_join` answering true, the user
+/// Disarm check: with `StoreTokenResolver::joinable_group` skipping the access check, the user
 /// restricted to library B receives `joined`.
 #[actix_web::test]
 async fn a_native_sync_join_needs_a_visible_queue() {
@@ -1113,6 +1113,38 @@ async fn a_native_sync_join_needs_a_visible_queue() {
             ("admin", "joined".to_string()),
         ]
     );
+}
+
+/// V582: a native `Join` of a group that is neither live nor a fresh persisted
+/// snapshot is refused as an unknown group and spawns no group.
+/// Disarm check: with `expect_join` back on `get_or_create`, the join is
+/// admitted into a phantom empty group and the registry is no longer empty.
+#[actix_web::test]
+async fn a_native_sync_join_of_a_dead_group_spawns_nothing() {
+    let f = seed_rich().await;
+    let sinks = pharos_sync::MemberSinks::new();
+    let registry = pharos_sync::GroupRegistry::spawn(std::sync::Arc::new(
+        pharos_sync::LocalDelivery::new(sinks.clone()),
+    ));
+    let state = f.state.clone();
+    let reg = registry.clone();
+    let server = actix_test::start(move || {
+        actix_web::App::new()
+            .app_data(state.clone())
+            .app_data(actix_web::web::Data::new(reg.clone()))
+            .app_data(actix_web::web::Data::new(sinks.clone()))
+            .app_data(actix_web::web::Data::new(
+                pharos_server::sync_resolver::build(state.clone().into_inner()),
+            ))
+            .configure(pharos_sync::ws::register)
+    });
+    let dead = pharos_sync::messages::GroupId::new();
+    assert_eq!(
+        native_join_reply(&server, &f.admin_token, dead).await,
+        "error"
+    );
+    assert!(registry.get(dead).await.unwrap().is_none());
+    assert!(registry.list().await.unwrap().is_empty());
 }
 
 /// Tag policies used by the B266 tests: blocking the rich item's tag, and
