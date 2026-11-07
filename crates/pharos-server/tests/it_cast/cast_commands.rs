@@ -317,22 +317,22 @@ async fn a_seek_on_the_tv_seeks_the_group_once_and_the_planner_leaves_it_alone()
 #[actix_web::test]
 async fn a_stop_on_the_tv_ends_the_cast_once_and_leaves_the_group_playing() {
     let rig = settled_cast().await;
-    let before = cast_rig::counter(
-        "pharos_cast_seat_total",
-        &[("event", "ended"), ("reason", "user_stop")],
-    );
+    rig.exclusive_metrics().await;
+    let user_stops = || {
+        cast_rig::counter(
+            "pharos_cast_seat_total",
+            &[("event", "ended"), ("reason", "user_stop")],
+        )
+    };
+    let before = user_stops();
 
     rig.receiver.user_stop();
     rig.wait_cast_gone().await;
+    cast_rig::eventually("the stop is counted", || user_stops() > before).await;
+    // A duplicate End would land after the first: let it, then assert exactly one.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    assert_eq!(
-        cast_rig::counter(
-            "pharos_cast_seat_total",
-            &[("event", "ended"), ("reason", "user_stop")]
-        ),
-        before + 1
-    );
+    assert_eq!(user_stops(), before + 1);
     assert_ne!(
         rig.group_play_state().await,
         pharos_sync::messages::GroupPlayState::Paused,

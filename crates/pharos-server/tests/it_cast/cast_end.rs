@@ -455,6 +455,7 @@ async fn a_tv_answering_after_its_owner_left_is_not_given_a_seat() {
 async fn leaving_the_group_while_the_tv_connects_cancels_the_start() {
     let rig = CastRig::new().await;
     let release = rig.factory.hold_open(cast_rig::TV);
+    rig.exclusive_metrics().await;
     let before = seat_total("ended", "owner_left");
 
     let start = rig.play_on_tv(&rig.alice);
@@ -469,6 +470,12 @@ async fn leaving_the_group_while_the_tv_connects_cancels_the_start() {
 
     assert_eq!(leave_status, 204);
     assert_ne!(start_status, 204, "the cast must not start: {start_body}");
+    cast_rig::eventually("the start is cancelled with owner_left", || {
+        seat_total("ended", "owner_left") > before
+    })
+    .await;
+    // The metric fires before the start's cleanup finishes and a duplicate
+    // End would land after it: let both settle before asserting the rest.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(rig.service.snapshot().await.is_empty(), "no seat is left");
     assert_eq!(cast_seat_count(&rig).await, 0, "no seat in the group");
