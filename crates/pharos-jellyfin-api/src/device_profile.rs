@@ -208,6 +208,18 @@ impl Decision {
     }
 }
 
+impl DeviceProfile {
+    /// This profile with every `VideoRangeType` condition removed, for a
+    /// server that does not enforce dynamic range.
+    pub fn without_video_range_conditions(&self) -> Self {
+        let mut stripped = self.clone();
+        for cp in &mut stripped.codec_profiles {
+            cp.conditions.retain(|c| c.property != "VideoRangeType");
+        }
+        stripped
+    }
+}
+
 /// P27 — evaluate a CodecProfile's required conditions against the
 /// source. Returns `true` when every required condition passes; an
 /// empty or non-matching profile is permissive.

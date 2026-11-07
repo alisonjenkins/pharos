@@ -32,6 +32,12 @@ async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fix
     serve(seed_rich().await, revalidate_secs)
 }
 
+/// A server that enforces `VideoRangeType` conditions (T065).
+pub(crate) async fn start_enforcing_video_range() -> (actix_test::TestServer, Fixture) {
+    let fx = crate::common::seed_rich_with(|s| s.with_enforce_video_range(true)).await;
+    serve(fx, NonZeroU32::MIN)
+}
+
 /// A server whose state also extracts image subtitles (spec 019). Its pool
 /// never runs: nothing here asks for the images, only whether they can be.
 #[cfg(feature = "ffmpeg-lib")]
