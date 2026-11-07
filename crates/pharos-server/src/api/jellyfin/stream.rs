@@ -753,7 +753,7 @@ async fn stream_transcoded_webm(
         filler: None,
         video_3d_format: item.probe.video_3d_format,
         stereo_output,
-        tonemap: pharos_transcode::Tonemap::Off,
+        tonemap: super::hls::source_tonemap(&item.probe),
     };
     tracing::info!(
         media.id = item.id,
