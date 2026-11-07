@@ -282,6 +282,9 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     // for a single-track source, so the swap scenario needs the real stream
     // list; register_seed_items writes an empty probe (pure DB, no ffmpeg).
     seed_probe_multitrack(&stores, &paths.multitrack).await?;
+    for name in DIAGNOSTICS_SEED_USERS {
+        seed_diagnostics_user(&stores, &auth, name).await?;
+    }
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -291,6 +294,55 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
          (incl. 3-episode series + a second show + multitrack + epub + cbz + pdf), fixture={}",
         paths.movie.display()
     )?;
+    writeln!(
+        lock,
+        "seeded: users {DIAGNOSTICS_SEED_USERS:?} (password '<name>-test-pw') \
+         with diagnostics opted in"
+    )?;
+    Ok(())
+}
+
+/// Seed users who have opted in to sending diagnostics (spec 016), so the
+/// watch-together e2e tests can see their client events reach the server.
+/// `playwright` keeps the default (off).
+#[cfg(debug_assertions)]
+const DIAGNOSTICS_SEED_USERS: [&str; 2] = ["together-a", "together-b"];
+
+/// Creates `name` (password `<name>-test-pw`, not admin) unless it exists,
+/// then sets its `diagnostics.opt_in` pref to `true`, the value Settings →
+/// Privacy writes.
+#[cfg(debug_assertions)]
+async fn seed_diagnostics_user(
+    stores: &Stores,
+    auth: &pharos_server::auth::BuiltinAuth<Stores>,
+    name: &str,
+) -> Result<(), AppError> {
+    use pharos_core::{SecretString, UserId, UserPolicy, UserPrefStore, UserRecord, UserStore};
+
+    let io = |e: String| AppError::Io(std::io::Error::other(e));
+    let hash = auth
+        .hash_password_off_worker(&SecretString::new(format!("{name}-test-pw")))
+        .await
+        .map_err(|e| io(e.to_string()))?;
+    let user = UserRecord {
+        id: UserId::new(),
+        name: name.into(),
+        password_hash: hash,
+        policy: UserPolicy::default(),
+    };
+    match stores.create(user).await {
+        Ok(()) | Err(pharos_core::AuthError::Conflict) => {}
+        Err(e) => return Err(io(e.to_string())),
+    }
+    let id = stores
+        .lookup_by_name(name)
+        .await
+        .map_err(|e| io(format!("seeded user {name} not found: {e}")))?
+        .id;
+    stores
+        .set_user_pref(id, "diagnostics.opt_in", b"true")
+        .await
+        .map_err(|e| io(format!("diagnostics opt-in for {name}: {e}")))?;
     Ok(())
 }
 
