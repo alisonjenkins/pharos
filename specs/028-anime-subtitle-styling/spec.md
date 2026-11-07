@@ -118,7 +118,7 @@ An operator can tell, from Prometheus and Loki alone, how many items were styled
 
 ### Background job
 
-- **FR-014** A `subtitle_styling` background job modelled on `audio_analysis`: it starts after a warm-up, runs on the background leader only, handles one item at a time, and takes a `BgPermit` around the signals op, so it yields to playback. It also starts no item while `pharos_transcode_pending_jobs` is above zero (design §8a). It retries a crashed or timed-out worker next pass, and stores a version-only row for an undecodable file so the file is not tried again until it changes.
+- **FR-014** A `subtitle_styling` background job modelled on `audio_analysis`: it starts after a warm-up, runs on the background leader only, handles one item at a time, and takes a `BgPermit` around the signals op, so it yields to playback. It also starts no item while `pharos_transcode_pending_jobs` is above zero (design §8a). It retries a crashed or timed-out worker, or a source script it failed to extract, next pass, and stores a version-only row for an undecodable file so the file is not tried again until it changes.
 - **FR-015** Which items: videos with an English (or untagged, single) text subtitle track, in a library or item whose genres include Anime or Animation. The job takes the item a viewer just opened first, through an on-demand queue that sits ahead of the backfill. [NEEDS CLARIFICATION: is the genre gate the right scope for phase 1, or should every video with an English text track be styled?]
 - **FR-016** Source track choice: the full English dialogue track (not forced). An SDH track is preferred when one exists, because its sound and speaker tags feed the director. An ASS source is preferred over SRT for the same language, because its italics and positions are kept.
 
@@ -131,7 +131,7 @@ An operator can tell, from Prometheus and Loki alone, how many items were styled
 
 ### Signals
 
-- **FR-021** `pharos_subtitle_styling_total{outcome,stage}`, with stage being `select`, `signals`, `direct` or `compile`. Later phases add `asr`, `align`, `diarize`, `ocr` and `track` (design §9). Also `pharos_subtitle_styling_seconds{stage}`, `pharos_subtitle_styling_pending`, and `pharos_subtitle_effect_total{intent,source}`, where source is `rule` or `model` (always `rule` in phase 1). The signal that fired is in the log line, never a label. The design's proof query is `sum by (intent, source) (increase(pharos_subtitle_effect_total[1d]))`. Labels come from `label()` methods and are asserted distinct. The styled track's deliveries are counted by B600's `pharos_subtitle_delivery_total` with `source="generated"`.
+- **FR-021** `pharos_subtitle_styling_total{outcome,stage}`, with stage being `select`, `read`, `signals`, `direct` or `store`, the stage an item ended in (`styled` ends in `store`). Compiling happens per request and is counted by the delivery metric below. Later phases add `asr`, `align`, `diarize`, `ocr` and `track` (design §9). Also `pharos_subtitle_styling_seconds{stage}`, `pharos_subtitle_styling_pending`, and `pharos_subtitle_effect_total{intent,source}`, where source is `rule` or `model` (always `rule` in phase 1). The signal that fired is in the log line, never a label. The design's proof query is `sum by (intent, source) (increase(pharos_subtitle_effect_total[1d]))`. Labels come from `label()` methods and are asserted distinct. The styled track's deliveries are counted by B600's `pharos_subtitle_delivery_total` with `source="generated"`.
 
 ## Key entities
 
