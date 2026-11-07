@@ -280,6 +280,7 @@ fn read_capabilities(
         audio_codecs: texts(caps.get_audio_codecs()?)?,
         containers: texts(caps.get_containers()?)?,
         max_bitrate: caps.get_max_bitrate(),
+        hdr: caps.get_hdr(),
         image_subtitles: if knows_image_delivery {
             texts(caps.get_image_subtitles()?)?
         } else {
