@@ -162,3 +162,80 @@ impl Together {
         self.seat.current()
     }
 }
+
+/// Where a tab keeps the group it is in, so a reload joins it again (B665).
+/// `sessionStorage`, like the tab's group device id (`pharos.group.device`):
+/// the server keeps a reloaded member's seat for the socket-loss grace, and
+/// the same device joining takes it back.
+const GROUP_KEY: &str = "pharos.group.id";
+
+/// What the tab keeps for `view`: the group's id while in one, else empty.
+fn kept_group(view: &GroupView) -> String {
+    if view.active {
+        view.id.clone().unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// Keeps the tab's group for a reload, writing only when it changes.
+#[derive(Default)]
+pub struct GroupKeeper(std::cell::RefCell<Option<String>>);
+
+impl GroupKeeper {
+    pub fn keep(&self, view: &GroupView) {
+        let id = kept_group(view);
+        if self.0.borrow().as_deref() == Some(id.as_str()) {
+            return;
+        }
+        if let Err(e) = platform::session_set(GROUP_KEY, &id) {
+            platform::warn(&format!(
+                "pharos: keeping the group for a reload failed: {e}"
+            ));
+        }
+        *self.0.borrow_mut() = Some(id);
+    }
+}
+
+/// The group this tab was in before it was reloaded, to join again; `None`
+/// when it was in none, or is in one already.
+pub fn group_to_rejoin(kept: Option<String>, in_group: bool) -> Option<String> {
+    kept.filter(|id| !id.is_empty() && !in_group)
+}
+
+/// What the tab kept before this page loaded.
+pub fn kept_before_load() -> Option<String> {
+    platform::session_get(GROUP_KEY).ok().flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tab_keeps_its_group_only_while_in_it() {
+        let mut view = GroupView {
+            active: true,
+            id: Some("g1".into()),
+            ..GroupView::default()
+        };
+        assert_eq!(kept_group(&view), "g1");
+        view.active = false;
+        assert_eq!(
+            kept_group(&view),
+            "",
+            "a left or ended group is not rejoined"
+        );
+    }
+
+    #[test]
+    fn a_reload_rejoins_the_kept_group_unless_already_in_one() {
+        assert_eq!(
+            group_to_rejoin(Some("g1".into()), false).as_deref(),
+            Some("g1")
+        );
+        assert_eq!(group_to_rejoin(Some("g1".into()), true), None);
+        assert_eq!(group_to_rejoin(Some(String::new()), false), None);
+        assert_eq!(group_to_rejoin(None, false), None);
+    }
+}
