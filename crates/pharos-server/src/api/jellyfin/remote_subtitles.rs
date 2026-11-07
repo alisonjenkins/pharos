@@ -37,28 +37,43 @@ fn imdb_number(id: &str) -> Option<u64> {
     id.trim().trim_start_matches("tt").parse().ok()
 }
 
-async fn build_query(state: &AppState, item: &MediaItem, language: String) -> SearchQuery {
+/// The moviehash of a movie or episode file, or `None` when the item is not
+/// hashable or the file cannot be read (logged). Reads the file, so callers
+/// compute it once per item and pass it to every language's [`build_query`].
+pub(crate) async fn item_moviehash(item: &MediaItem) -> Option<String> {
+    if !matches!(item.kind, MediaKind::Movie | MediaKind::Episode) {
+        return None;
+    }
+    match hash::moviehash(&item.path).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(item = item.id, error = %e, "opensubtitles: could not hash the media file");
+            None
+        }
+    }
+}
+
+/// The search for `item` in `language`. `moviehash` is [`item_moviehash`]'s
+/// answer for the item; this function never reads the media file.
+pub(crate) async fn build_query(
+    stores: &crate::state::Stores,
+    item: &MediaItem,
+    language: String,
+    moviehash: Option<String>,
+) -> SearchQuery {
     let ids = &item.metadata.provider_ids;
     let mut q = SearchQuery {
         imdb_id: ids.imdb.as_deref().and_then(imdb_number),
         tmdb_id: ids.tmdb.as_deref().and_then(|s| s.trim().parse().ok()),
         language,
+        moviehash,
         ..Default::default()
     };
-    if matches!(item.kind, MediaKind::Movie | MediaKind::Episode) {
-        match hash::moviehash(&item.path).await {
-            Ok(h) => q.moviehash = h,
-            Err(e) => {
-                tracing::warn!(item = item.id, error = %e, "opensubtitles: could not hash the media file");
-            }
-        }
-    }
     if let (MediaKind::Episode, Some(series)) = (item.kind, item.series.as_ref()) {
         // A show-level TMDB id is the parent id the API wants. Without one the
         // season/episode numbers mean nothing, so they are left out.
         let key = series.series_key().to_string();
-        if let Ok(map) = state
-            .stores
+        if let Ok(map) = stores
             .series_metadata_by_keys(std::slice::from_ref(&key))
             .await
         {
@@ -82,7 +97,7 @@ async fn build_query(state: &AppState, item: &MediaItem, language: String) -> Se
 }
 
 /// Hash matches first, then trusted uploaders, then popularity.
-fn rank(hits: &mut [SubtitleHit]) {
+pub(crate) fn rank(hits: &mut [SubtitleHit]) {
     hits.sort_by(|a, b| {
         b.hash_match
             .cmp(&a.hash_match)
@@ -188,7 +203,8 @@ pub async fn search_inner(
         );
         return Ok(Vec::new());
     };
-    let query = build_query(state, &item, language.clone()).await;
+    let moviehash = item_moviehash(&item).await;
+    let query = build_query(&state.stores, &item, language.clone(), moviehash).await;
     let result = os.provider.search(&query).await;
     record_search(&result);
     match result {
@@ -227,7 +243,7 @@ pub async fn download_inner(
     save_download(os, &item, file_id, &language).await
 }
 
-async fn save_download(
+pub(crate) async fn save_download(
     os: &OpenSubtitles,
     item: &MediaItem,
     file_id: u64,
@@ -284,4 +300,42 @@ pub async fn remote_subtitle_download(
     let (id, subtitle_id) = path.into_inner();
     download_inner(&state, &id, &subtitle_id).await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    /// The hash is computed once per item by the caller; the query takes it as
+    /// given and does not read the media file.
+    #[tokio::test]
+    async fn build_query_takes_the_hash_it_is_given_without_reading_the_file() {
+        let stores = crate::state::Stores::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let item = MediaItem {
+            id: 1,
+            path: "/nonexistent/film.mkv".into(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        };
+        let q = build_query(&stores, &item, "en".into(), Some("8e245d9679d31e12".into())).await;
+        assert_eq!(q.moviehash.as_deref(), Some("8e245d9679d31e12"));
+        assert_eq!(q.language, "en");
+        let q = build_query(&stores, &item, "fr".into(), None).await;
+        assert_eq!(q.moviehash, None);
+        assert_eq!(q.language, "fr");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_media_file_has_no_hash_and_is_not_an_error() {
+        let item = MediaItem {
+            id: 2,
+            path: "/nonexistent/film.mkv".into(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        };
+        assert_eq!(item_moviehash(&item).await, None);
+    }
 }
