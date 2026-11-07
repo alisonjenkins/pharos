@@ -2,6 +2,7 @@
 //! No IO impls here. Servers/adapters live in pharos-server and friends.
 
 pub mod auth;
+pub mod client_ids;
 pub mod fuzzy;
 pub mod language;
 pub mod origin;
@@ -21,6 +22,7 @@ pub use auth::{
     TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore, User, UserId, UserPolicy,
     UserRecord, UserStore, API_KEY_DEVICE_PREFIX,
 };
+pub use client_ids::{ClientDeviceId, PlaySessionId};
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
