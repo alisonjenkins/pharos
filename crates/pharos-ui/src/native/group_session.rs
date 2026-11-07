@@ -441,7 +441,14 @@ impl GroupState {
                     playing,
                 });
                 if self.watching == Some(item) {
-                    Vec::new()
+                    // Already showing it, perhaps loaded at this member's
+                    // own resume point before the item arrived: put it at the
+                    // group's (a no-op within `HOLD_BELOW_MS`). The seek's
+                    // landing carries the ready (B664).
+                    vec![Action::Seek {
+                        delay_ms: 0,
+                        position_ms,
+                    }]
                 } else {
                     vec![Action::Navigate(item)]
                 }
@@ -2297,6 +2304,29 @@ mod tests {
         rig.session.on_media(MediaEvent::Seeked);
         rig.env.settle();
         assert_eq!(calls_with(&rig, "ready"), ["ready(pl-7,3000,false)"]);
+    }
+
+    /// B664, the other order (Firefox): the player loaded at this member's
+    /// own resume point before the group's item arrived, so no media event
+    /// follows to carry the ready. The item puts the player at the group's
+    /// position, and that seek's landing says ready.
+    #[test]
+    fn an_item_for_a_player_loaded_away_from_the_group_seeks_it_there() {
+        let rig = rig();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.player.position.set(72_000);
+        rig.player.paused.set(true);
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 2_000,
+            playing: false,
+        });
+        rig.env.settle();
+        assert_eq!(rig.player.position.get(), 2_000);
+        rig.session.on_media(MediaEvent::Seeked);
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "ready"), ["ready(pl-7,2000,false)"]);
     }
 
     /// A server that answers slowly must not reorder what the viewer did:
