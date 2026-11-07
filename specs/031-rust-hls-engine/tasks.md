@@ -10,9 +10,11 @@
 
 ## Slice 1 - Seam (V630)
 
-- [ ] T031-04 `Engine::RustHls`; `choose_engine` takes the engine preference; `engine()` routes `RustHls` to hls.js until slice 2 lands, logging `reason=fallback cause=not-built`.
-- [ ] T031-05 Per-device setting in Settings, Playback, stored in `localStorage`; `?engine=` override; `pharos: playback engine=… reason=…` log and client event.
-- [ ] T031-06 Engine-neutral telemetry: `hls_event` takes the engine label; auto quality gates on an `Engine::reports_fragments()` capability instead of `== Engine::HlsJs`.
+- [x] T031-04 `Engine::RustHls`; `choose_engine` takes the engine preference; `engine()` routes `RustHls` to hls.js until slice 2 lands, logging `reason=fallback cause=not_built asked=rust asked_by=<reason>`.
+- [x] T031-05 Per-device setting in Settings, Playback, stored in `localStorage`; `?engine=` override; `pharos: playback engine=… reason=…` log and client event.
+- [ ] T031-06 Engine-neutral telemetry: `hls_event` takes the engine label (moved to slice 2, when a second engine raises errors); auto quality gates on an `Engine::reports_fragments()` capability instead of `== Engine::HlsJs` (done). The choice is reported as a `rendererMode` event with `renderer=hls`, `mode=<engine>`, `reason`.
+
+Notes from slice 1 (2026-11-07T23:00:00Z): Playwright's bundled Firefox does not advance `currentTime` on the HLS fixture here, for hls.js too (the existing "an HLS title plays through hls.js" case fails the same way), so Firefox playback checks need the system Firefox (puppeteer-core) in slice 0. The engine-choice logs pass in both browsers.
 
 ## Slice 2 - Play (V631-V636, V639, V641-V643)
 
