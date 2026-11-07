@@ -505,6 +505,16 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                 None => continue,
             }
         }
+        // V613: an item that had a styled plan goes before one that never
+        // had one. After a director bump that plan is still being served,
+        // so it is what viewers see; a file changed since is also redone
+        // early. The index rows carry no plan, so `outcome` says which had
+        // one. The sort is stable, so each group keeps the library's order.
+        work.sort_by_cached_key(|t| {
+            !rows
+                .get(&t.item.id)
+                .is_some_and(|r| r.outcome == Outcome::Styled.label())
+        });
         sum.pending = work.len();
         metrics::gauge!("pharos_subtitle_styling_pending").set(work.len() as f64);
         if work.is_empty() && sum.missing + sum.unscanned == 0 {
@@ -958,7 +968,9 @@ fn in_scope_kind(i: &MediaItem) -> bool {
     matches!(i.kind, MediaKind::Movie | MediaKind::Episode) && i.origin().local().is_some()
 }
 
-/// Whether `row` still describes this file, source and director.
+/// Whether `row` still describes this file, source and director. Stricter
+/// than [`crate::styled_track::current`], which keeps serving an older
+/// director's plan until this job replaces it (V613).
 fn is_current(
     row: &SubtitleStyling,
     sig: (i64, u64),
@@ -1622,6 +1634,42 @@ mod tests {
         std::fs::write(lib.dir.path().join("a.en.srt"), format!("{SRT}\n")).unwrap();
         job.run_pass(&OnDemand::default()).await;
         assert_eq!(fake.calls().len(), 4, "changed sidecar: redone");
+    }
+
+    /// V613: after a director bump, an item whose old plan is still being
+    /// served is re-styled before items that were never styled.
+    #[tokio::test]
+    async fn a_served_stale_plan_is_redone_before_new_items() {
+        let lib = library(&[(5, "e.mkv", ANIME, true)]).await;
+        let fake = FakeSignals::default();
+        let job = styler(&lib, &fake, idle());
+        job.run_pass(&OnDemand::default()).await;
+        let mut row = lib.store.subtitle_styling(5).await.unwrap().unwrap();
+        row.director_version = DIRECTOR_VERSION - 1;
+        lib.store.put_subtitle_styling(row).await.unwrap();
+        for (id, name) in [(1, "a.mkv"), (2, "b.mkv")] {
+            let path = lib.dir.path().join(name);
+            std::fs::write(&path, b"video").unwrap();
+            let stem = name.rsplit_once('.').unwrap().0;
+            std::fs::write(lib.dir.path().join(format!("{stem}.en.srt")), SRT).unwrap();
+            lib.store
+                .put(MediaItem {
+                    id,
+                    path,
+                    title: name.into(),
+                    kind: MediaKind::Movie,
+                    probe: MediaProbe {
+                        genre: ANIME.map(str::to_owned),
+                        duration_ms: Some(60_000),
+                        ..MediaProbe::default()
+                    },
+                    ..MediaItem::default()
+                })
+                .await
+                .unwrap();
+        }
+        job.run_pass(&OnDemand::default()).await;
+        assert_eq!(fake.calls(), ["e.mkv", "e.mkv", "a.mkv", "b.mkv"]);
     }
 
     /// FR-015 — the item a viewer opened goes ahead of the backfill.
