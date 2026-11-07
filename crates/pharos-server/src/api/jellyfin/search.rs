@@ -15,6 +15,7 @@ use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, Responder};
 use pharos_core::{MediaItem, MediaKind, MediaStore};
+use pharos_jellyfin_api::kinds::ItemType;
 use serde::{Deserialize, Serialize};
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -90,13 +91,18 @@ async fn search_hints(
         .as_deref()
         .map(|s| {
             s.split(',').any(|t| {
-                let t = t.trim();
-                t.eq_ignore_ascii_case("MusicArtist")
-                    || t.eq_ignore_ascii_case("MusicAlbum")
-                    || t.eq_ignore_ascii_case("Genre")
-                    || t.eq_ignore_ascii_case("Person")
-                    || t.eq_ignore_ascii_case("Studio")
-                    || t.eq_ignore_ascii_case("Tag")
+                // `Tag` is not a BaseItemKind (B69) but older clients send it.
+                t.trim().eq_ignore_ascii_case("Tag")
+                    || matches!(
+                        ItemType::from_wire(t),
+                        Some(
+                            ItemType::MusicArtist
+                                | ItemType::MusicAlbum
+                                | ItemType::Genre
+                                | ItemType::Person
+                                | ItemType::Studio
+                        )
+                    )
             })
         })
         .unwrap_or(true);
@@ -475,7 +481,7 @@ fn parse_include_item_types(s: Option<&str>) -> Option<Vec<MediaKind>> {
     if raw.is_empty() {
         return None;
     }
-    let kinds: Vec<MediaKind> = raw.split(',').filter_map(MediaKind::from_wire).collect();
+    let kinds = ItemType::stored_kinds(raw);
     if kinds.is_empty() {
         None
     } else {
