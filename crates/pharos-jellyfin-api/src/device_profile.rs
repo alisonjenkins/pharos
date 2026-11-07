@@ -133,6 +133,11 @@ pub struct SourceMedia {
     /// the condition evaluates permissively.
     pub video_bit_depth: Option<u32>,
     pub video_3d_format: Option<pharos_core::Video3DFormat>,
+    /// Jellyfin `VideoRangeType` of the video stream (`SDR`, `HDR10`, `HLG`).
+    /// Drives the `VideoRangeType` CodecProfile condition: an SDR-only
+    /// display must not be handed an HDR source for direct play. `None` =
+    /// unknown, so the condition evaluates permissively.
+    pub video_range_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -284,6 +289,11 @@ pub fn codec_profile_passes(
                     source.video_bit_depth.map(|n| n as i64),
                     &cond.value,
                 ),
+                "VideoRangeType" => compare_string(
+                    &cond.condition,
+                    source.video_range_type.as_deref(),
+                    Some(cond.value.as_str()),
+                ),
                 "Is3D" => compare_string(
                     &cond.condition,
                     Some(if source.video_3d_format.is_some() {
@@ -306,6 +316,31 @@ pub fn codec_profile_passes(
         }
     }
     true
+}
+
+/// Evaluates only the required `VideoRangeType` conditions against the
+/// source, with the same profile scoping as [`codec_profile_passes`]. Returns
+/// `true` for a source whose range is unknown.
+pub fn codec_profile_range_passes(profiles: &[CodecProfileDto], source: &SourceMedia) -> bool {
+    let range_only: Vec<CodecProfileDto> = profiles
+        .iter()
+        .map(|cp| CodecProfileDto {
+            conditions: cp
+                .conditions
+                .iter()
+                .filter(|c| c.property == "VideoRangeType")
+                .cloned()
+                .collect(),
+            ..cp.clone()
+        })
+        .collect();
+    codec_profile_passes(
+        &range_only,
+        source,
+        source.video_level,
+        source.video_profile.as_deref(),
+        source.audio_channels,
+    )
 }
 
 /// Evaluates required 3D conditions (`Is3D` and `Video3DFormat`) against the
@@ -465,6 +500,9 @@ pub enum DirectPlayBlock {
     /// CodecProfile condition (level, profile, bit depth, channel count)
     /// rejected the source — see [`codec_profile_passes`].
     CodecCondition,
+    /// A required `VideoRangeType` condition rejected the source's dynamic
+    /// range (an SDR-only client offered an HDR10 or HLG source).
+    VideoRange { source: String },
     /// 008 — the item has no file behind it, so there is nothing to direct
     /// play. The client's profile was never consulted.
     ///
@@ -491,6 +529,7 @@ impl DirectPlayBlock {
             Self::AudioCodec { .. } => "audio_codec",
             Self::Bitrate { .. } => "bitrate",
             Self::CodecCondition => "codec_condition",
+            Self::VideoRange { .. } => "video_range",
             Self::RemoteSource { .. } => "remote_source",
         }
     }
@@ -506,12 +545,13 @@ impl DirectPlayBlock {
             Self::AudioCodec { .. } => 3,
             Self::Bitrate { .. } => 4,
             Self::CodecCondition => 5,
+            Self::VideoRange { .. } => 6,
             // Ranked above every client-side reason: it is not a negotiation
             // outcome at all, so if it applies it is the whole answer and must
             // not be masked by a profile that also happened to reject the
             // container.
-            Self::RemoteSource { .. } => 6,
-            Self::NotBlocked => 7,
+            Self::RemoteSource { .. } => 7,
+            Self::NotBlocked => 8,
         }
     }
 }
@@ -533,6 +573,12 @@ impl std::fmt::Display for DirectPlayBlock {
                 cap_bps,
             } => write!(f, "source {source_bps} bps over client cap {cap_bps} bps"),
             Self::CodecCondition => write!(f, "a CodecProfile condition rejected the source"),
+            Self::VideoRange { source } => {
+                write!(
+                    f,
+                    "video range {source} rejected by a VideoRangeType condition"
+                )
+            }
             Self::RemoteSource { locator } => {
                 write!(f, "source {locator} is not a file; direct play impossible")
             }
@@ -586,6 +632,17 @@ pub fn negotiate_explained(
     let profile_3d_ok = codec_profile_3d_passes(&profile.codec_profiles, source);
     if !profile_3d_ok {
         note(DirectPlayBlock::CodecCondition, &mut block);
+    }
+    // An out-of-range source cannot be copied to this client by any path, so
+    // it also rules out the remuxes below, not only direct play.
+    let profile_range_ok = codec_profile_range_passes(&profile.codec_profiles, source);
+    if !profile_range_ok {
+        note(
+            DirectPlayBlock::VideoRange {
+                source: named(source.video_range_type.as_deref()),
+            },
+            &mut block,
+        );
     }
 
     // Look for an exact direct-play match first.
@@ -647,6 +704,7 @@ pub fn negotiate_explained(
             && audio_remux_candidate.is_none()
             && !over_bitrate
             && profile_3d_ok
+            && profile_range_ok
         {
             audio_remux_candidate = Some(p);
         }
@@ -667,7 +725,7 @@ pub fn negotiate_explained(
     // container differs from the source's, remux container only.
     // Skip when video bitrate exceeds the cap — full transcode is
     // forced in that case.
-    if !over_bitrate && source.is_video && profile_3d_ok {
+    if !over_bitrate && source.is_video && profile_3d_ok && profile_range_ok {
         for p in &profile.direct_play_profiles {
             if !p.kind.is_empty() && !p.kind.eq_ignore_ascii_case(want_kind) {
                 continue;
@@ -1170,6 +1228,9 @@ mod tests {
             DirectPlayBlock::RemoteSource {
                 locator: "ytdlp://youtube/dQw4w9WgXcQ".into(),
             },
+            DirectPlayBlock::VideoRange {
+                source: "HDR10".into(),
+            },
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|b| b.label()).collect();
         assert_eq!(labels.len(), all.len());
@@ -1177,6 +1238,7 @@ mod tests {
         assert!(all[2].to_string().contains('x'));
         assert!(all[5].to_string().contains('2'));
         assert!(all[7].to_string().contains("dQw4w9WgXcQ"));
+        assert!(all[8].to_string().contains("HDR10"));
     }
 
     #[test]
@@ -1768,5 +1830,93 @@ mod tests {
             "expected Transcode, got {decision:?}"
         );
         assert_eq!(block, DirectPlayBlock::CodecCondition);
+    }
+
+    fn sdr_only_profile() -> DeviceProfile {
+        serde_json::from_str(
+            r#"{
+              "DirectPlayProfiles":[
+                {"Container":"mkv","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"},
+                {"Container":"mp4","Type":"Video","VideoCodec":"hevc","AudioCodec":"aac"}
+              ],
+              "CodecProfiles":[
+                {"Type":"Video","Conditions":[
+                  {"Condition":"Equals","Property":"VideoRangeType","Value":"SDR","IsRequired":true}
+                ]}
+              ],
+              "TranscodingProfiles":[
+                {"Container":"ts","Type":"Video","Protocol":"hls","VideoCodec":"h264","AudioCodec":"aac"}
+              ]
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn ranged(range: Option<&str>) -> SourceMedia {
+        SourceMedia {
+            video_range_type: range.map(str::to_owned),
+            ..hevc_8bit_source()
+        }
+    }
+
+    #[test]
+    fn a_video_range_condition_blocks_hdr_and_names_the_range() {
+        let profile = sdr_only_profile();
+        for hdr in ["HDR10", "HLG"] {
+            let (decision, block) =
+                negotiate_explained(&profile, &ranged(Some(hdr)), &ServerCodecSupport::default());
+            assert!(
+                matches!(decision, Decision::Transcode { .. }),
+                "{hdr} must not direct-play to an SDR-only client, got {decision:?}"
+            );
+            assert_eq!(block, DirectPlayBlock::VideoRange { source: hdr.into() });
+        }
+    }
+
+    #[test]
+    fn a_video_range_condition_passes_sdr_and_unknown_ranges() {
+        let profile = sdr_only_profile();
+        for range in [Some("SDR"), None] {
+            let (decision, block) =
+                negotiate_explained(&profile, &ranged(range), &ServerCodecSupport::default());
+            assert_eq!(decision, Decision::DirectPlay, "range {range:?}");
+            assert_eq!(block, DirectPlayBlock::NotBlocked);
+        }
+    }
+
+    #[test]
+    fn a_video_range_condition_blocks_a_container_remux_too() {
+        let mut profile = sdr_only_profile();
+        profile.direct_play_profiles.truncate(1);
+        let mut source = ranged(Some("HDR10"));
+        source.container = "avi".into();
+        let (decision, _) = negotiate_explained(&profile, &source, &ServerCodecSupport::default());
+        assert!(
+            matches!(decision, Decision::Transcode { .. }),
+            "HDR remux to an SDR-only client must transcode, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn equals_any_range_condition_allows_the_listed_ranges() {
+        let mut profile = sdr_only_profile();
+        if let Some(cond) = profile
+            .codec_profiles
+            .first_mut()
+            .and_then(|cp| cp.conditions.first_mut())
+        {
+            cond.condition = "EqualsAny".into();
+            cond.value = "SDR|HDR10".into();
+        }
+        let ok = |range| {
+            negotiate_explained(
+                &profile,
+                &ranged(Some(range)),
+                &ServerCodecSupport::default(),
+            )
+            .0
+        };
+        assert_eq!(ok("HDR10"), Decision::DirectPlay);
+        assert!(matches!(ok("HLG"), Decision::Transcode { .. }));
     }
 }
