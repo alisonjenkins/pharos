@@ -25,6 +25,13 @@ export interface Account {
 /** The seeded user, opted out of diagnostics (the default). */
 export const SEEDED: Account = { name: TEST_USER, password: TEST_PASS };
 
+/**
+ * Seeded users who have opted in to diagnostics (spec 016), so their client
+ * events reach the server (`admin seed-playwright-user`).
+ */
+export const OPTED_IN_A: Account = { name: "together-a", password: "together-a-test-pw" };
+export const OPTED_IN_B: Account = { name: "together-b", password: "together-b-test-pw" };
+
 /** A member's `<video>` as the sync oracle reads it. */
 export class Member implements Probeable {
   constructor(
@@ -89,7 +96,7 @@ export async function toggleUntil(member: Member, paused: boolean) {
   throw new Error(`${member.label}'s player never became paused=${paused}`);
 }
 
-export async function signIn(browser: Browser, label: string) {
+export async function signIn(browser: Browser, label: string, account: Account = SEEDED) {
   const context = await browser.newContext();
   // A context of its own skips the config's storage: keep what's new off.
   await context.addInitScript(() => localStorage.setItem("pharos.whats_new", "off"));
@@ -98,8 +105,8 @@ export async function signIn(browser: Browser, label: string) {
   page.on("console", (m) => lines.push(`[${label}] ${m.text()}`));
   page.on("pageerror", (e) => lines.push(`[${label}] pageerror: ${e.message}`));
   await page.goto(`${PHAROS_URL}/ui/`);
-  await page.locator("#signin-name").fill(TEST_USER);
-  await page.locator("#signin-password").fill(TEST_PASS);
+  await page.locator("#signin-name").fill(account.name);
+  await page.locator("#signin-password").fill(account.password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
   return { context, page, lines };
@@ -124,26 +131,40 @@ export async function seededMovie(request: APIRequestContext, file: string) {
   test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
   const { AccessToken: token, User: user } = await auth.json();
   const api = { "X-Emby-Token": token };
-  const movies = await (
-    await request.get(
-      `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
-      { headers: api },
-    )
-  ).json();
-  const movie = movies.Items?.find((i: { Path?: string }) => i.Path?.endsWith(file));
+  const find = async () => {
+    const movies = await (
+      await request.get(
+        `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+        { headers: api },
+      )
+    ).json();
+    return movies.Items?.find((i: { Path?: string }) => i.Path?.endsWith(file));
+  };
+  // Clips from the media tree (not the seed's own rows) appear once the
+  // startup scan has reached them.
+  await expect
+    .poll(find, { timeout: 60_000 })
+    .toBeTruthy()
+    .catch(() => {});
+  const movie = await find();
   test.skip(!movie, `pharos has no seeded ${file}`);
   const nativeId = BigInt(`0x${movie.Id}`).toString();
   return { api, movie, nativeId };
 }
 
-/** Two signed-in browsers in one group on the seeded movie `file`. */
+/**
+ * Two signed-in browsers in one group on the seeded movie `file`: A, signed
+ * in as `opts.accounts[0]`, starts it, and B, as `opts.accounts[1]`, joins by
+ * the invite link. Both default to the seeded user.
+ */
 export async function startGroup(
   browser: Browser,
   request: APIRequestContext,
   open: { context: BrowserContext; page: Page }[],
   file: string,
-  opts: { subtitled?: boolean } = {},
+  opts: { subtitled?: boolean; accounts?: [Account, Account] } = {},
 ) {
+  const [asA, asB] = opts.accounts ?? [SEEDED, SEEDED];
   const { api, movie, nativeId } = await seededMovie(request, file);
   if (opts.subtitled) {
     // The startup rescan probes the fixture; its streams appear once it has.
@@ -163,9 +184,9 @@ export async function startGroup(
       .toBeGreaterThan(0);
   }
 
-  const a = await signIn(browser, "A");
+  const a = await signIn(browser, "A", asA);
   open.push(a);
-  const b = await signIn(browser, "B");
+  const b = await signIn(browser, "B", asB);
   open.push(b);
   const logs = () => [...a.lines, ...b.lines].join("\n");
   // Groups another test or an earlier try left are not A's.
@@ -200,7 +221,7 @@ export async function startGroup(
     });
   }
   const people = [new Member("A", a.page), new Member("B", b.page)];
-  return { a, b, people, logs };
+  return { a, b, people, logs, groupId };
 }
 
 /** A failed step's error: its message, both pages' text and the browser logs. */
@@ -232,3 +253,39 @@ export async function pickUntil(
   }
   throw new Error(`"${name}" never took ${value}`);
 }
+
+/**
+ * Firefox with autoplay allowed and audio muted, and the libavcodec the dev
+ * shell names (`PHAROS_FIREFOX_LIBAV`) on its loader path: without one
+ * Firefox cannot decode AAC or H.264, so it plays the seeded files direct
+ * but no HLS stream with their audio.
+ */
+function firefoxGroupLaunch() {
+  const libav = process.env.PHAROS_FIREFOX_LIBAV;
+  return {
+    firefoxUserPrefs: {
+      "media.autoplay.default": 0,
+      "media.autoplay.blocking_policy": 0,
+      "media.volume_scale": "0.0",
+    },
+    ...(libav ? { env: { ...process.env, LD_LIBRARY_PATH: libav } } : {}),
+  };
+}
+
+/**
+ * Launch options for a watch-together spec, per browser: the group's play is
+ * scheduled with no click behind it, so autoplay must be allowed, and the
+ * seeded clips' tone is muted. Chromium takes flags, Firefox takes prefs, and
+ * `launchOptions` replaces a project's own, so each browser gets only its own.
+ * Use as `test.use({ launchOptions: groupLaunchOptions })`.
+ */
+export const groupLaunchOptions: Parameters<typeof test.use>[0]["launchOptions"] = [
+  async ({ browserName }, use) => {
+    await use(
+      browserName === "firefox"
+        ? firefoxGroupLaunch()
+        : { args: ["--autoplay-policy=no-user-gesture-required", "--mute-audio"] },
+    );
+  },
+  { scope: "worker" },
+];
