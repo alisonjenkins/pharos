@@ -4026,6 +4026,12 @@ fn Player(
             );
             let (styled, styled_for) = (Rc::clone(&styled), Rc::clone(&styled_for));
             spawn(async move {
+                // Built before the video knows its size, the renderer never
+                // draws; and a pick replaced while waiting fetches nothing.
+                platform::video_metadata(VIDEO_ID).await;
+                if styled_for.get() != pick {
+                    return;
+                }
                 let report: Rc<dyn Fn(Result<(), String>)> =
                     Rc::new(move |result| styled_events.send((pick, result)));
                 match platform::styled_subtitles(VIDEO_ID, &url, &fonts, Rc::clone(&report)).await {

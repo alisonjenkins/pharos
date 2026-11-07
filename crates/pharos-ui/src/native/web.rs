@@ -2759,6 +2759,32 @@ impl Drop for StyledSubtitles {
     }
 }
 
+/// Resolves once `<video id=video_id>` knows its picture size
+/// (`HAVE_METADATA`), at once if it already does, or after
+/// `STYLED_READY_MS` if it never does. A JASSUB renderer built before then
+/// sizes itself to a 0x0 picture and never draws: the player used to build
+/// one, fetch its script, then build and fetch again once metadata came.
+pub async fn video_metadata(video_id: &str) {
+    let Some(video) = video_element(video_id) else {
+        return;
+    };
+    if video.ready_state() >= web_sys::HtmlMediaElement::HAVE_METADATA {
+        return;
+    }
+    let loaded = js_sys::Promise::new(&mut |resolve, _| {
+        let once = web_sys::AddEventListenerOptions::new();
+        once.set_once(true);
+        let _ = video.add_event_listener_with_callback_and_add_event_listener_options(
+            "loadedmetadata",
+            &resolve,
+            &once,
+        );
+    });
+    let loaded = std::pin::pin!(wasm_bindgen_futures::JsFuture::from(loaded));
+    let timeout = std::pin::pin!(sleep_ms(STYLED_READY_MS));
+    let _ = futures_util::future::select(loaded, timeout).await;
+}
+
 /// Starts drawing the script at `url` over `<video id=video_id>`, with the
 /// fonts at `fonts` (the file's embedded ones) loaded up front so libass finds
 /// a style's `Fontname` among them. While it is not dropped, `report` hears
