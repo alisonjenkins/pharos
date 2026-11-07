@@ -1772,6 +1772,9 @@ fn shown_targets(scope: &web_sys::Element) -> Vec<(web_sys::Element, super::keym
         .collect()
 }
 
+/// An open modal dialog, which keeps the arrow keys' focus inside it.
+const MODAL: &str = "[aria-modal='true']";
+
 /// Move the focus in `dir` among the controls of the nearest `data-keys`
 /// area around it; First and Last stay inside its `data-keys-list`, when
 /// it is in one. With the focus on nothing, focus the area's first
@@ -1782,7 +1785,12 @@ pub fn move_focus(dir: super::keymap::Dir) -> bool {
         return false;
     };
     let Some(from) = focused() else {
-        let Some(area) = doc.query_selector("[data-keys]").ok().flatten() else {
+        let area = doc
+            .query_selector(MODAL)
+            .ok()
+            .flatten()
+            .or_else(|| doc.query_selector("[data-keys]").ok().flatten());
+        let Some(area) = area else {
             return false;
         };
         let (_, view_h) = viewport();
@@ -1792,9 +1800,12 @@ pub fn move_focus(dir: super::keymap::Dir) -> bool {
         return first.is_some_and(|(el, _)| focus_element(&el, true));
     };
     let near = |selector: &str| from.closest(selector).ok().flatten();
+    // A modal dialog holds the focus: the keys never walk out to the page
+    // behind it (B711).
+    let area = || near(MODAL).or_else(|| near("[data-keys]"));
     let scope = match dir {
-        Dir::First | Dir::Last => near("[data-keys-list]").or_else(|| near("[data-keys]")),
-        _ => near("[data-keys]"),
+        Dir::First | Dir::Last => near("[data-keys-list]").or_else(area),
+        _ => area(),
     };
     let Some(scope) = scope else {
         return false;
