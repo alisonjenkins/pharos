@@ -373,6 +373,28 @@ pub(super) fn video_element(id: &str) -> Option<web_sys::HtmlMediaElement> {
         .ok()
 }
 
+/// The `<video>`'s dropped and total frame counts since it loaded, from
+/// `getVideoPlaybackQuality`; `None` when the element is gone or the browser
+/// has no such counters.
+pub fn video_quality(video_id: &str) -> Option<(u64, u64)> {
+    let video = video_element(video_id)?
+        .dyn_into::<web_sys::HtmlVideoElement>()
+        .ok()?;
+    let quality = video.get_video_playback_quality();
+    Some((
+        u64::from(quality.dropped_video_frames()),
+        u64::from(quality.total_video_frames()),
+    ))
+}
+
+/// Whether the page is on screen: frames a hidden tab skips say nothing
+/// about the renderer.
+pub fn page_visible() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .is_some_and(|d| !d.hidden())
+}
+
 /// The `<video>`'s current position, 0 when it is gone.
 pub fn position_ms(video_id: &str) -> u64 {
     video_element(video_id).map_or(0, |v| seconds_to_ms(v.current_time()))

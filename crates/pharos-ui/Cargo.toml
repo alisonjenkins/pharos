@@ -46,6 +46,7 @@ gloo-net = { workspace = true, optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "HtmlMediaElement",
     "HtmlVideoElement",
+    "VideoPlaybackQuality",
     "ResizeObserver",
     "ResizeObserverEntry",
     "Event",

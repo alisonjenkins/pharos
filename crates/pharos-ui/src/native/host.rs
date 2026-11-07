@@ -153,6 +153,15 @@ pub async fn styled_subtitles(
     Err("no renderer on the host".into())
 }
 
+/// The video's dropped and total frame counts; the host has no video.
+pub fn video_quality(_video_id: &str) -> Option<(u64, u64)> {
+    None
+}
+
+pub fn page_visible() -> bool {
+    true
+}
+
 pub fn element_width(_id: &str) -> f64 {
     0.0
 }
