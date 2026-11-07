@@ -19,8 +19,8 @@ use super::playback::MediaEvent;
 use super::seen::{self, MemberSeen};
 use super::together::{
     expected_position, ClockEstimator, Correction, DriftTracker, GroupClient, GroupError, GroupId,
-    GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SELF_SEEK_GRACE_MS,
-    SETTLE_AFTER_COMMAND_MS,
+    GroupSink, GroupSummary, GroupUpdate, Member, CLOCK_WINDOW, HOLD_BELOW_MS, SEEK_ABOVE_MS,
+    SELF_SEEK_GRACE_MS, SETTLE_AFTER_COMMAND_MS,
 };
 use super::track_follow::{
     follows_group, route_pick, GroupTracksView, PickRoute, TrackChoice, TrackPicks,
@@ -551,6 +551,9 @@ struct Inner {
     /// When this member said ready, until the group's next play: the time it
     /// spent waiting on the others.
     ready_sent_ms: Option<i64>,
+    /// The ready owed was held once to seek a player that loaded away from
+    /// the group (B664); the next chance sends it wherever the player is.
+    ready_held: bool,
     last_drift_ms: Option<i64>,
     /// This member left; what the server still sends is not for the screens.
     leaving: bool,
@@ -1553,10 +1556,32 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                         inner.buffering_sent = false;
                         buffering = Some(false);
                     }
-                    if owes {
-                        inner.state.owes_ready = false;
-                        inner.ready_sent_ms = Some(now);
-                        ready = true;
+                    // A player can load at this member's own resume point
+                    // after the catch-up seek (the engine applies its start
+                    // late): put it at the group's position first, once, and
+                    // say ready when that seek lands (B664).
+                    let away = inner
+                        .state
+                        .expected(now)
+                        .map(|(at, _)| at)
+                        .filter(|at| player.position_ms().abs_diff(*at) > SEEK_ABOVE_MS);
+                    match away {
+                        Some(at) if owes && !inner.ready_held => {
+                            inner.ready_held = true;
+                            line = Some(format!(
+                                "pharos: group ready held reason=away position_ms={} group_ms={at}",
+                                player.position_ms()
+                            ));
+                            inner.self_seek_ms = Some(now);
+                            player.seek_ms(at);
+                        }
+                        _ if owes => {
+                            inner.state.owes_ready = false;
+                            inner.ready_held = false;
+                            inner.ready_sent_ms = Some(now);
+                            ready = true;
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -2242,6 +2267,36 @@ mod tests {
             calls_with(&rig, "buffering"),
             ["buffering(pl-7,3000,true)", "buffering(pl-7,3000,false)"]
         );
+    }
+
+    /// B664: a player that loads at the member's own resume point, after
+    /// the group's catch-up seek, is put at the group's position before it
+    /// says it is ready, so a member joining a paused group waits there and
+    /// not 30 s away. Disarm check: sending ready at once fails this.
+    #[test]
+    fn a_player_ready_away_from_the_group_is_seeked_there_first() {
+        let rig = rig();
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 3_000,
+            playing: false,
+        });
+        // The engine applied this member's own resume point after the seek.
+        rig.player.position.set(30_000);
+        rig.player.paused.set(true);
+        rig.session.on_media(MediaEvent::CanPlay);
+        rig.env.settle();
+        assert!(calls_with(&rig, "ready").is_empty(), "{:?}", calls(&rig));
+        assert_eq!(rig.player.position.get(), 3_000);
+        assert_eq!(
+            rig.env.logged("pharos: group ready held reason=away").len(),
+            1
+        );
+        // The seek lands; now it is ready, at the group's position.
+        rig.session.on_media(MediaEvent::Seeked);
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "ready"), ["ready(pl-7,3000,false)"]);
     }
 
     /// A server that answers slowly must not reorder what the viewer did:
