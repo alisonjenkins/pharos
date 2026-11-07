@@ -4102,6 +4102,18 @@ impl GroupClient for Groups {
             .map_err(group_error)
     }
 
+    async fn set_item(
+        &self,
+        item: ItemRef,
+        position_ms: u64,
+        playlist_item_id: String,
+    ) -> Result<(), GroupError> {
+        let m = self.membership()?;
+        m.set_item(&self.call, item, position_ms, &playlist_item_id)
+            .await
+            .map_err(group_error)
+    }
+
     async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError> {
         let m = self.membership()?;
         m.follow_tracks(&self.call, follow)
