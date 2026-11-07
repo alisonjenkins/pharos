@@ -394,8 +394,8 @@ async fn subtitle_deliveries_are_counted_by_form_and_class() {
     // An image track refused on the WebVTT route.
     let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/4/Stream.vtt")).await;
     assert_eq!(resp.status(), 415);
-    // A sidecar index past the last sidecar: the failure path is counted too.
-    let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/6/Stream.ass")).await;
+    // A sidecar index past the last sidecar (6 is the styled slot): the failure path is counted too.
+    let resp = test::call_service(&app, get("/Videos/7/7/Subtitles/7/Stream.ass")).await;
     assert_eq!(resp.status(), 404);
 
     let count = |labels: &[(&str, &str)]| -> u64 {
