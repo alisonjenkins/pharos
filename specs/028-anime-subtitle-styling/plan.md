@@ -42,7 +42,7 @@
 |---|---|---|---|
 | 1 | Line is all in brackets or asterisks and names a sound (`[explosion]`, `*bang*`) | Sfx | text |
 | 2 | Speaker tag `NARRATOR:`, or italic and over 4 s inside a Recap segment | Narration | text, segment |
-| 3 | `[on phone]` / `(over radio)` tags, or high-band share below 30% of the track median with loudness within ±4 LU | Phone | text, audio |
+| 3 | A bracket naming a device: `[phone]`, `(radio)`, `[TV]`, `(intercom)`, `[on phone]`, `(over radio)`, `(through the intercom)`. The audio alone never decides it (B661) | Phone | text |
 | 4 | `(whispering)` tag, or loudness 8 LU or more below the median | Whisper | text, audio |
 | 5 | Wholly in parentheses or italic, and loudness within ±4 LU | Thought | text, audio |
 | 6 | Italic, and loudness above the median | OffScreen | text, audio |
