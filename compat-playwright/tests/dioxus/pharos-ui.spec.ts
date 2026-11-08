@@ -2739,6 +2739,86 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // The title page offers the tracks before playback, named by language
+    // rather than by code, and the player starts on the one picked there.
+    test("the title page picks the audio track the player starts on", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-preplay-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const dualAudio = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: { "X-Emby-Token": token } },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/08-test-dual-audio.webm"));
+      await expect.poll(dualAudio, { timeout: 60_000 }).toBeTruthy();
+      const movie = await dualAudio();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      // Nothing plays aloud: every media element is muted before it starts.
+      await page.addInitScript(() => {
+        const play = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function (this: HTMLMediaElement) {
+          this.muted = true;
+          return play.call(this);
+        };
+      });
+      const sessions = new Set<string>();
+      page.on("request", (r) => {
+        const url = new URL(r.url());
+        if (!url.pathname.toLowerCase().startsWith(`/videos/${movie.Id}/`)) return;
+        const session = url.searchParams.get("tag") ?? url.searchParams.get("PlaySessionId");
+        if (session) sessions.add(session);
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/title/${nativeId}`);
+      const before = page.locator(".pharos-title-tracks").getByRole("combobox", { name: "Audio" });
+      await expect(before).toBeVisible({ timeout: 30_000 });
+      const labels = (await before.locator("option").allTextContents()).join(" | ");
+      expect(labels).toMatch(/English/);
+      expect(labels).toMatch(/Japanese/);
+      expect(labels, "tracks are named by language, not by code").not.toMatch(/\b(eng|jpn)\b/i);
+      const japanese = await before
+        .locator("option", { hasText: "Japanese" })
+        .getAttribute("value");
+      await before.selectOption(japanese!);
+      await page.locator(".pharos-title .pharos-actions a.pharos-button").first().click();
+
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(1);
+      const picker = page.getByRole("combobox", { name: "Audio" });
+      await expect(picker, "the player starts on the track picked before it").toHaveValue(
+        japanese!,
+      );
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // Spec 019: an image subtitle (DVD here) is drawn by the player from the
     // server's PNGs, so turning it on keeps the playback it has: no new
     // session, no burn. Disarm check: with `subtitle_switch` renegotiating
