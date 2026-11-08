@@ -16,7 +16,7 @@ use pharos_client::mix::{
     Weight, SAVED_KEY,
 };
 
-use super::app::{call, remount_on, Ctx};
+use super::app::{call, remount_on, Ctx, Flash};
 use super::group_app::Together;
 use super::listen::Icon;
 use super::platform;
@@ -279,6 +279,16 @@ async fn load_saved(api: &NativeApi) -> Result<Vec<SavedMix>, String> {
 /// Undo a save or delete the server refused, so the menu shows what is
 /// stored. Only while the list is still the one that failed: a later
 /// change has its own outcome.
+/// What a mix that could not be saved says (B824).
+fn not_saved_line(name: &str, reason: &str) -> String {
+    format!("Couldn't save the mix \"{name}\": {reason}")
+}
+
+/// What a mix that could not be deleted says (B824).
+fn not_deleted_line(name: &str, reason: &str) -> String {
+    format!("Couldn't delete the mix \"{name}\": {reason}")
+}
+
 fn roll_back(mut saved: Signal<Option<Vec<SavedMix>>>, failed: &[SavedMix], before: Vec<SavedMix>) {
     if saved.peek().as_deref() == Some(failed) {
         saved.set(Some(before));
@@ -330,6 +340,12 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
     // Every hook runs before the early return, so the hook order never
     // depends on which contexts are present.
     let ctx = try_use_context::<Ctx>();
+    let flash = try_use_context::<Flash>();
+    let say = move |line: String| {
+        if let Some(flash) = flash {
+            flash.say(line, true);
+        }
+    };
     let mut open = use_signal(|| false);
     let mut editing = use_signal(|| None::<SavedMix>);
     // Counts each opening of the editor; the editor remounts on it, so a
@@ -383,6 +399,10 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                 "pharos: mix not saved mix={:?} reason=list_not_loaded",
                 m.name
             ));
+            say(not_saved_line(
+                &m.name,
+                "your saved mixes have not loaded yet",
+            ));
             return;
         };
         let before = list.clone();
@@ -402,6 +422,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                 Err(e) => {
                     platform::warn(&format!("pharos: mix not saved mix={:?} error={e}", m.name));
                     roll_back(saved, &list, before);
+                    say(not_saved_line(&m.name, &e));
                 }
             }
         });
@@ -414,6 +435,10 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             platform::warn(&format!(
                 "pharos: mix not deleted mix={name:?} reason=list_not_loaded"
             ));
+            say(not_deleted_line(
+                &name,
+                "your saved mixes have not loaded yet",
+            ));
             return;
         };
         let before = list.clone();
@@ -423,6 +448,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
             if let Err(e) = store_saved(&api, &list).await {
                 platform::warn(&format!("pharos: mix not deleted mix={name:?} error={e}"));
                 roll_back(saved, &list, before);
+                say(not_deleted_line(&name, &e));
             }
         });
     };
@@ -972,6 +998,19 @@ fn RuleValue(index: usize, test: Test, draft: Signal<SavedMix>) -> Element {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// B824: a mix that was not stored says which and why.
+    #[test]
+    fn a_mix_that_was_not_stored_names_itself_and_the_reason() {
+        assert_eq!(
+            not_saved_line("Late night", "unavailable: db down"),
+            "Couldn't save the mix \"Late night\": unavailable: db down"
+        );
+        assert_eq!(
+            not_deleted_line("Late night", "rpc: gone"),
+            "Couldn't delete the mix \"Late night\": rpc: gone"
+        );
+    }
     use pharos_client::api::{Item, ItemKind};
 
     fn item(id: u64) -> Item {
