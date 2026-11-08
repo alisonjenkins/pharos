@@ -6,6 +6,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::{ItemRef, StartTracks, Track, TrackChoice, TrackPicks};
 
+use super::show_tracks;
 use super::watch_view::TrackPicker;
 
 /// The picks the title page last made for an item, read once by the watch
@@ -46,6 +47,8 @@ pub fn TrackChoices(
     audio: Vec<Track>,
     subtitles: Vec<Track>,
     start: StartTracks,
+    /// The show whose other episodes a pick carries to.
+    series: Option<String>,
 ) -> Element {
     let mut pending = use_context::<PlayPicks>().0;
     let mut audio_pick = use_signal(|| start.audio);
@@ -53,15 +56,19 @@ pub fn TrackChoices(
     if audio.len() < 2 && subtitles.is_empty() {
         return rsx! {};
     }
+    let audio_series = series.clone();
     rsx! {
         div { class: "pharos-title-tracks",
             TrackPicker {
                 label: "Audio",
-                tracks: audio,
+                tracks: audio.clone(),
                 pick: audio_pick(),
                 offer_off: false,
                 on_pick: move |p: Option<u32>| {
-                    if p.is_some() {
+                    if let Some(i) = p {
+                        if let Some(series) = &audio_series {
+                            show_tracks::keep(series, |s| show_tracks::chose_audio(s, &audio, i));
+                        }
                         audio_pick.set(p);
                         pending.set(Some((id, picks(start, p, *subtitle_pick.peek()))));
                     }
@@ -69,10 +76,13 @@ pub fn TrackChoices(
             }
             TrackPicker {
                 label: "Subtitles",
-                tracks: subtitles,
+                tracks: subtitles.clone(),
                 pick: subtitle_pick(),
                 offer_off: true,
                 on_pick: move |p: Option<u32>| {
+                    if let Some(series) = &series {
+                        show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, &subtitles, p));
+                    }
                     subtitle_pick.set(p);
                     pending.set(Some((id, picks(start, *audio_pick.peek(), p))));
                 },
@@ -140,7 +150,7 @@ mod tests {
             let mut dom = VirtualDom::new_with_props(
                 |(audio, subtitles): (Vec<Track>, Vec<Track>)| {
                     use_context_provider(|| PlayPicks(Signal::new(None)));
-                    rsx! { TrackChoices { id: ItemRef::Real(1), audio, subtitles, start: START } }
+                    rsx! { TrackChoices { id: ItemRef::Real(1), audio, subtitles, start: START, series: None } }
                 },
                 (audio, subtitles),
             );

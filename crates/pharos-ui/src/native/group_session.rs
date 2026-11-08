@@ -936,6 +936,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         }
     }
 
+    /// The picks this member applies to a player of streams `audio` and
+    /// `subtitles`: the group's, unless this member is out of the group or on
+    /// their own tracks. `None` when there is nothing to apply.
+    pub fn tracks_followed(&self, audio: &[u32], subtitles: &[u32]) -> Option<TrackPicks> {
+        let inner = self.inner.borrow();
+        if !inner.active {
+            return None;
+        }
+        follows_group(inner.state.own_tracks, inner.state.tracks, audio, subtitles)
+    }
+
     /// A menu pick of an audio stream. `true` when it went to the group, which
     /// applies it to every following player, this one included; `false` when
     /// the caller changes only its own player.
