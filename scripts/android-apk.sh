@@ -49,9 +49,27 @@ nix develop .#android -c dx build --platform android --package pharos-ui \
   --bin pharos-tv --features mobile --target armv7-linux-androideabi \
   "${dx_flags[@]}"
 
-# dx writes <target>/dx/pharos-tv/<profile>/android/app/app/build/outputs/apk/<profile>/*.apk
-apk_dir=$target_dir/dx/pharos-tv/$profile/android/app/app/build/outputs/apk/$profile
-built=$(find "$apk_dir" -maxdepth 1 -name '*.apk' | head -n 1)
+# dx 0.7 has no setting for the launcher icon, TV banner or app_name: lay
+# crates/pharos-ui/android/res over the gradle project it generated, point
+# the banner at ours, and assemble again (crates/pharos-ui/android/res/README.md).
+gradle_root=$target_dir/dx/pharos-tv/$profile/android/app
+main_dir=$gradle_root/app/src/main
+cp -r crates/pharos-ui/android/res/. "$main_dir/res/"
+rm -f "$main_dir/res/README.md"
+sed -i 's|android:banner="@mipmap/ic_launcher"|android:banner="@drawable/pharos_banner"|' \
+  "$main_dir/AndroidManifest.xml"
+grep -q 'android:banner="@drawable/pharos_banner"' "$main_dir/AndroidManifest.xml" || {
+  echo "android-apk: could not point the manifest banner at pharos_banner" >&2
+  exit 1
+}
+apk_dir=$gradle_root/app/build/outputs/apk
+rm -rf "$apk_dir"
+# dx runs assembleRelease only when [bundle.android] signing is configured,
+# which it is not here (this script signs), so the APK is always under debug/.
+echo "android-apk: assembling with the Pharos icon and banner" >&2
+(cd "$gradle_root" && nix develop "$root#android" -c ./gradlew --quiet assembleDebug)
+
+built=$(find "$apk_dir" -name '*.apk' | head -n 1)
 if [ -z "$built" ]; then
   echo "android-apk: no APK found under $apk_dir" >&2
   exit 1
