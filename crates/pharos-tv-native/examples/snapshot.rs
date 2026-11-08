@@ -93,12 +93,13 @@ fn main() {
         let started = std::time::Instant::now();
         doc.resolve(0.0);
         let resolved = started.elapsed();
-        if screen == Some(Screen::Home) && std::env::var_os("SNAPSHOT_KEYS").is_some() {
+        if screen.is_some() && std::env::var_os("SNAPSHOT_KEYS").is_some() {
             use blitz_dom::Document as _;
             use blitz_traits::events::{BlitzKeyEvent, KeyState, UiEvent};
             use keyboard_types::{Code, Key, Location, Modifiers};
             println!("focussed node {:?}", doc.get_focussed_node_id());
-            for key in [Key::ArrowRight, Key::ArrowRight, Key::ArrowDown] {
+            let keys = if screen == Some(Screen::Grid) { vec![Key::ArrowDown; 4] } else { vec![Key::ArrowRight, Key::ArrowRight, Key::ArrowDown] };
+            for key in keys {
                 let ev = |state| BlitzKeyEvent {
                     key: key.clone(), code: Code::Unidentified, modifiers: Modifiers::empty(),
                     location: Location::Standard, is_auto_repeating: false, is_composing: false,
@@ -111,11 +112,11 @@ fn main() {
             doc.resolve(0.0);
         }
         if std::env::var_os("SNAPSHOT_DEBUG").is_some() {
-            for sel in [".pharos-grid", ".pharos-grid > li", ".pharos-poster", ".pharos-poster-art", ".pharos-poster-placeholder", ".pharos-poster-name", ".pharos-rail"] {
+            for sel in [".pharos-tv-focus", ".pharos-grid", ".pharos-grid > li", ".pharos-poster", ".pharos-poster-art", ".pharos-poster-placeholder", ".pharos-poster-name", ".pharos-rail"] {
                 if let Ok(Some(id)) = doc.query_selector(sel) {
                     let node = doc.get_node(id).unwrap();
                     let l = node.final_layout;
-                    println!("{sel}: id {id} size {:?} loc {:?} display {:?}", l.size, l.location, node.style.display);
+                    println!("{sel}: id {id} size {:?} loc {:?} display {:?} attrs {:?}", l.size, l.location, node.style.display, node.element_data().map(|e| e.attrs().iter().map(|a| (a.name.local.to_string(), a.value.clone())).collect::<Vec<_>>()));
                 } else {
                     println!("{sel}: none");
                 }
