@@ -53,13 +53,15 @@ pub enum SubtitleKind {
     /// `styled_at`) or a compiler/director bump never serves a stale
     /// script. pharos-cache cannot depend on pharos-styling, so the caller
     /// passes the tier and level as their enum ordinals and the versions as
-    /// plain numbers.
+    /// plain numbers. `size_percent` is the viewer's subtitle size the
+    /// theme was scaled to; 100 keeps the name it had before sizes existed.
     Styled {
         tier: u8,
         level: u8,
         compiler_version: u32,
         director_version: u32,
         plan_stamp: i64,
+        size_percent: u16,
     },
 }
 
@@ -520,7 +522,17 @@ impl SubtitleCache {
                 compiler_version,
                 director_version,
                 plan_stamp,
-            } => format!("y{tier}.{level}.c{compiler_version}.d{director_version}.p{plan_stamp}"),
+                size_percent,
+            } => {
+                let size = if size_percent == 100 {
+                    String::new()
+                } else {
+                    format!(".z{size_percent}")
+                };
+                format!(
+                    "y{tier}.{level}.c{compiler_version}.d{director_version}.p{plan_stamp}{size}"
+                )
+            }
         };
         Some(root.join("subtitles").join(format!(
             "{ph:016x}-{}-{}-{k}.sub",
@@ -1065,8 +1077,8 @@ mod tests {
     fn styled_names_differ_per_field() {
         let dir = tempfile::TempDir::new().unwrap();
         let disk = SubtitleCache::new(1_024, 64).with_disk(dir.path());
-        let base = (0u8, 1u8, 1u32, 1u32, 100i64);
-        let name = |t: (u8, u8, u32, u32, i64)| {
+        let base = (0u8, 1u8, 1u32, 1u32, 100i64, 100u16);
+        let name = |t: (u8, u8, u32, u32, i64, u16)| {
             disk.disk_path_of(
                 Path::new("/m/x.mkv"),
                 7,
@@ -1077,6 +1089,7 @@ mod tests {
                     compiler_version: t.2,
                     director_version: t.3,
                     plan_stamp: t.4,
+                    size_percent: t.5,
                 },
             )
             .unwrap()
@@ -1084,11 +1097,12 @@ mod tests {
         let b = name(base);
         assert_eq!(b, name(base));
         for variant in [
-            (1, 1, 1, 1, 100),
-            (0, 2, 1, 1, 100),
-            (0, 1, 2, 1, 100),
-            (0, 1, 1, 2, 100),
-            (0, 1, 1, 1, 101),
+            (1, 1, 1, 1, 100, 100),
+            (0, 2, 1, 1, 100, 100),
+            (0, 1, 2, 1, 100, 100),
+            (0, 1, 1, 2, 100, 100),
+            (0, 1, 1, 1, 101, 100),
+            (0, 1, 1, 1, 100, 125),
         ] {
             assert_ne!(b, name(variant), "{variant:?} must not alias the base");
         }

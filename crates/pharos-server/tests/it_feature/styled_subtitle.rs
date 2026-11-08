@@ -188,6 +188,35 @@ async fn an_unknown_tier_or_level_is_a_400_and_no_plan_a_404() {
     assert_eq!(get(&rig, &ass_uri(&rig, "")).await.0, 404);
 }
 
+/// B852 (V802): `?size=` scales the dialogue to the viewer's subtitle size, is
+/// cached apart from the other sizes, and 100 is the default.
+#[actix_web::test]
+async fn a_size_scales_the_dialogue_style() {
+    let rig = rig("Film.eng.ass", SCRIPT).await;
+    let default_style = |body: &[u8]| {
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with("Style: Default,"))
+            .map(str::to_owned)
+            .unwrap()
+    };
+    let (_, _, plain) = get(&rig, &ass_uri(&rig, "")).await;
+    let (_, _, hundred) = get(&rig, &ass_uri(&rig, "?size=100")).await;
+    assert_eq!(plain, hundred, "100 is the default");
+    let (status, _, large) = get(&rig, &ass_uri(&rig, "?size=150")).await;
+    assert_eq!(status, 200);
+    assert!(default_style(&plain).starts_with("Style: Default,Liberation Sans,56,"));
+    assert!(default_style(&large).starts_with("Style: Default,Liberation Sans,84,"));
+    let (_, _, again) = get(&rig, &ass_uri(&rig, "")).await;
+    assert_eq!(
+        again, plain,
+        "a sized script does not take the default's cache slot"
+    );
+    assert_eq!(get(&rig, &ass_uri(&rig, "?size=110")).await.0, 400);
+    assert_eq!(get(&rig, &ass_uri(&rig, "?size=big")).await.0, 400);
+}
+
 /// V532: the same request twice gives the same bytes, from the cache and from
 /// a cold start.
 #[actix_web::test]
