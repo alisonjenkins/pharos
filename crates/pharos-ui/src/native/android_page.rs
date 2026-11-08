@@ -990,6 +990,7 @@ fn on_bridge(message: Bridge) {
             ctrl,
             meta,
             text,
+            ..
         } => {
             let mut taken = false;
             for f in &listeners {
@@ -1053,6 +1054,8 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => VIEWPORT.with(|v| v.set((w, h))),
+        // Media and hls.js events have no consumer until the player lands.
+        Bridge::Media(_) | Bridge::Hls { .. } => {}
     }
 }
 
