@@ -600,7 +600,7 @@ fn SettingPage(
                 },
             }
             p { class: "pharos-whats-new-help",
-                "Saved on this device. You can change it later in Appearance."
+                "Saved on this device. You can change it later in Settings, under Appearance."
             }
         }
     }
