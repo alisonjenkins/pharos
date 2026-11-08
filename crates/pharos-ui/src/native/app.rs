@@ -1708,6 +1708,8 @@ fn NativeApp(route: Route) -> Element {
     // A page loaded before a deploy reconnects to the newer server, which may
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
+    // Dismissed for the rest of this run; a restart shows it again.
+    let mut update_dismissed = use_signal(|| false);
     let marks = use_signal(|| 0u32);
     // Bumped by a library change the server pushes; marks by a user data one.
     let library_rev = use_signal(|| 0u32);
@@ -2056,17 +2058,20 @@ fn NativeApp(route: Route) -> Element {
                     }
                 },
                 search: rsx! { TopSearch {} },
-                if outdated() && !on_player {
+                if outdated() && !on_player && !update_dismissed() {
                     if platform::can_reload() {
                         p { class: "pharos-error", role: "alert",
                             "Pharos has been updated. Reload to keep using it. "
                             button { class: "pharos-button", onclick: move |_| platform::reload(), "Reload" }
+                            " "
+                            button { class: "pharos-button", onclick: move |_| update_dismissed.set(true), "Dismiss" }
                         }
                     } else {
                         // An installed app has nothing to reload: the
                         // update is a new build.
                         p { class: "pharos-error", role: "alert",
-                            "The Pharos server has been updated. Some things may not work until this app is updated too."
+                            "The Pharos server has been updated. Some things may not work until this app is updated too. "
+                            button { class: "pharos-button", onclick: move |_| update_dismissed.set(true), "Dismiss" }
                         }
                     }
                 }
