@@ -135,6 +135,11 @@ A viewer on the Rust engine watches over a link that drops from fast to slow and
 | V647 | A down-switch is taken while the forward buffer still covers the next segment's download at the estimated rate | property test of the rule |
 | V648 | A rung switch appends the new init then the next segment, with no reload and no change in `currentTime` | adapter e2e on a throttled link |
 | V649 | Every switch is logged and reported with from, to, reason, estimate, buffer and cold-encode time | log/event test with a disarm check |
+| V690 | Every engine telemetry report (start, seek, stall, summary) logs a `pharos: playback <what> engine=rust` line carrying exactly the fields of its client event | `hls_trace` unit test |
+| V691 | Time from attach to the first `playing` is reported once per engine as `playbackStart`, with the first video segment's index, time to first byte, load time and append time; a player closed first reports `end=abandoned` | `hls_trace` unit tests; e2e `hls-telemetry.spec.ts` |
+| V692 | A `playbackSummary` (segments, bytes, kbps, ttfb p50/max, load max, forward buffer min/mean while playing, stalls, seeks, switches, quota hits) goes out every 5 minutes of segments and when the engine is dropped, falls back or fails | `hls_trace` unit tests; e2e |
+| V693 | A stall is `waiting` while playing, after the start and outside a seek, until `playing` or the head moves; it is reported with its duration, buffered ranges, network state, forward buffer and the last video download | `hls_trace` unit tests with a disarm check |
+| V694 | A seek runs from `seeking` to playing (or to `seeked` when paused or able to play on), names where it came from, whether the target was buffered, the scrub it replaced, and the first video segment after it (download vs append split); a seek still open when the engine goes reports `end=abandoned` | `hls_trace` unit tests with a disarm check; e2e |
 
 ## Open questions
 
