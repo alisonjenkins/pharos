@@ -1047,8 +1047,10 @@ impl Tier {
 }
 
 /// Where the tier this device last dropped to is kept; absent or unknown
-/// means no cap.
-pub const TIER_DROP_KEY: &str = "pharos.subtitles.tier_drop";
+/// means no cap. Versioned: a cap under the old key came from a detector that
+/// charged every dropped video frame to the subtitles, so it is not trusted
+/// (B666).
+pub const TIER_DROP_KEY: &str = "pharos.subtitles.tier_drop.v2";
 
 /// What kind of screen the page runs on, for choosing a [`Tier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,9 +1285,10 @@ pub fn tier_drop_report(renderer: &str, drop: &TierDropEvent) -> ClientEvent {
     }
 }
 
-/// How long a remembered tier cap lasts, so a device that has since been
-/// fixed or replaced climbs back.
-pub const TIER_DROP_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+/// How long a remembered tier cap lasts. It only spares a weak device the
+/// first 10 s of over-budget frames on its next episode, so a day is enough;
+/// one bad window used to cap a device for two weeks (B666).
+pub const TIER_DROP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The stored form of a cap: the tier and when it was set, `tv@<unix_ms>`.
 pub fn format_tier_drop(tier: Tier, set_at_ms: u64) -> String {
@@ -1300,7 +1303,9 @@ pub fn parse_tier_drop(stored: &str, now_ms: u64) -> Option<Tier> {
         return Tier::parse(stored);
     };
     let set_at: u64 = set_at.trim().parse().ok()?;
-    if now_ms.saturating_sub(set_at) > TIER_DROP_TTL_MS {
+    // A cap stamped after now came from a clock since corrected: it says
+    // nothing about how long ago the device dropped, so it is not trusted.
+    if set_at > now_ms || now_ms - set_at > TIER_DROP_TTL_MS {
         return None;
     }
     Tier::parse(tier)
@@ -3810,9 +3815,21 @@ mod tests {
         assert!(run(Tier::Desktop, &totals).is_empty());
     }
 
+    /// B666: one over-budget window no longer caps a device for two weeks.
+    #[test]
+    fn a_remembered_cap_lasts_a_day() {
+        let set = 1_000_000_000_000;
+        let cap = format_tier_drop(Tier::Tv, set);
+        let hour = 60 * 60 * 1000;
+        assert_eq!(parse_tier_drop(&cap, set + 23 * hour), Some(Tier::Tv));
+        assert_eq!(parse_tier_drop(&cap, set + 25 * hour), None);
+        // Stamped by a clock that ran ahead: not a cap until 2031.
+        assert_eq!(parse_tier_drop(&cap, set - 365 * 24 * hour), None);
+    }
+
     #[test]
     fn a_stored_tier_reads_back_and_unknown_is_none() {
-        assert_eq!(TIER_DROP_KEY, "pharos.subtitles.tier_drop");
+        assert_eq!(TIER_DROP_KEY, "pharos.subtitles.tier_drop.v2");
         for tier in Tier::ALL {
             assert_eq!(Tier::parse(tier.label()), Some(tier));
         }
@@ -3867,7 +3884,7 @@ mod tests {
         assert_eq!(at(0), Some(Tier::Tv));
         assert_eq!(at(TIER_DROP_TTL_MS), Some(Tier::Tv));
         assert_eq!(at(TIER_DROP_TTL_MS + 1), None);
-        assert_eq!(parse_tier_drop("tv@1000000000000", set - 5), Some(Tier::Tv));
+        assert_eq!(parse_tier_drop("tv@1000000000000", set - 5), None);
         assert_eq!(parse_tier_drop("low", set), Some(Tier::Low));
         for bad in ["tv@", "tv@soon", "ultra@1000000000000", "@5", ""] {
             assert_eq!(parse_tier_drop(bad, set), None, "{bad:?}");
