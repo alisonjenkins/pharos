@@ -3,8 +3,8 @@
 //! drift apart.
 
 use pharos_core::{
-    DomainError, LibraryKind, MediaItem, MediaKind, MediaStore as _, User, UserDataStore as _,
-    UserItemData, UserPolicy,
+    DomainError, ItemPerson, LibraryKind, MediaItem, MediaKind, MediaStore as _, PersonKind, User,
+    UserDataStore as _, UserItemData, UserPolicy,
 };
 
 use crate::services::access::ItemHidden;
@@ -355,6 +355,47 @@ pub async fn next_up(
         total,
         start: 0,
     })
+}
+
+/// Most people a title page lists from its cast.
+pub const CAST_LIMIT: usize = 40;
+
+/// Who appears in stored item `id`: its actors in billed order, then its
+/// guest stars. Crew are left out.
+pub async fn cast(state: &AppState, id: u64) -> Result<Vec<ItemPerson>, DomainError> {
+    use pharos_core::PersonStore as _;
+    let (mut cast, guests): (Vec<_>, Vec<_>) = state
+        .stores
+        .people_for_item(id)
+        .await?
+        .into_iter()
+        .filter(|p| matches!(p.kind, PersonKind::Actor | PersonKind::GuestStar))
+        .partition(|p| p.kind == PersonKind::Actor);
+    cast.extend(guests);
+    cast.truncate(CAST_LIMIT);
+    Ok(cast)
+}
+
+/// The regular cast of the synthesised series or season `wire_id`, ranked
+/// across its episodes' actor credits (guest stars left out). Empty for any
+/// other synthesised item.
+pub async fn ensemble(state: &AppState, wire_id: &str) -> Result<Vec<ItemPerson>, DomainError> {
+    use pharos_core::PersonStore as _;
+    let items = state.list_items_cached().await?;
+    let episodes: Vec<u64> = restrict_to_parent(state, &items, Some(wire_id))
+        .await
+        .into_iter()
+        .filter(|i| i.kind == MediaKind::Episode && i.series.is_some())
+        .map(|i| i.id)
+        .collect();
+    let credits = state.stores.actor_credits_for_items(&episodes).await?;
+    tracing::debug!(
+        wire_id,
+        episodes = episodes.len(),
+        credits = credits.len(),
+        "ensemble cast"
+    );
+    Ok(pharos_core::ensemble_cast(credits, CAST_LIMIT))
 }
 
 /// Drop items that don't live under the configured root / series /

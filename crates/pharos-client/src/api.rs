@@ -10,8 +10,8 @@ use pharos_api::pharos_capnp::{
     avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
     item_query, item_summary, items_result, library, lyrics_result, me_result, media_token_result,
     negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session,
-    stream_choice, telemetry, track, user_data, user_state_result, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
+    stream_choice, telemetry, track, user_data, user_state_result, CreditKind as WireCreditKind,
+    Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -208,6 +208,28 @@ pub struct Detail {
     pub artists: Vec<String>,
     /// A song's album name.
     pub album: Option<String>,
+    /// Who appears in it, in billed order. A series or season lists its
+    /// regulars ranked across its episodes.
+    pub cast: Vec<Credit>,
+}
+
+/// Someone who appears in an item, and who they play.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Credit {
+    pub name: String,
+    /// Empty when the credit names no character.
+    pub character: String,
+    pub kind: CreditKind,
+    /// The person's photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreditKind {
+    #[default]
+    Actor,
+    /// Appears in this one episode only.
+    GuestStar,
 }
 
 /// A font the file embeds. `url` holds `{subtitle}`, the index of the
@@ -973,6 +995,21 @@ impl PharosApi for NativeApi {
                         .map(text)
                         .collect::<Result<_, capnp::Error>>()?,
                     album: Some(text(d.get_album())?).filter(|a| !a.is_empty()),
+                    cast: d
+                        .get_cast()?
+                        .iter()
+                        .map(|c| {
+                            Ok(Credit {
+                                name: text(c.get_name())?,
+                                character: text(c.get_character())?,
+                                kind: match c.get_kind()? {
+                                    WireCreditKind::Actor => CreditKind::Actor,
+                                    WireCreditKind::GuestStar => CreditKind::GuestStar,
+                                },
+                                image_url: Some(text(c.get_image_url())?).filter(|u| !u.is_empty()),
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
