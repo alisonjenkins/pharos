@@ -1571,8 +1571,12 @@ fn on_bridge(message: Bridge) {
 struct Targets {
     /// The focused control's rect; `None` with the focus on nothing.
     from: Option<super::keymap::Rect>,
-    /// The shown controls in the move's scope: rect, selector, nth match.
-    targets: Vec<(super::keymap::Rect, String, u32)>,
+    /// The shown controls in the move's scope: rect, selector, nth match,
+    /// and whether it is in the docked player bar.
+    targets: Vec<(super::keymap::Rect, String, u32, bool)>,
+    /// Whether the focused control is in the docked player bar.
+    #[serde(default)]
+    from_docked: bool,
 }
 
 /// Collect the controls in the focused control's scope (an open modal
@@ -1601,9 +1605,11 @@ if (from) {{
 const els = scope ? shown(scope) : [];
 window.__pharosTargets = els;
 const rect = (el) => {{ const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; }};
+const docked = (el) => !!el.closest(".pharos-stage.is-mini");
 return {{
   from: from ? rect(from) : null,
-  targets: els.map((el) => {{ const [s, n] = mark(el); return [rect(el), s, Math.max(n, 0)]; }}),
+  from_docked: !!from && docked(from),
+  targets: els.map((el) => {{ const [s, n] = mark(el); return [rect(el), s, Math.max(n, 0), docked(el)]; }}),
 }};
 "#,
         targets = js_str(KEY_TARGETS),
@@ -1654,14 +1660,14 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         return Ok(());
     };
-    let rects: Vec<_> = found.targets.iter().map(|(r, _, _)| *r).collect();
-    let Some(at) = super::keymap::pick(dir, from, &rects) else {
+    let controls: Vec<_> = found.targets.iter().map(|(r, _, _, d)| (*r, *d)).collect();
+    let Some(at) = super::keymap::pick_docked(dir, from, found.from_docked, &controls) else {
         return Ok(());
     };
-    if rects[at] == from {
+    if controls[at].0 == from {
         return Ok(());
     }
-    let (_, sel, nth) = &found.targets[at];
+    let (_, sel, nth, _) = &found.targets[at];
     if !sel.is_empty() {
         let path = current_path();
         let mut m = lock(&LEFT_AT);
