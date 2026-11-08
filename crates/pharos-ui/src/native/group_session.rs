@@ -588,6 +588,11 @@ struct Inner {
     last_drift_ms: Option<i64>,
     /// This member left; what the server still sends is not for the screens.
     leaving: bool,
+    /// When the clock was last sampled and the server last pinged, by the
+    /// wall clock: a hidden tab's timers can fire once a minute, so counting
+    /// one-second ticks would ping every 30 minutes and be pruned (B893).
+    sampled_ms: i64,
+    pinged_ms: i64,
     /// When this session last moved the player itself.
     self_seek_ms: Option<i64>,
     /// When the drift check last started a player it found paused while the
@@ -806,6 +811,9 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 return Err(GroupError("This group has ended".into()));
             }
             inner.active = true;
+            let now = self.env.now_ms();
+            inner.sampled_ms = now;
+            inner.pinged_ms = now;
             inner.state.id = Some(summary.id.clone());
             if inner.state.members.is_empty() {
                 inner.state.members = summary.members.clone();
@@ -1389,27 +1397,34 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             }
             self.sync_clock().await;
         }
-        let mut n = 0u64;
         loop {
             self.env.sleep(1_000).await;
             if self.inner.borrow().epoch != epoch {
                 return;
             }
-            n += 1;
-            self.tick(n).await;
+            self.tick().await;
         }
     }
 
-    /// The work for the `n`th second of a membership: the drift check every
-    /// second, the drift sample and clock sync every 10 s, the ping every 30 s.
-    pub async fn tick(&self, n: u64) {
+    /// One second of a membership: the drift check, then the drift sample and
+    /// clock sync once 10 s have passed since the last, and the ping once 30 s
+    /// have.
+    pub async fn tick(&self) {
         self.check_drift();
         self.report_held_stall();
-        if n % SAMPLE_EVERY_S == 0 {
+        let (sample, ping) = {
+            let now = self.env.now_ms();
+            let mut inner = self.inner.borrow_mut();
+            (
+                elapsed(&mut inner.sampled_ms, now, SAMPLE_EVERY_S),
+                elapsed(&mut inner.pinged_ms, now, PING_EVERY_S),
+            )
+        };
+        if sample {
             self.report_drift();
             self.sync_clock().await;
         }
-        if n % PING_EVERY_S == 0 {
+        if ping {
             if let Err(e) = self.client.ping().await {
                 self.env
                     .warn(&format!("pharos: group ping failed: {}", e.0));
@@ -1826,6 +1841,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
 /// under about 10 s, where a seek would rebuffer (B761).
 const NUDGE_BELOW_MS: u64 = 500;
 
+/// Whether `every_s` seconds have passed since `*last` by `now`; if so,
+/// `*last` moves to `now`.
+fn elapsed(last: &mut i64, now: i64, every_s: u64) -> bool {
+    let every_ms = i64::try_from(every_s.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    if now.saturating_sub(*last) < every_ms {
+        return false;
+    }
+    *last = now;
+    true
+}
+
 /// The `<video>` the stage plays and the item it shows.
 struct Video {
     item: ItemRef,
@@ -2156,11 +2182,29 @@ mod tests {
     fn a_tick_syncs_the_clock_every_10_s_and_pings_every_30_s() {
         let rig = rig();
         let clocks = calls_with(&rig, "clock(").len();
-        for n in 1..=30 {
-            let _ = rig.session.tick(n).now_or_never();
+        for _ in 1..=30 {
+            rig.env.now.set(rig.env.now.get() + 1_000);
+            let _ = rig.session.tick().now_or_never();
         }
         assert_eq!(calls_with(&rig, "clock(").len() - clocks, 3);
         assert_eq!(calls_with(&rig, "ping").len(), 1);
+    }
+
+    /// B893: a hidden tab's timers fire about once a minute, so the one-second
+    /// tick comes 60 s apart. Each such tick still pings, well inside the
+    /// server's 150 s prune, where counting ticks pinged every 30 minutes.
+    #[test]
+    fn a_throttled_tick_still_pings_by_the_clock() {
+        let rig = rig();
+        let pings = || calls_with(&rig, "ping").len();
+        for _ in 0..3 {
+            rig.env.now.set(rig.env.now.get() + 60_000);
+            let _ = rig.session.tick().now_or_never();
+        }
+        assert_eq!(pings(), 3, "one ping a minute");
+        rig.env.now.set(rig.env.now.get() + 1_000);
+        let _ = rig.session.tick().now_or_never();
+        assert_eq!(pings(), 3, "a tick right after a ping does not ping again");
     }
 
     #[test]
@@ -2982,12 +3026,12 @@ mod tests {
 
         rig.player.paused.set(true);
         rig.env.now.set(104_999);
-        assert!(rig.session.tick(1).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
 
         rig.env.now.set(105_000);
-        assert!(rig.session.tick(2).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         let sent = calls_with(&rig, "buffering");
         assert_eq!(sent.len(), 1);
@@ -3024,9 +3068,9 @@ mod tests {
 
         // Past the report too: a player still waiting is not sought again
         // until it can play.
-        for (n, now) in [(1, 112_000), (2, 114_000), (3, 115_000), (4, 125_000)] {
+        for now in [112_000, 114_000, 115_000, 125_000] {
             rig.env.now.set(now);
-            assert!(rig.session.tick(n).now_or_never().is_some());
+            assert!(rig.session.tick().now_or_never().is_some());
             rig.env.settle();
         }
         assert_eq!(seeks(), before);
@@ -3133,7 +3177,7 @@ mod tests {
             1
         );
         rig.env.now.set(105_000);
-        assert!(rig.session.tick(1).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
         assert!(rig.env.logged("pharos: group wait reported").is_empty());
