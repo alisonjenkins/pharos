@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod filler_segment;
+mod gpu_tonemap;
 mod hdr_tonemap;
 mod mpegts_segment_timeline;
 mod muxed_audio_content;
