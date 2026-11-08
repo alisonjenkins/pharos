@@ -22,8 +22,8 @@ use pharos_subs::Viewport;
 
 use super::playback::SubtitleSize;
 use super::subtitles::{
-    content_box, controls_inset, style_for, FallbackReason, RustSubs, SubtitleRenderer,
-    FIRST_SUBTITLE_BUDGET_MS,
+    content_box, controls_inset, glide_inset, style_for, FallbackReason, RustSubs,
+    SubtitleRenderer, FIRST_SUBTITLE_BUDGET_MS, INSET_GLIDE_MS,
 };
 use crate::render::{self, subtitles::SubtitleCompositor};
 
@@ -53,6 +53,13 @@ enum Pending {
     Raf(i32),
 }
 
+/// The cues' lift moving from `from` to `to` buffer px since `started`.
+struct Glide {
+    from: u32,
+    to: u32,
+    started: f64,
+}
+
 struct Core {
     video: HtmlVideoElement,
     canvas: HtmlCanvasElement,
@@ -62,6 +69,10 @@ struct Core {
     viewport: Viewport,
     size_applied: SubtitleSize,
     measure_due: bool,
+    /// Whether the control bar showed at the last measure; `None` before the
+    /// first, which sets the lift without a glide.
+    bar_shown: Option<bool>,
+    glide: Option<Glide>,
     pending: Option<Pending>,
     tick: Option<Closure<dyn FnMut(JsValue, JsValue)>>,
     rvfc: Option<js_sys::Function>,
@@ -111,16 +122,41 @@ impl Core {
         } else {
             0
         };
+        let target = (f64::from(inset_css) * ratio).round() as u32;
+        let from = self.viewport.bottom_inset;
+        // Only the bar showing or hiding glides; a resize moves the lift at once.
+        let toggled = self.bar_shown.is_some_and(|before| before != visible);
+        self.bar_shown = Some(visible);
+        let glides = toggled
+            && target != from
+            && !super::platform::prefers("(prefers-reduced-motion: reduce)");
+        self.glide = glides.then(|| Glide {
+            from,
+            to: target,
+            started: now(),
+        });
         self.viewport = Viewport {
             width: w,
             height: h,
             content,
-            bottom_inset: (f64::from(inset_css) * ratio).round() as u32,
+            bottom_inset: if glides { from } else { target },
         };
         let size = SIZE.with(Cell::get);
         if size != self.size_applied {
             self.size_applied = size;
             self.renderer.set_style(style_for(size));
+        }
+    }
+
+    /// Moves the lift along its glide, ending it at the target.
+    fn advance_glide(&mut self) {
+        let Some(g) = &self.glide else {
+            return;
+        };
+        let elapsed = now() - g.started;
+        self.viewport.bottom_inset = glide_inset(g.from, g.to, elapsed);
+        if elapsed >= INSET_GLIDE_MS {
+            self.glide = None;
         }
     }
 
@@ -130,6 +166,7 @@ impl Core {
         if self.measure_due {
             self.measure();
         }
+        self.advance_glide();
         let t_ms = (media_s.unwrap_or_else(|| self.video.current_time()) * 1000.0).round() as i64;
         let frame = self.renderer.frame(t_ms, &self.viewport);
         let drawn = if frame.changed {
@@ -242,6 +279,34 @@ fn kick(core: &Shared, measure: bool) {
     };
     if playing {
         schedule(core);
+    }
+    if core.borrow().glide.is_some() {
+        animate(core);
+    }
+}
+
+/// Draws a frame on each animation frame until the cues' glide ends, so a
+/// paused video's subtitles still slide (the video-frame loop is idle then).
+fn animate(core: &Shared) {
+    let weak = Rc::downgrade(core);
+    let step = Closure::once_into_js(move |_: JsValue| {
+        let Some(core) = weak.upgrade() else {
+            return;
+        };
+        let more = {
+            let mut c = core.borrow_mut();
+            if c.dead {
+                return;
+            }
+            c.step(None);
+            c.glide.is_some()
+        };
+        if more {
+            animate(&core);
+        }
+    });
+    if let Some(w) = web_sys::window() {
+        let _ = w.request_animation_frame(step.unchecked_ref());
     }
 }
 
@@ -403,6 +468,8 @@ pub async fn rust_subtitles(
         viewport: Viewport::full(1, 1),
         size_applied: size,
         measure_due: true,
+        bar_shown: None,
+        glide: None,
         pending: None,
         tick: None,
         rvfc,
