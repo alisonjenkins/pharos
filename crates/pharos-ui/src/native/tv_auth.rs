@@ -261,9 +261,44 @@ fn check_authority(authority: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A new group device id from 64 random bits: `tv-` and 16 hex digits. The
+/// server refuses an empty device, and keys a member by user and device.
+pub fn new_group_device(bits: u64) -> String {
+    format!("tv-{bits:016x}")
+}
+
+/// Whether a stored group device id is one [`new_group_device`] made; any
+/// other text (an empty or half-written file) is replaced.
+pub fn is_group_device(id: &str) -> bool {
+    id.strip_prefix("tv-")
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TV's group member id is kept only while it is one we made, so a
+    /// truncated preference file mints a new one rather than sending "" (which
+    /// the server refuses). Disarm check: accepting any stored text fails this.
+    #[test]
+    fn a_group_device_id_is_kept_only_in_the_form_it_was_made() {
+        let id = new_group_device(0x0123_4567_89ab_cdef);
+        assert_eq!(id, "tv-0123456789abcdef");
+        assert!(is_group_device(&id));
+        assert!(is_group_device(&new_group_device(0)));
+        assert!(is_group_device(&new_group_device(u64::MAX)));
+        for bad in [
+            "",
+            "tv-",
+            "tv-0123",
+            "web-0123456789abcdef",
+            "tv-0123456789abcdeg",
+            "tv-0123456789abcdef\n",
+        ] {
+            assert!(!is_group_device(bad), "{bad:?}");
+        }
+    }
 
     /// The socket carries the QuickConnect secret and the device token, so a
     /// cleartext base is refused. Disarm check: mapping `http://` to `ws://`
