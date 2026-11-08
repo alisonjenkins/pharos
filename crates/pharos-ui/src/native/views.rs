@@ -315,6 +315,74 @@ pub fn ErrorNote(message: String) -> Element {
     rsx! { p { class: "pharos-error", role: "alert", "{message}" } }
 }
 
+/// Why a video is not playing: the plain-language headline the viewer reads
+/// and the raw reason kept for the details line (B806).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayFailure {
+    pub headline: &'static str,
+    pub reason: String,
+}
+
+impl PlayFailure {
+    /// The stream broke while it played.
+    pub fn stream(reason: impl Into<String>) -> Self {
+        Self {
+            headline: "This video stopped playing.",
+            reason: reason.into(),
+        }
+    }
+
+    /// The video could not be started: the engine would not attach, or the
+    /// server refused the play.
+    pub fn start(reason: impl Into<String>) -> Self {
+        Self {
+            headline: "This video could not be started.",
+            reason: reason.into(),
+        }
+    }
+
+    /// The one line a compact window shows in place of the panel.
+    pub fn line(&self) -> String {
+        format!("{} {}", self.headline, self.reason)
+    }
+}
+
+/// A playback failure over the picture: what happened in plain words, a way
+/// to try again from the last position, a way out, and the raw reason in a
+/// small details line (B806).
+#[component]
+pub fn PlaybackFailure(
+    failure: PlayFailure,
+    on_retry: EventHandler<()>,
+    on_back: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div { class: "pharos-playback-failure", role: "alert",
+            p { class: "pharos-playback-failure-title", "{failure.headline}" }
+            p { class: "pharos-playback-failure-hint",
+                "Check your connection, then try again. Your place is kept."
+            }
+            div { class: "pharos-playback-failure-actions",
+                button {
+                    class: "pharos-playback-failure-retry",
+                    r#type: "button",
+                    // A remote or keyboard lands on the way forward (TV, Quest).
+                    autofocus: true,
+                    onclick: move |_| on_retry.call(()),
+                    "Try again"
+                }
+                button {
+                    class: "pharos-playback-failure-back",
+                    r#type: "button",
+                    onclick: move |_| on_back.call(()),
+                    "Back"
+                }
+            }
+            p { class: "pharos-playback-failure-details", "Details: {failure.reason}" }
+        }
+    }
+}
+
 #[component]
 pub fn HomeView(home: Home) -> Element {
     use_hook(|| std::rc::Rc::new(platform::rail_gestures()));
@@ -1251,6 +1319,38 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// B806: a failure over the picture names what happened, offers Try
+    /// again and Back, and keeps the raw reason as small print.
+    #[test]
+    fn a_playback_failure_offers_retry_back_and_the_raw_reason() {
+        let html = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::stream("the stream failed (video segment 14: timeout)"),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                }
+            }
+        });
+        assert!(html.contains("This video stopped playing."), "{html}");
+        assert!(
+            html.contains("Try again") && html.contains(">Back<"),
+            "{html}"
+        );
+        assert!(
+            html.contains("Details: the stream failed (video segment 14: timeout)"),
+            "{html}"
+        );
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn a_start_failure_reads_differently_from_a_broken_stream() {
+        let start = PlayFailure::start("no MSE");
+        assert_ne!(start.headline, PlayFailure::stream("x").headline);
+        assert_eq!(start.line(), "This video could not be started. no MSE");
     }
 
     /// The heading on `html`, open tag to close tag.
