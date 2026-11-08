@@ -1015,6 +1015,24 @@ pub fn redact_dsn(url: &str) -> String {
 pub struct DatabaseConfig {
     #[serde(default = "default_db_url")]
     pub url: String,
+    /// Connections the pool holds open; requests beyond it queue.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: NonZeroU32,
+    /// Seconds a query waits for a free connection before failing.
+    #[serde(default = "default_db_acquire_timeout_secs")]
+    pub acquire_timeout_secs: NonZeroU32,
+}
+
+impl DatabaseConfig {
+    /// The pool size the stores are opened with.
+    pub fn pool(&self) -> pharos_store_sqlx::PoolConfig {
+        pharos_store_sqlx::PoolConfig {
+            max_connections: self.max_connections.get(),
+            acquire_timeout: std::time::Duration::from_secs(u64::from(
+                self.acquire_timeout_secs.get(),
+            )),
+        }
+    }
 }
 
 /// Hand-written so `{:?}` on a `Config` — anywhere, now or later — cannot print
@@ -1023,6 +1041,8 @@ impl std::fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseConfig")
             .field("url", &redact_dsn(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_secs", &self.acquire_timeout_secs)
             .finish()
     }
 }
@@ -1031,12 +1051,35 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             url: default_db_url(),
+            max_connections: default_db_max_connections(),
+            acquire_timeout_secs: default_db_acquire_timeout_secs(),
         }
     }
 }
 
 fn default_db_url() -> String {
     "sqlite::memory:".into()
+}
+
+fn default_db_max_connections() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 =
+        match NonZeroU32::new(pharos_store_sqlx::PoolConfig::DEFAULT_MAX_CONNECTIONS) {
+            Some(n) => n,
+            None => panic!("the default pool size must not be zero"),
+        };
+    DEFAULT
+}
+
+fn default_db_acquire_timeout_secs() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(
+        pharos_store_sqlx::PoolConfig::DEFAULT_ACQUIRE_TIMEOUT.as_secs() as u32,
+    ) {
+        Some(n) => n,
+        None => panic!("the default acquire timeout must not be zero"),
+    };
+    DEFAULT
 }
 
 fn default_server_name() -> String {
@@ -1886,6 +1929,32 @@ mod tests {
     }
 
     #[test]
+    fn database_pool_defaults_to_eight_connections_and_a_thirty_second_wait() {
+        let c = Config::from_toml_str(SAMPLE).unwrap();
+        let pool = c.database.pool();
+        assert_eq!(pool.max_connections, 8);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn database_pool_is_configurable_and_refuses_zero() {
+        let with = |extra: &str| {
+            Config::from_toml_str(&SAMPLE.replace(
+                "url = \"sqlite::memory:\"",
+                &format!("url = \"sqlite::memory:\"\n{extra}"),
+            ))
+        };
+        let pool = with("max_connections = 24\nacquire_timeout_secs = 5")
+            .unwrap()
+            .database
+            .pool();
+        assert_eq!(pool.max_connections, 24);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(5));
+        assert!(with("max_connections = 0").is_err());
+        assert!(with("acquire_timeout_secs = 0").is_err());
+    }
+
+    #[test]
     fn sampling_ratio_defaults_to_everything() {
         let c = Config::from_toml_str(SAMPLE).unwrap();
         assert_eq!(c.obs.sampling_ratio, 1.0);
@@ -2187,6 +2256,7 @@ mod dsn_redaction_tests {
     fn debug_of_the_config_does_not_print_the_password() {
         let cfg = DatabaseConfig {
             url: "postgres://u:hunter2@db:5432/pharos".into(),
+            ..DatabaseConfig::default()
         };
         let shown = format!("{cfg:?}");
         assert!(

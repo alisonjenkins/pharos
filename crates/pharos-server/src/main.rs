@@ -193,7 +193,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let cli_memo = probe_memo_for(cfg);
     // P48 — `ffmpeg-lib` build probes in-process via a resident libav
     // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
@@ -264,7 +264,7 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -995,7 +995,7 @@ async fn create_user(
     use pharos_server::auth::{BuiltinAuth, CreateUserOutcome};
 
     require_password(password)?;
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let outcome = auth
@@ -1040,7 +1040,7 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
     use pharos_server::auth::BuiltinAuth;
 
     require_password(password)?;
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let record = stores
@@ -1114,7 +1114,7 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -1541,7 +1541,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     obs::register_static_series();
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     // LIB-C1 — reconcile the typed `libraries` table from config (one row
     // per configured root/typed-library, with its kind + stable wire id),
     // then backfill `media_items.library_id` by path-prefix so the
