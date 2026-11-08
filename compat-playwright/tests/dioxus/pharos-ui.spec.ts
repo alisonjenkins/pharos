@@ -1772,7 +1772,7 @@ test.describe("pharos Dioxus UI", () => {
     // V630: `?engine=rust` picks the Pharos engine for one page load. Until it
     // is built (spec 031 slice 2) the watch page says so and plays through
     // hls.js, so the override can never leave a viewer without playback.
-    test("the engine override is logged and falls back to hls.js", async ({
+    test("the Rust engine override plays and seeks without hls.js", async ({
       page,
       request,
     }) => {
@@ -1829,23 +1829,35 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
 
       await page.goto(`/ui/watch/${nativeId}?engine=rust`);
-      const verdict =
-        "pharos: playback engine=hlsjs reason=fallback cause=not_built asked=rust asked_by=override";
+      const verdict = "pharos: playback engine=rust reason=override";
       await expect
         .poll(() => logs.some((l) => l.includes(verdict)), { timeout: 15_000 })
         .toBe(true);
-      await expect.poll(() => hlsjs.length, { timeout: 15_000 }).toBe(1);
       await expect
-        .poll(
-          () =>
-            page.evaluate(
-              () =>
-                (document.getElementById("pharos-video") as HTMLVideoElement | null)
-                  ?.currentTime ?? 0,
-            ),
-          { timeout: 60_000 },
-        )
-        .toBeGreaterThan(1);
+        .poll(() => logs.some((l) => l.includes("pharos: playback engine=rust start")), {
+          timeout: 30_000,
+        })
+        .toBe(true);
+      const video = () =>
+        page.evaluate(() => {
+          const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+          return { t: v?.currentTime ?? 0, d: v?.duration ?? 0 };
+        });
+      await expect.poll(async () => (await video()).t, { timeout: 60_000 }).toBeGreaterThan(1);
+
+      const { d } = await video();
+      const target = Math.floor(d / 2);
+      await page.evaluate((to) => {
+        const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+        if (v) v.currentTime = to;
+      }, target);
+      await expect
+        .poll(async () => (await video()).t, { timeout: 60_000 })
+        .toBeGreaterThan(target + 1);
+
+      expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual([]);
+      expect(logs.filter((l) => l.includes("playback error engine=rust"))).toEqual([]);
+      expect(hlsjs).toEqual([]);
     });
 
     // B551: a seek that waits on the server shows a spinner over the video,

@@ -158,7 +158,7 @@ pub fn pick_mse_engine(search: &str, stored: Option<&str>) -> (MseEngine, Engine
 }
 
 /// Whether [`Engine::RustHls`] can play yet (spec 031 slice 2).
-const RUST_HLS_BUILT: bool = false;
+const RUST_HLS_BUILT: bool = true;
 
 /// The HLS engine a play actually uses once `picked` for `reason`: the
 /// Rust engine hands over to hls.js until it is built.
@@ -172,8 +172,16 @@ pub struct EngineVerdict {
 }
 
 pub fn engine_verdict(picked: Engine, reason: EngineReason) -> EngineVerdict {
+    engine_verdict_with(picked, reason, RUST_HLS_BUILT)
+}
+
+pub fn engine_verdict_with(
+    picked: Engine,
+    reason: EngineReason,
+    rust_built: bool,
+) -> EngineVerdict {
     let (engine, fallback) = match picked {
-        Engine::RustHls if !RUST_HLS_BUILT => (Engine::HlsJs, Some("not_built")),
+        Engine::RustHls if !rust_built => (Engine::HlsJs, Some("not_built")),
         other => (other, None),
     };
     EngineVerdict {
@@ -3063,7 +3071,7 @@ mod tests {
     /// V630: one verdict per play, naming what plays, what was asked and why.
     #[test]
     fn the_rust_engine_hands_over_to_hlsjs_until_built_and_says_so() {
-        let v = engine_verdict(Engine::RustHls, EngineReason::Override);
+        let v = engine_verdict_with(Engine::RustHls, EngineReason::Override, false);
         assert_eq!(v.engine, Engine::HlsJs);
         assert_eq!(v.fallback, Some("not_built"));
         assert_eq!(
@@ -3085,6 +3093,10 @@ mod tests {
                 "{field:?}"
             );
         }
+
+        let built = engine_verdict(Engine::RustHls, EngineReason::Override);
+        assert_eq!((built.engine, built.fallback), (Engine::RustHls, None));
+        assert_eq!(built.line(), "pharos: playback engine=rust reason=override");
     }
 
     #[test]
