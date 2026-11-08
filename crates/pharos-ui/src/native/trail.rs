@@ -40,7 +40,8 @@ mod tests {
     use std::collections::HashMap;
 
     use pharos_client::api::{
-        Capabilities, Decision, Detail, Home, ListIndex, Listing, Page, PlaybackGrant, TrackPicks,
+        Capabilities, Decision, Detail, Home, ListIndex, Listing, Page, PlaybackGrant, StartTracks,
+        TrackPicks,
     };
 
     use super::*;
@@ -140,6 +141,14 @@ mod tests {
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
+            Err(missing())
+        }
+        async fn start_tracks(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+            _: &Capabilities,
+        ) -> Result<StartTracks, ClientError> {
             Err(missing())
         }
     }

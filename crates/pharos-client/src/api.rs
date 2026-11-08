@@ -446,20 +446,13 @@ pub trait PharosApi {
         picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
     /// The tracks [`PharosApi::play`] with default picks would start `id`
-    /// on: the user's last choice for it, else their preferences. An
-    /// implementation that cannot ask the server reports the call as
-    /// unimplemented, not as an empty answer.
+    /// on: the user's last choice for it, else their preferences.
     async fn start_tracks(
         &self,
         call: &CallInfo,
         id: ItemRef,
         caps: &Capabilities,
-    ) -> Result<StartTracks, ClientError> {
-        let _ = (call, id, caps);
-        Err(ClientError::Rpc(capnp::Error::unimplemented(
-            "startTracks is not available from this client".to_owned(),
-        )))
-    }
+    ) -> Result<StartTracks, ClientError>;
 }
 
 /// One negotiated playback, for progress reports.
