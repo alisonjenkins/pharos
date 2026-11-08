@@ -10,5 +10,6 @@ pub mod fmp4;
 pub mod planner;
 pub mod playlist;
 pub mod retry;
+pub mod stall;
 pub mod timeline;
 pub mod uri;
