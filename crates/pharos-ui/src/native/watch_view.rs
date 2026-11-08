@@ -167,8 +167,22 @@ pub(super) fn transport_control(t: Transport, media: &MediaState) -> Option<Cont
         Transport::SeekTenths(_)
         | Transport::Fullscreen
         | Transport::NextSubtitle
-        | Transport::NextAudio => return None,
+        | Transport::NextAudio
+        | Transport::SkipSegment => return None,
     })
+}
+
+/// The seek `s` makes: to the end of the segment whose skip button shows,
+/// and nothing when no button shows (B805). "Up next" takes the button's
+/// place over the credits, so it leaves `s` unbound too.
+pub(super) fn skip_segment_control(
+    segment: Option<Segment>,
+    up_next_shown: bool,
+) -> Option<Control> {
+    if up_next_shown {
+        return None;
+    }
+    segment.map(|seg| Control::Seek(seg.end_ms))
 }
 
 /// The subtitle after `pick` in `tracks`, then off, then the first again.
@@ -349,6 +363,8 @@ pub fn WatchView(
         c.audio.clone(),
         c.audio_pick,
     );
+    let skip = segment_at(&c.segments, media.position_ms);
+    let up_next_shown = c.up_next.is_some();
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
@@ -371,6 +387,16 @@ pub fn WatchView(
             Some(Transport::Fullscreen) => Some(Control::Fullscreen),
             Some(Transport::NextSubtitle) => next_subtitle(&tracks.0, tracks.1),
             Some(Transport::NextAudio) => next_audio(&tracks.2, tracks.3),
+            Some(Transport::SkipSegment) => {
+                let control = skip_segment_control(skip, up_next_shown);
+                if let Some(Control::Seek(to_ms)) = control {
+                    platform::info(&format!(
+                        "pharos: skip by key from {} ms to {to_ms} ms",
+                        media.position_ms
+                    ));
+                }
+                control
+            }
             Some(t) => transport_control(t, &media),
             None => None,
         };
@@ -380,7 +406,6 @@ pub fn WatchView(
         evt.prevent_default();
         on_control.call(control);
     };
-    let skip = segment_at(&c.segments, media.position_ms);
     let ends = ends_at(left_to_watch(&c.segments, media.position_ms, total));
     let text_tracks: Vec<(String, Track)> = c
         .subtitles
@@ -1274,6 +1299,38 @@ mod tests {
             rule(".pharos-controls:has(.pharos-seek-preview)").contains("z-index: 2;"),
             "the seek preview must rise over the skip button"
         );
+    }
+
+    /// B805: the idle fade hides the top strip and the control bar but not
+    /// the skip button, in the plain rule and in every `data-overlay-fx`
+    /// variant, or a viewer who is just watching never sees it.
+    #[test]
+    fn idle_never_hides_the_skip_button() {
+        let sheet = include_str!("../../assets/pharos.css");
+        for line in sheet.lines().filter(|l| l.contains(".is-idle")) {
+            assert!(
+                !line.contains(".pharos-skip"),
+                "an idle rule hides the skip button: {line}"
+            );
+        }
+        assert!(sheet.contains(".pharos-player.is-idle .pharos-controls {"));
+    }
+
+    #[test]
+    fn s_skips_only_the_segment_whose_button_shows() {
+        let seg = Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 10_000,
+            end_ms: 70_000,
+        };
+        assert!(matches!(
+            skip_segment_control(Some(seg), false),
+            Some(Control::Seek(70_000))
+        ));
+        assert!(skip_segment_control(None, false).is_none());
+        assert!(skip_segment_control(Some(seg), true).is_none());
+        let media = MediaState::default();
+        assert!(transport_control(Transport::SkipSegment, &media).is_none());
     }
 
     #[test]

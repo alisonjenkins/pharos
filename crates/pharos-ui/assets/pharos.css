@@ -1549,7 +1549,10 @@ body:has(.pharos-stage.is-full) .pharos-error {
     display: none;
   }
 }
-/* Playing with the pointer at rest: only the picture (and its subtitles). */
+/* Playing with the pointer at rest: only the picture (and its subtitles).
+   The skip button is not hidden here (B805): it only exists while its
+   segment plays, so it stays like "Up next" and a viewer who is just
+   watching can still press it. */
 .pharos-player.is-idle {
   cursor: none;
 }
@@ -1557,8 +1560,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
    would keep it over the picture for the whole film; every key press wakes
    it anyway. */
 .pharos-player.is-idle .pharos-watch-top,
-.pharos-player.is-idle .pharos-controls,
-.pharos-player.is-idle .pharos-skip {
+.pharos-player.is-idle .pharos-controls {
   opacity: 0;
   pointer-events: none;
 }
@@ -1595,8 +1597,8 @@ body:has(.pharos-stage.is-full) .pharos-error {
     opacity 180ms cubic-bezier(0, 0, 0.2, 1),
     transform 180ms cubic-bezier(0, 0, 0.2, 1);
 }
-:root[data-overlay-fx="glide"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip),
-:root[data-overlay-fx="zoom"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="glide"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls),
+:root[data-overlay-fx="zoom"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls) {
   transition:
     opacity 260ms cubic-bezier(0.4, 0, 1, 1),
     transform 260ms cubic-bezier(0.4, 0, 1, 1);
@@ -1608,27 +1610,24 @@ body:has(.pharos-stage.is-full) .pharos-error {
 :root[data-overlay-fx="glide"] .pharos-player.is-idle .pharos-controls {
   transform: translateY(100%);
 }
-:root[data-overlay-fx="glide"] .pharos-player.is-idle .pharos-skip {
-  transform: translateX(calc(100% + 1rem));
-}
 /* Zoom: each piece swells toward the viewer from its edge as it fades. */
 :root[data-overlay-fx="zoom"] .pharos-player.is-idle .pharos-watch-top {
   transform-origin: 50% 0;
   transform: scale(1.08);
 }
-:root[data-overlay-fx="zoom"] .pharos-player.is-idle :is(.pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="zoom"] .pharos-player.is-idle .pharos-controls {
   transform-origin: 50% 100%;
   transform: scale(1.08);
 }
 /* Wobble: a jelly shake that squashes the piece into its edge. Waking
    cuts it short and the bar fades straight back. */
-:root[data-overlay-fx="wobble"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="wobble"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls) {
   animation: 300ms ease-in both pharos-overlay-wobble;
 }
 :root[data-overlay-fx="wobble"] .pharos-player.is-idle .pharos-watch-top {
   transform-origin: 50% 0;
 }
-:root[data-overlay-fx="wobble"] .pharos-player.is-idle :is(.pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="wobble"] .pharos-player.is-idle .pharos-controls {
   transform-origin: 50% 100%;
 }
 @keyframes pharos-overlay-wobble {
@@ -1654,7 +1653,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
 }
 /* Dissolve: the piece breaks into two offset grids of dots that shrink at
    different rates until nothing is left. */
-:root[data-overlay-fx="dissolve"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="dissolve"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls) {
   --pharos-dissolve: 1;
   --pharos-dot: calc((1 - var(--pharos-dissolve)) * 4.5px);
   --pharos-dot-fast: calc((1 - min(1, var(--pharos-dissolve) * 1.6)) * 4.5px);
@@ -1677,7 +1676,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
    the piece's height, slid up by `--pharos-burn` (75% of the free travel
    takes the front from just below the piece to just above it); the glow is
    the same front drawn a few px inside the part still standing. */
-:root[data-overlay-fx="burn"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip) {
+:root[data-overlay-fx="burn"] .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls) {
   --pharos-burn: 1;
   -webkit-mask: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 300' preserveAspectRatio='none'><path d='M0,0H120V150L120,150 L115,138 L110,150 L103,136 L98,116 L94,134 L88,150 L80,130 L75,106 L70,128 L64,150 L56,138 L52,118 L48,136 L42,150 L35,128 L30,104 L26,126 L20,148 L14,134 L10,112 L6,132 L0,150Z'/></svg>") 0 calc(var(--pharos-burn) * 75%) / 120px 300% repeat-x;
   mask: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 300' preserveAspectRatio='none'><path d='M0,0H120V150L120,150 L115,138 L110,150 L103,136 L98,116 L94,134 L88,150 L80,130 L75,106 L70,128 L64,150 L56,138 L52,118 L48,136 L42,150 L35,128 L30,104 L26,126 L20,148 L14,134 L10,112 L6,132 L0,150Z'/></svg>") 0 calc(var(--pharos-burn) * 75%) / 120px 300% repeat-x;
@@ -1696,7 +1695,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
 /* Reduced motion: every effect but None becomes the plain fade. */
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-overlay-fx="none"]) :is(.pharos-watch-top, .pharos-controls, .pharos-skip),
-  :root:not([data-overlay-fx="none"]) .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls, .pharos-skip) {
+  :root:not([data-overlay-fx="none"]) .pharos-player.is-idle :is(.pharos-watch-top, .pharos-controls) {
     transform: none !important;
     animation: none !important;
     -webkit-mask: none !important;
