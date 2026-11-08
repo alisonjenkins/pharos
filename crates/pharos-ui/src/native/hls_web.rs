@@ -6,8 +6,10 @@ use std::rc::{Rc, Weak};
 
 use gloo_net::http::Request;
 use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
-use pharos_hls::playlist::{parse_master, parse_media, MediaPlaylist, Segment};
+use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
+use pharos_hls::timeline::same_grid;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
 
@@ -16,14 +18,19 @@ use super::platform::{
     sleep_ms, video_element, warn, HlsJs, HLSJS_SRC,
 };
 use super::playback::{
-    check_master, pick_audio_uri, plan_hls, ranges_to_ms, FragmentLoad, HlsFallbackCause, OnFatal,
-    OnFragment, PlaybackEngine,
+    abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
+    rung_label, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause, OnFatal, OnFragment,
+    PlaybackEngine,
 };
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// A failed segment is retried after this times its attempt count, so a server
 /// briefly out of encoders is not three failures in a few milliseconds.
 const RETRY_BASE_MS: u32 = 1_000;
+/// The cold-encode time is the slowest time-to-first-byte over this many recent
+/// video segments: a segment the server encodes on demand answers late, a
+/// cached one at once, and an up-switch has to survive the late kind.
+const COLD_WINDOW: usize = 4;
 
 type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
@@ -32,6 +39,7 @@ enum Op {
         bytes: Vec<u8>,
         request: SegRequest,
         load_ms: u64,
+        ttfb_ms: u64,
         media_ms: u64,
     },
     Remove {
@@ -46,9 +54,27 @@ enum RunningOp {
         request: SegRequest,
         bytes: u64,
         load_ms: u64,
+        ttfb_ms: u64,
         media_ms: u64,
     },
     Remove,
+}
+
+/// One rung the engine can switch the video track to.
+struct Rendition {
+    entry_label: String,
+    init_uri: String,
+    segments: Vec<Segment>,
+}
+
+/// In-player quality switching (spec 031 slice 4): the ladder, the rule and
+/// what the connection has shown.
+struct AbrState {
+    abr: Abr,
+    /// Indexed as [`Abr::ladder`], lowest bandwidth first.
+    renditions: Vec<Rendition>,
+    estimator: Estimator,
+    ttfbs: VecDeque<u64>,
 }
 
 struct TrackRunner {
@@ -92,6 +118,7 @@ struct Session {
     on_source_open: Option<EventListener>,
     video_listeners: Vec<(&'static str, EventListener)>,
     planner: Option<Planner>,
+    abr: Option<AbrState>,
     video_track: Option<TrackRunner>,
     audio_track: Option<TrackRunner>,
     eos_pending: bool,
@@ -140,6 +167,7 @@ impl PlaybackEngine for RustHls {
             on_source_open: None,
             video_listeners: Vec::new(),
             planner: None,
+            abr: None,
             video_track: None,
             audio_track: None,
             eos_pending: false,
@@ -269,14 +297,16 @@ async fn load(weak: Weak<RefCell<Session>>) {
         return;
     };
 
-    let master_text = match get_text(&url).await {
+    // Only the Rust engine asks for the ladder; a fallback to hls.js loads `url`.
+    let master_url = with_abr(&url);
+    let master_text = match get_text(&master_url).await {
         Ok(text) => text,
         Err((status, reason)) => {
-            fail_manifest(&weak, "manifestLoadError", status, &reason, &url);
+            fail_manifest(&weak, "manifestLoadError", status, &reason, &master_url);
             return;
         }
     };
-    let master = match parse_master(&master_text, &url) {
+    let master = match parse_master(&master_text, &master_url) {
         Ok(m) => m,
         Err(e) => {
             fail_manifest(&weak, "manifestParsingError", None, &e.to_string(), &url);
@@ -406,6 +436,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     wire_source_buffer(&weak, Track::Video, &mut video_runner);
 
     let seg_count = video_pl.segments.len();
+    let playing = (plan.video_uri.clone(), video_pl.segments.clone());
     let planner = Planner::new(
         video_pl.segments,
         true,
@@ -447,6 +478,212 @@ async fn load(weak: Weak<RefCell<Session>>) {
     ));
 
     pump(&session);
+    drop(session);
+    prepare_abr(weak, master, playing).await;
+}
+
+/// Fetches every other rung's media playlist and turns quality switching on
+/// once playback has started, so the start is not held up by rungs it may
+/// never use. A rung whose playlist fails, has no init, or cuts the media
+/// elsewhere is left out of the ladder.
+async fn prepare_abr(
+    weak: Weak<RefCell<Session>>,
+    master: Master,
+    playing: (String, Vec<Segment>),
+) {
+    let (playing_uri, playing_segments) = playing;
+    let ladder = abr_ladder(&master);
+    if ladder.len() < 2 {
+        info(&format!("pharos: abr off rungs={}", ladder.len()));
+        return;
+    }
+    let mut rungs: Vec<Rung> = Vec::with_capacity(ladder.len());
+    let mut renditions = Vec::with_capacity(ladder.len());
+    for entry in ladder {
+        let label = rung_label(&entry.rung);
+        let playlist = if entry.uri == playing_uri {
+            Ok(None)
+        } else {
+            match get_text(&entry.uri).await {
+                Ok(text) => parse_media(&text, &entry.uri)
+                    .map(Some)
+                    .map_err(|e| e.to_string()),
+                Err((status, reason)) => Err(format!(
+                    "status={} {reason}",
+                    status.map_or_else(|| "none".to_owned(), |s| s.to_string())
+                )),
+            }
+        };
+        let (init_uri, segments) = match playlist {
+            Ok(None) => {
+                let Some(init) = weak
+                    .upgrade()
+                    .and_then(|s| s.borrow().video_track.as_ref().map(|t| t.init_uri.clone()))
+                else {
+                    return;
+                };
+                (init, playing_segments.clone())
+            }
+            Ok(Some(pl)) => {
+                let Some(init) = pl.init_uri else {
+                    warn(&format!(
+                        "pharos: abr rung skipped rung={label} reason=no_init url={}",
+                        entry.uri
+                    ));
+                    continue;
+                };
+                if !same_grid(&pl.segments, &playing_segments) {
+                    warn(&format!(
+                        "pharos: abr rung skipped rung={label} reason=grid segments={} playing={} url={}",
+                        pl.segments.len(),
+                        playing_segments.len(),
+                        entry.uri
+                    ));
+                    continue;
+                }
+                (init, pl.segments)
+            }
+            Err(reason) => {
+                warn(&format!(
+                    "pharos: abr rung skipped rung={label} reason=playlist error={reason} url={}",
+                    entry.uri
+                ));
+                continue;
+            }
+        };
+        rungs.push(entry.rung);
+        renditions.push(Rendition {
+            entry_label: label,
+            init_uri,
+            segments,
+        });
+    }
+    if rungs.len() < 2 {
+        info(&format!("pharos: abr off rungs={}", rungs.len()));
+        return;
+    }
+
+    // Start where playback already is: the source rung, which the server
+    // prewarms. With no estimate yet this asks for the highest rung allowed.
+    let mut abr = Abr::new(
+        rungs,
+        AbrConfig {
+            default_start_bps: u64::MAX,
+            ..AbrConfig::default()
+        },
+    );
+    let started = abr.start(now_ms_u64(), None, None).map(|sw| sw.to);
+    let Some(current) = started else {
+        return;
+    };
+    let labels: Vec<&str> = renditions.iter().map(|r| r.entry_label.as_str()).collect();
+    let labels = labels.join(",");
+    let Some(session) = weak.upgrade() else {
+        return;
+    };
+    let mut s = session.borrow_mut();
+    if s.dead {
+        return;
+    }
+    let on_rung = s.video_track.as_ref().is_some_and(|t| {
+        renditions
+            .get(current)
+            .is_some_and(|r| r.init_uri == t.init_uri)
+    });
+    if !on_rung {
+        drop(s);
+        warn(&format!(
+            "pharos: abr off reason=start_mismatch rungs={labels} start={}",
+            renditions
+                .get(current)
+                .map_or("none", |r| r.entry_label.as_str())
+        ));
+        return;
+    }
+    let current_label = renditions[current].entry_label.clone();
+    s.abr = Some(AbrState {
+        abr,
+        renditions,
+        estimator: Estimator::new(EstimatorConfig::default()),
+        ttfbs: VecDeque::with_capacity(COLD_WINDOW),
+    });
+    drop(s);
+    info(&format!(
+        "pharos: abr on rungs={labels} current={current_label}"
+    ));
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn now_ms_u64() -> u64 {
+    now_ms().max(0.0) as u64
+}
+
+/// After video segment `index` is appended: learn from its download, then let
+/// the rule pick the rung for the segments after it (V645-V648). Runs with the
+/// video track idle, so a switch's init is the next thing fetched.
+fn abr_step(session: &Rc<RefCell<Session>>, index: usize, load: FragmentLoad, ttfb_ms: u64) {
+    let Some((play_ms, buffered)) = snapshot_state(session) else {
+        return;
+    };
+    let report = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
+        if s.dead {
+            return;
+        }
+        let (Some(st), Some(track), Some(planner)) =
+            (s.abr.as_mut(), s.video_track.as_mut(), s.planner.as_mut())
+        else {
+            return;
+        };
+        st.estimator.sample(load.bytes, load.load_ms, load.media_ms);
+        if st.ttfbs.len() == COLD_WINDOW {
+            st.ttfbs.pop_front();
+        }
+        st.ttfbs.push_back(ttfb_ms);
+        let Some(next) = track.segments.get(index.saturating_add(1)) else {
+            return;
+        };
+        let inputs = Inputs {
+            now_ms: now_ms_u64(),
+            estimate_bps: st.estimator.estimate_bps(),
+            buffer_ms: forward_buffer_ms(&buffered.video, play_ms),
+            segment_ms: next.duration_ms,
+            cold_ms: st.ttfbs.iter().copied().max().unwrap_or(0),
+            // The Settings maximum already caps the server's ladder (V645).
+            ceiling_bps: None,
+        };
+        let Some(switch) = st.abr.decide(&inputs) else {
+            return;
+        };
+        let from = switch
+            .from
+            .and_then(|i| st.renditions.get(i))
+            .map_or_else(|| "none".to_owned(), |r| r.entry_label.clone());
+        let Some(to) = st.renditions.get(switch.to) else {
+            return;
+        };
+        let applied = planner.reinit(Track::Video);
+        if applied {
+            track.init_uri = to.init_uri.clone();
+            track.segments = to.segments.clone();
+        }
+        AbrSwitchReport {
+            from,
+            to: to.entry_label.clone(),
+            reason: switch.reason.label(),
+            estimate_bps: inputs.estimate_bps,
+            buffer_ms: inputs.buffer_ms,
+            cold_ms: inputs.cold_ms,
+            applied,
+        }
+    };
+    if report.applied {
+        info(&report.line());
+    } else {
+        warn(&report.line());
+    }
+    report_event(report.event(current_path()));
 }
 
 fn empty_media_playlist() -> MediaPlaylist {
@@ -765,7 +1002,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
             return;
         };
         match outcome {
-            Ok((bytes, load_ms)) => {
+            Ok((bytes, load_ms, ttfb_ms)) => {
                 let queued = {
                     let mut s = session.borrow_mut();
                     if s.dead {
@@ -783,6 +1020,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                         bytes,
                         request,
                         load_ms,
+                        ttfb_ms,
                         media_ms,
                     });
                     true
@@ -802,7 +1040,7 @@ async fn fetch_segment(
     uri: &str,
     signal: &web_sys::AbortSignal,
     sent_at: f64,
-) -> Result<(Vec<u8>, u64), (Option<u16>, String)> {
+) -> Result<(Vec<u8>, u64, u64), (Option<u16>, String)> {
     let resp = Request::get(uri)
         .abort_signal(Some(signal))
         .send()
@@ -821,7 +1059,9 @@ async fn fetch_segment(
     };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let load_ms = (done_at - start).max(0.0).round() as u64;
-    Ok((bytes, load_ms))
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ttfb_ms = (start - sent_at).max(0.0).round() as u64;
+    Ok((bytes, load_ms, ttfb_ms))
 }
 
 fn on_fetch_failed(
@@ -937,11 +1177,13 @@ fn run_queue(session: &Rc<RefCell<Session>>, track: Track) {
                     bytes,
                     request,
                     load_ms,
+                    ttfb_ms,
                     media_ms,
                 } => RunningOp::Append {
                     request: *request,
                     bytes: bytes.len() as u64,
                     load_ms: *load_ms,
+                    ttfb_ms: *ttfb_ms,
                     media_ms: *media_ms,
                 },
                 Op::Remove { .. } => RunningOp::Remove,
@@ -1035,18 +1277,21 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
     };
 
     if let Some(RunningOp::Append {
-        request: SegRequest::Media(_),
+        request: SegRequest::Media(index),
         bytes,
         load_ms,
+        ttfb_ms,
         media_ms,
     }) = finished
     {
         if track == Track::Video && bytes > 0 && media_ms > 0 {
-            on_fragment(FragmentLoad {
+            let load = FragmentLoad {
                 bytes,
                 load_ms,
                 media_ms,
-            });
+            };
+            on_fragment(load);
+            abr_step(session, index, load, ttfb_ms);
         }
     }
 
