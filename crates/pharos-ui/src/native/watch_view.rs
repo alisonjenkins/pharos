@@ -1591,6 +1591,9 @@ pub(super) fn Volume(
     filled: bool,
 ) -> Element {
     let wake = try_use_context::<Wake>();
+    if !platform::owns_volume() {
+        return rsx! {};
+    }
     let shown = if media.muted { 0.0 } else { media.volume };
     let fill = format!("--pharos-fill: {:.0}%", shown * 100.0);
     rsx! {
