@@ -1157,11 +1157,37 @@ pub struct TierDropEvent {
     pub dropped: u64,
     pub presented: u64,
     pub window_ms: u64,
+    /// The subtitle renderer's own skipped and drawn frames over the window,
+    /// when it counts them.
+    pub renderer: Option<RendererFrames>,
+}
+
+/// A subtitle renderer's running frame counters: frames it skipped because
+/// it was still drawing the last one, and frames it drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererFrames {
+    pub skipped: u64,
+    pub drawn: u64,
+}
+
+/// What one quality sample decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierVerdict {
+    /// Nothing to do: within budget, mid-window or cooling down.
+    Hold,
+    /// The video dropped frames over budget but the subtitle renderer kept
+    /// up, so the cost is the video's own and the tier stays (B667).
+    Spared(TierDropEvent),
+    /// One tier lower.
+    Drop(TierDropEvent),
 }
 
 /// Watches `getVideoPlaybackQuality` counters and says when the styled track
 /// should fall one tier (spec 028 FR-019): over budget across a full 10 s
-/// window, at most once per 30 s, never below Low.
+/// window, at most once per 30 s, never below Low. When the renderer counts
+/// its own frames, a window only drops if the renderer was also skipping
+/// frames over budget: a video that drops frames on its own (a weak decoder)
+/// keeps its effects (B667, V617).
 #[derive(Debug)]
 pub struct TierDrop {
     tier: Tier,
@@ -1174,6 +1200,13 @@ struct QualitySample {
     at_ms: u64,
     dropped: u64,
     presented: u64,
+    renderer: Option<RendererFrames>,
+}
+
+/// Whether `dropped` frames out of `total` is over the drop budget.
+fn over_budget(dropped: u64, total: u64) -> bool {
+    u128::from(dropped).saturating_mul(100)
+        > u128::from(total).saturating_mul(TIER_DROP_BUDGET_PERCENT)
 }
 
 impl TierDrop {
@@ -1193,7 +1226,8 @@ impl TierDrop {
     /// Feed the video's running counters; a drop comes back when one is due.
     /// `counting` is false while the page is hidden or the video is paused or
     /// stalled: such a sample says nothing about the renderer, so it only
-    /// restarts the window.
+    /// restarts the window. With no renderer counters every video drop is
+    /// charged to the subtitles.
     pub fn sample(
         &mut self,
         now_ms: u64,
@@ -1201,17 +1235,42 @@ impl TierDrop {
         presented_total: u64,
         counting: bool,
     ) -> Option<TierDropEvent> {
+        match self.judge(now_ms, dropped_total, presented_total, None, counting) {
+            TierVerdict::Drop(e) => Some(e),
+            TierVerdict::Hold | TierVerdict::Spared(_) => None,
+        }
+    }
+
+    /// [`TierDrop::sample`] with the subtitle renderer's own counters, and
+    /// the verdict in full.
+    pub fn judge(
+        &mut self,
+        now_ms: u64,
+        dropped_total: u64,
+        presented_total: u64,
+        renderer: Option<RendererFrames>,
+        counting: bool,
+    ) -> TierVerdict {
         if !counting {
             self.samples.clear();
-            return None;
+            return TierVerdict::Hold;
         }
         let sample = QualitySample {
             at_ms: now_ms,
             dropped: dropped_total,
             presented: presented_total,
+            renderer,
         };
         if self.samples.back().is_some_and(|last| {
-            now_ms < last.at_ms || dropped_total < last.dropped || presented_total < last.presented
+            now_ms < last.at_ms
+                || dropped_total < last.dropped
+                || presented_total < last.presented
+                || match (last.renderer, renderer) {
+                    (Some(a), Some(b)) => b.skipped < a.skipped || b.drawn < a.drawn,
+                    (None, None) => false,
+                    // A renderer that starts or stops counting: start over.
+                    _ => true,
+                }
         }) {
             self.samples.clear();
         }
@@ -1225,13 +1284,20 @@ impl TierDrop {
         {
             self.samples.pop_front();
         }
-        let oldest = *self.samples.front()?;
+        let Some(&oldest) = self.samples.front() else {
+            return TierVerdict::Hold;
+        };
         let window_ms = now_ms.saturating_sub(oldest.at_ms);
         let dropped = dropped_total.saturating_sub(oldest.dropped);
         let presented = presented_total.saturating_sub(oldest.presented);
-        let over_budget = window_ms >= TIER_DROP_WINDOW_MS
-            && u128::from(dropped).saturating_mul(100)
-                > u128::from(presented).saturating_mul(TIER_DROP_BUDGET_PERCENT);
+        let in_window = match (oldest.renderer, renderer) {
+            (Some(a), Some(b)) => Some(RendererFrames {
+                skipped: b.skipped.saturating_sub(a.skipped),
+                drawn: b.drawn.saturating_sub(a.drawn),
+            }),
+            _ => None,
+        };
+        let video_over = window_ms >= TIER_DROP_WINDOW_MS && over_budget(dropped, presented);
         let cooled = self.last_drop_ms.map_or(true, |at| {
             now_ms.saturating_sub(at) >= TIER_DROP_COOLDOWN_MS
         });
@@ -1239,32 +1305,64 @@ impl TierDrop {
             Tier::Desktop => Tier::Tv,
             Tier::Tv | Tier::Low => Tier::Low,
         };
-        if !over_budget || !cooled || to == self.tier {
-            return None;
+        if !video_over || !cooled || to == self.tier {
+            return TierVerdict::Hold;
         }
-        let from = std::mem::replace(&mut self.tier, to);
-        self.last_drop_ms = Some(now_ms);
-        self.samples.clear();
-        Some(TierDropEvent {
-            from,
+        let event = TierDropEvent {
+            from: self.tier,
             to,
             dropped,
             presented,
             window_ms,
-        })
+            renderer: in_window,
+        };
+        // Each verdict ends the window and starts the cooldown, so a spared
+        // window is logged at most once per cooldown too.
+        self.last_drop_ms = Some(now_ms);
+        self.samples.clear();
+        // A renderer that counted no frames at all in the window tells us
+        // nothing (a stalled worker reads the same as an idle one), so the
+        // drop is charged to the video as if uncounted.
+        if let Some(r) = in_window.filter(|r| r.skipped.saturating_add(r.drawn) > 0) {
+            if !over_budget(r.skipped, r.skipped.saturating_add(r.drawn)) {
+                return TierVerdict::Spared(event);
+            }
+        }
+        self.tier = to;
+        TierVerdict::Drop(event)
     }
 }
 
 /// The log line for a tier drop and the numbers behind it.
 pub fn tier_drop_line(drop: &TierDropEvent) -> String {
     format!(
-        "pharos: subtitle tier drop from={} to={} reason=dropped_frames dropped={} presented={} window_ms={}",
+        "pharos: subtitle tier drop from={} to={} reason=dropped_frames dropped={} presented={} window_ms={}{}",
         drop.from.label(),
         drop.to.label(),
         drop.dropped,
         drop.presented,
         drop.window_ms,
+        renderer_fields(drop.renderer),
     )
+}
+
+/// The log line for a window whose dropped frames were the video's own, so
+/// the tier stayed (B667).
+pub fn tier_spared_line(spared: &TierDropEvent) -> String {
+    format!(
+        "pharos: subtitle tier kept tier={} reason=renderer_kept_up dropped={} presented={} window_ms={}{}",
+        spared.from.label(),
+        spared.dropped,
+        spared.presented,
+        spared.window_ms,
+        renderer_fields(spared.renderer),
+    )
+}
+
+fn renderer_fields(r: Option<RendererFrames>) -> String {
+    r.map_or(" renderer=uncounted".to_owned(), |r| {
+        format!(" renderer_skipped={} renderer_drawn={}", r.skipped, r.drawn)
+    })
 }
 
 /// The `rendererMode` client event for a tier drop, drawn by `renderer`.
@@ -3735,7 +3833,8 @@ mod tests {
                 to: Tier::Tv,
                 dropped: 120,
                 presented: 600,
-                window_ms: 10_000
+                window_ms: 10_000,
+                renderer: None,
             }
         );
     }
@@ -3815,6 +3914,102 @@ mod tests {
         assert!(run(Tier::Desktop, &totals).is_empty());
     }
 
+    /// `secs` samples of a renderer drawing 60 frames a second and skipping
+    /// `skip` of every 100.
+    fn renderer(secs: u64, skip: u64) -> Vec<RendererFrames> {
+        (0..=secs)
+            .map(|s| RendererFrames {
+                skipped: s * 60 * skip / 100,
+                drawn: s * 60 * (100 - skip) / 100,
+            })
+            .collect()
+    }
+
+    fn judge_all(video: &[(u64, u64)], frames: &[RendererFrames]) -> Vec<(u64, TierVerdict)> {
+        let mut td = TierDrop::new(Tier::Desktop);
+        video
+            .iter()
+            .zip(frames)
+            .enumerate()
+            .map(|(sec, ((d, p), r))| {
+                let sec = sec as u64;
+                (sec, td.judge(sec * 1000, *d, *p, Some(*r), true))
+            })
+            .filter(|(_, v)| *v != TierVerdict::Hold)
+            .collect()
+    }
+
+    /// B667: the counters `StyledSubtitles::frames` reads exist in the
+    /// vendored JASSUB, and its per-frame console callback is the one the
+    /// player silences. A JASSUB upgrade that renames them fails here.
+    #[test]
+    fn vendored_jassub_has_the_debug_counters_read() {
+        let js = include_str!("../../assets/vendor/jassub/jassub.js");
+        assert!(js.contains("droppedFrames=0;presentedFrames=0"));
+        assert!(js.contains("this.onsubtitleFrameCallback?.("));
+    }
+
+    /// B667: a renderer whose counters did not move is no evidence it kept up.
+    #[test]
+    fn a_renderer_that_counted_nothing_cannot_spare_the_tier() {
+        let idle: Vec<_> = (0..=45)
+            .map(|_| RendererFrames {
+                skipped: 0,
+                drawn: 0,
+            })
+            .collect();
+        let verdicts = judge_all(&stream(45, 9), &idle);
+        assert!(matches!(verdicts.first(), Some((10, TierVerdict::Drop(_)))));
+    }
+
+    /// B667: a video dropping 9% of its frames while the subtitle renderer
+    /// keeps up is the decoder's cost, not the effects': the tier stays, and
+    /// the spared window is reported once per cooldown.
+    #[test]
+    fn video_drops_the_renderer_kept_up_with_spare_the_tier() {
+        let verdicts = judge_all(&stream(45, 9), &renderer(45, 0));
+        let at: Vec<_> = verdicts
+            .iter()
+            .map(|(s, v)| (*s, matches!(v, TierVerdict::Spared(_))))
+            .collect();
+        assert_eq!(at, [(10, true), (40, true)]);
+        let TierVerdict::Spared(e) = verdicts[0].1 else {
+            unreachable!()
+        };
+        assert_eq!(
+            e.renderer,
+            Some(RendererFrames {
+                skipped: 0,
+                drawn: 600
+            })
+        );
+        let line = tier_spared_line(&e);
+        assert!(
+            line.contains("tier=desktop reason=renderer_kept_up"),
+            "{line}"
+        );
+        assert!(
+            line.contains("renderer_skipped=0 renderer_drawn=600"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn video_drops_with_a_busy_renderer_still_drop() {
+        let verdicts = judge_all(&stream(25, 9), &renderer(25, 10));
+        assert_eq!(verdicts.len(), 1);
+        let (sec, TierVerdict::Drop(e)) = verdicts[0] else {
+            unreachable!("{verdicts:?}")
+        };
+        assert_eq!((sec, e.to), (10, Tier::Tv));
+        assert!(tier_drop_line(&e).contains("renderer_skipped=60 renderer_drawn=540"));
+    }
+
+    #[test]
+    fn a_busy_renderer_alone_never_drops() {
+        assert!(judge_all(&stream(45, 1), &renderer(45, 50)).is_empty());
+    }
+
     /// B666: one over-budget window no longer caps a device for two weeks.
     #[test]
     fn a_remembered_cap_lasts_a_day() {
@@ -3846,6 +4041,7 @@ mod tests {
             dropped: 120,
             presented: 600,
             window_ms: 10_000,
+            renderer: None,
         }
     }
 
@@ -3853,7 +4049,7 @@ mod tests {
     fn the_tier_drop_log_line_names_the_measurement() {
         assert_eq!(
             tier_drop_line(&drop_event()),
-            "pharos: subtitle tier drop from=desktop to=tv reason=dropped_frames dropped=120 presented=600 window_ms=10000"
+            "pharos: subtitle tier drop from=desktop to=tv reason=dropped_frames dropped=120 presented=600 window_ms=10000 renderer=uncounted"
         );
     }
 

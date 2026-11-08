@@ -154,6 +154,13 @@ pub async fn video_metadata(_video_id: &str) {}
 
 pub struct StyledSubtitles;
 
+impl StyledSubtitles {
+    /// The renderer's frame counters; the host draws nothing.
+    pub fn frames(&self) -> Option<super::playback::RendererFrames> {
+        None
+    }
+}
+
 pub async fn styled_subtitles(
     _video_id: &str,
     _url: &str,
