@@ -1567,6 +1567,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // run in-process in crash-isolated workers; the fork/exec is amortised.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
+    state.image_tags_enforced = cfg.server.image_tags_enforced;
+    tracing::info!(
+        enforced = state.image_tags_enforced,
+        "image tag check for anonymous image requests (ADR-0073)"
+    );
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         let image_cache =
             ImageCache::new(cache_dir).with_seek_seconds(cfg.server.image_seek_seconds);

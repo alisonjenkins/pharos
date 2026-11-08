@@ -279,6 +279,15 @@ async fn serve_chapter_image(
     idx: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     let user = crate::api::jellyfin::optional_bearer(state, req, id_str, "image").await?;
+    check_anonymous_tag(
+        state,
+        user.as_ref(),
+        id_str,
+        "chapter",
+        idx,
+        requested_tag(req.query_string()),
+        ImageClient::of(req),
+    )?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     crate::api::jellyfin::require_item_access_if_signed_in(state, user.as_ref(), id, "image")
@@ -347,6 +356,8 @@ async fn get_image(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -367,6 +378,8 @@ async fn head_image(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -387,6 +400,8 @@ async fn get_image_indexed(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -407,6 +422,8 @@ async fn head_image_indexed(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -464,6 +481,8 @@ async fn serve_image(
     format: ImageFormat,
     req_width: Option<u32>,
     if_none_match: Option<&str>,
+    tag: Option<&str>,
+    client: ImageClient,
 ) -> Result<HttpResponse, actix_web::Error> {
     // B85 — accept the dashed synth/person id the kotlin SDK (Android TV) sends:
     // person + Series/Season image resolution below compares the raw id to the
@@ -524,6 +543,9 @@ async fn serve_image(
             );
         }
     }
+    // Past the person branch: portraits redirect to public provider URLs and
+    // are not tag-checked (ADR-0073).
+    check_anonymous_tag(state, user, id_str, image_type, index, tag, client)?;
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NotFound().body(""));
     };
@@ -1358,6 +1380,135 @@ impl ImageFormat {
     }
 }
 
+/// The `tag=` an image URL carries, as the client echoed it from a listing.
+fn requested_tag(qs: &str) -> Option<&str> {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("tag"))
+        .map(|(_, v)| v)
+}
+
+/// Which kind of client sent an anonymous image request, from its
+/// `User-Agent`: the `client` label of `pharos_image_tag_check_total`, so a
+/// lingering `invalid` or `absent` names the client to fix before
+/// enforcement (B286 was diagnosed from exactly this value). Buckets are the
+/// user agents seen in pharos's logs, 2026-11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageClient {
+    /// The Jellyfin Android app's image loader: `okhttp/4.x`.
+    Okhttp,
+    /// `jellyfin-sdk-kotlin` clients, e.g. `Jellyfin Android TV/0.19 via
+    /// jellyfin-sdk-kotlin (OkHttp/4.12.0)`.
+    JellyfinSdk,
+    /// A Chromecast receiver (`CrKey` in a Mozilla user agent).
+    Cast,
+    /// Any other `Mozilla/` user agent: a browser.
+    Browser,
+    /// A user agent none of the above match.
+    Other,
+    /// No `User-Agent` header.
+    None,
+}
+
+impl ImageClient {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Okhttp,
+        Self::JellyfinSdk,
+        Self::Cast,
+        Self::Browser,
+        Self::Other,
+        Self::None,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Okhttp => "okhttp",
+            Self::JellyfinSdk => "jellyfin_sdk",
+            Self::Cast => "cast",
+            Self::Browser => "browser",
+            Self::Other => "other",
+            Self::None => "none",
+        }
+    }
+
+    fn classify(ua: Option<&str>) -> Self {
+        let Some(ua) = ua else {
+            return Self::None;
+        };
+        let lower = ua.to_ascii_lowercase();
+        if lower.contains("jellyfin-sdk") {
+            Self::JellyfinSdk
+        } else if lower.starts_with("okhttp/") {
+            Self::Okhttp
+        } else if lower.contains("crkey") {
+            Self::Cast
+        } else if lower.starts_with("mozilla/") {
+            Self::Browser
+        } else {
+            Self::Other
+        }
+    }
+
+    fn of(req: &HttpRequest) -> Self {
+        Self::classify(
+            req.headers()
+                .get(actix_web::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+        )
+    }
+}
+
+/// ADR-0073 / V712 — an image request without a credential must carry a tag
+/// this server minted for that id and role. The verdict is counted on every
+/// anonymous request (`pharos_image_tag_check_total{verdict,enforced}`), and
+/// only refused when `[server].image_tags_enforced` is on, so the rollout
+/// can be read before it can break a client. A signed-in request is already
+/// checked against the user's library access (V189) and skips this.
+fn check_anonymous_tag(
+    state: &AppState,
+    user: Option<&pharos_core::User>,
+    id_str: &str,
+    role: &str,
+    index: u32,
+    tag: Option<&str>,
+    client: ImageClient,
+) -> Result<(), actix_web::Error> {
+    use pharos_jellyfin_api::image_tag_sig::{indexed_role, TagVerdict};
+    if user.is_some() {
+        return Ok(());
+    }
+    let role = indexed_role(&role.to_ascii_lowercase(), index as usize);
+    let role = role.as_str();
+    let verdict = state.image_tag_key.verify(id_str, role, tag);
+    let enforced = state.image_tags_enforced;
+    metrics::counter!(
+        "pharos_image_tag_check_total",
+        "verdict" => verdict.label(),
+        "enforced" => if enforced { "true" } else { "false" },
+        "client" => client.label(),
+    )
+    .increment(1);
+    if verdict == TagVerdict::Valid {
+        return Ok(());
+    }
+    // Debug, not warn: before enforcement every pre-ADR-0073 cached tag lands
+    // here, once per poster. The counter is the signal; this names the value.
+    tracing::debug!(
+        verdict = verdict.label(),
+        enforced,
+        item = id_str,
+        role,
+        tag_len = tag.map_or(0, str::len),
+        client = client.label(),
+        "anonymous image request without a valid tag"
+    );
+    if enforced {
+        return Err(error::ErrorUnauthorized("image tag required"));
+    }
+    Ok(())
+}
+
 fn parse_image_format(qs: &str) -> ImageFormat {
     for kv in qs.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -1744,6 +1895,133 @@ mod tests {
             cookie.status(),
             401,
             "JellyfinAuth cookie must authenticate"
+        );
+    }
+
+    /// ADR-0073 / V712 — with enforcement on, an anonymous request needs a
+    /// tag this server minted for that id and role; a signed-in one does not.
+    /// The verdict is counted for every anonymous request either way.
+    #[actix_web::test]
+    async fn an_enforced_anonymous_image_needs_a_keyed_tag() {
+        let _ = crate::obs::init("info", None);
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let mut st = crate::state::AppState::new(stores, "t".into());
+        st.image_tags_enforced = true;
+        let state = web::Data::new(st);
+        let good = state
+            .image_tag_key
+            .sign("abc", "primary", "0123456789abcdef");
+        let other_role = state
+            .image_tag_key
+            .sign("abc", "backdrop", "0123456789abcdef");
+        let state_key = state.image_tag_key.clone();
+        let token = token_for(&state.stores).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let status = |uri: String| {
+            let req = test::TestRequest::get().uri(&uri).to_request();
+            test::call_service(&app, req)
+        };
+        let base = "/items/abc/images/primary";
+        assert_eq!(status(base.into()).await.status(), 401, "no tag");
+        assert_eq!(
+            status(format!("{base}?tag=0123456789abcdef"))
+                .await
+                .status(),
+            401,
+            "unkeyed pre-ADR-0073 tag"
+        );
+        assert_eq!(
+            status(format!("{base}?tag={other_role}")).await.status(),
+            401,
+            "a tag minted for another role"
+        );
+        assert_ne!(
+            status(format!("{base}?fillWidth=240&Tag={good}"))
+                .await
+                .status(),
+            401,
+            "a keyed tag authorises its own image"
+        );
+        let backdrop_1 = state_key.sign("abc", "backdrop/1", "0123456789abcdef");
+        assert_eq!(
+            status(format!("/items/abc/images/backdrop/1?tag={other_role}"))
+                .await
+                .status(),
+            401,
+            "backdrop 0's tag must not authorise backdrop 1"
+        );
+        assert_ne!(
+            status(format!("/items/abc/images/backdrop/1?tag={backdrop_1}"))
+                .await
+                .status(),
+            401,
+            "backdrop 1's own tag authorises it"
+        );
+        assert_ne!(
+            status(format!("{base}?api_key={token}")).await.status(),
+            401,
+            "a signed-in request needs no tag"
+        );
+        let rendered = crate::obs::render();
+        for verdict in ["valid", "invalid", "absent"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|l| l.starts_with("pharos_image_tag_check_total{")
+                        && l.contains(&format!(r#"verdict="{verdict}""#))
+                        && l.contains(r#"enforced="true""#)),
+                "verdict {verdict} must be counted:\n{rendered}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn image_client_labels_are_distinct_and_classify_seen_agents() {
+        let mut labels: Vec<_> = ImageClient::ALL.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), ImageClient::ALL.len());
+        for (ua, want) in [
+            (Some("okhttp/4.12.0"), ImageClient::Okhttp),
+            (
+                Some("Jellyfin Android TV/0.19.10 via jellyfin-sdk-kotlin (OkHttp/4.12.0)"),
+                ImageClient::JellyfinSdk,
+            ),
+            (
+                Some("Mozilla/5.0 (X11; Linux armv7l) CrKey/1.56.500000"),
+                ImageClient::Cast,
+            ),
+            (
+                Some("Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0"),
+                ImageClient::Browser,
+            ),
+            (Some("curl/8.0"), ImageClient::Other),
+            (None, ImageClient::None),
+        ] {
+            assert_eq!(ImageClient::classify(ua), want, "{ua:?}");
+        }
+    }
+
+    /// Before enforcement is switched on, a bad tag is counted and served.
+    #[actix_web::test]
+    async fn an_unenforced_bad_tag_is_counted_and_served() {
+        let _ = crate::obs::init("info", None);
+        let state = seed_state().await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/abc/images/primary?tag=0123456789abcdef")
+            .insert_header(("User-Agent", "okhttp/4.12.0"))
+            .to_request();
+        assert_ne!(test::call_service(&app, req).await.status(), 401);
+        let rendered = crate::obs::render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("pharos_image_tag_check_total{")
+                    && l.contains(r#"verdict="invalid""#)
+                    && l.contains(r#"enforced="false""#)
+                    && l.contains(r#"client="okhttp""#)),
+            "{rendered}"
         );
     }
 

@@ -87,6 +87,10 @@ config:
     # Caches live under the cache volume (see persistence.cache).
     imageCacheDir: "/var/lib/pharos/cache/images"
     imageSeekSeconds: 30
+    # ADR-0073: refuse an anonymous image request whose tag= this server did
+    # not mint. Turn on once pharos_image_tag_check_total{verdict=~"invalid|absent"}
+    # has gone quiet; until then the verdict is only counted.
+    imageTagsEnforced: false
     # Soft cap (bytes) on the extracted-image cache; 0 = unbounded. A periodic
     # janitor evicts oldest-first once exceeded. Set it on large libraries so
     # posters/backdrops/thumbs can't slowly fill the shared cache volume.
