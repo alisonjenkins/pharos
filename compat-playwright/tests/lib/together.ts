@@ -166,7 +166,13 @@ export async function startGroup(
   request: APIRequestContext,
   open: { context: BrowserContext; page: Page }[],
   file: string,
-  opts: { subtitled?: boolean; accounts?: [Account, Account]; pausedBeforeJoin?: boolean } = {},
+  opts: {
+    subtitled?: boolean;
+    accounts?: [Account, Account];
+    pausedBeforeJoin?: boolean;
+    /** Keep each page's sockets, so `dropConnections` can close them. */
+    trackSockets?: boolean;
+  } = {},
 ) {
   const [asA, asB] = opts.accounts ?? [SEEDED, SEEDED];
   const { api, movie, nativeId } = await seededMovie(request, file);
@@ -193,6 +199,9 @@ export async function startGroup(
   const b = await signIn(browser, "B", asB);
   open.push(b);
   const logs = () => [...a.lines, ...b.lines].join("\n");
+  if (opts.trackSockets) {
+    for (const p of [a.page, b.page]) await p.addInitScript(keepSockets);
+  }
   // Groups another test or an earlier try left are not A's.
   const before = new Set(await listedGroups(request, api));
 
@@ -240,6 +249,51 @@ export async function startGroup(
   }
   const people = [new Member("A", a.page), new Member("B", b.page)];
   return { a, b, people, logs, groupId };
+}
+
+/** Wraps `WebSocket` so a test can reach the page's sockets. */
+function keepSockets() {
+  const sockets: WebSocket[] = [];
+  (window as unknown as { __sockets: WebSocket[] }).__sockets = sockets;
+  const Native = window.WebSocket;
+  window.WebSocket = class extends Native {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+      sockets.push(this);
+    }
+  } as typeof WebSocket;
+}
+
+/**
+ * Closes every open socket of `page` (started with `trackSockets`), as a
+ * server restart or a network drop does, and waits for the app to open a
+ * new one and settle on it.
+ */
+export async function dropConnections(page: Page) {
+  const sockets = () =>
+    page.evaluate(() => {
+      const all = (window as unknown as { __sockets?: WebSocket[] }).__sockets ?? [];
+      return {
+        total: all.length,
+        open: all.filter((s) => s.readyState === WebSocket.OPEN).length,
+      };
+    });
+  const before = await sockets();
+  expect(before.open, "the page has an open socket to drop").toBeGreaterThan(0);
+  await page.evaluate(() => {
+    for (const s of (window as unknown as { __sockets: WebSocket[] }).__sockets) {
+      if (s.readyState === WebSocket.OPEN) s.close();
+    }
+  });
+  await expect
+    .poll(async () => {
+      const now = await sockets();
+      return now.total > before.total && now.open > 0;
+    }, { message: "the page opens a new socket", timeout: 20_000 })
+    .toBe(true);
+  await expect(page.getByText("Connection lost. Reconnecting…")).toHaveCount(0, {
+    timeout: 15_000,
+  });
 }
 
 /** A failed step's error: its message, both pages' text and the browser logs. */

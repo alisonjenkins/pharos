@@ -9,6 +9,7 @@ import {
   settledClientEvents,
 } from "../lib/client-events";
 import {
+  dropConnections,
   Member,
   OPTED_IN_A,
   OPTED_IN_B,
@@ -551,6 +552,77 @@ test.describe("pharos Dioxus UI watch together", () => {
       // Still in step, and still one group: a pause from B reaches A.
       await toggleUntil(byB, true);
       await assertPausedAll(people);
+    } catch (e) {
+      throw await failure(e, a, b, logs);
+    }
+  });
+
+  // B894: a deploy closes every member's connection. Each tab reconnects and
+  // joins its group again over the new one; before that fix both tabs stayed
+  // shown in the group with a dead membership, so the next episode reached
+  // only the member who chose it and nothing synced after (2026-11-08).
+  test("after both connections drop, an episode change and its end still move the whole group", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(240_000);
+    const episode = (n: number) => `/Playwright Show - S01E0${n}.webm`;
+    const { a, b, people, logs } = await startGroup(browser, request, open, episode(1), {
+      accounts: [OPTED_IN_A, OPTED_IN_B],
+      trackSockets: true,
+    });
+    const [byA, byB] = people;
+    const [e2, e3] = await Promise.all(
+      [2, 3].map(async (n) => (await seededMovie(request, episode(n))).nativeId),
+    );
+    const onEpisode = async (id: string, why: string) => {
+      for (const p of [a.page, b.page]) {
+        await expect(p, why).toHaveURL(new RegExp(`/ui/watch/${id}$`), { timeout: 15_000 });
+        await expect(p.locator(".pharos-member-list li"), why).toHaveCount(2, {
+          timeout: 15_000,
+        });
+      }
+      await waitUntilInSync(people);
+    };
+    try {
+      await waitUntilInSync(people);
+
+      await Promise.all([dropConnections(a.page), dropConnections(b.page)]);
+      for (const [label, lines] of [
+        ["A", a.lines],
+        ["B", b.lines],
+      ] as const) {
+        await expect
+          .poll(() => lines.join("\n"), {
+            message: `${label} joins its group again over the new connection`,
+            timeout: 30_000,
+          })
+          .toMatch(/pharos: group rejoined reason=reconnect/);
+      }
+      await waitUntilInSync(people);
+
+      // A skips forward: both land on episode 2 and play it together.
+      let moves = await moveCounts(request);
+      await byA.page.mouse.move(200, 200);
+      await byA.page.getByRole("button", { name: "Next episode", exact: true }).click();
+      await onEpisode(e2, "A's next episode after the drop brings both to episode 2");
+      expect(await movesSince(request, moves), "one group move").toEqual({ moved: 1, stale: 0 });
+
+      // B's pause and seek still reach A.
+      await toggleUntil(byB, true);
+      await assertPausedAll(people);
+      await seekTo(byB, 0.4);
+      await assertSeekConverged(people, (await byB.probe()).currentTime * 1000);
+      await assertPausedAll(people);
+
+      // Played to its end, episode 2 moves both on to episode 3 once.
+      await toggleUntil(byB, false);
+      await waitUntilInSync(people);
+      moves = await moveCounts(request);
+      await seekTo(byA, 0.97);
+      await onEpisode(e3, "episode 2's end brings both to episode 3");
+      const ended = await movesSince(request, moves);
+      expect(ended.moved, `the end moves the group once: ${JSON.stringify(ended)}`).toBe(1);
     } catch (e) {
       throw await failure(e, a, b, logs);
     }
