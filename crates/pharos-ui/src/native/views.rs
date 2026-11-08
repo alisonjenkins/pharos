@@ -243,6 +243,9 @@ pub fn Crumbs(trail: Vec<Item>) -> Element {
     }
 }
 
+/// The id of the sign-in form's name field, which has the focus on arrival.
+pub const SIGNIN_NAME: &str = "signin-name";
+
 #[component]
 pub fn SignInView(
     error: Option<String>,
@@ -251,6 +254,9 @@ pub fn SignInView(
 ) -> Element {
     let mut name = use_signal(String::new);
     let mut password = use_signal(String::new);
+    // The name field takes the focus on arrival, so a keyboard or a TV
+    // remote types at once (B827).
+    use_effect(|| platform::focus_by_id(SIGNIN_NAME));
     rsx! {
         div { class: "pharos-app",
             header { class: "pharos-banner", Brand {} }
@@ -264,7 +270,7 @@ pub fn SignInView(
                 label {
                     "Name"
                     input {
-                        id: "signin-name",
+                        id: SIGNIN_NAME,
                         name: "name",
                         autocomplete: "username",
                         autocapitalize: "none",
@@ -1970,6 +1976,14 @@ mod tests {
         });
         assert!(html.contains("Wrong name or password."), "{html}");
         assert!(html.contains("Signing in…"), "{html}");
+    }
+
+    /// B827: the field that takes the focus on arrival is the name field.
+    #[test]
+    fn the_sign_in_focus_goes_to_the_name_field() {
+        let html = render(|| rsx! { SignInView { error: None, busy: false, on_submit: |_| {} } });
+        assert!(html.contains(&format!(r#"id="{SIGNIN_NAME}""#)), "{html}");
+        assert_eq!(SIGNIN_NAME, "signin-name");
     }
 
     /// A phone keyboard would capitalise or "correct" the name, and the
