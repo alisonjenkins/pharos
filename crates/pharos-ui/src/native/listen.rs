@@ -379,6 +379,7 @@ pub fn ListenView(
                         onplaying: {
                             let tap = tap.clone();
                             move |_| {
+                                platform::wake_media_tap(media_id);
                                 tap.connect(media_id);
                                 on_media.call(MediaEvent::Playing);
                             }
