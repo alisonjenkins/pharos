@@ -216,7 +216,7 @@ async fn connect_until_up(base: &str, qc: &mut QuickConnect) -> (bootstrap::Clie
     loop {
         match connect(base).await {
             Ok((client, system, closed)) => {
-                tokio::task::spawn_local(system);
+                dioxus::core::spawn_forever(system);
                 return (client, closed);
             }
             Err(e) => {
@@ -453,8 +453,8 @@ pub struct SignedIn {
 /// until someone approves it. Runs until approved (drop the future to
 /// cancel); a server address that is not `https://` is an error at once. The server closes a socket not signed in within 30 s, so this
 /// reconnects, with backoff, only once the socket has closed; a code that
-/// expires (`notFound`) is replaced by a new one. Must run inside a
-/// `LocalSet`, which drives the connection.
+/// expires (`notFound`) is replaced by a new one. Must run on the Dioxus
+/// runtime, which drives the connection.
 pub async fn quick_connect_sign_in(
     base: &str,
     info: &CallInfo,
