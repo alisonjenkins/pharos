@@ -1562,6 +1562,14 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
 /// WebView cuts a ranged request's answer out of the whole body itself, so
 /// the proxy fetches and answers whole.
 const PASSED_ON: [&str; 2] = ["accept", "if-none-match"];
+/// How long the proxy waits for the server before answering 503.
+///
+/// wry blocks the WebView's request thread on our answer for at most 10 s
+/// and then panics (`recv_timeout(..).unwrap()` in wry's android module),
+/// which wedges the app. A first transcoded segment, a resume point deep
+/// into a title in particular, can take the server longer than that. A 503
+/// instead is an ordinary load error that hls.js retries.
+const PROXY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 /// The response headers passed back to the page.
 const PASSED_BACK: [&str; 4] = ["content-type", "cache-control", "etag", "last-modified"];
 
@@ -1638,7 +1646,10 @@ pub fn use_server_proxy() {
                 .collect();
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
-                let response = match fetch_server(&path, &headers).await {
+                let fetched = tokio::time::timeout(PROXY_DEADLINE, fetch_server(&path, &headers))
+                    .await
+                    .unwrap_or_else(|_| Err(String::from("timed out")));
+                let response = match fetched {
                     Ok((status, back, body)) => {
                         let mut builder = dioxus::mobile::wry::http::Response::builder()
                             .status(status)
@@ -1654,16 +1665,25 @@ pub fn use_server_proxy() {
                         builder.body(body)
                     }
                     Err(e) => {
-                        log::warn!("pharos: proxy failed path_len={} error={e}", path.len());
+                        log::warn!(
+                            "pharos: proxy failed path_len={} ms={} error={e}",
+                            path.len(),
+                            started.elapsed().as_millis()
+                        );
                         dioxus::mobile::wry::http::Response::builder()
-                            .status(502)
+                            .status(503)
+                            .header("retry-after", "1")
                             .body(e.into_bytes())
                     }
                 };
-                match response {
-                    Ok(response) => responder.respond(response),
-                    Err(e) => log::warn!("pharos: proxy response build failed error={e}"),
-                }
+                // Always answer: a dropped responder panics in wry too.
+                let response = response.unwrap_or_else(|e| {
+                    log::warn!("pharos: proxy response build failed error={e}");
+                    let mut fallback = dioxus::mobile::wry::http::Response::new(Vec::new());
+                    *fallback.status_mut() = dioxus::mobile::wry::http::StatusCode::BAD_GATEWAY;
+                    fallback
+                });
+                responder.respond(response);
             });
         });
     }
