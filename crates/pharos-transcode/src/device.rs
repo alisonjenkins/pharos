@@ -206,6 +206,29 @@ pub struct DeviceSlot {
     /// client's `immutable` init whenever a driver upgrade added a decode
     /// block.
     decodable: Option<SmallVec<[crate::options::SourceCodec; 6]>>,
+    /// Whether a trial proved the GPU HDR tonemap route (ADR-0072) runs on this
+    /// device. Like `decodable`, deliberately NOT in
+    /// [`DeviceTable::placement_fingerprint`]: the encoder and its input format
+    /// are the same on both routes, so flipping it must not wipe the segment
+    /// cache.
+    gpu_tonemap: GpuTonemapCapability,
+}
+
+/// The verdict of the GPU tonemap trial for one device (ADR-0072).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuTonemapCapability {
+    /// No trial ran. Treated as incapable: the route needs Vulkan, libplacebo
+    /// and a matching ICD, none of which can be assumed.
+    #[default]
+    NotProbed,
+    Capable,
+    Incapable,
+}
+
+impl GpuTonemapCapability {
+    pub const fn is_capable(self) -> bool {
+        matches!(self, Self::Capable)
+    }
 }
 
 impl DeviceSlot {
@@ -220,6 +243,7 @@ impl DeviceSlot {
             capacity: permits,
             weight: weight.max(1),
             decodable: None,
+            gpu_tonemap: GpuTonemapCapability::NotProbed,
         }
     }
 
@@ -544,6 +568,23 @@ impl DeviceTable {
         }
     }
 
+    /// Record the GPU tonemap trial's verdict for `device`. An unknown device is
+    /// ignored, as in [`DeviceTable::set_decodable`].
+    pub fn set_gpu_tonemap(&mut self, device: DeviceId, verdict: GpuTonemapCapability) {
+        if let Some(slot) = self.slots.iter_mut().find(|s| s.id == device) {
+            slot.gpu_tonemap = verdict;
+        }
+    }
+
+    /// May an HDR job placed on `device` take the GPU tonemap route? Only a
+    /// trial that passed says yes; a device that was never probed says no.
+    pub fn may_gpu_tonemap(&self, device: DeviceId) -> bool {
+        self.slots
+            .iter()
+            .find(|s| s.id == device)
+            .is_some_and(|s| s.gpu_tonemap.is_capable())
+    }
+
     /// May a job whose SOURCE is `codec` offload its decode to `device`?
     ///
     /// This is the one place the question is answered, and it answers `false`
@@ -650,6 +691,27 @@ mod tests {
         assert!(!t.may_offload_decode(DeviceId::Cpu, Some(SourceCodec::H264)));
         // A device that is not in the table cannot be offloaded to either.
         assert!(!t.may_offload_decode(DeviceId::hw(HwAccel::Vaapi, 0), Some(SourceCodec::H264)));
+    }
+
+    #[test]
+    fn gpu_tonemap_needs_a_passed_trial_and_stays_out_of_the_cache_generation() {
+        let gpu = DeviceId::hw(HwAccel::Vaapi, 0);
+        let other = DeviceId::hw(HwAccel::Vaapi, 1);
+        let mut t = DeviceTable::from_probe(&[(gpu, 4), (other, 4)], 2);
+        assert!(!t.may_gpu_tonemap(gpu), "never probed reads as incapable");
+        let before = t.placement_fingerprint();
+
+        t.set_gpu_tonemap(gpu, GpuTonemapCapability::Capable);
+        t.set_gpu_tonemap(other, GpuTonemapCapability::Incapable);
+        assert!(t.may_gpu_tonemap(gpu));
+        assert!(!t.may_gpu_tonemap(other));
+        assert!(!t.may_gpu_tonemap(DeviceId::Cpu));
+        assert!(!t.may_gpu_tonemap(DeviceId::hw(HwAccel::Vaapi, 7)));
+        assert_eq!(
+            t.placement_fingerprint(),
+            before,
+            "a capability flip must not move the HLS cache generation"
+        );
     }
 
     /// `Some(empty)` is a real answer and `None` is not an answer at all. Left
