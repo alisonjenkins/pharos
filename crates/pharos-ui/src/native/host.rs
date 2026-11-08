@@ -91,6 +91,11 @@ pub fn can_reload() -> bool {
     true
 }
 
+/// The page draws its own mute button and volume slider.
+pub fn owns_volume() -> bool {
+    true
+}
+
 /// Quick Connect sign-in is the TV's: a browser has a keyboard.
 pub fn offers_quick_connect() -> bool {
     false
