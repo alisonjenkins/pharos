@@ -2861,6 +2861,8 @@ extern "C" {
     fn ready(this: &Jassub) -> js_sys::Promise;
     #[wasm_bindgen(method, js_class = "JASSUB")]
     fn destroy(this: &Jassub) -> js_sys::Promise;
+    #[wasm_bindgen(method, getter, js_class = "JASSUB")]
+    fn debug(this: &Jassub) -> JsValue;
 }
 
 /// An ASS/SSA script drawn over the `<video>` by libass in a worker. It
@@ -2869,6 +2871,26 @@ extern "C" {
 pub struct StyledSubtitles {
     jassub: Jassub,
     live: Rc<std::cell::Cell<bool>>,
+}
+
+impl StyledSubtitles {
+    /// JASSUB's own running frame counters: frames it skipped because it was
+    /// still drawing the last one, and frames it drew. `None` when its debug
+    /// counters are missing, as in a JASSUB without them.
+    pub fn frames(&self) -> Option<super::playback::RendererFrames> {
+        let debug = self.jassub.debug();
+        let count = |key: &str| {
+            js_sys::Reflect::get(&debug, &JsValue::from_str(key))
+                .ok()?
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        };
+        Some(super::playback::RendererFrames {
+            skipped: count("droppedFrames")?,
+            drawn: count("presentedFrames")?,
+        })
+    }
 }
 
 impl Drop for StyledSubtitles {
@@ -2966,7 +2988,19 @@ pub async fn styled_subtitles(
     )?;
     // Not the Local Font Access API: it asks the viewer for a permission.
     set(&options, "queryFonts", &JsValue::FALSE)?;
+    // Its debug counters say how many frames it skipped while busy, which is
+    // how a tier drop tells the renderer's cost from the video's (B667).
+    set(&options, "debug", &JsValue::TRUE)?;
     let jassub = Jassub::new(&options).map_err(|e| format!("{e:?}"))?;
+    // Counting only: its default per-frame console line would flood the log.
+    let debug = jassub.debug();
+    if debug.is_object() {
+        let _ = js_sys::Reflect::set(
+            &debug,
+            &JsValue::from_str("onsubtitleFrameCallback"),
+            &JsValue::UNDEFINED,
+        );
+    }
     let live = Rc::new(std::cell::Cell::new(true));
     let ready = wasm_bindgen_futures::JsFuture::from(jassub.ready());
     spawn_detached({
