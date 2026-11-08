@@ -62,6 +62,15 @@ grep -q 'android:banner="@drawable/pharos_banner"' "$main_dir/AndroidManifest.xm
   echo "android-apk: could not point the manifest banner at pharos_banner" >&2
   exit 1
 }
+# dx writes versionCode 1 every build. The Google TV launcher keeps an app's
+# label until its versionCode rises (a reinstall or reboot does not refresh
+# it), so count minutes since 2026-01-01 UTC: every build installs as newer.
+version_code=${PHAROS_ANDROID_VERSION_CODE:-$((($(date -u +%s) - 1767225600) / 60))}
+sed -i "s/versionCode = [0-9]*/versionCode = $version_code/" "$gradle_root/app/build.gradle.kts"
+grep -q "versionCode = $version_code" "$gradle_root/app/build.gradle.kts" || {
+  echo "android-apk: could not set versionCode $version_code" >&2
+  exit 1
+}
 apk_dir=$gradle_root/app/build/outputs/apk
 rm -rf "$apk_dir"
 # dx runs assembleRelease only when [bundle.android] signing is configured,
