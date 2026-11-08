@@ -70,6 +70,18 @@ body {
   max-width: 320px;
   margin: 4rem auto;
 }
+/* The TV's Quick Connect code, readable from the sofa. */
+.pharos-quick-connect h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.pharos-quick-connect-code {
+  margin: 0;
+  font-size: 2.5rem;
+  font-weight: 700;
+  letter-spacing: 0.3em;
+  font-variant-numeric: tabular-nums;
+}
 .pharos-login label {
   display: grid;
   gap: 0.25rem;
