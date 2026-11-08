@@ -229,6 +229,23 @@ impl Planner {
         }
     }
 
+    /// The track moves to another rendition on the same segment grid (a quality
+    /// switch): its init is fetched again before the next media segment, and
+    /// what is already buffered stays. Refused (`false`) while a request is in
+    /// flight, so a segment of the old rendition never lands after the new
+    /// init, and once the last segment is appended, since nothing is left to
+    /// fetch at the new quality.
+    pub fn reinit(&mut self, track: Track) -> bool {
+        let Some(state) = self.track_mut(track) else {
+            return false;
+        };
+        if state.in_flight.is_some() || state.last_appended {
+            return false;
+        }
+        state.needs_init = true;
+        true
+    }
+
     /// The request failed or was aborted; the segment is fetched again on a later tick.
     pub fn failed(&mut self, track: Track) {
         if let Some(state) = self.track_mut(track) {
@@ -550,6 +567,61 @@ mod tests {
                 min_forward_ms: 8_000,
             }
         );
+    }
+
+    #[test]
+    fn reinit_fetches_the_init_again_before_the_next_segment() {
+        let segs = make_segments(&[6_000, 6_000, 6_000]);
+        let mut planner = Planner::new(segs, true, None, Config::default(), 0);
+        let mut buffered = Buffered::default();
+        assert_eq!(
+            planner.tick(0, &buffered),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        planner.appended(Track::Video);
+        assert_eq!(
+            planner.tick(0, &buffered),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 0
+            }]
+        );
+        assert!(
+            !planner.reinit(Track::Video),
+            "refused with a segment in flight"
+        );
+        planner.appended(Track::Video);
+        buffered.video = vec![(0, 6_000)];
+
+        assert!(planner.reinit(Track::Video));
+        assert_eq!(
+            planner.tick(0, &buffered),
+            vec![Action::FetchInit {
+                track: Track::Video
+            }]
+        );
+        planner.appended(Track::Video);
+        assert_eq!(
+            planner.tick(0, &buffered),
+            vec![Action::Fetch {
+                track: Track::Video,
+                index: 1
+            }],
+            "the buffered segment stays; fetching carries on after it"
+        );
+    }
+
+    #[test]
+    fn reinit_is_refused_after_the_last_segment_and_for_a_missing_track() {
+        let segs = make_segments(&[6_000]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 0);
+        let buffered = Buffered::default();
+        assert!(!planner.reinit(Track::Audio), "no audio track");
+        let _ = planner.tick(0, &buffered);
+        planner.appended(Track::Video);
+        assert!(!planner.reinit(Track::Video), "nothing left to fetch");
     }
 
     #[test]
