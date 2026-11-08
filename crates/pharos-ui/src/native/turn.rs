@@ -1,8 +1,10 @@
 //! The episode turn (V790): a cube turn from the episode on screen to the
-//! next, or onto the episode being opened, that follows the load. The click
-//! turns the new face most of the way in at once; each loading step that
-//! completes turns it a little further; the first frame lands it flat. Pure
-//! rules here, so they test on the host; the layer itself is `turn_web.rs`.
+//! next, or onto the episode being opened. The click turns the new face all
+//! the way in, in one unbroken move whatever the load is doing (B841); the
+//! load shows on the face as a bar that each real loading step fills, and
+//! the face fades into the video once both the turn and the first frame are
+//! done. Pure rules here, so they test on the host; the layer itself is
+//! `turn_web.rs`.
 
 use std::cell::Cell;
 
@@ -67,26 +69,12 @@ pub enum Step {
 /// The angle the face starts at, edge-on like a cube's next side.
 pub const START_DEG: f64 = 90.0;
 
-/// The angle the click turns the face to. Most of the turn happens at once,
-/// so the press shows; a slow load then waits at a modest angle rather than
-/// a steep one that reads as broken.
-const CLICKED_DEG: f64 = 30.0;
-const NEGOTIATED_DEG: f64 = 22.0;
-const METADATA_DEG: f64 = 15.0;
-/// Buffering turns the face from [`METADATA_DEG`] down to this as
-/// [`BUFFER_FULL_MS`] of media comes in.
-const BUFFERED_MIN_DEG: f64 = 8.0;
-/// About what a player buffers before its first frame; only a scale for the
-/// angle, never shown as a number.
-const BUFFER_FULL_MS: u32 = 3_000;
-
-/// How long the click's first move takes.
-pub const FIRST_MOVE_MS: u32 = 420;
-/// How long each later loading step's move takes.
-pub const STEP_MS: u32 = 380;
-/// How long the landing, and the old episode's turn away, take: long enough
-/// to notice (Alison found 220-300 ms too quick to see).
-pub const LAND_MS: u32 = 650;
+/// How long the whole turn takes, the old episode's face turning away with
+/// it: long enough to notice (Alison found 220-300 ms too quick to see), and
+/// never held part way, which read as a jarring stop (B841).
+pub const TURN_MS: u32 = 650;
+/// How long the landed face takes to fade into the video.
+pub const FADE_MS: u32 = 350;
 /// A turn with no first frame by then is given up, so it never hides a
 /// player that has stalled or failed.
 pub const GIVE_UP_MS: u32 = 30_000;
@@ -95,18 +83,27 @@ const CAPTION_AFTER_MS: u32 = 2_500;
 /// No step for this long reads as a stall.
 const STALLED_AFTER_MS: u32 = 6_000;
 
-/// The face's angle, in degrees, once `step` has been heard. Never rises
-/// again: [`Turn::hear`] keeps the smallest.
-pub fn angle(step: Step) -> f64 {
+const NEGOTIATED_DONE: f64 = 0.35;
+const METADATA_DONE: f64 = 0.55;
+/// Buffering fills the bar from [`METADATA_DONE`] up to this as
+/// [`BUFFER_FULL_MS`] of media comes in; only the first frame fills it.
+const BUFFERED_MAX_DONE: f64 = 0.9;
+/// About what a player buffers before its first frame; only a scale for the
+/// bar, never shown as a number.
+const BUFFER_FULL_MS: u32 = 3_000;
+
+/// How full the face's loading bar is, 0 to 1, once `step` has been heard.
+/// Never falls again: [`Turn::hear`] keeps the largest.
+pub fn progress(step: Step) -> f64 {
     match step {
-        Step::Clicked => CLICKED_DEG,
-        Step::Negotiated => NEGOTIATED_DEG,
-        Step::Metadata => METADATA_DEG,
+        Step::Clicked => 0.0,
+        Step::Negotiated => NEGOTIATED_DONE,
+        Step::Metadata => METADATA_DONE,
         Step::Buffered(ms) => {
             let filled = f64::from(ms.min(BUFFER_FULL_MS)) / f64::from(BUFFER_FULL_MS);
-            METADATA_DEG - (METADATA_DEG - BUFFERED_MIN_DEG) * filled
+            METADATA_DONE + (BUFFERED_MAX_DONE - METADATA_DONE) * filled
         }
-        Step::FirstFrame => 0.0,
+        Step::FirstFrame => 1.0,
     }
 }
 
@@ -167,11 +164,12 @@ impl Turn {
         }
     }
 
-    /// Take `step` if it moves the face further in; returns the angle to
-    /// turn to, or `None` when it changes nothing (a late or repeated event).
+    /// Take `step` if it moves the load further on; returns how full the
+    /// bar now is, or `None` when it changes nothing (a late or repeated
+    /// event).
     pub fn hear(&mut self, step: Step, now_ms: f64) -> Option<f64> {
-        let to = angle(step);
-        if to >= angle(self.step) {
+        let to = progress(step);
+        if to <= progress(self.step) {
             return None;
         }
         self.step = step;
@@ -185,6 +183,18 @@ impl Turn {
             elapsed(self.begun_ms, now_ms),
             elapsed(self.stepped_ms, now_ms),
         )
+    }
+
+    /// Whether the turn's one move is over, so the face is flat.
+    pub fn turned(&self, now_ms: f64) -> bool {
+        elapsed(self.begun_ms, now_ms) >= TURN_MS
+    }
+
+    /// Whether the face fades into the video now: only once it is flat and
+    /// the first frame is in, so a quick load never cuts the turn short and
+    /// a slow one never stops it part way.
+    pub fn fades(&self, now_ms: f64) -> bool {
+        self.step == Step::FirstFrame && self.turned(now_ms)
     }
 
     pub fn given_up(&self, now_ms: f64) -> bool {
@@ -241,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn each_step_turns_the_face_further_in_and_the_first_frame_lands_it() {
+    fn each_step_fills_the_bar_further_and_only_the_first_frame_fills_it() {
         let steps = [
             Step::Clicked,
             Step::Negotiated,
@@ -250,32 +260,52 @@ mod tests {
             Step::Buffered(3_000),
             Step::FirstFrame,
         ];
-        let angles: Vec<f64> = steps.iter().map(|&s| angle(s)).collect();
-        assert!(angles.windows(2).all(|w| w[0] > w[1]), "{angles:?}");
-        assert!(angle(Step::Clicked) < START_DEG);
-        assert_eq!(angle(Step::FirstFrame), 0.0);
-        // A slow load waits at a modest angle, never a steep one.
-        assert!(angle(Step::Clicked) <= 30.0);
+        let done: Vec<f64> = steps.iter().map(|&s| progress(s)).collect();
+        assert!(done.windows(2).all(|w| w[0] < w[1]), "{done:?}");
+        assert_eq!(progress(Step::Clicked), 0.0);
+        assert_eq!(progress(Step::FirstFrame), 1.0);
     }
 
     #[test]
-    fn buffering_past_the_scale_stops_at_its_floor() {
+    fn buffering_past_the_scale_stops_short_of_full() {
         assert_eq!(
-            angle(Step::Buffered(60_000)),
-            angle(Step::Buffered(BUFFER_FULL_MS))
+            progress(Step::Buffered(60_000)),
+            progress(Step::Buffered(BUFFER_FULL_MS))
         );
-        assert!(angle(Step::Buffered(0)) == angle(Step::Metadata));
+        assert!(progress(Step::Buffered(60_000)) < 1.0);
+        assert_eq!(progress(Step::Buffered(0)), progress(Step::Metadata));
     }
 
     #[test]
-    fn a_late_or_repeated_step_never_turns_the_face_back() {
+    fn a_late_or_repeated_step_never_empties_the_bar() {
         let mut t = Turn::new(0.0);
-        assert_eq!(t.hear(Step::Metadata, 10.0), Some(METADATA_DEG));
+        assert_eq!(t.hear(Step::Metadata, 10.0), Some(METADATA_DONE));
         assert_eq!(t.hear(Step::Negotiated, 20.0), None);
         assert_eq!(t.hear(Step::Metadata, 30.0), None);
         assert_eq!(t.step, Step::Metadata);
         assert_eq!(t.stepped_ms, 10.0);
-        assert_eq!(t.hear(Step::FirstFrame, 40.0), Some(0.0));
+        assert_eq!(t.hear(Step::FirstFrame, 40.0), Some(1.0));
+    }
+
+    #[test]
+    fn a_quick_load_still_finishes_the_turn_before_it_fades() {
+        let mut t = Turn::new(1_000.0);
+        t.hear(Step::FirstFrame, 1_100.0);
+        assert!(!t.fades(1_100.0));
+        assert!(!t.fades(1_000.0 + f64::from(TURN_MS) - 1.0));
+        assert!(t.fades(1_000.0 + f64::from(TURN_MS)));
+    }
+
+    #[test]
+    fn a_slow_load_lands_the_turn_and_fades_only_at_the_first_frame() {
+        let mut t = Turn::new(0.0);
+        t.hear(Step::Negotiated, 100.0);
+        assert!(t.turned(f64::from(TURN_MS)));
+        assert!(!t.fades(4_000.0));
+        t.hear(Step::Metadata, 4_000.0);
+        assert!(!t.fades(4_100.0));
+        t.hear(Step::FirstFrame, 4_200.0);
+        assert!(t.fades(4_200.0));
     }
 
     #[test]
