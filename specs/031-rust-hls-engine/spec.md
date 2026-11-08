@@ -4,7 +4,7 @@
 **Created**: 2026-11-07T23:10:00Z
 **Status**: Draft
 **Scope**: The native web UI (`/ui/`, 013/017) and the Android TV WebView (025) play HLS through a Pharos-owned engine: a pure-Rust crate, `pharos-hls`, driven by a Media Source Extensions adapter in `pharos-ui`. It sits behind the existing `PlaybackEngine` trait and a per-device setting; the vendored hls.js (ADR-0035) stays the default and the fallback until this spec's parity table and budgets are met. Safari's native HLS, direct play and jellyfin-web are unchanged.
-**Decision record**: ADR-0071. **Bugs reserved**: B680-B699. **Verification**: V630-V649.
+**Decision record**: ADR-0071. **Bugs reserved**: B680-B699, B751-B760 (slice 3 recovery). **Verification**: V630-V649, V701-V710 (slice 3 recovery).
 
 ---
 
@@ -135,6 +135,8 @@ A viewer on the Rust engine watches over a link that drops from fast to slow and
 | V647 | A down-switch is taken while the forward buffer still covers the next segment's download at the estimated rate | property test of the rule |
 | V648 | A rung switch appends the new init then the next segment, with no reload and no change in `currentTime` | adapter e2e on a throttled link |
 | V649 | Every switch is logged and reported with from, to, reason, estimate, buffer and cold-encode time | log/event test with a disarm check |
+| V701 | A play head stuck at a buffer hole of at most 1 s is moved past it; one stuck with data ahead is nudged up to three times, then reported as a fatal `mediaError` `bufferStalledError`; a hole wider than 1 s is left to the planner | watchdog unit tests on a fake clock; e2e with a cut audio range |
+| V702 | Every stall verdict (jump, nudge, starved, give up, recovered) is logged and reported as `playbackStall` with the play head, target, gap, attempt, stall time, each track's buffer ahead and the requests in flight | log/event test with a disarm check |
 
 ## Open questions
 
