@@ -222,4 +222,6 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
-strip = true
+# No `strip`: wasm-bindgen reads the `target_features` custom section, and
+# stripping removes it ("target_features custom section is missing").
+# dx's `--debug-symbols false` plus wasm-opt drop the names section instead.
