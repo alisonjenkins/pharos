@@ -2141,6 +2141,22 @@ body:has(.pharos-stage.is-full) .pharos-error {
   object-fit: cover;
   display: block;
 }
+/* A song with no cover (V751): lit from one corner in the accent, the way
+   the player's own stand-in is, with the note set on it. */
+.pharos-poster-placeholder.pharos-art-song {
+  aspect-ratio: 1 / 1;
+  border-radius: var(--px-radius);
+  background:
+    radial-gradient(circle at 18% 12%, color-mix(in srgb, var(--px-color-accent) 55%, transparent), transparent 70%),
+    linear-gradient(160deg, var(--px-color-surface-raised), var(--px-color-surface));
+}
+.pharos-art-note {
+  font-size: 3.5rem;
+  line-height: 1;
+  color: color-mix(in srgb, var(--px-color-accent) 35%, var(--px-color-fg));
+  opacity: 0.85;
+  text-shadow: 0 0.15rem 0.6rem color-mix(in srgb, var(--px-color-accent) 40%, transparent);
+}
 .pharos-listen-art .pharos-poster-placeholder {
   font-size: 2.5rem;
   background: linear-gradient(135deg, color-mix(in srgb, var(--px-color-accent) 55%, var(--px-color-surface)), var(--px-color-surface));
