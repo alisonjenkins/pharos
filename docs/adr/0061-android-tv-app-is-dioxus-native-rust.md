@@ -42,10 +42,12 @@ Details: `specs/025-android-tv/spec.md`.
   Rust and read synchronously from the cache, so `web.rs`'s synchronous
   callers keep their signatures; the mirror can lag by one push. Reads made
   on an input (spatial focus, element sizes, tile in view) run as one
-  batched `document::eval` per event. One round trip is 2.1 ms p50 / 2.8 ms
-  p95 / 3.7 ms p99 idle and 2.7 ms / 8.9 ms / 12.2 ms p99 during muted
-  1080p playback, so one batched read per key press fits a 16.7 ms frame,
-  while polling by eval during playback does not. A fully async surface
+  batched `document::eval` per event. Worst of five launches, one round
+  trip is 2.2 ms p50 / 2.9 ms p95 / 3.7 ms p99 idle and 2.9 / 8.9 / 12.2 ms
+  during muted 1080p playback, and the mirror's push holds 60 Hz during
+  playback (gap p95 20.1 ms, max 24.7 ms). So one batched read per key
+  press fits a 16.7 ms frame, while polling by eval during playback does
+  not. A fully async surface
   was rejected: every caller changes and it still pays a round trip per
   read.
 - Until native playback lands, codec support is the WebView's (weak HEVC,
