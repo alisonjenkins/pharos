@@ -125,6 +125,20 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
+    // The TV remote's Back at the first page closes the player still
+    // floating there before it leaves the app.
+    use_hook(move || {
+        Rc::new(platform::on_back_at_root(move || {
+            let Some(item) = stage.peek().item else {
+                return false;
+            };
+            stage.write().close();
+            platform::info(&format!(
+                "pharos: stage view=closed item={item} reason=back_at_root"
+            ));
+            true
+        }))
+    });
     // The F key put the page in fullscreen; the player leaving the full
     // view (Back, the floating window, Close) takes it out again.
     let shown_full = use_memo(move || {

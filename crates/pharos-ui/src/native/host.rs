@@ -86,6 +86,14 @@ pub fn on_back(_on_back: impl FnMut() -> bool + 'static) -> BackWatch {
 
 pub struct PopState;
 
+pub struct BackAtRoot;
+
+/// The remote's Back at the first page (the Android TV app only): a browser
+/// leaves the page itself.
+pub fn on_back_at_root(_on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
+    BackAtRoot
+}
+
 pub fn on_pop_state(_on_path: impl FnMut(String) + 'static) -> PopState {
     PopState
 }
