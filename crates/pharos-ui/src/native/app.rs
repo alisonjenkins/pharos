@@ -52,6 +52,7 @@ use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
+use super::show_tracks;
 use super::stage::{
     Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View, STAGE_ID,
 };
@@ -3328,6 +3329,17 @@ fn TitleScreen(id: ItemRef) -> Element {
                     .flatten()
                     .filter(|(asked, _)| *asked == id)
                     .map(|(_, start)| {
+                        // A choice made on another episode of the show
+                        // applies here.
+                        let series = show_tracks::show_of(detail);
+                        let start = series.map_or(start, |s| {
+                            let (audio, subtitle) = show_tracks::shown(
+                                &show_tracks::load(s),
+                                detail,
+                                (start.audio, start.subtitle),
+                            );
+                            StartTracks { audio, subtitle }
+                        });
                         rsx! {
                             TrackChoices {
                                 key: "{id}",
@@ -3335,6 +3347,7 @@ fn TitleScreen(id: ItemRef) -> Element {
                                 audio: detail.audio_tracks.clone(),
                                 subtitles: detail.subtitle_tracks.clone(),
                                 start,
+                                series: series.map(str::to_owned),
                             }
                         }
                     });
@@ -3378,6 +3391,16 @@ struct Playing {
 }
 
 impl Playing {
+    /// The tracks this playback was negotiated with, for negotiating it again.
+    fn asked(&self) -> TrackPicks {
+        TrackPicks {
+            audio: self
+                .asked_audio
+                .map_or(TrackChoice::Default, TrackChoice::Index),
+            subtitle: self.asked_subtitle,
+        }
+    }
+
     /// Whether the stream has its subtitle drawn in by the server.
     fn burned(&self) -> bool {
         self.subtitle.is_some_and(|i| {
@@ -3558,13 +3581,30 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 } else {
                     platform::turn_cancel(&id.to_string(), "not-video");
                 }
+                // Every start of an episode comes through here: from its
+                // title page, the next-episode button, up next and the
+                // episode turn alike.
+                let asked = show_tracks::show_of(&detail).map_or(asked, |series| {
+                    let followed = together.current().and_then(|s| {
+                        let audio: Vec<u32> = detail.audio_tracks.iter().map(|t| t.index).collect();
+                        let subtitles: Vec<u32> =
+                            detail.subtitle_tracks.iter().map(|t| t.index).collect();
+                        s.tracks_followed(&audio, &subtitles)
+                    });
+                    show_tracks::start_picks(
+                        followed.as_ref(),
+                        &show_tracks::load(series),
+                        &detail,
+                        asked,
+                    )
+                });
                 let caps = negotiation_capabilities(detail.item.kind, auto);
                 let (decision, grant) = api.play(&info, id, &caps, asked).await?;
-                Ok::<_, ClientError>((detail, decision, grant))
+                Ok::<_, ClientError>((detail, decision, grant, asked))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
+                settle(ctx.machine, result).and_then(|(detail, decision, grant, asked)| {
                     let (mse_engine, engine_reason) = mse_engine_choice();
                     let picked = choose_engine(
                         decision.is_hls(),
@@ -3686,7 +3726,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let Some(api) = ctx.api.peek().clone() else {
             return;
         };
-        let asked = *picks.peek();
+        let asked = p.0.asked();
         let kind = p.0.kind;
         spawn(async move {
             let info = call("watch", "renew");
@@ -5100,6 +5140,10 @@ fn Player(
                     }
                 }
                 Control::Audio(index) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.audio_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_audio(s, tracks, index));
+                    }
                     let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
                         session().is_some_and(|s| s.pick_audio(index))
                     }) else {
@@ -5111,6 +5155,10 @@ fn Player(
                     });
                 }
                 Control::Subtitle(to) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.subtitle_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, tracks, to));
+                    }
                     let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
                         session().is_some_and(|s| s.pick_subtitle(to))
                     });
