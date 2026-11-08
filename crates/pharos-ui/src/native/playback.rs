@@ -64,6 +64,12 @@ impl Engine {
     pub fn reports_fragments(self) -> bool {
         matches!(self, Engine::HlsJs | Engine::RustHls)
     }
+
+    /// Whether the engine picks the quality itself (spec 031 slice 4), so the
+    /// watch page's auto quality must stay out of the way.
+    pub fn adapts_quality(self) -> bool {
+        matches!(self, Engine::RustHls)
+    }
 }
 
 /// The engine for a stream: native HLS where the browser has it, else the
@@ -378,6 +384,113 @@ pub fn ranges_to_ms(ranges_s: &[(f64, f64)]) -> Vec<(u64, u64)> {
     }
     out.sort_unstable_by_key(|&(start, _)| start);
     out
+}
+
+/// The master URL the Rust engine asks for: with `abr=1` the server lists the
+/// H.264 fMP4 quality ladder (V644), which no other client is sent.
+pub fn with_abr(url: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}abr=1")
+}
+
+/// One rung the Rust engine can switch to: its media playlist and its place in
+/// the ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LadderEntry {
+    pub uri: String,
+    pub rung: pharos_hls::abr::Rung,
+}
+
+/// The rungs a switch can move between: the variants carrying the first
+/// variant's codecs and audio group, lowest bandwidth first, the order
+/// [`pharos_hls::abr::Abr`] indexes them in. A variant on other codecs would
+/// need `changeType`, so it is left out.
+pub fn abr_ladder(master: &pharos_hls::playlist::Master) -> Vec<LadderEntry> {
+    let Some(first) = master.variants.first() else {
+        return Vec::new();
+    };
+    let mut out: Vec<LadderEntry> = master
+        .variants
+        .iter()
+        .filter(|v| v.codecs == first.codecs && v.audio_group == first.audio_group)
+        .map(|v| LadderEntry {
+            uri: v.uri.clone(),
+            rung: pharos_hls::abr::Rung {
+                bandwidth_bps: v.bandwidth,
+                height: v.resolution.map(|(_, h)| h),
+            },
+        })
+        .collect();
+    out.sort_by_key(|e| e.rung.bandwidth_bps);
+    out.dedup_by(|a, b| a.uri == b.uri);
+    out
+}
+
+/// A rung as the switch log names it: its height, else its bandwidth.
+pub fn rung_label(rung: &pharos_hls::abr::Rung) -> String {
+    match rung.height {
+        Some(h) => format!("{h}p"),
+        None => format!("{}k", rung.bandwidth_bps / 1000),
+    }
+}
+
+/// How much media is buffered ahead of `play_ms`: the end of the range that
+/// holds it, less `play_ms`; 0 when the play head is in a gap.
+pub fn forward_buffer_ms(ranges: &[(u64, u64)], play_ms: u64) -> u64 {
+    ranges
+        .iter()
+        .find(|&&(start, end)| start <= play_ms && play_ms < end)
+        .map_or(0, |&(_, end)| end - play_ms)
+}
+
+/// One quality switch the Rust engine took, with what it decided on (V649).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbrSwitchReport {
+    pub from: String,
+    pub to: String,
+    pub reason: &'static str,
+    pub estimate_bps: Option<u64>,
+    pub buffer_ms: u64,
+    pub cold_ms: u64,
+    /// The planner took the switch; `false` is a switch it refused.
+    pub applied: bool,
+}
+
+impl AbrSwitchReport {
+    pub fn line(&self) -> String {
+        let est = self
+            .estimate_bps
+            .map_or_else(|| "none".to_owned(), |b| (b / 1000).to_string());
+        format!(
+            "pharos: abr switch from={} to={} reason={} est_kbps={est} buffer_ms={} cold_ms={} applied={}",
+            self.from, self.to, self.reason, self.buffer_ms, self.cold_ms, self.applied
+        )
+    }
+
+    pub fn event(&self, route: String) -> ClientEvent {
+        let est = self
+            .estimate_bps
+            .map_or_else(|| "none".to_owned(), |b| (b / 1000).to_string());
+        ClientEvent {
+            kind: ClientEventKind::QualitySwitch,
+            level: if self.applied {
+                ClientLevel::Info
+            } else {
+                ClientLevel::Warn
+            },
+            route,
+            fields: vec![
+                ("engine", "rust".to_owned()),
+                ("from", self.from.clone()),
+                ("to", self.to.clone()),
+                ("reason", self.reason.to_owned()),
+                ("est_kbps", est),
+                ("buffer_ms", self.buffer_ms.to_string()),
+                ("cold_ms", self.cold_ms.to_string()),
+                ("applied", self.applied.to_string()),
+            ],
+        }
+    }
 }
 
 impl EngineVerdict {
@@ -3056,6 +3169,137 @@ mod tests {
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|e| engine_label(*e)).collect();
         assert_eq!(labels.len(), all.len());
+    }
+
+    #[test]
+    fn only_the_rust_engine_adapts_quality() {
+        assert!(Engine::RustHls.adapts_quality());
+        for e in [
+            Engine::HlsJs,
+            Engine::NativeHls,
+            Engine::Direct,
+            Engine::Unsupported,
+        ] {
+            assert!(!e.adapts_quality(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn with_abr_adds_the_flag_to_either_query_shape() {
+        assert_eq!(with_abr("/m.m3u8"), "/m.m3u8?abr=1");
+        assert_eq!(with_abr("/m.m3u8?api_key=k"), "/m.m3u8?api_key=k&abr=1");
+    }
+
+    const ABR_MASTER: &str = "#EXTM3U\n#EXT-X-VERSION:7\n\
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,URI=\"a.m3u8\"\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=8128000,CODECS=\"avc1.640028,opus\",AUDIO=\"aud\",RESOLUTION=1920x1080\n\
+        main.m3u8\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=3128000,CODECS=\"avc1.640028,opus\",AUDIO=\"aud\",RESOLUTION=1280x720\n\
+        720p/main.m3u8\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=928000,CODECS=\"avc1.640028,opus\",AUDIO=\"aud\",RESOLUTION=640x360\n\
+        360p/main.m3u8\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"vp09.00.40.08,opus\",AUDIO=\"aud\"\n\
+        vp9/main.m3u8\n";
+
+    // Abr indexes its ladder lowest bandwidth first; the master lists the
+    // source rung first. The entries must follow Abr's order, or a switch
+    // fetches the wrong rung.
+    #[test]
+    fn abr_ladder_is_lowest_first_and_keeps_only_the_first_variants_codecs() {
+        let master =
+            pharos_hls::playlist::parse_master(ABR_MASTER, "https://h/videos/9/master.m3u8")
+                .unwrap();
+        let ladder = abr_ladder(&master);
+        let got: Vec<(u64, Option<u32>, &str)> = ladder
+            .iter()
+            .map(|e| (e.rung.bandwidth_bps, e.rung.height, e.uri.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (928_000, Some(360), "https://h/videos/9/360p/main.m3u8"),
+                (3_128_000, Some(720), "https://h/videos/9/720p/main.m3u8"),
+                (8_128_000, Some(1080), "https://h/videos/9/main.m3u8"),
+            ]
+        );
+        let abr = pharos_hls::abr::Abr::new(
+            ladder.iter().map(|e| e.rung).collect(),
+            pharos_hls::abr::AbrConfig::default(),
+        );
+        let order: Vec<_> = abr.ladder().iter().map(|r| r.bandwidth_bps).collect();
+        let ours: Vec<_> = ladder.iter().map(|e| e.rung.bandwidth_bps).collect();
+        assert_eq!(order, ours, "entries and Abr disagree on rung order");
+    }
+
+    #[test]
+    fn abr_ladder_of_a_master_without_variants_is_empty() {
+        let master = pharos_hls::playlist::parse_master("#EXTM3U\n", "https://h/m.m3u8").unwrap();
+        assert!(abr_ladder(&master).is_empty());
+    }
+
+    #[test]
+    fn rung_labels_name_the_height_or_the_bandwidth() {
+        use pharos_hls::abr::Rung;
+        let r = |bandwidth_bps, height| Rung {
+            bandwidth_bps,
+            height,
+        };
+        assert_eq!(rung_label(&r(3_128_000, Some(720))), "720p");
+        assert_eq!(rung_label(&r(928_000, None)), "928k");
+    }
+
+    #[test]
+    fn forward_buffer_is_measured_in_the_range_holding_the_play_head() {
+        let ranges = [(0, 6_000), (12_000, 30_000)];
+        assert_eq!(forward_buffer_ms(&ranges, 2_000), 4_000);
+        assert_eq!(forward_buffer_ms(&ranges, 12_000), 18_000);
+        assert_eq!(forward_buffer_ms(&ranges, 8_000), 0, "in a gap");
+        assert_eq!(forward_buffer_ms(&ranges, 30_000), 0, "at the end");
+        assert_eq!(forward_buffer_ms(&[], 0), 0);
+    }
+
+    // V649: every switch is logged and reported with from, to, reason,
+    // estimate, buffer and cold-encode time.
+    #[test]
+    fn an_abr_switch_is_logged_and_reported_with_its_inputs() {
+        let r = AbrSwitchReport {
+            from: "1080p".to_owned(),
+            to: "480p".to_owned(),
+            reason: pharos_hls::abr::Reason::Bandwidth.label(),
+            estimate_bps: Some(1_234_567),
+            buffer_ms: 9_000,
+            cold_ms: 2_500,
+            applied: true,
+        };
+        assert_eq!(
+            r.line(),
+            "pharos: abr switch from=1080p to=480p reason=bandwidth est_kbps=1234 buffer_ms=9000 cold_ms=2500 applied=true"
+        );
+        let e = r.event("/ui/watch/9".to_owned());
+        assert_eq!(e.kind, ClientEventKind::QualitySwitch);
+        assert_eq!(e.level, ClientLevel::Info);
+        let keys: Vec<_> = e.fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            [
+                "engine",
+                "from",
+                "to",
+                "reason",
+                "est_kbps",
+                "buffer_ms",
+                "cold_ms",
+                "applied"
+            ]
+        );
+        let refused = AbrSwitchReport {
+            estimate_bps: None,
+            applied: false,
+            ..r
+        };
+        assert!(refused.line().contains("est_kbps=none"));
+        assert!(refused.line().ends_with("applied=false"));
+        assert_eq!(refused.event(String::new()).level, ClientLevel::Warn);
     }
 
     #[test]
