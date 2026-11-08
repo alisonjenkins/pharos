@@ -354,8 +354,8 @@ pub trait GroupClient {
 }
 
 /// The seam's one place of construction: the screens ask for the client
-/// here. In the browser it is the network adapter over the session's `Group`;
-/// on the host, the in-memory [`FakeGroups`].
+/// here. In the browser and the Android TV app it is the network adapter over
+/// the session's `Group`; on the host, the in-memory [`FakeGroups`].
 pub fn group_api(api: &NativeApi) -> Groups {
     super::platform::groups(api)
 }
