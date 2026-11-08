@@ -2154,9 +2154,17 @@ fn NativeApp(route: Route) -> Element {
                 },
                 search: rsx! { TopSearch {} },
                 if outdated() {
-                    p { class: "pharos-error", role: "alert",
-                        "Pharos has been updated. Reload to keep using it. "
-                        button { class: "pharos-button", onclick: move |_| platform::reload(), "Reload" }
+                    if platform::can_reload() {
+                        p { class: "pharos-error", role: "alert",
+                            "Pharos has been updated. Reload to keep using it. "
+                            button { class: "pharos-button", onclick: move |_| platform::reload(), "Reload" }
+                        }
+                    } else {
+                        // An installed app has nothing to reload: the
+                        // update is a new build.
+                        p { class: "pharos-error", role: "alert",
+                            "The Pharos server has been updated. Some things may not work until this app is updated too."
+                        }
                     }
                 }
                 if reconnecting {
