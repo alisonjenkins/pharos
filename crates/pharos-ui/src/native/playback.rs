@@ -443,6 +443,92 @@ pub fn forward_buffer_ms(ranges: &[(u64, u64)], play_ms: u64) -> u64 {
         .map_or(0, |&(_, end)| end - play_ms)
 }
 
+/// One stall verdict of the Rust engine's watchdog, with the play head's
+/// surroundings (V702): which tracks had a request in flight, and where each
+/// track's buffered data ends past the play head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallReport {
+    pub verdict: pharos_hls::stall::Verdict,
+    pub video_ahead_ms: u64,
+    pub audio_ahead_ms: u64,
+    pub in_flight: &'static str,
+}
+
+impl StallReport {
+    /// `(at_ms, to_ms, gap_ms, attempt, stalled_ms)`; `None` where the
+    /// verdict has no such value.
+    fn fields(&self) -> (u64, Option<u64>, Option<u64>, u32, Option<u64>) {
+        use pharos_hls::stall::Verdict as V;
+        match self.verdict {
+            V::Jump {
+                from_ms,
+                to_ms,
+                gap_ms,
+                attempt,
+            } => (from_ms, Some(to_ms), Some(gap_ms), attempt, None),
+            V::Nudge {
+                from_ms,
+                to_ms,
+                attempt,
+                ..
+            } => (from_ms, Some(to_ms), None, attempt, None),
+            V::Starved { at_ms, stalled_ms } => (at_ms, None, None, 0, Some(stalled_ms)),
+            V::GiveUp {
+                at_ms,
+                stalled_ms,
+                attempts,
+            }
+            | V::Recovered {
+                at_ms,
+                stalled_ms,
+                attempts,
+            } => (at_ms, None, None, attempts, Some(stalled_ms)),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        let (at, to, gap, attempt, stalled) = self.fields();
+        let opt = |v: Option<u64>| v.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        format!(
+            "pharos: playback stall engine=rust action={} at_ms={at} to_ms={} gap_ms={} attempt={attempt} stalled_ms={} video_ahead_ms={} audio_ahead_ms={} in_flight={}",
+            self.verdict.label(),
+            opt(to),
+            opt(gap),
+            opt(stalled),
+            self.video_ahead_ms,
+            self.audio_ahead_ms,
+            self.in_flight,
+        )
+    }
+
+    pub fn event(&self, route: String) -> ClientEvent {
+        use pharos_hls::stall::Verdict as V;
+        let (at, to, gap, attempt, stalled) = self.fields();
+        let opt = |v: Option<u64>| v.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        ClientEvent {
+            kind: ClientEventKind::PlaybackStall,
+            level: match self.verdict {
+                V::GiveUp { .. } => ClientLevel::Error,
+                V::Recovered { .. } => ClientLevel::Info,
+                V::Jump { .. } | V::Nudge { .. } | V::Starved { .. } => ClientLevel::Warn,
+            },
+            route,
+            fields: vec![
+                ("engine", "rust".to_owned()),
+                ("action", self.verdict.label().to_owned()),
+                ("at_ms", at.to_string()),
+                ("to_ms", opt(to)),
+                ("gap_ms", opt(gap)),
+                ("attempt", attempt.to_string()),
+                ("stalled_ms", opt(stalled)),
+                ("video_ahead_ms", self.video_ahead_ms.to_string()),
+                ("audio_ahead_ms", self.audio_ahead_ms.to_string()),
+                ("in_flight", self.in_flight.to_owned()),
+            ],
+        }
+    }
+}
+
 /// One quality switch the Rust engine took, with what it decided on (V649).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbrSwitchReport {
@@ -3256,6 +3342,59 @@ mod tests {
         assert_eq!(forward_buffer_ms(&ranges, 8_000), 0, "in a gap");
         assert_eq!(forward_buffer_ms(&ranges, 30_000), 0, "at the end");
         assert_eq!(forward_buffer_ms(&[], 0), 0);
+    }
+
+    // V702: every stall verdict is logged and reported with the play head's
+    // surroundings.
+    #[test]
+    fn a_stall_verdict_is_logged_and_reported_with_its_surroundings() {
+        use pharos_hls::stall::Verdict;
+        let r = StallReport {
+            verdict: Verdict::Jump {
+                from_ms: 10_000,
+                to_ms: 10_500,
+                gap_ms: 400,
+                attempt: 1,
+            },
+            video_ahead_ms: 0,
+            audio_ahead_ms: 2_000,
+            in_flight: "video",
+        };
+        assert_eq!(
+            r.line(),
+            "pharos: playback stall engine=rust action=jump at_ms=10000 to_ms=10500 gap_ms=400 attempt=1 stalled_ms=none video_ahead_ms=0 audio_ahead_ms=2000 in_flight=video"
+        );
+        let e = r.event("/ui/watch/9".to_owned());
+        assert_eq!(e.kind, ClientEventKind::PlaybackStall);
+        assert_eq!(e.level, ClientLevel::Warn);
+        let keys: Vec<_> = e.fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            [
+                "engine",
+                "action",
+                "at_ms",
+                "to_ms",
+                "gap_ms",
+                "attempt",
+                "stalled_ms",
+                "video_ahead_ms",
+                "audio_ahead_ms",
+                "in_flight"
+            ]
+        );
+        let gave_up = StallReport {
+            verdict: Verdict::GiveUp {
+                at_ms: 30_000,
+                stalled_ms: 8_000,
+                attempts: 3,
+            },
+            ..r
+        };
+        assert!(gave_up.line().contains(
+            "action=give_up at_ms=30000 to_ms=none gap_ms=none attempt=3 stalled_ms=8000"
+        ));
+        assert_eq!(gave_up.event(String::new()).level, ClientLevel::Error);
     }
 
     // V649: every switch is logged and reported with from, to, reason,
