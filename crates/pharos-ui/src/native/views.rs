@@ -857,6 +857,12 @@ pub fn TitleView(
     .collect();
     let facts = facts.join(" · ");
     let resume = progress_percent(item).is_some();
+    let chosen = detail
+        .versions
+        .iter()
+        .find(|v| v.id == version)
+        .or(detail.versions.first());
+    let version_facts = chosen.map(versions::version_facts).unwrap_or_default();
     rsx! {
         article { class: "pharos-title",
             div { class: "pharos-title-art",
@@ -945,6 +951,16 @@ pub fn TitleView(
                     }
                 }
                 InThisGroup { rows: group_rows }
+                if !version_facts.is_empty() {
+                    dl { class: "pharos-version-facts",
+                        for (label, value) in version_facts {
+                            div {
+                                dt { "{label}" }
+                                dd { "{value}" }
+                            }
+                        }
+                    }
+                }
                 if !detail.overview.is_empty() {
                     p { class: "pharos-overview", "{detail.overview}" }
                 }
@@ -1892,6 +1908,54 @@ mod tests {
         assert!(
             tile.contains("pharos-badge-3d") && tile.contains(">3D<"),
             "{tile}"
+        );
+    }
+
+    /// Two copies of an episode: the picker names each by its file, and the
+    /// chosen one's facts are listed, its path only when the server sent it.
+    #[test]
+    fn a_title_lists_the_chosen_versions_file() {
+        use pharos_client::api::Version;
+        let copy = |id: &str, height: u32, path: &str| Version {
+            id: id.into(),
+            primary: id.is_empty(),
+            width: height * 16 / 9,
+            height,
+            video_codec: "h264".into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let detail = |path: &str| Detail {
+            item: item(ItemKind::Episode),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            versions: vec![copy("", 720, ""), copy("season-1", 1080, path)],
+        };
+        let viewer = detail("");
+        let html = render(move || {
+            rsx! { TitleView { detail: viewer.clone(), version: "season-1".to_string() } }
+        });
+        assert!(
+            html.contains(r#"<option value="season-1" selected=true>1080p · H.264</option>"#),
+            "{html}"
+        );
+        assert!(html.contains("<dd>1080p · H.264</dd>"), "{html}");
+        assert!(!html.contains("<dt>Path</dt>"), "{html}");
+        let admin = detail("/media/TV/Show/Season 1/Show - S01E02.mkv");
+        let html = render(move || {
+            rsx! { TitleView { detail: admin.clone(), version: "season-1".to_string() } }
+        });
+        assert!(
+            html.contains("<dt>Path</dt><dd>/media/TV/Show/Season 1/Show - S01E02.mkv</dd>"),
+            "{html}"
         );
     }
 
