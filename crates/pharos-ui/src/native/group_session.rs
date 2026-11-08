@@ -260,6 +260,19 @@ impl GroupState {
         ))
     }
 
+    /// Where a player newly loading `item` should start: the group's
+    /// position, while `item` is what the group plays. Before the first clock
+    /// sample that is the anchor's own position; the catch-up corrects it
+    /// once the clock is known.
+    pub fn start_for(&self, item: ItemRef, now_ms: i64) -> Option<u64> {
+        if self.item != Some(item) {
+            return None;
+        }
+        self.expected(now_ms)
+            .map(|(at, _)| at)
+            .or_else(|| self.anchor.map(|a| a.position_ms))
+    }
+
     /// Milliseconds since the last server command, large before any.
     pub fn since_command_ms(&self, now_ms: i64) -> u64 {
         self.last_command_ms
@@ -631,6 +644,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// Whether a membership is active.
     pub fn active(&self) -> bool {
         self.inner.borrow().active
+    }
+
+    /// Where a player newly loading `item` starts, while in a group that
+    /// plays it: the group's position, not this member's own resume point
+    /// (B664). `None` out of a group or for another item.
+    pub fn start_for(&self, item: ItemRef) -> Option<u64> {
+        let inner = self.inner.borrow();
+        if !inner.active {
+            return None;
+        }
+        inner.state.start_for(item, self.env.now_ms())
     }
 
     /// Whether the group drives the stage's player: in a group, and the
@@ -2373,6 +2397,25 @@ mod tests {
             .filter(|c| c.starts_with("ready"))
             .collect();
         assert_eq!(ready, ["ready(pl-7,2000,false)"]);
+    }
+
+    /// B664, the root of it: a player that loads while the group plays an
+    /// item starts at the group's position, not at this member's own resume
+    /// point, so no late resume seek can carry it away after its ready.
+    #[test]
+    fn a_player_loading_the_groups_item_starts_at_the_group() {
+        let rig = rig();
+        assert_eq!(rig.session.start_for(ItemRef::Real(7)), None);
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 1_900,
+            playing: false,
+        });
+        assert_eq!(rig.session.start_for(ItemRef::Real(7)), Some(1_900));
+        assert_eq!(rig.session.start_for(ItemRef::Real(8)), None);
+        rig.session.leave().now_or_never();
+        assert_eq!(rig.session.start_for(ItemRef::Real(7)), None);
     }
 
     /// A server that answers slowly must not reorder what the viewer did:
