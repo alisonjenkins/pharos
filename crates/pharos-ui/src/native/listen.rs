@@ -1460,13 +1460,22 @@ mod tests {
         );
     }
 
+    /// The attributes of the first `<tag ...>` in `html`, in whatever order
+    /// the renderer writes them (dioxus-ssr 0.8 puts `class` before `id`).
+    fn open_tag<'a>(html: &'a str, tag: &str) -> &'a str {
+        html.split(&format!("<{tag} "))
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .unwrap_or("")
+    }
+
     #[test]
     fn a_song_gets_art_title_audio_and_every_style() {
         let html = render("Teardrop", Some("/art.jpg"));
         assert!(html.contains("Teardrop"));
         assert!(html.contains(r#"src="/art.jpg""#));
         assert!(
-            html.contains(&format!(r#"<audio id="{VIDEO_ID}""#)),
+            open_tag(&html, "audio").contains(&format!(r#"id="{VIDEO_ID}""#)),
             "{html}"
         );
         for style in Style::ALL {
@@ -1479,7 +1488,7 @@ mod tests {
     fn the_default_style_mounts_a_canvas_behind_the_controls() {
         let html = render("Teardrop", None);
         assert!(
-            html.contains(&format!(r#"<canvas id="{CANVAS_ID}""#)),
+            open_tag(&html, "canvas").contains(&format!(r#"id="{CANVAS_ID}""#)),
             "{html}"
         );
         assert!(html.contains("♪"));
