@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/blitz-tv`
 **Created**: 2026-11-08T13:30:00Z
-**Status**: Draft. Slice 0 (spike) not started.
+**Status**: Draft. Slice 0 (spike) run; results in `spike-0.md`.
 **Asked by**: Alison, 2026-11-08: "We should do the Dioxus route and we can potentially help improve the experimental nature of it" (choosing Dioxus Native over a WebView wrapper for the TV app).
 **Scope**: A second Android TV build of `pharos-ui` that draws with Dioxus Native (Blitz: Stylo CSS, Taffy layout, a GPU or CPU 2D renderer) in place of the system WebView, plays video through the NDK `AMediaCodec` fed by `pharos-hls` (spec 031), and draws subtitles with `pharos-subs`. The current WebView app (spec 025, ADR-0061) keeps shipping until this one passes its parity gate.
 **Decision record**: ADR-0077 (supersedes ADR-0061 in part). **Bugs reserved**: B870-B889. **Verification**: V820-V839.
