@@ -2398,10 +2398,13 @@ mod tests {
             "one try, then one per backoff step"
         );
         assert!(!rig.session.active());
-        let last = views(&rig).pop().expect("a view after giving up");
-        assert!(!last.active);
+        let last = views(&rig).pop();
+        assert!(
+            last.as_ref().is_some_and(|v| !v.active),
+            "a view out of the group after giving up"
+        );
         assert_eq!(
-            last.ended.as_deref(),
+            last.and_then(|v| v.ended).as_deref(),
             Some("Couldn't rejoin your group, so you're watching on your own. (This group has ended)")
         );
     }
