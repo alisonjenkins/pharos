@@ -296,6 +296,11 @@ pub fn bootstrap_client(
 }
 
 /// Serves `bootstrap` over one byte stream until the peer goes away.
+///
+/// Dropping the returned future mid-connection (the socket's `select!` does,
+/// whenever the socket ends before the RPC side notices) disconnects the
+/// `RpcSystem`, so the calls still running are dropped with it rather than
+/// leaked holding database pool slots (B730, V680).
 pub async fn serve<R, W>(
     reader: R,
     writer: W,
@@ -311,7 +316,8 @@ where
         Side::Server,
         reader_options(),
     );
-    RpcSystem::new(Box::new(network), Some(bootstrap.client)).await
+    pharos_api::DisconnectOnDrop::new(RpcSystem::new(Box::new(network), Some(bootstrap.client)))
+        .await
 }
 
 /// Which way bytes moved. The `direction` label of `pharos_rpc_bytes_total`.
