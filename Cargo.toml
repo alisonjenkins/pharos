@@ -207,3 +207,16 @@ inherits = "dev"
 
 [profile.android-dev]
 inherits = "dev"
+
+# The web UI's release build (flake.nix `pharosUiBundle`: `dx build --release
+# --profile wasm-release`). Size over speed: the bundle is downloaded and
+# compiled on every cold start of weak clients (Quest, Android TV), and the
+# 017 spike measured 3.53 MB -> 1.86 MB raw for these settings
+# (specs/017-native-api/research.md R8). Kept off plain `release`, which the
+# server and transcode worker build with.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
