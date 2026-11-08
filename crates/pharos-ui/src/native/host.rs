@@ -498,6 +498,10 @@ pub fn tap_peak(_id: &str) -> Option<f32> {
     None
 }
 
+pub fn tap_wake(_id: &str) -> super::resume::Wake {
+    super::resume::Wake::None
+}
+
 /// The host has no server: the in-memory groups.
 pub type Groups = super::together::FakeGroups;
 
